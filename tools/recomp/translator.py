@@ -384,6 +384,26 @@ class FunctionTranslator:
                     f"goto {target};",
                     f"(void)0; /* goto {target} - dead code, label not in function */")
 
+        # Ensure labels at end of function have a statement after them.
+        # In C, a label must be followed by a statement; a comment alone is not
+        # enough.  Walk backwards from the end and if the last real content is a
+        # label (with only blank lines / comments after it), insert "(void)0;".
+        _last_label_idx = None
+        _has_stmt_after = False
+        for _ri in range(len(lines) - 1, -1, -1):
+            _s = lines[_ri].strip()
+            if not _s:
+                continue
+            if _s.startswith("/*") and _s.endswith("*/"):
+                continue
+            if re.match(r'^loc_[0-9A-Fa-f]+:', _s):
+                _last_label_idx = _ri
+                break
+            _has_stmt_after = True
+            break
+        if _last_label_idx is not None and not _has_stmt_after:
+            lines.insert(_last_label_idx + 1, "    (void)0;")
+
         # Undefine FPU macros
         if has_fpu:
             lines.append(f"    #undef fp_push")

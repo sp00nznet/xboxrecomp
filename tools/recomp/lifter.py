@@ -1045,14 +1045,14 @@ class Lifter:
             return ["/* cmp: bad operands */"]
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
-        return [f"/* cmp {lhs}, {rhs} - flags set for next jcc */"]
+        return [f"(void)0; /* cmp {lhs}, {rhs} - flags set for next jcc */"]
 
     def _lift_test(self, insn, ops):
         if len(ops) < 2:
             return ["/* test: bad operands */"]
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
-        return [f"/* test {lhs}, {rhs} - flags set for next jcc */"]
+        return [f"(void)0; /* test {lhs}, {rhs} - flags set for next jcc */"]
 
     # ── Control flow ──
 

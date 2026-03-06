@@ -99,8 +99,10 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 | 124 | `LONG KeQueryBasePriorityThread(PVOID Thread)` | Get thread base priority. |
 | 238 | `NTSTATUS NtYieldExecution(void)` | Yield CPU to another thread. |
 | 197 | `NTSTATUS NtDuplicateObject(HANDLE SourceHandle, PHANDLE TargetHandle, ULONG Options)` | Duplicate a kernel handle. |
+| 302 | `NTSTATUS NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount)` | Resume a suspended thread. Returns previous suspend count. |
+| 304 | `NTSTATUS NtSuspendThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount)` | Suspend a thread. Returns previous suspend count. |
 
-**Win32 replacement**: `CreateThread` (note Xbox uses `__stdcall` for thread procs), `ExitThread`, `Sleep`, `SetThreadPriority`, `SwitchToThread`.
+**Win32 replacement**: `CreateThread` (note Xbox uses `__stdcall` for thread procs), `ExitThread`, `Sleep`, `SetThreadPriority`, `SwitchToThread`, `ResumeThread`, `SuspendThread`.
 
 ## Synchronization
 
@@ -164,6 +166,7 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 | 126 | `LARGE_INTEGER KeQueryPerformanceCounter(void)` | High-resolution timer (same as QPC). |
 | 127 | `LARGE_INTEGER KeQueryPerformanceFrequency(void)` | Performance counter frequency. |
 | 128 | `VOID KeQuerySystemTime(PLARGE_INTEGER CurrentTime)` | Get current system time (100ns since 1601). |
+| 125 | `ULONGLONG KeQueryInterruptTime(void)` | Get monotonic time in 100ns units. On Xbox, reads kernel shared data page updated at timer interrupt. |
 | 151 | `VOID KeStallExecutionProcessor(ULONG MicroSeconds)` | Busy-wait for N microseconds. |
 | 160 | `KIRQL KfRaiseIrql(KIRQL NewIrql)` | Raise IRQL (interrupt priority). |
 | 161 | `VOID KfLowerIrql(KIRQL NewIrql)` | Lower IRQL. |
@@ -250,9 +253,11 @@ Then use `CreateFileW`, `ReadFile`, `WriteFile`, `CloseHandle`, etc. Key differe
 
 | Ord | Function | Description |
 |-----|----------|-------------|
-| 7 | `VOID DbgPrint(const char* Format, ...)` | Debug printf (debug builds only). |
+| 7 | `ULONG DbgPrint(const char* Format, ...)` | Debug printf (__cdecl, variadic). On real hardware, outputs to kernel debugger serial port. |
+| 5 | `BOOLEAN KdDebuggerNotPresent` | Data export: TRUE on retail (no debugger attached). Game code checks this to skip debug output. |
+| 8 | (unknown) | Unknown ordinal 8. Appears in some games' thunk tables. Stub as no-op. |
 
-**Win32 replacement**: `OutputDebugStringA` or `fprintf(stderr, ...)`.
+**Win32 replacement**: `DbgPrint` maps to `fprintf(stderr, ...)` or your logging system. Note __cdecl calling convention (caller cleans stack), unlike most kernel functions which use __stdcall. `KdDebuggerNotPresent` should be a static `BOOLEAN = TRUE`.
 
 ## Network (Xbox Live)
 

@@ -500,6 +500,60 @@ static inline NTSTATUS __stdcall kstub_ObReferenceObjectByHandle(
 /* Note: This needs special handling in the thunk table because it's
  * __cdecl (caller cleans stack) while most kernel functions are __stdcall.
  * For the recompiled code, the argument count is baked into the caller. */
+static inline unsigned long __cdecl kstub_DbgPrint(const char* Format, ...)
+{
+    va_list args;
+    char buf[512];
+    va_start(args, Format);
+    vsnprintf(buf, sizeof(buf), Format, args);
+    va_end(args);
+    KSTUB_LOG("DbgPrint: %s", buf);
+    return 0; /* STATUS_SUCCESS */
+}
+
+/* Ordinal 5: Exported data - KdDebuggerNotPresent (BOOLEAN)
+ * TRUE on retail, FALSE when kernel debugger is attached.
+ * Game code checks this to skip debug output. */
+/* static BOOLEAN kstub_KdDebuggerNotPresent = TRUE; */
+
+/* Ordinal 128: KeQueryInterruptTime
+ * Returns monotonic time in 100-nanosecond units.
+ * On Xbox, reads from kernel shared data page updated at each timer interrupt. */
+static inline unsigned long long __stdcall kstub_KeQueryInterruptTime(void)
+{
+    /* GetTickCount64() returns milliseconds; convert to 100ns units */
+    return (unsigned long long)GetTickCount64() * 10000ULL;
+}
+
+/* Ordinal 302: NtResumeThread
+ * Resumes a previously suspended thread. Returns previous suspend count. */
+static inline NTSTATUS __stdcall kstub_NtResumeThread(
+    HANDLE ThreadHandle, unsigned long* PreviousSuspendCount)
+{
+    DWORD prev = ResumeThread(ThreadHandle);
+    if (prev == (DWORD)-1) {
+        KSTUB_LOG("NtResumeThread: ResumeThread failed (error %u)", GetLastError());
+        return STATUS_UNSUCCESSFUL;
+    }
+    if (PreviousSuspendCount)
+        *PreviousSuspendCount = prev;
+    return STATUS_SUCCESS;
+}
+
+/* Ordinal 304: NtSuspendThread
+ * Suspends a thread. Returns previous suspend count. */
+static inline NTSTATUS __stdcall kstub_NtSuspendThread(
+    HANDLE ThreadHandle, unsigned long* PreviousSuspendCount)
+{
+    DWORD prev = SuspendThread(ThreadHandle);
+    if (prev == (DWORD)-1) {
+        KSTUB_LOG("NtSuspendThread: SuspendThread failed (error %u)", GetLastError());
+        return STATUS_UNSUCCESSFUL;
+    }
+    if (PreviousSuspendCount)
+        *PreviousSuspendCount = prev;
+    return STATUS_SUCCESS;
+}
 
 /* ================================================================
  * Port I/O Stubs (no-ops - no direct hardware access on PC)
