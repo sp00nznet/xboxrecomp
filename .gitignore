@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Tool output (regenerated per-game)
+tools/disasm/output/
+tools/func_id/output/
+tools/recomp/output/
+
+# Game files (user provides their own)
+game_files/
+*.xbe
+*.iso
+*.xiso
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Build
+build/
+bin/
+*.obj
+*.exe
