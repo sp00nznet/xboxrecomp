@@ -76,6 +76,71 @@ Emulators are great. Cxbx-Reloaded and xemu do incredible work. But static recom
     +-------------------+
 ```
 
+## Runtime Libraries
+
+Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (which does the same for Xbox 360 via Xenia), xboxrecomp provides link-time libraries extracted from [xemu](https://github.com/xemu-project/xemu) and purpose-built compatibility layers. Your recompiled game links against these — no emulator needed at runtime.
+
+| Library | Source | What It Does |
+|---------|--------|-------------|
+| **xbox_kernel** | Custom | Xbox kernel → Win32 (147 imports: memory, file I/O, threading, sync, crypto, HAL) |
+| **xbox_d3d8** | Custom | D3D8 → D3D11 graphics (Xbox D3D8 COM interfaces backed by Direct3D 11) |
+| **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
+| **xbox_apu** | xemu | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
+| **xbox_nv2a** | xemu | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH) |
+| **xbox_input** | Custom | Xbox gamepad → XInput |
+
+### Building the Libraries
+
+```bash
+cd xboxrecomp
+cmake -S . -B build
+cmake --build build --config Release
+```
+
+This produces 6 static libraries in `build/src/*/Release/`. Link your game project against `xboxrecomp` (umbrella target) or individual libraries.
+
+### Integration Pattern
+
+Your recompiled game provides two callback functions that the kernel bridge calls to resolve function addresses:
+
+```c
+typedef void (*recomp_func_t)(void);
+recomp_func_t recomp_lookup(uint32_t xbox_va);        // Auto-generated dispatch table
+recomp_func_t recomp_lookup_manual(uint32_t xbox_va);  // Hand-written overrides
+```
+
+The recompiler output (`tools/recomp`) generates these automatically. The xboxrecomp libraries handle everything else — memory layout, kernel calls, graphics, audio, and input.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│              Your Game (.exe)                     │
+│  ┌──────────┐ ┌──────────┐ ┌──────────────────┐ │
+│  │ recomp/  │ │ manual   │ │ game-specific    │ │
+│  │ gen/*.c  │ │ overrides│ │ loaders/formats  │ │
+│  └────┬─────┘ └────┬─────┘ └────────┬─────────┘ │
+│       │             │                │            │
+│       └──────┬──────┘────────────────┘            │
+│              │ recomp_lookup() / ICALL dispatch    │
+├──────────────┼────────────────────────────────────┤
+│              │   xboxrecomp libraries             │
+│  ┌───────────┴──────────┐                         │
+│  │    xbox_kernel        │  Memory layout, file    │
+│  │    (kernel_bridge.c)  │  I/O, threading, sync   │
+│  └───────────┬──────────┘                         │
+│              │                                     │
+│  ┌───────┐ ┌┴──────┐ ┌────────┐ ┌──────┐ ┌─────┐│
+│  │xbox_  │ │xbox_  │ │xbox_   │ │xbox_ │ │xbox_││
+│  │d3d8   │ │dsound │ │apu     │ │nv2a  │ │input││
+│  │D3D8→  │ │DSound→│ │MCPX APU│ │NV2A  │ │XPP→ ││
+│  │D3D11  │ │mixer  │ │(xemu)  │ │(xemu)│ │XInput│
+│  └───────┘ └───────┘ └────────┘ └──────┘ └─────┘│
+├──────────────────────────────────────────────────┤
+│  Windows 11: D3D11, XInput, waveOut, Win32 API   │
+└──────────────────────────────────────────────────┘
+```
+
 ## Quick Start
 
 ### Prerequisites
@@ -144,11 +209,20 @@ With Burnout 3 (the first game recompiled with this toolkit), the process from "
 ```
 xboxrecomp/
 ├── README.md                    # You are here
-├── tools/                       # The recompilation toolchain
+├── CMakeLists.txt               # Top-level build (builds all runtime libs)
+├── tools/                       # The recompilation toolchain (Python)
 │   ├── xbe_parser/              # XBE file format parser
 │   ├── disasm/                  # x86 disassembler + function detector
 │   ├── func_id/                 # Library function identifier
 │   └── recomp/                  # x86 -> C static recompiler
+├── src/                         # Runtime libraries (C, link-time)
+│   ├── kernel/                  # xbox_kernel - Xbox kernel → Win32
+│   ├── d3d/                     # xbox_d3d8   - D3D8 → D3D11 graphics
+│   ├── audio/                   # xbox_dsound - DirectSound compat
+│   ├── apu/                     # xbox_apu    - MCPX APU emulation (xemu)
+│   ├── nv2a/                    # xbox_nv2a   - NV2A GPU emulation (xemu)
+│   └── input/                   # xbox_input  - Gamepad → XInput
+├── include/xbox/                # Public umbrella header (xboxrecomp.h)
 ├── templates/                   # Starter templates for new projects
 │   └── runtime/                 # Runtime shim templates
 │       ├── recomp_types.h       # Register model + ICALL macros
@@ -163,6 +237,19 @@ xboxrecomp/
 ```
 
 ## Documentation
+
+### Start Here
+- **[Getting Started Guide](docs/GETTING_STARTED.md)** — End-to-end walkthrough from XBE to running game
+- **[Tools Reference](tools/README.md)** — Detailed usage for all 5 pipeline tools
+- **[Runtime Libraries](src/README.md)** — Architecture, build instructions, integration guide
+
+### Per-Module API Reference
+- [xbox_kernel](src/kernel/README.md) — Memory layout, file I/O, threading, sync, crypto (7,935 LOC)
+- [xbox_d3d8](src/d3d/README.md) — D3D8 interface, render states, textures, shaders (3,372 LOC)
+- [xbox_dsound](src/audio/README.md) — DirectSound buffers, 3D audio, mixbins (573 LOC)
+- [xbox_apu](src/apu/README.md) — MCPX APU voice processor, mixer, MMIO (3,918 LOC)
+- [xbox_nv2a](src/nv2a/README.md) — NV2A GPU registers, push buffer, PGRAPH (3,761 LOC)
+- [xbox_input](src/input/README.md) — Gamepad state, vibration, button mapping (212 LOC)
 
 ### Pipeline Guides
 - [Extracting and Parsing XBE Files](docs/pipeline/01-xbe-parsing.md)
@@ -277,10 +364,11 @@ capstone        # x86 disassembly (pip install capstone)
 
 That's it. No IDA, no Ghidra, no proprietary tools. Standard library + Capstone.
 
-The runtime (C/C++) uses:
-- MSVC (Visual Studio 2022)
-- Windows SDK (for D3D11, XInput, XAudio2)
+The runtime libraries (C) use:
+- MSVC (Visual Studio 2022) or MinGW-w64
+- Windows SDK (D3D11, DXGI, XInput, waveOut)
 - CMake 3.20+
+- No external dependencies — all hardware emulation code is self-contained
 
 ## FAQ
 
@@ -315,5 +403,6 @@ Built with [Claude Code](https://claude.ai) (Anthropic) — proving that AI-assi
 - [Xbox Architecture](https://www.copetti.org/writings/consoles/xbox/) — Copetti's deep dive
 - [N64Recomp](https://github.com/N64Recomp/N64Recomp) — Static recomp for N64 (MIPS→C)
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) — Static recomp for Xbox 360 (PPC→C)
+- [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) — Xbox 360 recomp runtime (Xenia as link-time library)
 - [Cxbx-Reloaded](https://github.com/Cxbx-Reloaded/Cxbx-Reloaded) — Xbox emulator (dynamic recomp)
 - [xemu](https://github.com/xemu-project/xemu) — Xbox emulator (LLE)
