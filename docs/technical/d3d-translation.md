@@ -455,3 +455,94 @@ void d3d8_PresentFrame(void) {
 ```
 
 This is called from the recompiled game's rendering loop, replacing the original Xbox D3D8 Present call.
+
+## D3D8LTCG Library Internals
+
+Many Xbox games link the D3D8 library with Link-Time Code Generation (D3D8LTCG), which
+inlines and optimizes the D3D8 functions directly into the game binary. This creates
+unique challenges for static recompilation.
+
+### Device Context is Static
+
+The D3D8LTCG device context is a **static object** within the D3D library section — it
+is NOT heap-allocated. For example, in a game with the D3D section at 0x0034C2E0, the
+device context may live at 0x0035D6A0 (offset ~0x1400 into the section).
+
+The global pointer `MEM32(0x35FB48)` points to this static address. Key fields:
+
+| Offset | Type | Description |
+|--------|------|-------------|
+| +0x000 | uint32 | Push buffer write cursor (GPU physical address) |
+| +0x004 | uint32 | Push buffer end pointer |
+| +0x008 | uint32 | Push buffer base |
+| +0x00C | uint32 | Push buffer size |
+| +0x784 | ptr | Render target surface object |
+| +0x794 | ptr | Depth/stencil surface object |
+| +0x7A8 | ptr | Back buffer surface object |
+| +0x954 | uint32 | Max viewport width |
+| +0x958 | uint32 | Max viewport height |
+| +0xCA0 | 64B | Render state block (matrices/transforms) |
+| +0xEE0 | uint32 | Viewport width |
+| +0xEE4 | uint32 | Viewport height |
+| +0xEF8 | float | Viewport half-pixel offset X |
+| +0xEFC | float | Viewport half-pixel offset Y |
+| +0x1A04 | ptr | Active render target surface |
+| +0x1A08 | ptr | Active depth surface |
+
+**Initialization approach**: Capture the device context at runtime from xemu (16KB) and
+load it at boot to provide the D3D8LTCG gen code with proper initialized state.
+
+### Multi-Entry Render State Flush
+
+D3D8LTCG has a single massive function (~80KB) for flushing accumulated render state
+changes to the NV2A push buffer. This function has **multiple entry points** depending
+on which dirty flags are set:
+
+```
+0x0034D410 — Full entry (top of function)
+0x0034D530 — Standard entry (skips some setup)
+0x0034F5B0 — Partial flush (skips early state)
+0x003558A0 — Minimal flush (push buffer management only)
+```
+
+All entry points share the same end address (e.g., 0x00360A54). The recompiler generates
+each as a separate function with `fpo_leaf` calling convention (inherits caller's frame).
+
+**For static recompilation**, these mid-entry points should be **stubbed** to return the
+current push buffer position. The main entry point (0x0034D530) can be overridden to
+capture push buffer output:
+
+```c
+void sub_0034F5B0(void) {
+    eax = MEM32(0x35D6A0);  /* current write pointer */
+    esp += 4; return;
+}
+void sub_003558A0(void) {
+    eax = MEM32(0x35D6A0);
+    esp += 4; return;
+}
+void sub_0034D410(void) {
+    eax = MEM32(0x35D6A0);
+    esp += 12; return;  /* ret 8 */
+}
+```
+
+### Capturing Device Context from xemu
+
+To bootstrap the D3D device context for the recompiled game, capture a snapshot from xemu:
+
+1. Launch xemu with GDB stub: `xemu.exe -s`
+2. Boot the game to the desired state (e.g., main menu)
+3. Halt CPU, read `MEM32(0x35FB48)` for device address
+4. Dump 16KB from that address
+5. Load snapshot into Xbox memory at boot, fix up PB/surface pointers
+
+```python
+dev_ptr = read32(client, 0x35FB48)
+dev_data = client.read_memory(dev_ptr, 0x4000)
+# Save as C header with embedded byte array
+```
+
+Note: The snapshot contains heap pointers from the xemu session that must be fixed up
+(push buffer addresses, surface object pointers, etc.). Scalar values like viewport
+dimensions, state flags, and matrices can be used directly.
