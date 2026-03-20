@@ -20,7 +20,7 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 | PGRAPH → D3D11 method translator | N/A | From burnout3 | ADDED | High |
 | Push buffer replay | N/A | From burnout3 | ADDED | Medium |
 | **Register combiners (pixel shaders)** | Full (8 stages, RGB/alpha, final combiner) | Full (8 stages, HLSL generation, 128-entry cache) | DONE | - |
-| **Vertex shader microcode translation** | Full (MAC+ILU ops, 192 constants, 12 temps) | **NONE** (FVF only) | MISSING | **CRITICAL** |
+| **Vertex shader microcode translation** | Full (MAC+ILU ops, 192 constants, 12 temps) | Full (d3d8_vsh.c: parser, HLSL gen, 64-entry cache) | DONE | - |
 | **Texture unswizzling (Z-order/Morton)** | Full | Full | ADDED | High |
 | Texture format coverage (66 formats) | Full | 17 formats + 3 new | PARTIAL | High |
 | Palettized textures (P8 with palette lookup) | Full | Format mapped, no palette | PARTIAL | Medium |
@@ -45,7 +45,7 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 | Quad list support | DONE | Converted to tri list |
 | Viewport/scissor | DONE | |
 | **Xbox pixel shader (register combiners)** | DONE | d3d8_combiners.c: 8 stages + final, HLSL cache |
-| **Xbox vertex shader (NV2A microcode)** | MISSING | Need microcode→HLSL translation |
+| **Xbox vertex shader (NV2A microcode)** | DONE | d3d8_vsh.c: 14 MAC + 8 ILU ops, 192 constants, 64-entry cache |
 | Multi-texture (beyond stage 0) | PARTIAL | States tracked, shader limited |
 | Bump mapping / normal mapping | MISSING | Needs combiners |
 | Environment mapping | MISSING | Needs combiners + tex coord gen |
@@ -101,7 +101,7 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 
 1. ~~**Register combiner translation**~~ - DONE. d3d8_combiners.c/h: 1,415 lines. Full 8-stage combiner + final combiner, runtime HLSL generation with 128-entry compiled shader cache.
 
-2. **Vertex shader microcode translation** - Port xemu's `vsh-prog.c` vertex shader microcode translator. Blood Wake's water effects and Wreckless's visual effects likely depend on this.
+2. ~~**Vertex shader microcode translation**~~ - DONE. d3d8_vsh.c/h: 1,868 lines. 128-bit instruction parser, HLSL generator for 14 MAC + 8 ILU ops, 64-entry compiled shader cache, 192-constant buffer, input layout management.
 
 3. **WMA audio decoder** - Blood Wake has a WMADEC section. Need either a software WMA decoder or integration with Windows Media Foundation.
 

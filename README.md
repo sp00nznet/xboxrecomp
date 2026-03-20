@@ -13,6 +13,17 @@
 
 > Turn any Xbox game binary into a native Windows executable. No emulation. No interpreter. Just raw, recompiled C.
 
+### Recent Changes
+
+- **NV2A Register Combiner Pixel Shaders** — Full 8-stage combiner + final combiner translated to HLSL at runtime with 128-entry shader cache. Enables multi-texturing, environment mapping, bump mapping, and all Xbox rendering techniques.
+- **NV2A Programmable Vertex Shaders** — 128-bit microcode parser and HLSL generator covering all 14 MAC + 8 ILU operations, 192 constant registers, and relative addressing. 64-entry compiled shader cache.
+- **Texture Unswizzling** — Xbox Z-order (Morton code) swizzled textures automatically converted to linear D3D11 layout on upload. Optimized masked-increment algorithm from xemu.
+- **NV2A PGRAPH→D3D11 Translator** — Push buffer method interception and D3D11 rendering (upstreamed from Burnout 3).
+- **EEPROM / AV Pack / SMBus** — Games can query region, language, video standard, AV pack type (HDTV/component), and hardware info.
+- **New Game Template** — `templates/new-game/` provides a copy-paste project scaffold for starting any new game recomp.
+- **CONTRIBUTING.md** — Developer onboarding guide for the growing contributor community.
+- **Three games in progress** — Burnout 3 (rendering), Wreckless (debugging), Blood Wake (analysis complete, scaffolded).
+
 ---
 
 ## What Is This?
@@ -82,11 +93,11 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 
 | Library | Source | What It Does |
 |---------|--------|-------------|
-| **xbox_kernel** | Custom | Xbox kernel → Win32 (147 imports: memory, file I/O, threading, sync, crypto, HAL) |
-| **xbox_d3d8** | Custom | D3D8 → D3D11 graphics (Xbox D3D8 COM interfaces backed by Direct3D 11) |
+| **xbox_kernel** | Custom | Xbox kernel → Win32 (147+ imports: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
+| **xbox_d3d8** | Custom | D3D8 → D3D11 graphics with **NV2A register combiner** pixel shaders (8 stages + final combiner → runtime HLSL), **programmable vertex shaders** (NV2A microcode → HLSL), texture unswizzling, 20+ format conversions |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
 | **xbox_apu** | xemu | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
-| **xbox_nv2a** | xemu | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH) |
+| **xbox_nv2a** | xemu+Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
 | **xbox_input** | Custom | Xbox gamepad → XInput |
 
 ### Building the Libraries
@@ -244,11 +255,11 @@ xboxrecomp/
 - **[Runtime Libraries](src/README.md)** — Architecture, build instructions, integration guide
 
 ### Per-Module API Reference
-- [xbox_kernel](src/kernel/README.md) — Memory layout, file I/O, threading, sync, crypto (7,935 LOC)
-- [xbox_d3d8](src/d3d/README.md) — D3D8 interface, render states, textures, shaders (3,372 LOC)
+- [xbox_kernel](src/kernel/README.md) — Memory layout, file I/O, threading, sync, crypto, EEPROM, SMBus (8,298 LOC)
+- [xbox_d3d8](src/d3d/README.md) — D3D8 interface, register combiners, vertex shaders, texture unswizzle (7,018 LOC)
 - [xbox_dsound](src/audio/README.md) — DirectSound buffers, 3D audio, mixbins (573 LOC)
 - [xbox_apu](src/apu/README.md) — MCPX APU voice processor, mixer, MMIO (3,918 LOC)
-- [xbox_nv2a](src/nv2a/README.md) — NV2A GPU registers, push buffer, PGRAPH (3,761 LOC)
+- [xbox_nv2a](src/nv2a/README.md) — NV2A GPU registers, push buffer, PGRAPH→D3D11 (4,778 LOC)
 - [xbox_input](src/input/README.md) — Gamepad state, vibration, button mapping (212 LOC)
 
 ### Pipeline Guides
@@ -267,6 +278,7 @@ xboxrecomp/
 - [Xbox Kernel Replacement](docs/technical/kernel-replacement.md) — Mapping 147 kernel imports to Win32
 - [SEH and Exception Handling](docs/technical/seh-handling.md) — Structured exception handling in recompiled code
 - [Lessons Learned](docs/technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
+- [Gap Analysis vs xemu](docs/technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
 
 ### Xbox Formats
 - [XBE File Format](docs/formats/xbe.md) — Xbox executable format reference
@@ -324,6 +336,35 @@ The single hardest challenge. When the game does `call [eax+0x10]` (a virtual me
 
 Most ICALLs resolve through the auto-generated dispatch table (binary search over all function addresses). The rest are either kernel calls (0xFE000000+ range) or garbage pointers from corrupted vtables that need per-function guards.
 
+### NV2A Register Combiners → HLSL
+
+Xbox games don't use traditional pixel shaders — they configure the NV2A's 8-stage register combiner pipeline. Each stage performs independent RGB and alpha math (multiply, dot product, MUX) on a register file of textures, vertex colors, and constants. The final combiner blends everything together.
+
+We translate this to HLSL at runtime:
+
+```c
+// Game configures 3 combiner stages...
+SetPixelShader(0x00000103);  // 3 stages, tex0=2D, tex1=2D
+
+// At draw time, we generate and cache an HLSL pixel shader:
+//   Stage 0: r0.rgb = tex0 * diffuse
+//   Stage 1: r0.rgb = r0 * tex1 (environment map modulate)
+//   Stage 2: r0.a   = tex0.a * diffuse.a
+//   Final:   output = r0
+```
+
+The 128-entry shader cache means each unique combiner configuration is compiled once and reused. This handles multi-texturing, bump mapping, environment mapping, water effects, and every other Xbox rendering technique.
+
+### NV2A Vertex Shader Microcode → HLSL
+
+When games use programmable vertex shaders (water displacement, skeletal animation, custom lighting), they upload NV2A microcode — 128-bit instructions with paired MAC+ILU operations. We parse and translate to HLSL:
+
+- **14 MAC ops**: MOV, MUL, ADD, MAD, DP3, DP4, DPH, DST, MIN, MAX, SLT, SGE, ARL
+- **8 ILU ops**: MOV, RCP, RCC, RSQ, EXP, LOG, LIT
+- **192 constant registers**, 12 temporaries, 16 vertex inputs
+- Relative addressing via the address register (A0)
+- 64-entry compiled shader cache
+
 ## Games That Work Well As Targets
 
 Based on our experience with Burnout 3, the best candidates for Xbox static recomp share these traits:
@@ -341,9 +382,9 @@ See [docs/technical/candidate-games.md](docs/technical/candidate-games.md) for a
 
 ## Projects Using This Toolkit
 
-- **[Burnout 3: Takedown](https://github.com/sp00nznet/burnout3)** — The first game recompiled with this toolkit. 22,097 functions lifted, game boots and renders textured 3D tracks from original assets.
-- **[Wreckless: The Yakuza Missions](https://github.com/sp00nznet/wreckless)** — Xbox launch title (2002). Custom engine, 3,407 functions, boots through CRT init into game main.
-- **[Blood Wake](https://github.com/sp00nznet/bloodwake)** — First-party Microsoft naval combat (2001). Stormfront Studios custom engine. Currently in early analysis phase.
+- **[Burnout 3: Takedown](https://github.com/sp00nznet/burnout3)** — The reference implementation. 22,097 functions lifted, full main menu rendering at 60fps, 37 playable tracks with textures, 67 vehicle models, AWD audio playback.
+- **[Wreckless: The Yakuza Missions](https://github.com/sp00nznet/wreckless)** — Xbox launch title (2002). Custom engine, 3,407 functions, boots through CRT init into game main. Debugging early gameplay crash.
+- **[Blood Wake](https://github.com/sp00nznet/bloodwake)** — First-party Microsoft naval combat (2001). Stormfront Studios custom engine. 4,608 functions, 367K lines of C generated (99.1% success). Project scaffolded, working toward first build.
 
 ## How You Can Help
 

@@ -286,6 +286,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
     LONG ref = InterlockedDecrement(&g_device_state.ref_count);
     if (ref <= 0) {
         /* Cleanup subsystems first */
+        d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
         d3d8_states_shutdown();
         d3d8_shaders_shutdown();
@@ -599,7 +600,9 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
     if (vertex_count == 0) return E_INVALIDARG;
 
     /* Prepare pipeline: shaders, input layout, constant buffers, render states */
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
+    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
+        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -618,7 +621,9 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     topology = map_primitive_type(PrimitiveType, PrimitiveCount, &index_count);
     if (index_count == 0) return E_INVALIDARG;
 
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
+    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
+        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -660,7 +665,9 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
     ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
         0, 1, &tmp_vb, &VertexStreamZeroStride, &offset);
 
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
+    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
+        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -726,7 +733,9 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
     ID3D11DeviceContext_IASetIndexBuffer(g_device_state.d3d11_context,
         tmp_ib, ib_fmt, 0);
 
-    d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
+    if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
+        d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
     d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
@@ -862,6 +871,13 @@ static HRESULT __stdcall dev_LightEnable(IDirect3DDevice8 *self, DWORD Index, BO
     return S_OK;
 }
 
+static HRESULT __stdcall dev_CreateVertexShader(IDirect3DDevice8 *self, const DWORD *pDeclaration, const DWORD *pFunction, DWORD *pHandle, DWORD Usage)
+{
+    (void)self; (void)pDeclaration; (void)Usage;
+    if (!pHandle) return E_INVALIDARG;
+    return d3d8_vsh_create_shader(pFunction, pHandle);
+}
+
 static HRESULT __stdcall dev_SetVertexShader(IDirect3DDevice8 *self, DWORD Handle)
 {
     (void)self;
@@ -878,8 +894,8 @@ static HRESULT __stdcall dev_GetVertexShader(IDirect3DDevice8 *self, DWORD *pHan
 
 static HRESULT __stdcall dev_SetVertexShaderConstant(IDirect3DDevice8 *self, INT Register, const void *pConstantData, DWORD ConstantCount)
 {
-    (void)self; (void)Register; (void)pConstantData; (void)ConstantCount;
-    /* TODO: upload to D3D11 constant buffer */
+    (void)self;
+    d3d8_vsh_set_constant(Register, pConstantData, ConstantCount);
     return S_OK;
 }
 
@@ -1096,6 +1112,12 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: Combiner init failed: 0x%08lX\n", hr);
         /* Non-fatal: fall back to fixed-function pixel shaders */
+    }
+
+    hr = d3d8_vsh_init();
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: VSH init failed: 0x%08lX\n", hr);
+        /* Non-fatal: fall back to FVF vertex shaders */
     }
 
     g_device.lpVtbl = &g_device_vtbl;
