@@ -342,6 +342,8 @@ See [docs/technical/candidate-games.md](docs/technical/candidate-games.md) for a
 ## Projects Using This Toolkit
 
 - **[Burnout 3: Takedown](https://github.com/sp00nznet/burnout3)** — The first game recompiled with this toolkit. 22,097 functions lifted, game boots and renders textured 3D tracks from original assets.
+- **[Wreckless: The Yakuza Missions](https://github.com/sp00nznet/wreckless)** — Xbox launch title (2002). Custom engine, 3,407 functions, boots through CRT init into game main.
+- **[Blood Wake](https://github.com/sp00nznet/bloodwake)** — First-party Microsoft naval combat (2001). Stormfront Studios custom engine. Currently in early analysis phase.
 
 ## How You Can Help
 
