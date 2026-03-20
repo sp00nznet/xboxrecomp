@@ -100,14 +100,37 @@ static inline uint32_t swizzle_offset(uint32_t x, uint32_t y,
 }
 
 /**
+ * Generate interleaved bit masks for X and Y dimensions.
+ * Dimensions must be powers of 2.
+ * Based on xemu's generate_swizzle_masks algorithm.
+ */
+static inline void xbox_swizzle_masks(uint32_t width, uint32_t height,
+                                       uint32_t *mask_x, uint32_t *mask_y)
+{
+    uint32_t x = 0, y = 0;
+    uint32_t bit = 1, mask_bit = 1;
+    while (bit < width || bit < height) {
+        if (bit < width)  { x |= mask_bit; mask_bit <<= 1; }
+        if (bit < height) { y |= mask_bit; mask_bit <<= 1; }
+        bit <<= 1;
+    }
+    *mask_x = x;
+    *mask_y = y;
+}
+
+/**
  * Unswizzle a texture from Xbox swizzled (Z-order/Morton) layout
  * to linear row-major layout suitable for D3D11.
  *
- * @param dst       Destination buffer (linear layout), must be at least
- *                  width * height * bytes_per_pixel bytes.
+ * Uses the masked-increment trick from xemu (Fabian Giesen):
+ *   off_x = (off_x - mask_x) & mask_x
+ * This increments through only the bits belonging to X's mask,
+ * avoiding per-pixel swizzle_offset() recomputation.
+ *
+ * @param dst       Destination buffer (linear layout).
  * @param src       Source buffer (swizzled layout).
- * @param width     Texture width in pixels.
- * @param height    Texture height in pixels.
+ * @param width     Texture width in pixels (must be power of 2).
+ * @param height    Texture height in pixels (must be power of 2).
  * @param bpp       Bytes per pixel (1, 2, or 4).
  */
 static inline void xbox_unswizzle_rect(void *dst, const void *src,
@@ -116,27 +139,35 @@ static inline void xbox_unswizzle_rect(void *dst, const void *src,
 {
     const uint8_t *s = (const uint8_t *)src;
     uint8_t *d = (uint8_t *)dst;
+    uint32_t mask_x, mask_y;
 
+    xbox_swizzle_masks(width, height, &mask_x, &mask_y);
+
+    uint32_t off_y = 0;
     for (uint32_t y = 0; y < height; y++) {
+        uint32_t off_x = 0;
+        uint8_t *dst_row = d + y * width * bpp;
         for (uint32_t x = 0; x < width; x++) {
-            uint32_t swiz_off = swizzle_offset(x, y, width, height) * bpp;
-            uint32_t lin_off = (y * width + x) * bpp;
+            uint32_t swiz_off = (off_y + off_x) * bpp;
 
             switch (bpp) {
             case 1:
-                d[lin_off] = s[swiz_off];
+                dst_row[x] = s[swiz_off];
                 break;
             case 2:
-                *(uint16_t *)(d + lin_off) = *(const uint16_t *)(s + swiz_off);
+                ((uint16_t *)dst_row)[x] = *(const uint16_t *)(s + swiz_off);
                 break;
             case 4:
-                *(uint32_t *)(d + lin_off) = *(const uint32_t *)(s + swiz_off);
+                ((uint32_t *)dst_row)[x] = *(const uint32_t *)(s + swiz_off);
                 break;
             default:
-                memcpy(d + lin_off, s + swiz_off, bpp);
+                memcpy(dst_row + x * bpp, s + swiz_off, bpp);
                 break;
             }
+
+            off_x = (off_x - mask_x) & mask_x;  /* masked increment */
         }
+        off_y = (off_y - mask_y) & mask_y;  /* masked increment */
     }
 }
 
@@ -150,27 +181,35 @@ static inline void xbox_swizzle_rect(void *dst, const void *src,
 {
     const uint8_t *s = (const uint8_t *)src;
     uint8_t *d = (uint8_t *)dst;
+    uint32_t mask_x, mask_y;
 
+    xbox_swizzle_masks(width, height, &mask_x, &mask_y);
+
+    uint32_t off_y = 0;
     for (uint32_t y = 0; y < height; y++) {
+        uint32_t off_x = 0;
+        const uint8_t *src_row = s + y * width * bpp;
         for (uint32_t x = 0; x < width; x++) {
-            uint32_t swiz_off = swizzle_offset(x, y, width, height) * bpp;
-            uint32_t lin_off = (y * width + x) * bpp;
+            uint32_t swiz_off = (off_y + off_x) * bpp;
 
             switch (bpp) {
             case 1:
-                d[swiz_off] = s[lin_off];
+                d[swiz_off] = src_row[x];
                 break;
             case 2:
-                *(uint16_t *)(d + swiz_off) = *(const uint16_t *)(s + lin_off);
+                *(uint16_t *)(d + swiz_off) = ((const uint16_t *)src_row)[x];
                 break;
             case 4:
-                *(uint32_t *)(d + swiz_off) = *(const uint32_t *)(s + lin_off);
+                *(uint32_t *)(d + swiz_off) = ((const uint32_t *)src_row)[x];
                 break;
             default:
-                memcpy(d + swiz_off, s + lin_off, bpp);
+                memcpy(d + swiz_off, src_row + x * bpp, bpp);
                 break;
             }
+
+            off_x = (off_x - mask_x) & mask_x;
         }
+        off_y = (off_y - mask_y) & mask_y;
     }
 }
 
