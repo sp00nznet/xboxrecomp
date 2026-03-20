@@ -13,45 +13,25 @@
  */
 
 #include "xbox_memory_layout.h"
+#include "kernel.h"
 #include <stdio.h>
 #include <string.h>
 
-/* Section info from XBE analysis */
+/* XBE header field offsets (per xboxdevwiki.net/Xbe) */
+#define XBE_MAGIC_OFFSET        0x0000
+#define XBE_BASE_ADDR_OFFSET    0x0104
+#define XBE_HEADER_SIZE_OFFSET  0x0108
+#define XBE_SECTION_COUNT_OFFSET 0x011C
+#define XBE_SECTION_HEADERS_OFFSET 0x0120
 
-/* .text raw file offset (XBE stores this at section header +0x0C) */
-#define TEXT_RAW_OFFSET         0x00001000
-
-/* .rdata raw file offset */
-#define RDATA_RAW_OFFSET        0x0035C000
-
-/* .data raw file offset */
-#define DATA_RAW_OFFSET         0x003A3000
-
-/* Additional XBE sections to map.
- * All sections need to be at their original Xbox VAs because the RW engine's
- * memory walker processes ALL of physical RAM as data structures, including
- * code sections (the walker doesn't distinguish code from data). */
-static const struct {
-    const char *name;
-    DWORD va;
-    DWORD size;
-    DWORD raw_offset;
-} g_extra_sections[] = {
-    /* XDK library code sections (between .text and .rdata) */
-    { "XMV",     0x002CC200, 163108, 0x002BD000 },
-    { "DSOUND",  0x002F3F40,  52052, 0x002E5000 },
-    { "WMADEC",  0x00300D00, 105828, 0x002F2000 },
-    { "XONLINE", 0x0031AA80, 124764, 0x0030C000 },
-    { "XNET",    0x003391E0,  78056, 0x0032B000 },
-    { "D3D",     0x0034C2E0,  69284, 0x0033F000 },
-    { "XGRPH",   0x00360A60,   8300, 0x00350000 },
-    { "XPP",     0x00362AE0,  36052, 0x00353000 },
-    /* Data sections past .data */
-    { "DOLBY",   0x0076B940,  29036, 0x0040C000 },
-    { "XON_RD",  0x00772AC0,   5416, 0x00414000 },
-    { ".data1",  0x00774000,    176, 0x00416000 },
-};
-#define NUM_EXTRA_SECTIONS (sizeof(g_extra_sections) / sizeof(g_extra_sections[0]))
+/* XBE section header layout (56 bytes each) */
+#define SECTHDR_FLAGS       0x00
+#define SECTHDR_VA          0x04
+#define SECTHDR_VSIZE       0x08
+#define SECTHDR_RAW_OFFSET  0x0C
+#define SECTHDR_RAW_SIZE    0x10
+#define SECTHDR_NAME_ADDR   0x14
+#define SECTHDR_SIZE        56
 
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
@@ -102,8 +82,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * This includes low memory (KPCR at 0x0-0xFF) which game code reads
      * from, the XBE sections, and the simulated stack.
      */
-    DWORD map_end = XBOX_HEAP_BASE + XBOX_HEAP_SIZE + XBOX_GUARD_SIZE;  /* Include stack + heap + guard */
-    g_memory_size = map_end - XBOX_MAP_START;
+    /* Map the full 64MB Xbox address space (covers all sections + stack + heap) */
+    g_memory_size = XBOX_TOTAL_RAM;
 
     /*
      * Create a file mapping backed by the page file.
@@ -213,58 +193,100 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
-     * Copy .text section from XBE to its original Xbox VA.
+     * Dynamically load ALL XBE sections by parsing the section headers.
      *
-     * Even though the recompiled code runs natively (not from the .text
-     * section), the RW engine's memory walker processes ALL physical RAM
-     * as data structures, including the code pages. On Xbox, addresses
-     * past 64MB wrap back to lower memory via the RAM mirror. When the
-     * walker crosses 64MB and reads from mirrored .text addresses, it
-     * expects actual code bytes (not zeros). Without this, the walker's
-     * internal data structures are corrupted by zero-filled gaps.
+     * This replaces the old approach of hardcoding section addresses for
+     * a specific game (Burnout 3). By reading the section table from the
+     * XBE header, any game's sections are loaded automatically.
+     *
+     * Every section is copied to its original Xbox VA:
+     * - .text: needed because memory walkers may scan code pages
+     * - .rdata: constants, vtables, kernel thunk table
+     * - .data: global variables (initialized portion from XBE, BSS zeroed)
+     * - XDK library sections (D3D, DSOUND, WMADEC, XPP, etc.)
+     * - DOLBY, BINK, XTIMAGE, etc.
      */
-    if (TEXT_RAW_OFFSET + XBOX_TEXT_SIZE <= xbe_size) {
-        memcpy(XBOX_VA(XBOX_TEXT_VA), xbe + TEXT_RAW_OFFSET, XBOX_TEXT_SIZE);
-        fprintf(stderr, "  .text: %u bytes at %p (Xbox VA 0x%08X) [for memory walker]\n",
-                XBOX_TEXT_SIZE, XBOX_VA(XBOX_TEXT_VA), XBOX_TEXT_VA);
-    } else {
-        fprintf(stderr, "  WARNING: .text raw data out of bounds\n");
+    {
+        DWORD base_addr = *(const DWORD *)(xbe + XBE_BASE_ADDR_OFFSET);
+        DWORD num_sections = *(const DWORD *)(xbe + XBE_SECTION_COUNT_OFFSET);
+        DWORD sect_headers_va = *(const DWORD *)(xbe + XBE_SECTION_HEADERS_OFFSET);
+        DWORD sect_headers_off = sect_headers_va - base_addr;
+        int sections_loaded = 0;
+        size_t total_bytes = 0;
+
+        if (num_sections > 64) num_sections = 64;  /* sanity cap */
+
+        fprintf(stderr, "  XBE sections: %u (headers at file offset 0x%08X)\n",
+                num_sections, sect_headers_off);
+
+        for (DWORD si = 0; si < num_sections; si++) {
+            if (sect_headers_off + (si + 1) * SECTHDR_SIZE > xbe_size) break;
+
+            const uint8_t *sh = xbe + sect_headers_off + si * SECTHDR_SIZE;
+            DWORD sec_va       = *(const DWORD *)(sh + SECTHDR_VA);
+            DWORD sec_vsize    = *(const DWORD *)(sh + SECTHDR_VSIZE);
+            DWORD sec_raw_off  = *(const DWORD *)(sh + SECTHDR_RAW_OFFSET);
+            DWORD sec_raw_size = *(const DWORD *)(sh + SECTHDR_RAW_SIZE);
+            DWORD sec_name_va  = *(const DWORD *)(sh + SECTHDR_NAME_ADDR);
+
+            /* Read section name from XBE header */
+            const char *sec_name = "?";
+            DWORD name_off = sec_name_va - base_addr;
+            if (name_off < xbe_size && name_off + 8 <= xbe_size)
+                sec_name = (const char *)(xbe + name_off);
+
+            /* Validate: section must fit within our 64MB mapped region */
+            if (sec_va < XBOX_BASE_ADDRESS || sec_va + sec_vsize > XBOX_TOTAL_RAM)
+                continue;
+
+            /* Determine copy size (raw_size may exceed vsize due to alignment) */
+            DWORD copy_size = (sec_raw_size < sec_vsize) ? sec_raw_size : sec_vsize;
+
+            /* Zero the full virtual size first (handles BSS) */
+            memset(XBOX_VA(sec_va), 0, sec_vsize);
+
+            /* Copy initialized data from XBE */
+            if (copy_size > 0 && sec_raw_off + copy_size <= xbe_size) {
+                memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
+            }
+
+            sections_loaded++;
+            total_bytes += copy_size;
+
+            fprintf(stderr, "  [%2u] %-12s VA=0x%08X vsize=%-8u raw=0x%08X rsize=%-8u%s\n",
+                    si, sec_name, sec_va, sec_vsize, sec_raw_off, sec_raw_size,
+                    (sec_raw_size < sec_vsize) ? " (BSS)" : "");
+        }
+
+        fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
+                sections_loaded, num_sections, total_bytes);
     }
 
     /*
-     * Copy .rdata section from XBE.
+     * Parse the kernel thunk table address from the XBE header.
+     * The XBE stores KernelImageThunkAddress at offset 0x0158,
+     * XOR-encrypted with 0x5B6D40B6 for retail builds.
+     * We decrypt it and tell the kernel bridge where to find thunks.
      */
-    if (RDATA_RAW_OFFSET + XBOX_RDATA_SIZE <= xbe_size) {
-        memcpy(XBOX_VA(XBOX_RDATA_VA), xbe + RDATA_RAW_OFFSET, XBOX_RDATA_SIZE);
-        fprintf(stderr, "  .rdata: %u bytes at %p (Xbox VA 0x%08X)\n",
-                XBOX_RDATA_SIZE, XBOX_VA(XBOX_RDATA_VA), XBOX_RDATA_VA);
-    } else {
-        fprintf(stderr, "  WARNING: .rdata raw data out of bounds\n");
-    }
+    if (xbe_size >= 0x015C) {
+        uint32_t thunk_raw = *(const uint32_t *)(xbe + 0x0158);
+        uint32_t thunk_va = thunk_raw ^ 0x5B6D40B6;  /* retail XOR key */
 
-    /*
-     * Copy initialized .data section from XBE.
-     * BSS (the rest of .data) is already zeroed by VirtualAlloc.
-     */
-    if (DATA_RAW_OFFSET + XBOX_DATA_INIT_SIZE <= xbe_size) {
-        memcpy(XBOX_VA(XBOX_DATA_VA), xbe + DATA_RAW_OFFSET, XBOX_DATA_INIT_SIZE);
-        fprintf(stderr, "  .data: %u bytes initialized, %u bytes BSS at %p (Xbox VA 0x%08X)\n",
-                XBOX_DATA_INIT_SIZE, XBOX_DATA_SIZE - XBOX_DATA_INIT_SIZE,
-                XBOX_VA(XBOX_DATA_VA), XBOX_DATA_VA);
-    } else {
-        fprintf(stderr, "  WARNING: .data raw data out of bounds\n");
-    }
-
-    /*
-     * Copy extra sections (DOLBY, XON_RD, .data1).
-     */
-    for (size_t i = 0; i < NUM_EXTRA_SECTIONS; i++) {
-        if (g_extra_sections[i].raw_offset + g_extra_sections[i].size <= xbe_size) {
-            memcpy(XBOX_VA(g_extra_sections[i].va),
-                   xbe + g_extra_sections[i].raw_offset, g_extra_sections[i].size);
-            fprintf(stderr, "  %s: %u bytes at %p (Xbox VA 0x%08X)\n",
-                    g_extra_sections[i].name, g_extra_sections[i].size,
-                    XBOX_VA(g_extra_sections[i].va), g_extra_sections[i].va);
+        /* Validate: thunk VA should be within our mapped region */
+        if (thunk_va >= XBOX_BASE_ADDRESS && thunk_va < XBOX_TOTAL_RAM) {
+            /* Count thunk entries by scanning until we hit 0 */
+            uint32_t thunk_count = 0;
+            for (uint32_t t = 0; t < 366; t++) {
+                uint32_t entry = *(volatile uint32_t *)((uintptr_t)(thunk_va + t * 4) + g_memory_offset);
+                if (entry == 0) break;
+                thunk_count++;
+            }
+            xbox_kernel_set_thunk_address(thunk_va, thunk_count);
+            fprintf(stderr, "  Kernel thunks: %u entries at Xbox VA 0x%08X\n",
+                    thunk_count, thunk_va);
+        } else {
+            fprintf(stderr, "  WARNING: kernel thunk VA 0x%08X out of range (raw=0x%08X)\n",
+                    thunk_va, thunk_raw);
         }
     }
 

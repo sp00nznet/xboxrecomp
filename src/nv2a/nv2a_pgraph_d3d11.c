@@ -24,14 +24,21 @@
 extern IDirect3DDevice8 *xbox_GetD3DDevice(void);
 
 /* Global.txd texture lookup */
+/* Game-specific texture lookup - only available when GAME_HAS_FONT_ATLAS is defined */
+#ifdef GAME_HAS_FONT_ATLAS
 typedef struct { char name[24]; IDirect3DTexture8 *texture; uint32_t width, height, format; } TXD_Entry;
 typedef struct { TXD_Entry entries[512]; int count; } TXD_Dict;
 extern TXD_Dict g_global_txd;
 extern int g_textures_loaded;
 extern IDirect3DTexture8 *txd_find(const TXD_Dict *dict, const char *name);
+#else
+static int g_textures_loaded = 0;
+#endif
 
-/* Font atlas DXT5 data captured from xemu */
+/* Font atlas DXT5 data - game-specific, only available in burnout3 */
+#ifdef GAME_HAS_FONT_ATLAS
 #include "font_atlas_data.h"
+#endif
 
 /* Create a D3D8 texture from raw DXT5 data */
 static IDirect3DTexture8 *create_dxt5_texture(IDirect3DDevice8 *dev,
@@ -349,16 +356,15 @@ static void submit_draw(void)
     /* Set FVF for pre-transformed 2D with texture */
     dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
-    /* Bind texture from Global.txd based on NV2A VRAM offset.
-     * We match the push buffer's SET_TEXTURE_OFFSET value to known
-     * Global.txd entries identified via xemu dimension/format matching. */
+    /* Bind texture based on NV2A VRAM offset.
+     * Game-specific texture mapping is handled via GAME_HAS_FONT_ATLAS
+     * compile flag. Generic path uses vertex color only. */
+#ifdef GAME_HAS_FONT_ATLAS
     if (g_textures_loaded) {
-        /* Build lookup table on first use */
         if (!g_pg.texture_lookup_done) {
             g_pg.texture_lookup_done = 1;
             fprintf(stderr, "[PGRAPH-D3D11] Texture lookup init (global_txd has %d textures)\n",
                     g_global_txd.count);
-            /* Dump all texture names+sizes for reference */
             for (int ti = 0; ti < g_global_txd.count; ti++) {
                 fprintf(stderr, "    [%3d] %-24s %3ux%-3u fmt=0x%X\n",
                         ti, g_global_txd.entries[ti].name,
@@ -368,31 +374,23 @@ static void submit_draw(void)
             }
         }
 
-        /* Match NV2A VRAM offset → Global.txd name (from xemu analysis).
-         * Offsets identified by capturing PGRAPH texture registers from xemu
-         * and matching by texture dimension + format code. */
         IDirect3DTexture8 *tex = NULL;
         uint32_t vram_off = g_pg.tex[0].offset;
         switch (vram_off) {
-            case 0x03C1ED00: tex = txd_find(&g_global_txd, "B3Logo"); break;      /* 256x64 A1R5G5B5 */
-            case 0x03C24700: tex = txd_find(&g_global_txd, "bg"); break;           /* 64x32 DXT1 */
-            case 0x03C24B80: tex = txd_find(&g_global_txd, "big_curve"); break;    /* 128x128 DXT5 */
-            case 0x03C7BE00: tex = txd_find(&g_global_txd, "Buttons"); break;      /* 128x64 DXT5 */
-            case 0x03C95700: tex = txd_find(&g_global_txd, "dpad"); break;          /* 32x16 DXT5 */
-            case 0x03C95980: tex = txd_find(&g_global_txd, "FE"); break;            /* 32x32 DXT5 */
-            case 0x03CA1A80: tex = txd_find(&g_global_txd, "small_curve"); break;   /* 32x32 DXT5 */
-            case 0x03D57000: tex = txd_find(&g_global_txd, "box_curve"); break;     /* 32x32 DXT5 */
-            case 0x03CB9200: tex = txd_find(&g_global_txd, "grid"); break;          /* 16x16 DXT1 */
+            case 0x03C1ED00: tex = txd_find(&g_global_txd, "B3Logo"); break;
+            case 0x03C24700: tex = txd_find(&g_global_txd, "bg"); break;
+            case 0x03C24B80: tex = txd_find(&g_global_txd, "big_curve"); break;
+            case 0x03C7BE00: tex = txd_find(&g_global_txd, "Buttons"); break;
+            case 0x03C95700: tex = txd_find(&g_global_txd, "dpad"); break;
+            case 0x03C95980: tex = txd_find(&g_global_txd, "FE"); break;
+            case 0x03CA1A80: tex = txd_find(&g_global_txd, "small_curve"); break;
+            case 0x03D57000: tex = txd_find(&g_global_txd, "box_curve"); break;
+            case 0x03CB9200: tex = txd_find(&g_global_txd, "grid"); break;
             case 0x02EC0400:
-                /* Render target / framebuffer texture — skip this draw entirely.
-                 * In xemu this shows the looping background video; in our recomp
-                 * the background is rendered separately. Drawing this as vertex-color
-                 * produces a solid white quad that washes out everything. */
                 dev->lpVtbl->EndScene(dev);
                 g_pg.inline_count = 0;
-                return;  /* Skip draw */
+                return;
             case 0x021C4100:
-                /* Font atlas — create from captured DXT5 data on first use */
                 if (!g_pg.font_atlas) {
                     g_pg.font_atlas = create_dxt5_texture(dev,
                         FONT_ATLAS_WIDTH, FONT_ATLAS_HEIGHT,
@@ -400,8 +398,8 @@ static void submit_draw(void)
                 }
                 tex = g_pg.font_atlas;
                 break;
-            case 0: tex = NULL; break;  /* No texture set — vertex color only */
-            default: tex = NULL; break; /* Unknown — render with vertex color only */
+            case 0: tex = NULL; break;
+            default: tex = NULL; break;
         }
 
         if (tex) {
@@ -425,6 +423,16 @@ static void submit_draw(void)
     } else {
         dev->lpVtbl->SetTexture(dev, 0, NULL);
     }
+#else
+    /* Generic path: no game-specific texture lookup, use vertex color only */
+    {
+        dev->lpVtbl->SetTexture(dev, 0, NULL);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 1, 2 /*SELECTARG1*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 2, 0 /*DIFFUSE*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 4, 2 /*SELECTARG1*/);
+        dev->lpVtbl->SetTextureStageState(dev, 0, 5, 0 /*DIFFUSE*/);
+    }
+#endif
 
     /* Begin scene if needed */
     dev->lpVtbl->BeginScene(dev);

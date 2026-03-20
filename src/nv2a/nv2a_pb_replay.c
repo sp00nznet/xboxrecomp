@@ -25,7 +25,8 @@
 #include <windows.h>
 #include "../d3d/d3d8_xbox.h"
 
-/* Captured push buffer data for each menu state */
+/* Captured push buffer data for each menu state (game-specific) */
+#ifdef GAME_HAS_PB_DATA
 #include "menu_pushbuffer_data.h"
 #include "menu_pb_main_menu.h"
 #include "menu_pb_world_tour.h"
@@ -35,6 +36,17 @@
 #include "menu_pb_road_rage.h"
 #include "menu_pb_crash_select.h"
 #include "menu_pb_driver_details.h"
+#endif
+
+/* The entire replay implementation is game-specific (burnout3 menu system).
+ * When GAME_HAS_PB_DATA is not defined, provide empty stubs. */
+#ifndef GAME_HAS_PB_DATA
+
+void nv2a_pb_replay_frame(void) {}
+void nv2a_pb_replay_set_active(int active) { (void)active; }
+int  nv2a_pb_replay_is_active(void) { return 0; }
+
+#else /* GAME_HAS_PB_DATA */
 
 /* Push buffer command encoding */
 #define PB_INC_MASK      0xE0030003
@@ -339,3 +351,5 @@ int nv2a_pb_replay_is_active(void)
 {
     return g_replay_active;
 }
+
+#endif /* GAME_HAS_PB_DATA */

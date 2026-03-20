@@ -28,6 +28,19 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include <stdio.h>
+
+/* Runtime-configurable thunk table address and size.
+ * Set by xbox_kernel_set_thunk_address() before bridge init.
+ * Defaults to Burnout 3's address for backward compatibility. */
+static uint32_t g_thunk_table_va = XBOX_KERNEL_THUNK_TABLE_BASE;
+static uint32_t g_thunk_table_count = 147;
+
+void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
+{
+    g_thunk_table_va = xbox_va;
+    g_thunk_table_count = count;
+    fprintf(stderr, "  Kernel thunk address set to 0x%08X (%u entries)\n", xbox_va, count);
+}
 #include <float.h>
 
 /* Access to recompiled code globals */
@@ -1906,14 +1919,14 @@ void xbox_kernel_bridge_init(void)
     int unbridged = 0;
     DWORD old_protect;
 
-    fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
-            XBOX_KERNEL_THUNK_TABLE_SIZE, XBOX_KERNEL_THUNK_TABLE_BASE);
+    fprintf(stderr, "  Kernel thunk bridge: resolving %u entries at 0x%08X\n",
+            g_thunk_table_count, g_thunk_table_va);
 
-    /* The thunk table lives in .rdata which is marked PAGE_READONLY.
+    /* The thunk table lives in .rdata which may be marked PAGE_READONLY.
      * Temporarily make it writable so we can patch the ordinals. */
     VirtualProtect(
-        (LPVOID)((uintptr_t)XBOX_KERNEL_THUNK_TABLE_BASE + g_xbox_mem_offset),
-        XBOX_KERNEL_THUNK_TABLE_SIZE * 4,
+        (LPVOID)((uintptr_t)g_thunk_table_va + g_xbox_mem_offset),
+        g_thunk_table_count * 4,
         PAGE_READWRITE,
         &old_protect
     );
@@ -1921,8 +1934,8 @@ void xbox_kernel_bridge_init(void)
     /* Initialize kernel data export values first */
     kernel_data_init();
 
-    for (i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
-        uint32_t va = XBOX_KERNEL_THUNK_TABLE_BASE + i * 4;
+    for (i = 0; (uint32_t)i < g_thunk_table_count; i++) {
+        uint32_t va = g_thunk_table_va + i * 4;
         uint32_t current = BRIDGE_MEM32(va);
 
         if (current & 0x80000000) {
@@ -1959,14 +1972,14 @@ void xbox_kernel_bridge_init(void)
 
     /* Restore original protection */
     VirtualProtect(
-        (LPVOID)((uintptr_t)XBOX_KERNEL_THUNK_TABLE_BASE + g_xbox_mem_offset),
-        XBOX_KERNEL_THUNK_TABLE_SIZE * 4,
+        (LPVOID)((uintptr_t)g_thunk_table_va + g_xbox_mem_offset),
+        g_thunk_table_count * 4,
         old_protect,
         &old_protect
     );
 
-    fprintf(stderr, "  Kernel thunk bridge: %d/%d resolved (%d bridged, %d stub)\n",
-            resolved, XBOX_KERNEL_THUNK_TABLE_SIZE, bridged, unbridged);
+    fprintf(stderr, "  Kernel thunk bridge: %d/%u resolved (%d bridged, %d stub)\n",
+            resolved, g_thunk_table_count, bridged, unbridged);
     fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
 

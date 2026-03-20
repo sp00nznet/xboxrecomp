@@ -875,7 +875,14 @@ static HRESULT __stdcall dev_CreateVertexShader(IDirect3DDevice8 *self, const DW
 {
     (void)self; (void)pDeclaration; (void)Usage;
     if (!pHandle) return E_INVALIDARG;
-    return d3d8_vsh_create_shader(pFunction, pHandle);
+    if (!pFunction) return E_INVALIDARG;
+    /* Count instructions: each is 4 DWORDs, last has bit 0 of word[3] set (END flag) */
+    int num_insns = 0;
+    for (int i = 0; i < 136; i++) {
+        num_insns++;
+        if (pFunction[i * 4 + 3] & 1) break;  /* END bit in last word */
+    }
+    return d3d8_vsh_create_shader(pFunction, num_insns, pHandle);
 }
 
 static HRESULT __stdcall dev_SetVertexShader(IDirect3DDevice8 *self, DWORD Handle)

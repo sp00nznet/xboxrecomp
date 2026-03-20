@@ -3,28 +3,24 @@
  *
  * The Xbox has 64MB of unified memory shared between CPU and GPU.
  * Memory is identity-mapped (physical == virtual for most of it).
- * The game's code and data were linked expecting specific address ranges:
+ * Game code and data are linked to specific address ranges which vary
+ * per game. Section addresses are parsed dynamically from the XBE header
+ * at runtime, so this module works with ANY Xbox game.
  *
- *   0x00010000 - 0x002BD000  .text (code)       ~2.73 MB
- *   0x002CC200 - 0x00362AE0  XDK library code   ~600 KB
- *   0x0036B7C0 - 0x003B2354  .rdata (constants) ~280 KB
- *   0x003B2360 - 0x0076F000  .data + BSS        ~3.9 MB
+ * On Windows, we:
+ * 1. Create a 64MB file mapping (CreateFileMapping)
+ * 2. Map the base view + 28 mirror views at 64MB intervals
+ * 3. Parse the XBE section table and copy sections to their Xbox VAs
+ * 4. Set up simulated stack, heap, TIB, and kernel data area
  *
- * On Windows, we need to:
- * 1. Reserve the same virtual address range (0x00010000+)
- * 2. Map sections to their expected addresses
- * 3. Handle the fact that Xbox has no address space layout randomization
- * 4. Provide contiguous memory for GPU resources (textures, VBs)
- *
- * Strategy:
- * - Use VirtualAlloc with specific base addresses to place sections
- * - The recompiled code uses the same addresses for globals and data
- * - GPU memory (D3D textures, etc.) is managed separately by D3D11
- * - Stack and heap use normal Windows allocation
+ * The mirror views ensure Xbox RAM wrapping works correctly: the Xbox
+ * memory controller uses a 26-bit address bus, so ALL addresses wrap
+ * modulo 64MB. File mapping views backed by the same section give us
+ * true aliases where writes at one address are visible at all mirrors.
  */
 
-#ifndef BURNOUT3_XBOX_MEMORY_LAYOUT_H
-#define BURNOUT3_XBOX_MEMORY_LAYOUT_H
+#ifndef XBOX_MEMORY_LAYOUT_H
+#define XBOX_MEMORY_LAYOUT_H
 
 #include <windows.h>
 #include <stdint.h>
@@ -37,36 +33,20 @@ extern "C" {
  * Xbox memory map constants
  * ================================================================ */
 
-/* Base address of the XBE in Xbox memory */
+/* Base address of all XBE files in Xbox memory */
 #define XBOX_BASE_ADDRESS       0x00010000
 
 /* Start of mapped region - includes low memory (KPCR at 0x0) because
  * game code reads from addresses like 0x20 and 0x28 (Xbox kernel structures). */
 #define XBOX_MAP_START          0x00000000
 
-/* .text section */
-#define XBOX_TEXT_VA            0x00011000
-#define XBOX_TEXT_SIZE          2863616     /* 0x002BC000 */
-
-/* .rdata section */
-#define XBOX_RDATA_VA           0x0036B7C0
-#define XBOX_RDATA_SIZE         289684
-
-/* .data section (includes BSS) */
-#define XBOX_DATA_VA            0x003B2360
-#define XBOX_DATA_SIZE          3904988
-#define XBOX_DATA_INIT_SIZE     424960     /* Initialized data in XBE file */
-/* BSS starts at DATA_VA + DATA_INIT_SIZE, zero-initialized */
-
 /* Xbox physical memory */
 #define XBOX_TOTAL_RAM          (64 * 1024 * 1024)  /* 64 MB */
 #define XBOX_GPU_RESERVED       (4 * 1024 * 1024)   /* ~4 MB for GPU */
 
-/* End of mapped sections */
-#define XBOX_MAP_END            (XBOX_DATA_VA + XBOX_DATA_SIZE)
-
-/* Total virtual space needed (from XBOX_MAP_START, not XBOX_BASE_ADDRESS) */
-#define XBOX_MAP_TOTAL_SIZE     (XBOX_MAP_END - XBOX_MAP_START)
+/* NOTE: Section addresses (.text, .rdata, .data, etc.) are NOT hardcoded.
+ * They are parsed from the XBE header at runtime in xbox_MemoryLayoutInit().
+ * This allows the toolkit to work with ANY Xbox game without modification. */
 
 /* ================================================================
  * Memory initialization
@@ -201,4 +181,4 @@ HANDLE xbox_GetMappingHandle(void);
 }
 #endif
 
-#endif /* BURNOUT3_XBOX_MEMORY_LAYOUT_H */
+#endif /* XBOX_MEMORY_LAYOUT_H */
