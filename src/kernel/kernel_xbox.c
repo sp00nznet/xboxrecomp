@@ -100,6 +100,119 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
 }
 
 /* ============================================================================
+ * EEPROM / Non-Volatile Settings
+ *
+ * ExQueryNonVolatileSetting / ExSaveNonVolatileSetting read and write EEPROM
+ * settings. On real hardware these are stored in the 256-byte EEPROM on the
+ * SMBus. For recompilation, we return sensible defaults:
+ *   - Region: North America
+ *   - Video: NTSC, widescreen+HDTV enabled
+ *   - Language: English
+ *   - Audio: Stereo, Dolby Digital
+ *   - DVD Region: Region 1 (North America)
+ * ============================================================================ */
+
+NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+    ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
+{
+    if (!Value)
+        return STATUS_INVALID_PARAMETER;
+
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
+        "ExQueryNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
+
+    switch (ValueIndex) {
+    case XC_LANGUAGE:
+        /* English = 1 */
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = 1;
+            if (Type) *Type = 4; /* REG_DWORD */
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_VIDEO:
+        /* NTSC with widescreen and HDTV support enabled */
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            if (Type) *Type = 4; /* REG_DWORD */
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_AUDIO:
+        /* Stereo + Dolby Digital enabled (0x00000001 = stereo, 0x00010000 = AC3) */
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = 0x00010001;
+            if (Type) *Type = 4; /* REG_DWORD */
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_PARENTAL_CONTROL:
+        /* No parental controls */
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = 0;
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_DVD_REGION:
+        /* Region 1 (North America) */
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = 1;
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_MISC:
+        /* Misc flags: 0 = no special flags */
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = 0;
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_TIMEZONE_BIAS:
+        /* UTC-5 (Eastern Time) in minutes: -300 */
+        if (ValueLength >= sizeof(LONG)) {
+            *(PLONG)Value = -300;
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(LONG);
+        }
+        break;
+
+    default:
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,
+            "ExQueryNonVolatileSetting: unhandled index 0x%02X", ValueIndex);
+        memset(Value, 0, ValueLength);
+        if (Type) *Type = 4;
+        if (ResultLength) *ResultLength = ValueLength;
+        break;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(
+    ULONG ValueIndex, ULONG Type, PVOID Value, ULONG ValueLength)
+{
+    (void)Type;
+    (void)Value;
+    (void)ValueLength;
+
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_XBOX,
+        "ExSaveNonVolatileSetting: index=0x%02X len=%u (ignored - read-only on PC)",
+        ValueIndex, ValueLength);
+
+    /* Accept writes silently but don't persist them */
+    return STATUS_SUCCESS;
+}
+
+/* ============================================================================
  * Network / PHY
  *
  * PhyGetLinkState reports Ethernet link status. Xbox had a built-in 100Mbit

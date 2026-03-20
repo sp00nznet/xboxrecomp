@@ -390,14 +390,15 @@ NTSTATUS __stdcall xbox_NtSetSystemTime(PLARGE_INTEGER SystemTime, PLARGE_INTEGE
 }
 
 /* ============================================================================
- * Display / AV Stubs
+ * Display / AV
  *
  * These are declared in kernel.h for the thunk table but will be fully
- * implemented by the D3D replacement layer. Minimal stubs here to prevent
- * linker errors.
+ * implemented by the D3D replacement layer. We provide realistic AV pack
+ * detection so games can query display capabilities (480p, 720p, widescreen).
  * ============================================================================ */
 
 static ULONG g_av_saved_data_address = 0;
+static ULONG g_av_display_mode = 0;
 
 ULONG __stdcall xbox_AvGetSavedDataAddress(void)
 {
@@ -408,10 +409,62 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
     PVOID RegisterBase, ULONG Option, ULONG Param, PULONG Result)
 {
     (void)RegisterBase;
-    (void)Option;
     (void)Param;
-    if (Result)
+
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
+        "AvSendTVEncoderOption: option=0x%02X param=0x%X", Option, Param);
+
+    if (!Result)
+        return;
+
+    switch (Option) {
+    case AV_OPTION_QUERY_AVPACK:
+        /* Report HDTV/Component pack - allows games to offer 480p/720p */
+        *Result = AV_PACK_HDTV;
+        break;
+
+    case AV_OPTION_QUERY_MODE:
+        /* Return current display mode */
+        *Result = g_av_display_mode;
+        break;
+
+    case AV_OPTION_QUERY_AV_CAPABILITIES:
+        /* Report support for 480i, 480p, 720p, and widescreen */
+        *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
+                | AV_FLAGS_HDTV_720p | AV_FLAGS_WIDESCREEN
+                | AV_FLAGS_60Hz;
+        break;
+
+    case AV_OPTION_QUERY_ENCODER_TYPE:
+        /* Conexant CX25871 (common in retail Xboxes) */
+        *Result = 4;
+        break;
+
+    case AV_OPTION_QUERY_MODE_CAPS:
+        /* Same as capabilities for our purposes */
+        *Result = AV_FLAGS_HDTV_480i | AV_FLAGS_HDTV_480p
+                | AV_FLAGS_HDTV_720p | AV_FLAGS_WIDESCREEN
+                | AV_FLAGS_60Hz;
+        break;
+
+    case AV_OPTION_SET_MODE:
+        g_av_display_mode = Param;
         *Result = 0;
+        break;
+
+    case AV_OPTION_BLANK_SCREEN:
+    case AV_OPTION_MACROVISION_MODE:
+    case AV_OPTION_FLICKER_FILTER:
+    case AV_OPTION_ZERO_MODE:
+        *Result = 0;
+        break;
+
+    default:
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
+            "AvSendTVEncoderOption: unknown option 0x%02X", Option);
+        *Result = 0;
+        break;
+    }
 }
 
 VOID __stdcall xbox_AvSetSavedDataAddress(ULONG Address)
@@ -429,8 +482,113 @@ VOID __stdcall xbox_AvSetDisplayMode(
     (void)Pitch;
     (void)FrameBuffer;
 
+    g_av_display_mode = Mode;
+
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
-        "AvSetDisplayMode: mode=%u (handled by D3D layer)", Mode);
+        "AvSetDisplayMode: step=%u mode=0x%X format=0x%X pitch=%u fb=0x%X",
+        Step, Mode, Format, Pitch, FrameBuffer);
+}
+
+/* ============================================================================
+ * SMBus - HalReadSMBusValue / HalWriteSMBusValue
+ *
+ * The Xbox SMBus connects the CPU to the System Management Controller (SMC),
+ * EEPROM, temperature sensor, and TV encoder. Games use these to detect
+ * AV pack type, read EEPROM settings, and check hardware state.
+ *
+ * We simulate responses for the most commonly queried devices:
+ *   - SMC (0x20): firmware version, tray state, AV pack, temperatures
+ *   - EEPROM (0xA8): handled separately via ExQueryNonVolatileSetting
+ *   - Temperature sensor (0x98): CPU/board temperatures
+ * ============================================================================ */
+
+NTSTATUS __stdcall xbox_HalReadSMBusValue(
+    UCHAR SlaveAddress, UCHAR CommandCode, BOOLEAN ReadWordValue, PULONG DataValue)
+{
+    if (!DataValue)
+        return STATUS_INVALID_PARAMETER;
+
+    *DataValue = 0;
+
+    switch (SlaveAddress) {
+    case SMC_SLAVE_ADDRESS:  /* 0x20 - System Management Controller */
+        switch (CommandCode) {
+        case SMC_CMD_FIRMWARE_VER:
+            /* "P01" = production SMC, return 'P' for first byte.
+             * Games read version byte-by-byte: P(0x50), 0(0x30), 1(0x31) */
+            *DataValue = 0x50; /* 'P' */
+            break;
+        case SMC_CMD_TRAY_STATE:
+            /* 0x60 = media present, tray closed */
+            *DataValue = 0x60;
+            break;
+        case SMC_CMD_AV_PACK:
+            /* HDTV/Component pack */
+            *DataValue = AV_PACK_HDTV;
+            break;
+        case SMC_CMD_CPU_TEMP:
+            *DataValue = 40; /* 40 degrees C */
+            break;
+        case SMC_CMD_MB_TEMP:
+            *DataValue = 35; /* 35 degrees C */
+            break;
+        case SMC_CMD_FAN_SPEED:
+            *DataValue = 50; /* ~50% fan speed */
+            break;
+        case SMC_CMD_INTERRUPT_REASON:
+            *DataValue = 0;  /* No pending interrupt */
+            break;
+        case SMC_CMD_ERROR_CODE:
+            *DataValue = 0;  /* No error */
+            break;
+        default:
+            xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
+                "HalReadSMBusValue: SMC unknown cmd=0x%02X", CommandCode);
+            break;
+        }
+        break;
+
+    case TEMP_SLAVE_ADDRESS:  /* 0x98 - ADM1032 temperature sensor */
+        /* CommandCode 0x00 = local temp, 0x01 = remote temp */
+        if (CommandCode == 0x00)
+            *DataValue = 35;  /* Board: 35C */
+        else if (CommandCode == 0x01)
+            *DataValue = 40;  /* CPU: 40C */
+        else
+            *DataValue = 30;
+        break;
+
+    case ENCODER_SLAVE_ADDRESS:  /* 0xD4 - TV encoder */
+        /* Return 0 for most encoder register reads */
+        *DataValue = 0;
+        break;
+
+    default:
+        xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
+            "HalReadSMBusValue: unknown slave=0x%02X cmd=0x%02X",
+            SlaveAddress, CommandCode);
+        break;
+    }
+
+    xbox_log(XBOX_LOG_TRACE, XBOX_LOG_HAL,
+        "HalReadSMBusValue: slave=0x%02X cmd=0x%02X word=%d -> 0x%X",
+        SlaveAddress, CommandCode, ReadWordValue, *DataValue);
+
+    (void)ReadWordValue;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS __stdcall xbox_HalWriteSMBusValue(
+    UCHAR SlaveAddress, UCHAR CommandCode, BOOLEAN WriteWordValue, ULONG DataValue)
+{
+    (void)WriteWordValue;
+
+    xbox_log(XBOX_LOG_TRACE, XBOX_LOG_HAL,
+        "HalWriteSMBusValue: slave=0x%02X cmd=0x%02X word=%d val=0x%X (ignored)",
+        SlaveAddress, CommandCode, WriteWordValue, DataValue);
+
+    /* Writes to SMC (LED control, fan speed, etc.) are silently accepted */
+    return STATUS_SUCCESS;
 }
 
 /* ============================================================================

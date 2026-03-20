@@ -109,14 +109,19 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
     case  16: return (ULONG_PTR)xbox_ExAllocatePoolWithTag;
     case  17: return (ULONG_PTR)&xbox_ExEventObjectType;         /* data */
     case  24: return (ULONG_PTR)xbox_ExQueryPoolBlockSize;
+    case  25: return (ULONG_PTR)xbox_ExQueryNonVolatileSetting;
+    case  29: return (ULONG_PTR)xbox_ExSaveNonVolatileSetting;
 
     /* ---- HAL ---- */
     case  40: return (ULONG_PTR)xbox_HalClearSoftwareInterrupt;
     case  41: return (ULONG_PTR)xbox_HalDisableSystemInterrupt;
     case  44: return (ULONG_PTR)xbox_HalGetInterruptVector;
+    case  45: return (ULONG_PTR)xbox_HalReadSMBusValue;
     case  46: return (ULONG_PTR)xbox_HalReadSMCTrayState;
     case  47: return (ULONG_PTR)xbox_HalReadWritePCISpace;
     case  49: return (ULONG_PTR)xbox_HalRequestSoftwareInterrupt;
+    case  50: return (ULONG_PTR)xbox_HalReturnToFirmware;
+    case  51: return (ULONG_PTR)xbox_HalWriteSMBusValue;
     case 358: return (ULONG_PTR)xbox_HalIsResetOrShutdownPending;
     case 360: return (ULONG_PTR)xbox_HalInitiateShutdown;
 

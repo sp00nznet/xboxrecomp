@@ -43,6 +43,9 @@ struct McpxApuDebug g_dbg_cache;
 int g_dbg_voice_monitor = -1;
 uint64_t g_dbg_muted_voices[4] = { 0 };
 
+/* Global audio mute — disables all AWD/mixer sound playback */
+volatile int g_audio_muted = 1;  /* Start muted; set to 0 to enable */
+
 /* ============================================================
  * Debug frame markers (minimal stubs)
  * ============================================================ */
@@ -253,8 +256,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
 
-        /* Test tone */
-        if (g_test_tone.active) {
+        /* Test tone (skip if muted) */
+        if (g_test_tone.active && !g_audio_muted) {
             for (int i = 0; i < chunk; i++) {
                 int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
                 d->monitor.frame_buf[i][0] = s;
@@ -265,8 +268,9 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             }
         }
 
-        /* Mix software voices */
-        mixer_render(d->monitor.frame_buf, chunk);
+        /* Mix software voices (skip if muted) */
+        if (!g_audio_muted)
+            mixer_render(d->monitor.frame_buf, chunk);
 
         /* Copy to waveOut buffer */
         memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
@@ -659,6 +663,7 @@ APUMixerVoice *apu_mixer_get_voice(int slot)
 
 void apu_mixer_play(int slot, int looping)
 {
+    if (g_audio_muted) return;
     if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
     APUMixerVoice *v = &g_mixer_voices[slot];
     if (!v->pcm_data || v->pcm_bytes == 0) return;

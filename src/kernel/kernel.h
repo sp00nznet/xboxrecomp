@@ -784,6 +784,93 @@ VOID    __stdcall xbox_AvSendTVEncoderOption(PVOID RegisterBase, ULONG Option, U
 VOID    __stdcall xbox_AvSetSavedDataAddress(ULONG Address);
 VOID    __stdcall xbox_AvSetDisplayMode(PVOID RegisterBase, ULONG Step, ULONG Mode, ULONG Format, ULONG Pitch, ULONG FrameBuffer);
 
+/* SMBus (HalReadSMBusValue / HalWriteSMBusValue) */
+NTSTATUS __stdcall xbox_HalReadSMBusValue(UCHAR SlaveAddress, UCHAR CommandCode, BOOLEAN ReadWordValue, PULONG DataValue);
+NTSTATUS __stdcall xbox_HalWriteSMBusValue(UCHAR SlaveAddress, UCHAR CommandCode, BOOLEAN WriteWordValue, ULONG DataValue);
+
+/* EEPROM / Non-Volatile Settings */
+NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength);
+NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, PVOID Value, ULONG ValueLength);
+
+/* ---- AV Pack types (returned by AvSendTVEncoderOption) ---- */
+#define AV_PACK_NONE            0x00
+#define AV_PACK_STANDARD        0x01
+#define AV_PACK_RFU             0x02
+#define AV_PACK_SCART           0x03
+#define AV_PACK_HDTV            0x04
+#define AV_PACK_VGA             0x05
+#define AV_PACK_SVIDEO          0x06
+
+/* ---- AV option codes for AvSendTVEncoderOption ---- */
+#define AV_OPTION_QUERY_MODE            0x01
+#define AV_OPTION_SET_MODE              0x02
+#define AV_OPTION_QUERY_AVPACK          0x06
+#define AV_OPTION_QUERY_ENCODER_TYPE    0x08
+#define AV_OPTION_QUERY_AV_CAPABILITIES 0x09
+#define AV_OPTION_BLANK_SCREEN          0x0A
+#define AV_OPTION_MACROVISION_MODE      0x0C
+#define AV_OPTION_FLICKER_FILTER        0x0B
+#define AV_OPTION_ZERO_MODE             0x0D
+#define AV_OPTION_QUERY_MODE_CAPS       0x0E
+
+/* ---- AV flags (for capabilities / display mode) ---- */
+#define AV_FLAGS_HDTV_480i      0x00000001
+#define AV_FLAGS_HDTV_480p      0x00000002
+#define AV_FLAGS_HDTV_720p      0x00000004
+#define AV_FLAGS_HDTV_1080i     0x00000008
+#define AV_FLAGS_WIDESCREEN     0x00000010
+#define AV_FLAGS_LETTERBOX      0x00000020
+#define AV_FLAGS_60Hz           0x00000040
+#define AV_FLAGS_50Hz           0x00000080
+#define AV_FLAGS_INTERLACED     0x00000100
+
+/* ---- SMBus slave addresses ---- */
+#define SMC_SLAVE_ADDRESS       0x20    /* System Management Controller */
+#define EEPROM_SLAVE_ADDRESS    0xA8    /* EEPROM */
+#define TEMP_SLAVE_ADDRESS      0x98    /* Temperature sensor (ADM1032) */
+#define ENCODER_SLAVE_ADDRESS   0xD4    /* TV encoder (Conexant/Focus) */
+
+/* ---- SMC command codes ---- */
+#define SMC_CMD_FIRMWARE_VER    0x01    /* SMC firmware version */
+#define SMC_CMD_TRAY_STATE      0x03    /* DVD tray state */
+#define SMC_CMD_AV_PACK         0x04    /* AV pack type */
+#define SMC_CMD_CPU_TEMP        0x09    /* CPU temperature */
+#define SMC_CMD_MB_TEMP         0x0A    /* Motherboard temperature */
+#define SMC_CMD_FAN_SPEED       0x10    /* Fan speed */
+#define SMC_CMD_INTERRUPT_REASON 0x11   /* Interrupt reason */
+#define SMC_CMD_ERROR_CODE      0x0E    /* System error code */
+#define SMC_CMD_POWER_FAN_MODE  0x05    /* Power/fan mode */
+#define SMC_CMD_LED_OVERRIDE    0x07    /* LED override */
+#define SMC_CMD_LED_STATES      0x08    /* LED states */
+#define SMC_CMD_SCRATCH         0x1B    /* Scratch register */
+
+/* ---- EEPROM non-volatile setting indices ---- */
+#define XC_TIMEZONE_BIAS           0x01
+#define XC_TZ_STD_NAME            0x02
+#define XC_TZ_STD_DATE           0x03
+#define XC_TZ_STD_BIAS           0x04
+#define XC_TZ_DLT_NAME           0x05
+#define XC_TZ_DLT_DATE           0x06
+#define XC_TZ_DLT_BIAS           0x07
+#define XC_LANGUAGE               0x08
+#define XC_VIDEO                  0x09
+#define XC_AUDIO                  0x0A
+#define XC_PARENTAL_CONTROL       0x0B
+#define XC_PARENTAL_PASSWORD      0x0C
+#define XC_ONLINE_IP_ADDRESS      0x0D
+#define XC_ONLINE_DNS_ADDRESS     0x0E
+#define XC_ONLINE_DEFAULT_GATEWAY 0x0F
+#define XC_ONLINE_SUBNET_MASK     0x10
+#define XC_MISC                   0x11
+#define XC_DVD_REGION             0x12
+#define XC_MAX_OS                 0xFF
+
+/* Video standard flags in XC_VIDEO */
+#define XC_VIDEO_FLAGS_WIDESCREEN   0x01
+#define XC_VIDEO_FLAGS_HDTV         0x02
+#define XC_VIDEO_FLAGS_PAL_I        0x04
+#define XC_VIDEO_FLAGS_LETTERBOX    0x10
+
 /* Unknown ordinals - stub */
 VOID    __stdcall xbox_Unknown_8(void);
 VOID    __stdcall xbox_Unknown_23(void);

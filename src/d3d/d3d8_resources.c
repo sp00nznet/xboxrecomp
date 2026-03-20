@@ -7,6 +7,7 @@
  */
 
 #include "d3d8_internal.h"
+#include "d3d8_swizzle.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -33,6 +34,10 @@ DXGI_FORMAT d3d8_to_dxgi_format(D3DFORMAT fmt)
     case D3DFMT_LIN_X8R8G8B8:   return DXGI_FORMAT_B8G8R8X8_UNORM;
     case D3DFMT_LIN_R5G6B5:     return DXGI_FORMAT_B5G6R5_UNORM;
     case D3DFMT_LIN_A1R5G5B5:   return DXGI_FORMAT_B5G5R5A1_UNORM;
+    case D3DFMT_A4R4G4B4:       return DXGI_FORMAT_B4G4R4A4_UNORM;
+    case D3DFMT_LIN_A4R4G4B4:   return DXGI_FORMAT_B4G4R4A4_UNORM;
+    case D3DFMT_A8L8:           return DXGI_FORMAT_R8G8_UNORM;
+    case D3DFMT_P8:             return DXGI_FORMAT_R8_UNORM;  /* palette handled separately */
     case D3DFMT_INDEX16:        return DXGI_FORMAT_R16_UINT;
     case D3DFMT_INDEX32:        return DXGI_FORMAT_R32_UINT;
     default:
@@ -449,15 +454,34 @@ static HRESULT __stdcall tex_UnlockRect(IDirect3DTexture8 *self, UINT Level)
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     if (ctx && tex->d3d11_texture) {
         UINT rows;
+        BYTE *upload_data = tex->sys_mem;
+        BYTE *unswizzled = NULL;
+
         if (d3d8_format_is_compressed(tex->d3d8_format))
             rows = (tex->height + 3) / 4;
         else
             rows = tex->height;
 
+        /* Unswizzle if the format is a swizzled Xbox format */
+        if (!d3d8_format_is_compressed(tex->d3d8_format) &&
+            d3d8_format_is_swizzled(tex->d3d8_format))
+        {
+            UINT bpp = d3d8_format_bpp(tex->d3d8_format) / 8;
+            UINT linear_size = tex->width * tex->height * bpp;
+            unswizzled = (BYTE *)malloc(linear_size);
+            if (unswizzled) {
+                xbox_unswizzle_rect(unswizzled, tex->sys_mem,
+                                     tex->width, tex->height, bpp);
+                upload_data = unswizzled;
+            }
+        }
+
         ID3D11DeviceContext_UpdateSubresource(ctx,
             (ID3D11Resource *)tex->d3d11_texture,
-            0, NULL, tex->sys_mem, tex->pitch, tex->pitch * rows);
+            0, NULL, upload_data, tex->pitch, tex->pitch * rows);
         tex->dirty = FALSE;
+
+        if (unswizzled) free(unswizzled);
     }
     return S_OK;
 }
