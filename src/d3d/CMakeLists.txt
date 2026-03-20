@@ -6,6 +6,7 @@ add_library(xbox_d3d8 STATIC
     d3d8_resources.c
     d3d8_shaders.c
     d3d8_states.c
+    d3d8_combiners.c
 )
 
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

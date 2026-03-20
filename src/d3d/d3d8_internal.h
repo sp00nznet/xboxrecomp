@@ -114,6 +114,12 @@ void    d3d8_shaders_shutdown(void);
 void    d3d8_shaders_prepare_draw(DWORD fvf);
 
 /* ================================================================
+ * NV2A Register Combiner pixel shaders (d3d8_combiners.c)
+ * ================================================================ */
+
+#include "d3d8_combiners.h"
+
+/* ================================================================
  * Render state management (d3d8_states.c)
  * ================================================================ */
 

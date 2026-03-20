@@ -286,6 +286,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
     LONG ref = InterlockedDecrement(&g_device_state.ref_count);
     if (ref <= 0) {
         /* Cleanup subsystems first */
+        d3d8_combiners_shutdown();
         d3d8_states_shutdown();
         d3d8_shaders_shutdown();
 
@@ -464,7 +465,10 @@ static HRESULT __stdcall dev_SetRenderState(IDirect3DDevice8 *self, D3DRENDERSTA
     if ((DWORD)State < MAX_RENDER_STATES) {
         g_device_state.render_states[(DWORD)State] = Value;
     }
-    /* TODO: translate to D3D11 state objects and apply */
+    /* Mark combiner state dirty if any PS register combiner state changed */
+    if ((DWORD)State >= D3DRS_PSALPHAINPUTS0 && (DWORD)State <= D3DRS_PSINPUTTEXTURE) {
+        d3d8_combiners_mark_dirty();
+    }
     return S_OK;
 }
 
@@ -596,6 +600,7 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVET
 
     /* Prepare pipeline: shaders, input layout, constant buffers, render states */
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -614,6 +619,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(IDirect3DDevice8 *self, D3DPRI
     if (index_count == 0) return E_INVALIDARG;
 
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -655,6 +661,7 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
         0, 1, &tmp_vb, &VertexStreamZeroStride, &offset);
 
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -720,6 +727,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(IDirect3DDevice8 *self, D3DP
         tmp_ib, ib_fmt, 0);
 
     d3d8_shaders_prepare_draw(g_device_state.vertex_shader);
+    d3d8_combiners_prepare_draw(); /* overrides PS if combiner shader is active */
     d3d8_states_apply();
 
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
@@ -879,6 +887,7 @@ static HRESULT __stdcall dev_SetPixelShader(IDirect3DDevice8 *self, DWORD Handle
 {
     (void)self;
     g_device_state.pixel_shader = Handle;
+    d3d8_combiners_set_pixel_shader(Handle);
     return S_OK;
 }
 
@@ -1081,6 +1090,12 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8: State init failed: 0x%08lX\n", hr);
         return hr;
+    }
+
+    hr = d3d8_combiners_init();
+    if (FAILED(hr)) {
+        fprintf(stderr, "D3D8: Combiner init failed: 0x%08lX\n", hr);
+        /* Non-fatal: fall back to fixed-function pixel shaders */
     }
 
     g_device.lpVtbl = &g_device_vtbl;
