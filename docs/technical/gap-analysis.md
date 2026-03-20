@@ -19,7 +19,7 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 | Push buffer parsing (PFIFO DMA pusher) | Full | Stub | N/A | Low (D3D8 API intercept instead) |
 | PGRAPH → D3D11 method translator | N/A | From burnout3 | ADDED | High |
 | Push buffer replay | N/A | From burnout3 | ADDED | Medium |
-| **Register combiners (pixel shaders)** | Full (8 stages, RGB/alpha, final combiner) | **NONE** | MISSING | **CRITICAL** |
+| **Register combiners (pixel shaders)** | Full (8 stages, RGB/alpha, final combiner) | Full (8 stages, HLSL generation, 128-entry cache) | DONE | - |
 | **Vertex shader microcode translation** | Full (MAC+ILU ops, 192 constants, 12 temps) | **NONE** (FVF only) | MISSING | **CRITICAL** |
 | **Texture unswizzling (Z-order/Morton)** | Full | Full | ADDED | High |
 | Texture format coverage (66 formats) | Full | 17 formats + 3 new | PARTIAL | High |
@@ -44,7 +44,7 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 | DrawPrimitive/DrawIndexedPrimitive | DONE | All primitive types |
 | Quad list support | DONE | Converted to tri list |
 | Viewport/scissor | DONE | |
-| **Xbox pixel shader (register combiners)** | MISSING | Need combiner→HLSL translation |
+| **Xbox pixel shader (register combiners)** | DONE | d3d8_combiners.c: 8 stages + final, HLSL cache |
 | **Xbox vertex shader (NV2A microcode)** | MISSING | Need microcode→HLSL translation |
 | Multi-texture (beyond stage 0) | PARTIAL | States tracked, shader limited |
 | Bump mapping / normal mapping | MISSING | Needs combiners |
@@ -99,7 +99,7 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 
 ## Next Steps (Priority Order)
 
-1. **Register combiner translation** - Port xemu's `psh.c` register combiner GLSL code and adapt to HLSL for D3D11. This is the single biggest rendering gap. Every Xbox game uses combiners for multi-texturing.
+1. ~~**Register combiner translation**~~ - DONE. d3d8_combiners.c/h: 1,415 lines. Full 8-stage combiner + final combiner, runtime HLSL generation with 128-entry compiled shader cache.
 
 2. **Vertex shader microcode translation** - Port xemu's `vsh-prog.c` vertex shader microcode translator. Blood Wake's water effects and Wreckless's visual effects likely depend on this.
 
