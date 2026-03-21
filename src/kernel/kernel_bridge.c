@@ -247,14 +247,18 @@ static void bridge_PsCreateSystemThreadEx(void)
      * because on real Xbox each thread has its own register set. Without this,
      * the worker clobbers the caller's g_esi, g_ebx, etc. */
     if (start_routine) {
-        recomp_func_t fn = recomp_lookup(start_routine);
-        if (!fn) fn = recomp_lookup_manual(start_routine);
+        recomp_func_t fn = recomp_lookup_manual(start_routine);
+        if (!fn) fn = recomp_lookup(start_routine);
         if (fn) {
             if (is_first_call) {
                 /* Main game thread: run directly, inheriting register state */
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+                /* Set g_seh_ebp so fpo_leaf functions that inherit the
+                 * caller's frame can access the simulated stack. The SEH
+                 * prolog (__SEH_prolog) will overwrite this properly. */
+                g_seh_ebp = g_esp;
                 fn();
                 g_esp += 12;
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
@@ -706,16 +710,90 @@ static void bridge_KeInitializeTimerEx(void)
     g_eax = 0;
 }
 
+/* ── DPC queue for HalRequestSoftwareInterrupt ───────────
+ * When KeSetTimer is called with a DPC, we record it.
+ * When HalRequestSoftwareInterrupt is called at DISPATCH_LEVEL,
+ * we immediately drain any pending DPCs.
+ */
+#define MAX_PENDING_DPCS 16
+static uint32_t g_pending_dpc_vas[MAX_PENDING_DPCS]; /* Xbox VA of KDPC objects */
+static int g_pending_dpc_count = 0;
+
+extern recomp_func_t recomp_lookup(uint32_t xbox_va);
+extern recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
+
 /* ── KeSetTimer / KeSetTimerEx (ordinal 149/150) ──────────
  * BOOLEAN KeSetTimer(PKTIMER Timer, LARGE_INTEGER DueTime, PKDPC Dpc)
  *
- * Sets a timer. We don't actually start timers - just record the state.
+ * Sets a timer with an optional DPC. We record the DPC for immediate
+ * dispatch when HalRequestSoftwareInterrupt fires.
  * Returns FALSE (timer was not already set).
  */
 static void bridge_KeSetTimer(void)
 {
-    /* Timer functionality is not needed for basic execution.
-     * Return FALSE = timer was not previously set. */
+    uint32_t timer_va = STACK_ARG(0);
+    /* DueTime is a LARGE_INTEGER (8 bytes) at STACK_ARG(1) and STACK_ARG(2) */
+    uint32_t dpc_va = STACK_ARG(3);
+
+    if (dpc_va && g_pending_dpc_count < MAX_PENDING_DPCS) {
+        g_pending_dpc_vas[g_pending_dpc_count++] = dpc_va;
+        fprintf(stderr, "  [KERNEL] KeSetTimer: timer=0x%08X dpc=0x%08X (queued #%d)\n",
+                timer_va, dpc_va, g_pending_dpc_count);
+    }
+    g_eax = 0; /* Timer was not previously set */
+}
+
+/* ── HalRequestSoftwareInterrupt (ordinal 49) ────────────
+ * VOID HalRequestSoftwareInterrupt(KIRQL Irql)
+ *
+ * When called with DISPATCH_LEVEL (2), drain any pending DPCs.
+ * The DPC routine signature is:
+ *   VOID DeferredRoutine(PKDPC Dpc, PVOID DeferredContext,
+ *                        PVOID SystemArgument1, PVOID SystemArgument2)
+ */
+static void bridge_HalRequestSoftwareInterrupt(void)
+{
+    uint32_t irql = STACK_ARG(0);
+
+    fprintf(stderr, "  [KERNEL] HalRequestSoftwareInterrupt: irql=%u, pending_dpcs=%d\n",
+            irql, g_pending_dpc_count);
+    fflush(stderr);
+
+    if (irql >= 2 && g_pending_dpc_count > 0) {
+        fprintf(stderr, "  [KERNEL] HalRequestSoftwareInterrupt: dispatching %d DPCs\n",
+                g_pending_dpc_count);
+        fflush(stderr);
+
+        for (int i = 0; i < g_pending_dpc_count; i++) {
+            uint32_t dpc_va = g_pending_dpc_vas[i];
+            uint32_t routine_va = BRIDGE_MEM32(dpc_va + 12); /* DeferredRoutine */
+            uint32_t context_va = BRIDGE_MEM32(dpc_va + 16); /* DeferredContext */
+
+            fprintf(stderr, "  [KERNEL]   DPC #%d: routine=0x%08X ctx=0x%08X\n",
+                    i, routine_va, context_va);
+            fflush(stderr);
+
+            recomp_func_t fn = recomp_lookup_manual(routine_va);
+            if (!fn) fn = recomp_lookup(routine_va);
+            if (fn) {
+                /* Push DPC arguments (stdcall, 4 args) */
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;          /* SystemArgument2 */
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;          /* SystemArgument1 */
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = context_va; /* DeferredContext */
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;     /* Dpc */
+                g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;          /* dummy return */
+                fn();
+                g_esp += 20; /* clean up 4 args + return addr */
+                fprintf(stderr, "  [KERNEL]   DPC #%d completed\n", i);
+                fflush(stderr);
+            } else {
+                fprintf(stderr, "  [KERNEL]   DPC #%d: routine 0x%08X not found!\n",
+                        i, routine_va);
+                fflush(stderr);
+            }
+        }
+        g_pending_dpc_count = 0;
+    }
     g_eax = 0;
 }
 
@@ -1787,6 +1865,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
     /* Hardware */
     case  47: return bridge_HalReadSMCTrayState;
+    case  49: return bridge_HalRequestSoftwareInterrupt;
 
     /* Display */
     case   3: return bridge_AvSetDisplayMode;
