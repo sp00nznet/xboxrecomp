@@ -924,6 +924,10 @@ static NTSTATUS bridge_create_file_impl(
 
     xbox_path = bridge_get_xbox_path(obj_attrs_va);
     if (!xbox_path) {
+        if (g_kernel_call_count <= 200) {
+            fprintf(stderr, "  [FILE] NtCreateFile: obj_attrs=0x%08X -> NULL path\n", obj_attrs_va);
+            fflush(stderr);
+        }
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
@@ -1479,24 +1483,7 @@ static void bridge_NtQuerySymbolicLinkObject(void)
     g_eax = STATUS_SUCCESS;
 }
 
-/* ── IoCreateFile (ordinal 67, 10 args = 40 bytes) ────── */
-static void bridge_IoCreateFile(void)
-{
-    /* Same as NtCreateFile with an extra Options arg at the end */
-    uint32_t handle_va   = STACK_ARG(0);
-    uint32_t access      = STACK_ARG(1);
-    uint32_t obj_attrs   = STACK_ARG(2);
-    uint32_t iostatus    = STACK_ARG(3);
-    uint32_t file_attrs  = STACK_ARG(5);
-    uint32_t share       = STACK_ARG(6);
-    uint32_t disposition = STACK_ARG(7);
-    uint32_t options     = STACK_ARG(8);
-
-    g_eax = (uint32_t)bridge_create_file_impl(
-        handle_va, access, obj_attrs, iostatus,
-        file_attrs, share, disposition, options);
-}
-
+/* ── IoCreateSymbolicLink (ordinal 67, 2 args = 8 bytes) ────── */
 /* ── NtDeviceIoControlFile (ordinal 196, 10 args = 40 bytes) */
 static void bridge_NtDeviceIoControlFile(void)
 {
@@ -1665,7 +1652,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     /* ── I/O Manager ── */
     case  62: return 36;  /* IoBuildDeviceIoControlRequest(9) */
     /* case  65: DATA export - IoCompletionObjectType */
-    case  67: return 40;  /* IoCreateFile(10) */
+    case  67: return  8;  /* IoCreateSymbolicLink(2) */
     case  69: return  4;  /* IoDeleteDevice(1) */
     /* case  71: DATA export - IoDeviceObjectType */
     case  74: return 12;  /* IoInitializeIrp(3) */
@@ -1893,7 +1880,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
     /* I/O */
     case  63: return bridge_IoCreateSymbolicLink;
-    case  67: return bridge_IoCreateFile;
+    case  67: return bridge_IoCreateSymbolicLink;
     case 188: return bridge_NtCreateDirectoryObject;
     case 246: return bridge_ObReferenceObjectByHandle;
 
