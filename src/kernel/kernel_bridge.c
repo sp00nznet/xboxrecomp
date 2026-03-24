@@ -514,6 +514,24 @@ static void bridge_RtlLeaveCriticalSection(void)
     g_eax = 0;
 }
 
+/* ── RtlInitAnsiString (ordinal 289) ────────────────────────── */
+static void bridge_RtlInitAnsiString(void)
+{
+    uint32_t dest_va = STACK_ARG(0);  /* PANSI_STRING */
+    uint32_t src_va  = STACK_ARG(1);  /* const char* */
+
+    /* Xbox ANSI_STRING: { USHORT Length, USHORT MaxLength, PCHAR Buffer } */
+    if (src_va) {
+        const char *src = (const char *)XBOX_TO_NATIVE(src_va);
+        USHORT len = (USHORT)strlen(src);
+        BRIDGE_MEM32(dest_va + 0) = len | ((UINT32)(len + 1) << 16); /* Length | MaxLength */
+        BRIDGE_MEM32(dest_va + 4) = src_va;  /* Buffer = original Xbox VA */
+    } else {
+        BRIDGE_MEM32(dest_va + 0) = 0;
+        BRIDGE_MEM32(dest_va + 4) = 0;
+    }
+}
+
 /* ── KeQueryPerformanceCounter / Frequency (ordinals 126, 127) ─ */
 static void bridge_KeQueryPerformanceCounter(void)
 {
@@ -1845,6 +1863,9 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 291: return bridge_RtlInitializeCriticalSection;
     case 277: return bridge_RtlEnterCriticalSection;
     case 294: return bridge_RtlLeaveCriticalSection;
+
+    /* String functions */
+    case 289: return bridge_RtlInitAnsiString;
 
     /* Timing */
     case 126: return bridge_KeQueryPerformanceCounter;

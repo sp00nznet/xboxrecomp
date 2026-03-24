@@ -102,6 +102,24 @@ BOOL xbox_translate_path(const char* xbox_path, WCHAR* win_path_buf, DWORD buf_s
         goto translate;
     }
 
+    /* C:\ → system partition (dashboard files, XIP archives) */
+    skip = match_prefix(xbox_path, "C:\\");
+    if (skip) {
+        remainder = xbox_path + skip;
+        base_dir = s_game_dir;
+        sub_dir = NULL;
+        goto translate;
+    }
+
+    /* c:\ (lowercase variant) */
+    skip = match_prefix(xbox_path, "c:\\");
+    if (skip) {
+        remainder = xbox_path + skip;
+        base_dir = s_game_dir;
+        sub_dir = NULL;
+        goto translate;
+    }
+
     /* D:\ → game disc */
     skip = match_prefix(xbox_path, "D:\\");
     if (skip) {
@@ -122,6 +140,7 @@ BOOL xbox_translate_path(const char* xbox_path, WCHAR* win_path_buf, DWORD buf_s
 
     /* T:\ → TitleData (save games) */
     skip = match_prefix(xbox_path, "T:\\");
+    if (!skip) skip = match_prefix(xbox_path, "t:\\");
     if (skip) {
         remainder = xbox_path + skip;
         base_dir = s_save_dir;
