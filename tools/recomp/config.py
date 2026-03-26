@@ -52,11 +52,12 @@ def is_code_address(va):
     """Check if VA is in an executable section (.text or XDK library sections)."""
     if TEXT_VA_START <= va < TEXT_VA_END:
         return True
-    # XDK library sections also contain executable code
+    # XDK library sections also contain executable code.
+    # XIPS contains the XAP parser and IS code despite XBE marking it non-executable.
     for name, sec_va, sec_size, _ in SECTIONS:
-        if name in (".data", ".data1", "XIPS", "EnglishXlate", "JapaneseXlate",
+        if name in (".data", ".data1", "EnglishXlate", "JapaneseXlate",
                      "GermanXlate", "FrenchXlate", "SpanishXlate", "ItalianXlate"):
-            continue  # skip data/resource sections
+            continue  # skip data/resource sections (but NOT XIPS — it's code)
         if sec_va <= va < sec_va + sec_size:
             return True
     return False

@@ -36,7 +36,8 @@ class Disassembler:
                  text_only: bool = False,
                  stats_only: bool = False,
                  verbose: bool = False,
-                 force: bool = False):
+                 force: bool = False,
+                 extra_sections: Optional[list] = None):
         self.xbe_path = xbe_path
         self.analysis_json = analysis_json
         self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
@@ -44,6 +45,7 @@ class Disassembler:
         self.stats_only = stats_only
         self.verbose = verbose
         self.force = force
+        self.extra_sections = extra_sections or []
 
         # Components (initialized during run)
         self.image: Optional[BinaryImage] = None
@@ -201,13 +203,32 @@ class Disassembler:
     def _get_target_sections(self) -> List[SectionInfo]:
         """Determine which sections to disassemble."""
         if self.text_only:
+            sections = []
             text = self.image.get_section(".text")
             if text is None:
                 raise ValueError("No .text section found")
-            return [text]
+            sections.append(text)
+        else:
+            # All executable sections with code
+            sections = list(self.image.get_code_sections())
 
-        # All executable sections with code
-        return self.image.get_code_sections()
+        # Add extra sections (for sections marked non-executable but containing code)
+        if self.extra_sections:
+            existing_names = {s.name for s in sections}
+            for name in self.extra_sections:
+                if name in existing_names:
+                    continue
+                sec = self.image.get_section(name)
+                if sec is None:
+                    print(f"  Warning: extra section '{name}' not found in XBE")
+                elif sec.raw_size == 0:
+                    print(f"  Warning: extra section '{name}' has no raw data")
+                else:
+                    print(f"  Adding extra section '{name}' (VA=0x{sec.virtual_addr:08X}, "
+                          f"size={sec.raw_size} bytes, executable={sec.executable})")
+                    sections.append(sec)
+
+        return sections
 
     def _find_analysis_json(self) -> Optional[str]:
         """Find the analysis JSON file path."""
