@@ -66,11 +66,19 @@ def main():
              "(for sections marked non-executable in the XBE but containing code, "
              "e.g., --extra-sections XIPS,DOLBY)",
     )
+    parser.add_argument(
+        "--seed-functions",
+        default=None,
+        help="JSON file with additional function entry points to seed the detector. "
+             "Format: array of objects with 'start' field (hex address string). "
+             "Use identified_functions.json from func_id to feed back vtable thunks.",
+    )
 
     args = parser.parse_args()
 
     try:
         extra = [s.strip() for s in args.extra_sections.split(",")] if args.extra_sections else []
+        seed_funcs = _load_seed_functions(args.seed_functions) if args.seed_functions else []
         disassembler = Disassembler(
             xbe_path=args.xbe_path,
             analysis_json=args.analysis_json,
@@ -80,6 +88,7 @@ def main():
             verbose=args.verbose,
             force=args.force,
             extra_sections=extra,
+            seed_functions=seed_funcs,
         )
         success = disassembler.run()
         sys.exit(0 if success else 1)
@@ -98,6 +107,20 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(2)
+
+
+def _load_seed_functions(path):
+    """Load seed function addresses from a JSON file."""
+    import json
+    with open(path) as f:
+        data = json.load(f)
+    addrs = []
+    for entry in data:
+        if isinstance(entry, dict) and "start" in entry:
+            addrs.append(int(entry["start"], 16))
+        elif isinstance(entry, int):
+            addrs.append(entry)
+    return addrs
 
 
 if __name__ == "__main__":
