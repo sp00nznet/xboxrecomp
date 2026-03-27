@@ -310,19 +310,46 @@ typedef enum D3DTEXTURESTAGESTATETYPE {
 } D3DTEXTURESTAGESTATETYPE;
 
 typedef enum D3DTEXTUREOP {
-    D3DTOP_DISABLE    = 1,
-    D3DTOP_SELECTARG1 = 2,
-    D3DTOP_SELECTARG2 = 3,
-    D3DTOP_MODULATE   = 4,
-    D3DTOP_MODULATE2X = 5,
-    D3DTOP_MODULATE4X = 6,
-    D3DTOP_ADD        = 7,
-    D3DTOP_ADDSIGNED  = 8,
-    D3DTOP_SUBTRACT   = 10,
-    D3DTOP_DOTPRODUCT3 = 24,
-    D3DTOP_MULTIPLYADD = 25,
-    D3DTOP_LERP       = 26,
+    D3DTOP_DISABLE              = 1,
+    D3DTOP_SELECTARG1           = 2,
+    D3DTOP_SELECTARG2           = 3,
+    D3DTOP_MODULATE             = 4,
+    D3DTOP_MODULATE2X           = 5,
+    D3DTOP_MODULATE4X           = 6,
+    D3DTOP_ADD                  = 7,
+    D3DTOP_ADDSIGNED            = 8,
+    D3DTOP_ADDSIGNED2X          = 9,
+    D3DTOP_SUBTRACT             = 10,
+    D3DTOP_ADDSMOOTH            = 11,
+    D3DTOP_BLENDDIFFUSEALPHA    = 12,
+    D3DTOP_BLENDTEXTUREALPHA    = 13,
+    D3DTOP_BLENDFACTORALPHA     = 14,
+    D3DTOP_BLENDCURRENTALPHA    = 15,
+    D3DTOP_PREMODULATE          = 16,
+    D3DTOP_DOTPRODUCT3          = 24,
+    D3DTOP_MULTIPLYADD          = 25,
+    D3DTOP_LERP                 = 26,
 } D3DTEXTUREOP;
+
+/* Texture argument flags (D3DTA_*) */
+#define D3DTA_DIFFUSE           0x00
+#define D3DTA_CURRENT           0x01
+#define D3DTA_TEXTURE           0x02
+#define D3DTA_TFACTOR           0x03
+#define D3DTA_SPECULAR          0x04
+#define D3DTA_COMPLEMENT        0x10
+#define D3DTA_ALPHAREPLICATE    0x20
+
+/* Light types */
+#define D3DLIGHT_POINT          1
+#define D3DLIGHT_SPOT           2
+#define D3DLIGHT_DIRECTIONAL    3
+
+/* Fog modes */
+#define D3DFOG_NONE             0
+#define D3DFOG_EXP              1
+#define D3DFOG_EXP2             2
+#define D3DFOG_LINEAR           3
 
 typedef enum D3DBLEND {
     D3DBLEND_ZERO            = 1,

@@ -345,6 +345,10 @@ void d3d8_states_apply(void)
     if (g_raster_state)
         ID3D11DeviceContext_RSSetState(ctx, g_raster_state);
 
-    /* Apply sampler for stage 0 (primary texture) */
-    d3d8_states_apply_sampler(0);
+    /* Apply samplers for all 4 texture stages */
+    {
+        DWORD s;
+        for (s = 0; s < 4; s++)
+            d3d8_states_apply_sampler(s);
+    }
 }

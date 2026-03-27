@@ -38,7 +38,7 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 |---------|--------|-------|
 | Device creation/reset/present | DONE | D3D11 backend |
 | Fixed-function vertex transform (FVF) | DONE | HLSL vertex shader |
-| Texture stage states (4 stages) | DONE | MODULATE, ADD, SELECTARG |
+| Texture stage states (4 stages) | DONE | Full D3DTOP set: MODULATE/2X/4X, ADD/SIGNED/2X, SUBTRACT, BLEND*, DOTPRODUCT3 |
 | Render states (blend, depth, stencil, cull) | DONE | ~20 states translated |
 | Vertex/index buffer management | DONE | System memory staging |
 | DrawPrimitive/DrawIndexedPrimitive | DONE | All primitive types |
@@ -46,11 +46,14 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 | Viewport/scissor | DONE | |
 | **Xbox pixel shader (register combiners)** | DONE | d3d8_combiners.c: 8 stages + final, HLSL cache |
 | **Xbox vertex shader (NV2A microcode)** | DONE | d3d8_vsh.c: 14 MAC + 8 ILU ops, 192 constants, 64-entry cache |
-| Multi-texture (beyond stage 0) | PARTIAL | States tracked, shader limited |
-| Bump mapping / normal mapping | MISSING | Needs combiners |
-| Environment mapping | MISSING | Needs combiners + tex coord gen |
-| Per-pixel fog | MISSING | |
-| Hardware T&L lighting | MISSING | Light state stored, not applied |
+| **Multi-texture (4 stages, full TSS ops)** | DONE | All D3DTOP ops, D3DTA args, 4 samplers bound |
+| **Hardware T&L lighting (8 lights)** | DONE | Directional, point, spot; material; global ambient |
+| **Vertex fog (linear/exp/exp2)** | DONE | VS fog factor, PS fog color blending |
+| **Triangle fan conversion** | DONE | Fan/quad → tri list in DrawPrimitiveUP |
+| **DrawPrimitiveUP ring buffer** | DONE | 4MB ring buffer, no per-call buffer create/destroy |
+| Bump mapping / normal mapping | PARTIAL | Register combiners support bump; tex coord gen missing |
+| Environment mapping | PARTIAL | Register combiners handle it; tex coord gen missing |
+| Per-pixel fog (table fog) | MISSING | Vertex fog done; table fog needs PS computation |
 
 ## Kernel
 
@@ -103,8 +106,20 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 
 2. ~~**Vertex shader microcode translation**~~ - DONE. d3d8_vsh.c/h: 1,868 lines. 128-bit instruction parser, HLSL generator for 14 MAC + 8 ILU ops, 64-entry compiled shader cache, 192-constant buffer, input layout management.
 
-3. **WMA audio decoder** - Blood Wake has a WMADEC section. Need either a software WMA decoder or integration with Windows Media Foundation.
+3. ~~**Multi-texture pixel shader**~~ - DONE. Full 4-stage TSS with all D3DTOP operations, D3DTA argument resolution (DIFFUSE, CURRENT, TEXTURE, TFACTOR, SPECULAR + COMPLEMENT/ALPHAREPLICATE modifiers), 4 samplers bound per draw.
 
-4. **Mipmap support** - Currently only level 0. Add mipmap chain upload in texture creation and UnlockRect.
+4. ~~**Hardware T&L lighting**~~ - DONE. Up to 8 lights (directional, point, spot) with material properties, global ambient, specular highlights. World-space normal transform via inverse-transpose matrix.
 
-5. **Multi-texture pixel shader** - Even without full combiners, supporting 2-4 texture stages with basic blending (MODULATE, ADD) in the pixel shader would help many games.
+5. ~~**Vertex fog**~~ - DONE. Linear/exp/exp2 fog modes computed in vertex shader, blended with fog color in pixel shader.
+
+6. ~~**Triangle fan + quad list conversion**~~ - DONE. Fan→tri list and quad→tri list conversion in DrawPrimitiveUP.
+
+7. ~~**DrawPrimitiveUP performance**~~ - DONE. 4MB ring buffer with WRITE_NO_OVERWRITE/WRITE_DISCARD, no per-call buffer create/destroy.
+
+8. **WMA audio decoder** - Blood Wake has a WMADEC section. Need either a software WMA decoder or integration with Windows Media Foundation.
+
+9. **Mipmap support** - Currently only level 0. Add mipmap chain upload in texture creation and UnlockRect.
+
+10. **Texture coordinate generation** - TEXCOORDINDEX with TCI_CAMERASPACENORMAL, TCI_CAMERASPACEPOSITION, TCI_CAMERASPACEREFLECTIONVECTOR for environment mapping.
+
+11. **Per-pixel (table) fog** - Vertex fog is done; table fog needs distance computation in pixel shader.

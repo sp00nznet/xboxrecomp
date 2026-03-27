@@ -15,13 +15,15 @@
 
 ### Recent Changes
 
-- **NV2A Register Combiner Pixel Shaders** — Full 8-stage combiner + final combiner translated to HLSL at runtime with 128-entry shader cache. Enables multi-texturing, environment mapping, bump mapping, and all Xbox rendering techniques.
-- **NV2A Programmable Vertex Shaders** — 128-bit microcode parser and HLSL generator covering all 14 MAC + 8 ILU operations, 192 constant registers, and relative addressing. 64-entry compiled shader cache.
-- **Texture Unswizzling** — Xbox Z-order (Morton code) swizzled textures automatically converted to linear D3D11 layout on upload. Optimized masked-increment algorithm from xemu.
+- **Full Multi-Texture Fixed-Function Pipeline** — 4-stage texture blending with all D3D8 operations (MODULATE, ADD, SUBTRACT, BLEND*, DOTPRODUCT3, etc.), full D3DTA argument resolution (DIFFUSE, CURRENT, TEXTURE, TFACTOR, SPECULAR + COMPLEMENT/ALPHAREPLICATE), and 4 samplers bound per draw.
+- **Hardware T&L Lighting** — Up to 8 lights (directional, point, spot) with material properties, global ambient, specular highlights, and world-space normal transform. Full Blinn-Phong with attenuation and spotlight cones.
+- **Vertex Fog** — Linear/exp/exp2 fog computed in vertex shader, blended with fog color in pixel shader. Fog parameters sourced from D3D8 render states.
+- **DrawPrimitiveUP Ring Buffer** — 4MB persistent ring buffer eliminates per-call D3D11 buffer create/destroy. Triangle fan and quad list to triangle list conversion.
+- **NV2A Register Combiner Pixel Shaders** — Full 8-stage combiner + final combiner translated to HLSL at runtime with 128-entry shader cache.
+- **NV2A Programmable Vertex Shaders** — 128-bit microcode parser and HLSL generator covering all 14 MAC + 8 ILU operations, 192 constant registers, and relative addressing.
+- **Texture Unswizzling** — Xbox Z-order (Morton code) swizzled textures converted to linear D3D11 layout. Optimized masked-increment algorithm from xemu.
 - **NV2A PGRAPH→D3D11 Translator** — Push buffer method interception and D3D11 rendering (upstreamed from Burnout 3).
-- **EEPROM / AV Pack / SMBus** — Games can query region, language, video standard, AV pack type (HDTV/component), and hardware info.
-- **New Game Template** — `templates/new-game/` provides a copy-paste project scaffold for starting any new game recomp.
-- **CONTRIBUTING.md** — Developer onboarding guide for the growing contributor community.
+- **EEPROM / AV Pack / SMBus** — Games can query region, language, video standard, AV pack type, and hardware info.
 - **Three games in progress** — Burnout 3 (rendering), Wreckless (debugging), Blood Wake (analysis complete, scaffolded).
 
 ---
@@ -94,7 +96,7 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 | Library | Source | What It Does |
 |---------|--------|-------------|
 | **xbox_kernel** | Custom | Xbox kernel → Win32 (147+ imports: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
-| **xbox_d3d8** | Custom | D3D8 → D3D11 graphics with **NV2A register combiner** pixel shaders (8 stages + final combiner → runtime HLSL), **programmable vertex shaders** (NV2A microcode → HLSL), texture unswizzling, 20+ format conversions |
+| **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
 | **xbox_apu** | xemu | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
 | **xbox_nv2a** | xemu+Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |

@@ -34,6 +34,12 @@ const DWORD         *d3d8_GetTSS(DWORD stage);
 /* Transform accessors */
 const D3DMATRIX     *d3d8_GetTransform(D3DTRANSFORMSTATETYPE type);
 
+/* Lighting accessors (d3d8_device.c) */
+const D3DLIGHT8     *d3d8_GetLight(DWORD index);
+BOOL                 d3d8_GetLightEnable(DWORD index);
+const D3DMATERIAL8  *d3d8_GetMaterial(void);
+UINT                 d3d8_GetNumLights(void);
+
 /* ================================================================
  * Resource wrapper structures
  * ================================================================ */

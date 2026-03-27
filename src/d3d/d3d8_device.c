@@ -81,6 +81,7 @@ static IDirect3DBaseTexture8  *g_cur_textures[4] = { NULL };
 
 /* Forward declarations */
 static const IDirect3DDevice8Vtbl g_device_vtbl;
+static void up_ring_shutdown(void);
 
 /* ================================================================
  * Public frame pump (called from recompiled game code)
@@ -116,6 +117,22 @@ const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_s
 const DWORD         *d3d8_GetTSS(DWORD stage) { return (stage < MAX_TEXTURE_STAGES) ? g_device_state.tss[stage] : NULL; }
 const D3DMATRIX     *d3d8_GetTransform(D3DTRANSFORMSTATETYPE type) {
     return ((DWORD)type < MAX_TRANSFORMS) ? &g_device_state.transforms[(DWORD)type] : NULL;
+}
+
+const D3DLIGHT8     *d3d8_GetLight(DWORD index) {
+    return (index < MAX_LIGHTS) ? &g_device_state.lights[index] : NULL;
+}
+
+BOOL                 d3d8_GetLightEnable(DWORD index) {
+    return (index < MAX_LIGHTS) ? g_device_state.light_enable[index] : FALSE;
+}
+
+const D3DMATERIAL8  *d3d8_GetMaterial(void) {
+    return &g_device_state.material;
+}
+
+UINT                 d3d8_GetNumLights(void) {
+    return MAX_LIGHTS;
 }
 
 /* ================================================================
@@ -286,6 +303,7 @@ static ULONG __stdcall dev_Release(IDirect3DDevice8 *self)
     LONG ref = InterlockedDecrement(&g_device_state.ref_count);
     if (ref <= 0) {
         /* Cleanup subsystems first */
+        up_ring_shutdown();
         d3d8_vsh_shutdown();
         d3d8_combiners_shutdown();
         d3d8_states_shutdown();
@@ -581,12 +599,134 @@ static D3D11_PRIMITIVE_TOPOLOGY map_primitive_type(D3DPRIMITIVETYPE pt, UINT cou
     switch (pt) {
     case D3DPT_TRIANGLELIST:  *out_count = count * 3; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     case D3DPT_TRIANGLESTRIP: *out_count = count + 2; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
-    case D3DPT_TRIANGLEFAN:   *out_count = count * 3; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST; /* needs conversion */
+    case D3DPT_TRIANGLEFAN:   *out_count = count * 3; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     case D3DPT_LINELIST:      *out_count = count * 2; return D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
     case D3DPT_LINESTRIP:     *out_count = count + 1; return D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
     case D3DPT_POINTLIST:     *out_count = count;     return D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
+    case D3DPT_QUADLIST:      *out_count = count * 6; return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     default:                  *out_count = 0;          return D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
     }
+}
+
+/* ================================================================
+ * Triangle fan / quad list → triangle list conversion
+ *
+ * D3D11 doesn't support triangle fans or quad lists.
+ * Convert vertex data in-place to triangle list.
+ * Returns malloc'd buffer (caller must free) or NULL if no conversion needed.
+ * ================================================================ */
+
+static void *convert_fan_or_quad(D3DPRIMITIVETYPE pt, const void *src,
+                                  UINT prim_count, UINT stride,
+                                  UINT *out_vertex_count)
+{
+    BYTE *dst;
+    const BYTE *s = (const BYTE *)src;
+    UINT i;
+
+    if (pt == D3DPT_TRIANGLEFAN) {
+        /* Fan: vertex 0 is the hub, each triangle is (0, i+1, i+2) */
+        UINT tri_verts = prim_count * 3;
+        dst = (BYTE *)malloc(tri_verts * stride);
+        if (!dst) return NULL;
+
+        for (i = 0; i < prim_count; i++) {
+            memcpy(dst + (i * 3 + 0) * stride, s, stride);                      /* v0 (hub) */
+            memcpy(dst + (i * 3 + 1) * stride, s + (i + 1) * stride, stride);   /* v[i+1] */
+            memcpy(dst + (i * 3 + 2) * stride, s + (i + 2) * stride, stride);   /* v[i+2] */
+        }
+        *out_vertex_count = tri_verts;
+        return dst;
+    }
+
+    if (pt == D3DPT_QUADLIST) {
+        /* Quad list: each quad (v0,v1,v2,v3) → 2 triangles (v0,v1,v2), (v0,v2,v3) */
+        UINT tri_verts = prim_count * 6;
+        dst = (BYTE *)malloc(tri_verts * stride);
+        if (!dst) return NULL;
+
+        for (i = 0; i < prim_count; i++) {
+            const BYTE *q = s + i * 4 * stride;
+            memcpy(dst + (i * 6 + 0) * stride, q + 0 * stride, stride);  /* v0 */
+            memcpy(dst + (i * 6 + 1) * stride, q + 1 * stride, stride);  /* v1 */
+            memcpy(dst + (i * 6 + 2) * stride, q + 2 * stride, stride);  /* v2 */
+            memcpy(dst + (i * 6 + 3) * stride, q + 0 * stride, stride);  /* v0 */
+            memcpy(dst + (i * 6 + 4) * stride, q + 2 * stride, stride);  /* v2 */
+            memcpy(dst + (i * 6 + 5) * stride, q + 3 * stride, stride);  /* v3 */
+        }
+        *out_vertex_count = tri_verts;
+        return dst;
+    }
+
+    return NULL; /* no conversion needed */
+}
+
+/* ================================================================
+ * DrawPrimitiveUP ring buffer
+ *
+ * Instead of creating and destroying a D3D11 buffer on every
+ * DrawPrimitiveUP call, use a persistent ring buffer.
+ * ================================================================ */
+
+#define UP_RING_BUFFER_SIZE (4 * 1024 * 1024)  /* 4MB ring buffer */
+
+static ID3D11Buffer *g_up_ring_buffer = NULL;
+static UINT          g_up_ring_offset = 0;
+
+static HRESULT up_ring_init(void)
+{
+    D3D11_BUFFER_DESC bd;
+    memset(&bd, 0, sizeof(bd));
+    bd.ByteWidth = UP_RING_BUFFER_SIZE;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    return ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, NULL, &g_up_ring_buffer);
+}
+
+static void up_ring_shutdown(void)
+{
+    if (g_up_ring_buffer) {
+        ID3D11Buffer_Release(g_up_ring_buffer);
+        g_up_ring_buffer = NULL;
+    }
+    g_up_ring_offset = 0;
+}
+
+/* Upload vertex data to ring buffer, returns offset. Returns (UINT)-1 on failure. */
+static UINT up_ring_upload(const void *data, UINT size)
+{
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    D3D11_MAP map_type;
+    HRESULT hr;
+    UINT offset;
+
+    if (!g_up_ring_buffer) {
+        if (FAILED(up_ring_init())) return (UINT)-1;
+    }
+
+    if (size > UP_RING_BUFFER_SIZE) return (UINT)-1;
+
+    /* Wrap around if not enough space */
+    if (g_up_ring_offset + size > UP_RING_BUFFER_SIZE) {
+        g_up_ring_offset = 0;
+        map_type = D3D11_MAP_WRITE_DISCARD;
+    } else {
+        map_type = D3D11_MAP_WRITE_NO_OVERWRITE;
+    }
+
+    hr = ID3D11DeviceContext_Map(g_device_state.d3d11_context,
+        (ID3D11Resource *)g_up_ring_buffer, 0, map_type, 0, &mapped);
+    if (FAILED(hr)) return (UINT)-1;
+
+    offset = g_up_ring_offset;
+    memcpy((BYTE *)mapped.pData + offset, data, size);
+
+    ID3D11DeviceContext_Unmap(g_device_state.d3d11_context,
+        (ID3D11Resource *)g_up_ring_buffer, 0);
+
+    g_up_ring_offset = (offset + size + 15) & ~15;  /* 16-byte align */
+    return offset;
 }
 
 static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self, D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount)
@@ -637,33 +777,34 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
     (void)self;
     g_d3d_draw_count++;
     D3D11_PRIMITIVE_TOPOLOGY topology;
-    D3D11_BUFFER_DESC bd;
-    D3D11_SUBRESOURCE_DATA sd;
-    ID3D11Buffer *tmp_vb = NULL;
-    UINT vertex_count, vb_size, offset = 0;
-    HRESULT hr;
+    UINT vertex_count, vb_size, ring_offset;
+    const void *draw_data = pVertexData;
+    void *converted = NULL;
 
     if (!pVertexData || !VertexStreamZeroStride) return E_INVALIDARG;
 
     topology = map_primitive_type(PrimitiveType, PrimitiveCount, &vertex_count);
     if (vertex_count == 0) return E_INVALIDARG;
 
+    /* Convert triangle fans and quad lists to triangle lists */
+    if (PrimitiveType == D3DPT_TRIANGLEFAN || PrimitiveType == D3DPT_QUADLIST) {
+        converted = convert_fan_or_quad(PrimitiveType, pVertexData,
+                                         PrimitiveCount, VertexStreamZeroStride,
+                                         &vertex_count);
+        if (converted) draw_data = converted;
+    }
+
     vb_size = vertex_count * VertexStreamZeroStride;
 
-    /* Create temporary vertex buffer with initial data */
-    memset(&bd, 0, sizeof(bd));
-    bd.ByteWidth = vb_size;
-    bd.Usage = D3D11_USAGE_IMMUTABLE;
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    memset(&sd, 0, sizeof(sd));
-    sd.pSysMem = pVertexData;
+    /* Upload to ring buffer */
+    ring_offset = up_ring_upload(draw_data, vb_size);
+    if (converted) free(converted);
 
-    hr = ID3D11Device_CreateBuffer(g_device_state.d3d11_device, &bd, &sd, &tmp_vb);
-    if (FAILED(hr)) return hr;
+    if (ring_offset == (UINT)-1) return E_OUTOFMEMORY;
 
-    /* Bind temp VB, prepare pipeline, draw */
+    /* Bind ring buffer at the right offset */
     ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
-        0, 1, &tmp_vb, &VertexStreamZeroStride, &offset);
+        0, 1, &g_up_ring_buffer, &VertexStreamZeroStride, &ring_offset);
 
     /* Vertex shader: try programmable VS first, fall back to FVF fixed-function */
     if (!d3d8_vsh_prepare_draw(g_device_state.vertex_shader))
@@ -674,15 +815,12 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self, D3DPRIMITIV
     ID3D11DeviceContext_IASetPrimitiveTopology(g_device_state.d3d11_context, topology);
     ID3D11DeviceContext_Draw(g_device_state.d3d11_context, vertex_count, 0);
 
-    /* Release temp buffer */
-    ID3D11Buffer_Release(tmp_vb);
-
     /* Restore previous VB binding if any */
     if (g_cur_vb) {
         D3D8VertexBuffer *vb = (D3D8VertexBuffer *)g_cur_vb;
-        offset = 0;
+        UINT restore_offset = 0;
         ID3D11DeviceContext_IASetVertexBuffers(g_device_state.d3d11_context,
-            0, 1, &vb->d3d11_buffer, &g_cur_vb_stride, &offset);
+            0, 1, &vb->d3d11_buffer, &g_cur_vb_stride, &restore_offset);
     }
     return S_OK;
 }
@@ -877,12 +1015,14 @@ static HRESULT __stdcall dev_CreateVertexShader(IDirect3DDevice8 *self, const DW
     if (!pHandle) return E_INVALIDARG;
     if (!pFunction) return E_INVALIDARG;
     /* Count instructions: each is 4 DWORDs, last has bit 0 of word[3] set (END flag) */
-    int num_insns = 0;
-    for (int i = 0; i < 136; i++) {
-        num_insns++;
-        if (pFunction[i * 4 + 3] & 1) break;  /* END bit in last word */
+    {
+        int i, num_insns = 0;
+        for (i = 0; i < 136; i++) {
+            num_insns++;
+            if (pFunction[i * 4 + 3] & 1) break;  /* END bit in last word */
+        }
+        return d3d8_vsh_create_shader(pFunction, num_insns, pHandle);
     }
-    return d3d8_vsh_create_shader(pFunction, num_insns, pHandle);
 }
 
 static HRESULT __stdcall dev_SetVertexShader(IDirect3DDevice8 *self, DWORD Handle)
