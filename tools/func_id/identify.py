@@ -123,8 +123,17 @@ def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
     if verbose:
         print("\nPhase 5: Vtable scanning...")
     t5 = time.time()
+
+    # Parse section info from XBE for game-agnostic vtable scanning
+    xbe_sections = _parse_xbe_sections(xbe_data)
+    if verbose and xbe_sections:
+        code_count = sum(1 for s in xbe_sections if s.get("executable"))
+        data_count = len(xbe_sections) - code_count
+        print(f"  XBE sections: {len(xbe_sections)} ({code_count} code, {data_count} data)")
+
     vtable_results, vtables = scan_vtables(
-        xbe_data, functions, imm_refs, verbose=verbose
+        xbe_data, functions, imm_refs, verbose=verbose,
+        sections=xbe_sections if xbe_sections else None
     )
     # Only classify functions not already labeled by earlier phases
     already_labeled = set(rw_results) | set(crt_results) | set(propagated) | set(stub_results)
@@ -135,6 +144,27 @@ def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
 
     # Merge vtable results into propagated for output
     propagated.update(vtable_new)
+
+    # Add discovered vtable thunks as new function entries
+    func_starts = {int(f["start"], 16) for f in functions}
+    thunk_count = 0
+    for addr, info in vtable_results.items():
+        if addr not in func_starts and info.get("method") == "vtable_thunk":
+            est_size = 32  # estimate; refined later if re-disassembled
+            functions.append({
+                "start": f"0x{addr:08X}",
+                "end": f"0x{addr + est_size:08X}",
+                "size": est_size,
+                "name": f"sub_{addr:08X}",
+                "section": ".text",
+                "insn_count": 8,
+                "type": "vtable_thunk",
+                "vtable_addr": f"0x{info.get('vtable_addr', 0):08X}",
+                "vtable_index": info.get("vtable_index", -1),
+            })
+            thunk_count += 1
+    if verbose and thunk_count:
+        print(f"  Added {thunk_count} vtable thunks to function list")
 
     # ── Phase 6: Write output ────────────────────────────────
     if verbose:
@@ -199,6 +229,71 @@ def _merge_xref_data_reads(xrefs, functions, imm_refs, verbose):
                 imm_refs[target].append(func_addr)
 
     return count
+
+
+def _parse_xbe_sections(xbe_data):
+    """
+    Parse section info directly from XBE headers.
+
+    Returns list of dicts: {name, va, size, raw, executable}
+    Returns None if parsing fails (falls back to config).
+    """
+    import struct
+
+    if len(xbe_data) < 0x180:
+        return None
+
+    # XBE header magic check
+    if xbe_data[:4] != b'XBEH':
+        return None
+
+    try:
+        # Section headers offset and count
+        sec_headers_offset = struct.unpack_from('<I', xbe_data, 0x120)[0]
+        num_sections = struct.unpack_from('<I', xbe_data, 0x11C)[0]
+
+        # XBE base address
+        base_addr = struct.unpack_from('<I', xbe_data, 0x104)[0]
+
+        # Adjust section headers offset to be relative to file start
+        sec_offset = sec_headers_offset - base_addr
+
+        sections = []
+        for i in range(num_sections):
+            off = sec_offset + i * 56  # Each section header is 56 bytes
+            if off + 56 > len(xbe_data):
+                break
+
+            flags = struct.unpack_from('<I', xbe_data, off + 0)[0]
+            va = struct.unpack_from('<I', xbe_data, off + 4)[0]
+            vsize = struct.unpack_from('<I', xbe_data, off + 8)[0]
+            raw_addr = struct.unpack_from('<I', xbe_data, off + 12)[0]
+            raw_size = struct.unpack_from('<I', xbe_data, off + 16)[0]
+            name_addr = struct.unpack_from('<I', xbe_data, off + 20)[0]
+
+            # Read section name
+            name_off = name_addr - base_addr
+            if 0 <= name_off < len(xbe_data) - 16:
+                name_end = xbe_data.index(b'\0', name_off) if b'\0' in xbe_data[name_off:name_off+32] else name_off+8
+                name = xbe_data[name_off:name_end].decode('ascii', errors='replace')
+            else:
+                name = f"sec_{i}"
+
+            executable = bool(flags & 0x4)  # Section flag for executable
+
+            sections.append({
+                "name": name,
+                "va": va,
+                "size": vsize,
+                "raw": raw_addr,
+                "raw_size": raw_size,
+                "executable": executable,
+            })
+
+        return sections if sections else None
+
+    except Exception:
+        return None
 
 
 def _load_binary(path):
