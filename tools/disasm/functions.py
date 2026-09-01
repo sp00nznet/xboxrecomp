@@ -112,10 +112,13 @@ class FunctionDetector:
         # Pass 4: Call targets
         self._pass_call_targets(sections)
 
-        # Pass 5: Build functions from candidates
+        # Pass 5: Code addresses stored as immediates
+        self._pass_code_pointers()
+
+        # Pass 6: Build functions from candidates
         self._build_functions(sections)
 
-        # Pass 6: Tail-jump targets. A function reached only by "jmp" and never
+        # Pass 7: Tail-jump targets. A function reached only by "jmp" and never
         # by "call" is invisible to every pass above, so it is emitted as a stub
         # that returns without unwinding the frame its jumping caller built --
         # silently corrupting the simulated stack for everything upstream. Halo
@@ -377,6 +380,29 @@ class FunctionDetector:
                 detection_method="tail_jump_alias",
                 num_instructions=len(insns),
                 has_prologue=False,
+            )
+
+    def _pass_code_pointers(self) -> None:
+        """Add stored code addresses as function-start candidates.
+
+        Callbacks stored in tables are not direct call targets, so the other
+        detection passes can miss them. Requiring an existing instruction
+        boundary in an executable section avoids promoting ordinary integer or
+        data addresses.
+        """
+        for insn in self.engine.instructions.values():
+            target = insn.imm_ref
+            if target is None or target in self._candidates:
+                continue
+            if target not in self.engine.instructions:
+                continue
+            section = self.image.get_section_at_va(target)
+            if section is None or not section.executable:
+                continue
+            self._add_candidate(
+                target,
+                config.CONFIDENCE_CODE_POINTER,
+                "code_pointer",
             )
 
     def _build_functions(self, sections: List[SectionInfo]) -> None:
