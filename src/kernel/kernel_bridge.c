@@ -514,7 +514,27 @@ static void bridge_PsCreateSystemThreadEx(void)
                  * Now that the register set is thread-local (RECOMP_TLS), a
                  * spawned thread gets its own, and the caller's is untouched by
                  * construction rather than by save/restore. */
-                uint32_t stack_top = xbox_AllocThreadStack();
+                /* RECOMP_WORKERS=inline runs a title's worker routines on
+                 * the calling thread instead of spawning one.
+                 *
+                 * Not a mode to ship a title in -- a worker that blocks
+                 * waiting for requests never returns, and the caller never
+                 * gets control back. It is a bisecting tool: when something
+                 * only goes wrong with two guest threads running, this says so
+                 * in one run, and the answer separates a concurrency bug from
+                 * everything else it might have been. */
+                const char *inline_workers = getenv("RECOMP_WORKERS");
+                uint32_t stack_top;
+
+                if (inline_workers && !strcmp(inline_workers, "inline")) {
+                    fprintf(stderr, "  [KERNEL] RECOMP_WORKERS=inline: running "
+                            "worker 0x%08X on this thread\n", start_routine);
+                    fflush(stderr);
+                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    return;
+                }
+
+                stack_top = xbox_AllocThreadStack();
 
                 if (!stack_top) {
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: out of "
