@@ -814,7 +814,10 @@ class FunctionTranslator:
         # bsf/bsr publish ZF through the same pair (the source, against 0), so
         # a function whose only flag-setter is a bit scan still needs them --
         # sub_000EEA10 in Wreckless is exactly `bsf eax, ecx; ret`.
-        if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr")
+        # cmpxchg belongs here too: it snapshots the compare it performed,
+        # because eax may be replaced before the branch reads the result.
+        if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
+                                 "lock cmpxchg")
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")

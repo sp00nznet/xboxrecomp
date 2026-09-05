@@ -1330,9 +1330,7 @@ class Lifter:
                     return [
                         "{ uint32_t _old = RECOMP_ATOMIC_ADD32("
                         f"XBOX_PTR({addr}), {src});",
-                        "  " + _fmt_operand_write(ops[1], "_old"),
-                        f"  _fa = _old + {src}; _fb = 0;",
-                        "  _fas = (int32_t)_fa; _fbs = (int32_t)_fb; }"
+                        "  " + _fmt_operand_write(ops[1], "_old") + " }"
                         f"  /* {m} */",
                     ]
                 # cmpxchg: compare eax with dst; on a match store src, else
