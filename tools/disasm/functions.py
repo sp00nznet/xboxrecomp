@@ -146,6 +146,11 @@ class FunctionDetector:
             self.functions.clear()
             self._build_functions(sections)
 
+        # A function that begins immediately after a ret, with no padding.
+        if self._pass_gap_prologues(sections):
+            self.functions.clear()
+            self._build_functions(sections)
+
         # Then the same for addresses that only ever exist as table entries.
         # After the immediate pass, so its results narrow the gaps first. These
         # become aliases rather than function starts, so no rebuild: aliases are
@@ -161,6 +166,61 @@ class FunctionDetector:
         self._build_call_graph()
 
         return len(self.functions)
+
+    def _pass_gap_prologues(self, sections: List[SectionInfo]) -> bool:
+        """A function that starts right after a ret, with no padding between.
+
+        _pass_cc_boundaries only recognises a boundary when the compiler left
+        int3 padding to the next alignment. It usually does -- but not when the
+        next function happens to start on the boundary already, and then a
+        clean prologue sits immediately after the previous function's ret with
+        nothing to mark it.
+
+        Nothing else covers that case either. Such a function is not a call
+        target if it is only ever reached through a vtable, and the prologue
+        pass looks for "push ebp; mov ebp, esp", which an FPO function like
+        "sub esp, 0x18" does not have.
+
+        Restricted to addresses in an unclaimed gap, which makes it safe by
+        construction rather than by judgement: MSVC parks out-of-line tails
+        after a ret too, and those look identical from here. The difference is
+        that a tail belongs to the function above it, so _find_function_end has
+        already walked over it and it is not in a gap. Half-Life 2 has 20 of
+        these; 12 are in gaps and 8 are tails, and the gap test separates them.
+
+        The one that mattered was 0x00476EB0, a material-system method reached
+        only through a shader's vtable. Unresolved, the call was skipped rather
+        than made, so eax kept a stale value that the caller then used as a
+        string pointer.
+        """
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+
+        def in_a_gap(addr: int) -> bool:
+            i = bisect.bisect_right(starts, addr) - 1
+            return not (i >= 0 and addr < bounds[i][1])
+
+        added = False
+        for insn in list(self.engine.instructions.values()):
+            if not insn.is_ret:
+                continue
+            nxt = insn.end_address
+            if nxt in self._candidates or nxt in self.functions:
+                continue
+            section = self.image.get_section_at_va(nxt)
+            if section is None or not section.executable:
+                continue
+            if not in_a_gap(nxt):
+                continue                    # an out-of-line tail, not a start
+            if not self.engine.probes_as_prologue(nxt):
+                continue
+            self._add_candidate(nxt, config.CONFIDENCE_CC_BOUNDARY,
+                                "gap_prologue")
+            added = True
+
+        if added:
+            print("  functions recovered that follow a ret with no padding")
+        return added
 
     def _pass_seed_aliases(self) -> None:
         """
