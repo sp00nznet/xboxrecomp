@@ -226,7 +226,7 @@ class FunctionDetector:
             # return path, and splitting one of those would cut a function in
             # half -- but those are covered, so they are not in a gap.
             if not (self.engine.probes_as_prologue(nxt)
-                    or self.engine.probes_as_returning_body(nxt, max_insns=8)):
+                    or self.engine.probes_as_constant_stub(nxt)):
                 continue
             self._add_candidate(nxt, config.CONFIDENCE_CC_BOUNDARY,
                                 "gap_prologue")

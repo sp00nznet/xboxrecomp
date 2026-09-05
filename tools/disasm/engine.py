@@ -546,6 +546,47 @@ class DisasmEngine:
 
         return False
 
+    def probes_as_constant_stub(self, addr: int) -> bool:
+        """Is this the whole of a constant-returning accessor?
+
+            mov <reg>, <imm32>
+            ret [imm16]
+
+        MSVC emits runs of these for members that return a fixed address, packs
+        them back to back with no padding, and reaches them only through
+        vtables -- so no pass that looks for a prologue, padding or a call site
+        finds them. Half-Life 2 has 3,147.
+
+        Matched exactly, and not by asking a general "does a ret come soon"
+        probe. That was tried: allowing any short run ending in ret added 825
+        function starts instead of the 19 this shape accounts for, because data
+        and mid-function fragments satisfy it too, and the title stopped
+        loading. The narrow rule is the honest one -- it is what was measured.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        if not data:
+            return False
+        offset = addr - section.virtual_addr
+        if offset < 0 or offset >= len(data):
+            return False
+
+        insns = list(self._cs.disasm(data[offset:offset + 12], addr, count=2))
+        if len(insns) != 2:
+            return False
+        first, second = insns
+        if first.mnemonic != "mov":
+            return False
+        try:
+            ops = first.operands
+        except Exception:
+            return False
+        if len(ops) != 2 or ops[0].type != CS_OP_REG or ops[1].type != CS_OP_IMM:
+            return False
+        return second.mnemonic in config.RET_MNEMONICS
+
     def probes_as_function_body(self, addr: int,
                                 max_insns: int = 8192) -> bool:
         """
