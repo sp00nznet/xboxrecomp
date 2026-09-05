@@ -570,6 +570,9 @@ NTSTATUS __stdcall xbox_RtlUnicodeStringToAnsiString(
 BOOLEAN __stdcall xbox_RtlEqualString(PXBOX_ANSI_STRING String1, PXBOX_ANSI_STRING String2, BOOLEAN CaseInSensitive);
 ULONG   __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pattern);
 
+/* Name contended CRT locks by index instead of by address. */
+void xbox_SetCrtLockTable(uint32_t table_va, uint32_t count);
+
 VOID    __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);
 VOID    __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection);

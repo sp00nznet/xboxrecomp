@@ -256,6 +256,37 @@ extern ptrdiff_t g_xbox_mem_offset;
 static LONG g_cs_contention_reports;
 static LONG g_cs_enters, g_cs_leaves;
 
+/* Which CRT lock is this?
+ *
+ * MSVC keeps its internal locks in a table of {CRITICAL_SECTION*, refcount}
+ * pairs, so a contended address can be named by its index rather than left as
+ * a bare pointer. The index is what the CRT's own headers document: 1 is the
+ * stdio scan lock, 4 the heap, and 16 upwards are the per-stream locks. The
+ * table's address is per-title, so it is supplied rather than assumed.
+ */
+static uint32_t g_crt_lock_table, g_crt_lock_count;
+
+void xbox_SetCrtLockTable(uint32_t table_va, uint32_t count)
+{
+    g_crt_lock_table = table_va;
+    g_crt_lock_count = count;
+}
+
+static int xbox_crt_lock_index(uint32_t guest_va)
+{
+    uint32_t i;
+
+    if (!g_crt_lock_table)
+        return -1;
+    for (i = 0; i < g_crt_lock_count; i++) {
+        uint32_t slot = *(const uint32_t *)((uintptr_t)(g_crt_lock_table + i * 8)
+                                            + g_xbox_mem_offset);
+        if (slot == guest_va)
+            return (int)i;
+    }
+    return -1;
+}
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
@@ -271,6 +302,13 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
                 (uint32_t)((uintptr_t)CriticalSection
                            - (uintptr_t)g_xbox_mem_offset),
                 (unsigned long)(uintptr_t)cs->OwningThread);
+        {
+            int idx = xbox_crt_lock_index(
+                (uint32_t)((uintptr_t)CriticalSection
+                           - (uintptr_t)g_xbox_mem_offset));
+            if (idx >= 0)
+                fprintf(stderr, "  [CS]   that is CRT lock %d\n", idx);
+        }
         fprintf(stderr, "  [CS] enters=%ld leaves=%ld (outstanding %ld)\n",
                 g_cs_enters, g_cs_leaves, g_cs_enters - g_cs_leaves);
         fflush(stderr);
