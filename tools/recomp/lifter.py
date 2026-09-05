@@ -680,10 +680,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── cmpxchg: compares accumulator with dest, sets ZF on match ──
     if flag_setter == "cmpxchg":
+        # ZF comes from the compare the instruction already did, and the lift
+        # snapshots it into _fa/_fb. Re-reading eax here would test a value
+        # cmpxchg may have just replaced.
         if jcc in ("je", "jz"):
-            return f"({lhs} == eax)", desc
+            return "(_fa == _fb)", desc
         if jcc in ("jne", "jnz"):
-            return f"({lhs} != eax)", desc
+            return "(_fa != _fb)", desc
         return None
 
     # ── xadd: exchange and add, flags from addition ──
@@ -1298,6 +1301,54 @@ class Lifter:
                 "    " + _fmt_operand_write(ops[0], "(uint32_t)_bs_i") + ";",
                 f"  }} else {{ (void)({dst}); }} }}",
             ]
+
+        # ── Atomic read-modify-write ──
+        #
+        # "lock xadd" and "lock cmpxchg" are what InterlockedIncrement and
+        # InterlockedCompareExchange compile to, so they carry a title's
+        # reference counts and its lock-free lists. Both used to fall through
+        # to the TODO below: a refcount that never moved and a compare-and-swap
+        # that never swapped. Harmless while every guest thread ran
+        # synchronously, and not once the runtime began spawning real ones.
+        #
+        # Emitted through RECOMP_ATOMIC_*, which are genuinely atomic. A
+        # read-modify-write that races is the exact bug these instructions are
+        # there to prevent, so lowering them to a plain sequence would swap one
+        # silent race for another.
+        # Capstone keeps the prefix in the mnemonic, so the locked and
+        # unlocked spellings both arrive here. Both lift atomically: an
+        # unlocked xadd on memory is single-CPU-safe on the console and
+        # costs nothing extra to make safe here.
+        atomic_m = m[5:] if m.startswith("lock ") else m
+        if atomic_m in ("xadd", "cmpxchg") and len(ops) >= 2:
+            width = _operand_width(ops[0]) or 4
+            if width == 4 and ops[0].type == "mem":
+                addr = _fmt_mem(ops[0])
+                src = _fmt_operand_read(ops[1])
+                if atomic_m == "xadd":
+                    # dst = dst + src, and src receives dst's old value.
+                    return [
+                        "{ uint32_t _old = RECOMP_ATOMIC_ADD32("
+                        f"XBOX_PTR({addr}), {src});",
+                        "  " + _fmt_operand_write(ops[1], "_old"),
+                        f"  _fa = _old + {src}; _fb = 0;",
+                        "  _fas = (int32_t)_fa; _fbs = (int32_t)_fb; }"
+                        f"  /* {m} */",
+                    ]
+                # cmpxchg: compare eax with dst; on a match store src, else
+                # load dst into eax. ZF says which happened, and it is
+                # snapshotted rather than recomputed -- eax may have just been
+                # overwritten, so re-reading it to decide the branch would test
+                # the wrong pair.
+                return [
+                    "{ uint32_t _cmp = eax;",
+                    "  uint32_t _old = RECOMP_ATOMIC_CAS32("
+                    f"XBOX_PTR({addr}), _cmp, {src});",
+                    "  _fa = _old; _fb = _cmp;",
+                    "  _fas = (int32_t)_fa; _fbs = (int32_t)_fb;",
+                    "  if (_old != _cmp) eax = _old; }"
+                    f"  /* {m} */",
+                ]
 
         # ── Unhandled ──
         #

@@ -191,6 +191,28 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
  * for a buffer that has no native counterpart, leaving the caller to fall back
  * to the guest's own longjmp.
  */
+/* Atomic read-modify-write, for the lock-prefixed instructions.
+ *
+ * "lock xadd" and "lock cmpxchg" are what InterlockedIncrement and
+ * InterlockedCompareExchange compile to, so they carry a title's reference
+ * counts and its lock-free lists. They used to lift to a TODO comment, which
+ * meant a refcount that never moved and a compare-and-swap that never swapped
+ * -- harmless while every guest thread ran synchronously, and not once the
+ * runtime began spawning real ones.
+ *
+ * Genuinely atomic, not merely correct in isolation: the guest's own threads
+ * now run on real host threads, so a read-modify-write that races is exactly
+ * the bug these instructions exist to prevent.
+ */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)_InterlockedCompareExchange((volatile long *)(p),                                            (long)(val), (long)(cmp)))
+#else
+#define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)__sync_fetch_and_add((volatile uint32_t *)(p), (uint32_t)(v)))
+#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p),                                            (uint32_t)(cmp), (uint32_t)(val)))
+#endif
+
 #include <setjmp.h>
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);

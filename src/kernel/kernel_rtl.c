@@ -158,34 +158,108 @@ ULONG __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pat
  * ============================================================================ */
 
 /*
- * Critical section operations are no-ops for now.
+ * Critical sections, shadowed onto real host locks.
  *
- * The Xbox CRITICAL_SECTION is a 20-byte 32-bit structure that's
- * incompatible with the Windows 64-bit CRITICAL_SECTION (40 bytes).
- * Passing Xbox memory pointers to native Windows CS functions would
- * corrupt memory. Since the recompiled game runs single-threaded
- * (all Xbox threads are called synchronously), there's no contention
- * and no-ops are correct.
+ * These used to be no-ops, on the stated grounds that every Xbox thread ran
+ * synchronously so there was no contention. That stopped being true when
+ * PsCreateSystemThreadEx began spawning real threads: a title's worker and its
+ * main thread now run at the same time on different host threads, and the
+ * locks the title takes to keep them apart did nothing.
  *
- * TODO: If multithreading is needed, implement a shadow CS mapping
- * (Xbox VA → native Windows CRITICAL_SECTION).
+ * The failure that produced is worth describing, because it looks like
+ * anything but a lock. Half-Life 2's level load faulted intermittently -- four
+ * runs, three different functions, one clean -- and any attempt to observe it
+ * made it disappear, including two plain stores to globals. Registers held
+ * fragments of strings where pointers belonged, which is what a half-updated
+ * structure looks like from the other thread.
+ *
+ * The Xbox RTL_CRITICAL_SECTION is 20 bytes of 32-bit layout and a Win32
+ * CRITICAL_SECTION is 40 bytes of 64-bit layout, so the guest's own structure
+ * cannot back a host lock. Shadow it instead: the guest pointer is the key,
+ * the host lock lives here, and the guest's bytes are left alone. Win32
+ * critical sections are recursive, which matches RTL semantics.
+ *
+ * Lazily created on first use rather than in RtlInitializeCriticalSection,
+ * because a title can perfectly well use a statically zeroed one it never
+ * announced.
  */
+#define XBOX_CS_TABLE_SIZE 4096
+
+typedef struct {
+    uintptr_t        key;        /* guest critical section; 0 means free */
+    CRITICAL_SECTION cs;
+} XBOX_CS_SLOT;
+
+static XBOX_CS_SLOT g_cs_table[XBOX_CS_TABLE_SIZE];
+static SRWLOCK      g_cs_table_lock = SRWLOCK_INIT;
+static int          g_cs_table_full;
+
+static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
+{
+    uintptr_t key = (uintptr_t)guest;
+    CRITICAL_SECTION* found = NULL;
+    size_t home, i;
+
+    if (!key)
+        return NULL;
+    home = (size_t)((key >> 4) % XBOX_CS_TABLE_SIZE);
+
+    /* Shared pass first: after start-up almost every call finds an existing
+     * entry, and taking the table exclusively for each of those would put a
+     * global serialisation point in front of the title's own locks. */
+    AcquireSRWLockShared(&g_cs_table_lock);
+    for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
+        XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
+        if (slot->key == key) { found = &slot->cs; break; }
+        if (slot->key == 0) break;
+    }
+    ReleaseSRWLockShared(&g_cs_table_lock);
+    if (found)
+        return found;
+
+    AcquireSRWLockExclusive(&g_cs_table_lock);
+    for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
+        XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
+        if (slot->key == key) { found = &slot->cs; break; }
+        if (slot->key == 0) {
+            InitializeCriticalSection(&slot->cs);
+            slot->key = key;             /* published last: a shared reader
+                                          * that sees the key sees a live
+                                          * lock behind it */
+            found = &slot->cs;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_cs_table_lock);
+
+    if (!found && !g_cs_table_full) {
+        g_cs_table_full = 1;
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_RTL,
+                 "critical-section table full at %d entries; further locks "
+                 "are unprotected", XBOX_CS_TABLE_SIZE);
+    }
+    return found;
+}
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution, no contention */
+    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    if (cs)
+        EnterCriticalSection(cs);
 }
 
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution */
+    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    if (cs)
+        LeaveCriticalSection(cs);
 }
 
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution */
+    /* Creating the shadow here is not required -- Enter does it -- but doing
+     * it now keeps the first Enter off the exclusive path. */
+    (void)xbox_cs_shadow(CriticalSection);
 }
 
 /* ============================================================================
