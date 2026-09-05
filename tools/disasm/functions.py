@@ -486,7 +486,12 @@ class FunctionDetector:
             # A ret, not merely a terminator: an immediate is weak evidence,
             # so the probe has to reject data that happens to disassemble. The
             # cap also keeps a wrong guess from walking the rest of the section.
-            if not self.engine.probes_as_returning_body(target):
+            # ...or a virtual-call thunk, which never reaches a ret: it
+            # dispatches through the vtable and is gone. Those are taken by
+            # address and passed around as values, so an immediate is exactly
+            # how they show up.
+            if not (self.engine.probes_as_returning_body(target)
+                    or self.engine.probes_as_vcall_thunk(target)):
                 continue
             if target not in self.engine.instructions:
                 if not self.engine.decode_at(target):
