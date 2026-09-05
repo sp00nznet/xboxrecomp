@@ -394,10 +394,23 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
 
-    /* Own register set (RECOMP_TLS), own simulated stack. */
+    /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
+     *
+     * The TIB carries the SEH chain head and, through fs:[4], the CRT's
+     * per-thread data. Sharing one made "which thread am I" a single answer
+     * for every thread, which is how two of them ended up inside _lock() each
+     * holding the lock the other wanted. */
     g_is_spawned_thread = 1;
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
+    {
+        uint32_t tib = xbox_AllocThreadTib();
+        if (tib)
+            g_fs_base = tib;
+        else
+            fprintf(stderr, "  [KERNEL] worker thread has no TIB of its own;"
+                            " it shares the main thread's\n");
+    }
     free(s);
 
     bridge_run_thread_inline(fn, ctx1, ctx2);

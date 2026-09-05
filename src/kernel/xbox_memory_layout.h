@@ -312,8 +312,21 @@ typedef union RecompXmm {
  * surfaced somewhere else entirely. With the TIB up here, page zero is left
  * unmapped and either mistake faults where it happens.
  *
- * Sits below every XBE's image base (0x00010000), so it displaces nothing. */
-#define XBOX_FS_BASE        0x00001000
+ * Sits below every XBE's image base (0x00010000), so it displaces nothing.
+ *
+ * Per-thread, because a TIB is. It used to be one constant address for the
+ * whole process, which meant every guest thread shared one SEH chain head
+ * and -- through fs:[4] -- one CRT per-thread data block. Half-Life 2
+ * deadlocked on that: two threads in _lock() each holding the CRT lock the
+ * other wanted, because the bookkeeping that decides who owns what was
+ * shared between them.
+ *
+ * XBOX_TIB_MAIN is where the first thread's TIB is built; every spawned
+ * thread gets its own from xbox_AllocThreadTib() and points g_fs_base at
+ * it. */
+#define XBOX_TIB_MAIN       0x00001000
+extern RECOMP_TLS uint32_t g_fs_base;
+#define XBOX_FS_BASE        g_fs_base
 
 #define XBOX_STACK_BASE     0x00780000
 
@@ -426,6 +439,10 @@ HANDLE xbox_GetMappingHandle(void);
 /* Carve a simulated stack for a spawned thread. Returns the Xbox VA of the
  * stack top, or 0 when the pool is exhausted. */
 uint32_t xbox_AllocThreadStack(void);
+
+/* A TIB and TLS block for a newly spawned guest thread, copied from the
+ * template the loader built. Returns the new TIB's Xbox VA, or 0. */
+uint32_t xbox_AllocThreadTib(void);
 
 /**
  * Return a worker's stack when the worker ends. Takes the value

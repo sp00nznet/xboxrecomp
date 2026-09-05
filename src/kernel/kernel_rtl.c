@@ -241,18 +241,57 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
     return found;
 }
 
+/* Contention is worth saying out loud.
+ *
+ * Now that these locks are real, a title that leaks one -- or a thread of ours
+ * that holds one somewhere the console's would not -- deadlocks instead of
+ * sailing through. That looks like a hang with no output at all, so the first
+ * time a lock is actually contended, say which one and who is waiting.
+ * TryEnter first, so the common uncontended path costs nothing extra.
+ */
+/* The guest VA is what cross-references against a disassembly; the native
+ * pointer does not. */
+extern ptrdiff_t g_xbox_mem_offset;
+
+static LONG g_cs_contention_reports;
+static LONG g_cs_enters, g_cs_leaves;
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
-    if (cs)
-        EnterCriticalSection(cs);
+    if (!cs)
+        return;
+    InterlockedIncrement(&g_cs_enters);
+    if (TryEnterCriticalSection(cs))
+        return;
+    if (InterlockedIncrement(&g_cs_contention_reports) <= 16) {
+        fprintf(stderr, "  [CS] thread %lu waiting on guest lock 0x%08X"
+                        " (held by thread %lu)\n",
+                GetCurrentThreadId(),
+                (uint32_t)((uintptr_t)CriticalSection
+                           - (uintptr_t)g_xbox_mem_offset),
+                (unsigned long)(uintptr_t)cs->OwningThread);
+        fprintf(stderr, "  [CS] enters=%ld leaves=%ld (outstanding %ld)\n",
+                g_cs_enters, g_cs_leaves, g_cs_enters - g_cs_leaves);
+        fflush(stderr);
+    }
+    EnterCriticalSection(cs);
+    if (g_cs_contention_reports <= 16) {
+        fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",
+                GetCurrentThreadId(),
+                (uint32_t)((uintptr_t)CriticalSection
+                           - (uintptr_t)g_xbox_mem_offset));
+        fflush(stderr);
+    }
 }
 
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
-    if (cs)
+    if (cs) {
+        InterlockedIncrement(&g_cs_leaves);
         LeaveCriticalSection(cs);
+    }
 }
 
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)

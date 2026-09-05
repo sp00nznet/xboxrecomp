@@ -587,6 +587,16 @@ uint32_t g_xbox_code_lo = 0;
 uint32_t g_xbox_code_hi = 0;
 
 /* Global registers for recompiled code (via recomp_types.h) */
+/* Each guest thread's TIB. The first thread uses the one the loader built;
+ * a spawned thread gets its own from xbox_AllocThreadTib(). */
+RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
+
+/* The shape of the TLS block the loader built, so a new thread can be
+ * given one just like it: where the initialised image data starts, how
+ * big the block is, and how big the per-thread structure slot 0 points
+ * at is. Zero total means the image had no TLS directory. */
+static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
+
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 
@@ -1294,6 +1304,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 MEM32_INIT(FAKE_TLS_BLOCK_VA, FAKE_TLS_THREAD_VA);
                 MEM32_INIT(XBOX_FS_BASE + 0x04, FAKE_TLS_BLOCK_VA + total);
 
+                g_tls_template_va = FAKE_TLS_BLOCK_VA;
+                g_tls_total       = total;
+
                 fprintf(stderr, "  TLS: %u-byte block at 0x%08X,"
                         " fs:[4] = 0x%08X (index will be %d)\n",
                         total, FAKE_TLS_BLOCK_VA, FAKE_TLS_BLOCK_VA + total,
@@ -1833,6 +1846,54 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 #define XBOX_MAX_THREAD_STACKS  8
 
 static int g_thread_stacks_used = 0;
+
+/* A TIB and TLS block for a newly spawned guest thread.
+ *
+ * A TIB is per-thread on the console and was per-process here: one address,
+ * 0x1000, for everyone. Two things live in it that must not be shared. fs:[0]
+ * is the SEH chain head, so two threads unwinding at once walk each other's
+ * frames. fs:[4] points at the image's TLS block, whose slot 0 is the CRT's
+ * per-thread data -- errno, the locale, and the bookkeeping _lock() uses to
+ * decide who owns which lock.
+ *
+ * Half-Life 2 deadlocked on the last of those: two threads inside _lock(),
+ * each holding the CRT lock the other was waiting for, because "which thread
+ * am I" was a single shared answer.
+ *
+ * The new block is a copy of the template the loader built, so a thread starts
+ * with the image's initialised thread-local data rather than zeros, and its
+ * own per-thread structure behind slot 0.
+ */
+uint32_t xbox_AllocThreadTib(void)
+{
+    /* XBOX_VA is scoped to the loader; the same arithmetic, spelled here. */
+    #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
+    const uint32_t tib_size = 0x40;
+    uint32_t tib, block, thread_data, total;
+
+    if (!g_tls_total)
+        return 0;                    /* image has no TLS; nothing to copy */
+
+    total = g_tls_total;
+    tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size, 16);
+    if (!tib)
+        return 0;
+    block       = tib + tib_size;
+    thread_data = block + total;
+
+    /* The TIB itself, copied so stack bounds and the fields the title filled
+     * in are inherited, then the two that must not be. */
+    memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), tib_size);
+    memcpy(TIB_VA(block), TIB_VA(g_tls_template_va), total);
+    memset(TIB_VA(thread_data), 0, g_tls_thread_size);
+
+    *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
+    *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
+    *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
+
+    return tib;
+    #undef TIB_VA
+}
 
 uint32_t xbox_AllocThreadStack(void)
 {

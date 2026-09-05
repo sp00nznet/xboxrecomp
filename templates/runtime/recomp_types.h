@@ -171,8 +171,13 @@ extern RECOMP_TLS int g_fp_top;
 /* Linear base of the fs segment: where the fake TIB lives. Generated code
  * adds this to every fs-relative address, so page zero stays unmapped and a
  * null dereference faults instead of hitting the TIB. Must match
- * XBOX_FS_BASE in src/kernel/xbox_memory_layout.h. */
-#define XBOX_FS_BASE 0x00001000u
+ * XBOX_FS_BASE in src/kernel/xbox_memory_layout.h.
+ *
+ * Per-thread, because a TIB is. fs:[0] is the SEH chain head and fs:[4]
+ * reaches the CRT's per-thread data, so a single shared base makes every
+ * guest thread the same thread as far as the CRT is concerned. */
+extern RECOMP_TLS uint32_t g_fs_base;
+#define XBOX_FS_BASE g_fs_base
 
 extern RECOMP_TLS uint32_t g_seh_ebp;
 
