@@ -580,6 +580,43 @@ static void bridge_MmAllocateContiguousMemory(void)
     g_eax = xbox_va;
 }
 
+/* ── MmAllocateSystemMemory (ordinal 167) ─────────────────
+ * PVOID MmAllocateSystemMemory(ULONG NumberOfBytes, ULONG Protect)
+ *
+ * The kernel's own page allocator: whole pages, not the title's heap, and not
+ * required to be physically contiguous. Titles use it for large buffers they
+ * intend to keep -- Half-Life 2 takes one while loading a level, right after
+ * it opens the .bsp.
+ *
+ * Unbridged this returned 0, and a NULL from an allocator is not a failure the
+ * caller checks for here; it carried the pointer into graphics setup and hung
+ * touching the NV2A aperture with it. Page-aligned out of the ordinary heap is
+ * the right answer: the distinction the console draws between system memory
+ * and the title heap is about which pool the pages come from, and there is one
+ * pool here.
+ *
+ * Zeroed, because the console hands out zeroed pages and callers assume it.
+ */
+static void bridge_MmAllocateSystemMemory(void)
+{
+    uint32_t size = STACK_ARG(0);
+    uint32_t prot = STACK_ARG(1);
+    uint32_t xbox_va;
+
+    (void)prot;
+    if (!size) {
+        g_eax = 0;
+        return;
+    }
+    xbox_va = xbox_HeapAlloc(size, 4096);
+    if (xbox_va)
+        memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
+    else
+        fprintf(stderr, "  [KERNEL] MmAllocateSystemMemory: %u bytes REFUSED\n",
+                size);
+    g_eax = xbox_va;
+}
+
 /* ── MmAllocateContiguousMemoryEx (ordinal 166) ───────────
  * PVOID MmAllocateContiguousMemoryEx(SIZE_T size, ULONG_PTR low, ULONG_PTR high,
  *                                     ULONG alignment, ULONG protect)
@@ -3454,6 +3491,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case  23: return bridge_ExQueryPoolBlockSize;
     case 268: return bridge_RtlCompareMemory;
     case 269: return bridge_RtlCompareMemoryUlong;
+    case 167: return bridge_MmAllocateSystemMemory;
     case  35: return bridge_FscGetCacheSize;
     case  37: return bridge_FscSetCacheSize;
     case  24: return bridge_ExQueryNonVolatileSetting;
