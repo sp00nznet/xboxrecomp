@@ -519,6 +519,31 @@ class DisasmEngine:
         if m == "mov" and ops.replace(" ", "") == "edi,edi":
             return True   # hot-patch pad
 
+        # A function whose frame __SEH_prolog builds:
+        #
+        #     push <frame size>        immediate
+        #     push <scope table>       immediate
+        #     call __SEH_prolog
+        #
+        # There is no "push ebp; mov ebp, esp" to find, because the helper does
+        # that on the caller's behalf, so none of the shapes above match and
+        # such a function is invisible to every pass that asks this question.
+        # Half-Life 2 has one at 0x001F572B, reached only through a vtable: the
+        # call could not be resolved, so it was skipped rather than made, and
+        # the arguments already pushed for it stayed on the stack. That shifted
+        # the caller's frame, and its "pop ebx" then restored the wrong slot.
+        #
+        # Two immediate pushes followed by a call is specific enough not to
+        # occur by accident -- and this is only ever asked about an address
+        # that already looks like a boundary.
+        if m == "push" and ops.startswith("0x") and len(insns) > 1:
+            nxt = insns[1]
+            if nxt.mnemonic == "push" and nxt.op_str.startswith("0x"):
+                third = list(self._cs.disasm(
+                    data[offset:offset + 24], addr, count=3))
+                if len(third) > 2 and third[2].mnemonic == "call":
+                    return True
+
         return False
 
     def probes_as_function_body(self, addr: int,

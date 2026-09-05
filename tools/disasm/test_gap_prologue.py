@@ -93,3 +93,55 @@ class GapPrologueTest(unittest.TestCase):
         funcs = [_Func(0x00476EA0, 0x00476EB0), _Func(0x004771C0, 0x004771D0)]
         det = _detector(insns, funcs, prologues={0x00476EB0})
         self.assertFalse(det._pass_gap_prologues([]))
+
+class SehPrologueShapeTest(unittest.TestCase):
+    """A function whose frame __SEH_prolog builds has no prologue to find.
+
+        push <frame size>
+        push <scope table>
+        call __SEH_prolog
+
+    None of the usual shapes match, because the helper does "push ebp; mov
+    ebp, esp" on the caller's behalf. Half-Life 2 has one at 0x001F572B
+    reached only through a vtable: unresolved, the call was skipped rather
+    than made, and the arguments already pushed for it stayed on the stack --
+    which shifted the caller's frame so its "pop ebx" restored the wrong slot.
+    """
+    import os as _os
+    import sys as _sys
+
+    def _probe(self, code):
+        from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+        from tools.disasm.engine import DisasmEngine
+
+        class _Sec:
+            virtual_addr = 0x001F5000
+            virtual_size = 0x1000
+            executable = True
+
+        class _Img:
+            def get_section_at_va(self, addr):
+                return _Sec()
+
+            def get_section_data(self, sec):
+                return bytes([0x90]) * 0x72B + code
+
+        eng = DisasmEngine.__new__(DisasmEngine)
+        eng.image = _Img()
+        eng._cs = Cs(CS_ARCH_X86, CS_MODE_32)
+        eng._cs.detail = True
+        return eng.probes_as_prologue(0x001F572B)
+
+    def test_seh_prologue_is_a_prologue(self):
+        # push 0x18 ; push 0x00772760 ; call rel32
+        code = bytes.fromhex("6a18") + bytes.fromhex("6860277700")              + bytes.fromhex("e800000000")
+        self.assertTrue(self._probe(code))
+
+    def test_two_pushes_without_a_call_are_not(self):
+        code = bytes.fromhex("6a18") + bytes.fromhex("6860277700")              + bytes.fromhex("90909090")
+        self.assertFalse(self._probe(code))
+
+    def test_a_single_immediate_push_is_not(self):
+        code = bytes.fromhex("6a18") + bytes.fromhex("c3") + bytes([0x90]) * 8
+        self.assertFalse(self._probe(code))
+
