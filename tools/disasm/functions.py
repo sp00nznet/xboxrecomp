@@ -745,7 +745,8 @@ class FunctionDetector:
             section = self.image.get_section_at_va(target)
             if section is None or not section.executable:
                 continue
-            if not self.engine.probes_as_returning_body(target, max_insns=256):
+            if not (self.engine.probes_as_returning_body(target, max_insns=256)
+                    or self.engine.probes_as_vcall_thunk(target)):
                 continue
 
             # Run to the next known function start, or the section end.

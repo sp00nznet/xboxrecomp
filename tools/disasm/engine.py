@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CsInsn
-from capstone import CS_OP_IMM, CS_OP_MEM
+from capstone import CS_OP_IMM, CS_OP_MEM, CS_OP_REG
 
 from . import config
 from .loader import BinaryImage, SectionInfo
@@ -409,6 +409,63 @@ class DisasmEngine:
             if count >= max_insns:
                 return False
         return False
+
+    def probes_as_vcall_thunk(self, addr: int) -> bool:
+        """Is this MSVC's virtual-call thunk?
+
+            mov eax, [ecx]              ; load the vtable from `this`
+            jmp dword ptr [eax + N]     ; dispatch to slot N
+
+        A real function, and one that only ever exists as a value in a table --
+        the compiler emits them for pointers-to-virtual-member-functions and
+        for interface forwarding. They end in an indirect tail jump and never
+        reach a `ret`, so probes_as_returning_body rejects them, and they are
+        packed back to back with no int3 between them, so the padding boundary
+        pass does not see them either.
+
+        Half-Life 2 has 568 of these and only 41 were being found. Each missed
+        one is an indirect call the runtime cannot resolve, so the call is
+        skipped rather than made: two of them, at 0x00583BE2 and 0x00583BFA,
+        were being reached 22 million times in a boot that then sat spinning.
+
+        Matched shape-exactly rather than by relaxing the general prober,
+        because "ends in an indirect jump" on its own is weak evidence that
+        data happens to disassemble into.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.read_bytes_at_va(addr, 16)
+        if not data:
+            return False
+
+        insns = list(self._cs.disasm(data, addr, count=2))
+        if len(insns) != 2:
+            return False
+
+        load, dispatch = insns
+        if load.mnemonic.lower() != "mov":
+            return False
+        try:
+            load_ops = load.operands
+            jmp_ops = dispatch.operands
+        except Exception:
+            return False
+        # mov <reg>, [<reg>]  -- the vtable load, no index, no displacement
+        if len(load_ops) != 2:
+            return False
+        dst, src = load_ops
+        if dst.type != CS_OP_REG or src.type != CS_OP_MEM:
+            return False
+        if src.mem.base == 0 or src.mem.index != 0 or src.mem.disp != 0:
+            return False
+
+        if dispatch.mnemonic.lower() not in config.JMP_MNEMONICS:
+            return False
+        if len(jmp_ops) != 1 or jmp_ops[0].type != CS_OP_MEM:
+            return False
+        # ...through the register the load just filled.
+        return jmp_ops[0].mem.base == dst.reg and jmp_ops[0].mem.index == 0
 
     def probes_as_prologue(self, addr: int) -> bool:
         """
