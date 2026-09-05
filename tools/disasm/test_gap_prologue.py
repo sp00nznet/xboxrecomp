@@ -53,6 +53,9 @@ class _Engine:
     def probes_as_prologue(self, addr):
         return addr in self._prologues
 
+    def probes_as_returning_body(self, addr, max_insns=64):
+        return False
+
 
 def _detector(insns, functions, prologues):
     det = FunctionDetector.__new__(FunctionDetector)
@@ -82,10 +85,29 @@ class GapPrologueTest(unittest.TestCase):
         self.assertFalse(det._pass_gap_prologues([]))
         self.assertEqual(det.added, [])
 
-    def test_bytes_that_are_not_a_prologue_are_ignored(self):
+    def test_bytes_that_are_neither_a_prologue_nor_a_body_are_ignored(self):
         insns = [_Insn(0x00476EAF, 1, is_ret=True)]
         funcs = [_Func(0x00476EA0, 0x00476EB0), _Func(0x004771C0, 0x004771D0)]
         det = _detector(insns, funcs, prologues=set())
+        det.engine.probes_as_returning_body = lambda a, max_insns=8: False
+        self.assertFalse(det._pass_gap_prologues([]))
+
+    def test_a_whole_small_function_counts_even_without_a_prologue(self):
+        """"mov eax, <imm32>; ret" has no frame to recognise."""
+        insns = [_Insn(0x00476EAF, 1, is_ret=True)]
+        funcs = [_Func(0x00476EA0, 0x00476EB0), _Func(0x004771C0, 0x004771D0)]
+        det = _detector(insns, funcs, prologues=set())
+        det.engine.probes_as_returning_body = lambda a, max_insns=8: True
+        self.assertTrue(det._pass_gap_prologues([]))
+        self.assertIn((0x00476EB0, "gap_prologue"), det.added)
+
+    def test_a_small_body_inside_a_function_is_still_not_split(self):
+        # The same two instructions occur as a return path in larger
+        # functions; the gap test is what keeps them intact.
+        insns = [_Insn(0x00476EAF, 1, is_ret=True)]
+        funcs = [_Func(0x00476EA0, 0x00476F00)]
+        det = _detector(insns, funcs, prologues=set())
+        det.engine.probes_as_returning_body = lambda a, max_insns=8: True
         self.assertFalse(det._pass_gap_prologues([]))
 
     def test_a_non_ret_instruction_starts_nothing(self):

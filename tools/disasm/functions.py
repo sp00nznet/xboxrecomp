@@ -212,7 +212,21 @@ class FunctionDetector:
                 continue
             if not in_a_gap(nxt):
                 continue                    # an out-of-line tail, not a start
-            if not self.engine.probes_as_prologue(nxt):
+            # A prologue, or a whole small function.
+            #
+            # MSVC packs runs of constant-returning accessors -- "mov eax,
+            # <address>; ret", six bytes each -- back to back with no padding,
+            # and they are reached only through vtables. There is no prologue
+            # to recognise because there is no frame; the entire function is
+            # two instructions. Half-Life 2 has 3,147 of that exact shape, of
+            # which 19 land in a gap and are found by nothing else.
+            #
+            # The gap restriction is what makes this safe. The same two
+            # instructions appear 795 times *inside* larger functions as a
+            # return path, and splitting one of those would cut a function in
+            # half -- but those are covered, so they are not in a gap.
+            if not (self.engine.probes_as_prologue(nxt)
+                    or self.engine.probes_as_returning_body(nxt, max_insns=8)):
                 continue
             self._add_candidate(nxt, config.CONFIDENCE_CC_BOUNDARY,
                                 "gap_prologue")
