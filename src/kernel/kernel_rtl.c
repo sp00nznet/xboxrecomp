@@ -8,6 +8,8 @@
  */
 
 #include "kernel.h"
+/* RECOMP_TLS, and the guest stack pointer the contention report walks. */
+#include "xbox_memory_layout.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -253,6 +255,36 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
  * pointer does not. */
 extern ptrdiff_t g_xbox_mem_offset;
 
+extern RECOMP_TLS uint32_t g_esp;
+extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
+
+/* A guest backtrace, printed where the guest is standing.
+ *
+ * This runs on the guest thread -- g_esp is thread-local and therefore real
+ * here, which it is not in the watchdog or any sampling thread. Lifted calls
+ * push their guest return address before jumping, so scanning the stack for
+ * words that land in the code range recovers the chain. Approximate by
+ * construction: a stale value from an earlier call can look like a frame. It
+ * is still the difference between knowing two threads are deadlocked and
+ * knowing which two paths did it. */
+static void xbox_guest_backtrace(int depth)
+{
+    uint32_t sp = g_esp;
+    int shown = 0;
+    int i;
+
+    if (!sp || !g_xbox_code_hi)
+        return;
+    for (i = 0; i < 256 && shown < depth; i++) {
+        uint32_t word = *(const uint32_t *)((uintptr_t)(sp + i * 4)
+                                            + g_xbox_mem_offset);
+        if (word >= g_xbox_code_lo && word < g_xbox_code_hi) {
+            fprintf(stderr, "  [CS]     guest 0x%08X\n", word);
+            shown++;
+        }
+    }
+}
+
 static LONG g_cs_contention_reports;
 static LONG g_cs_enters, g_cs_leaves;
 
@@ -311,6 +343,7 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         }
         fprintf(stderr, "  [CS] enters=%ld leaves=%ld (outstanding %ld)\n",
                 g_cs_enters, g_cs_leaves, g_cs_enters - g_cs_leaves);
+        xbox_guest_backtrace(10);
         fflush(stderr);
     }
     EnterCriticalSection(cs);
