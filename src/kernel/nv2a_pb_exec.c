@@ -514,17 +514,30 @@ static void clear_surface(uint32_t param)
 
 /* One texel, in the title's own format.
  *
- * Only the linear formats are read. A swizzled texture stores its texels in
- * Morton order rather than in rows, so reading one as if it had a pitch does
- * not give a slightly wrong colour, it gives a different image -- and
- * inventing that image is exactly what this is not for. An unsupported format
- * samples nothing and the caller keeps the vertex colour, which is visibly
- * wrong rather than quietly wrong.
+ * The codes are the NV097 colour field, which is the Xbox D3DFMT_ enum --
+ * src/d3d/d3d8_xbox.h is the table, and it is the table to check against
+ * rather than recollection: 0x1E is LIN_X8R8G8B8 and not, as this first read
+ * it, a byte-reversed BGRA. Getting that one wrong turned an opaque black
+ * render target into a screen of pure blue, which is the kind of wrong that
+ * looks like content.
  *
- * The codes are the NV097 colour field: 0x12 and 0x19 are the linear
- * A8R8G8B8/X8R8G8B8 pair, 0x1D..0x1F their byte-reordered siblings, 0x11 is
- * linear R5G6B5 and 0x10 linear A1R5G5B5.
+ * Only the linear (LIN_) formats are read. A swizzled texture stores its
+ * texels in Morton order rather than in rows, so reading one as if it had a
+ * pitch does not give a slightly wrong colour, it gives a different image --
+ * and inventing that image is exactly what this is not for. An unsupported
+ * format samples nothing and the caller keeps the vertex colour, which is
+ * visibly wrong rather than quietly wrong.
+ *
+ * ponytail: nearest texel, no filtering, whatever SET_TEXTURE_FILTER asked
+ * for. Bilinear when a title's output actually depends on it.
  */
+static uint32_t expand(uint32_t v, uint32_t bits)
+{
+    /* 5 bits of white have to come back as 0xFF, not 0xF8, so scale rather
+     * than shift. */
+    return v * 255u / ((1u << bits) - 1u);
+}
+
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -537,42 +550,80 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
     p = mem + s_gpu.tex.offset + (size_t)v * s_gpu.tex.pitch;
 
     switch (s_gpu.tex.color) {
-    case 0x12:                             /* LU A8R8G8B8 */
-    case 0x19: {                           /* LU X8R8G8B8 */
+
+    /* 32-bit, alpha-red-green-blue in the dword. */
+    case 0x12:                                      /* LIN_A8R8G8B8 */
+        *argb = ((const uint32_t *)p)[u];
+        return 1;
+    case 0x1E:                                      /* LIN_X8R8G8B8 */
+        *argb = ((const uint32_t *)p)[u] | 0xFF000000u;
+        return 1;
+
+    /* 32-bit, other channel orders. The name gives the byte order from the
+     * top of the dword down, so each is a permutation of the same four. */
+    case 0x3F: {                                    /* LIN_A8B8G8R8 */
         uint32_t t = ((const uint32_t *)p)[u];
-        *argb = (s_gpu.tex.color == 0x19) ? (t | 0xFF000000u) : t;
+        *argb = (t & 0xFF00FF00u) | ((t & 0xFF) << 16) | ((t >> 16) & 0xFF);
         return 1;
     }
-    case 0x1D:                             /* LU A8B8G8R8 */
-    case 0x1E:                             /* LU B8G8R8A8 */
-    case 0x1F: {                           /* LU R8G8B8A8 */
-        uint32_t t  = ((const uint32_t *)p)[u];
-        uint32_t b0 =  t        & 0xFF, b1 = (t >>  8) & 0xFF;
-        uint32_t b2 = (t >> 16) & 0xFF, b3 = (t >> 24) & 0xFF;
-        if (s_gpu.tex.color == 0x1D)            /* bytes R,G,B,A */
-            *argb = (b3 << 24) | (b0 << 16) | (b1 << 8) | b2;
-        else if (s_gpu.tex.color == 0x1E)       /* bytes A,R,G,B */
-            *argb = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
-        else                                    /* bytes A,B,G,R */
-            *argb = (b0 << 24) | (b3 << 16) | (b2 << 8) | b1;
+    case 0x40: {                                    /* LIN_B8G8R8A8 */
+        uint32_t t = ((const uint32_t *)p)[u];
+        *argb = ((t & 0xFFu) << 24)                 /* A, from the bottom */
+              | (((t >>  8) & 0xFFu) << 16)         /* R */
+              | (((t >> 16) & 0xFFu) <<  8)         /* G */
+              |  ((t >> 24) & 0xFFu);               /* B, from the top */
         return 1;
     }
-    case 0x11: {                           /* LU R5G6B5 */
+    case 0x41: {                                    /* LIN_R8G8B8A8 */
+        uint32_t t = ((const uint32_t *)p)[u];
+        *argb = ((t & 0xFFu) << 24) | (t >> 8);
+        return 1;
+    }
+
+    /* 16-bit. */
+    case 0x10: {                                    /* LIN_A1R5G5B5 */
+        uint32_t t = ((const uint16_t *)p)[u];
+        *argb = ((t & 0x8000u) ? 0xFF000000u : 0u)
+              | (expand((t >> 10) & 0x1F, 5) << 16)
+              | (expand((t >>  5) & 0x1F, 5) <<  8)
+              |  expand( t        & 0x1F, 5);
+        return 1;
+    }
+    case 0x1C: {                                    /* LIN_X1R5G5B5 */
         uint32_t t = ((const uint16_t *)p)[u];
         *argb = 0xFF000000u
-              | ((((t >> 11) & 0x1F) * 255 / 31) << 16)
-              | ((((t >>  5) & 0x3F) * 255 / 63) <<  8)
-              |   ((t        & 0x1F) * 255 / 31);
+              | (expand((t >> 10) & 0x1F, 5) << 16)
+              | (expand((t >>  5) & 0x1F, 5) <<  8)
+              |  expand( t        & 0x1F, 5);
         return 1;
     }
-    case 0x10: {                           /* LU A1R5G5B5 */
+    case 0x11: {                                    /* LIN_R5G6B5 */
         uint32_t t = ((const uint16_t *)p)[u];
-        *argb = ((t & 0x8000) ? 0xFF000000u : 0u)
-              | ((((t >> 10) & 0x1F) * 255 / 31) << 16)
-              | ((((t >>  5) & 0x1F) * 255 / 31) <<  8)
-              |   ((t        & 0x1F) * 255 / 31);
+        *argb = 0xFF000000u
+              | (expand((t >> 11) & 0x1F, 5) << 16)
+              | (expand((t >>  5) & 0x3F, 6) <<  8)
+              |  expand( t        & 0x1F, 5);
         return 1;
     }
+    case 0x1D: {                                    /* LIN_A4R4G4B4 */
+        uint32_t t = ((const uint16_t *)p)[u];
+        *argb = (expand((t >> 12) & 0x0F, 4) << 24)
+              | (expand((t >>  8) & 0x0F, 4) << 16)
+              | (expand((t >>  4) & 0x0F, 4) <<  8)
+              |  expand( t        & 0x0F, 4);
+        return 1;
+    }
+
+    /* 8-bit. */
+    case 0x13: {                                    /* LIN_L8 */
+        uint32_t t = p[u];
+        *argb = 0xFF000000u | (t << 16) | (t << 8) | t;
+        return 1;
+    }
+    case 0x1F:                                      /* LIN_A8 */
+        *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
+        return 1;
+
     default:
         return 0;
     }
