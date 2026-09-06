@@ -107,6 +107,18 @@ CASES = [
     Case("testz_i16", "ZF from a 16-bit test",
          ["test ax, cx", "setz al", "movzx eax, al"], _PAIRS),
 
+    # -- xor zeroing must clear an incoming carry ----------------------------
+    Case("xor_self_adc_i8", "byte zeroing clears CF before adc",
+         ["stc", "xor cl, cl", "adc eax, 0"], [(a, 0) for a in _EDGES]),
+    Case("xor_self_adc_hi8", "high-byte zeroing clears CF before adc",
+         ["stc", "xor ch, ch", "adc eax, 0"], [(a, 0) for a in _EDGES]),
+    Case("xor_self_adc_i16", "word zeroing clears CF before adc",
+         ["stc", "xor cx, cx", "adc eax, 0"], [(a, 0) for a in _EDGES]),
+    Case("xor_self_adc_i32", "dword zeroing clears CF before adc",
+         ["stc", "xor ecx, ecx", "adc eax, 0"], [(a, 0) for a in _EDGES]),
+    Case("xor_self_sbb_i32", "dword zeroing clears CF before sbb",
+         ["stc", "xor ecx, ecx", "sbb eax, 0"], [(a, 0) for a in _EDGES]),
+
     # -- neg carry into a dependent sbb (PR #8) ------------------------------
     Case("neg_sbb_adjacent", "neg sets CF = (operand != 0); sbb consumes it",
          ["neg eax", "sbb ecx, ecx", "mov eax, ecx"], _PAIRS),

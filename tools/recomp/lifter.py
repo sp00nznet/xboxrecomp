@@ -1420,7 +1420,9 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         # XOR reg, reg → zero
         if m == "xor" and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-            return [_fmt_operand_write(ops[0], "0") + " /* xor self */"]
+            out = ["_cf = 0; /* xor clears CF */"] if self.needs_cf else []
+            out.append(_fmt_operand_write(ops[0], "0") + " /* xor self */")
+            return out
         expr = f"{dst} {c_op} {src}"
         out = []
         if self.needs_cf:
