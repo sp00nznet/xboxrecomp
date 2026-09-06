@@ -141,6 +141,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_BEGIN_END               0x17FC
 #define NV097_SET_TEXTURE_OFFSET          0x1B00   /* +i*0x40 */
 #define NV097_SET_TEXTURE_FORMAT          0x1B04
+#define NV097_SET_TEXTURE_ADDRESS         0x1B08
 #define NV097_SET_TEXTURE_CONTROL1        0x1B10
 #define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
 #define NV097_ARRAY_ELEMENT16             0x1800
@@ -172,6 +173,7 @@ typedef struct {
     uint32_t width, height;             /* from IMAGE_RECT               */
     uint32_t pitch;                     /* bytes per row, from CONTROL1  */
     uint32_t color;                     /* NV097 colour-format code      */
+    uint32_t addr_u, addr_v;            /* wrap mode per axis            */
     int      valid;
 } Texture;
 
@@ -531,6 +533,23 @@ static void clear_surface(uint32_t param)
  * ponytail: nearest texel, no filtering, whatever SET_TEXTURE_FILTER asked
  * for. Bilinear when a title's output actually depends on it.
  */
+/* Off the edge of the texture, the way the title asked for.
+ *
+ * Refusing to sample instead is not neutral: it hands the caller back the
+ * vertex colour, so a pass whose coordinates reach the last texel by half a
+ * texel gets a bright line down the edge of the screen. The dashboard's
+ * resolve does exactly that -- its last column and last row, 1119 pixels of
+ * white on a black frame, from a rounding step at the boundary.
+ */
+static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
+{
+    if (!size)
+        return 0;
+    if (mode == 1)                         /* wrap */
+        return c % size;
+    return c >= size ? size - 1 : c;       /* clamp, and everything else */
+}
+
 static uint32_t expand(uint32_t v, uint32_t bits)
 {
     /* 5 bits of white have to come back as 0xFF, not 0xF8, so scale rather
@@ -545,8 +564,8 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
 
     if (!s_gpu.tex.valid)
         return 0;
-    if (u >= s_gpu.tex.width || v >= s_gpu.tex.height)
-        return 0;
+    u = wrap_coord(u, s_gpu.tex.width,  s_gpu.tex.addr_u);
+    v = wrap_coord(v, s_gpu.tex.height, s_gpu.tex.addr_v);
     p = mem + s_gpu.tex.offset + (size_t)v * s_gpu.tex.pitch;
 
     switch (s_gpu.tex.color) {
@@ -1186,6 +1205,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_TEXTURE_FORMAT:
         s_gpu.tex.color = (param >> 8) & 0xFF;
+        record_tex_reg(method, param);
+        break;
+
+    case NV097_SET_TEXTURE_ADDRESS:
+        /* Four bits per axis. 1 is wrap, 3 is clamp-to-edge; the rest (mirror,
+         * border) fall back to clamp, which is wrong at an edge rather than
+         * wrong everywhere. */
+        s_gpu.tex.addr_u =  param        & 0xF;
+        s_gpu.tex.addr_v = (param >>  8) & 0xF;
         record_tex_reg(method, param);
         break;
 
