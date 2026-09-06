@@ -1,7 +1,7 @@
 # Ghidra Headless Naming Pipeline (Xbox XBE)
 
 Recovers real function names / symbols / decompiled C from the Xbox XBE Xbox
-XBE using **Ghidra 12.0.3 headless**, then turns them into a `{address: name}`
+XBE using **Ghidra headless**, then turns them into a `{address: name}`
 map the static recompiler can consume to replace `sub_XXXXXXXX` names with
 meaningful ones.
 
@@ -27,8 +27,13 @@ tools/ghidra_naming/
 
 ## Why a flat raw image (not an XBE loader)
 
-Ghidra 12.0.3 ships no XBE loader, and no prebuilt XBE loader extension exists
-for this exact version. The reliable approach (and the one used here) is:
+Ghidra ships no XBE loader. There is a community one,
+[XboxDev/ghidra-xbe](https://github.com/XboxDev/ghidra-xbe), which warns about a
+version mismatch on current Ghidra and works anyway — @DarthSidious666 has run
+it against 12.1.3 (#26). This tool does not need it: flattening the image is
+version-proof and puts every address exactly where `functions.json` expects it,
+which is the property that matters when the names are merged back. The approach
+used here is:
 
 1. `extract_for_ghidra.py` uses the repo's `tools/xbe_parser` to read the XBE
    section table and assemble **one flat image** spanning `0x00010000` to the end

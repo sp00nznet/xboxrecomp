@@ -134,10 +134,14 @@ signatures to match, so it keeps `sub_`. On the Xbox Dashboard this recovered
 133 CRT/XDK names including the LZX and XIP decompressors, which is what made
 the asset loader legible at all.
 
-Ghidra 12.x has no XBE loader, so the pipeline flattens the XBE into a raw
-image at the right base address first — that is why the addresses line up with
-`functions.json` exactly. Set `GHIDRA_HOME` if yours is not at
-`/c/tools/ghidra/ghidra_12.0.3_PUBLIC`. Full detail, including optional
+Ghidra ships no XBE loader, so the pipeline flattens the XBE into a raw image
+at the right base address first — that is why the addresses line up with
+`functions.json` exactly. (There is a community one,
+[XboxDev/ghidra-xbe](https://github.com/XboxDev/ghidra-xbe); it warns about a
+version mismatch on current Ghidra and works anyway. The flattening path does
+not need it.) The runner takes the newest `ghidra_*_PUBLIC` under
+`/c/tools/ghidra`; set `GHIDRA_ROOT` if you keep them elsewhere, or
+`GHIDRA_HOME` to name one install exactly. Full detail, including optional
 decompilation and why function seeding is off by default, is in
 [tools/ghidra_naming/README.md](../tools/ghidra_naming/README.md).
 

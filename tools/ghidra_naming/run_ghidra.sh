@@ -18,7 +18,9 @@
 #   ANALYZE=0 to skip analysis and only re-export (e.g. to continue decompiling).
 #
 # Env overrides:
-#   GHIDRA_HOME  (default: /c/tools/ghidra/ghidra_12.0.3_PUBLIC)
+#   GHIDRA_ROOT  (default: /c/tools/ghidra) - searched for the newest
+#                ghidra_*_PUBLIC when GHIDRA_HOME is unset
+#   GHIDRA_HOME  an exact install, overriding the search
 #   XBE          (REQUIRED: path to the Xbox default.xbe to analyze)
 #   IMPORT=0     skip import step (program already in project)
 #   ANALYZE=0    skip analysis (-noanalysis); just (re)run export post-script
@@ -28,7 +30,26 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 
-GHIDRA_HOME="${GHIDRA_HOME:-/c/tools/ghidra/ghidra_12.0.3_PUBLIC}"
+# Ghidra's install directory carries its version, so pinning one in a default
+# dates the script the first time anyone updates. Take the newest
+# ghidra_*_PUBLIC under GHIDRA_ROOT, and accept GHIDRA_ROOT itself being an
+# install (or a symlink to one) for anyone who keeps it unversioned.
+# Reported by @DarthSidious666 (#26), who was 10 revisions ahead of the pin.
+GHIDRA_ROOT="${GHIDRA_ROOT:-/c/tools/ghidra}"
+if [ -z "${GHIDRA_HOME:-}" ]; then
+    if [ -f "$GHIDRA_ROOT/support/analyzeHeadless.bat" ]; then
+        GHIDRA_HOME="$GHIDRA_ROOT"
+    else
+        GHIDRA_HOME="$(ls -d "$GHIDRA_ROOT"/ghidra_*_PUBLIC 2>/dev/null \
+                       | sort -V | tail -1)"
+    fi
+fi
+if [ -z "${GHIDRA_HOME:-}" ]; then
+    echo "ERROR: no Ghidra install found under $GHIDRA_ROOT." >&2
+    echo "       Set GHIDRA_HOME=/path/to/ghidra_<version>_PUBLIC," >&2
+    echo "       or GHIDRA_ROOT to the directory holding them." >&2
+    exit 1
+fi
 HEADLESS="$GHIDRA_HOME/support/analyzeHeadless.bat"
 XBE="${XBE:?ERROR: set XBE=/path/to/Xbox/default.xbe (the XBE to analyze)}"
 
