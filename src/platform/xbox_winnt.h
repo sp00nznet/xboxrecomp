@@ -210,6 +210,15 @@ typedef struct _RTL_CRITICAL_SECTION {
 typedef struct { PVOID Ptr; } CONDITION_VARIABLE, *PCONDITION_VARIABLE;
 #define CONDITION_VARIABLE_INIT { NULL }
 
+/* SRWLOCK / INIT_ONCE: same single-pointer layout as Win32, and like it both
+ * are usable from a static initialiser with no explicit Initialize* call.
+ * Ptr is a pthread_rwlock_t* on POSIX. */
+typedef struct { PVOID Ptr; } SRWLOCK, *PSRWLOCK;
+#define SRWLOCK_INIT { NULL }
+
+typedef struct { PVOID Ptr; } INIT_ONCE, *PINIT_ONCE, *LPINIT_ONCE;
+#define INIT_ONCE_STATIC_INIT { NULL }
+
 /* ---- Common small structs ---------------------------------------------- */
 typedef struct _FILETIME   { DWORD dwLowDateTime; DWORD dwHighDateTime; }
         FILETIME, *PFILETIME, *LPFILETIME;
