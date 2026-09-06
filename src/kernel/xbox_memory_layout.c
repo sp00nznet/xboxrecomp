@@ -1990,6 +1990,17 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     return result;
 }
 
+/* How much of the window has been handed out.
+ *
+ * Lets a caller holding a physical address decide whether it names contiguous
+ * memory this runtime allocated. The pushbuffer executor needs exactly that:
+ * a surface offset is physical, and only the window makes it addressable. */
+uint32_t xbox_ContiguousAllocatedBytes(void)
+{
+    return g_contig_next - XBOX_CONTIG_BASE;
+}
+
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;

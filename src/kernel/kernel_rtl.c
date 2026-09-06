@@ -196,8 +196,47 @@ static XBOX_CS_SLOT g_cs_table[XBOX_CS_TABLE_SIZE];
 static SRWLOCK      g_cs_table_lock = SRWLOCK_INIT;
 static int          g_cs_table_full;
 
+/* RECOMP_CS_MODE=single puts every guest critical section behind one recursive
+ * lock.
+ *
+ * Deadlock-free by construction -- there is only one lock, so there is no order
+ * to invert -- and deliberately NOT the default. A title that deadlocks under
+ * real locks is telling you its threads are reaching a place the console's
+ * would not, and collapsing the hierarchy hides that rather than answering it.
+ * What it is good for is deciding whether a lock cycle is the last thing in the
+ * way: if the title still does not get further with this on, the cycle was not
+ * what was stopping it.
+ *
+ * Safe only because guest code here never holds a lock while waiting on another
+ * guest thread to make progress -- the runtime's own I/O completes
+ * synchronously. That would not hold in general.
+ */
+static CRITICAL_SECTION g_cs_single;
+static INIT_ONCE g_cs_single_once = INIT_ONCE_STATIC_INIT;
+static int g_cs_single_mode = -1;
+
+static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_cs_single);
+    return TRUE;
+}
+
 static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
 {
+    if (g_cs_single_mode < 0) {
+        const char* mode = getenv("RECOMP_CS_MODE");
+        g_cs_single_mode = (mode && !strcmp(mode, "single")) ? 1 : 0;
+        if (g_cs_single_mode)
+            fprintf(stderr, "  [CS] RECOMP_CS_MODE=single: every guest lock "
+                            "shares one recursive lock\n");
+    }
+    if (g_cs_single_mode) {
+        if (!guest)
+            return NULL;
+        InitOnceExecuteOnce(&g_cs_single_once, xbox_cs_single_init, NULL, NULL);
+        return &g_cs_single;
+    }
     uintptr_t key = (uintptr_t)guest;
     CRITICAL_SECTION* found = NULL;
     size_t home, i;

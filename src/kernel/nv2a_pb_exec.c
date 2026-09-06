@@ -60,7 +60,7 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
     return base < g_xbox_image_hi && base + bytes > g_xbox_image_lo;
 }
 
-/* Where a surface offset actually lives.
+/* Where a DMA-object offset actually lives.
  *
  * NV097_SET_SURFACE_COLOR_OFFSET is an offset inside the colour DMA object,
  * and for a framebuffer that object covers physical memory -- so the offset
@@ -81,8 +81,26 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
  * in ordinary RAM (Wreckless renders to the tiled alias of physical
  * 0x01954000) keep the first path and are unaffected.
  */
-static uint32_t surface_resolve(uint32_t offset)
+static uint32_t dma_resolve(uint32_t offset)
 {
+    extern uint32_t xbox_ContiguousAllocatedBytes(void);
+
+    /* Did this runtime hand the offset out as contiguous memory? Then the
+     * bytes live in the window, and that is not a guess: the arena is a bump
+     * allocator from XBOX_CONTIG_BASE, so everything below its high-water
+     * mark is memory some MmAllocateContiguousMemory call returned. The
+     * title's own writes go through the window, so the executor's must too.
+     *
+     * Checking this BEFORE the image test is the whole point. The image test
+     * only catches an offset that would land on the title's code, and whether
+     * it does is an accident of where the image happens to end: Half-Life 2's
+     * colour surface is physical 0x00A6C000, which clears the image by 700 KB.
+     * So it looked like an ordinary VA, and the executor cleared 1.2 MB of
+     * black straight through the guest heap -- which faulted the title three
+     * frames later on a pointer that had been overwritten, while the real
+     * framebuffer at 0x80A6C000 stayed untouched and the screen stayed black. */
+    if (offset < xbox_ContiguousAllocatedBytes())
+        return XBOX_CONTIG_BASE + offset;
     if (!surface_hits_image(offset, 1))
         return offset;
     if ((uint64_t)offset < XBOX_CONTIG_SIZE)
@@ -264,7 +282,7 @@ static void dump_surface_bmp(void)
 
     /* BMP rows run bottom-up. */
     for (y = h; y-- > 0; ) {
-        const uint8_t *row = mem + surface_resolve(s_gpu.color_offset)
+        const uint8_t *row = mem + dma_resolve(s_gpu.color_offset)
                            + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
         for (x = 0; x < w; x++) {
             uint8_t bgr[3];
@@ -308,7 +326,7 @@ static void clear_surface(uint32_t param)
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
     {
-        uint32_t base = surface_resolve(s_gpu.color_offset);
+        uint32_t base = dma_resolve(s_gpu.color_offset);
         if (surface_write_refused(base,
                                   (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch,
                                   "clear"))
@@ -393,7 +411,7 @@ static void clear_surface(uint32_t param)
      * would show the one nothing is writing. */
     /* The window has to read where the pixels actually are, which is the
      * resolved address rather than the DMA-object offset. */
-    xbox_FramebufferWindowSet(surface_resolve(s_gpu.color_offset), s_gpu.pitch);
+    xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
 
     /* And open the window, rather than waiting for AvSetDisplayMode to do it.
      *
@@ -439,10 +457,10 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     /* Same reason the clear checks: a rasterised triangle writes guest memory
      * too, and a surface address that lands on the image is no safer one pixel
      * at a time than 4.9 MB at once. */
-    if (surface_hits_image(surface_resolve(s_gpu.color_offset),
+    if (surface_hits_image(dma_resolve(s_gpu.color_offset),
                            (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return;
-    row = mem + surface_resolve(s_gpu.color_offset) + (size_t)y * s_gpu.pitch;
+    row = mem + dma_resolve(s_gpu.color_offset) + (size_t)y * s_gpu.pitch;
     if (bpp == 4) {
         ((uint32_t *)row)[x] = argb;
     } else if (bpp == 2) {
@@ -751,7 +769,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     default:
         if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
                 && method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + NV_VERTEX_ATTRS * 4) {
-            s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4].offset = param;
+            /* Resolved here, once, so every consumer -- the rasteriser's
+             * attribute reads and the diagnostics alike -- sees the same
+             * address. A vertex array offset is a DMA-object offset exactly
+             * like a surface offset: physical, and addressable only through
+             * the window when it names contiguous memory. */
+            s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4].offset =
+                dma_resolve(param);
         } else if (method >= NV097_SET_VERTEX_DATA_ARRAY_FORMAT
                 && method < NV097_SET_VERTEX_DATA_ARRAY_FORMAT + NV_VERTEX_ATTRS * 4) {
             VertexAttr *a = &s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4];
