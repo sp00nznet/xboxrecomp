@@ -31,8 +31,6 @@ typedef struct DSoundBuffer {
     LONG    ref_count;
     void   *buffer_data;
     DWORD   buffer_size;
-    DWORD   play_cursor;
-    DWORD   status;  /* DSBSTATUS_* flags */
     LONG    volume;  /* hundredths of dB */
     DWORD   frequency;
     WORD    channels;     /* 1=mono, 2=stereo */
@@ -74,6 +72,7 @@ static ULONG __stdcall buf_Release(IDirectSoundBuffer8 *self)
 static HRESULT __stdcall buf_SetBufferData(IDirectSoundBuffer8 *self, const void *pvBufferData, DWORD dwBufferBytes)
 {
     DSoundBuffer *buf = buf_from_iface(self);
+    apu_mixer_stop(buf->mixer_slot);
     free(buf->buffer_data);
     buf->buffer_data = NULL;
     buf->buffer_size = dwBufferBytes;
@@ -84,11 +83,12 @@ static HRESULT __stdcall buf_SetBufferData(IDirectSoundBuffer8 *self, const void
     }
 
     /* Update mixer voice with new buffer data */
-    if (buf->mixer_slot >= 0 && buf->buffer_data && buf->bits_per_sample == 16) {
+    if (buf->mixer_slot >= 0 && buf->bits_per_sample == 16) {
         APUMixerVoice *v = apu_mixer_get_voice(buf->mixer_slot);
         if (v) {
             v->pcm_data = (const int16_t *)buf->buffer_data;
-            v->pcm_bytes = dwBufferBytes;
+            v->pcm_bytes = buf->buffer_data ? dwBufferBytes : 0;
+            v->play_offset = 0;
             v->num_channels = buf->channels;
             v->sample_rate = buf->frequency;
         }
@@ -136,21 +136,26 @@ static HRESULT __stdcall buf_Unlock(IDirectSoundBuffer8 *self, void *p1, DWORD n
 
 static HRESULT __stdcall buf_SetCurrentPosition(IDirectSoundBuffer8 *self, DWORD dwNewPosition)
 {
-    buf_from_iface(self)->play_cursor = dwNewPosition;
-    return S_OK;
+    return apu_mixer_set_position(buf_from_iface(self)->mixer_slot, dwNewPosition)
+        ? S_OK : E_INVALIDARG;
 }
 
 static HRESULT __stdcall buf_GetCurrentPosition(IDirectSoundBuffer8 *self, DWORD *pdwPlay, DWORD *pdwWrite)
 {
     DSoundBuffer *buf = buf_from_iface(self);
-    if (pdwPlay)  *pdwPlay = buf->play_cursor;
-    if (pdwWrite) *pdwWrite = buf->play_cursor;
+    uint32_t cursor;
+    apu_mixer_get_state(buf->mixer_slot, &cursor, NULL, NULL);
+    if (pdwPlay)  *pdwPlay = cursor;
+    if (pdwWrite) *pdwWrite = cursor;
     return S_OK;
 }
 
 static HRESULT __stdcall buf_GetStatus(IDirectSoundBuffer8 *self, DWORD *pdwStatus)
 {
-    if (pdwStatus) *pdwStatus = buf_from_iface(self)->status;
+    int active, looping;
+    apu_mixer_get_state(buf_from_iface(self)->mixer_slot, NULL, &active, &looping);
+    if (pdwStatus) *pdwStatus = (active ? DSBSTATUS_PLAYING : 0) |
+                                (looping ? DSBSTATUS_LOOPING : 0);
     return S_OK;
 }
 
@@ -158,8 +163,6 @@ static HRESULT __stdcall buf_Play(IDirectSoundBuffer8 *self, DWORD r1, DWORD r2,
 {
     (void)r1; (void)r2;
     DSoundBuffer *buf = buf_from_iface(self);
-    buf->status = DSBSTATUS_PLAYING;
-    if (dwFlags & DSBPLAY_LOOPING) buf->status |= DSBSTATUS_LOOPING;
 
     /* Start playback through APU mixer */
     if (buf->mixer_slot >= 0) {
@@ -171,7 +174,6 @@ static HRESULT __stdcall buf_Play(IDirectSoundBuffer8 *self, DWORD r1, DWORD r2,
 static HRESULT __stdcall buf_Stop(IDirectSoundBuffer8 *self)
 {
     DSoundBuffer *buf = buf_from_iface(self);
-    buf->status = 0;
     if (buf->mixer_slot >= 0) {
         apu_mixer_stop(buf->mixer_slot);
     }
