@@ -724,7 +724,7 @@ void apu_mixer_free_voice(int slot)
 {
     if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
     EnterCriticalSection(&g_mixer_cs);
-    g_mixer_voices[slot].active = 0;
+    apu_mixer_stop(slot);
     g_mixer_voices[slot].pcm_data = NULL;
     g_mixer_voices[slot].pcm_bytes = 0;
     g_mixer_voices[slot].play_offset = 0;
@@ -737,25 +737,49 @@ APUMixerVoice *apu_mixer_get_voice(int slot)
     return &g_mixer_voices[slot];
 }
 
+int apu_mixer_set_position(int slot, uint32_t byte_offset)
+{
+    if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return 0;
+    EnterCriticalSection(&g_mixer_cs);
+    APUMixerVoice *v = &g_mixer_voices[slot];
+    uint32_t frame_bytes = v->num_channels * sizeof(int16_t);
+    int valid = (v->num_channels == 1 || v->num_channels == 2) &&
+                byte_offset < v->pcm_bytes &&
+                byte_offset / frame_bytes < v->pcm_bytes / frame_bytes;
+    if (valid) v->play_offset = ((uint64_t)(byte_offset / frame_bytes)) << 16;
+    LeaveCriticalSection(&g_mixer_cs);
+    return valid;
+}
+
+void apu_mixer_get_state(int slot, uint32_t *byte_offset, int *active, int *looping)
+{
+    if (byte_offset) *byte_offset = 0;
+    if (active) *active = 0;
+    if (looping) *looping = 0;
+    if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
+    EnterCriticalSection(&g_mixer_cs);
+    APUMixerVoice *v = &g_mixer_voices[slot];
+    if (byte_offset) *byte_offset = (uint32_t)(v->play_offset >> 16) *
+                                    v->num_channels * sizeof(int16_t);
+    if (active) *active = v->active;
+    if (looping) *looping = v->active && v->looping;
+    LeaveCriticalSection(&g_mixer_cs);
+}
+
 void apu_mixer_play(int slot, int looping)
 {
     if (g_audio_muted) return;
     if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
+    EnterCriticalSection(&g_mixer_cs);
     APUMixerVoice *v = &g_mixer_voices[slot];
-    if (!v->pcm_data || v->pcm_bytes == 0) return;
-    v->looping = looping;
-    v->play_offset = 0;
-    v->active = 1;
-    InterlockedIncrement((volatile LONG *)&g_mixer_active_count);
-
-    /* Wake up APU thread if it was paused */
-    extern MCPXAPUState *g_state;
-    if (g_state) {
-        qemu_mutex_lock(&g_state->lock);
-        g_state->pause_requested = false;
-        qemu_cond_signal(&g_state->cond);
-        qemu_mutex_unlock(&g_state->lock);
+    if (!v->pcm_data || (v->num_channels != 1 && v->num_channels != 2) ||
+        v->pcm_bytes < v->num_channels * sizeof(int16_t)) {
+        LeaveCriticalSection(&g_mixer_cs);
+        return;
     }
+    v->looping = looping;
+    if (!v->active) InterlockedIncrement((volatile LONG *)&g_mixer_active_count);
+    v->active = 1;
 
     static int play_log_count = 0;
     if (play_log_count < 20) {
@@ -763,22 +787,35 @@ void apu_mixer_play(int slot, int looping)
                 slot, v->pcm_bytes, v->num_channels, v->sample_rate, v->volume, looping);
         play_log_count++;
     }
+    LeaveCriticalSection(&g_mixer_cs);
+
+    /* The frame thread takes the APU lock before the mixer lock. */
+    extern MCPXAPUState *g_state;
+    if (g_state) {
+        qemu_mutex_lock(&g_state->lock);
+        g_state->pause_requested = false;
+        qemu_cond_signal(&g_state->cond);
+        qemu_mutex_unlock(&g_state->lock);
+    }
 }
 
 void apu_mixer_stop(int slot)
 {
     if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
+    EnterCriticalSection(&g_mixer_cs);
     if (g_mixer_voices[slot].active) {
         g_mixer_voices[slot].active = 0;
         InterlockedDecrement((volatile LONG *)&g_mixer_active_count);
     }
+    LeaveCriticalSection(&g_mixer_cs);
 }
 
 /* Mix all active voices into frame_buf. Called from mcpx_apu_monitor_frame.
- * play_offset is stored as a 16.16 fixed-point source frame position. */
+ * Keep 16 fractional bits in a wide offset so buffers can exceed 65536 frames. */
 static void mixer_render(int16_t frame_buf[][2], int num_samples)
 {
     if (!g_mixer_initialized) return;
+    EnterCriticalSection(&g_mixer_cs);
 
     for (int v = 0; v < APU_MIXER_MAX_VOICES; v++) {
         APUMixerVoice *voice = &g_mixer_voices[v];
@@ -790,8 +827,9 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
         if (total_frames == 0) continue;
 
         /* Fixed-point 16.16 increment per output sample */
-        uint32_t inc = (uint32_t)(((uint64_t)voice->sample_rate << 16) / 48000);
-        uint32_t pos = voice->play_offset; /* 16.16 fixed-point */
+        uint64_t inc = ((uint64_t)voice->sample_rate << 16) / 48000;
+        uint64_t pos = voice->play_offset;
+        uint64_t end = (uint64_t)total_frames << 16;
         float vol = voice->volume;
 
         for (int i = 0; i < num_samples; i++) {
@@ -799,9 +837,10 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
 
             if (src_frame >= total_frames) {
                 if (voice->looping) {
-                    pos = 0;
-                    src_frame = 0;
+                    pos %= end;
+                    src_frame = (uint32_t)(pos >> 16);
                 } else {
+                    pos = 0;
                     voice->active = 0;
                     InterlockedDecrement((volatile LONG *)&g_mixer_active_count);
                     break;
@@ -833,11 +872,13 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
         uint32_t end_frame = pos >> 16;
         if (end_frame >= total_frames) {
             if (voice->looping) {
-                voice->play_offset = 0;
+                voice->play_offset = pos % end;
             } else if (voice->active) {
+                voice->play_offset = 0;
                 voice->active = 0;
                 InterlockedDecrement((volatile LONG *)&g_mixer_active_count);
             }
         }
     }
+    LeaveCriticalSection(&g_mixer_cs);
 }
