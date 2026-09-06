@@ -360,6 +360,47 @@ class DisasmEngine:
             self._sorted_addrs = None
         return added
 
+    def block_tail_jump(self, addr: int, max_insns: int = 256):
+        """
+        Where the straight-line block at `addr` jumps, if it ends in an
+        unconditional jmp rather than a ret.
+
+        probes_as_returning_body deliberately stops at such a jump, because for
+        a weak candidate -- an address that merely appeared as an immediate --
+        a tail jump is not evidence of a function. But for a branch target that
+        is already known to be reached from inside a function, the jump is the
+        block's terminator and its destination is the rest of the same
+        function. Half-Life 2's _lock helper reaches its loop tail this way:
+        "cmp [ebp-0x1c],-1 / jne / inc edi / jmp back into the body".
+
+        Returns the jump target, or None if the block rets, runs long, or ends
+        in something that is not a direct jmp.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return None
+        data = self.image.read_bytes_at_va(addr, max_insns * 8)
+        if not data:
+            return None
+
+        count = 0
+        for decoded in self._cs.disasm(data, addr):
+            count += 1
+            if count > max_insns:
+                return None
+            mnemonic = decoded.mnemonic.lower()
+            if mnemonic in config.RET_MNEMONICS:
+                return None                 # a ret block: not this shape
+            if mnemonic in config.JMP_MNEMONICS:
+                try:
+                    ops = decoded.operands
+                except Exception:
+                    return None
+                if not ops or ops[0].type != CS_OP_IMM:
+                    return None             # indirect: nothing to name
+                return ops[0].imm & 0xFFFFFFFF
+        return None
+
     def probes_as_returning_body(self, addr: int,
                                  max_insns: int = 64) -> bool:
         """

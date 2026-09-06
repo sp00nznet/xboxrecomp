@@ -11,6 +11,7 @@
 /* RECOMP_TLS, and the guest stack pointer the contention report walks. */
 #include "xbox_memory_layout.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
@@ -358,12 +359,78 @@ static int xbox_crt_lock_index(uint32_t guest_va)
     return -1;
 }
 
+/* Every acquisition and release of a lock the CRT names, in order.
+ *
+ * A deadlock report says which two locks are crossed but not how they got that
+ * way, and the two candidate explanations need opposite fixes: the title really
+ * does take them in two orders (its problem, and it shipped, so unlikely), or
+ * this runtime dropped a release somewhere and a lock that should be free is
+ * still held (our problem). The order in this log tells them apart.
+ *
+ * Gated on RECOMP_CS_TRACE_CRT because it is one table scan per lock operation
+ * and the CRT locks are hot. */
+static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
+{
+    static int enabled = -1;
+    int idx;
+
+    static int all;
+    uint32_t va;
+
+    if (enabled < 0) {
+        const char *v = getenv("RECOMP_CS_TRACE_CRT");
+        enabled = v != NULL;
+        all = v && !strcmp(v, "all");
+    }
+    if (!enabled)
+        return;
+    va = (uint32_t)((uintptr_t)guest - (uintptr_t)g_xbox_mem_offset);
+    idx = xbox_crt_lock_index(va);
+    /* "all" logs by address as well as index. Whether a lock's release is
+     * missing or merely unrecognised by the index lookup are different bugs,
+     * and only the raw address separates them. */
+    /* One lock, both sides, with the guest stack that got there.
+     *
+     * A take at one address and a release 0x78 lower is not a lock protocol
+     * this runtime can reason about from addresses alone -- it needs the two
+     * call sites, because the question is whether the guest computed different
+     * addresses or we did. */
+    {
+        static int watch = -1;
+        static uint32_t watch_va;
+        if (watch < 0) {
+            const char *w = getenv("RECOMP_CS_WATCH");
+            watch = w != NULL;
+            watch_va = w ? (uint32_t)strtoul(w, NULL, 0) : 0;
+        }
+        if (watch && va == watch_va) {
+            fprintf(stderr, "  [CSWATCH] t%-6lu %s 0x%08X\n",
+                    GetCurrentThreadId(), what, va);
+            xbox_guest_backtrace(8);
+            fflush(stderr);
+        }
+    }
+
+    if (all) {
+        fprintf(stderr, "  [CSTRACE] t%-6lu %-4s 0x%08X idx %d\n",
+                GetCurrentThreadId(), what, va, idx);
+        fflush(stderr);
+        return;
+    }
+    if (idx < 0)
+        return;
+    fprintf(stderr, "  [CSTRACE] t%-6lu %-4s lock %d\n",
+            GetCurrentThreadId(), what, idx);
+    fflush(stderr);
+}
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (!cs)
         return;
     InterlockedIncrement(&g_cs_enters);
+    crt_lock_trace("take", CriticalSection);
     if (TryEnterCriticalSection(cs))
         return;
     if (InterlockedIncrement(&g_cs_contention_reports) <= 16) {
@@ -400,6 +467,7 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (cs) {
         InterlockedIncrement(&g_cs_leaves);
+        crt_lock_trace("drop", CriticalSection);
         LeaveCriticalSection(cs);
     }
 }

@@ -824,8 +824,20 @@ class FunctionDetector:
             section = self.image.get_section_at_va(target)
             if section is None or not section.executable:
                 continue
+            # A block that ends in an unconditional jmp instead of a ret is
+            # the other half of this shape, and rejecting it left the branch
+            # pointing at a stub just the same. Half-Life 2's _lock helper
+            # (sub_005BE146) exits its scan loop into two such blocks at
+            # 0x005BE244 and 0x005BE250; both were emitted as stubs that
+            # returned without running the function's __finally, so _unlock
+            # never ran. The CRT lock was taken 15 times and released none,
+            # and the next thread to want it waited forever -- a level load
+            # that deadlocked two thirds of the way in, with nothing in the
+            # log to connect it to a missed function boundary.
+            tail = self.engine.block_tail_jump(target)
             if not (self.engine.probes_as_returning_body(target, max_insns=256)
-                    or self.engine.probes_as_vcall_thunk(target)):
+                    or self.engine.probes_as_vcall_thunk(target)
+                    or tail is not None):
                 continue
 
             # Run to the next known function start, or the section end.
@@ -834,6 +846,15 @@ class FunctionDetector:
                                                     + section.virtual_size)
             self._alias_entries[target] = end
             added = True
+
+            # Where that jump lands has to be addressable too, or the block we
+            # just recovered ends in a call to a stub and nothing is gained.
+            # Landing inside a function is the ordinary case -- it is the rest
+            # of the loop -- and the alias mechanism already exists for it.
+            if tail is not None and tail not in self._alias_entries                     and tail not in self._candidates and tail not in self.functions:
+                m = bisect.bisect_right(starts, tail) - 1
+                if m >= 0 and bodies[m][0] < tail < bodies[m][1]:
+                    self._alias_entries[tail] = bodies[m][1]
 
         if added:
             print("  conditional-branch orphans recovered as alias entries")
