@@ -97,7 +97,7 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 
 | Library | Source | What It Does |
 |---------|--------|-------------|
-| **xbox_kernel** | Custom | Xbox kernel → Win32 (120 of the kernel's 371 ordinals routed, 119 with dedicated bridge functions: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
+| **xbox_kernel** | Custom | Xbox kernel → Win32 (170 of the kernel's 371 ordinals routed, 169 with dedicated bridge functions: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
 | **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
 | **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |

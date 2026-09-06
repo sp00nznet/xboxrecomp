@@ -2860,10 +2860,15 @@ static void bridge_AvSendTVEncoderOption(void)
 /* ── ExFreePool (ordinal 17, 1 arg)
  * Was resolving to a DATA address before the kernel_data_va_for_ordinal fix,
  * so the title was calling into kernel data. Even after that it was an
- * unbridged no-op, which leaks every pool block the title ever frees. */
+ * unbridged no-op, which leaks every pool block the title ever frees.
+ *
+ * Deliberately does NOT call xbox_ExFreePool: that one HeapFrees its argument
+ * on the host heap, but every pool block reaches the title as a guest VA from
+ * xbox_HeapAlloc, so only the guest heap can release it. xbox_HeapFree answers
+ * through the block table and takes the raw 32-bit guest VA. */
 static void bridge_ExFreePool(void)
 {
-    xbox_ExFreePool(XBOX_TO_NATIVE(STACK_ARG(0)));
+    xbox_HeapFree(STACK_ARG(0));
     g_eax = 0;
 }
 
@@ -3441,6 +3446,491 @@ static void bridge_XcDESKeyParity(void)
     g_eax = 0;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * The rest of the xbox_* implementations that had no route. Each was checked
+ * against the memory-model bar: reads or writes only happen at
+ * caller-supplied guest addresses, XBOX_TO_NATIVE maps guest NULL to host
+ * NULL, and nothing allocates, frees, or hands back a host pointer unless the
+ * exception is stated in place. I/O Manager and HAL entries are mostly
+ * documented stubs whose whole contract is a return value; the Xc* crypto
+ * entries are stubs and guest-buffer operations.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── DbgBreakPoint (ordinal 5, void) */
+static void bridge_DbgBreakPoint(void)
+{
+    xbox_DbgBreakPoint();
+    g_eax = 0;
+}
+
+/* ── AvSetSavedDataAddress (ordinal 4, 1 arg) */
+static void bridge_AvSetSavedDataAddress(void)
+{
+    xbox_AvSetSavedDataAddress(STACK_ARG(0));
+    g_eax = 0;
+}
+
+/* ── HalDisableSystemInterrupt (ordinal 39, 2 args) */
+static void bridge_HalDisableSystemInterrupt(void)
+{
+    xbox_HalDisableSystemInterrupt(STACK_ARG(0), (KIRQL)STACK_ARG(1));
+    g_eax = 0;
+}
+
+/* ── HalInitiateShutdown (ordinal 360, void)
+ * The implementation calls ExitProcess, so this never actually returns. */
+static void bridge_HalInitiateShutdown(void)
+{
+    xbox_HalInitiateShutdown();
+    g_eax = 0;
+}
+
+/* ── HalIsResetOrShutdownPending (ordinal 358, void) */
+static void bridge_HalIsResetOrShutdownPending(void)
+{
+    g_eax = (uint32_t)xbox_HalIsResetOrShutdownPending();
+}
+
+/* ── WRITE_PORT_BUFFER_ULONG / WRITE_PORT_BUFFER_USHORT (334 / 333, 3 args)
+ * Port I/O stubs that ignore every argument, so pointers pass through without
+ * translation -- nothing dereferences them. */
+static void bridge_WRITE_PORT_BUFFER_ULONG(void)
+{
+    xbox_WRITE_PORT_BUFFER_ULONG((PULONG)(uintptr_t)STACK_ARG(0),
+        (PULONG)(uintptr_t)STACK_ARG(1), STACK_ARG(2));
+    g_eax = 0;
+}
+
+static void bridge_WRITE_PORT_BUFFER_USHORT(void)
+{
+    xbox_WRITE_PORT_BUFFER_USHORT((PUSHORT)(uintptr_t)STACK_ARG(0),
+        (PUSHORT)(uintptr_t)STACK_ARG(1), STACK_ARG(2));
+    g_eax = 0;
+}
+
+/* ── I/O Manager stubs (ordinals 61, 62, 69, 73, 74, 79, 81-87, 359)
+ *
+ * The Xbox I/O manager is used internally by the XDK libraries we replace, so
+ * these are all stubs whose contract is a return value plus occasional writes
+ * to caller-supplied guest structures (IRP, IO_STATUS_BLOCK, symlink table).
+ * None of them hands back a pointer the title dereferences.
+ *
+ * IofCallDriver / IofCompleteRequest are __fastcall on Xbox, so their
+ * arguments live in ecx/edx, never on the stack -- the arg-size entries are 0
+ * and reading STACK_ARG would dereference whatever the caller left there.
+ */
+static void bridge_IoBuildDeviceIoControlRequest(void)
+{
+    g_eax = (uint32_t)xbox_IoBuildDeviceIoControlRequest(
+        STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
+        XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
+        XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
+        (BOOLEAN)STACK_ARG(6), bridge_resolve_handle(STACK_ARG(7)),
+        (PXBOX_IO_STATUS_BLOCK)XBOX_TO_NATIVE(STACK_ARG(8)));
+}
+
+static void bridge_IoBuildSynchronousFsdRequest(void)
+{
+    g_eax = (uint32_t)(uintptr_t)xbox_IoBuildSynchronousFsdRequest(
+        STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
+        XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
+        XBOX_TO_NATIVE(STACK_ARG(4)), bridge_resolve_handle(STACK_ARG(5)),
+        (PXBOX_IO_STATUS_BLOCK)XBOX_TO_NATIVE(STACK_ARG(6)));
+}
+
+static void bridge_IoDeleteSymbolicLink(void)
+{
+    uint32_t name_va = STACK_ARG(0);
+    XBOX_ANSI_STRING name;
+
+    if (!name_va) {
+        g_eax = 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    name.Length        = BRIDGE_MEM16(name_va + 0);
+    name.MaximumLength = BRIDGE_MEM16(name_va + 2);
+    name.Buffer        = (PCHAR)XBOX_TO_NATIVE(BRIDGE_MEM32(name_va + 4));
+
+    g_eax = (uint32_t)xbox_IoDeleteSymbolicLink(&name);
+}
+
+static void bridge_IoInitializeIrp(void)
+{
+    xbox_IoInitializeIrp(XBOX_TO_NATIVE(STACK_ARG(0)),
+        (USHORT)STACK_ARG(1), (CCHAR)STACK_ARG(2));
+    g_eax = 0;
+}
+
+static void bridge_IoInvalidDeviceRequest(void)
+{
+    g_eax = (uint32_t)xbox_IoInvalidDeviceRequest(
+        XBOX_TO_NATIVE(STACK_ARG(0)), XBOX_TO_NATIVE(STACK_ARG(1)));
+}
+
+static void bridge_IoMarkIrpMustComplete(void)
+{
+    xbox_IoMarkIrpMustComplete(XBOX_TO_NATIVE(STACK_ARG(0)));
+    g_eax = 0;
+}
+
+static void bridge_IoSetIoCompletion(void)
+{
+    g_eax = (uint32_t)xbox_IoSetIoCompletion(
+        XBOX_TO_NATIVE(STACK_ARG(0)), XBOX_TO_NATIVE(STACK_ARG(1)),
+        XBOX_TO_NATIVE(STACK_ARG(2)), (NTSTATUS)STACK_ARG(3),
+        (ULONG_PTR)STACK_ARG(4));
+}
+
+static void bridge_IoStartNextPacket(void)
+{
+    xbox_IoStartNextPacket(XBOX_TO_NATIVE(STACK_ARG(0)),
+        (BOOLEAN)STACK_ARG(1));
+    g_eax = 0;
+}
+
+static void bridge_IoStartNextPacketByKey(void)
+{
+    xbox_IoStartNextPacketByKey(XBOX_TO_NATIVE(STACK_ARG(0)),
+        (BOOLEAN)STACK_ARG(1), STACK_ARG(2));
+    g_eax = 0;
+}
+
+static void bridge_IoStartPacket(void)
+{
+    xbox_IoStartPacket(XBOX_TO_NATIVE(STACK_ARG(0)),
+        XBOX_TO_NATIVE(STACK_ARG(1)), (PULONG)XBOX_TO_NATIVE(STACK_ARG(2)),
+        XBOX_TO_NATIVE(STACK_ARG(3)));
+    g_eax = 0;
+}
+
+static void bridge_IoSynchronousDeviceIoControlRequest(void)
+{
+    g_eax = (uint32_t)xbox_IoSynchronousDeviceIoControlRequest(
+        STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
+        XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
+        XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
+        (PULONG)XBOX_TO_NATIVE(STACK_ARG(6)), (BOOLEAN)STACK_ARG(7));
+}
+
+static void bridge_IoSynchronousFsdRequest(void)
+{
+    g_eax = (uint32_t)xbox_IoSynchronousFsdRequest(
+        STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
+        XBOX_TO_NATIVE(STACK_ARG(2)), STACK_ARG(3),
+        XBOX_TO_NATIVE(STACK_ARG(4)));
+}
+
+static void bridge_IofCallDriver(void)
+{
+    g_eax = (uint32_t)xbox_IofCallDriver(XBOX_TO_NATIVE(g_ecx),
+                                        XBOX_TO_NATIVE(g_edx));
+}
+
+static void bridge_IofCompleteRequest(void)
+{
+    xbox_IofCompleteRequest(XBOX_TO_NATIVE(g_ecx), (CCHAR)g_edx);
+    g_eax = 0;
+}
+
+/* ── MmLockUnlockPhysicalPage (ordinal 176, 2 args)
+ * Page locking is a no-op in user mode; the physical address is a value,
+ * never dereferenced. */
+static void bridge_MmLockUnlockPhysicalPage(void)
+{
+    xbox_MmLockUnlockPhysicalPage(STACK_ARG(0), (BOOLEAN)STACK_ARG(1));
+    g_eax = 0;
+}
+
+/* ── MmAllocateSystemMemory (ordinal 167, 2 args)
+ *
+ * Deliberately does NOT call xbox_MmAllocateSystemMemory: that one
+ * VirtualAllocs from the host and returns a 64-bit host pointer, which the
+ * title would truncate to a 4-byte guest VA and then dereference as Xbox
+ * memory. The pool must live where the guest can reach it, so it is carved
+ * from the guest heap like the ExAllocatePool bridges, and the Protect
+ * argument has no meaning for a heap bump. */
+static void bridge_MmAllocateSystemMemory(void)
+{
+    uint32_t size = STACK_ARG(0);
+    uint32_t xbox_va = xbox_HeapAlloc(size, 16);
+
+    g_eax = xbox_va;
+}
+
+/* ── MmFreeSystemMemory (ordinal 172, 2 args)
+ * Guest-heap twin of the allocator above; nothing on the host heap has ever
+ * seen this address. */
+static void bridge_MmFreeSystemMemory(void)
+{
+    xbox_HeapFree(STACK_ARG(0));
+    g_eax = 0;
+}
+
+/* ── MmCreateKernelStack / MmDeleteKernelStack (169 / 170, 2 args)
+ *
+ * Same memory model as the pair above. The Xbox convention is that
+ * MmCreateKernelStack returns the TOP of the stack and the delete call
+ * receives (StackBase=top, StackLimit=base). Both halves of that come from the
+ * guest heap here: create returns base+size, delete frees the base (arg 1). */
+static void bridge_MmCreateKernelStack(void)
+{
+    uint32_t size = STACK_ARG(0);
+    uint32_t base_va = xbox_HeapAlloc(size, 16);
+
+    g_eax = base_va ? base_va + size : 0;
+}
+
+static void bridge_MmDeleteKernelStack(void)
+{
+    xbox_HeapFree(STACK_ARG(1));
+    g_eax = 0;
+}
+
+/* ── Xc* remaining crypto (ordinals 341-345, 347-351)
+ *
+ * Split into two kinds, both of which clear the memory-model bar:
+ *  - the public-key / DES / ModExp entries are documented stubs that ignore
+ *    their arguments (no Xbox Live, no on-console key derivation), so the
+ *    pointers pass through without being dereferenced;
+ *  - XcBlockCrypt/XcKeyTable/XcCryptService/XcUpdateCrypto are the same shape.
+ * XcVerifyPKCS1Signature is worth singling out: it returns TRUE so that
+ * signature checks succeed instead of rebooting the dashboard. */
+static void bridge_XcPKGetKeyLen(void)
+{
+    g_eax = (uint32_t)xbox_XcPKGetKeyLen(XBOX_TO_NATIVE(STACK_ARG(0)));
+}
+
+static void bridge_XcPKDecPrivate(void)
+{
+    g_eax = (uint32_t)xbox_XcPKDecPrivate(XBOX_TO_NATIVE(STACK_ARG(0)),
+        XBOX_TO_NATIVE(STACK_ARG(1)), XBOX_TO_NATIVE(STACK_ARG(2)));
+}
+
+static void bridge_XcPKEncPublic(void)
+{
+    g_eax = (uint32_t)xbox_XcPKEncPublic(XBOX_TO_NATIVE(STACK_ARG(0)),
+        XBOX_TO_NATIVE(STACK_ARG(1)), XBOX_TO_NATIVE(STACK_ARG(2)));
+}
+
+static void bridge_XcVerifyPKCS1Signature(void)
+{
+    g_eax = (uint32_t)xbox_XcVerifyPKCS1Signature(
+        XBOX_TO_NATIVE(STACK_ARG(0)), XBOX_TO_NATIVE(STACK_ARG(1)),
+        XBOX_TO_NATIVE(STACK_ARG(2)));
+}
+
+static void bridge_XcModExp(void)
+{
+    g_eax = (uint32_t)xbox_XcModExp((PULONG)XBOX_TO_NATIVE(STACK_ARG(0)),
+        (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)),
+        (PULONG)XBOX_TO_NATIVE(STACK_ARG(2)),
+        (PULONG)XBOX_TO_NATIVE(STACK_ARG(3)), STACK_ARG(4));
+}
+
+static void bridge_XcKeyTable(void)
+{
+    xbox_XcKeyTable(STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
+        (const UCHAR*)XBOX_TO_NATIVE(STACK_ARG(2)));
+    g_eax = 0;
+}
+
+static void bridge_XcBlockCrypt(void)
+{
+    xbox_XcBlockCrypt(STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)),
+        XBOX_TO_NATIVE(STACK_ARG(2)), XBOX_TO_NATIVE(STACK_ARG(3)),
+        STACK_ARG(4));
+    g_eax = 0;
+}
+
+static void bridge_XcBlockCryptCBC(void)
+{
+    xbox_XcBlockCryptCBC(STACK_ARG(0), STACK_ARG(1),
+        XBOX_TO_NATIVE(STACK_ARG(2)), XBOX_TO_NATIVE(STACK_ARG(3)),
+        XBOX_TO_NATIVE(STACK_ARG(4)), STACK_ARG(5),
+        XBOX_TO_NATIVE(STACK_ARG(6)));
+    g_eax = 0;
+}
+
+static void bridge_XcCryptService(void)
+{
+    xbox_XcCryptService(STACK_ARG(0), XBOX_TO_NATIVE(STACK_ARG(1)));
+    g_eax = 0;
+}
+
+static void bridge_XcUpdateCrypto(void)
+{
+    xbox_XcUpdateCrypto(XBOX_TO_NATIVE(STACK_ARG(0)),
+        XBOX_TO_NATIVE(STACK_ARG(1)));
+    g_eax = 0;
+}
+
+/* ── RtlRip (ordinal 352, 3 args)
+ * The CRT rip/assert path. All three pointers are guest C strings, so each is
+ * translated; nothing is written. */
+static void bridge_RtlRip(void)
+{
+    xbox_RtlRip((PCHAR)XBOX_TO_NATIVE(STACK_ARG(0)),
+        (PCHAR)XBOX_TO_NATIVE(STACK_ARG(1)),
+        (PCHAR)XBOX_TO_NATIVE(STACK_ARG(2)));
+    g_eax = 0;
+}
+
+/* ── RtlAnsiStringToUnicodeString (ordinal 260, 3 args) ──────────────────
+ *
+ * NOT a call into xbox_RtlAnsiStringToUnicodeString. That one HeapAllocs on
+ * the host heap and stores the resulting 64-bit host pointer into the guest
+ * string's 4-byte Buffer field -- the memory-model mismatch. This bridge does
+ * the whole conversion by hand:
+ *
+ *  - Source fields are read from the guest struct (Buffer at offset 4);
+ *  - the destination stays wherever the title put it (non-allocating), or is
+ *    carved from the guest heap (allocating) and its guest VA stored at
+ *    offset 4;
+ *  - conversion writes only at guest addresses.
+ */
+static void bridge_RtlAnsiStringToUnicodeString(void)
+{
+    uint32_t dst_va  = STACK_ARG(0);
+    uint32_t src_va  = STACK_ARG(1);
+    uint32_t do_alloc = STACK_ARG(2);
+    uint32_t s_len, s_buf_va, d_max, d_buf_va = 0;
+    uint32_t unicode_bytes;
+    int result;
+
+    if (!dst_va || !src_va) {
+        g_eax = 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    s_len   = BRIDGE_MEM16(src_va + 0);
+    s_buf_va = BRIDGE_MEM32(src_va + 4);
+    if (!s_buf_va) {
+        g_eax = 0xC000000Du;
+        return;
+    }
+    unicode_bytes = (uint32_t)(s_len + 1) * sizeof(WCHAR);
+
+    d_max = BRIDGE_MEM16(dst_va + 2);
+    if (do_alloc) {
+        d_buf_va = xbox_HeapAlloc(unicode_bytes, 16);
+        if (!d_buf_va) {
+            g_eax = 0xC0000017u;   /* STATUS_NO_MEMORY */
+            return;
+        }
+        BRIDGE_MEM16(dst_va + 2) = (uint16_t)unicode_bytes;
+        BRIDGE_MEM32(dst_va + 4) = d_buf_va;
+    } else {
+        if (d_max < unicode_bytes) {
+            g_eax = 0xC0000205u;   /* STATUS_BUFFER_OVERFLOW */
+            return;
+        }
+        d_buf_va = BRIDGE_MEM32(dst_va + 4);
+        if (!d_buf_va) {
+            g_eax = 0xC000000Du;
+            return;
+        }
+    }
+
+    result = MultiByteToWideChar(CP_ACP, 0,
+        (const char*)XBOX_TO_NATIVE(s_buf_va), (int)s_len,
+        (WCHAR*)XBOX_TO_NATIVE(d_buf_va), (int)(unicode_bytes / sizeof(WCHAR)));
+    if (result > 0) {
+        BRIDGE_MEM16(dst_va + 0) = (uint16_t)(result * sizeof(WCHAR));
+        ((WCHAR*)XBOX_TO_NATIVE(d_buf_va))[result] = 0;
+        g_eax = 0;
+    } else {
+        g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */
+    }
+}
+
+/* ── RtlUnicodeStringToAnsiString (ordinal 308, 3 args)
+ * Mirror of the ANSI→Unicode bridge above. */
+static void bridge_RtlUnicodeStringToAnsiString(void)
+{
+    uint32_t dst_va  = STACK_ARG(0);
+    uint32_t src_va  = STACK_ARG(1);
+    uint32_t do_alloc = STACK_ARG(2);
+    uint32_t s_len, s_buf_va, d_max, d_buf_va = 0;
+    uint32_t ansi_bytes;
+    int result;
+
+    if (!dst_va || !src_va) {
+        g_eax = 0xC000000Du;
+        return;
+    }
+    s_len   = BRIDGE_MEM16(src_va + 0);
+    s_buf_va = BRIDGE_MEM32(src_va + 4);
+    if (!s_buf_va) {
+        g_eax = 0xC000000Du;
+        return;
+    }
+    ansi_bytes = s_len / sizeof(WCHAR) + 1;
+
+    d_max = BRIDGE_MEM16(dst_va + 2);
+    if (do_alloc) {
+        d_buf_va = xbox_HeapAlloc(ansi_bytes, 16);
+        if (!d_buf_va) {
+            g_eax = 0xC0000017u;
+            return;
+        }
+        BRIDGE_MEM16(dst_va + 2) = (uint16_t)ansi_bytes;
+        BRIDGE_MEM32(dst_va + 4) = d_buf_va;
+    } else {
+        if (d_max < ansi_bytes) {
+            g_eax = 0xC0000205u;
+            return;
+        }
+        d_buf_va = BRIDGE_MEM32(dst_va + 4);
+        if (!d_buf_va) {
+            g_eax = 0xC000000Du;
+            return;
+        }
+    }
+
+    result = WideCharToMultiByte(CP_ACP, 0,
+        (const WCHAR*)XBOX_TO_NATIVE(s_buf_va), (int)(s_len / sizeof(WCHAR)),
+        (char*)XBOX_TO_NATIVE(d_buf_va), (int)ansi_bytes, NULL, NULL);
+    if (result > 0) {
+        BRIDGE_MEM16(dst_va + 0) = (uint16_t)result;
+        if ((uint16_t)result < d_max)
+            ((char*)XBOX_TO_NATIVE(d_buf_va))[result] = 0;
+        g_eax = 0;
+    } else {
+        g_eax = 0xC0000001u;
+    }
+}
+
+/* ── NtDuplicateObject (ordinal 197, 3 args)
+ *
+ * Xbox NtDuplicateObject has one process, and the handle table is ours: a
+ * by-value source token in, a 4-byte guest slot for the duplicated target.
+ * The source resolves through the table, DuplicateHandle produces a real
+ * native handle, and the target lands via bridge_write_handle as a fresh
+ * token -- same shape as NtCreateEvent. DUPLICATE_CLOSE_SOURCE also closes
+ * the native handle behind the source token, which is why the source token is
+ * NOT consumed here (the OS handle it wraps is gone after this call). */
+static void bridge_NtDuplicateObject(void)
+{
+    uint32_t target_va = STACK_ARG(1);
+    HANDLE src = bridge_resolve_handle(STACK_ARG(0));
+    HANDLE dup = NULL;
+    DWORD opts = 0;
+
+    if (!target_va) {
+        g_eax = 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    if (STACK_ARG(2) & 0x1) opts |= DUPLICATE_CLOSE_SOURCE;
+    if (STACK_ARG(2) & 0x2) opts |= DUPLICATE_SAME_ACCESS;
+
+    if (!DuplicateHandle(GetCurrentProcess(), src, GetCurrentProcess(),
+                         &dup, 0, FALSE, opts)) {
+        g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */
+        return;
+    }
+    bridge_write_handle(target_va, dup);
+    g_eax = 0;
+}
+
 /* ── Dispatch table: ordinal → bridge function + stack arg bytes ── */
 
 typedef void (*bridge_func_t)(void);
@@ -3643,13 +4133,16 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 338: return 12;  /* XcRC4Key (3) */
     case 339: return 12;  /* XcRC4Crypt (3) */
     case 340: return 28;  /* XcHMAC (7) */
+    case 341: return 12;  /* XcPKEncPublic (3) */
     case 342: return 12;  /* XcPKDecPrivate (3) */
     case 343: return  4;  /* XcPKGetKeyLen (1) */
     case 344: return 12;  /* XcVerifyPKCS1Signature (3) */
     case 345: return 20;  /* XcModExp (5) */
     case 346: return  8;  /* XcDESKeyParity (2) */
     case 347: return 12;  /* XcKeyTable (3) */
+    case 348: return 20;  /* XcBlockCrypt (5) */
     case 349: return 28;  /* XcBlockCryptCBC (7) */
+    case 350: return  8;  /* XcCryptService (2) */
     case 351: return  8;  /* XcUpdateCrypto (2) */
     case 352: return 12;  /* RtlRip (3) */
     case 358: return  0;  /* HalIsResetOrShutdownPending (void) */
@@ -3837,46 +4330,29 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 302: return bridge_RtlRaiseException;
 
 
-    /* BISECT-OFF case 338: bridge_XcRC4Key */
-    /* BISECT-OFF case 339: bridge_XcRC4Crypt */
+    /* Routed. The XcRC4 pair was turned OFF mid-bisect and never turned back
+     * on. Both pass the memory-model bar: a guest RC4_CONTEXT and a guest data
+     * buffer, every access translated through XBOX_TO_NATIVE, no allocation
+     * and no host pointer returned. Unrouted, savegame/EEPROM code that used
+     * RC4 silently did nothing. */
+    case 338: return bridge_XcRC4Key;
+    case 339: return bridge_XcRC4Crypt;
 
-
-    /* NOT ROUTED, deliberately. The wrappers above exist and compile, and each
-     * has a working xbox_* behind it, but routing them made Halo 2276 crash
-     * EARLIER than leaving them stubbed -- twice, with two different faults.
-     * Bisected to a memory-model mismatch, not to the wrappers' arithmetic:
+    /* Routed. The lesson of the block that used to sit here was that an
+     * xbox_* existence does not make a wrapper mechanical: each candidate has
+     * to be checked for which side owns the allocation and whether an
+     * out-pointer must carry a guest VA. IoCreateDevice was fixed by
+     * allocating the device object in guest memory; ExFreePool below answers
+     * through the guest heap; MmUnmapIoSpace/IoDeleteDevice do the same.
      *
-     *   xbox_IoCreateDevice HeapAllocs from GetProcessHeap() and writes that
-     *   NATIVE pointer through its out-parameter. The bridge hands it the
-     *   native address of a 4-BYTE GUEST slot, so a 64-bit pointer is written
-     *   into 4 bytes: it clobbers the adjacent guest dword and leaves the title
-     *   a truncated pointer it then dereferences. Crash was a write to
-     *   0x90909090.
-     *
-     *   xbox_ExFreePool calls HeapFree(GetProcessHeap(), P). Guest pool memory
-     *   is not on the host heap, so P is a pointer HeapFree has never seen.
-     *
-     * These xbox_* functions were written for a NATIVE caller, where pointers
-     * are host pointers and allocations are host allocations. The bridge is a
-     * different world: pointers are guest VAs and memory lives in the mapped
-     * guest space. XBOX_TO_NATIVE converts an address; it cannot convert an
-     * allocator.
-     *
-     * So 'an xbox_* exists, therefore the wrapper is mechanical' is false, and
-     * tools.kernel_audit.coverage no longer says it. Each of these needs its
-     * memory model checked one at a time: which side owns the allocation, and
-     * whether an out-pointer must carry a guest VA. Ones that only read or
-     * write bytes at a caller-supplied address (the Xc* crypto group,
-     * RtlTimeToTimeFields) should be fine; ones that allocate, free, or hand
-     * back a pointer are not.
-     *
-     * Left in place rather than deleted: the wrappers are correct as argument
-     * marshalling, and re-deriving them is the easy half of the work.
-     */
-    /* case   1: bridge_AvGetSavedDataAddress */
-    /* case  17: bridge_ExFreePool */
-    /* case  97: bridge_KeCancelTimer */
-    /* case 100: bridge_KeDisconnectInterrupt */
+     * The three beside them were parked, never broken: AvGetSavedDataAddress
+     * returns a ULONG value, KeCancelTimer takes a guest KTIMER through
+     * XBOX_TO_NATIVE, KeDisconnectInterrupt takes a guest KINTERRUPT the same
+     * way. None of them allocates, frees, or hands back a host pointer. */
+    case   1: return bridge_AvGetSavedDataAddress;
+    case  17: return bridge_ExFreePool;
+    case  97: return bridge_KeCancelTimer;
+    case 100: return bridge_KeDisconnectInterrupt;
     /* Routed: thread base priority, queried and set. Neither allocates,
      * frees, nor returns a pointer -- each takes a thread handle and a
      * LONG. Half-Life 2 calls both while starting its worker threads,
@@ -3928,9 +4404,15 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * thread the title had created suspended never started. */
     case 224: return bridge_NtResumeThread;
     case 231: return bridge_NtSuspendThread;
-    /* case 250: bridge_ObfDereferenceObject */
-    /* case 252: bridge_PhyGetLinkState */
-    /* case 253: bridge_PhyInitialize */
+    /* Routed. ObfDereferenceObject is the fastcall partner of 251 (see its
+     * wrapper) and only touches the object's reference count; PhyGetLinkState
+     * reports link-up and PhyInitialize is a successful no-op. None of the
+     * three allocates, frees, or hands back a host pointer; PhyGetLinkState is
+     * what titles poll for Ethernet presence before selecting their network
+     * path. */
+    case 250: return bridge_ObfDereferenceObject;
+    case 252: return bridge_PhyGetLinkState;
+    case 253: return bridge_PhyInitialize;
     /* Routed. The memory-model note above already names this group as the
      * safe kind: each one reads or writes bytes at an address the caller
      * supplied, and none allocates, frees, or hands back a host pointer.
@@ -3944,7 +4426,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 336: return bridge_XcSHAUpdate;
     case 337: return bridge_XcSHAFinal;
     case 340: return bridge_XcHMAC;
-    /* case 346: bridge_XcDESKeyParity */
+    case 346: return bridge_XcDESKeyParity;
 
     /* Routed. Each of these was checked against the memory-model bar
      * described above before being added: reads or writes only happen at
@@ -3972,6 +4454,68 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 251: return bridge_ObfReferenceObject;
     case 290: return bridge_RtlInitUnicodeString;
     case 304: return bridge_RtlTimeFieldsToTime;
+
+    /* Routed. The next batch is every remaining xbox_* implementation that
+     * clears the memory-model bar, split by category:
+     *
+     *  - HAL/AV/port-I/O and the I/O Manager stubs all take or produce value
+     *    arguments and caller-supplied guest structures; none of them returns
+     *    a pointer the title dereferences. IofCallDriver/IofCompleteRequest
+     *    are __fastcall (ns in ecx/edx).
+     *  - The Xc* entries are documented stubs (no Xbox Live, no on-console key
+     *    derivation); pointers are translated but never dereferenced.
+     *  - MmAllocateSystemMemory/MmCreateKernelStack answer through the guest
+     *    heap rather than VirtualAlloc so the title sees a 32-bit guest VA;
+     *    their frees pair with them.
+     *  - NtDuplicateObject dups a real native handle and hands it back as a
+     *    fresh guest token; RtlRip logs guest strings; the ANSI<->Unicode
+     *    conversion bridges do the whole conversion in guest memory (their
+     *    xbox_* versions write host pointers into 4-byte guest slots).
+     */
+    case   4: return bridge_AvSetSavedDataAddress;
+    case   5: return bridge_DbgBreakPoint;
+    case  39: return bridge_HalDisableSystemInterrupt;
+    case 360: return bridge_HalInitiateShutdown;
+    case 358: return bridge_HalIsResetOrShutdownPending;
+    case 333: return bridge_WRITE_PORT_BUFFER_USHORT;
+    case 334: return bridge_WRITE_PORT_BUFFER_ULONG;
+
+    case  61: return bridge_IoBuildDeviceIoControlRequest;
+    case  62: return bridge_IoBuildSynchronousFsdRequest;
+    case  69: return bridge_IoDeleteSymbolicLink;
+    case  73: return bridge_IoInitializeIrp;
+    case  74: return bridge_IoInvalidDeviceRequest;
+    case  79: return bridge_IoSetIoCompletion;
+    case  81: return bridge_IoStartNextPacket;
+    case  82: return bridge_IoStartNextPacketByKey;
+    case  83: return bridge_IoStartPacket;
+    case  84: return bridge_IoSynchronousDeviceIoControlRequest;
+    case  85: return bridge_IoSynchronousFsdRequest;
+    case  86: return bridge_IofCallDriver;
+    case  87: return bridge_IofCompleteRequest;
+    case 359: return bridge_IoMarkIrpMustComplete;
+
+    case 176: return bridge_MmLockUnlockPhysicalPage;
+    case 167: return bridge_MmAllocateSystemMemory;
+    case 172: return bridge_MmFreeSystemMemory;
+    case 169: return bridge_MmCreateKernelStack;
+    case 170: return bridge_MmDeleteKernelStack;
+
+    case 341: return bridge_XcPKEncPublic;
+    case 342: return bridge_XcPKDecPrivate;
+    case 343: return bridge_XcPKGetKeyLen;
+    case 344: return bridge_XcVerifyPKCS1Signature;
+    case 345: return bridge_XcModExp;
+    case 347: return bridge_XcKeyTable;
+    case 348: return bridge_XcBlockCrypt;
+    case 349: return bridge_XcBlockCryptCBC;
+    case 350: return bridge_XcCryptService;
+    case 351: return bridge_XcUpdateCrypto;
+
+    case 352: return bridge_RtlRip;
+    case 260: return bridge_RtlAnsiStringToUnicodeString;
+    case 308: return bridge_RtlUnicodeStringToAnsiString;
+    case 197: return bridge_NtDuplicateObject;
 
     default:  return NULL;
     }
