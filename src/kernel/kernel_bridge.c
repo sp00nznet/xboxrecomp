@@ -3725,22 +3725,6 @@ static void bridge_MmLockUnlockPhysicalPage(void)
     g_eax = 0;
 }
 
-/* ── MmAllocateSystemMemory (ordinal 167, 2 args)
- *
- * Deliberately does NOT call xbox_MmAllocateSystemMemory: that one
- * VirtualAllocs from the host and returns a 64-bit host pointer, which the
- * title would truncate to a 4-byte guest VA and then dereference as Xbox
- * memory. The pool must live where the guest can reach it, so it is carved
- * from the guest heap like the ExAllocatePool bridges, and the Protect
- * argument has no meaning for a heap bump. */
-static void bridge_MmAllocateSystemMemory(void)
-{
-    uint32_t size = STACK_ARG(0);
-    uint32_t xbox_va = xbox_HeapAlloc(size, 16);
-
-    g_eax = xbox_va;
-}
-
 /* ── MmFreeSystemMemory (ordinal 172, 2 args)
  * Guest-heap twin of the allocator above; nothing on the host heap has ever
  * seen this address. */
@@ -4333,7 +4317,6 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case  23: return bridge_ExQueryPoolBlockSize;
     case 268: return bridge_RtlCompareMemory;
     case 269: return bridge_RtlCompareMemoryUlong;
-    case 167: return bridge_MmAllocateSystemMemory;
     case  35: return bridge_FscGetCacheSize;
     case  37: return bridge_FscSetCacheSize;
     case  24: return bridge_ExQueryNonVolatileSetting;
@@ -4581,6 +4564,9 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 359: return bridge_IoMarkIrpMustComplete;
 
     case 176: return bridge_MmLockUnlockPhysicalPage;
+    /* Allocator and free together: both answer from the guest heap, and the
+     * allocator page-aligns and zeroes because that is what the console's
+     * page allocator returns and callers assume it. */
     case 167: return bridge_MmAllocateSystemMemory;
     case 172: return bridge_MmFreeSystemMemory;
     case 169: return bridge_MmCreateKernelStack;

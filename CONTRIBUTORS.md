@@ -96,6 +96,27 @@ helpers the lift emits — was not in the PRs and was added on integration.)*
   every direct caller. Now direct calls and both tail-jump forms route through
   the manual set that `--manual-functions` and `--exclude-manual` already build.
 
+*Flags, vertex layout and audio (#22, #23, #24)*
+- **`xor reg, reg` zeroed the register without clearing the carry flag** — the
+  lifter emitted the zeroing and nothing else, so `_cf` still held whatever the
+  previous instruction left and a following `adc`/`sbb` borrowed a carry the
+  hardware had already cleared. Shipped with five conformance cases covering
+  byte, high-byte, word and dword zeroing into both `adc` and `sbb`.
+- **The FVF position field was tested as bits (#23)** — `fvf & D3DFVF_XYZRHW`
+  is a bit test against an *encoded* field, so `D3DFVF_XYZB1` (0x006) tested as
+  transformed and took the untransformed path's opposite branch. The attribute
+  offset had the matching bug: it assumed 3 or 4 floats and stepped over blend
+  weights and normals as if they were not there. Both now come from the
+  position field's own value.
+- **DirectSound cursors and the mixer disagreed (#24)** — buffers kept a
+  `play_cursor` and `status` of their own while the mixer advanced and stopped
+  independently, so `SetCurrentPosition` did not seek, `Play` discarded the
+  position it was given, and the getters were stale after rendering. The
+  fixed-point source position was also too narrow and overflowed past 65,535
+  frames. The regression is the notable part: it compiles the real mixer out of
+  `apu_core.c` against the real `dsound_device.c` rather than a copy of either,
+  so it cannot drift from what actually runs.
+
 *Also raised: stored code pointers (#13).* The gap is real and was found
 independently while bringing up Half-Life 2 -- functions reachable only as an
 address in a table have no call site, no prologue and no padding boundary, so
@@ -126,6 +147,17 @@ direction.
   change this size reviewable at all. `docs/technical/gap-analysis.md` marks
   the approximate maps that still want in-game validation rather than claiming
   them.
+- **Kernel ordinal routing (#25)** — 20 more routes (SMBus, PCI config space,
+  IRQL, EEPROM save, semaphores, FP-state save/restore, `KeWaitForMultiple-
+  Objects`, and the rest), and more valuably the memory-model corrections
+  behind them: the allocator bridges now answer from the *guest* heap instead
+  of handing back a 64-bit host pointer for the title to truncate to four
+  bytes and dereference, `RtlInitUnicodeString` and `ObReferenceObjectByName`
+  write 4-byte guest fields rather than host-width ones, and a 64-bit return is
+  split across `g_eax`/`g_edx`. That took the image from 150 to 170 of 371
+  ordinals routed. It also closed every ordinal Half-Life 2 was hitting
+  unbridged at runtime — `AvGetSavedDataAddress`, `HalReadWritePCISpace`,
+  `MmFreeSystemMemory` and `ObfDereferenceObject` — which now log none.
 - The same PR **took Burnout 3 out of the tooling** — hardcoded title strings
   in the parser, disassembler, func_id and translator replaced with a shared
   config, and the Linux default paths made generic.
@@ -139,6 +171,15 @@ direction.
   by reading for a missing `ERROR_NOT_OWNER`, which turned out to be the
   smaller half of the problem. Also set `ERROR_INVALID_HANDLE` on the
   bad-handle path, which had been a bare `FALSE` with no error set.
+- **Built the macOS path he had scoped (#20)** — the Darwin half of
+  `win32_compat`, `mach/mach.h` for the memory queries with no
+  `GlobalMemoryStatusEx`, and honest `TODO`s where the platform has no
+  equivalent rather than a silently wrong one: macOS has no
+  `MAP_FIXED_NOREPLACE`, and plain `MAP_FIXED` would unmap whatever already
+  lives at the address instead of failing, so the note names `mach_vm_map` with
+  `VM_FLAGS_FIXED` as the way through. Also replaced `wcslen` with the
+  project's own `xbox_wcslen`, which is the one functional change: the CRT's
+  operates on 32-bit `wchar_t` and the Xbox `WCHAR` is 16-bit.
 - **Scoped the macOS port (#19)** — an accurate, specific list of what stands
   in the way (`MAP_FIXED_NOREPLACE`, `memfd_create`, `GlobalMemoryStatusEx`,
   SDL2/epoxy) rather than a request, which is the useful kind of issue.
@@ -156,6 +197,14 @@ direction.
   That single issue is the origin of the pipeline fix in `21488f4` — and of the
   repository having a LICENSE file at all, which the README had claimed for
   months without one actually existing.
+
+### SpringierTrain — [@SpringierTrain](https://github.com/SpringierTrain)
+- **Asked whether Half-Life 2 could be ported (#12).** It could, and the asking
+  is what started it. HL2 is now the toolkit's largest target and its most
+  productive one: the carry-flag, `bt`/`bts`, `rep movs`, atomics, per-thread
+  TIB, function-boundary and SSE-compare fixes all came out of making that one
+  title load a level, and every one of them is in the shared toolkit rather
+  than the title.
 
 ### M0RSM4LLEO — [@M0RSM4LLEO](https://github.com/M0RSM4LLEO)
 - **Reproduced and pinned down the getting-started failures (#2)** with the
