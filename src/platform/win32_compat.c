@@ -5,7 +5,7 @@
  * (threads/events/mutexes/atomics/heap/timers) -- it carries no Xbox
  * semantics. The Xbox kernel HLE in src/kernel builds on top of it.
  *
- * Linux/POSIX only.
+ * POSIX (Linux/MacOS) only.
  */
 
 #if !defined(_WIN32)
@@ -26,7 +26,13 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <sys/stat.h>
+#include <mach/mach.h>
+#else
 #include <sys/sysinfo.h>
+#endif
 
 /* ===================================================================== */
 /* Last-error (thread-local)                                             */
@@ -904,10 +910,20 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
         /* fall through to a fresh mapping */
     }
 
+#if defined(MAP_FIXED_NOREPLACE)
     if (address) flags |= MAP_FIXED_NOREPLACE;
+#elif defined(__APPLE__)
+    /* TODO: mach_vm_map with VM_FLAGS_FIXED (which does fail rather than replace),
+     * or a mach_vm_region probe before an MAP_FIXED call. */
+#endif
     void *p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
                    flags, -1, 0);
     if (p == MAP_FAILED) { SetLastError(8); return NULL; }
+#if !defined(MAP_FIXED_NOREPLACE)
+    /* TODO: Without MAP_FIXED_NOREPLACE (macOS or older kernels) plain
+     * MAP_FIXED would silently unmap whatever already lives there. Getting a
+     * different address means the range was taken: fail as Linux does. */
+#endif
     return p;
 }
 
@@ -1010,7 +1026,29 @@ VOID OutputDebugStringA(LPCSTR str)
 
 VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
 
-VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt) { explicit_bzero(ptr, cnt); }
+BOOL IsDebuggerPresent(void)
+{
+#if defined(__APPLE__)
+    /* TODO: Darwin: KERN_PROC_PID reports P_TRACED when a debugger is attached. */
+    return FALSE;
+#else
+    /* TODO: On Linux a non-zero TracerPid in /proc/self/status means ptrace is attached. */
+    return FALSE;
+#endif
+}
+
+VOID DebugBreak(void) {
+    // TODO: Use __debugbreak()?
+}
+
+VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
+{
+#if defined(__APPLE__)
+    // TODO: Darwin explicit_bzero equivalent is memset_s.
+#else
+    explicit_bzero(ptr, cnt);
+#endif
+}
 
 unsigned int _clearfp(void)
 {
@@ -1253,6 +1291,18 @@ static size_t view_take(const void *addr)
     return len;
 }
 
+/* An unnamed file descriptor that ftruncate and mmap both accept. Linux has
+ * memfd_create for this; elsewhere an immediately-unlinked temp file does. */
+static int anon_map_fd(const char *name)
+{
+#if defined(__APPLE__)
+    // TODO: use shm_open on macOS 10.12+ or mkstemp + unlink for older versions
+    return 0;
+#else
+    return memfd_create(name ? name : "xbox_map", 0);
+#endif
+}
+
 HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
                           DWORD maxSizeHigh, DWORD maxSizeLow, LPCSTR name)
 {
@@ -1260,7 +1310,7 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     SIZE_T size = ((SIZE_T)maxSizeHigh << 32) | maxSizeLow;
     if (size == 0) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
 
-    int fd = memfd_create(name ? name : "xbox_map", 0);
+    int fd = anon_map_fd(name);
     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
     if (ftruncate(fd, (off_t)size) != 0) {
         close(fd);
@@ -1329,6 +1379,10 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
 
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
 {
+#if defined(__APPLE__)
+    /* TODO: Darwin has no sysinfo(2): physical memory comes from sysctl, the free
+     * page count from the Mach VM statistics, swap from vm.swapusage. */
+#else
     struct sysinfo si;
     if (!b) return FALSE;
     if (sysinfo(&si) != 0) return FALSE;
@@ -1338,6 +1392,7 @@ BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
     b->ullAvailPhys     = (ULONGLONG)si.freeram   * unit;
     b->ullTotalPageFile = b->ullTotalPhys + (ULONGLONG)si.totalswap * unit;
     b->ullAvailPageFile = b->ullAvailPhys + (ULONGLONG)si.freeswap  * unit;
+#endif
     b->ullTotalVirtual  = b->ullTotalPhys;
     b->ullAvailVirtual  = b->ullAvailPhys;
     b->ullAvailExtendedVirtual = 0;

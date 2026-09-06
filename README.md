@@ -164,6 +164,7 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 ### Prerequisites
 
 - **Windows 11/10** (D3D11 backend) — or **Linux** (OpenGL backend; `tools/linux/install_deps.sh`)
+- **macOS**: install the native libraries required by the OpenGL backend with `brew install sdl2 libepoxy`
 - **Python 3.10+** with `capstone` (`pip install capstone`)
 - **Visual Studio 2022** (MSVC compiler)
 - **CMake 3.20+**
@@ -410,6 +411,11 @@ That's it for the core pipeline — no IDA, no Ghidra, no proprietary tools. Jus
 ```
 py -3 -m pytest tools/       # unit tests
 py -3 -m tools.conformance   # differential: lifted C vs the real CPU
+```
+
+Run unit tests on MacOS
+```bash
+bash tools/macos/run_tests.sh
 ```
 
 The unit tests are fast and need no game files. The conformance suite goes

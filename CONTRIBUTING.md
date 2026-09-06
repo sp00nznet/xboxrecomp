@@ -108,6 +108,12 @@ py -3 -m pytest tools/       # unit tests
 py -3 -m tools.conformance   # differential: lifted C vs the real CPU
 ```
 
+Run unit tests on MacOS
+
+```bash
+bash tools/macos/run_tests.sh
+```
+
 The unit tests are fast and need no game files — the lifter tests assemble real byte
 sequences and check the C that comes out. If you fix a lift, add the case.
 

@@ -16,6 +16,7 @@ game_files/
 *.xiso
 
 # IDE
+.vs/
 .vscode/
 .idea/
 *.suo

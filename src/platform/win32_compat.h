@@ -8,7 +8,7 @@
  * honestly on POSIX so the Xbox-specific HLE code above it is unchanged and
  * stays verifiable.
  *
- * Linux-only: on Windows these come from the real <windows.h>.
+ * Linux/MacOS only: on Windows these come from the real <windows.h>.
  */
 
 #ifndef WIN32_COMPAT_H
@@ -198,6 +198,8 @@ BOOL  QueryPerformanceFrequency(PLARGE_INTEGER freq);
 VOID  OutputDebugStringA(LPCSTR str);
 VOID  OutputDebugStringW(LPCWSTR str);
 VOID  ExitProcess(UINT exitCode);
+BOOL  IsDebuggerPresent(void);
+VOID  DebugBreak(void);
 BOOL  TerminateProcess(HANDLE process, UINT exitCode);
 VOID  SecureZeroMemory(PVOID ptr, SIZE_T cnt);
 unsigned int _clearfp(void);   /* clear pending FPU exception flags */

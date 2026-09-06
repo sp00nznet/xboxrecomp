@@ -16,7 +16,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <malloc.h>
 #include <math.h>
 
 /* D3D8 device — we include the full header for COM vtable access */
