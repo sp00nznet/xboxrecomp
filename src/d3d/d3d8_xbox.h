@@ -612,8 +612,14 @@ typedef enum D3DCLEAR_FLAGS {
  * Vertex declaration / FVF
  * ================================================================ */
 
+#define D3DFVF_POSITION_MASK    0x00E
 #define D3DFVF_XYZ              0x002
 #define D3DFVF_XYZRHW           0x004
+#define D3DFVF_XYZB1            0x006
+#define D3DFVF_XYZB2            0x008
+#define D3DFVF_XYZB3            0x00A
+#define D3DFVF_XYZB4            0x00C
+#define D3DFVF_XYZB5            0x00E
 #define D3DFVF_NORMAL           0x010
 #define D3DFVF_DIFFUSE          0x040
 #define D3DFVF_SPECULAR         0x080

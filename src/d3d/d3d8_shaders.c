@@ -17,6 +17,7 @@
  */
 
 #include "d3d8_internal.h"
+#include "d3d8_fvf.h"
 #include <d3dcompiler.h>
 #include <string.h>
 #include <stdio.h>
@@ -624,22 +625,6 @@ static UINT fvf_texcoord_size(DWORD fvf, UINT t)
     return field == 0 ? 2 : field;
 }
 
-/* Calculate vertex stride from FVF */
-static UINT fvf_stride(DWORD fvf)
-{
-    UINT stride = 0;
-    UINT tex_count = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
-    UINT t;
-    if (fvf & D3DFVF_XYZ)    stride += 12;
-    if (fvf & D3DFVF_XYZRHW) stride += 16;
-    if (fvf & D3DFVF_NORMAL) stride += 12;
-    if (fvf & D3DFVF_DIFFUSE) stride += 4;
-    if (fvf & D3DFVF_SPECULAR) stride += 4;
-    for (t = 0; t < tex_count; t++)
-        stride += fvf_texcoord_size(fvf, t) * 4;
-    return stride;
-}
-
 /*
  * Build input layout for a given FVF.
  *
@@ -661,16 +646,14 @@ static ID3D11InputLayout *get_or_create_layout(DWORD fvf)
     }
 
     /* POSITION */
-    if (fvf & D3DFVF_XYZRHW) {
+    if (d3d8_fvf_transformed(fvf)) {
         elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        elem_count++; offset += 16;
-    } else if (fvf & D3DFVF_XYZ) {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
-        elem_count++; offset += 12;
+        elem_count++;
     } else {
-        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
+        elems[elem_count] = (D3D11_INPUT_ELEMENT_DESC){"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offset, D3D11_INPUT_PER_VERTEX_DATA, 0};
         elem_count++;
     }
+    offset = d3d8_fvf_position_bytes(fvf);
 
     /* NORMAL */
     if (fvf & D3DFVF_NORMAL) {
@@ -943,7 +926,7 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
         UINT i;
         memset(cb, 0, sizeof(*cb));
 
-        if (fvf & D3DFVF_XYZRHW) {
+        if (d3d8_fvf_transformed(fvf)) {
             float identity[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
             memcpy(cb->wvp, identity, sizeof(identity));
             memcpy(cb->world, identity, sizeof(identity));

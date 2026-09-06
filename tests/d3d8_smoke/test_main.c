@@ -14,6 +14,7 @@
 #define COBJMACROS
 #include "d3d8_internal.h"
 #include "d3d8_swizzle.h"
+#include "d3d8_fvf.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -232,6 +233,26 @@ static void test_convert_linear(void)
     (void)src; (void)dst;
 }
 
+static void test_fvf_position(void)
+{
+    static const struct { DWORD position; UINT bytes; int transformed; } cases[] = {
+        {D3DFVF_XYZ, 12, 0}, {D3DFVF_XYZRHW, 16, 1},
+        {D3DFVF_XYZB1, 16, 0}, {D3DFVF_XYZB2, 20, 0},
+        {D3DFVF_XYZB3, 24, 0}, {D3DFVF_XYZB4, 28, 0},
+        {D3DFVF_XYZB5, 32, 0}, {0, 0, 0},
+    };
+    UINT i;
+    printf("test_fvf_position\n");
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        DWORD fvf = cases[i].position | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+        CHECK_INT("position span", d3d8_fvf_position_bytes(fvf), cases[i].bytes);
+        CHECK_INT("transformed", d3d8_fvf_transformed(fvf), cases[i].transformed);
+    }
+    /* A packed last beta still occupies one four-byte slot. */
+    CHECK_INT("indexed beta span", d3d8_fvf_position_bytes(0x1000u | D3DFVF_XYZB3), 24);
+    CHECK_INT("weighted normal offset", d3d8_fvf_position_bytes(0x118u), 20);
+}
+
 int main(void)
 {
     int i;
@@ -244,6 +265,7 @@ int main(void)
     test_swizzle_classification();
     test_unswizzle_roundtrip();
     test_convert_linear();
+    test_fvf_position();
 
     if (failures == 0) {
         printf("d3d8_smoke: ALL PASS\n");
