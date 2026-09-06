@@ -3066,6 +3066,303 @@ static void bridge_ObfDereferenceObject(void)
     g_eax = 0;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * More wrappers for xbox_* implementations that had no route. Same rule as
+ * the block above: each one was checked against the memory-model bar --
+ * reads/writes only happen at caller-supplied guest addresses, XBOX_TO_NATIVE
+ * maps guest NULL to host NULL, and none of them allocates, frees, or hands
+ * back a host pointer. Any exception is noted in place.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── ObfReferenceObject (ordinal 251, fastcall: object in ecx)
+ * Mirror of 250. Xbox uses __fastcall here too, so the argument never reaches
+ * the stack and the arg-size entry is 0; reading it off the stack would
+ * dereference whatever the caller happened to leave there. */
+static void bridge_ObfReferenceObject(void)
+{
+    xbox_ObfReferenceObject(XBOX_TO_NATIVE(g_ecx));
+    g_eax = 0;
+}
+
+/* ── HalReadSMBusValue / HalWriteSMBusValue (ordinals 45 / 50, 4 args)
+ *
+ * The SMC side of the AV-pack / temperature queries titles make at init.
+ * Unrouted they read 0 -- "no AV pack connected" -- which made D3D pick the
+ * lowest common denominator display mode and 40C sensors read as 0C.
+ *
+ * HalReadSMBusValue writes one ULONG through a caller-supplied DataValue and
+ * nothing else; HalWriteSMBusValue is all scalars. Both are the safe kind the
+ * note below names.
+ */
+static void bridge_HalReadSMBusValue(void)
+{
+    uint32_t data_va = STACK_ARG(3);
+
+    g_eax = (uint32_t)xbox_HalReadSMBusValue(
+        (UCHAR)STACK_ARG(0), (UCHAR)STACK_ARG(1),
+        (BOOLEAN)STACK_ARG(2), (PULONG)XBOX_TO_NATIVE(data_va));
+}
+
+static void bridge_HalWriteSMBusValue(void)
+{
+    g_eax = (uint32_t)xbox_HalWriteSMBusValue(
+        (UCHAR)STACK_ARG(0), (UCHAR)STACK_ARG(1),
+        (BOOLEAN)STACK_ARG(2), STACK_ARG(3));
+}
+
+/* ── HalReadWritePCISpace (ordinal 46, 6 args)
+ *
+ * PCI config space for the NV2A/southbridge; on reads the kernel serves a
+ * zeroed buffer, so only a memset at a caller-supplied address happens. */
+static void bridge_HalReadWritePCISpace(void)
+{
+    xbox_HalReadWritePCISpace(
+        STACK_ARG(0), STACK_ARG(1), STACK_ARG(2),
+        XBOX_TO_NATIVE(STACK_ARG(3)), STACK_ARG(4), (BOOLEAN)STACK_ARG(5));
+    g_eax = 0;
+}
+
+/* ── HalRequestSoftwareInterrupt / HalClearSoftwareInterrupt (48 / 38, 1 arg)
+ * DPC/APC delivery hooks with no interrupt-driven machinery behind them here;
+ * both xbox_* versions are documented no-ops. */
+static void bridge_HalRequestSoftwareInterrupt(void)
+{
+    xbox_HalRequestSoftwareInterrupt((KIRQL)STACK_ARG(0));
+    g_eax = 0;
+}
+
+static void bridge_HalClearSoftwareInterrupt(void)
+{
+    xbox_HalClearSoftwareInterrupt((KIRQL)STACK_ARG(0));
+    g_eax = 0;
+}
+
+/* ── ExSaveNonVolatileSetting (ordinal 29, 4 args)
+ *
+ * The write half of the EEPROM pair whose read side is already routed.
+ * xbox_ExSaveNonVolatileSetting logs and returns success without ever reading
+ * the Value buffer, so marshalling it across is cosmetic but keeps the write
+ * path out of the unknowable-stub category. */
+static void bridge_ExSaveNonVolatileSetting(void)
+{
+    g_eax = (uint32_t)xbox_ExSaveNonVolatileSetting(
+        STACK_ARG(0), STACK_ARG(1), XBOX_TO_NATIVE(STACK_ARG(2)),
+        STACK_ARG(3));
+}
+
+/* ── MmUnmapIoSpace (ordinal 183, 2 args)
+ *
+ * Deliberately does NOT call xbox_MmUnmapIoSpace: that one VirtualFrees its
+ * argument, but the mapping coming back out of bridge_MmMapIoSpace was carved
+ * from the guest heap, so only the guest heap can release it. xbox_HeapFree
+ * matches against the block table and takes the raw 32-bit guest VA. */
+static void bridge_MmUnmapIoSpace(void)
+{
+    xbox_HeapFree(STACK_ARG(0));
+    g_eax = 0;
+}
+
+/* ── IoDeleteDevice (ordinal 68, 1 arg)
+ *
+ * Same memory model as MmUnmapIoSpace: bridge_IoCreateDevice allocates the
+ * device object on the guest heap, so deletion has to answer there too --
+ * HeapFree (what xbox_IoDeleteDevice calls) would free a pointer that heap
+ * never saw. */
+static void bridge_IoDeleteDevice(void)
+{
+    xbox_HeapFree(STACK_ARG(0));
+    g_eax = 0;
+}
+
+/* ── KeQueryInterruptTime (ordinal 125, void)
+ * Returns a 64-bit tick count; the caller reads it as edx:eax, so the high
+ * half goes to g_edx exactly like the performance-counter bridges. */
+static void bridge_KeQueryInterruptTime(void)
+{
+    uint64_t t = xbox_KeQueryInterruptTime();
+
+    g_eax = (uint32_t)t;
+    g_edx = (uint32_t)(t >> 32);
+}
+
+/* ── KeSaveFloatingPointState / KeRestoreFloatingPointState (142 / 139, 1 arg)
+ *
+ * D3D brackets its fixed-function transform code with these on hardware. Both
+ * xbox_* implementations are successful no-ops -- Windows user mode preserves
+ * FP state across context switches -- so marshalling is a pass-through of one
+ * address. */
+static void bridge_KeSaveFloatingPointState(void)
+{
+    g_eax = (uint32_t)xbox_KeSaveFloatingPointState(
+        XBOX_TO_NATIVE(STACK_ARG(0)));
+}
+
+static void bridge_KeRestoreFloatingPointState(void)
+{
+    g_eax = (uint32_t)xbox_KeRestoreFloatingPointState(
+        XBOX_TO_NATIVE(STACK_ARG(0)));
+}
+
+/* ── NtCreateSemaphore (ordinal 193, 4 args)
+ *
+ * Handle-shaped twin of NtCreateEvent/NtCreateMutant. The native HANDLE is
+ * 8 bytes and the guest slot is 4, so the create goes through a local and the
+ * result lands via bridge_write_handle. */
+static void bridge_NtCreateSemaphore(void)
+{
+    uint32_t handle_va = STACK_ARG(0);
+    HANDLE h = NULL;
+    NTSTATUS st;
+
+    st = xbox_NtCreateSemaphore(
+        &h, XBOX_TO_NATIVE(STACK_ARG(1)),
+        (LONG)STACK_ARG(2), (LONG)STACK_ARG(3));
+    if (st >= 0 && handle_va)
+        bridge_write_handle(handle_va, h);
+    g_eax = (uint32_t)st;
+}
+
+/* ── NtReleaseSemaphore (ordinal 222, 3 args)
+ * Handle token in, LONG by value, optional 4-byte PLONG out. */
+static void bridge_NtReleaseSemaphore(void)
+{
+    uint32_t count_va = STACK_ARG(2);
+
+    g_eax = (uint32_t)xbox_NtReleaseSemaphore(
+        bridge_resolve_handle(STACK_ARG(0)), (LONG)STACK_ARG(1),
+        count_va ? (PLONG)XBOX_TO_NATIVE(count_va) : NULL);
+}
+
+/* ── KeAlertThread (ordinal 93, 2 args)
+ * Thread passed as an object; resolves through the handle table the way the
+ * Nt* thread calls do, degrading to a pass-through for synthetic handles. */
+static void bridge_KeAlertThread(void)
+{
+    g_eax = (uint32_t)xbox_KeAlertThread(
+        bridge_resolve_handle(STACK_ARG(0)), (KPROCESSOR_MODE)STACK_ARG(1));
+}
+
+/* ── KeWaitForMultipleObjects (ordinal 158, 8 args)
+ *
+ * KeWaitForSingleObject is routed; the multiple-object sibling was not. Like
+ * NtWaitForMultipleObjectsEx, the Objects[] array in guest memory holds 32-bit
+ * handle tokens, so each is resolved before the native wait sees it. */
+#define BRIDGE_MAXIMUM_WAIT_OBJECTS 64
+
+static void bridge_KeWaitForMultipleObjects(void)
+{
+    uint32_t count      = STACK_ARG(0);
+    uint32_t objects_va = STACK_ARG(1);
+    uint32_t wait_type  = STACK_ARG(2);
+    uint32_t alertable  = STACK_ARG(5);   /* 3=WaitReason, 4=WaitMode */
+    uint32_t timeout_va = STACK_ARG(6);
+    HANDLE handles[BRIDGE_MAXIMUM_WAIT_OBJECTS];
+    uint32_t i;
+
+    if (count == 0) {
+        g_eax = (uint32_t)STATUS_INVALID_PARAMETER;
+        return;
+    }
+    if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
+        count = BRIDGE_MAXIMUM_WAIT_OBJECTS;
+    for (i = 0; i < count; i++)
+        handles[i] = bridge_resolve_handle(
+            objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
+
+    g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
+        count, (PVOID *)handles, wait_type,
+        STACK_ARG(3), (KPROCESSOR_MODE)STACK_ARG(4),
+        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
+        XBOX_TO_NATIVE(STACK_ARG(7)));
+}
+
+#undef BRIDGE_MAXIMUM_WAIT_OBJECTS
+
+/* ── NtSetSystemTime (ordinal 228, 2 args)
+ * Accepts the new time, ignores it, reports the old one through the optional
+ * PreviousTime out-parameter (8-byte FILETIME at a guest address). */
+static void bridge_NtSetSystemTime(void)
+{
+    uint32_t prev_va = STACK_ARG(1);
+
+    g_eax = (uint32_t)xbox_NtSetSystemTime(
+        XBOX_TO_NATIVE(STACK_ARG(0)),
+        prev_va ? (PLARGE_INTEGER)XBOX_TO_NATIVE(prev_va) : NULL);
+}
+
+/* ── ObReferenceObjectByName (ordinal 247, 5 args)
+ *
+ * The ANSI_STRING is rebuilt by hand (native struct has a 64-bit Buffer at
+ * offset 8, the guest one a 32-bit Buffer at offset 4) and the Object
+ * out-parameter is filled through a local so the 8-byte NULL store lands in a
+ * local instead of spilling past a 4-byte guest slot. */
+static void bridge_ObReferenceObjectByName(void)
+{
+    uint32_t name_va   = STACK_ARG(0);
+    uint32_t object_va = STACK_ARG(4);
+    XBOX_ANSI_STRING name;
+    PVOID object_local = NULL;
+
+    if (!name_va) {
+        g_eax = (uint32_t)STATUS_INVALID_PARAMETER;
+        return;
+    }
+    name.Length        = BRIDGE_MEM16(name_va);
+    name.MaximumLength = BRIDGE_MEM16(name_va + 2);
+    name.Buffer        = (PCHAR)XBOX_TO_NATIVE(BRIDGE_MEM32(name_va + 4));
+
+    g_eax = (uint32_t)xbox_ObReferenceObjectByName(
+        &name, STACK_ARG(1), XBOX_TO_NATIVE(STACK_ARG(2)),
+        XBOX_TO_NATIVE(STACK_ARG(3)), &object_local);
+    if (object_va)
+        BRIDGE_MEM32(object_va) = (uint32_t)(uintptr_t)object_local;
+}
+
+/* ── RtlInitUnicodeString (ordinal 290, 2 args)
+ *
+ * Mirror of the RtlInitAnsiString bridge: the guest UNICODE_STRING is
+ * { USHORT Length; USHORT MaximumLength; 32-bit Buffer; } and the Buffer field
+ * must carry the guest VA of the source, so the fields are written by hand
+ * rather than letting the native xbox_* write a 64-bit host pointer into a
+ * 4-byte guest slot. Lengths are in bytes (wide chars x2). */
+static void bridge_RtlInitUnicodeString(void)
+{
+    uint32_t dest_va = STACK_ARG(0);
+    uint32_t src_va  = STACK_ARG(1);
+
+    if (!dest_va) {
+        g_eax = 0;
+        return;
+    }
+    if (src_va) {
+        const uint16_t *wp = (const uint16_t *)XBOX_TO_NATIVE(src_va);
+        size_t bytes = 0;
+
+        while (wp[bytes / 2])
+            bytes += sizeof(uint16_t);
+        if (bytes > 0xFFFE)
+            bytes = 0xFFFE;
+        BRIDGE_MEM16(dest_va + 0) = (uint16_t)bytes;
+        BRIDGE_MEM16(dest_va + 2) = (uint16_t)(bytes + sizeof(uint16_t));
+        BRIDGE_MEM32(dest_va + 4) = src_va;
+    } else {
+        BRIDGE_MEM16(dest_va + 0) = 0;
+        BRIDGE_MEM16(dest_va + 2) = 0;
+        BRIDGE_MEM32(dest_va + 4) = 0;
+    }
+    g_eax = 0;
+}
+
+/* ── RtlTimeFieldsToTime (ordinal 304, 2 args)
+ * Counterpart of the routed RtlTimeToTimeFields: reads a XBOX_TIME_FIELDS and
+ * writes a LARGE_INTEGER, both at caller-supplied guest addresses. */
+static void bridge_RtlTimeFieldsToTime(void)
+{
+    g_eax = (uint32_t)xbox_RtlTimeFieldsToTime(
+        (PXBOX_TIME_FIELDS)XBOX_TO_NATIVE(STACK_ARG(0)),
+        (PLARGE_INTEGER)XBOX_TO_NATIVE(STACK_ARG(1)));
+}
+
 /* ── PhyGetLinkState (ordinal 252, 1 arg) */
 static void bridge_PhyGetLinkState(void)
 {
@@ -3173,6 +3470,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  17: return  4;  /* ExFreePool (1) */
     case  23: return  4;  /* ExQueryPoolBlockSize (1) */
     case  24: return 20;  /* ExQueryNonVolatileSetting (5) */
+    case  29: return 16;  /* ExSaveNonVolatileSetting (4) */
     case  35: return  0;  /* FscGetCacheSize (void) */
     case  37: return  4;  /* FscSetCacheSize (1) */
     case  38: return  4;  /* HalClearSoftwareInterrupt (1) */
@@ -3181,6 +3479,8 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case  44: return  8;  /* HalGetInterruptVector (2) */
     case  47: return  8;  /* HalRegisterShutdownNotification (2) */
     case  46: return 24;  /* HalReadWritePCISpace (6) */
+    case  45: return 16;  /* HalReadSMBusValue (4) */
+    case  50: return 16;  /* HalWriteSMBusValue (4) */
     case  48: return  4;  /* HalRequestSoftwareInterrupt (1) */
     case  49: return  4;  /* HalReturnToFirmware (1) */
     case  61: return 36;  /* IoBuildDeviceIoControlRequest (9) */
@@ -3257,6 +3557,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 180: return  4;  /* MmQueryAllocationSize (1) */
     case 181: return  4;  /* MmQueryStatistics (1) */
     case 182: return 12;  /* MmSetAddressProtect (3) */
+    case 183: return  8;  /* MmUnmapIoSpace (2) */
     case 184: return 20;  /* NtAllocateVirtualMemory (5) */
     case 185: return  8;  /* NtCancelTimer (2) */
     case 186: return  4;  /* NtClearEvent (1) */
@@ -3309,6 +3610,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 243: return 16;  /* ObOpenObjectByName (4) */
     case 247: return 20;  /* ObReferenceObjectByName (5) */
     case 250: return  0;  /* ObfDereferenceObject (fastcall: arg in ecx) */
+    case 251: return  0;  /* ObfReferenceObject (fastcall: arg in ecx) */
     case 252: return  4;  /* PhyGetLinkState (1) */
     case 253: return  8;  /* PhyInitialize (2) */
     case 255: return 40;  /* PsCreateSystemThreadEx (10) */
@@ -3643,6 +3945,33 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 337: return bridge_XcSHAFinal;
     case 340: return bridge_XcHMAC;
     /* case 346: bridge_XcDESKeyParity */
+
+    /* Routed. Each of these was checked against the memory-model bar
+     * described above before being added: reads or writes only happen at
+     * caller-supplied guest addresses, and nothing allocates, frees, or hands
+     * back a host pointer. Two of them (MmUnmapIoSpace, IoDeleteDevice) free
+     * guest memory, so they deliberately answer through the guest heap rather
+     * than calling the xbox_* host-heap version -- see the wrappers. */
+    case  29: return bridge_ExSaveNonVolatileSetting;
+    case  38: return bridge_HalClearSoftwareInterrupt;
+    case  45: return bridge_HalReadSMBusValue;
+    case  46: return bridge_HalReadWritePCISpace;
+    case  48: return bridge_HalRequestSoftwareInterrupt;
+    case  50: return bridge_HalWriteSMBusValue;
+    case  68: return bridge_IoDeleteDevice;
+    case  93: return bridge_KeAlertThread;
+    case 125: return bridge_KeQueryInterruptTime;
+    case 139: return bridge_KeRestoreFloatingPointState;
+    case 142: return bridge_KeSaveFloatingPointState;
+    case 158: return bridge_KeWaitForMultipleObjects;
+    case 183: return bridge_MmUnmapIoSpace;
+    case 193: return bridge_NtCreateSemaphore;
+    case 222: return bridge_NtReleaseSemaphore;
+    case 228: return bridge_NtSetSystemTime;
+    case 247: return bridge_ObReferenceObjectByName;
+    case 251: return bridge_ObfReferenceObject;
+    case 290: return bridge_RtlInitUnicodeString;
+    case 304: return bridge_RtlTimeFieldsToTime;
 
     default:  return NULL;
     }
