@@ -23,7 +23,7 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
-                     detect_setjmp_helpers)
+                     detect_setjmp_helpers, _func_ident)
 
 
 def _fixup_icall_esp_save(lines):
@@ -544,6 +544,8 @@ class FunctionTranslator:
                 cc = m[1:]
             elif m.startswith("set"):
                 cc = m[3:]
+            elif m.startswith("cmov") and len(m) > 4:
+                cc = m[4:]
             if (cc in FunctionTranslator._CARRY_CC
                     and last_setter in CF_TRACKED):
                 return True
@@ -600,7 +602,7 @@ class FunctionTranslator:
         if end <= start:
             return None
 
-        name = func_info.get("name", f"sub_{start:08X}")
+        name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
         size = end - start
 
         # Read bytes from XBE
@@ -847,10 +849,11 @@ class FunctionTranslator:
         #
         # adc/sbb read CF directly, and so does a jb/jae whose flags came from
         # arithmetic rather than a cmp -- the bit-stream decoders in the Xbox
-        # XCompress code are nothing but "add reg,reg" followed by jae. Which
-        # setter a branch reads is the lifter's tracking rule, mirrored here so
-        # only the functions that consume CF declare it: computing it beside
-        # every add in the image would be a line per add in 48,000 functions.
+        # XCompress code are nothing but "add reg,reg" followed by jae, and a
+        # cmovb/cmovae after an add reads the same carry. Which setter a branch
+        # reads is the lifter's tracking rule, mirrored here so only the
+        # functions that consume CF declare it: computing it beside every add
+        # in the image would be a line per add in 48,000 functions.
         has_carry = self._function_needs_cf(instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
@@ -1212,7 +1215,7 @@ class BatchTranslator:
 
         # Forward declarations
         for addr, func_info in func_list:
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             decl = self._make_declaration(addr, name)
             c_chunks.append(f"{decl};")
         c_chunks.append("")
@@ -1221,7 +1224,7 @@ class BatchTranslator:
 
         # Translate each function
         for i, (addr, func_info) in enumerate(func_list):
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             if verbose and (i % 100 == 0 or i == len(func_list) - 1):
                 print(f"  [{i+1}/{len(func_list)}] Translating {name} at 0x{addr:08X}...")
 
@@ -1325,7 +1328,7 @@ class BatchTranslator:
         }
 
         for i, (addr, func_info) in enumerate(func_list):
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             if verbose and (i % 500 == 0 or i == len(func_list) - 1):
                 print(f"  [{i+1}/{len(func_list)}] Translating {name}...",
                       file=sys.stderr)
