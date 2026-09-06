@@ -140,6 +140,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_VERTEX_DATA_ARRAY_FORMAT 0x1760   /* +i*4 */
 #define NV097_SET_BEGIN_END               0x17FC
 #define NV097_ARRAY_ELEMENT16             0x1800
+#define NV097_INLINE_ARRAY                0x1818
 
 #define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
 
@@ -154,12 +155,19 @@ typedef struct {
 
 #define NV_VERTEX_ATTRS 16
 #define NV_MAX_INDICES  4096
+#define NV_MAX_INLINE   4096            /* dwords of INLINE_ARRAY per batch */
 
 static struct {
     VertexAttr attr[NV_VERTEX_ATTRS];
     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
     uint16_t   idx[NV_MAX_INDICES];
     uint32_t   idx_count;
+    /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
+     * instead of into a buffer the title points at. Same vertex format, a
+     * different place to read them from. */
+    uint32_t   inline_buf[NV_MAX_INLINE];
+    uint32_t   inline_count;
+    int        inline_active;
     uint32_t   draws, verts, nonzero_draws;
     float      min_x, max_x, min_y, max_y;
     uint32_t color_offset, color_base, pitch, format;
@@ -206,9 +214,22 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
-    if (!a->offset || !a->size || !a->stride)
+    if (!a->size || !a->stride)
         return 0;
-    p = mem + a->offset + (size_t)index * a->stride;
+    if (s_gpu.inline_active) {
+        /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
+         * the buffered payload rather than a guest address -- and 0 is a legal
+         * one there, which is why the offset test is on the other side of this
+         * branch. */
+        size_t at = (size_t)a->offset + (size_t)index * a->stride;
+        if (at + 4 > (size_t)s_gpu.inline_count * 4)
+            return 0;
+        p = (const uint8_t *)s_gpu.inline_buf + at;
+    } else {
+        if (!a->offset)
+            return 0;
+        p = mem + a->offset + (size_t)index * a->stride;
+    }
 
     switch (a->type) {
     case 0:                                  /* D3DCOLOR */
@@ -559,27 +580,58 @@ static uint32_t vertex_color(uint32_t index)
          |  (uint32_t)(c[2] * 255.0f);
 }
 
-/* Is attribute 0 already in screen space? Measured, not assumed: every vertex
- * of the batch has to land inside the surface. Object-space positions are
- * small numbers around the origin and fail this immediately, which is what
- * keeps an untransformed batch from being smeared across the top-left corner.
+/* An untransformed batch drawn as if it were screen space smears a few pixels
+ * into the corner, so the batch has to be classified before it is rasterised.
+ *
+ * This used to demand that every vertex land inside the surface, which is a
+ * different question and the wrong one: geometry that extends past the
+ * viewport is ordinary, and clipping it is raster_triangle's job (it clamps
+ * its span to the clip rect). The dashboard is exactly the case that exposed
+ * it -- a full-screen pass drawn as one oversized triangle, vertices at
+ * (-0.5,-0.5), (2*w,-0.5), (-0.5,2*h), all correct and all rejected.
+ *
+ * What actually separates the two is scale. Object-space positions are model
+ * units, a handful either side of the origin; screen-space ones are measured
+ * in pixels of a surface hundreds of pixels wide. So: the batch has to be able
+ * to touch the surface at all, and it has to be bigger than object space.
+ *
+ * ponytail: a genuinely tiny screen-space sprite reads as object space and is
+ * skipped. It is counted as skipped rather than silently dropped, and the
+ * unambiguous answer needs the vertex-program state, which is not tracked yet.
  */
+#define OBJECT_SPACE_SPAN 8.0f
+
 static int batch_is_screen_space(void)
 {
-    float p[4];
+    float p[4], lo_x, hi_x, lo_y, hi_y;
     uint32_t i;
 
-    if (!s_gpu.clip_w || !s_gpu.clip_h)
+    if (!s_gpu.clip_w || !s_gpu.clip_h || !s_gpu.idx_count)
         return 0;
-    for (i = 0; i < s_gpu.idx_count; i++) {
+    if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p))
+        return 0;
+    lo_x = hi_x = p[0];
+    lo_y = hi_y = p[1];
+    for (i = 1; i < s_gpu.idx_count; i++) {
         if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], p))
             return 0;
-        if (p[0] < (float)s_gpu.clip_x - 1.0f
-         || p[0] > (float)(s_gpu.clip_x + s_gpu.clip_w) + 1.0f
-         || p[1] < (float)s_gpu.clip_y - 1.0f
-         || p[1] > (float)(s_gpu.clip_y + s_gpu.clip_h) + 1.0f)
-            return 0;
+        if (p[0] < lo_x) lo_x = p[0];
+        if (p[0] > hi_x) hi_x = p[0];
+        if (p[1] < lo_y) lo_y = p[1];
+        if (p[1] > hi_y) hi_y = p[1];
     }
+
+    /* Entirely off the surface: nothing to draw under either reading. */
+    if (hi_x < (float)s_gpu.clip_x
+     || lo_x > (float)(s_gpu.clip_x + s_gpu.clip_w)
+     || hi_y < (float)s_gpu.clip_y
+     || lo_y > (float)(s_gpu.clip_y + s_gpu.clip_h))
+        return 0;
+
+    /* Small enough to be model units rather than pixels. */
+    if (hi_x - lo_x < OBJECT_SPACE_SPAN && hi_y - lo_y < OBJECT_SPACE_SPAN)
+        return 0;
+
     return 1;
 }
 
@@ -590,10 +642,18 @@ static int batch_is_screen_space(void)
 #define NV_PRIM_QUADS          7
 #define NV_PRIM_QUAD_STRIP     8
 
+/* How many post-draw captures to keep: enough to see whether the geometry
+ * is stable from frame to frame, few enough not to fill a directory. */
+#define FB_DUMP_AFTER_DRAW 8
+static int s_drawn_dumps;
+
+static void dump_surface_bmp(void);
+
 static void raster_batch(void)
 {
     float p[3][4];
     uint32_t i;
+    uint32_t before = s_gpu.tris_drawn;
 
     if (s_gpu.idx_count < 3)
         return;
@@ -635,6 +695,18 @@ static void raster_batch(void)
 
     if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
+
+    /* Capture the surface while the geometry is still on it.
+     *
+     * The periodic report dumps too, but a title clears every frame and draws
+     * in only some of them, so a report almost always lands on a surface that
+     * was wiped a moment ago -- which reads as "nothing was drawn" when the
+     * triangles went down correctly just before it. A few frames that actually
+     * contain geometry are worth more than any number of clears. */
+    if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW) {
+        s_drawn_dumps++;
+        dump_surface_bmp();
+    }
 }
 
 /* What a batch actually contains. Before anything can be rasterised, the
@@ -720,6 +792,66 @@ static void draw_primitive(void)
     }
 }
 
+/* Draw the vertices the title wrote straight into the pushbuffer.
+ *
+ * INLINE_ARRAY carries no offsets and no indices: the dwords between BEGIN and
+ * END *are* the vertex buffer, packed in attribute order using the same
+ * SET_VERTEX_DATA_ARRAY_FORMAT registers an ordinary array would use. So the
+ * whole batch is describable as a vertex array whose base happens to be that
+ * payload, which means synthesising the layout and handing it to the existing
+ * path -- rather than a second copy of the topology and rasterisation code.
+ *
+ * The title's own attribute table is saved and put back: these offsets and
+ * strides are ours, and it has not stopped using its.
+ *
+ * ponytail: each attribute is padded to a whole dword. That is exact for the
+ * float and D3DCOLOR formats every inline batch actually uses; a packed
+ * sub-dword attribute would need the unpadded layout.
+ */
+static void draw_inline_array(void)
+{
+    VertexAttr saved[NV_VERTEX_ATTRS];
+    uint32_t off = 0, a, i, vsize, count;
+
+    memcpy(saved, s_gpu.attr, sizeof saved);
+
+    for (a = 0; a < NV_VERTEX_ATTRS; a++) {
+        uint32_t bytes;
+        if (!s_gpu.attr[a].size)
+            continue;
+        switch (s_gpu.attr[a].type) {
+        case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
+        case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
+        case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
+        default: bytes = 4 * s_gpu.attr[a].size;   break;
+        }
+        s_gpu.attr[a].offset = off;
+        off += (bytes + 3u) & ~3u;
+    }
+    vsize = off;
+    if (!vsize)
+        goto out;
+
+    count = (s_gpu.inline_count * 4) / vsize;
+    if (count < 3 || count > NV_MAX_INDICES)
+        goto out;
+    for (a = 0; a < NV_VERTEX_ATTRS; a++)
+        if (s_gpu.attr[a].size)
+            s_gpu.attr[a].stride = vsize;
+
+    for (i = 0; i < count; i++)
+        s_gpu.idx[i] = (uint16_t)i;
+    s_gpu.idx_count = count;
+
+    s_gpu.inline_active = 1;
+    draw_primitive();
+    s_gpu.inline_active = 0;
+
+out:
+    memcpy(s_gpu.attr, saved, sizeof saved);
+    s_gpu.idx_count = 0;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -782,10 +914,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (param) {
             s_gpu.prim = param;
             s_gpu.idx_count = 0;
+            s_gpu.inline_count = 0;
         } else {
-            draw_primitive();
+            if (s_gpu.inline_count)
+                draw_inline_array();
+            else
+                draw_primitive();
             s_gpu.prim = 0;
+            s_gpu.inline_count = 0;
         }
+        break;
+
+    case NV097_INLINE_ARRAY:
+        /* Vertex data, not a pointer to it. Buffered rather than decoded here
+         * because the format is only fully known at END. */
+        if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
+            s_gpu.inline_buf[s_gpu.inline_count++] = param;
         break;
 
     case NV097_ARRAY_ELEMENT16:
