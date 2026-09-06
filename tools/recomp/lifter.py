@@ -21,6 +21,56 @@ from .disasm import Instruction, Operand
 from .config import is_code_address, is_data_address, va_to_file_offset
 
 
+# C identifiers a recompiled function name must not be: the generated TUs
+# include the C standard headers (math.h/string.h through recomp_types.h,
+# stdlib.h in the dispatch TU), and a recompiled image carries its own copies
+# of the CRT helpers -- Black has a function literally named `onexit`.
+# Emitting `void onexit(void);` next to UCRT's `onexit_t __cdecl onexit(
+# onexit_t)` is a redefinition with different type modifiers and cl fails with
+# C2373. Mangle with the address, the same suffixed-<addr> scheme func_id
+# already uses for duplicate names.
+_FUNC_RESERVED_IDENT = frozenset({
+    # C and C++ keywords
+    "asm", "auto", "break", "case", "char", "const", "continue",
+    "default", "do", "double", "else", "enum", "extern", "float",
+    "for", "goto", "if", "inline", "int", "long", "register",
+    "restrict", "return", "short", "signed", "sizeof", "static",
+    "struct", "switch", "typedef", "union", "unsigned", "void",
+    "volatile", "while",
+    # <string.h>
+    "memchr", "memcmp", "memcpy", "memmove", "memset", "strcat",
+    "strchr", "strcmp", "strcoll", "strcpy", "strcspn", "strerror",
+    "strlen", "strncat", "strncmp", "strncpy", "strpbrk", "strrchr",
+    "strspn", "strstr", "strtok", "strxfrm",
+    # <math.h>
+    "acos", "asin", "atan", "atan2", "ceil", "cos", "cosh", "exp",
+    "fabs", "floor", "fmod", "frexp", "ldexp", "log", "log10", "modf",
+    "pow", "sin", "sinh", "sqrt", "tan", "tanh",
+    # <stdlib.h>
+    "abort", "abs", "atexit", "atof", "atoi", "atol", "bsearch",
+    "calloc", "div", "exit", "free", "getenv", "labs", "ldiv", "malloc",
+    "mblen", "mbstowcs", "mbtowc", "onexit", "qsort", "rand", "realloc",
+    "srand", "strtod", "strtol", "strtoul", "system", "wctomb",
+    "wcstombs",
+    # <setjmp.h>
+    "longjmp", "setjmp",
+})
+
+
+def _func_ident(addr, name):
+    """C identifier for the recompiled function at addr.
+
+    Every place a func_db name becomes a C token -- the function definition,
+    its forward declaration, call sites and the dispatch table -- must agree,
+    or the link fails. Reserved names get the same ``_<addr>`` suffix func_id
+    already gives duplicate names.
+    """
+    base = name if name else f"sub_{addr:08X}"
+    if base in _FUNC_RESERVED_IDENT:
+        return f"{base}_{addr:08X}"
+    return base
+
+
 # ── Operand formatting ──────────────────────────────────────
 
 def _fmt_reg(name, size=4):
@@ -983,6 +1033,7 @@ class Lifter:
             name = self.label_db[addr]
         else:
             name = f"sub_{addr:08X}"
+        name = _func_ident(addr, name)
         self.referenced_calls[addr] = name
         return name
 

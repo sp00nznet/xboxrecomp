@@ -144,6 +144,30 @@ def test_empty_translation_set_does_not_divide_by_zero():
         assert "if (!g_flat_span) return 0;" in src
 
 
+def test_reserved_name_mangled_everywhere():
+    # The recompiled image carries its own CRT; Black's function named
+    # `onexit` clashed with UCRT's onexit_t __cdecl onexit(onexit_t) (C2373)
+    # in the dispatch TU, which includes <stdlib.h>. The identifier, its
+    # forward declaration, every call site and the dispatch row must share one
+    # mangled name.
+    from tools.recomp.lifter import _func_ident
+
+    assert _func_ident(0x000A1C60, "onexit") == "onexit_000A1C60"
+    assert _func_ident(0x000A1C60, "sub_000A1C60") == "sub_000A1C60"
+    assert _func_ident(0x000A1C60, None) == "sub_000A1C60"
+
+
+def test_reserved_dispatch_row_uses_mangled_name():
+    with tempfile.TemporaryDirectory() as tmp:
+        disp = os.path.join(tmp, "d.c")
+        BatchTranslator._write_dispatch_table(
+            object.__new__(BatchTranslator),
+            [(0x000A1C60, "onexit_000A1C60", "void onexit_000A1C60(void) {}")],
+            disp, "recomp_funcs.h")
+        src = open(disp).read()
+        assert "(recomp_func_t)onexit_000A1C60" in src
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
