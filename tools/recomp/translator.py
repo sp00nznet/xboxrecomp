@@ -827,6 +827,22 @@ class FunctionTranslator:
             # width, so the branch tests what the compare saw.
 
 
+        # Float compare snapshot, same reasoning as the integer one above and
+        # for a sharper reason: an SSE compare is routinely followed by a `lea`
+        # that overwrites the very register the address was built from. MSVC
+        # emits exactly that in Half-Life 2's displacement collision builder --
+        #
+        #   comiss xmm5, [esi + eax*4]     ; compare with the old eax
+        #   lea    eax, [esi + eax*4]      ; then eax becomes the pointer
+        #
+        # -- so reconstructing the comparison at the jcc read `esi + eax*4`
+        # with eax already holding a pointer. The address wrapped to guest
+        # 0x651BCD20 and the level load died in CDispCollTree.
+        if any(insn.mnemonic in ("comiss", "comisd", "ucomiss", "ucomisd")
+               for insn in instructions):
+            lines.append("    double _fca = 0.0, _fcb = 0.0;")
+            lines.append("    (void)_fca; (void)_fcb;")
+
         # Add _cf for carry-dependent instructions.
         #
         # adc/sbb read CF directly, and so does a jb/jae whose flags came from

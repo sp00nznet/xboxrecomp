@@ -139,6 +139,10 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_VERTEX_DATA_ARRAY_OFFSET 0x1720   /* +i*4, 16 attributes */
 #define NV097_SET_VERTEX_DATA_ARRAY_FORMAT 0x1760   /* +i*4 */
 #define NV097_SET_BEGIN_END               0x17FC
+#define NV097_SET_TEXTURE_OFFSET          0x1B00   /* +i*0x40 */
+#define NV097_SET_TEXTURE_FORMAT          0x1B04
+#define NV097_SET_TEXTURE_CONTROL1        0x1B10
+#define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
 #define NV097_ARRAY_ELEMENT16             0x1800
 #define NV097_INLINE_ARRAY                0x1818
 
@@ -156,6 +160,20 @@ typedef struct {
 #define NV_VERTEX_ATTRS 16
 #define NV_MAX_INDICES  4096
 #define NV_MAX_INLINE   4096            /* dwords of INLINE_ARRAY per batch */
+
+/* Texture stage 0, decoded from what the title programmed.
+ *
+ * Only stage 0: it is the only one the dashboard configures, and a stage
+ * nothing writes to is a stage nothing can be sampled from. The rest arrive
+ * as unhandled methods and are counted as such, which is how the next title
+ * that needs them will say so. */
+typedef struct {
+    uint32_t offset;                    /* guest address of texel (0,0)  */
+    uint32_t width, height;             /* from IMAGE_RECT               */
+    uint32_t pitch;                     /* bytes per row, from CONTROL1  */
+    uint32_t color;                     /* NV097 colour-format code      */
+    int      valid;
+} Texture;
 
 static struct {
     VertexAttr attr[NV_VERTEX_ATTRS];
@@ -175,6 +193,7 @@ static struct {
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
+    Texture  tex;
 } s_gpu;
 
 /* Unhandled methods, ranked. The interesting output is not that something was
@@ -184,6 +203,22 @@ static struct {
 typedef struct { uint32_t method, count; } PbUnhandled;
 static PbUnhandled s_unhandled[PB_EXEC_MAX_UNHANDLED];
 static int s_unhandled_count;
+
+/* Every texture-stage register, as the title last set it.
+ * Texturing is not implemented yet; knowing which formats and sizes a title
+ * actually programs is what decides which ones are worth implementing. */
+#define NV_TEX_FIRST 0x1B00
+#define NV_TEX_LAST  0x1BFC
+static uint32_t s_tex_reg[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
+static uint8_t  s_tex_set[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
+
+static void record_tex_reg(uint32_t method, uint32_t param)
+{
+    s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
+    s_tex_set[(method - NV_TEX_FIRST) / 4] = 1;
+    s_gpu.tex.valid = s_gpu.tex.offset && s_gpu.tex.pitch
+                   && s_gpu.tex.width  && s_gpu.tex.height;
+}
 
 static void note_unhandled(uint32_t method)
 {
@@ -343,7 +378,8 @@ static void dump_surface_bmp(void)
 /* Defined below, next to the rest of the rasteriser; the clear path uses it
  * for RECOMP_RASTER_TEST. */
 static void raster_triangle(const float a[2], const float b[2],
-                            const float c[2], uint32_t argb);
+                            const float c[2], uint32_t argb,
+                            const float uv[3][2]);
 
 static void clear_surface(uint32_t param)
 {
@@ -427,7 +463,7 @@ static void clear_surface(uint32_t param)
             a[0] = s_gpu.clip_w * 0.5f; a[1] = s_gpu.clip_h * 0.15f;
             b[0] = s_gpu.clip_w * 0.85f; b[1] = s_gpu.clip_h * 0.85f;
             c[0] = s_gpu.clip_w * 0.15f; c[1] = s_gpu.clip_h * 0.85f;
-            raster_triangle(a, b, c, 0xFFFF00FFu);   /* magenta: never a clear colour */
+            raster_triangle(a, b, c, 0xFFFF00FFu, NULL);  /* magenta: never a clear colour */
             if (announced++ == 0)
             fprintf(stderr, "  [GPU] raster self-test: triangle (%.0f,%.0f)"
                             " (%.0f,%.0f) (%.0f,%.0f) into 0x%08X %ubpp\n",
@@ -476,6 +512,72 @@ static void clear_surface(uint32_t param)
  * which in practice is UI, HUD and 2D overlays -- all pre-transformed.
  */
 
+/* One texel, in the title's own format.
+ *
+ * Only the linear formats are read. A swizzled texture stores its texels in
+ * Morton order rather than in rows, so reading one as if it had a pitch does
+ * not give a slightly wrong colour, it gives a different image -- and
+ * inventing that image is exactly what this is not for. An unsupported format
+ * samples nothing and the caller keeps the vertex colour, which is visibly
+ * wrong rather than quietly wrong.
+ *
+ * The codes are the NV097 colour field: 0x12 and 0x19 are the linear
+ * A8R8G8B8/X8R8G8B8 pair, 0x1D..0x1F their byte-reordered siblings, 0x11 is
+ * linear R5G6B5 and 0x10 linear A1R5G5B5.
+ */
+static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint8_t *p;
+
+    if (!s_gpu.tex.valid)
+        return 0;
+    if (u >= s_gpu.tex.width || v >= s_gpu.tex.height)
+        return 0;
+    p = mem + s_gpu.tex.offset + (size_t)v * s_gpu.tex.pitch;
+
+    switch (s_gpu.tex.color) {
+    case 0x12:                             /* LU A8R8G8B8 */
+    case 0x19: {                           /* LU X8R8G8B8 */
+        uint32_t t = ((const uint32_t *)p)[u];
+        *argb = (s_gpu.tex.color == 0x19) ? (t | 0xFF000000u) : t;
+        return 1;
+    }
+    case 0x1D:                             /* LU A8B8G8R8 */
+    case 0x1E:                             /* LU B8G8R8A8 */
+    case 0x1F: {                           /* LU R8G8B8A8 */
+        uint32_t t  = ((const uint32_t *)p)[u];
+        uint32_t b0 =  t        & 0xFF, b1 = (t >>  8) & 0xFF;
+        uint32_t b2 = (t >> 16) & 0xFF, b3 = (t >> 24) & 0xFF;
+        if (s_gpu.tex.color == 0x1D)            /* bytes R,G,B,A */
+            *argb = (b3 << 24) | (b0 << 16) | (b1 << 8) | b2;
+        else if (s_gpu.tex.color == 0x1E)       /* bytes A,R,G,B */
+            *argb = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+        else                                    /* bytes A,B,G,R */
+            *argb = (b0 << 24) | (b3 << 16) | (b2 << 8) | b1;
+        return 1;
+    }
+    case 0x11: {                           /* LU R5G6B5 */
+        uint32_t t = ((const uint16_t *)p)[u];
+        *argb = 0xFF000000u
+              | ((((t >> 11) & 0x1F) * 255 / 31) << 16)
+              | ((((t >>  5) & 0x3F) * 255 / 63) <<  8)
+              |   ((t        & 0x1F) * 255 / 31);
+        return 1;
+    }
+    case 0x10: {                           /* LU A1R5G5B5 */
+        uint32_t t = ((const uint16_t *)p)[u];
+        *argb = ((t & 0x8000) ? 0xFF000000u : 0u)
+              | ((((t >> 10) & 0x1F) * 255 / 31) << 16)
+              | ((((t >>  5) & 0x1F) * 255 / 31) <<  8)
+              |   ((t        & 0x1F) * 255 / 31);
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
     uint8_t *row;
@@ -504,12 +606,14 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
  * the same test decides both windings, so a title that emits clockwise
  * triangles does not silently render nothing. */
 static void raster_triangle(const float a[2], const float b[2],
-                            const float c[2], uint32_t argb)
+                            const float c[2], uint32_t argb,
+                            const float uv[3][2])
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     float area;
     int minx, maxx, miny, maxy, x, y;
+    int textured = uv && s_gpu.tex.valid;
 
     if (bpp != 4 && bpp != 2)
         return;
@@ -538,8 +642,28 @@ static void raster_triangle(const float a[2], const float b[2],
             float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
             float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
             float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
-            if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0))
-                put_pixel(mem, bpp, x, y, argb);
+            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
+               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                continue;
+            if (textured) {
+                /* Barycentric, straight from the edge functions already
+                 * computed: w1 is the area opposite a, w2 opposite b, w0
+                 * opposite c, and the three sum to the whole triangle.
+                 *
+                 * No perspective divide. These are screen-space vertices with
+                 * no w to divide by -- which is exactly the case a full-screen
+                 * pass is, and the only case that reaches here. */
+                uint32_t texel;
+                float su = (w1 * uv[0][0] + w2 * uv[1][0] + w0 * uv[2][0]) / area;
+                float sv = (w1 * uv[0][1] + w2 * uv[1][1] + w0 * uv[2][1]) / area;
+                if (su < 0.0f) su = 0.0f;
+                if (sv < 0.0f) sv = 0.0f;
+                if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
+                    put_pixel(mem, bpp, x, y, texel);
+                    continue;
+                }
+            }
+            put_pixel(mem, bpp, x, y, argb);
         }
     }
     s_gpu.tris_drawn++;
@@ -566,6 +690,31 @@ static const VertexAttr *color_attr(void)
                 && s_gpu.attr[a].offset && s_gpu.attr[a].stride)
             return &s_gpu.attr[a];
     return &s_gpu.attr[3];
+}
+
+/* Attribute 9 is texture coordinate 0 in the NV2A vertex layout, the same way
+ * 0 is position and 3 is diffuse. Nothing clever to fall back to: a batch that
+ * does not set it is not textured. */
+static const VertexAttr *texcoord_attr(void)
+{
+    return &s_gpu.attr[9];
+}
+
+/* Texel coordinates, not normalised ones.
+ *
+ * The two conventions are not interchangeable and the format decides which is
+ * in force: a swizzled texture is addressed in [0,1], a linear one in texels.
+ * sample_texture only reads linear formats, so this only ever sees the second.
+ */
+static int fetch_texcoord(uint32_t index, float out[2])
+{
+    float t[4];
+
+    if (!fetch_attr(texcoord_attr(), index, t))
+        return 0;
+    out[0] = t[0];
+    out[1] = t[1];
+    return 1;
 }
 
 static uint32_t vertex_color(uint32_t index)
@@ -649,9 +798,31 @@ static int s_drawn_dumps;
 
 static void dump_surface_bmp(void);
 
+/* One triangle by vertex index: gather position and, if the batch has one,
+ * texture coordinate 0. A vertex whose position cannot be read is not drawn;
+ * a batch whose texcoords cannot be read is drawn untextured rather than not
+ * at all, so a missing coordinate stream costs the colour and not the shape.
+ */
+static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+{
+    float p[3][4], uv[3][2];
+    int textured;
+
+    if (!fetch_attr(&s_gpu.attr[0], i0, p[0])
+     || !fetch_attr(&s_gpu.attr[0], i1, p[1])
+     || !fetch_attr(&s_gpu.attr[0], i2, p[2]))
+        return;
+
+    textured = fetch_texcoord(i0, uv[0])
+            && fetch_texcoord(i1, uv[1])
+            && fetch_texcoord(i2, uv[2]);
+
+    raster_triangle(p[0], p[1], p[2], argb,
+                    textured ? (const float (*)[2])uv : NULL);
+}
+
 static void raster_batch(void)
 {
-    float p[3][4];
     uint32_t i;
     uint32_t before = s_gpu.tris_drawn;
 
@@ -662,21 +833,16 @@ static void raster_batch(void)
         return;
     }
 
-#define VTX(slot, index) \
-    (fetch_attr(&s_gpu.attr[0], (index), p[slot]) ? 1 : 0)
-
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < s_gpu.idx_count; i += 3)
-            if (VTX(0, s_gpu.idx[i]) && VTX(1, s_gpu.idx[i+1])
-             && VTX(2, s_gpu.idx[i+2]))
-                raster_triangle(p[0], p[1], p[2], vertex_color(s_gpu.idx[i]));
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
         break;
     case NV_PRIM_TRIANGLE_STRIP:
         for (i = 0; i + 2 < s_gpu.idx_count; i++)
-            if (VTX(0, s_gpu.idx[i]) && VTX(1, s_gpu.idx[i+1])
-             && VTX(2, s_gpu.idx[i+2]))
-                raster_triangle(p[0], p[1], p[2], vertex_color(s_gpu.idx[i]));
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_QUADS:
@@ -684,14 +850,12 @@ static void raster_batch(void)
         /* A fan and a quad both rasterise as a triangle fan around index 0;
          * for a quad that is exactly its two triangles. */
         for (i = 1; i + 1 < s_gpu.idx_count; i++)
-            if (VTX(0, s_gpu.idx[0]) && VTX(1, s_gpu.idx[i])
-             && VTX(2, s_gpu.idx[i+1]))
-                raster_triangle(p[0], p[1], p[2], vertex_color(s_gpu.idx[0]));
+            raster_indexed(s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i+1],
+                           vertex_color(s_gpu.idx[0]));
         break;
     default:
         break;                             /* points and lines: not yet */
     }
-#undef VTX
 
     if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
@@ -750,6 +914,28 @@ static void draw_primitive(void)
                             " off 0x%08X type %u size %u stride %u\n",
                     s_gpu.prim, s_gpu.idx_count, s_gpu.attr[0].offset,
                     s_gpu.attr[0].type, s_gpu.attr[0].size, s_gpu.attr[0].stride);
+            /* An inline batch has no guest buffer to go and look at -- the
+             * vertices are the payload -- so print the payload and what the
+             * texture stage will be sampled with. Which of the two texture
+             * coordinate conventions is in force is not a guess anyone should
+             * be making from the format code alone. */
+            if (s_gpu.inline_active) {
+                uint32_t k;
+                fprintf(stderr, "  [GPU]   inline %u dwords:", s_gpu.inline_count);
+                for (k = 0; k < s_gpu.inline_count && k < 16; k++)
+                    fprintf(stderr, " %08X", s_gpu.inline_buf[k]);
+                fprintf(stderr, "\n");
+                for (k = 0; k < s_gpu.idx_count && k < 4; k++) {
+                    float t[2];
+                    if (fetch_texcoord(s_gpu.idx[k], t))
+                        fprintf(stderr, "  [GPU]   uv[%u] = %.3f %.3f\n",
+                                k, t[0], t[1]);
+                }
+                fprintf(stderr, "  [GPU]   tex: off 0x%08X %ux%u pitch %u"
+                                " colour 0x%02X valid %d\n",
+                        s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
+                        s_gpu.tex.pitch, s_gpu.tex.color, s_gpu.tex.valid);
+            }
             {
                 /* Every attribute the batch has, not just position. If the
                  * other streams carry data and position does not, the problem
@@ -939,7 +1125,35 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
         }
         break;
+    case NV097_SET_TEXTURE_OFFSET:
+        /* A texture offset is a DMA-object offset, exactly like a surface or a
+         * vertex array offset -- physical, and reachable only through the
+         * contiguous window when it names contiguous memory. */
+        s_gpu.tex.offset = dma_resolve(param);
+        record_tex_reg(method, param);
+        break;
+
+    case NV097_SET_TEXTURE_FORMAT:
+        s_gpu.tex.color = (param >> 8) & 0xFF;
+        record_tex_reg(method, param);
+        break;
+
+    case NV097_SET_TEXTURE_CONTROL1:
+        /* Pitch lives in the top half. Only meaningful for a linear format; a
+         * swizzled texture has no pitch because it has no rows. */
+        s_gpu.tex.pitch = param >> 16;
+        record_tex_reg(method, param);
+        break;
+
+    case NV097_SET_TEXTURE_IMAGE_RECT:
+        s_gpu.tex.width  = param >> 16;
+        s_gpu.tex.height = param & 0xFFFF;
+        record_tex_reg(method, param);
+        break;
+
     default:
+        if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST)
+            record_tex_reg(method, param);
         if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
                 && method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + NV_VERTEX_ATTRS * 4) {
             /* Resolved here, once, so every consumer -- the rasteriser's
@@ -1150,6 +1364,14 @@ void nv2a_pb_exec_report(void)
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
+
+    if (getenv("RECOMP_TEX_STATE")) {
+        uint32_t k;
+        for (k = 0; k < sizeof s_tex_set / sizeof s_tex_set[0]; k++)
+            if (s_tex_set[k])
+                fprintf(stderr, "  [TEX] 0x%04X = 0x%08X\n",
+                        (unsigned)(NV_TEX_FIRST + k * 4), s_tex_reg[k]);
+    }
 
     /* Top ten by frequency: selection sort over a small table, once every few
      * seconds, is not worth a better algorithm. */

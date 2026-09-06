@@ -397,8 +397,15 @@ def _make_condition(jcc, flag_setter, flag_ops):
                     return f"MEMD({_fmt_mem(op)})"
                 return f"MEMF({_fmt_mem(op)})"
             return _fmt_operand_read(op)
-        a = _sse_op(flag_ops[0]) if len(flag_ops) >= 1 else "0.0f"
-        b = _sse_op(flag_ops[1]) if len(flag_ops) >= 2 else "0.0f"
+        # Read the snapshot the compare left rather than the operands, which
+        # may since have been overwritten. _sse_op stays in use for the
+        # description only.
+        (void_a, void_b) = (
+            _sse_op(flag_ops[0]) if len(flag_ops) >= 1 else "0.0f",
+            _sse_op(flag_ops[1]) if len(flag_ops) >= 2 else "0.0f",
+        )
+        desc = f"{desc} ({void_a} vs {void_b})" if desc else desc
+        a, b = "_fca", "_fcb"
         # comiss uses unsigned condition codes (CF, ZF)
         if jcc in ("ja", "jnbe"):
             return f"({a} > {b})", desc
@@ -2549,7 +2556,13 @@ class Lifter:
         # ── Comparison ──
         if m in ("comiss", "comisd", "ucomiss", "ucomisd"):
             if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} - sets EFLAGS */"]
+                # Snapshot, not a comment. The consuming jcc can be several
+                # instructions away, and what sits between it and here is
+                # frequently a write to a register the operand address was
+                # built from -- so the operands have to be read now, while
+                # they still mean what the compare meant.
+                return [f"_fca = {_sse_read(ops[0])}; _fcb = {_sse_read(ops[1])};"
+                        f" /* {m} */"]
 
         # ── Bitwise ──
         # Done on the integer lanes: these carry sign-mask and select idioms
