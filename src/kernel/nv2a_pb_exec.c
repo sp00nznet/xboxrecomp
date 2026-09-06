@@ -211,6 +211,15 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     p = mem + a->offset + (size_t)index * a->stride;
 
     switch (a->type) {
+    case 0:                                  /* D3DCOLOR */
+        /* A DWORD 0xAARRGGBB, so little-endian bytes are B,G,R,A -- not the
+         * component order of every other format here. Returned as R,G,B,A so
+         * callers need not know which format the title chose. */
+        out[0] = (float)p[2] / 255.0f;
+        out[1] = (float)p[1] / 255.0f;
+        out[2] = (float)p[0] / 255.0f;
+        out[3] = (float)p[3] / 255.0f;
+        return 1;
     case 2:                                  /* float */
         for (i = 0; i < a->size && i < 4; i++)
             out[i] = ((const float *)p)[i];
@@ -518,11 +527,31 @@ static void raster_triangle(const float a[2], const float b[2],
 /* Attribute 3 is diffuse colour in every NV2A layout that sets one. Absent it,
  * white -- a visible wrong colour beats an invisible correct one during
  * bring-up. */
+/* Which attribute carries the colour.
+ *
+ * Slot 3 is diffuse by convention and titles that follow it are read straight
+ * from there. Half-Life 2 does not: its vertex is position, colour, texcoord
+ * at stride 24, and the colour arrives in slot 5. So fall back to the format
+ * rather than the slot number -- D3DCOLOR is the one attribute type that is
+ * only ever a colour, which makes it a stronger signal than the convention. */
+static const VertexAttr *color_attr(void)
+{
+    uint32_t a;
+
+    if (s_gpu.attr[3].offset && s_gpu.attr[3].stride)
+        return &s_gpu.attr[3];
+    for (a = 0; a < NV_VERTEX_ATTRS; a++)
+        if (s_gpu.attr[a].type == 0 && s_gpu.attr[a].size == 4
+                && s_gpu.attr[a].offset && s_gpu.attr[a].stride)
+            return &s_gpu.attr[a];
+    return &s_gpu.attr[3];
+}
+
 static uint32_t vertex_color(uint32_t index)
 {
     float c[4];
 
-    if (!fetch_attr(&s_gpu.attr[3], index, c))
+    if (!fetch_attr(color_attr(), index, c))
         return 0xFFFFFFFFu;
     return ((uint32_t)(c[3] * 255.0f) << 24)
          | ((uint32_t)(c[0] * 255.0f) << 16)
