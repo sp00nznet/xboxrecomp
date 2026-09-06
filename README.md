@@ -18,11 +18,11 @@ community hub for sp00nznet's recomp projects, where ps3recomp development
 happens in the open. Good place to ask questions, show a port you are working
 on, or find out what people are stuck on before you duplicate the effort.
 
-**Title-agnostic.** The runtime, kernel layer, D3D8 abstraction, NV2A translator, and the Python pipeline (parser → disasm → func_id → abi_analysis → recomp) all derive per-title layout and behavior from the XBE itself. *Burnout 3: Takedown* was the reference title the toolkit was built against, so many docs use its metrics as examples — see `docs/candidate-games.md` for ports in progress.
+**Title-agnostic.** The runtime, kernel layer, D3D8 abstraction, NV2A translator, and the Python pipeline (parser → disasm → func_id → abi_analysis → recomp) all derive per-title layout and behavior from the XBE itself. *Burnout 3: Takedown* was the reference title the toolkit was built against, so many docs use its metrics as examples — see `docs/technical/candidate-games.md` for ports in progress.
 
 ### Recent Changes
 
-**Current version: v0.7.1 — _"Non-Local"_ (September 2026).**
+**Current version: v0.8.0 — _"Snapshot"_ (September 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
@@ -496,6 +496,96 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.8.0 — *"Snapshot"* (September 2026)
+
+*Half-Life 2 loads a level and draws its own loading screen. Most of what
+stood in the way was one mistake wearing different clothes: a value read at the
+wrong moment.*
+
+**Read where it is set, not where it is used.**
+
+- **An SSE compare was rebuilt at the branch, not recorded at the compare.**
+  `comiss` lifted to a comment and the comparison was reconstructed at the
+  consuming `jcc` from the operands as they read *there* — which is the same
+  comparison only if nothing in between writes them. MSVC writes them
+  constantly: `comiss xmm5, [esi + eax*4]` followed by `lea eax, [esi + eax*4]`
+  means the address register becomes a pointer before the branch reads it. The
+  generated C evaluated the operand with `eax` already holding `0x1438C348`,
+  which wraps to guest `0x651BCD20`. 19 of Half-Life 2's 12,617 float compares
+  have that shape; rare, and silently fatal in each.
+- **`xor reg, reg` cleared the register but not the carry flag**, so a later
+  `adc`/`sbb` borrowed a carry the hardware had cleared — with conformance
+  cases — *[@NoRain211](https://github.com/NoRain211)* (#22)
+- Carry conditions are lowered from the snapshot rather than reconstructed
+  after the write, and `cmpxchg` declares the snapshot it needs.
+
+**A missed function boundary skips an epilogue, and an epilogue is where locks
+are released.** The orphan-recovery pass accepted a recovered block only if it
+reached a `ret`, so a block ending in `jmp` stayed a stub that pops a return
+address and returns. Half-Life 2's CRT `_lock` helper exits its scan loop
+through exactly that shape, and the stub skipped the `__finally` that calls
+`_unlock`. Traced by address, every CRT lock balanced except `_OSFHND_LOCK`:
+15 takes, 0 drops. Critical sections are recursive, so the holder kept running
+and only the *second* thread blocked — which is why it read as an AB-BA
+deadlock between two locks rather than one lock leaking. With that fixed, a
+level load goes from 7.8 MB and a deadlock to 15.3 MB with real locks. Four
+more boundary shapes recovered alongside it: tail calls, vcall thunks,
+`__SEH_prolog` frames, and constant accessors with no frame at all.
+
+**A DMA-object offset is physical.** `SET_SURFACE_COLOR_OFFSET` and
+`SET_VERTEX_DATA_ARRAY_OFFSET` are offsets into a DMA object, not guest VAs,
+and the pushbuffer executor only corrected for that when the offset would have
+hit the loaded image. Whether it does is an accident of where the image ends —
+Half-Life 2's colour surface clears it by 700 KB — so the executor cleared
+1.2 MB of black through the guest heap while the real framebuffer sat untouched
+in the contiguous window. The test is now the contiguous arena's high-water
+mark, which is an answer rather than a guess.
+
+**Vertex colours arrive as D3DCOLOR.** `fetch_attr` had no case for NV2A format
+0 — a DWORD `0xAARRGGBB` whose little-endian bytes run B,G,R,A, the reverse of
+every other format it handled — so the fetch failed and the caller's white
+fallback took over, which is indistinguishable from a title asking for white.
+The colour is also found by format now rather than by slot: slot 3 is diffuse
+by convention and HL2 puts it in slot 5.
+
+**Contributed.**
+
+- **The FVF position field was tested as bits** — `fvf & D3DFVF_XYZRHW` is a
+  bit test against an encoded field, so `D3DFVF_XYZB1` tested as transformed,
+  and the attribute offset stepped over blend weights and normals as if they
+  were absent — *[@NoRain211](https://github.com/NoRain211)* (#23)
+- **DirectSound cursors and the mixer disagreed**, so `SetCurrentPosition` did
+  not seek and `Play` discarded the position it was given; the fixed-point
+  source position also overflowed past 65,535 frames. Its regression compiles
+  the real mixer against the real device rather than a copy of either —
+  *[@NoRain211](https://github.com/NoRain211)* (#24)
+- **20 more kernel ordinals routed** (SMBus, PCI config space, IRQL, EEPROM
+  save, semaphores, FP-state save/restore) and the memory-model corrections
+  behind them: allocator bridges answering from the guest heap instead of
+  returning a host pointer the title truncates to four bytes, guest-width
+  writes in `RtlInitUnicodeString` and `ObReferenceObjectByName`, 64-bit
+  returns split across `g_eax`/`g_edx`. 170 of 371 ordinals routed, and every
+  ordinal Half-Life 2 was hitting unbridged now answers —
+  *[@DarthSidious666](https://github.com/DarthSidious666)* (#25)
+- **The macOS build path**, with `mach/mach.h` for the memory queries and
+  honest `TODO`s where Darwin has no equivalent — macOS has no
+  `MAP_FIXED_NOREPLACE`, and plain `MAP_FIXED` would unmap whatever is already
+  there — plus `xbox_wcslen` for the 16-bit Xbox `WCHAR` —
+  *[@dplewis](https://github.com/dplewis)* (#20)
+
+**Diagnostics**, because each of the above cost a day of looking in the wrong
+place first: per-lock acquire/release tracing by address (`RECOMP_CS_TRACE_CRT`),
+a watch on one lock with a guest backtrace (`RECOMP_CS_WATCH`), the guest call
+site of a contended lock's holder, `RECOMP_WORKERS=inline` to answer whether a
+bug needs two threads, and a failed file open that names its Win32 error rather
+than only its NTSTATUS.
+
+**Also:** `MmAllocateSystemMemory` bridged (page-aligned and zeroed, as the
+console's page allocator returns), a TIB per guest thread, `lock`-prefixed
+atomics, and the guest's own critical sections actually doing something —
+they had been a no-op, which no title had noticed until one ran two threads
+through a CRT that cares.
 
 ### v0.7.1 — *"Non-Local"* (September 2026)
 
