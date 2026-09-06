@@ -324,6 +324,9 @@ static long kernel_log_budget(void)
  * arg0 is at g_esp+0, arg1 at g_esp+4, etc. */
 #define STACK_ARG(n) ((uint32_t)BRIDGE_MEM32(g_esp + (n) * 4))
 
+/* Guest return address of the call currently in a bridge. */
+RECOMP_TLS uint32_t g_xbox_kernel_caller;
+
 /* ── Per-ordinal bridge functions ─────────────────────────
  *
  * Each bridge reads args from the Xbox stack, translates pointer
@@ -3810,6 +3813,10 @@ static void kernel_thunk_dispatch(void)
      * On real x86, "call [thunk]" pushes a real return address and "ret" pops it.
      * In our model, the bridge is called directly (not via the simulated stack),
      * so we must manually consume the dummy return address. */
+    /* Keep the caller before popping it. A bridge that blocks -- a critical
+     * section above all -- can then say which guest call site is holding the
+     * lock, which is the one fact a deadlock report otherwise lacks. */
+    g_xbox_kernel_caller = g_esp ? BRIDGE_MEM32(g_esp) : 0;
     g_esp += 4;
 
     /* Name the bridge that corrupts a watched dword.

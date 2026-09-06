@@ -12,6 +12,7 @@
 #include "xbox_memory_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
@@ -191,9 +192,31 @@ ULONG __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pat
 typedef struct {
     uintptr_t        key;        /* guest critical section; 0 means free */
     CRITICAL_SECTION cs;
+    /* Who holds it, and the guest call site that took it.
+     *
+     * A deadlock report can already say which lock and which thread. What it
+     * cannot say is where the holder took it, and that is the only part that
+     * points at code. Written after the lock is held and cleared as the last
+     * recursion is released, so a waiter reads a consistent pair or a stale
+     * one -- never a torn address. Nothing depends on them being current;
+     * they exist to be printed. */
+    volatile uint32_t      owner_site;
+    volatile unsigned long owner_tid;
+    volatile long          depth;
 } XBOX_CS_SLOT;
 
 static XBOX_CS_SLOT g_cs_table[XBOX_CS_TABLE_SIZE];
+
+/* The slot a shadow lock lives in, or NULL if it is not one of ours --
+ * RECOMP_CS_MODE=single hands out a lock that belongs to no slot. */
+static XBOX_CS_SLOT* xbox_cs_slot_of(CRITICAL_SECTION* cs)
+{
+    char* p = (char*)cs;
+    if (p < (char*)&g_cs_table[0]
+            || p >= (char*)&g_cs_table[XBOX_CS_TABLE_SIZE])
+        return NULL;
+    return (XBOX_CS_SLOT*)(p - offsetof(XBOX_CS_SLOT, cs));
+}
 static SRWLOCK      g_cs_table_lock = SRWLOCK_INIT;
 static int          g_cs_table_full;
 
@@ -424,6 +447,29 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
     fflush(stderr);
 }
 
+extern RECOMP_TLS uint32_t g_xbox_kernel_caller;
+
+static void xbox_cs_note_owner(CRITICAL_SECTION* cs)
+{
+    XBOX_CS_SLOT* slot = xbox_cs_slot_of(cs);
+    if (!slot)
+        return;
+    slot->owner_site = g_xbox_kernel_caller;
+    slot->owner_tid  = GetCurrentThreadId();
+    slot->depth++;
+}
+
+static void xbox_cs_clear_owner(CRITICAL_SECTION* cs)
+{
+    XBOX_CS_SLOT* slot = xbox_cs_slot_of(cs);
+    if (!slot)
+        return;
+    if (--slot->depth <= 0) {
+        slot->depth = 0;
+        slot->owner_tid = 0;
+    }
+}
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
@@ -431,8 +477,10 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         return;
     InterlockedIncrement(&g_cs_enters);
     crt_lock_trace("take", CriticalSection);
-    if (TryEnterCriticalSection(cs))
+    if (TryEnterCriticalSection(cs)) {
+        xbox_cs_note_owner(cs);
         return;
+    }
     if (InterlockedIncrement(&g_cs_contention_reports) <= 16) {
         fprintf(stderr, "  [CS] thread %lu waiting on guest lock 0x%08X"
                         " (held by thread %lu)\n",
@@ -447,12 +495,23 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
             if (idx >= 0)
                 fprintf(stderr, "  [CS]   that is CRT lock %d\n", idx);
         }
+        {
+            /* Where the holder took it. The waiter's own backtrace below
+             * says who is blocked; this is the half that says who to look
+             * at. */
+            XBOX_CS_SLOT* slot = xbox_cs_slot_of(cs);
+            if (slot && slot->owner_tid)
+                fprintf(stderr, "  [CS]   holder thread %lu took it at guest"
+                                " 0x%08X (depth %ld)\n",
+                        slot->owner_tid, slot->owner_site, slot->depth);
+        }
         fprintf(stderr, "  [CS] enters=%ld leaves=%ld (outstanding %ld)\n",
                 g_cs_enters, g_cs_leaves, g_cs_enters - g_cs_leaves);
         xbox_guest_backtrace(10);
         fflush(stderr);
     }
     EnterCriticalSection(cs);
+    xbox_cs_note_owner(cs);
     if (g_cs_contention_reports <= 16) {
         fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",
                 GetCurrentThreadId(),
@@ -468,6 +527,7 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     if (cs) {
         InterlockedIncrement(&g_cs_leaves);
         crt_lock_trace("drop", CriticalSection);
+        xbox_cs_clear_owner(cs);
         LeaveCriticalSection(cs);
     }
 }
