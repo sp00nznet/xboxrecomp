@@ -76,6 +76,13 @@ static DWORD xbox_access_to_win32(ACCESS_MASK Access)
     return result;
 }
 
+uint32_t g_xbox_last_file_error;
+
+uint32_t xbox_LastFileError(void)
+{
+    return g_xbox_last_file_error;
+}
+
 /* Convert Xbox share access to Win32 */
 static DWORD xbox_share_to_win32(ULONG Share)
 {
@@ -157,6 +164,12 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (h == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
+        /* Kept for the caller's trace. An NTSTATUS says "it did not open";
+         * only the Win32 error distinguishes a title probing for a file that
+         * is genuinely absent from one it cannot open because this runtime
+         * already holds it open with a share mode the second open forbids --
+         * and those need opposite responses. */
+        g_xbox_last_file_error = (uint32_t)err;
         /* A warning, not a compiled-out trace: a failed open is how a title
          * silently decides a volume or asset is missing, and in a Release
          * build that decision was invisible. */

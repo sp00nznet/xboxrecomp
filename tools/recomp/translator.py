@@ -1404,25 +1404,44 @@ class BatchTranslator:
         # project writes, so the pipeline should hand it over like everything
         # else it generates.
         #
-        # Never overwritten. A project that has edited this copy keeps its
-        # edits across a regen, which is the opposite of how the .c files
-        # behave -- but this is a header a project may reasonably touch, and
-        # silently reverting someone's change on every regen is worse than
-        # letting a stale one persist. Delete it to get the current one back.
+        # Refreshed every run, not written once.
+        #
+        # This first said "never overwritten, so a project's edits survive".
+        # That was wrong, and the cost is a link error with no obvious cause:
+        # the lifter and this header are two halves of one contract, so a
+        # lifter that starts emitting RECOMP_ATOMIC_CAS32 against a header
+        # from three weeks ago gives
+        #
+        #     LNK2019: unresolved external symbol RECOMP_ATOMIC_CAS32
+        #
+        # pointing at generated code that is perfectly correct. The Xbox
+        # Dashboard hit exactly that. It is not hypothetical elsewhere either:
+        # Bloodwake's and Burnout 3's copies had already drifted from the
+        # template by 641 and 983 lines.
+        #
+        # So it tracks the template, like the .c files do. A project that
+        # genuinely needs its own can put one earlier on the include path --
+        # gen/ is only found because recomp_funcs.h sits beside it.
         types_dst = os.path.join(output_dir, "recomp_types.h")
-        if not os.path.exists(types_dst):
-            types_src = os.path.join(os.path.dirname(__file__), "..", "..",
-                                     "templates", "runtime", "recomp_types.h")
-            try:
-                with open(types_src, "r", encoding="utf-8") as src:
-                    with open(types_dst, "w", encoding="utf-8") as dst:
-                        dst.write(src.read())
-                print(f"  wrote {types_dst} (runtime register model)",
+        types_src = os.path.join(os.path.dirname(__file__), "..", "..",
+                                 "templates", "runtime", "recomp_types.h")
+        try:
+            with open(types_src, "r", encoding="utf-8") as src:
+                want = src.read()
+            have = None
+            if os.path.exists(types_dst):
+                with open(types_dst, "r", encoding="utf-8") as dst:
+                    have = dst.read()
+            if have != want:
+                with open(types_dst, "w", encoding="utf-8") as dst:
+                    dst.write(want)
+                print("  %s recomp_types.h (runtime register model)"
+                      % ("refreshed" if have is not None else "wrote"),
                       file=sys.stderr)
-            except OSError as e:
-                print(f"  WARNING: could not write recomp_types.h ({e}); copy "
-                      f"it from templates/runtime/ by hand or the build will "
-                      f"not find it", file=sys.stderr)
+        except OSError as e:
+            print(f"  WARNING: could not write recomp_types.h ({e}); copy "
+                  f"it from templates/runtime/ by hand or the build will "
+                  f"not find it", file=sys.stderr)
 
         # Split translations into chunks and write .c files
         generated_files = [header_path]
