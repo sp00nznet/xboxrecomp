@@ -1242,12 +1242,6 @@ static void draw_primitive(void)
     }
 
     raster_batch();
-    /* A frame is only whole between its last draw and whatever the title
-     * does next. Dumping at the flip assumes nothing clears in between;
-     * this says what the surface holds while the batch that drew it is
-     * still the most recent thing to have touched it. */
-    if ((s_gpu.draws % 2000) == 0)
-        dump_surface_bmp();
 
     if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
         static int shown;
