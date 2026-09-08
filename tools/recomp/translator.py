@@ -620,8 +620,30 @@ class FunctionTranslator:
         if not instructions:
             return None
 
+        # Addresses this function loads as immediates into a register and
+        # then jumps to. `mov ebx, 0x3A0DC; ... ; jmp ebx` is a continuation
+        # chain inside one function, and its targets need labels for the
+        # goto the lifter emits -- see _lift_jmp. Restricted to functions
+        # that actually contain a register-operand indirect jmp, so a plain
+        # `mov reg, <address of a function>` for a callback does not start
+        # splitting blocks everywhere.
+        imm_refs = set()
+        if any(insn.mnemonic == "jmp" and not insn.jump_target and insn.operands
+               and insn.operands[0].type == "reg" for insn in instructions):
+            for insn in instructions:
+                if insn.mnemonic != "mov" or len(insn.operands) < 2:
+                    continue
+                if insn.operands[0].type != "reg":
+                    continue
+                if insn.operands[1].type != "imm":
+                    continue
+                value = insn.operands[1].imm
+                if start <= value < end:
+                    imm_refs.add(value)
+        self.lifter.imm_code_refs = imm_refs
+
         # Collect switch table targets as extra block leaders
-        switch_leaders = set()
+        switch_leaders = set(imm_refs)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
                 targets = self.lifter._analyze_switch_table(insn.operands)
@@ -900,6 +922,7 @@ class FunctionTranslator:
         for insn in instructions:
             if insn.jump_target and start <= insn.jump_target < end:
                 label_addrs.add(insn.jump_target)
+        label_addrs |= imm_refs
         # Add switch table targets (indirect jmp with intra-function table)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:

@@ -966,6 +966,9 @@ class Lifter:
         self.SETJMP_FN = setjmp_fn
         self.LONGJMP_FN = longjmp_fn
         self.jump_table_targets = {}
+        # Addresses loaded as immediates into a register inside the current
+        # function, used to resolve `jmp <reg>`. See _lift_jmp.
+        self.imm_code_refs = set()
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.
@@ -1992,6 +1995,31 @@ class Lifter:
                     lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
                 lines.append(f"g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }}")
                 return lines
+            # `jmp <reg>` where the register was loaded with an address
+            # inside this same function: a hand-written continuation chain,
+            # not a call. The XMV YUV-to-RGB converter in Half-Life 2's
+            # loader is built this way -- four blocks that each do
+            # `mov ebx, <next>; jmp <shared tail>`, and the shared tail ends
+            # `jmp ebx`. Treated as an indirect tail call it resolved to
+            # nothing, so the shared tail never came back and the function's
+            # epilogue never ran: every call leaked 0x2C bytes of guest stack
+            # and the converter wrote past its surface until it walked out of
+            # the tiled aperture, 144 MB later.
+            #
+            # The targets are labels in this function, so this is a goto, and
+            # the same shape the memory-operand switch above emits.
+            if ops[0].type == "reg" and self.imm_code_refs:
+                inside = sorted(t for t in self.imm_code_refs
+                                if self.func_start <= t < self.func_end)
+                if inside:
+                    target_expr = _fmt_operand_read(ops[0])
+                    lines = [f"{{ uint32_t _jt = {target_expr};"
+                             f" /* intra-function indirect jmp:"
+                             f" {len(inside)} targets */"]
+                    for t in inside:
+                        lines.append(f"if (_jt == 0x{t:08X}u) goto loc_{t:08X};")
+                    lines.append("g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
+                    return lines
             target = _fmt_operand_read(ops[0])
             return [f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return; /* indirect tail jmp */"]
         return ["/* jmp: no target */"]
