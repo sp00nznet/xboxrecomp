@@ -187,10 +187,6 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
-/* Same, when the device structure is at a fixed address rather than behind a
- * global holding its pointer. */
-int xbox_Nv2aMirrorFenceAt(uint32_t device_va, uint32_t put_off,
-                           uint32_t get_ptr_off);
 
 void xbox_MemoryLayoutShutdown(void);
 

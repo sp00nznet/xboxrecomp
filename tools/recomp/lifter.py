@@ -1209,9 +1209,13 @@ class Lifter:
         # Dispatched on the operands rather than the mnemonic, because the
         # integer SIMD names are shared with SSE: `paddw mm0, mm1` and
         # `paddw xmm0, xmm1` differ only in register file.
+        # cvtpi2ps is named here as well: its source may be m64 rather than
+        # an mm register, and dispatching purely on the operands then sent
+        # that form past the MMX lifter to a TODO comment -- the same silent
+        # drop, one addressing mode along.
         if any(op.type == "reg" and op.reg and op.reg.startswith("mm")
                and not op.reg.startswith("xmm") for op in ops) or m in (
-                   "emms", "femms"):
+                   "emms", "femms", "cvtpi2ps"):
             return self._lift_mmx(insn, m, ops)
 
         if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps",
@@ -2321,6 +2325,25 @@ class Lifter:
             else:
                 return [f"/* TODO: {m} {insn.op_str} */"]
             return [f"{dst.reg} = {self._MMX_SHIFT[m]}({dst.reg}, {cnt}); /* {m} */"]
+
+        # cvtpi2ps: the other direction -- two dwords in, two singles out,
+        # into the LOW half of an xmm whose upper lanes are preserved. The
+        # destination is an xmm and the source an mm register or m64, so
+        # neither goes through the mm paths above and it fell through to a
+        # TODO comment: in Half-Life 2's loader that silently deleted every
+        # integer-to-float step of the XMV YUV-to-RGB converter, which then
+        # ran its whole float pipeline on stale registers and painted every
+        # frame of the intro solid red.
+        if m == "cvtpi2ps" and len(ops) >= 2 and dst.type == "reg" \
+                and dst.reg and dst.reg.startswith("xmm"):
+            s_op = ops[1]
+            if s_op.type == "reg" and s_op.reg and s_op.reg.startswith("mm"):
+                a = s_op.reg
+            elif s_op.type == "mem":
+                a = f"MMX_MEM({_fmt_mem(s_op)})"
+            else:
+                return [f"/* TODO: {m} {insn.op_str} */"]
+            return [f"{dst.reg} = XMM_FROM_PI({dst.reg}, {a}); /* cvtpi2ps */"]
 
         # cvtps2pi / cvttps2pi: two singles in, two dwords out. The source is
         # an xmm register or a 64-bit memory operand -- never an mm register,

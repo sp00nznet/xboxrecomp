@@ -934,6 +934,17 @@ static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
     return r;
 }
 
+/** cvtpi2ps: two signed dwords in, two singles out, into the LOW half of the
+ * destination -- lanes 2 and 3 keep whatever they held. That detail is the
+ * whole instruction: code that builds a float4 from two of these relies on
+ * the first one surviving the second. */
+static inline RecompXmm XMM_FROM_PI(RecompXmm dst, RecompMmx src)
+{
+    dst.f[0] = (float)src.d[0];
+    dst.f[1] = (float)src.d[1];
+    return dst;
+}
+
 static inline RecompMmx MMX_MEM(uint32_t addr) {
     RecompMmx r;
     memcpy(&r, (const void *)XBOX_PTR(addr), 8);

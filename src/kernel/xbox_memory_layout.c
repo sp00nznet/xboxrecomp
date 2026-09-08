@@ -263,7 +263,6 @@ static int g_apu_mmio_trapped = 0;
 
 static struct {
     uint32_t device_ptr_va;
-    int      direct;   /* device_ptr_va IS the device, not a pointer to it */
     uint32_t put_off;
     uint32_t get_ptr_off;
 } g_fence_mirrors[XBOX_MAX_FENCE_MIRRORS];
@@ -275,7 +274,6 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
     if (g_fence_mirror_count >= XBOX_MAX_FENCE_MIRRORS)
         return -1;
     g_fence_mirrors[g_fence_mirror_count].device_ptr_va = device_ptr_va;
-    g_fence_mirrors[g_fence_mirror_count].direct = 0;
     g_fence_mirrors[g_fence_mirror_count].put_off = put_off;
     g_fence_mirrors[g_fence_mirror_count].get_ptr_off = get_ptr_off;
     g_fence_mirror_count++;
@@ -284,18 +282,6 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
             device_ptr_va, put_off, get_ptr_off);
     return 0;
 }
-
-/* Same, for a title whose device structure is at a fixed address rather than
- * behind a global holding its pointer. */
-int xbox_Nv2aMirrorFenceAt(uint32_t device_va, uint32_t put_off,
-                           uint32_t get_ptr_off)
-{
-    int rc = xbox_Nv2aMirrorFence(device_va, put_off, get_ptr_off);
-    if (rc)
-        g_fence_mirrors[g_fence_mirror_count - 1].direct = 1;
-    return rc;
-}
-
 /* A guest address is usable only once the window is mapped and it lands
  * inside it; the chain is followed fresh every poll because the title may not
  * have built it yet. */
@@ -460,15 +446,7 @@ static void fence_mirrors_tick(void)
 
         if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
             continue;
-        /* Some titles keep a global holding the device pointer; others put
-         * the device there. Dereferencing the wrong one reads two fields
-         * from the middle of the structure and mirrors garbage into
-         * whatever the second one happens to point at -- for HL2's loader
-         * that was a constant 0x0F written to the base of the contiguous
-         * window, every tick. */
-        dev = g_fence_mirrors[i].direct
-            ? g_fence_mirrors[i].device_ptr_va
-            : *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
+        dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
                                      + g_memory_offset);
         if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4)
                 || !fence_readable(dev + g_fence_mirrors[i].put_off, 4))

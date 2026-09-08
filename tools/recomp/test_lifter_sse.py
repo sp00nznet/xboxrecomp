@@ -171,5 +171,39 @@ class SsePackedLifterTest(unittest.TestCase):
                 statement.lstrip().startswith("/*"), (mnemonic, statement))
 
 
+class CvtPi2PsTest(unittest.TestCase):
+    """cvtpi2ps: two signed dwords out of an MMX register (or m64) become two
+    singles in the LOW half of an xmm, upper lanes untouched.
+
+    It has an xmm destination and an mm source, so it matched neither the mm
+    paths nor the xmm ones and fell through to a TODO comment -- which deletes
+    the instruction silently. In Half-Life 2's Xbox loader that removed every
+    integer-to-float step of the XMV YUV-to-RGB converter; the float pipeline
+    then ran on whatever the xmm registers held from before and painted the
+    whole intro solid red. A dropped instruction is the worst kind of bug the
+    recompiler can have, because everything downstream still runs.
+    """
+
+    def test_mmx_source_is_lifted(self):
+        lifted = Lifter().lift_instruction(
+            _insn("cvtpi2ps", "xmm0, mm0", [_xmm("xmm0"), _xmm("mm0")]))
+        self.assertEqual(len(lifted), 1)
+        self.assertIn("XMM_FROM_PI(xmm0, mm0)", lifted[0])
+
+    def test_memory_source_is_lifted(self):
+        lifted = Lifter().lift_instruction(
+            _insn("cvtpi2ps", "xmm1, qword ptr [eax]",
+                  [_xmm("xmm1"), _mem("eax", size=8)]))
+        self.assertEqual(len(lifted), 1)
+        self.assertIn("MMX_MEM(", lifted[0])
+
+    def test_it_does_not_become_a_comment(self):
+        # The regression itself: a TODO comment compiles and does nothing.
+        statement = Lifter().lift_instruction(
+            _insn("cvtpi2ps", "xmm0, mm0", [_xmm("xmm0"), _xmm("mm0")]))[0]
+        self.assertNotIn("TODO", statement)
+        self.assertFalse(statement.lstrip().startswith("/*"), statement)
+
+
 if __name__ == "__main__":
     unittest.main()
