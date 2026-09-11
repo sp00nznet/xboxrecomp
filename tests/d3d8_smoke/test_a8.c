@@ -1,4 +1,4 @@
-/* Sample A8 through both real pixel-shader paths on the D3D11 WARP device.
+/* Test A8 sampling and transformed-vertex interpolation on D3D11 WARP.
  * No game data, window, or hardware adapter is needed. */
 #include "d3d8_internal.h"
 #include <d3dcompiler.h>
@@ -43,6 +43,81 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
 
 #define REQUIRE(call) do { HRESULT hr = (call); if (FAILED(hr)) { \
     fprintf(stderr, "%s: HRESULT 0x%08lx\n", #call, (unsigned long)hr); exit(1); } } while (0)
+
+/* Keep the real fixed-function VS: varying RHW must affect interpolation,
+ * but not the quad's screen position. */
+static int check_rhw(ID3D11Texture2D *target, ID3D11Texture2D *readback,
+                     ID3D11RenderTargetView *rtv)
+{
+    struct Vertex { float x, y, z, rhw; DWORD diffuse; float u, v; } vertices[] = {
+        {0, 0, 0.5f, 1, 0xFFFFFFFF, 0, 0}, {1, 0, 0.5f, 1, 0xFFFFFFFF, 1, 0},
+        {0, 1, 0.5f, 1, 0xFFFFFFFF, 0, 1}, {1, 1, 0.5f, 1, 0xFFFFFFFF, 1, 1}
+    };
+    static const struct { float left, right; int expected; } cases[] = {
+        {1, 1, 128}, {1, 3, 255}, {3, 1, 0}, {2, 2, 128}
+    };
+    const DWORD row[] = {0xFF000000, 0xFFFFFFFF};
+    const float clear[] = {1, 0, 1, 0};
+    IDirect3DTexture8 *texture;
+    ID3D11ShaderResourceView *srv;
+    ID3D11SamplerState *sampler;
+    ID3D11Buffer *buffer;
+    D3DLOCKED_RECT lock;
+    D3D11_BUFFER_DESC bd = {0};
+    D3D11_SAMPLER_DESC sd = {0};
+    UINT stride = sizeof(vertices[0]), offset = 0;
+    unsigned i;
+    int failures = 0;
+
+    REQUIRE(d3d8_CreateTextureImpl(2, 2, 1, 0, D3DFMT_LIN_A8R8G8B8, &texture));
+    REQUIRE(texture->lpVtbl->LockRect(texture, 0, &lock, NULL, 0));
+    memcpy(lock.pBits, row, sizeof(row));
+    memcpy((BYTE *)lock.pBits + lock.Pitch, row, sizeof(row));
+    REQUIRE(texture->lpVtbl->UnlockRect(texture, 0));
+    textures[0] = (IDirect3DBaseTexture8 *)texture;
+    srv = d3d8_base_srv(textures[0]);
+    ID3D11DeviceContext_PSSetShaderResources(context, 0, 1, &srv);
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    REQUIRE(ID3D11Device_CreateSamplerState(device, &sd, &sampler));
+    ID3D11DeviceContext_PSSetSamplers(context, 0, 1, &sampler);
+    stages[0][D3DTSS_COLOROP] = stages[0][D3DTSS_ALPHAOP] = D3DTOP_SELECTARG1;
+    stages[0][D3DTSS_COLORARG1] = stages[0][D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
+    stages[1][D3DTSS_COLOROP] = D3DTOP_DISABLE;
+    bd.ByteWidth = sizeof(vertices);
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    REQUIRE(ID3D11Device_CreateBuffer(device, &bd, NULL, &buffer));
+    ID3D11DeviceContext_IASetVertexBuffers(context, 0, 1, &buffer, &stride, &offset);
+    ID3D11DeviceContext_IASetPrimitiveTopology(context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    d3d8_shaders_prepare_draw(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        BYTE *got;
+        vertices[0].rhw = vertices[2].rhw = cases[i].left;
+        vertices[1].rhw = vertices[3].rhw = cases[i].right;
+        ID3D11DeviceContext_UpdateSubresource(context, (ID3D11Resource *)buffer, 0, NULL, vertices, 0, 0);
+        ID3D11DeviceContext_ClearRenderTargetView(context, rtv, clear);
+        ID3D11DeviceContext_Draw(context, 4, 0);
+        ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)readback, (ID3D11Resource *)target);
+        REQUIRE(ID3D11DeviceContext_Map(context, (ID3D11Resource *)readback, 0, D3D11_MAP_READ, 0, &mapped));
+        got = mapped.pData;
+        if (abs(got[0] - cases[i].expected) > 1 || abs(got[1] - cases[i].expected) > 1 ||
+            abs(got[2] - cases[i].expected) > 1 || got[3] != 255) {
+            fprintf(stderr, "FAIL RHW=%g:%g expected=%d RGBA=%u,%u,%u,%u\n",
+                cases[i].left, cases[i].right, cases[i].expected, got[0], got[1], got[2], got[3]);
+            failures++;
+        }
+        ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)readback, 0);
+    }
+    textures[0] = NULL;
+    srv = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(context, 0, 1, &srv);
+    texture->lpVtbl->Release(texture);
+    ID3D11Buffer_Release(buffer);
+    ID3D11SamplerState_Release(sampler);
+    printf("d3d8_rhw: %d failures (4 draws)\n", failures);
+    return failures;
+}
 
 int main(void)
 {
@@ -100,6 +175,7 @@ int main(void)
     ID3D11DeviceContext_RSSetState(context, rasterizer);
     ID3D11DeviceContext_RSSetViewports(context, 1, &viewport);
     ID3D11DeviceContext_OMSetRenderTargets(context, 1, &rtv, NULL);
+    failures += check_rhw(target, readback, rtv);
 
     for (kind = 0; kind < 3; kind++)
     for (stage = 0; stage < 4; stage++) {
@@ -219,6 +295,6 @@ int main(void)
     ID3D11Texture2D_Release(readback);
     ID3D11DeviceContext_Release(context);
     ID3D11Device_Release(device);
-    printf("d3d8_a8: %d failures (336 draws)\n", failures);
+    printf("d3d8_a8: %d failures (336 A8 + 4 RHW draws)\n", failures);
     return failures != 0;
 }
