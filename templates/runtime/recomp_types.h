@@ -60,6 +60,9 @@
  * CMakeLists) -- MSVC's C4013 was emitted and discarded. Same failure as the
  * missing stdlib.h in kernel_bridge.c, in a hotter path. */
 #include <math.h>
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
 #if !defined(_MSC_VER) && !defined(__forceinline)
@@ -909,21 +912,20 @@ extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
 
 static inline RecompMmx MMX_ZERO(void) { RecompMmx r; r.q = 0; return r; }
 
-/* cvtps2pi / cvttps2pi: the low two packed singles of an SSE register or of a
- * 64-bit memory operand become two signed dwords in an MMX register. The
- * rounding form follows the current rounding mode, round-to-nearest everywhere
- * these titles use it; the truncating form is what a C cast already does.
- *
- * An input that is NaN or outside int32 gives the "integer indefinite" value
- * on hardware, where the C cast is undefined -- and a video decoder pushing
- * coefficients through this reaches that edge often enough to matter. */
+/* CVTPS2PI follows MXCSR; CVTTPS2PI truncates regardless of its rounding mode.
+ * Use SSE scalar conversions to avoid touching the host x87/MMX register file.
+ * Non-x86 hosts use their floating-point environment for rounding instead. */
 static inline int32_t MMX_CVT_F2I(float v, int truncate)
 {
-    if (!(v >= -2147483648.0f && v <= 2147483647.0f))
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return truncate ? _mm_cvttss_si32(_mm_set_ss(v))
+                    : _mm_cvtss_si32(_mm_set_ss(v));
+#else
+    double rounded = truncate ? trunc((double)v) : nearbyint((double)v);
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
         return (int32_t)0x80000000u;       /* integer indefinite */
-    if (truncate)
-        return (int32_t)v;
-    return (int32_t)(v < 0.0f ? v - 0.5f : v + 0.5f);
+    return (int32_t)rounded;
+#endif
 }
 
 static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
