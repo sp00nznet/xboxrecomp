@@ -440,3 +440,22 @@ CASES = [
          ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fucompp",
           "fnstsw ax", "and eax, 04500h"], _FP_NAN, "fpu"),
 ]
+
+# MMX arithmetic/conversions preserve EFLAGS. Exercise the deferred condition,
+# not only the MMX result, with both true and false incoming comparisons.
+for _op in (
+        "paddsb mm0, mm1", "paddsw mm0, mm1", "paddusb mm0, mm1",
+        "psubsb mm0, mm1", "psubsw mm0, mm1", "psubusb mm0, mm1",
+        "pavgb mm0, mm1", "pavgw mm0, mm1", "pminsw mm0, mm1",
+        "pmaxsw mm0, mm1", "psadbw mm0, mm1",
+        "cvtps2pi mm0, xmm0", "cvttps2pi mm0, xmm0",
+        "pinsrw mm0, ecx, 0", "pextrw edx, mm0, 0"):
+    for _consumer, _before, _after in (
+            ("sete", ["cmp eax, 0"], ["sete al", "movzx eax, al"]),
+            ("cmove", ["cmp eax, 0"], ["cmove eax, ecx"]),
+            ("sbb", ["neg eax"], ["sbb eax, eax"])):
+        CASES.append(Case(
+            "mmx_flags_" + _op.split()[0] + "_" + _consumer,
+            "MMX preserves the comparison/carry consumed afterward",
+            ["pxor mm0, mm0", "pxor mm1, mm1", "xorps xmm0, xmm0"]
+            + _before + [_op] + _after + ["emms"], [(0, 7), (1, 7)]))
