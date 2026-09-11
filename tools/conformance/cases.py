@@ -416,6 +416,26 @@ CASES = [
     Case("js_cmp_i8", "sign flag after an 8-bit cmp, which truncates first",
          ["cmp al, cl", "sets al", "movzx eax, al"], _PAIRS),
 
+    # Unsigned word saturation must clamp each lane, not wrap or drop the op.
+    *[Case("mmx_" + op + "_" + form + "_" + str(half),
+           "unsigned word arithmetic saturates all four lanes",
+           ["movd mm0, eax", "punpckldq mm0, mm0",
+            "movd mm1, ecx", "punpckldq mm1, mm1"]
+           + ([op + " mm0, mm1"] if form == "reg" else
+              ["sub esp, 8", "movq qword ptr [esp], mm1",
+               op + " mm0, qword ptr [esp]", "add esp, 8"])
+           + (["psrlq mm0, 32"] if half else [])
+           + ["sub esp, 8", "movq qword ptr [esp], mm0",
+              "mov eax, dword ptr [esp]", "add esp, 8", "emms"],
+           [(a, b) for a in (0, 1, 0x0001ffff, 0x80007fff, 0xfffeffff, 0xffffffff)
+                   for b in (0, 1, 0x0001ffff, 0x80007fff, 0xfffeffff, 0xffffffff)])
+      for op in ("paddusw", "psubusw") for form in ("reg", "mem") for half in (0, 1)],
+
+    *[Case("mmx_" + op + "_flags", "unsigned saturated arithmetic preserves EFLAGS",
+           ["pxor mm0, mm0", "pxor mm1, mm1", "cmp eax, 0", op + " mm0, mm1",
+            "sete al", "movzx eax, al", "emms"], [(0, 0), (1, 0)])
+      for op in ("paddusw", "psubusw")],
+
     # bt/btr/bts/btc are 386 instructions, so real Xbox code has them. They
     # were unhandled until the corpus lifted the CRT's float-to-int helper,
     # which uses btr to clear a rounding-control bit of the x87 control word.

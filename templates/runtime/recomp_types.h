@@ -959,6 +959,10 @@ static inline uint8_t recomp_sat_u8(int32_t v) {
     return (uint8_t)(v > 255 ? 255 : (v < 0 ? 0 : v));
 }
 
+static inline uint16_t recomp_sat_u16(int32_t v) {
+    return (uint16_t)(v > 65535 ? 65535 : (v < 0 ? 0 : v));
+}
+
 /* -- integer arithmetic, lane-wise, wrapping -------------------- */
 #define RECOMP_MMX_BINOP(NAME, LANES, FIELD, EXPR)                      \
     static inline RecompMmx NAME(RecompMmx a, RecompMmx b) {            \
@@ -981,6 +985,10 @@ RECOMP_MMX_BINOP(MMX_PADDUSB, 8, ub,
                  recomp_sat_u8((int32_t)a.ub[i] + b.ub[i]))
 RECOMP_MMX_BINOP(MMX_PSUBUSB, 8, ub,
                  recomp_sat_u8((int32_t)a.ub[i] - b.ub[i]))
+RECOMP_MMX_BINOP(MMX_PADDUSW, 4, uw,
+                 recomp_sat_u16((int32_t)a.uw[i] + b.uw[i]))
+RECOMP_MMX_BINOP(MMX_PSUBUSW, 4, uw,
+                 recomp_sat_u16((int32_t)a.uw[i] - b.uw[i]))
 RECOMP_MMX_BINOP(MMX_PMULLW, 4, w, (int16_t)((int32_t)a.w[i] * b.w[i]))
 RECOMP_MMX_BINOP(MMX_PMULHW, 4, w, (int16_t)(((int32_t)a.w[i] * b.w[i]) >> 16))
 RECOMP_MMX_BINOP(MMX_PAVGB, 8, ub, (uint8_t)(((int32_t)a.ub[i] + b.ub[i] + 1) >> 1))
