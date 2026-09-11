@@ -33,6 +33,44 @@ static D3D11_DEPTH_STENCIL_DESC apply(void)
     return desc;
 }
 
+static void check_blend_factors(void)
+{
+    static const struct { DWORD guest; D3D11_BLEND rgb, alpha; } cases[] = {
+        {D3DBLEND_SRCALPHA, D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_SRC_ALPHA},
+        {D3DBLEND_SRCCOLOR, D3D11_BLEND_SRC_COLOR, D3D11_BLEND_SRC_ALPHA},
+        {D3DBLEND_INVSRCCOLOR, D3D11_BLEND_INV_SRC_COLOR, D3D11_BLEND_INV_SRC_ALPHA},
+        {D3DBLEND_DESTCOLOR, D3D11_BLEND_DEST_COLOR, D3D11_BLEND_DEST_ALPHA},
+        {D3DBLEND_INVDESTCOLOR, D3D11_BLEND_INV_DEST_COLOR, D3D11_BLEND_INV_DEST_ALPHA},
+        {D3DBLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_ONE},
+        {D3DBLEND_ZERO, D3D11_BLEND_ZERO, D3D11_BLEND_ZERO}
+    };
+    unsigned side, i;
+    rs[D3DRS_ALPHABLENDENABLE] = TRUE;
+    for (side = 0; side < 2; side++) {
+        for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            ID3D11BlendState *state = NULL;
+            D3D11_BLEND_DESC desc;
+            rs[D3DRS_SRCBLEND] = side ? D3DBLEND_ONE : cases[i].guest;
+            rs[D3DRS_DESTBLEND] = side ? cases[i].guest : D3DBLEND_ZERO;
+            d3d8_states_apply();
+            ID3D11DeviceContext_OMGetBlendState(context, &state, NULL, NULL);
+            CHECK("blend state bound", state != NULL);
+            if (!state) continue;
+            ID3D11BlendState_GetDesc(state, &desc);
+            /* A failed creation can leave the previous state bound. */
+            if (!desc.RenderTarget[0].BlendEnable ||
+                desc.RenderTarget[0].SrcBlend != (side ? D3D11_BLEND_ONE : cases[i].rgb) ||
+                desc.RenderTarget[0].DestBlend != (side ? cases[i].rgb : D3D11_BLEND_ZERO) ||
+                desc.RenderTarget[0].SrcBlendAlpha != (side ? D3D11_BLEND_ONE : cases[i].alpha) ||
+                desc.RenderTarget[0].DestBlendAlpha != (side ? cases[i].alpha : D3D11_BLEND_ZERO)) {
+                printf("FAIL: blend side=%u factor=%lu\n", side, cases[i].guest);
+                failures++;
+            }
+            ID3D11BlendState_Release(state);
+        }
+    }
+}
+
 int main(void)
 {
     D3D11_DEPTH_STENCIL_DESC desc;
@@ -111,6 +149,7 @@ int main(void)
     d3d8_states_init();
     desc = apply();
     CHECK("cache recreates after shutdown", desc.StencilWriteMask == 0x5A);
+    check_blend_factors();
     d3d8_states_shutdown();
     ID3D11DeviceContext_ClearState(context);
     ID3D11DeviceContext_Release(context);
