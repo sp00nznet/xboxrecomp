@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Merge Ghidra-exported names into a clean {address: name} map for the recompiler.
+Merge exported names into a clean {address: name} map for the recompiler.
 
-Reads the JSONs produced by ExportXbeNames.py:
-  tools/ghidra_naming/export/functions.json
-  tools/ghidra_naming/export/symbols.json
+Reads the JSONs produced by Ghidra's ExportXbeNames.py, or by IDA's
+tools/ida_naming/export_xbe_names.py, which writes the same two files:
+  <export-dir>/functions.json
+  <export-dir>/symbols.json
 
 Produces:
   tools/ghidra_naming/ghidra_names.json   -> { "0x00352560": "name", ... }
 
-Only MEANINGFUL names are kept. Ghidra auto-generated placeholders are excluded:
+Only MEANINGFUL names are kept. Auto-generated placeholders are excluded:
   FUN_*, LAB_*, DAT_*, SUB_*, UNK_*, EXT_*, OFF_*, thunk_FUN_*, switchD_*,
   caseD_*, j_* (jump thunks), and entirely-numeric / empty names.
 Each kept name is sanitized to a valid C identifier (alnum + underscore, no
@@ -64,6 +65,12 @@ PLACEHOLDER_PREFIXES = (
     "FID_",          # FunctionID conflict / hash marker
     "BYTE_", "WORD_", "DWORD_", "QWORD_", "UINT_", "INT_",
     "FLOAT_", "DOUBLE_", "BOOL_", "CHAR_", "UNICODE_",
+    # IDA's own, for tools/ida_naming/export_xbe_names.py. Its autonames do
+    # not all overlap Ghidra's: loc_ is IDA's LAB_, and jpt_/algn_/asc_/stru_
+    # have no Ghidra equivalent at all. Without these an IDA export merges
+    # thousands of loc_1A2B3C-shaped non-names into the recompiler.
+    "LOC_", "NULLSUB_", "JPT_", "ALGN_", "ASC_", "STRU_",
+    "XMMWORD_", "YMMWORD_", "TBYTE_", "FLT_", "DBL_", "PACKREAL_",
 )
 # Exact placeholder names (no address suffix) that must be dropped.
 PLACEHOLDER_EXACT = {
@@ -260,9 +267,12 @@ def build_map(export_dir):
     if funcs:
         for f in funcs:
             addr = norm_addr(f.get("address"))
+            # IDA's exporter sets `source` to IMPORTED for a FLIRT-identified
+            # library function, which is the same claim Ghidra's FidDb makes
+            # through the symbol table. Ghidra's function export has no such
+            # field, so it keeps the old behaviour.
             consider(addr, f.get("name"), "Function",
-                     f.get("namespace", ""), "ANALYSIS"
-                     if not f.get("is_thunk") else "ANALYSIS")
+                     f.get("namespace", ""), f.get("source") or "ANALYSIS")
 
     # Then symbols (covers labels promoted to data/functions, RTTI, demangled).
     if syms:

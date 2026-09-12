@@ -269,7 +269,8 @@ xboxrecomp/
 │   ├── abi_analysis/            # Calling convention / param recovery
 │   ├── recomp/                  # x86 -> C static recompiler
 │   ├── debug_symbols/           # Debug-build symbol recovery
-│   ├── symbols/ ghidra_naming/  # Optional symbol-name recovery
+│   ├── symbols/ ghidra_naming/  # Optional symbol-name recovery (Ghidra)
+│   ├── ida_naming/              # ... or the same thing through IDA
 │   ├── xiso/ xmv/               # Disc image and video container tools
 │   └── fusion/                  # MS Ficl/Fission study tooling
 ├── src/                         # Runtime libraries (C, link-time)
@@ -404,7 +405,7 @@ capstone        # x86 disassembly  (pip install capstone)
 pytest          # test suite only  (pip install pytest)
 ```
 
-That's it for the core pipeline — no IDA, no Ghidra, no proprietary tools. Just the standard library + Capstone. (An *optional* `tools/ghidra_naming` helper can use headless Ghidra purely to recover symbol names; it is never required to produce a working build.)
+That's it for the core pipeline — no IDA, no Ghidra, no proprietary tools. Just the standard library + Capstone. (Optional `tools/ghidra_naming` and `tools/ida_naming` helpers use headless Ghidra or IDA purely to recover symbol names; neither is ever required to produce a working build.)
 
 ### Running the tests
 
