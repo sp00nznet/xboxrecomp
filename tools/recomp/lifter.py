@@ -395,6 +395,7 @@ _EFLAGS_PRESERVE = frozenset({
     "punpckhbw", "punpckhwd", "punpckhdq", "punpckhqdq",
     "packsswb", "packssdw", "packuswb",
     "pmovmskb",
+    "paddusw", "psubusw",
     # String operations (without rep prefix)
     "stosb", "stosw", "stosd",
     "movsb", "movsw", "movsd",
@@ -2326,6 +2327,7 @@ class Lifter:
         "paddsb": "MMX_PADDSB", "paddsw": "MMX_PADDSW",
         "psubsb": "MMX_PSUBSB", "psubsw": "MMX_PSUBSW",
         "paddusb": "MMX_PADDUSB", "psubusb": "MMX_PSUBUSB",
+        "paddusw": "MMX_PADDUSW", "psubusw": "MMX_PSUBUSW",
         "pmullw": "MMX_PMULLW", "pmulhw": "MMX_PMULHW",
         "pmaddwd": "MMX_PMADDWD",
         "pavgb": "MMX_PAVGB", "pavgw": "MMX_PAVGW",
