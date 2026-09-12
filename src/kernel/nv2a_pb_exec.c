@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
+#include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
@@ -863,24 +864,42 @@ static void dump_texture_bmp(uint32_t seq)
     fflush(stderr);
 }
 
+/* The surface, resolved once per batch.
+ *
+ * dma_resolve consults the contiguous arena's high-water mark and
+ * surface_hits_image walks the image range; both were being done per pixel
+ * -- dma_resolve twice -- which cost more than the rasterisation they
+ * guarded. Neither answer can change inside a batch, because the colour
+ * offset arrives as a method and a method cannot arrive mid-triangle.
+ *
+ * This is not a micro-optimisation for its own sake: the loader's video
+ * paces on frames actually presented, so the rasteriser's throughput is the
+ * playback rate. */
+static uint8_t *s_surface;          /* host address of surface row 0 */
+
+static int surface_begin_batch(const uint8_t *mem)
+{
+    uint32_t base = dma_resolve(s_gpu.color_offset);
+
+    if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
+        return 0;
+    s_surface = (uint8_t *)mem + base;
+    return 1;
+}
+
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
     uint8_t *row;
 
+    (void)mem;
     if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
         return;
     if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
         return;
-    /* Same reason the clear checks: a rasterised triangle writes guest memory
-     * too, and a surface address that lands on the image is no safer one pixel
-     * at a time than 4.9 MB at once. */
-    if (surface_hits_image(dma_resolve(s_gpu.color_offset),
-                           (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
-        return;
     s_gpu.pixels++;
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
-    row = mem + dma_resolve(s_gpu.color_offset) + (size_t)y * s_gpu.pitch;
+    row = s_surface + (size_t)y * s_gpu.pitch;
     if (bpp == 4) {
         ((uint32_t *)row)[x] = argb;
     } else if (bpp == 2) {
@@ -909,6 +928,12 @@ static void raster_triangle(const float a[2], const float b[2],
     area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
     if (area == 0.0f)
         return;                            /* degenerate */
+
+    /* Where this batch writes. The same check the per-pixel path made, made
+     * once: a surface address landing on the title's own image is no safer
+     * one pixel at a time than 4.9 MB at once. */
+    if (!surface_begin_batch(mem))
+        return;
 
     minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
     maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
@@ -1633,6 +1658,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now. */
         s_gpu.flip_read = s_gpu.flip_write;
+        /* And this is a completed swap, which is what a title's own swap
+         * counter counts -- see xbox_Nv2aFrameCounterFlip. */
+        xbox_Nv2aFrameCounterFlip();
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
             if (n++ < 8) {

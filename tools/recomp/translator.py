@@ -26,6 +26,27 @@ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers)
 
 
+def write_if_changed(path, text):
+    """Write text to path only when it differs from what is already there.
+
+    Every regen rewrites all 54 chunks of generated C. If the bytes are
+    identical the mtime bump still forces the compiler to redo the whole
+    365 MB at /O2, which is minutes of a saturated box for a one-function
+    change. Comparing first makes an unchanged chunk free.
+
+    Returns True if the file was written.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return True
+
+
 def _fixup_icall_esp_save(lines):
     """
     Post-process generated C lines to insert _icall_esp save points.
@@ -1429,8 +1450,7 @@ class BatchTranslator:
 
         header_lines.extend(["", "#endif /* RECOMP_FUNCS_H */", ""])
 
-        with open(header_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(header_lines))
+        write_if_changed(header_path, "\n".join(header_lines))
 
         # recomp_types.h goes with it.
         #
@@ -1520,8 +1540,7 @@ class BatchTranslator:
             for addr, name, code in chunk:
                 c_lines.append(code)
 
-            with open(c_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(c_lines))
+            write_if_changed(c_path, "\n".join(c_lines))
             generated_files.append(c_path)
 
             if verbose:
@@ -1569,8 +1588,7 @@ class BatchTranslator:
                 )
             stub_lines.append("")
 
-            with open(stub_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(stub_lines))
+            write_if_changed(stub_path, "\n".join(stub_lines))
             generated_files.append(stub_path)
 
             if verbose:
@@ -1736,5 +1754,4 @@ class BatchTranslator:
             "",
         ])
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        write_if_changed(output_path, "\n".join(lines))

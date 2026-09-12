@@ -174,6 +174,10 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
                            uint32_t src_off, uint32_t dst_off);
 
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
+/* Advance those counters now, because a swap really completed. Called by the
+ * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
+ * stands down, so the count follows what was actually drawn. */
+void xbox_Nv2aFrameCounterFlip(void);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);

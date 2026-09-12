@@ -413,6 +413,40 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
     return 0;
 }
 
+/* A real swap happened: advance every registered counter, and remember when.
+ *
+ * The timer below exists for a title nothing presents for. Once the
+ * pushbuffer executor is actually running flips, the timer is the wrong
+ * clock and an actively harmful one: Half-Life 2's loader paces its intro on
+ * this count, so a 62 Hz timer against an executor managing a fraction of a
+ * frame per second ran the video forward in virtual time far faster than it
+ * could be drawn. Only every few hundredth frame was ever presented, each one
+ * sampled part way through its own decode -- which looks exactly like a
+ * stalling, blocky video rather than a clock running away.
+ */
+static DWORD g_frame_counter_flip_ms;
+
+void xbox_Nv2aFrameCounterFlip(void)
+{
+    int i;
+
+    g_frame_counter_flip_ms = GetTickCount();
+    if (!g_frame_counter_flip_ms)
+        g_frame_counter_flip_ms = 1;          /* 0 means "never" */
+    for (i = 0; i < g_frame_counter_count; i++) {
+        uint32_t dev;
+
+        if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
+                                     + g_memory_offset);
+        if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
+            continue;
+        *(volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
+                               + g_memory_offset) += 1;
+    }
+}
+
 static void frame_counters_tick(void)
 {
     DWORD now = GetTickCount();
@@ -423,6 +457,13 @@ static void frame_counters_tick(void)
     if (g_frame_counter_last_ms
             && (now - g_frame_counter_last_ms) < XBOX_FRAME_PERIOD_MS)
         return;
+    /* Something is presenting: let it drive the count instead. Two seconds,
+     * because the executor's flips are not evenly spaced and a title that
+     * genuinely stops presenting still has to be got moving again. */
+    if (g_frame_counter_flip_ms && (now - g_frame_counter_flip_ms) < 2000) {
+        g_frame_counter_last_ms = now;
+        return;
+    }
     g_frame_counter_last_ms = now;
 
     for (i = 0; i < g_frame_counter_count; i++) {
