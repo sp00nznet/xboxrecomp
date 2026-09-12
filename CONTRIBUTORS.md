@@ -145,6 +145,41 @@ helpers the lift emits — was not in the PRs and was added on integration.)*
   that thread, without uninitialising on `RPC_E_CHANGED_MODE`, and makes repeat
   initialisation idempotent and repeat shutdown safe after a partial one.
 
+*MMX, blending and pretransformed vertices (#33, #34, #35, #36, #37)*
+- **Fifteen MMX forms lost the comparison before them (#34)** — they were
+  implemented, but missing from `_EFLAGS_PRESERVE`, so the lifter dropped the
+  live comparison and fell back to recomputing `_flags`. `cmp eax, 0; pavgb
+  mm0, mm1; sete al` returns 1 on the CPU and returned 0 lifted. The set was
+  simply incomplete: signed and unsigned byte saturation, signed word
+  saturation, the averages, min/max, sum of absolute differences,
+  `CVTPS2PI`/`CVTTPS2PI`, `PINSRW` and `PEXTRW`. No implementation changed.
+- **`PADDUSW` and `PSUBUSW` were never lifted (#33)** — they became TODO
+  comments while the `MOVQ` loads and stores around them still executed, so the
+  store published the unchanged value rather than the saturated one. That is
+  the quiet failure mode: no lifter error, no warning, just the wrong number.
+- **Float-to-MMX conversion ignored the rounding mode (#35)** — `MMX_CVT_F2I`
+  added or subtracted 0.5 and cast, which rounds halfway away from zero
+  regardless of MXCSR; 2.5 became 3 under round-to-nearest, and downward,
+  upward and toward-zero were all wrong. Its range guard compared against a
+  *float* literal for `INT32_MAX`, which rounds up to 2147483648 and admits an
+  out-of-range cast. Uses the SSE scalar conversions on x86, which do exactly
+  the right thing and leave the host x87/MMX register file alone, with a
+  double-precision `nearbyint`/`trunc` fallback elsewhere.
+- **Colour blend factors were copied into the alpha fields (#36)** —
+  `update_blend_state` put `SrcBlend`/`DestBlend` straight into
+  `SrcBlendAlpha`/`DestBlendAlpha`, and D3D11 rejects colour factors there. So
+  a guest `SRCCOLOR`, `INVSRCCOLOR`, `DESTCOLOR` or `INVDESTCOLOR` made
+  `CreateBlendState` fail with `E_INVALIDARG` and left the *previous* blend
+  state bound — a wrong blend rather than a missing one, which is much harder
+  to see. The regression reads back the bound descriptor for exactly that
+  reason: a stale non-null state cannot produce a false pass.
+- **`D3DFVF_XYZRHW` threw RHW away (#37)** — the fixed-function vertex shader
+  accepted pretransformed input and emitted clip W = 1, so screen-space
+  geometry still landed in the right place while its texture coordinates were
+  interpolated affinely. Not a misplaced quad; a subtly wrong texture on a
+  correctly placed one. Dividing the reconstructed clip position by RHW
+  restores clip W = 1/RHW and leaves post-divide screen XYZ untouched.
+
 *Also raised: stored code pointers (#13).* The gap is real and was found
 independently while bringing up Half-Life 2 -- functions reachable only as an
 address in a table have no call site, no prologue and no padding boundary, so
@@ -186,6 +221,29 @@ direction.
   ordinals routed. It also closed every ordinal Half-Life 2 was hitting
   unbridged at runtime — `AvGetSavedDataAddress`, `HalReadWritePCISpace`,
   `MmFreeSystemMemory` and `ObfDereferenceObject` — which now log none.
+- **Routed all 371 kernel ordinals (#32)** — the remaining ~136 unrouted
+  exports used to fall through to a silent return-0, which is the worst kind of
+  stub: the title carries on with a plausible answer it never asked for. Real
+  implementations where the Win32 mapping is clear, documented stubs where it
+  is not, across Dbg, Ex, ExfInterlocked, Fsc, Hal, Interlocked, Io, Kd, Ke,
+  Mm, Nt, Ob, Ps, Rtl and the port-I/O ordinals, plus data-export bridges at
+  guarded KDATA offsets. The structural piece is a guest-VA to host-HANDLE
+  shadow table: a `KEVENT`/`KSEMAPHORE`/`KMUTANT` created through
+  `KeInitializeEvent` lives in *guest memory* and is not a handle, and
+  `KeSetEvent` and the `KeWaitFor*` pair had been treating the VA as one.
+  Also found the audit itself broken and passing — `test_bridge_ordinals.py`
+  anchored its regexes on the *name* `stdcall_args_for_ordinal`, the bridge
+  file gained a comment mentioning it, the comment matched first, and the whole
+  check was silently skipped.
+- **Two generator bugs that stop the build (#28)** — `cmovcc` reads CF exactly
+  as a `jcc` does, but `_function_needs_cf` scanned only `jcc` and `setcc`, so
+  a `cmovb` after an `add` generated `if (_cf)` with `_cf` never declared. And
+  a guest function whose recovered name is a reserved C identifier or a Win32
+  export collides at compile or link time: Black has a function literally named
+  `onexit`, which is C2373 against UCRT's, and Nightfire re-exports shims named
+  exactly like the APIs they wrap, which is LNK2005 against `kernel32.lib`.
+  Both now take the same `_<addr>` suffix `func_id` already gives duplicate
+  names, applied everywhere a name becomes a C token.
 - The same PR **took Burnout 3 out of the tooling** — hardcoded title strings
   in the parser, disassembler, func_id and translator replaced with a shared
   config, and the Linux default paths made generic.
@@ -208,6 +266,19 @@ direction.
   `VM_FLAGS_FIXED` as the way through. Also replaced `wcslen` with the
   project's own `xbox_wcslen`, which is the one functional change: the CRT's
   operates on 32-bit `wchar_t` and the Xbox `WCHAR` is 16-bit.
+- **Restored the POSIX build (#27)** — broken four ways by recent changes.
+  ISO C99 dropped implicit declarations, so the missing includes were errors
+  rather than warnings; `strtok_s` is MSVC's spelling and POSIX has
+  `strtok_r`; `GetFileSizeEx` and the Slim reader/writer locks had no POSIX
+  implementation at all. The SRWLOCK note is the good part: an `SRWLOCK` is
+  usable straight from `SRWLOCK_INIT` and is by definition taken from several
+  threads with nothing else held, so unlike the condition variables — whose
+  lazy init is covered by the caller holding the paired critical section — its
+  first use genuinely races, and it is serialised accordingly with a plain
+  atomic load on the fast path. Also spotted that the FATX geometry constants
+  were defined inside the `_WIN32` half and referenced from the POSIX half, and
+  hoisted them above the backend split rather than duplicating the 0x4000 that
+  Half-Life 2's CRT init requires.
 - **Scoped the macOS port (#19)** — an accurate, specific list of what stands
   in the way (`MAP_FIXED_NOREPLACE`, `memfd_create`, `GlobalMemoryStatusEx`,
   SDL2/epoxy) rather than a request, which is the useful kind of issue.

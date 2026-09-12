@@ -22,7 +22,7 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 ### Recent Changes
 
-**Current version: v0.8.0 — _"Snapshot"_ (September 2026).**
+**Current version: v0.9.0 — _"Quietly Wrong"_ (September 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
@@ -497,6 +497,98 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.9.0 — *"Quietly Wrong"* (September 2026)
+
+*A release of contributed fixes, and nearly all of them share a shape: the code
+ran, returned, and was wrong, with no error anywhere. A stub that answers 0. A
+flag that was dropped instead of preserved. A value rounded the wrong way. A
+blend state that failed to create and left the previous one bound. None of them
+look like a bug from where you find them.*
+
+**Every kernel ordinal is routed.** All 371 Xbox kernel exports — 347 function
+ordinals plus 24 data exports — now have either a real bridge, a documented
+stub, or a data entry. The ~136 that were unrouted fell through to a silent
+return-0, which is worse than a crash: the title carries on with a plausible
+answer it never asked for. The structural piece is a guest-VA to host-HANDLE
+shadow table — a `KEVENT`/`KSEMAPHORE`/`KMUTANT` created through
+`KeInitializeEvent` lives in *guest memory* and is not a handle, and
+`KeSetEvent` and the `KeWaitFor*` pair had been treating the VA as one. The
+audit that was supposed to catch all this was itself broken and passing: its
+regexes anchored on a function's *name*, the file gained a comment mentioning
+that name, the comment matched first, and the check was skipped entirely —
+*[@DarthSidious666](https://github.com/DarthSidious666)* (#32)
+
+**Two generator bugs that stop the build.** `cmovcc` reads CF exactly as a
+`jcc` does, but the carry-declaration scan looked only at `jcc` and `setcc`, so
+a `cmovb` after an `add` emitted `if (_cf)` with `_cf` never declared. And a
+guest function whose recovered name is a reserved C identifier or a Win32
+export collides at compile or link time — Black has a function literally named
+`onexit` (C2373 against UCRT's), Nightfire re-exports shims named exactly like
+the APIs they wrap (LNK2005 against `kernel32.lib`). Both take the `_<addr>`
+suffix `func_id` already gives duplicate names —
+*[@DarthSidious666](https://github.com/DarthSidious666)* (#28)
+
+**MMX was losing comparisons and rounding by hand.**
+
+- **Fifteen implemented MMX forms were missing from the EFLAGS-preserve set**,
+  so the lifter dropped the live comparison before them and recomputed. `cmp
+  eax, 0; pavgb mm0, mm1; sete al` returns 1 on the CPU and returned 0 lifted —
+  *[@NoRain211](https://github.com/NoRain211)* (#34)
+- **`PADDUSW`/`PSUBUSW` became TODO comments** while the `MOVQ` loads and
+  stores around them still ran, so a store published the unchanged value —
+  *[@NoRain211](https://github.com/NoRain211)* (#33)
+- **Float-to-MMX conversion added 0.5 and cast**, rounding halfway away from
+  zero regardless of MXCSR, and range-checked against a *float* `INT32_MAX`
+  that rounds up to 2147483648 and admits an out-of-range cast. Uses the SSE
+  scalar conversions on x86 now — *[@NoRain211](https://github.com/NoRain211)*
+  (#35)
+
+**Two D3D8 states that were wrong in the invisible direction.**
+
+- **Colour blend factors were copied into the alpha fields**, which D3D11
+  rejects, so a guest `SRCCOLOR` or `DESTCOLOR` failed `CreateBlendState` with
+  `E_INVALIDARG` and left the *previous* state bound — a wrong blend rather
+  than a missing one — *[@NoRain211](https://github.com/NoRain211)* (#36)
+- **`D3DFVF_XYZRHW` threw RHW away** and emitted clip W = 1, so pretransformed
+  geometry landed in the right place with its texture coordinates interpolated
+  affinely across it — *[@NoRain211](https://github.com/NoRain211)* (#37)
+
+**The POSIX build works again.** Missing includes that C99 turned from warnings
+into errors, `strtok_s` where POSIX wants `strtok_r`, and no implementation at
+all for `GetFileSizeEx` or the Slim reader/writer locks. An `SRWLOCK` is usable
+straight from `SRWLOCK_INIT` and is by definition taken from several threads
+with nothing else held, so unlike the condition variables its first use
+genuinely races, and it is serialised accordingly. Also caught the FATX
+geometry constants being defined inside the `_WIN32` half and referenced from
+the POSIX half — *[@dplewis](https://github.com/dplewis)* (#27)
+
+**A real flip drives the frame counter.** `FLIP_STALL` now advances every
+registered swap counter, and while those arrive the 62 Hz fallback timer stands
+down. That timer exists for a title nothing presents for; once the pushbuffer
+executor is actually running flips it is the wrong clock and an actively
+harmful one. Half-Life 2's loader paces its intro video on this count, so a
+62 Hz timer against an executor managing a fraction of a frame per second ran
+the video forward in virtual time far faster than it could be drawn — which
+looks exactly like a stalling, blocky video rather than a clock running away.
+The rasteriser's per-pixel surface check moved to once per batch alongside it:
+`dma_resolve` walked the arena high-water mark twice per pixel to guard a
+rasterisation cheaper than the guard, and neither answer can change mid-batch.
+
+**An IDA path for name recovery**, alongside the Ghidra one. Not a port of
+pcrecomp's four IDA scripts — one exporter that writes the same
+`functions.json`/`symbols.json` `merge_names.py` already reads, so the merge,
+the placeholder filter, the sanitising and `--apply` stay where they are.
+IDA's FLIRT and Ghidra's FidDb are the same idea with different coverage and
+neither is a superset, so running both and taking the union names more than
+either alone. `merge_names` learned IDA's autonames while it was there — `loc_`
+is IDA's `LAB_`, and `jpt_`/`algn_`/`asc_`/`stru_` have no Ghidra equivalent,
+so without them an IDA export merges thousands of addresses-in-disguise into
+the recompiler.
+
+**Also.** `write_if_changed` in the translator — a regen rewrites all 54 chunks
+of generated C, and an mtime bump on identical bytes costs a full `/O2` rebuild
+of 365 MB for nothing.
 
 ### v0.8.0 — *"Snapshot"* (September 2026)
 
