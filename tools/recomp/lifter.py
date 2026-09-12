@@ -380,9 +380,12 @@ _EFLAGS_PRESERVE = frozenset({
     "addpd", "subpd", "mulpd", "divpd",
     # SSE/MMX integer
     "movd", "movq", "movntq",
+    "cvtps2pi", "cvttps2pi", "pinsrw", "pextrw",
     "emms",
     "paddb", "paddw", "paddd", "paddq",
     "psubb", "psubw", "psubd",
+    "paddsb", "paddsw", "paddusb", "psubsb", "psubsw", "psubusb",
+    "pavgb", "pavgw", "pminsw", "pmaxsw", "psadbw",
     "pmullw", "pmulhw", "pmulhuw", "pmaddwd",
     "pand", "pandn", "por", "pxor",
     "pcmpeqb", "pcmpeqw", "pcmpeqd",
