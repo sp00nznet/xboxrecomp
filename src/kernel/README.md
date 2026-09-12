@@ -1,6 +1,8 @@
 # xbox_kernel — Xbox Kernel Replacement Layer
 
-Replaces 147 Xbox kernel imports with Win32 equivalents. This is the foundation layer that every recompiled game needs — it provides memory layout, file I/O, threading, synchronization, and hardware abstraction.
+Replaces all 371 Xbox kernel exports (347 function ordinals + 24 data exports) with Win32 equivalents. This is the foundation layer that every recompiled game needs — it provides memory layout, file I/O, threading, synchronization, and hardware abstraction.
+
+All 371 ordinals are routed: every export now has either a per-ordinal `bridge_*` wrapper (real implementation or a documented stub) or a kernel data export entry. Verified by `tools/kernel_audit/test_bridge_ordinals.py`, which cross-checks routing, argument sizes, and data exports against the reference export table.
 
 ## Files
 
@@ -9,7 +11,7 @@ Replaces 147 Xbox kernel imports with Win32 equivalents. This is the foundation 
 | `kernel.h` | 829 | Master public header — all types, constants, and function prototypes |
 | `xbox_memory_layout.h` | 204 | Memory layout constants and API |
 | `xbox_memory_layout.c` | 534 | Memory mapping (CreateFileMapping + 28 mirror views) |
-| `kernel_bridge.c` | 1,973 | Core dispatcher — thunk table, ICALL resolution, kernel data exports |
+| `kernel_bridge.c` | 8,390 | Core dispatcher — thunk table, ICALL resolution, all 371 per-ordinal bridges, kernel data exports |
 | `kernel_file.c` | 834 | File I/O — NtCreateFile, NtReadFile, path translation |
 | `kernel_thread.c` | 344 | Threading — PsCreateSystemThreadEx, thread priorities |
 | `kernel_sync.c` | 547 | Synchronization — events, semaphores, mutexes, critical sections |
