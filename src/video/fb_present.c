@@ -14,12 +14,13 @@
  *
  * Off unless RECOMP_FB_WINDOW is set.
  */
+#include <stdint.h>
+
 #if defined(_WIN32)
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 

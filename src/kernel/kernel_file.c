@@ -38,6 +38,20 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     return ObjectAttributes->ObjectName->Buffer;
 }
 
+/* Xbox volume geometry.
+ *
+ * FATX uses 16 KB clusters: 512-byte sectors, 32 sectors per cluster. That is
+ * not cosmetic. A title's CRT startup asks for FileFsSizeInformation and
+ * multiplies SectorsPerAllocationUnit by BytesPerSector, then *requires* the
+ * product to equal the cluster size it was built for. Half-Life 2 checks for
+ * 0x4000 and returns STATUS_DEVICE_NOT_READY (0xC000014F) otherwise, which
+ * aborts CRT init before main ever runs -- the process then exits cleanly,
+ * which reads as a title that did nothing rather than one that failed.
+ *
+ * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
+#define XBOX_BYTES_PER_SECTOR       512u
+#define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
+
 /* ======================================================================== */
 #if defined(_WIN32)
 /* ====================  Win32 backend  =================================== */
@@ -469,20 +483,6 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             return STATUS_NOT_IMPLEMENTED;
     }
 }
-
-/* Xbox volume geometry.
- *
- * FATX uses 16 KB clusters: 512-byte sectors, 32 sectors per cluster. That is
- * not cosmetic. A title's CRT startup asks for FileFsSizeInformation and
- * multiplies SectorsPerAllocationUnit by BytesPerSector, then *requires* the
- * product to equal the cluster size it was built for. Half-Life 2 checks for
- * 0x4000 and returns STATUS_DEVICE_NOT_READY (0xC000014F) otherwise, which
- * aborts CRT init before main ever runs -- the process then exits cleanly,
- * which reads as a title that did nothing rather than one that failed.
- *
- * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
-#define XBOX_BYTES_PER_SECTOR       512u
-#define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,

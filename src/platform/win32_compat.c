@@ -120,6 +120,71 @@ VOID DeleteCriticalSection(LPCRITICAL_SECTION cs)
 }
 
 /* ===================================================================== */
+/* Slim reader/writer locks                                              */
+/* ===================================================================== */
+
+/* An SRWLOCK is usable straight from SRWLOCK_INIT, so the pthread_rwlock_t
+ * behind it has to appear on first use. Unlike the condition variables below
+ * -- whose lazy init is covered by the caller holding the paired CRITICAL
+ * SECTION -- an SRWLOCK is by definition taken from several threads at once
+ * with nothing else held, so first use genuinely races. Serialise just that:
+ * once Ptr is published, every acquire is a plain atomic load. */
+static pthread_rwlock_t *srw_lazy_init(PSRWLOCK lock)
+{
+    pthread_rwlock_t *rw = __atomic_load_n((pthread_rwlock_t **)&lock->Ptr,
+                                           __ATOMIC_ACQUIRE);
+    if (!rw) {
+        static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&init_lock);
+        rw = (pthread_rwlock_t *)lock->Ptr;
+        if (!rw) {
+            rw = (pthread_rwlock_t *)malloc(sizeof(*rw));
+            pthread_rwlock_init(rw, NULL);
+            __atomic_store_n((pthread_rwlock_t **)&lock->Ptr, rw, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&init_lock);
+    }
+    return rw;
+}
+
+VOID InitializeSRWLock(PSRWLOCK lock)
+{
+    lock->Ptr = NULL;
+    srw_lazy_init(lock);
+}
+
+VOID AcquireSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_rdlock(srw_lazy_init(lock)); }
+VOID ReleaseSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_unlock(srw_lazy_init(lock)); }
+VOID AcquireSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_wrlock(srw_lazy_init(lock)); }
+VOID ReleaseSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_unlock(srw_lazy_init(lock)); }
+
+/* ===================================================================== */
+/* One-time initialisation                                               */
+/* ===================================================================== */
+
+/* Win32 semantics: the callback runs at most once for a given INIT_ONCE, and
+ * a callback returning FALSE leaves it un-run so a later call retries. Ptr
+ * doubles as the "done" flag. One global mutex covers every INIT_ONCE --
+ * initialisation is rare, and the fast path never touches it. */
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *context)
+{
+    static pthread_mutex_t once_lock = PTHREAD_MUTEX_INITIALIZER;
+
+    if (__atomic_load_n(&once->Ptr, __ATOMIC_ACQUIRE))
+        return TRUE;
+
+    pthread_mutex_lock(&once_lock);
+    BOOL ok = TRUE;
+    if (!once->Ptr) {
+        ok = fn(once, param, context);
+        if (ok)
+            __atomic_store_n(&once->Ptr, (PVOID)1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&once_lock);
+    return ok;
+}
+
+/* ===================================================================== */
 /* Condition variables (paired with a CRITICAL_SECTION)                  */
 /* ===================================================================== */
 
@@ -1137,6 +1202,16 @@ DWORD GetFileSize(HANDLE h, LPDWORD high)
     if (fstat(fd, &st) != 0) return INVALID_FILE_SIZE;
     if (high) *high = (DWORD)(((uint64_t)st.st_size >> 32) & 0xFFFFFFFFu);
     return (DWORD)(st.st_size & 0xFFFFFFFFu);
+}
+
+BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
+{
+    int fd = w32_handle_fd(h);
+    if (fd < 0 || !size) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
+    size->QuadPart = (LONGLONG)st.st_size;
+    return TRUE;
 }
 
 BOOL FlushFileBuffers(HANDLE h)

@@ -15,8 +15,12 @@
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+#if !defined(_WIN32)
+#include <unistd.h>   /* _exit */
+#endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
