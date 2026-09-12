@@ -244,6 +244,13 @@ direction.
   exactly like the APIs they wrap, which is LNK2005 against `kernel32.lib`.
   Both now take the same `_<addr>` suffix `func_id` already gives duplicate
   names, applied everywhere a name becomes a C token.
+- **Reported that the Ghidra pipeline had a version pinned into it (#26)** —
+  the runner defaulted to a versioned install path, which dates the script the
+  first time anyone updates Ghidra, and they were ten revisions ahead of the
+  pin. It takes the newest `ghidra_*_PUBLIC` under `GHIDRA_ROOT` now, and
+  accepts `GHIDRA_ROOT` itself being an install for anyone who keeps it
+  unversioned. Also confirmed [XboxDev/ghidra-xbe](https://github.com/XboxDev/ghidra-xbe)
+  works on current Ghidra despite its version-mismatch warning, and built one.
 - The same PR **took Burnout 3 out of the tooling** — hardcoded title strings
   in the parser, disassembler, func_id and translator replaced with a shared
   config, and the Linux default paths made generic.
