@@ -156,8 +156,10 @@ static const char g_vs_source[] =
     "        o.pos.y = 1.0 - (input.pos.y / ScreenSize.y) * 2.0;\n"
     "        o.pos.z = input.pos.z;\n"
     "        o.pos.w = 1.0;\n"
-    /* Recover clip W for perspective interpolation without changing screen XYZ. */
-    "        o.pos /= input.pos.w;\n"
+    /* Recover clip W for perspective interpolation without changing screen XYZ.
+     * RHW = 0 is degenerate and titles do emit it for 2D overlays that do not
+     * care; dividing by it culls the whole quad, so leave those alone. */
+    "        if (input.pos.w != 0.0) o.pos /= input.pos.w;\n"
     "        o.tex0 = input.tex0.xyz;\n"
     "        o.tex1 = input.tex1.xyz;\n"
     "        o.tex2 = input.tex2.xyz;\n"

@@ -1911,6 +1911,8 @@ static void bridge_KeInsertQueueDpc(void)
  * Returns what the routine returned -- an ISR that does not recognise the
  * interrupt returns FALSE, and that is worth seeing rather than assuming.
  */
+uint32_t xbox_GetConnectedInterrupt(uint32_t vector);   /* defined below */
+
 static int kernel_raise_interrupt(uint32_t vector)
 {
     uint32_t kint = xbox_GetConnectedInterrupt(vector);
@@ -2155,7 +2157,7 @@ static void bridge_HalRegisterShutdownNotification(void)
  * Win32 event in the shadow table (manual reset for notification timers, auto
  * reset for synchronization timers), so a KeWaitForSingleObject on a timer
  * sleeps on a real object. KeSetTimer/KeSetTimerEx arm the polling table below
- * whose thread fires DPCs and signals that event; KeCancelTimer clears both.
+ * whose thread fires DPCs and signals that event; KeCancelTimer clears both. */
 
 /* ── KeInitializeTimerEx (ordinal 113) ────────────────────
  * VOID KeInitializeTimerEx(PKTIMER Timer, TIMER_TYPE Type)
@@ -2947,7 +2949,7 @@ static void bridge_NtReadFile(void)
     uint32_t length    = STACK_ARG(6);
     uint32_t offset_va = STACK_ARG(7);
     XBOX_IO_STATUS_BLOCK ios;
-    LARGE_INTEGER  off;
+    LARGE_INTEGER  off = {0};
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
@@ -2997,7 +2999,7 @@ static void bridge_NtWriteFile(void)
     uint32_t length    = STACK_ARG(6);
     uint32_t offset_va = STACK_ARG(7);
     XBOX_IO_STATUS_BLOCK ios;
-    LARGE_INTEGER  off;
+    LARGE_INTEGER  off = {0};
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
