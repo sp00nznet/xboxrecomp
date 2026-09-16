@@ -39,9 +39,18 @@ HEADERS = """#include <string.h>
 """
 
 # The names most likely to be recovered from a real title, and the ones whose
-# failure mode is a preprocessor expansion rather than a redeclaration.
-SHARP = ("isnan", "isinf", "isfinite", "isnormal", "signbit", "fpclassify",
-         "round", "trunc", "onexit", "div", "exit", "abs")
+# failure mode is a preprocessor expansion rather than a redeclaration. These
+# are declared by any hosted C library, so the negative control can demand them
+# everywhere.
+SHARP_PORTABLE = ("isnan", "isinf", "isfinite", "isnormal", "signbit",
+                  "fpclassify", "round", "trunc", "div", "exit", "abs")
+
+# Declared only by the Microsoft CRT. It belongs in the reserved set -- a title
+# built with MSVC can well have a function named `onexit`, and there it does
+# collide -- but elsewhere the name is simply free, so demanding that it fail to
+# compile would be asserting a fact about Windows on a machine that is not
+# Windows.
+SHARP_MSVC = ("onexit",)
 
 
 def _find_cc():
@@ -50,6 +59,15 @@ def _find_cc():
         cc = r"C:\Program Files\LLVM\bin\clang.exe"
     return cc
 
+
+def _targets_msvc_crt():
+    """Does the compiler under test build against the Microsoft CRT?"""
+    rc, _ = _compile("#ifndef _MSC_VER\n#error not the Microsoft CRT\n#endif\n")
+    return rc == 0
+
+def sharp_names():
+    """The names the negative control demands for this toolchain."""
+    return SHARP_PORTABLE + (SHARP_MSVC if _targets_msvc_crt() else ())
 
 def _compile(body):
     """Compile one TU. Returns (returncode, stderr)."""
@@ -87,7 +105,9 @@ class ReservedIdentTest(unittest.TestCase):
         would compile as an ordinary identifier and that test would still
         pass.
         """
-        for name in SHARP:
+        names = sharp_names()
+        self.assertTrue(names, "no names to check: the control tests nothing")
+        for name in names:
             with self.subTest(name=name):
                 self.assertIn(name, _FUNC_RESERVED_IDENT,
                               f"{name} is missing from the reserved set")
