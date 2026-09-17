@@ -634,26 +634,18 @@ class FunctionTranslator:
         return any(getattr(insn, "call_target", None) == seh_prolog
                    for insn in instructions)
 
-    def translate_function(self, func_addr, func_info):
-        """
-        Translate a single function to C code.
-        Returns a string of C source code, or None on failure.
-        """
-        start = func_addr
+    def decode_function(self, start, end):
+        """Recover instructions and blocks, including indirect-entry leaders."""
         recovered = self._recovered_cfg.get(start)
-        end = recovered["end"] if recovered else func_info.get("end")
-        if not end:
-            end = start + func_info.get("size", 0)
+        if recovered:
+            end = recovered["end"]
         if end <= start:
-            return None
-
-        name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
-        size = end - start
+            return [], []
 
         # Read bytes from XBE
         raw_bytes = self._read_func_bytes(start, end)
         if not raw_bytes:
-            return None
+            return [], []
 
         # Set function bounds for the lifter
         self.lifter.func_start = start
@@ -665,7 +657,7 @@ class FunctionTranslator:
         instructions = (recovered["instructions"] if recovered else
                         self.disasm.disassemble_function(raw_bytes, start, end))
         if not instructions:
-            return None
+            return [], []
 
         # Addresses this function loads as immediates into a register and
         # then jumps to. `mov ebx, 0x3A0DC; ... ; jmp ebx` is a continuation
@@ -715,6 +707,24 @@ class FunctionTranslator:
         blocks = self.disasm.build_basic_blocks(
             instructions, start, end,
             extra_leaders=switch_leaders if switch_leaders else None)
+        return instructions, blocks
+
+    def translate_function(self, func_addr, func_info):
+        """
+        Translate a single function to C code.
+        Returns a string of C source code, or None on failure.
+        """
+        start = func_addr
+        recovered = self._recovered_cfg.get(start)
+        end = recovered["end"] if recovered else func_info.get("end")
+        if not end:
+            end = start + func_info.get("size", 0)
+        if end <= start:
+            return None
+
+        name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
+        size = end - start
+        instructions, blocks = self.decode_function(start, end)
         if not blocks:
             return None
 
@@ -983,7 +993,7 @@ class FunctionTranslator:
         for insn in instructions:
             if insn.jump_target and start <= insn.jump_target < end:
                 label_addrs.add(insn.jump_target)
-        label_addrs |= imm_refs
+        label_addrs |= self.lifter.imm_code_refs
         # Add switch table targets (indirect jmp with intra-function table)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
