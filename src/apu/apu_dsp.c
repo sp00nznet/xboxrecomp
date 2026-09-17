@@ -79,6 +79,21 @@ static void dsp_ack_init(void)
                 s_dsp_ack_count, s_dsp_ack[0]);
 }
 
+/* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
+ *
+ * Default ON. RECOMP_APU_MIXDOWN_ALL=0 restores the previous two-bin read,
+ * because this changes audible output for every title and an escape hatch
+ * costs one branch. */
+static int mcpx_apu_mixdown_all(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
+        on = (e && *e) ? (atoi(e) != 0) : 1;
+    }
+    return on;
+}
+
 static void dsp_ack_frame(MCPXAPUState *d)
 {
     int i;
@@ -146,9 +161,46 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            /* Bins 2..31 used to be computed and then dropped on the floor.
+             * On hardware the GP and EP mix the submixes down; here they are
+             * stubs, so thirty of thirty-two bins were discarded every frame
+             * with no counter anywhere to say so.
+             *
+             * Measured on Jet Set Radio Future, one 200 s gameplay run, with
+             * a positive control moving beside it:
+             *
+             *     [APU-BIN] 2D heard=557466 lost=0
+             *               3D heard=0      lost=377768
+             *               lost by bin: 6,7,8,9,10
+             *
+             * 557,466 music voice-frames heard and none lost; 377,768 effect
+             * voice-frames produced correctly and thrown away. The title's 3D
+             * positional voices -- its sound effects -- are routed to bins 6
+             * to 10 by the guest's own V0BIN..V3BIN, and music on 2D voices
+             * lands in bins 0 and 1, which is why the music was always
+             * audible and no effect ever was. Every instrument upstream of
+             * this line read healthy.
+             *
+             * Gating the HRTF submix override was tried first and did not fix
+             * it, so the defect is the width of this mixdown and nothing else.
+             *
+             * Even bins left, odd bins right, which preserves the stereo
+             * pairing the guest set up -- bins 6/7 and 8/9 arrive with matched
+             * counts. This is not what a real EP does; it is the cheapest
+             * mixdown that stops discarding audio. */
+            float left, right;
+            if (mcpx_apu_mixdown_all()) {
+                left = 0.0f;
+                right = 0.0f;
+                for (int b = 0; b < NUM_MIXBINS; ++b) {
+                    if (b & 1) right += mixbins[b][i];
+                    else       left  += mixbins[b][i];
+                }
+            } else {
+                left = mixbins[0][i];
+                right = mixbins[1][i];
+            }
             /* Clamp to [-1, 1] range */
-            float left = mixbins[0][i];
-            float right = mixbins[1][i];
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;
