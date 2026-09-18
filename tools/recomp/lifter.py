@@ -365,6 +365,13 @@ _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
     "rdtsc", "cpuid",      # Special instructions
     "lock xadd",           # Lock prefix - complex flag behavior
+    # popfd REPLACES every flag with whatever was pushed. Its flags are not
+    # architecturally undefined -- they are simply not knowable from the
+    # instruction stream -- but the tracking action is the same: whatever the
+    # last comparison left is gone, and a jcc after it must not be resolved
+    # from that comparison. It used to sit in _EFLAGS_PRESERVE, next to
+    # pushfd, which does read-and-preserve and does belong there.
+    "popfd",
 })
 
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
@@ -378,7 +385,9 @@ _EFLAGS_PRESERVE = frozenset({
     "call",
     "int3", "int", "wait",
     "cld", "std", "cli", "sti",
-    "pushfd", "popfd", "pushal",
+    # pushfd READS the flags and leaves them alone, so it belongs here.
+    # popfd does NOT -- see _FLAGS_UNDEFINED.
+    "pushfd", "pushal",
     "sgdt", "ljmp", "sfence",
     # SSE scalar float
     "movss", "movsd",
@@ -3331,8 +3340,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
         if curr.mnemonic == "neg":
             j = i + 1
             while (j < len(insns)
+                    # popfd is no longer in _EFLAGS_PRESERVE, so the set
+                    # carries this now; it used to need naming here, which is
+                    # how the inconsistency was visible in the first place.
                     and insns[j].mnemonic in _EFLAGS_PRESERVE
-                    and insns[j].mnemonic != "popfd"
                     and not insns[j].is_branch
                     and not insns[j].is_call
                     and not insns[j].is_ret):
