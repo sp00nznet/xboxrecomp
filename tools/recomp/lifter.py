@@ -1803,11 +1803,28 @@ class Lifter:
         return out
 
     def _lift_rotate(self, insn, ops, m):
+        """A rotate is at the OPERAND's width, not always at 32 bits.
+
+        Every narrow read here arrives zero-extended, so ROL32/ROR32 on a byte
+        rotated it inside a 32-bit word: the bits that should wrap around at
+        bit 7 landed in bits 31..8 and were then discarded by the store. `ror
+        al, 2` on 0x01 produced 0x00 where x86 gives 0x40 -- the operand's top
+        bits silently deleted rather than rotated round.
+
+        The count is masked to 5 bits by the hardware and only then reduced
+        modulo the width, so `rol al, 16` is the identity and `rol ax, 31` is a
+        rotate by 15. Both of those came back as 0 before.
+
+        Same defect class as the `sar` width bug: a narrow operand evaluated at
+        32 bits. That one was fixed; the rotates beside it were missed.
+        """
         if len(ops) < 2:
             return [f"/* {m}: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
-        func = "ROL32" if m == "rol" else "ROR32"
+        bits = (_operand_width(ops[0]) or 4) * 8
+        suffix = {8: "8", 16: "16"}.get(bits, "32")
+        func = ("ROL" if m == "rol" else "ROR") + suffix
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
 
     # ── Compare / Test (standalone) ──

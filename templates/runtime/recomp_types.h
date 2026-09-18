@@ -607,14 +607,45 @@ static inline uint32_t SUB32_CF(uint32_t a, uint32_t b, int *cf) {
  * Rotation / shift helpers
  * ================================================================ */
 
+/* x86 masks the rotate count to 5 bits, and THEN the rotate is modulo the
+ * operand's own width -- so `rol al, 16` is a rotate by zero and `rol ax, 31`
+ * is a rotate by 15. A narrow rotate performed at 32 bits is not a rotate at
+ * all: the bits that should wrap around at bit 7 or 15 land above the operand
+ * and are discarded by the store, which turns `ror al, 2` on 0x01 into 0x00
+ * where x86 gives 0x40.
+ *
+ * The zero case is separated out because `val >> (32 - 0)` is a shift of a
+ * uint32_t by 32, which is undefined behaviour -- it happened to survive
+ * because x86 masks shift counts to 5 bits and gives back `val`, but the
+ * compiler is under no obligation to agree, least of all at -O2. */
 static inline uint32_t ROL32(uint32_t val, int n) {
     n &= 31;
-    return (val << n) | (val >> (32 - n));
+    return n ? ((val << n) | (val >> (32 - n))) : val;
 }
 
 static inline uint32_t ROR32(uint32_t val, int n) {
     n &= 31;
-    return (val >> n) | (val << (32 - n));
+    return n ? ((val >> n) | (val << (32 - n))) : val;
+}
+
+static inline uint8_t ROL8(uint8_t val, int n) {
+    n = (n & 31) % 8;
+    return n ? (uint8_t)((val << n) | (val >> (8 - n))) : val;
+}
+
+static inline uint8_t ROR8(uint8_t val, int n) {
+    n = (n & 31) % 8;
+    return n ? (uint8_t)((val >> n) | (val << (8 - n))) : val;
+}
+
+static inline uint16_t ROL16(uint16_t val, int n) {
+    n = (n & 31) % 16;
+    return n ? (uint16_t)((val << n) | (val >> (16 - n))) : val;
+}
+
+static inline uint16_t ROR16(uint16_t val, int n) {
+    n = (n & 31) % 16;
+    return n ? (uint16_t)((val >> n) | (val << (16 - n))) : val;
 }
 
 /* ================================================================
