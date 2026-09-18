@@ -165,8 +165,23 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
 
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
 {
-    /* No physical address translation on Windows - return the VA as a placeholder */
-    return (ULONG_PTR)BaseAddress;
+    /*
+     * The contiguous arena is the virtual window onto physical RAM, so an
+     * address inside it is its physical offset plus XBOX_CONTIG_BASE. Anything
+     * outside passes through unchanged.
+     *
+     * The only implementation. bridge_MmGetPhysicalAddress calls this rather
+     * than repeating the arithmetic: the two used to disagree, with the bridge
+     * translating and this returning its argument unchanged as a placeholder,
+     * so the answer a title got depended on which dispatch path it took. A
+     * title writes the result into a pushbuffer, the NV2A reads an address
+     * with bit 31 set, and the corruption surfaces as wrong geometry with
+     * nothing naming this function.
+     */
+    uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
+    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
+                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+                     ? va - XBOX_CONTIG_BASE : va);
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

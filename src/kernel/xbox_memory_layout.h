@@ -332,6 +332,15 @@ typedef union RecompXmm {
  *
  * Sits below every XBE's image base (0x00010000), so it displaces nothing.
  *
+ * 0x4000 rather than 0x1000 because protection is applied at *host* page
+ * granularity. Apple Silicon pages are 16 KB, so RECOMP_TRAP_NULL asking to
+ * protect guest page zero actually covers guest 0..0x3FFF -- which reached a
+ * TIB at 0x1000 and killed the run, so the guard disabled itself on every
+ * such host and the diagnostic quietly did nothing. At 0x4000 the largest
+ * page any supported host uses fits below the TIB and the guard installs.
+ * Nothing else lives in the low 64 KB, and no guest code names the address:
+ * fs: resolves through g_fs_base.
+ *
  * Per-thread, because a TIB is. It used to be one constant address for the
  * whole process, which meant every guest thread shared one SEH chain head
  * and -- through fs:[4] -- one CRT per-thread data block. Half-Life 2
@@ -342,7 +351,7 @@ typedef union RecompXmm {
  * XBOX_TIB_MAIN is where the first thread's TIB is built; every spawned
  * thread gets its own from xbox_AllocThreadTib() and points g_fs_base at
  * it. */
-#define XBOX_TIB_MAIN       0x00001000
+#define XBOX_TIB_MAIN       0x00004000
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
 

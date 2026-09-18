@@ -1624,12 +1624,12 @@ static void bridge_NtYieldExecution(void)
 static void bridge_MmGetPhysicalAddress(void)
 {
     uint32_t addr = STACK_ARG(0);
-    /* The contiguous arena is the virtual window for physical RAM.
-     * DMA consumers need its physical offset, not the high virtual-address bit.
-     * Preserve existing identity behavior outside this mapped window. */
-    g_eax = (addr >= XBOX_CONTIG_BASE &&
-             (uint64_t)addr < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-          ? addr - XBOX_CONTIG_BASE : addr;
+    /* Calls the same xbox_* the thunk table exposes, so there is one
+     * implementation rather than two that have to be kept in agreement.
+     * Note this bridge itself is not covered by any test: bridge functions
+     * are static and driven by guest CPU state, and nothing in tests/ can
+     * reach them. */
+    g_eax = (uint32_t)xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)addr);
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */

@@ -12,6 +12,10 @@ tools/abi_analysis/output/
 # Game files (user provides their own)
 game_files/
 *.xbe
+# ...except the synthetic one the tests default to. It is 4KB of generated
+# header and five leaf functions, carries no title content, and without it
+# the memory-layout test has nothing to open on a fresh clone.
+!tools/conformance/test.xbe
 *.iso
 *.xiso
 

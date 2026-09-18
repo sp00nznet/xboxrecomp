@@ -153,6 +153,17 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
 }
 
 /* ======================================================================== */
+/* Shared by both backends, for the same reason as xbox_LastFileError: the
+ * bridge calls it unconditionally, and a _WIN32-only definition breaks every
+ * POSIX link. The Win32 backend fills this during translation; the POSIX one
+ * does not yet, so it reads empty there. */
+static XBOX_THREAD_LOCAL wchar_t s_last_host_path_shared[MAX_PATH];
+
+const wchar_t *xbox_LastHostPath(void)
+{
+    return s_last_host_path_shared;
+}
+
 #if defined(_WIN32)
 /* ======================================================================== */
 
@@ -359,17 +370,12 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
 /* Thread-local: several threads open files at once, and a plain static let one
  * thread's translation overwrite another's between the translate and the read.
  * That showed up as the FMV trigger firing on roughly two runs in three. */
-static __declspec(thread) wchar_t s_last_host_path[MAX_PATH];
 
 static void xbox_remember_host_path(const wchar_t *p)
 {
-    if (p) wcsncpy_s(s_last_host_path, MAX_PATH, p, _TRUNCATE);
+    if (p) wcsncpy_s(s_last_host_path_shared, MAX_PATH, p, _TRUNCATE);
 }
 
-const wchar_t *xbox_LastHostPath(void)
-{
-    return s_last_host_path;
-}
 
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)

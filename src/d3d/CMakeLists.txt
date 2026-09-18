@@ -25,7 +25,12 @@ else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(EPOXY REQUIRED epoxy)
     target_include_directories(xbox_d3d8 PRIVATE ${EPOXY_INCLUDE_DIRS})
-    target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2 ${EPOXY_LIBRARIES})
+    # EPOXY_LINK_LIBRARIES, not EPOXY_LIBRARIES: the latter is the bare name
+    # `epoxy`, which only resolves if EPOXY_LIBRARY_DIRS happens to be on the
+    # link path. That holds for the top-level build and not when this is pulled
+    # in via add_subdirectory from tests/, where the link fails with
+    # "library 'epoxy' not found". The _LINK_LIBRARIES form is absolute paths.
+    target_link_libraries(xbox_d3d8 PUBLIC platform SDL2::SDL2 ${EPOXY_LINK_LIBRARIES})
 endif()
 
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

@@ -67,6 +67,16 @@ static HANDLE g_mapping_handle = NULL;
 
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
+
+/* The base view and its 28 mirrors occupy one contiguous span. Reserving that
+ * span up front is what makes the mirrors placeable at all: each one sits at
+ * base + N * 64 MB, and on a host that chose the base for us, those addresses
+ * run through whatever the loader already owns. Placing them one at a time
+ * means ~3 of 28 collide, and *which* three changes with ASLR. Claiming the
+ * whole range first, then carving views out of ground we hold, removes the
+ * question. */
+static void *g_span_base = NULL;
+static size_t g_span_size = 0;
 static void *g_tiled_view = NULL;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
@@ -1099,7 +1109,31 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             0,                      /* sentinel - let OS choose */
         };
 
-        for (int i = 0; try_bases[i] != 0 || i == 0; i++) {
+        /* Iterate the whole array, sentinel included. The old condition
+         * (try_bases[i] != 0 || i == 0) stopped *at* the zero rather than
+         * using it, so the "let the OS choose" fallback never ran: the loop
+         * tried the fixed addresses and gave up. Invisible on Windows, where
+         * one of the low bases succeeds -- fatal on arm64 macOS, where all of
+         * them sit inside the 4 GB __PAGEZERO segment and none can. */
+        /* Reserve base + mirrors as one range, and map the base at its head.
+         * VirtualFree releases just the slice about to be used, so each view
+         * replaces our own reservation rather than racing for free space. */
+        g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        if (g_span_base) {
+            VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
+            g_memory_base = MapViewOfFileEx(g_mapping_handle,
+                                            FILE_MAP_ALL_ACCESS, 0, 0,
+                                            g_memory_size, g_span_base);
+            if (!g_memory_base) {
+                VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+                g_span_base = NULL;
+                g_span_size = 0;
+            }
+        }
+
+        const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
+        for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
             g_memory_base = MapViewOfFileEx(
                 g_mapping_handle,
@@ -1156,9 +1190,31 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Best-effort: failing to protect it costs only the diagnostic. */
     if (XBOX_MAP_START == 0 && getenv("RECOMP_TRAP_NULL")) {
         DWORD old_protect;
-        if (VirtualProtect(g_memory_base, 0x1000, PAGE_NOACCESS, &old_protect))
-            fprintf(stderr, "  guest page 0 is PAGE_NOACCESS"
-                            " (null dereferences fault)\n");
+        /* Protection is applied at host page granularity, and the host page
+         * is not always the guest's 4 KB -- Apple Silicon uses 16 KB, so this
+         * 0x1000 request actually covers guest 0..0x3FFF. That is why
+         * XBOX_TIB_MAIN sits at 0x4000: the widest page any supported host
+         * uses fits below the TIB, so the rounding costs nothing and the
+         * guard installs everywhere.
+         *
+         * The check below is what remains of an earlier bug rather than dead
+         * code. With the TIB at 0x1000 the rounding reached it, init wrote the
+         * TIB moments later, and every run that asked for the guard died at
+         * startup -- so the guard disabled itself on all of Apple Silicon and
+         * the diagnostic silently did nothing. It stays as a floor for a host
+         * with pages wider than the TIB offset, where skipping really is
+         * better than breaking the run. */
+        long host_page = sysconf(_SC_PAGESIZE);
+        if (host_page > 0 && (uint32_t)host_page > XBOX_TIB_MAIN) {
+            fprintf(stderr, "  RECOMP_TRAP_NULL: not available -- the host page "
+                    "is %ld bytes, so trapping guest page zero would also trap "
+                    "the TIB at 0x%08X\n", host_page, XBOX_TIB_MAIN);
+        } else {
+            if (VirtualProtect(g_memory_base, 0x1000, PAGE_NOACCESS, &old_protect)) {
+                fprintf(stderr, "  guest page 0 is PAGE_NOACCESS"
+                                " (null dereferences fault)\n");
+            }
+        }
     }
 
     if (g_memory_offset == 0) {
@@ -1216,6 +1272,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         DWORD sect_headers_va = *(const DWORD *)(xbe + XBE_SECTION_HEADERS_OFFSET);
         DWORD sect_headers_off = sect_headers_va - base_addr;
         int sections_loaded = 0;
+        int sections_short = 0;
         size_t total_bytes = 0;
 
         if (num_sections > 64) num_sections = 64;  /* sanity cap */
@@ -1249,9 +1306,27 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             /* Zero the full virtual size first (handles BSS) */
             memset(XBOX_VA(sec_va), 0, sec_vsize);
 
-            /* Copy initialized data from XBE */
-            if (copy_size > 0 && sec_raw_off + copy_size <= xbe_size) {
+            /*
+             * Copy initialized data from XBE.
+             *
+             * A section whose raw data runs past the end of the buffer is a
+             * truncated or corrupt image, not a BSS section, and it must not
+             * be counted among the sections loaded. Reporting it as loaded is
+             * how a 4MB title read through a 1MB buffer produced "Loaded
+             * 17/17 sections" with every byte of every section still zero --
+             * including the kernel thunk table, which then resolved 0 imports
+             * and looked like a title that calls no kernel functions.
+             */
+            int have_data = (copy_size == 0) ||
+                            (sec_raw_off + copy_size <= xbe_size);
+            if (copy_size > 0 && have_data) {
                 memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
+            } else if (!have_data) {
+                fprintf(stderr,
+                        "  WARNING: section %u (%s) raw data 0x%08X+%u runs past "
+                        "the %zu-byte image -- left zeroed\n",
+                        si, sec_name, sec_raw_off, copy_size, xbe_size);
+                sections_short++;
             }
 
             /* Every loaded section, executable or not. Anything that writes
@@ -1273,8 +1348,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     g_xbox_code_hi = sec_va + sec_vsize;
             }
 
-            sections_loaded++;
-            total_bytes += copy_size;
+            if (have_data) {
+                sections_loaded++;
+                total_bytes += copy_size;
+            }
 
             fprintf(stderr, "  [%2u] %-12s VA=0x%08X vsize=%-8u raw=0x%08X rsize=%-8u%s\n",
                     si, sec_name, sec_va, sec_vsize, sec_raw_off, sec_raw_size,
@@ -1283,6 +1360,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
         fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
                 sections_loaded, num_sections, total_bytes);
+        if (sections_short) {
+            fprintf(stderr,
+                    "  ERROR: %d section(s) had no data in the image -- the XBE "
+                    "is truncated or was read short; the title will not run\n",
+                    sections_short);
+        }
     }
 
     /*
@@ -1775,6 +1858,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                         m + 1, (unsigned)XBOX_TILED_BASE);
                 continue;
             }
+            /* Inside the reservation this hands back the slice we are about
+             * to use; outside it (no reservation) this is a no-op on an
+             * address we never held. */
+            if (g_span_base)
+                VirtualFree((LPVOID)mirror_base, g_memory_size, MEM_RELEASE);
             g_mirror_views[m] = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
@@ -1940,10 +2028,40 @@ void xbox_MemoryLayoutShutdown(void)
         g_memory_base = NULL;
         g_memory_size = 0;
     }
+    /* The apertures. Left mapped, a second init cannot place them: the first
+     * run still owns 0x80000000, 0xFD000000, 0xFE800000, 0xFF000000 and the
+     * tiled alias, and every one of those comes back as "failed" while init
+     * still returns TRUE because they are best-effort. The result is a layout
+     * that looks initialised and has no device apertures at all. */
+    if (g_tiled_view) {
+        UnmapViewOfFile(g_tiled_view);
+        g_tiled_view = NULL;
+    }
+    if (g_contig_memory) {
+        VirtualFree(g_contig_memory, 0, MEM_RELEASE);
+        g_contig_memory = NULL;
+    }
+    if (g_mcpx_memory) {
+        VirtualFree(g_mcpx_memory, 0, MEM_RELEASE);
+        g_mcpx_memory = NULL;
+    }
+    if (g_flash_memory) {
+        VirtualFree(g_flash_memory, 0, MEM_RELEASE);
+        g_flash_memory = NULL;
+    }
+
     /* Close file mapping handle */
     if (g_mapping_handle) {
         CloseHandle(g_mapping_handle);
         g_mapping_handle = NULL;
+    }
+
+    /* Whatever is left of the base+mirrors reservation. The views carved out
+     * of it are already unmapped above; this releases the range itself. */
+    if (g_span_base) {
+        VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
+        g_span_base = NULL;
+        g_span_size = 0;
     }
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
 }

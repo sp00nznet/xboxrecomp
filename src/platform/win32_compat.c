@@ -33,6 +33,7 @@
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #else
 #include <sys/sysinfo.h>
 #endif
@@ -1070,6 +1071,59 @@ static int prot_from_page(DWORD protect)
     }
 }
 
+#if defined(__APPLE__)
+/* Darwin has no MAP_FIXED_NOREPLACE, and the two mmap options are both wrong
+ * for VirtualAlloc: MAP_FIXED silently unmaps whatever already occupies the
+ * range, and a bare address hint can be relocated by the kernel for reasons
+ * other than the range being taken -- so "we got a different address" is only
+ * an approximation of "it was occupied", and a racy one.
+ *
+ * mach_vm_map with VM_FLAGS_FIXED is the exact primitive: it maps at the
+ * address given, and returns KERN_NO_SPACE rather than displacing an existing
+ * mapping. That is what Win32 promises, and this layer exists to keep the Xbox
+ * HLE above it honest -- a VirtualAlloc that quietly replaced a live mapping
+ * would corrupt whatever held it, far from the call that did it.
+ *
+ * Memory from mach_vm_map is released by munmap like any other, because the
+ * BSD and Mach halves of Darwin share one VM map, so VirtualFree is unchanged.
+ */
+/* Length registry, defined with the view helpers below. Win32 frees by address
+ * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
+ * documented to take size 0 -- so the length has to be recoverable here or
+ * munmap cannot be called at all. */
+void view_register(void *addr, size_t len);
+size_t view_take(const void *addr);
+
+static void *mach_map_fixed(void *address, size_t size, int prot)
+{
+    mach_vm_address_t addr = (mach_vm_address_t)(uintptr_t)address;
+    mach_vm_size_t len = (size + vm_page_size - 1) & ~((mach_vm_size_t)vm_page_size - 1);
+    vm_prot_t vmprot = VM_PROT_NONE;
+
+    if (prot & PROT_READ)  vmprot |= VM_PROT_READ;
+    if (prot & PROT_WRITE) vmprot |= VM_PROT_WRITE;
+    if (prot & PROT_EXEC)  vmprot |= VM_PROT_EXECUTE;
+
+    kern_return_t kr = mach_vm_map(
+        mach_task_self(),
+        &addr,
+        len,
+        0,
+        VM_FLAGS_FIXED,
+        MEMORY_OBJECT_NULL,
+        0,
+        FALSE,
+        vmprot,
+        VM_PROT_ALL,
+        VM_INHERIT_DEFAULT
+    );
+    if (kr != KERN_SUCCESS) {
+        return MAP_FAILED;
+    }
+    return (void *)(uintptr_t)addr;
+}
+#endif
+
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
@@ -1085,17 +1139,32 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 
 #if defined(MAP_FIXED_NOREPLACE)
     if (address) flags |= MAP_FIXED_NOREPLACE;
-#elif defined(__APPLE__)
-    /* TODO: mach_vm_map with VM_FLAGS_FIXED (which does fail rather than replace),
-     * or a mach_vm_region probe before an MAP_FIXED call. */
 #endif
-    void *p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
-                   flags, -1, 0);
-    if (p == MAP_FAILED) { SetLastError(8); return NULL; }
-#if !defined(MAP_FIXED_NOREPLACE)
-    /* TODO: Without MAP_FIXED_NOREPLACE (macOS or older kernels) plain
-     * MAP_FIXED would silently unmap whatever already lives there. Getting a
-     * different address means the range was taken: fail as Linux does. */
+
+    void *p;
+#if defined(__APPLE__)
+    if (address) {
+        p = mach_map_fixed(address, size, prot ? prot : PROT_READ | PROT_WRITE);
+    } else
+#endif
+    p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (p == MAP_FAILED) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    /* Remember the length: VirtualFree(MEM_RELEASE) is passed size 0 by every
+     * Win32 caller, and munmap cannot be called without one. */
+    view_register(p, size);
+#if !defined(MAP_FIXED_NOREPLACE) && !defined(__APPLE__)
+    /* Older kernels without MAP_FIXED_NOREPLACE: plain MAP_FIXED would silently
+     * unmap whatever already lives there, so we pass the address as a hint and
+     * treat a different result as "taken". Apple goes through mach_map_fixed
+     * above, which reports that properly instead of inferring it. */
+    if (address && p != address) {
+        munmap(p, size);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
 #endif
     return p;
 }
@@ -1103,9 +1172,14 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
 {
     if (freeType & MEM_RELEASE) {
-        /* Win32 MEM_RELEASE passes size 0; we can't know the length, so this
-         * path is only safe when callers pass the real size. */
-        if (size == 0) return TRUE;
+        /* Win32 MEM_RELEASE passes size 0 and frees the whole allocation, so
+         * the length comes from the registry VirtualAlloc filled in. Returning
+         * TRUE without unmapping -- as this used to -- made every release a
+         * silent no-op: the caller believed the address was free, the next
+         * allocation there failed, and nothing connected the two. */
+        size_t len = view_take(address);
+        if (size == 0) size = len;
+        if (size == 0) return FALSE;
         return munmap(address, size) == 0;
     }
     if (freeType & MEM_DECOMMIT)
@@ -1475,7 +1549,7 @@ typedef struct { void *addr; size_t len; } w32_view;
 static w32_view        s_views[512];
 static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void view_register(void *addr, size_t len)
+void view_register(void *addr, size_t len)
 {
     pthread_mutex_lock(&s_views_lock);
     for (int i = 0; i < 512; i++)
@@ -1483,7 +1557,31 @@ static void view_register(void *addr, size_t len)
     pthread_mutex_unlock(&s_views_lock);
 }
 
-static size_t view_take(const void *addr)
+/* Non-destructive counterpart to view_take, and interior-aware: VirtualQuery
+ * is asked about addresses *within* a region at least as often as about its
+ * base -- a translated guest VA lands in the middle of the 64 MB window.
+ * Picks the containing region and reports where it starts. */
+int view_lookup(const void *addr, void **base_out, size_t *len_out)
+{
+    int found = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        if (!s_views[i].addr)
+            continue;
+        uintptr_t lo = (uintptr_t)s_views[i].addr;
+        uintptr_t hi = lo + s_views[i].len;
+        if ((uintptr_t)addr >= lo && (uintptr_t)addr < hi) {
+            if (base_out) *base_out = s_views[i].addr;
+            if (len_out)  *len_out  = s_views[i].len;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    return found;
+}
+
+size_t view_take(const void *addr)
 {
     size_t len = 0;
     pthread_mutex_lock(&s_views_lock);
@@ -1548,10 +1646,40 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     off_t  off = ((off_t)offHigh << 32) | offLow;
     SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
     int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED | (baseAddr ? MAP_FIXED : 0);
+    int flags  = MAP_SHARED;
+
+    /* Win32 MapViewOfFileEx *fails* when the requested address is unavailable.
+     * Plain MAP_FIXED does the opposite: it silently unmaps whatever is there
+     * and succeeds. The Xbox memory model asks for 28 mirror views at computed
+     * addresses, so with a base the OS chose rather than one we picked, that
+     * difference is the process quietly destroying its own libraries and heap
+     * and dying somewhere unrelated a moment later. */
+    if (baseAddr) {
+#if defined(MAP_FIXED_NOREPLACE)
+        flags |= MAP_FIXED_NOREPLACE;
+#elif defined(__APPLE__)
+        /* Darwin has no MAP_FIXED_NOREPLACE. Claim the range first with
+         * mach_vm_map(VM_FLAGS_FIXED), which refuses rather than displaces;
+         * MAP_FIXED below can then only replace the placeholder we now own. */
+        if (mach_map_fixed(baseAddr, len, PROT_READ | PROT_WRITE) == MAP_FAILED) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+        flags |= MAP_FIXED;
+#else
+        flags |= MAP_FIXED;
+#endif
+    }
 
     void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
     if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    if (baseAddr && p != baseAddr) {
+        /* MAP_FIXED_NOREPLACE hands back a different address instead of
+         * failing on some kernels; treat that as the refusal it means. */
+        munmap(p, len);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return NULL;
+    }
     view_register(p, len);
     return p;
 }
@@ -1572,16 +1700,53 @@ BOOL UnmapViewOfFile(LPCVOID baseAddr)
 /* VirtualQuery                                                           */
 /* ===================================================================== */
 
+/*
+ * Answers from the view registry rather than from a constant.
+ *
+ * This used to report RegionSize 0x1000, MEM_COMMIT, PAGE_READWRITE and
+ * AllocationBase NULL for every address it was handed, mapped or not. Four
+ * kernel entry points are built on it, and one of them chooses a deallocator
+ * with it: MmFreeContiguousMemory frees via VirtualFree only when
+ * AllocationBase equals the pointer, so a hardcoded NULL sent every
+ * contiguous buffer -- all of which come from VirtualAlloc, i.e. mmap -- to
+ * _aligned_free, which is free(). The allocator aborts on the foreign
+ * pointer. MmQueryAllocationSize answered 0x1000 for everything and
+ * NtQueryVirtualMemory called unmapped addresses committed and readable.
+ *
+ * Everything the shim maps -- VirtualAlloc and MapViewOfFileEx alike -- is in
+ * the registry, so it can answer for exactly the memory it owns and say
+ * MEM_FREE for the rest. Saying MEM_FREE for an address it did not map is the
+ * honest answer: a host heap pointer is not a Win32 reservation, and the
+ * callers that branch on this want to know which allocator owns the pointer.
+ */
 SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T length)
 {
     if (!buffer || length < sizeof(*buffer)) return 0;
     memset(buffer, 0, sizeof(*buffer));
-    buffer->BaseAddress    = (PVOID)address;
-    buffer->AllocationBase = NULL;       /* != address -> freed via _aligned_free */
-    buffer->RegionSize     = 0x1000;
-    buffer->State          = MEM_COMMIT;
-    buffer->Protect        = PAGE_READWRITE;
-    buffer->Type           = 0x20000;    /* MEM_PRIVATE */
+
+    void  *base = NULL;
+    size_t len  = 0;
+
+    if (!view_lookup(address, &base, &len)) {
+        /* Not ours. Report it free rather than inventing a committed page. */
+        buffer->BaseAddress    = (PVOID)address;
+        buffer->AllocationBase = NULL;
+        buffer->RegionSize     = 0;
+        buffer->State          = MEM_FREE;
+        buffer->Protect        = PAGE_NOACCESS;
+        buffer->Type           = 0;
+        return sizeof(*buffer);
+    }
+
+    buffer->BaseAddress      = (PVOID)address;
+    buffer->AllocationBase   = base;
+    buffer->AllocationProtect = PAGE_READWRITE;
+    /* From the queried address to the end of the region, which is what Win32
+     * reports and what callers sizing a copy out of it depend on. */
+    buffer->RegionSize       = len - (size_t)((uintptr_t)address - (uintptr_t)base);
+    buffer->State            = MEM_COMMIT;
+    buffer->Protect          = PAGE_READWRITE;
+    buffer->Type             = MEM_PRIVATE;
     return sizeof(*buffer);
 }
 

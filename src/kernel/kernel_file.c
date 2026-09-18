@@ -53,6 +53,20 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
 /* ======================================================================== */
+/* Shared by both backends. kernel_bridge.c calls xbox_LastFileError()
+ * unconditionally, so defining it only under _WIN32 leaves every POSIX link
+ * with an undefined symbol -- invisible until something links an executable,
+ * because a static archive never resolves its own references.
+ *
+ * The POSIX backend does not populate this yet, so it reads 0 there; that is a
+ * missing detail rather than a missing symbol, and it is visible here. */
+uint32_t g_xbox_last_file_error;
+
+uint32_t xbox_LastFileError(void)
+{
+    return g_xbox_last_file_error;
+}
+
 #if defined(_WIN32)
 /* ====================  Win32 backend  =================================== */
 /* ======================================================================== */
@@ -88,13 +102,6 @@ static DWORD xbox_access_to_win32(ACCESS_MASK Access)
     if (result == 0 || result == SYNCHRONIZE)
         result |= GENERIC_READ;
     return result;
-}
-
-uint32_t g_xbox_last_file_error;
-
-uint32_t xbox_LastFileError(void)
-{
-    return g_xbox_last_file_error;
 }
 
 /* Convert Xbox share access to Win32 */

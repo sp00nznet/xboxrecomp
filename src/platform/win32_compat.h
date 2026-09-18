@@ -56,6 +56,8 @@ extern "C" {
 #define MEM_RESERVE    0x00002000u
 #define MEM_DECOMMIT   0x00004000u
 #define MEM_RELEASE    0x00008000u
+#define MEM_FREE       0x00010000u
+#define MEM_PRIVATE    0x00020000u
 #define MEM_TOP_DOWN   0x00100000u
 #define PAGE_NOACCESS          0x01u
 #define PAGE_READONLY          0x02u
@@ -389,6 +391,7 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_MORE_DATA               234u
 #define ERROR_NOT_OWNER               288u
 #define ERROR_MR_MID_NOT_FOUND        317u
+#define ERROR_INVALID_ADDRESS         487u
 #define ERROR_IO_PENDING              997u
 #define ERROR_CANCELLED               1223u
 #define ERROR_NO_SYSTEM_RESOURCES     1450u
