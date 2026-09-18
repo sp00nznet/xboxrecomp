@@ -351,6 +351,14 @@ CF_TRACKED = frozenset({
     "add", "sub", "adc", "sbb", "shl", "shr", "sar",
 })
 
+# bt reports CF without touching the operand, so its CF can be rebuilt at the
+# consumer by reading the bit again. The other three WRITE the bit they report,
+# so the same read gives the value after the write -- always 1 after bts,
+# always 0 after btr, inverted after btc. Their CF only exists if it was
+# captured before the write, which is what _cf is for, so they are listed
+# separately and _function_needs_cf treats them as CF producers.
+BT_MODIFY = frozenset({"bts", "btr", "btc"})
+
 # Additional instructions that modify EFLAGS (tracked but handled as generic)
 _EFLAGS_SETTERS = frozenset({
     "shld", "shrd", "rol", "ror", "rcl", "rcr",  # Shifts/rotates set CF
@@ -783,6 +791,27 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── bsf/bsr: bit scan, ZF set if source is zero ──
     # ── bt/bts/btr/btc: bit test, sets CF ──
     if flag_setter in ("bt", "bts", "btr", "btc"):
+        # THE THREE THAT WRITE THE BIT CANNOT BE REBUILT BY READING IT.
+        #
+        # Every form below answers CF by reading the tested bit a second time,
+        # at the consumer. That is exact for `bt`, which reports the bit and
+        # leaves it alone. bts/btr/btc report the bit and then MODIFY it, so by
+        # the time the consumer looks, the answer is the value they wrote:
+        # always 1 after bts, always 0 after btr, inverted after btc. The
+        # test-and-set idiom -- "did I just claim this, or was it already
+        # taken?" -- therefore always answered "already taken" after bts and
+        # "free" after btr, with no way for guest code to observe the truth.
+        #
+        # The lift already captures the pre-write value into _cf (see the
+        # bt/bts/btr/btc arm of _lift_misc), and _function_needs_cf now counts
+        # these three as CF producers so that capture is always emitted when a
+        # carry condition consumes it. So answer from the snapshot.
+        if flag_setter in BT_MODIFY:
+            if jcc in ("jb", "jnae", "jc"):
+                return "_cf", desc
+            if jcc in ("jae", "jnb", "jnc"):
+                return "!_cf", desc
+            return None
         if rhs is None:
             return None
         # Same bit-string rule as the lifter above: a memory bit base with a

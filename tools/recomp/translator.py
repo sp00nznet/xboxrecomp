@@ -576,7 +576,7 @@ class FunctionTranslator:
     @staticmethod
     def _function_needs_cf(instructions):
         """True when something in the function reads CF."""
-        from .lifter import (FLAG_SETTERS, CF_TRACKED,
+        from .lifter import (FLAG_SETTERS, CF_TRACKED, BT_MODIFY,
                              _EFLAGS_SETTERS, _FLAGS_UNDEFINED)
 
         last_setter = None
@@ -592,7 +592,9 @@ class FunctionTranslator:
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
             if (cc in FunctionTranslator._CARRY_CC
-                    and (last_setter in CF_TRACKED or last_setter in ("inc", "dec"))):
+                    and (last_setter in CF_TRACKED
+                         or last_setter in ("inc", "dec")
+                         or last_setter in BT_MODIFY)):
                 return True
             if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
