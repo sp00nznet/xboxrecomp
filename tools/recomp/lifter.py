@@ -533,6 +533,27 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if _sf_width is None and len(flag_ops) > 1:
         _sf_width = _operand_width(flag_ops[1])
     _sf_cast = {1: "(int8_t)", 2: "(int16_t)"}.get(_sf_width, "(int32_t)")
+    # SF AFTER A COMPARE IS THE SIGN BIT OF THE WRAPPED DIFFERENCE, AND THE
+    # SUBTRACTION MUST BE DONE UNSIGNED TO GET IT.
+    #
+    # `cmp` snapshots its operands sign-extended into _fas/_fbs, so the obvious
+    # spelling is `(int32_t)(_fas - _fbs) < 0`. Signed overflow is undefined
+    # behaviour, and this subtraction overflows for exactly the inputs the
+    # question is about: cmp 0x80000000, 1 leaves 0x7FFFFFFF on the hardware,
+    # so SF is 0, while the C expression is INT_MIN - 1. From -O1 the compiler
+    # is entitled to fold `a - b < 0` to `a < b`, which answers 1. It does:
+    # gcc and clang both give 0 at -O0 and 1 at -O1 and above, so the emitted
+    # program's meaning changes with the optimisation level.
+    #
+    # Unsigned subtraction is defined to wrap, so doing it in the unsigned type
+    # of the operand's own width and taking the top bit is exactly the
+    # hardware's SF, at every width, with no undefined case.
+    _sf_utype = {1: "uint8_t", 2: "uint16_t"}.get(_sf_width, "uint32_t")
+    _sf_top = {1: 7, 2: 15}.get(_sf_width, 31)
+
+    def _sf_of_difference(a, b):
+        return (f"(({_sf_utype})(({_sf_utype})({a}) - ({_sf_utype})({b}))"
+                f" >> {_sf_top})")
 
     # ── bsf/bsr: ZF is the only flag they define ──
     #
@@ -552,9 +573,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if cmp_macro:
             return f"{cmp_macro}({lhs}, {rhs})", desc
         if jcc == "js":
-            return f"({_sf_cast}(({lhs}) - ({rhs})) < 0)", desc
+            return f"({_sf_of_difference(lhs, rhs)} != 0)", desc
         if jcc == "jns":
-            return f"({_sf_cast}(({lhs}) - ({rhs})) >= 0)", desc
+            return f"({_sf_of_difference(lhs, rhs)} == 0)", desc
         if jcc == "jp":
             return f"RECOMP_PARITY8(({lhs}) - ({rhs}))", desc
         if jcc == "jnp":
