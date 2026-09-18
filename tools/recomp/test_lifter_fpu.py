@@ -89,7 +89,8 @@ class FpuLifterTest(unittest.TestCase):
         translator.disasm.disassemble_function = (
             lambda _raw, _start, _end: instructions)
         translator.disasm.build_basic_blocks = (
-            lambda _instructions, _start, _end, extra_leaders=None: [block])
+            lambda _instructions, _start, _end, extra_leaders=None,
+            stop_mnemonics=(): [block])
 
         generated = translator.translate_function(
             start, {"_addr": start, "end": start + 3})

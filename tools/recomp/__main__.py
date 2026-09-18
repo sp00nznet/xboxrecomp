@@ -75,6 +75,17 @@ def _load_addrs(path):
     return out
 
 
+def _load_manual_protection(manual_functions, exclude_manual):
+    """Load manual entry points before any destructive boundary repair."""
+    protected = _load_addrs(manual_functions)
+    scan_result = None
+    if exclude_manual:
+        from .manual_scan import scan as _scan_manual
+        scan_result = _scan_manual(exclude_manual)
+        protected.update(set().union(*scan_result))
+    return protected, scan_result
+
+
 def check_data_matches_binary(xbe_path, summary_path):
     """Refuse to lift one binary's code using another binary's disassembly.
 
@@ -215,12 +226,22 @@ def main():
                         help="JSON list of addresses to emit an entry trace "
                              "for (RECOMP_TRACE_ENTER). For bring-up: shows "
                              "which call in an init chain is not returning")
+    parser.add_argument("--coalesce-functions", metavar="JSON", action="append",
+                        help="Explicit owner bounds and false interior starts "
+                             "to merge before translation; repeatable")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
     args = parser.parse_args()
+
+    # Boundary repair is destructive: an interior function start disappears
+    # once it is coalesced into its owner. Load hand-written entry points before
+    # constructing BatchTranslator so coalescence cannot delete a symbol the
+    # project implements, wraps, or references manually.
+    protected_function_starts, manual_scan_result = _load_manual_protection(
+        args.manual_functions, args.exclude_manual)
 
     if args.game_name:
         config.set_game_name(args.game_name)
@@ -271,6 +292,8 @@ def main():
         abi_json_path=data_files.get("abi"),
         output_dir=args.output_dir,
         trace_functions=_load_addrs(args.trace_functions),
+        coalesce_json_paths=args.coalesce_functions,
+        protected_function_starts=protected_function_starts,
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
     )
@@ -392,8 +415,7 @@ def main():
         # used above -- the `manual` set (declare-only) and func_db name pinning
         # -- so the translator needs no changes.
         if args.exclude_manual:
-            from .manual_scan import scan as _scan_manual
-            skip, wrap, referenced = _scan_manual(args.exclude_manual)
+            skip, wrap, referenced = manual_scan_result
             known = set(translator.func_db)
 
             # referenced-but-not-wrapped: the hand-written code names these as

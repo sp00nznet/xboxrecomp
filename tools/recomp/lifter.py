@@ -3229,6 +3229,47 @@ class Lifter:
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
+def _advance_flag_state(curr, flag_state=None):
+    """Return EFLAGS provenance after one instruction.
+
+    This is the single classification used by both the CFG fixed-point pass and
+    emitted block lifting. Keeping the transition in one place prevents control
+    flow analysis from disagreeing with the conditions the emitter generates.
+    """
+    if curr.mnemonic in FLAG_SETTERS or curr.mnemonic in _EFLAGS_SETTERS:
+        return (curr.mnemonic, list(curr.operands))
+    if curr.mnemonic in _FLAGS_UNDEFINED:
+        return None
+    if curr.mnemonic in _EFLAGS_PRESERVE:
+        return flag_state
+    if curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",
+                         "fucomip", "fcomi"):
+        return (curr.mnemonic, list(curr.operands))
+    if curr.mnemonic == "sahf":
+        return ("sahf", list(curr.operands))
+    if (curr.mnemonic.startswith("f")
+            or curr.mnemonic.startswith("cmov")
+            or curr.mnemonic.startswith(("j", "loop"))
+            or curr.mnemonic.startswith("set")):
+        return flag_state
+    if curr.mnemonic.startswith("rep"):
+        rest = curr.op_str.strip() if hasattr(curr, "op_str") else ""
+        raw_m = curr.mnemonic
+        if ("cmpsb" in raw_m or "scasb" in raw_m
+                or "cmpsb" in rest or "scasb" in rest):
+            return (raw_m, list(curr.operands))
+        return flag_state
+    return None
+
+
+def flag_state_after_block(bb, flag_state=None):
+    """Return the EFLAGS provenance leaving ``bb`` without emitting code."""
+    state = flag_state
+    for curr in bb.instructions:
+        state = _advance_flag_state(curr, state)
+    return state
+
+
 def lift_basic_block(lifter, bb, flag_state=None):
     """
     Lift a basic block to C statements.
@@ -3345,55 +3386,16 @@ def lift_basic_block(lifter, bb, flag_state=None):
             results = lifter.lift_instruction(insns[i])
         stmts.extend(results)
 
-        # Track flag-setting instructions
-        if curr.mnemonic in FLAG_SETTERS:
-            last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic in _FLAGS_UNDEFINED:
-            # Flags are undefined after these - clear tracking
+        next_flag_state = _advance_flag_state(
+            curr,
+            (last_flag_setter, last_flag_ops) if last_flag_setter else None)
+        if next_flag_state is None:
             last_flag_setter = None
             last_flag_ops = []
-        elif curr.mnemonic in _EFLAGS_SETTERS:
-            # Additional flag-setting instructions
-            last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic in _EFLAGS_PRESERVE:
-            pass  # These don't affect EFLAGS
-        elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",
-                                "fucomip", "fcomi"):
-            # FPU compare-to-EFLAGS: sets CF, ZF, PF directly
-            last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic == "sahf":
-            # sahf loads AH into flags - typically after fnstsw ax
-            # in the fcomp/fnstsw/sahf pattern for FPU comparisons
-            last_flag_setter = "sahf"
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic.startswith("f") or curr.mnemonic.startswith("cmov"):
-            pass  # FPU and already-handled CMOVcc
-        elif curr.mnemonic.startswith("j"):
-            pass  # Jumps don't set flags
-        elif curr.mnemonic.startswith("set"):
-            pass  # SETcc doesn't set flags
-        elif curr.mnemonic.startswith("rep"):
-            # rep movsb/movsd = data copy, preserves flags
-            # repe cmpsb/repne scasb = comparison, sets flags
-            rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
-            raw_m = curr.mnemonic
-            if "cmpsb" in raw_m or "scasb" in raw_m:
-                last_flag_setter = raw_m
-                last_flag_ops = list(curr.operands)
-            elif "cmpsb" in rest or "scasb" in rest:
-                last_flag_setter = raw_m
-                last_flag_ops = list(curr.operands)
-            else:
-                pass  # rep movs/stos = data movement, flags preserved
         else:
-            # Unknown instruction - conservatively clear flag state
-            last_flag_setter = None
-            last_flag_ops = []
+            last_flag_setter, last_flag_ops = next_flag_state
 
         i += 1
 
-    out_flag_state = (last_flag_setter, last_flag_ops) if last_flag_setter else None
+    out_flag_state = flag_state_after_block(bb, flag_state)
     return stmts, out_flag_state
