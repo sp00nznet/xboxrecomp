@@ -2559,6 +2559,35 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
     oa->Attributes    = 0;
 }
 
+/*
+ * The DVD drive as a device, not as a directory.
+ *
+ * A title that checks its media opens "\\Device\\CdRom0" itself -- the bare
+ * device, with nothing after it -- and then issues IOCTLs on the handle. The
+ * path table in kernel_path.c only carries the "\\Device\\CdRom0\\" form with
+ * the separator, which is the prefix for reading a *file* off the disc, so the
+ * bare open matched no rule, was reported as "Unrecognized Xbox path", and came
+ * back STATUS_OBJECT_PATH_NOT_FOUND. DDS9 reads that as "no disc" and exits
+ * through HalReturnToFirmware before it draws a frame.
+ *
+ * There is nothing on the host to open here: the game directory is a
+ * directory, and a directory handle would not answer the IOCTLs that follow.
+ * So the open returns a synthetic handle, in the same style as the ones
+ * NtCreateDirectoryObject and the partition devices already hand out. It is
+ * deliberately untagged, which bridge_resolve_handle passes through unchanged,
+ * and distinct so bridge_NtDeviceIoControlFile can recognise it by value.
+ *
+ * Accepts the "\??\" prefix, since titles reach the device both ways.
+ */
+#define BRIDGE_CDROM_HANDLE 0xDECD0001u
+
+static int bridge_is_cdrom_device(const char *path)
+{
+    if (!path) return 0;
+    if (_strnicmp(path, "\\??\\", 4) == 0) path += 4;
+    return _stricmp(path, "\\Device\\CdRom0") == 0;
+}
+
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
 static NTSTATUS bridge_create_file_impl(
     uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
@@ -2576,6 +2605,16 @@ static NTSTATUS bridge_create_file_impl(
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
+
+    if (bridge_is_cdrom_device(name.Buffer)) {
+        fprintf(stderr, "  [FILE] %s -> synthetic DVD device handle\n",
+                name.Buffer);
+        if (handle_va)
+            BRIDGE_MEM32(handle_va) = BRIDGE_CDROM_HANDLE;
+        bridge_write_iostatus(iostatus_va, 0, 1 /* FILE_OPENED */);
+        return 0;
+    }
+
     memset(&ios, 0, sizeof(ios));
 
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
@@ -3249,10 +3288,92 @@ static void bridge_IoCreateFile(void)
 
 static void bridge_NtDeviceIoControlFile(void)
 {
+    uint32_t handle  = STACK_ARG(0);
     uint32_t ios_va  = STACK_ARG(4);
     uint32_t ioctl   = STACK_ARG(5);
     uint32_t out_va  = STACK_ARG(8);
     uint32_t out_len = STACK_ARG(9);
+
+    /* IOCTLs aimed at the DVD device (see bridge_is_cdrom_device).
+     *
+     * These are the media check: the title asks the drive to confirm a disc is
+     * present and that it is the one it expects. There is no drive here and no
+     * disc to describe, so the honest answer is the one that lets the title
+     * proceed -- the alternative is STATUS_NOT_SUPPORTED, which it reads as a
+     * failed check and answers with HalReturnToFirmware.
+     *
+     * Reported rather than silent: which codes a title sends is the useful
+     * fact when the check still fails, and guessing at them from documentation
+     * is how this layer accumulates handlers for IOCTLs nothing ever sends. The
+     * output buffer is zeroed, so a title that reads a result field back sees a
+     * defined value instead of whatever was on its heap. */
+    if (handle == BRIDGE_CDROM_HANDLE) {
+        uint32_t in_va  = STACK_ARG(6);
+        uint32_t in_len = STACK_ARG(7);
+
+        /* The media check arrives as a SCSI pass-through, so the answer the
+         * title reads is not the IOCTL's output buffer -- that is NULL here,
+         * with length zero -- but the DataBuffer the request points at.
+         * Returning STATUS_SUCCESS alone leaves that buffer as the title
+         * zeroed it, which it reads as a failed check; DDS9 retries five
+         * times and then exits through HalReturnToFirmware.
+         *
+         * SCSI_PASS_THROUGH_DIRECT, 32-bit layout, 44 bytes:
+         *   0 Length(USHORT)  2 ScsiStatus  3 PathId  4 TargetId  5 Lun
+         *   6 CdbLength  7 SenseInfoLength  8 DataIn
+         *   12 DataTransferLength  16 TimeOutValue  20 DataBuffer
+         *   24 SenseInfoOffset  28 Cdb[16] */
+        if (in_va && in_len >= 44 && BRIDGE_MEM8(in_va + 28) == 0x5A) {
+            uint32_t data_va  = BRIDGE_MEM32(in_va + 20);
+            uint32_t data_len = BRIDGE_MEM32(in_va + 12);
+            uint32_t page     = BRIDGE_MEM8(in_va + 30) & 0x3F;
+
+            fprintf(stderr, "  [FILE] DVD MODE SENSE(10) page 0x%02X, "
+                            "%u bytes -> authentication page\n", page, data_len);
+
+            if (data_va && data_len) {
+                uint32_t i;
+                for (i = 0; i < data_len; i++)
+                    BRIDGE_MEM8(data_va + i) = 0;
+
+                /* An 8-byte MODE SENSE(10) parameter header, then the page.
+                 * The three bytes that matter are named by the title's own
+                 * validation at guest 0x0021EA56-0x0021EA6D, which is the only
+                 * specification of this page there is: byte 11 must be exactly
+                 * 1, and bytes 10 and 12 must both be non-zero. Anything else
+                 * is read as "not the expected disc". */
+                if (data_len >= 2) {
+                    BRIDGE_MEM8(data_va + 0) = 0;
+                    BRIDGE_MEM8(data_va + 1) = 26;   /* mode data length */
+                }
+                if (data_len >= 10) {
+                    BRIDGE_MEM8(data_va + 8) = 0x3E; /* page code */
+                    BRIDGE_MEM8(data_va + 9) = 18;   /* page length */
+                }
+                if (data_len >= 13) {
+                    BRIDGE_MEM8(data_va + 10) = 1;   /* non-zero */
+                    BRIDGE_MEM8(data_va + 11) = 1;   /* exactly 1 */
+                    BRIDGE_MEM8(data_va + 12) = 1;   /* non-zero */
+                }
+            }
+
+            BRIDGE_MEM8(in_va + 2) = 0;              /* ScsiStatus = GOOD */
+            bridge_write_iostatus(ios_va, 0, in_len);
+            g_eax = 0;
+            return;
+        }
+
+        fprintf(stderr, "  [FILE] DVD device IOCTL 0x%X (in=%u out=%u) "
+                        "-> STATUS_SUCCESS\n", ioctl, in_len, out_len);
+        if (out_va && out_len) {
+            uint32_t i;
+            for (i = 0; i < out_len; i++)
+                BRIDGE_MEM8(out_va + i) = 0;
+        }
+        bridge_write_iostatus(ios_va, 0, out_len);
+        g_eax = 0;
+        return;
+    }
 
     if (ioctl == IOCTL_DISK_GET_DRIVE_GEOMETRY) {
         /* DISK_GEOMETRY: Cylinders (LARGE_INTEGER), MediaType,
