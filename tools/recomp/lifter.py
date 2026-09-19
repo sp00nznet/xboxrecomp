@@ -432,6 +432,19 @@ _EFLAGS_PRESERVE = frozenset({
 })
 
 
+def _has_xmm_operand(ops):
+    """True for the SSE reading of a mnemonic the string operations share.
+
+    Only "movsd" is ambiguous in the dispatcher today -- "cmpsd" is the other
+    mnemonic x86 overloads this way, but it has no SSE lifter here yet. The
+    test is written over the operands rather than the mnemonic so it stays
+    correct if one is added.
+    """
+    return any(op is not None and getattr(op, "type", None) == "reg"
+               and (getattr(op, "reg", None) or "").startswith("xmm")
+               for op in (ops or ()))
+
+
 def _make_condition(jcc, flag_setter, flag_ops):
     """
     Generate a C condition expression for a jcc based on what set the flags.
@@ -1191,8 +1204,15 @@ class Lifter:
         # ── String operations ──
         if m.startswith("rep ") or m.startswith("repe ") or m.startswith("repne "):
             return self._lift_rep_string(insn, m)
+        # "movsd" is TWO instructions. The string MOVSD copies a dword from
+        # [esi] to es:[edi]; the SSE2 MOVSD moves a scalar double in or out of
+        # an xmm register. They share a mnemonic and nothing else, and this
+        # branch runs ahead of the SSE one below, so an SSE movsd was lifted
+        # as a string copy -- walking esi and edi and touching neither operand
+        # the instruction actually names. Told apart by the only thing that
+        # differs.
         if m in ("movsb", "movsd", "movsw", "stosb", "stosd", "stosw",
-                 "lodsb", "lodsd", "lodsw"):
+                 "lodsb", "lodsd", "lodsw") and not _has_xmm_operand(ops):
             return self._lift_string_op(insn, m)
         if m == "wait":
             return ["/* wait - FPU sync */"]
