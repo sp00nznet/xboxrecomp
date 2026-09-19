@@ -104,7 +104,8 @@ def test_seeds_drops_unaligned_targets():
         db = os.path.join(tmp, "targets.json")
         out = os.path.join(tmp, "seeds.json")
         save_db(db, {0x001B5540: 2, 0x001D99BA: 2, 0x0024B5FB: 2, 0x00130EC0: 2})
-        assert main(["--db", db, "seeds", "--out", out, "--align", "16"]) == 0
+        assert main(["--db", db, "--functions", os.path.join(tmp, "none.json"),
+                     "seeds", "--out", out, "--align", "16"]) == 0
         kept = load_db(out)
     assert sorted(kept) == [0x00130EC0, 0x001B5540], [hex(v) for v in kept]
 
@@ -114,7 +115,8 @@ def test_seeds_align_zero_keeps_everything():
         db = os.path.join(tmp, "targets.json")
         out = os.path.join(tmp, "seeds.json")
         save_db(db, {0x001B5540: 2, 0x001D99BA: 2})
-        assert main(["--db", db, "seeds", "--out", out, "--align", "0"]) == 0
+        assert main(["--db", db, "--functions", os.path.join(tmp, "none.json"),
+                     "seeds", "--out", out, "--align", "0"]) == 0
         assert len(load_db(out)) == 2
 
 
