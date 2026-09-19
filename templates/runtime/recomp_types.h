@@ -79,8 +79,12 @@
 void recomp_debug_service(uint32_t service, uint32_t arg_va);
 
 /* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent.
- * The auto-generated code emits __debugbreak for x86 INT 3 instructions. */
-#if !defined(_MSC_VER) && !defined(__debugbreak)
+ * The auto-generated code emits __debugbreak for x86 INT 3 instructions.
+ * !defined(__debugbreak) is not enough on its own: MinGW declares __debugbreak
+ * as a function, not a macro, so that test passes and the macro is defined
+ * anyway. Any windows.h reaching this TU afterwards then fails to declare it.
+ * Excluding _WIN32 outright leaves the SDK's own int3 intrinsic in place. */
+#if !defined(_MSC_VER) && !defined(_WIN32) && !defined(__debugbreak)
 #define __debugbreak() __builtin_trap()
 #endif
 
