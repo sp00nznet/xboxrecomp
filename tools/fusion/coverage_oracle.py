@@ -15,6 +15,13 @@ mid-function-entry cases our detector still merges. Run it after detector change
 to measure movement against ground truth.
 
     py -3 -m tools.fusion.coverage_oracle <module.dll> <our_functions.json>
+
+`our_functions.json` is our detection for the *donor* title, so it comes from
+running the pipeline over that title's original Xbox default.xbe. Get one out
+of the package with tools/fusion/svod.py -- the SVOD container is not sealed:
+
+    py -3 -m tools.fusion.svod extract "<package>" default.xbe donor.xbe
+    py -3 -m tools.disasm donor.xbe --text-only
 """
 import bisect
 import json

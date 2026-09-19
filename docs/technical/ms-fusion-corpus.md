@@ -139,6 +139,9 @@ Reading the differences:
 3. **The byte-dense map is a coverage oracle.** For any guest address it says "this is code",
    which we can use to validate our own function/boundary detection: a start our detector misses
    that Microsoft treats as an entry point is a detector gap worth investigating.
+   `tools/fusion/coverage_oracle.py` grades it, and needs the donor title's original Xbox
+   `default.xbe` to grade *against*. That XBE lives in the package's SVOD container, which is
+   not sealed — see [svod-extraction.md](svod-extraction.md) for the format and the reader.
 
 ---
 
