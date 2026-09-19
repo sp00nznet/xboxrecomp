@@ -23,6 +23,34 @@ cmake --build build --config Release
 
 This produces six static libraries in `build/src/*/Release/`. See the [README](README.md) for the full architecture diagram and library descriptions.
 
+### macOS
+
+The toolkit and its tests build and run here too — the runtime's Win32 calls go
+through the POSIX shims in `src/platform/`. One command sets everything up:
+
+```bash
+bash tools/macos/setup.sh
+```
+
+That creates a `.venv` with the Python dependencies and installs a `py` shell
+function, so the `py -3` commands in these docs work as written — enough to run
+`py -3 -m pytest tools/`. The conformance suite additionally needs container
+images, which are large and slow to build, so they are opt-in:
+
+```bash
+bash tools/macos/setup.sh --test        # adds the images (~2.2 GB, ~10 min)
+```
+
+The Docker containers exist because conformance executes code as **real 32-bit x86** and
+compares it against the lifted C. Apple Silicon has no such CPU — Rosetta
+translates x86-64 only, and macOS dropped 32-bit support in Catalina — so a
+`linux/386` container supplies one. What is substituted is the toolchain, never
+the comparison. Two of the images carry MSVC under Wine, which the corpus and
+XBE phases need because those exist to exercise MSVC's *own* codegen; see
+[tools/conformance/msvc-wine/](tools/conformance/msvc-wine/).
+
+After setup the suite runs exactly as it does on Windows, with the same commands.
+
 ## Project Structure
 
 The repository has two halves:
@@ -101,20 +129,32 @@ Every Xbox game has its own asset formats. If you reverse-engineer a texture for
 
 ## Testing
 
-The Python side of the toolchain has a test suite. Run it before opening a PR:
+The Python side of the toolchain has a test suite. Run it before opening a PR
+(on macOS or Linux, run [setup](#macos-and-linux) once first):
 
 ```
 py -3 -m pytest tools/       # unit tests
 py -3 -m tools.conformance   # differential: lifted C vs the real CPU
 ```
 
-Run unit tests on MacOS
+The unit tests are fast and need no game files — the lifter tests assemble real byte
+sequences and check the C that comes out. If you fix a lift, add the case.
 
-```bash
-bash tools/macos/run_tests.sh
+`pytest tools/` reports **1 skipped**, and that is the expected result anywhere
+without a 32-bit MSVC. The skip is `test_conformance.py`, which wraps the
+differential suite: it needs an assembler and a CPU to compare against, and it
+will not reach for the containers on its own, because building and running them
+is far too heavy a side effect for a unit-test pass. That check is not going
+unrun — `py -3 -m tools.conformance` is where it lives off Windows.
+
+To run it from pytest anyway, opt in explicitly:
+
+```
+XBOXRECOMP_PYTEST_DOCKER=1 py -3 -m pytest tools/
 ```
 
-The unit tests are fast and need no game files — the lifter tests assemble real byte
+That needs the container images (`bash tools/macos/setup.sh --test`) and takes
+longer. The unit tests are fast and need no game files — the lifter tests assemble real byte
 sequences and check the C that comes out. If you fix a lift, add the case.
 
 Running a game is still manual:

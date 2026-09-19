@@ -164,7 +164,7 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 ### Prerequisites
 
 - **Windows 11/10** (D3D11 backend) — or **Linux** (OpenGL backend; `tools/linux/install_deps.sh`)
-- **macOS**: install the native libraries required by the OpenGL backend with `brew install sdl2 libepoxy`
+- **macOS**: homebrew, docker `tools/macos/setup.sh`
 - **Python 3.10+** with `capstone` (`pip install capstone`)
 - **Visual Studio 2022** (MSVC compiler)
 - **CMake 3.20+**
@@ -428,28 +428,42 @@ expression and requires it to fail. They need a C compiler on `PATH`, and
 export PATH="/c/Program Files/LLVM/bin:$PATH"   # Git Bash
 ```
 
-Run unit tests on MacOS
-```bash
-bash tools/macos/run_tests.sh
-```
-
 The unit tests are fast and need no game files. The conformance suite goes
 further: it assembles each snippet, lifts the resulting bytes, then runs the
 lifted C *and the original instructions* over the same inputs and requires them
 to agree. The CPU executing those instructions is the oracle — no model to be
 wrong. See [Conformance Testing](docs/technical/conformance-testing.md).
 
+### Running the tests (MacOS)
+
 That oracle has to be 32-bit x86. On Windows a 32-bit MSVC supplies one.
-Everywhere else a `linux/386` container stands in for the toolchain while the
-lifting stays on the host:
+Everywhere else Docker containers stand in for the toolchain while the lifting stays on
+the host. Run the setup once:
 
 ```bash
-bash tools/macos/run_conformance_tests.sh
+bash tools/macos/setup.sh --test        # adds the images (~2.2 GB, ~10 min)
 ```
 
-That builds the container image on first run, then runs the snippet phase. The
-corpus and XBE phases need MSVC (they link a PE DLL and lift it back out) and
-report as skipped, never as passed.
+After that **the suite runs exactly as it does on Windows** — the commands below
+are the commands, no platform-specific runner:
+
+```bash
+py -3 -m tools.conformance                  # snippets + corpus
+py -3 -m tools.conformance --only snippets
+py -3 -m tools.conformance --xbe tools/conformance/test.xbe
+```
+
+| image | phase | cost |
+|---|---|---|
+| `xboxrecomp-gcc-i386` | snippets | ~280 MB, under a minute |
+| `xboxrecomp-msvc-amd64` | corpus, XBE — compiles and links | ~975 MB, ~5 min |
+| `xboxrecomp-msvc-wine` | corpus, XBE — runs the 32-bit harnesses | ~985 MB, ~4 min |
+
+The snippet image is GCC and builds in seconds. The other two carry MSVC under
+Wine and each download ~1.5 GB from Microsoft, so setup says what it is about to
+do before building them. See
+[tools/conformance/msvc-wine/](tools/conformance/msvc-wine/) for why corpus and
+XBE need the real MSVC where snippets do not, and why it takes two images.
 
 If you fix a lift, add the case.
 

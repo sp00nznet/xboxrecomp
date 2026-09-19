@@ -1,0 +1,109 @@
+# MSVC under Wine, for the conformance corpus phase.
+#
+# The snippet phase runs anywhere, because a snippet is assembly *text* and any
+# assembler produces the same bytes -- GCC stands in for MSVC without changing
+# what is tested. The corpus phase is different: it exists to exercise MSVC's
+# own codegen, the instruction selection and CRT helpers real Xbox titles are
+# built from. Substituting GCC there would test shapes no title contains, so the
+# only honest port is to run the real MSVC.
+#
+# WHY i386/debian AND NOT ubuntu
+# ------------------------------
+# Two constraints collide. The corpus harness is a 32-bit PE and has to actually
+# execute, which needs 32-bit x86: Rosetta is x86-64 only, so a linux/amd64
+# container cannot run it on Apple Silicon, while linux/386 demonstrably can.
+# That rules out the amd64 ubuntu base upstream msvc-wine uses.
+#
+# Ubuntu then has no maintained i386: it dropped i386 as a release architecture
+# after 18.04, and `i386/ubuntu:latest` is 18.04 (EOL) carrying wine 3.0 from
+# 2018 -- too old to be worth pointing at a modern MSVC. Debian still supports
+# i386 properly, and bookworm ships wine 8.0 and msitools 0.101.
+#
+# Everything here is therefore 32-bit: wine32 runs the Hostx86 MSVC tools, which
+# are themselves 32-bit PEs, and the harness it builds runs in the same place.
+FROM i386/debian:bookworm-slim AS base
+
+# msitools unpacks the MSI packages vsdownload.py fetches; the README wants
+# 0.98 or newer, and bookworm has 0.101.
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        wine wine32 python3 python3-simplejson msitools ca-certificates \
+        winbind procps && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Initialise the wine prefix, and wait for wineserver to exit before the layer
+# closes -- killing it mid-write corrupts the prefix.
+ENV WINEDEBUG=-all
+# cl.exe puts its temporary .il files in TEMP; without a writable one it
+# stops with "D8037: cannot create temporary il file".
+ENV TMP=/tmp TEMP=/tmp
+RUN wine wineboot --init && \
+    while pgrep wineserver > /dev/null; do sleep 1; done
+
+# Both stages start from `base`, and only the pruned toolchain is copied out of
+# `build`. Deleting files in a later layer does not reclaim what an earlier one
+# already committed -- the download layer writes several GB, and a later `rm`
+# just adds whiteouts over it.
+FROM base AS build
+
+WORKDIR /opt/msvc
+
+# Download and install are separate layers on purpose: the download is ~1.5GB
+# and slow under emulation, so iterating on install.sh should not re-fetch it.
+# vsdownload.py is copied alone for the same reason -- touching any other file
+# must not invalidate the download layer.
+COPY vsdownload.py ./
+
+# x86 only, host and target. The full install carries four architectures plus
+# ATL, DIA and MSBuild; none of that is reachable from a corpus that compiles C
+# and links one DLL. The Windows SDK stays, because the link step needs
+# kernel32.lib.
+# MSVC_SKIP_SDK_ARCHS is a local patch to vsdownload.py: --architecture
+# filters the MSVC toolchains but not the Windows SDK, which arrives as one
+# set of per-architecture MSIs -- including a 219MB arm64 link library in an
+# image that only ever targets x86.
+RUN MSVC_SKIP_SDK_ARCHS=arm,arm64 PYTHONUNBUFFERED=1 \
+    ./vsdownload.py --accept-license --dest /opt/msvc \
+        --architecture x86 --host-arch x86 \
+        --with-atl no --with-dia no --with-msbuild no --with-asan no
+
+COPY lowercase fixinclude install.sh msvctricks.cpp ./
+COPY wrappers/ ./wrappers/
+
+# MSVC_HOST_ARCH is a local patch to install.sh: upstream hardcodes an x64 host,
+# so with only Hostx86 unpacked it finds no Host$host/$arch/cl.exe and silently
+# creates no bin/ wrappers at all.
+# Pruned here for the same reasons as Dockerfile.amd64. This image is the x86
+# *host*, so lib/x86 is what stays; onecore and x64 are target libraries for
+# platforms nothing here builds for, and the arm64 SDK libraries survive the
+# download filter because some ship inside arch-neutral MSIs.
+RUN MSVC_HOST_ARCH=x86 bash ./install.sh /opt/msvc && \
+    rm -f lowercase fixinclude install.sh vsdownload.py && \
+    rm -rf wrappers && \
+    rm -rf /opt/msvc/VC/Tools/MSVC/*/lib/onecore \
+           /opt/msvc/VC/Tools/MSVC/*/lib/x64 \
+           "/opt/msvc/Windows Kits/10/lib"/*/um/arm64 \
+           "/opt/msvc/Windows Kits/10/lib"/*/um/arm \
+           "/opt/msvc/Windows Kits/10/lib"/*/ucrt/arm64 \
+           "/opt/msvc/Windows Kits/10/lib"/*/ucrt/arm \
+           "/opt/msvc/Windows Kits/10/lib"/*/ucrt_enclave/arm64 \
+           "/opt/msvc/Windows Kits/10/bin"/*/arm64 \
+           "/opt/msvc/Windows Kits/10/bin"/*/arm \
+           "/opt/msvc/Windows Kits/10/References" \
+           "/opt/msvc/Windows Kits/10/Redist" \
+           "/opt/msvc/Windows Kits/10/Testing" \
+           /opt/msvc/MSBuild && \
+    rm -f /opt/msvc/WinSDK-*-listing.txt
+
+
+
+# ---------------------------------------------------------------------------
+# Final image: the same base, plus only the pruned toolchain.
+# ---------------------------------------------------------------------------
+FROM base
+
+COPY --from=build /opt/msvc /opt/msvc
+
+ENV PATH="/opt/msvc/bin/x86:${PATH}"
+WORKDIR /w

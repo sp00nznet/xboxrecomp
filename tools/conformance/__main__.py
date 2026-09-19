@@ -74,7 +74,7 @@ def _cl(vcvars, workdir, args):
     return subprocess.run(cmd, cwd=workdir, shell=True, capture_output=True,
                           text=True)
 
-_IMAGE = "xboxrecomp-conf-i386"
+_IMAGE = "xboxrecomp-gcc-i386"
 
 def _docker_image_present():
     # Not just a non-zero exit: with no docker on PATH at all this raises
@@ -109,6 +109,51 @@ class _Container:
         if self.cid:
             subprocess.run(["docker", "rm", "-f", self.cid], capture_output=True)
             self.cid = None
+
+
+# ---------------------------------------------------------------------------
+# MSVC under Wine, for the corpus phase, in two images.
+#
+# The corpus exists to exercise MSVC's *own* codegen -- the instruction
+# selection and CRT helpers real Xbox titles are built from -- so unlike the
+# snippets, GCC is not an acceptable stand-in here.
+#
+# It takes two containers because no single one can do both halves on Apple
+# Silicon. link.exe is I/O-bound over memory-mapped files and never finishes
+# under 32-bit emulation (hours, for three trivial functions), so the build runs
+# on amd64, where the Hostx64/x86 tools are 64-bit PEs that Rosetta translates at
+# close to native speed. But Rosetta cannot execute 32-bit x86 at all, and wine
+# runs 32-bit code in-process rather than as a separate binary, so the 32-bit
+# harness that build produces has to execute on the i386 image instead.
+#
+# See tools/conformance/msvc-wine/README.md for the measurements.
+# ---------------------------------------------------------------------------
+
+_MSVC_AMD64 = "xboxrecomp-msvc-amd64"   # cl + link
+_MSVC_I386 = "xboxrecomp-msvc-wine"     # runs the 32-bit PEs amd64 builds
+
+_MSVC_BUILD_HINT = (
+    "    cd tools/conformance/msvc-wine\n"
+    "    docker build --platform linux/amd64 -t " + _MSVC_AMD64 +
+    " -f Dockerfile.amd64 .\n"
+    "    docker build --platform linux/386  -t " + _MSVC_I386 +
+    " -f Dockerfile.i386  .")
+
+
+def _image_present(name):
+    return subprocess.run(["docker", "image", "inspect", name],
+                          capture_output=True).returncode == 0
+
+
+def _msvc(image, platform, workdir, script, mounts=()):
+    """Run a shell script with the MSVC tools on PATH; workdir is /w inside."""
+    cmd = ["docker", "run", "--rm", "--platform", platform,
+           "-v", f"{workdir}:/w", "-w", "/w"]
+    for src, dst in mounts:
+        cmd += ["-v", f"{src}:{dst}:ro"]
+    cmd += [image, "sh", "-c", "export PATH=/opt/msvc/bin/x86:$PATH\n" + script]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
 
 # "   1a:\t90                   \tnop"  ->  addr, bytes. objdump wraps a long
 # instruction onto a continuation line carrying an address but no mnemonic, so
@@ -249,6 +294,8 @@ def main_with_args(argv, allow_container=True):
 
     if args.xbe:
         rc = _run_xbe(vcvars, workdir, runtime_inc, args)
+        if dk:
+            dk.close()
         if not args.keep:
             import shutil
             shutil.rmtree(workdir, ignore_errors=True)
@@ -256,6 +303,8 @@ def main_with_args(argv, allow_container=True):
 
     if args.only == "corpus":
         rc = _run_corpus(vcvars, workdir, runtime_inc, args)
+        if dk:
+            dk.close()
         if not args.keep:
             import shutil
             shutil.rmtree(workdir, ignore_errors=True)
@@ -369,11 +418,18 @@ def main_with_args(argv, allow_container=True):
 def _run_corpus(vcvars, workdir, runtime_inc, args):
     """Phase two: real C functions -- compiled, linked, lifted, compared."""
     nl = chr(10)
+    use_docker = False
     if not vcvars:
-        print(nl + "corpus phase SKIPPED: needs a 32-bit MSVC (PE/DLL linking). "
-              "The snippet phase above did run and did compare.",
-              file=sys.stderr)
-        return 0
+        if _image_present(_MSVC_AMD64) and _image_present(_MSVC_I386):
+            use_docker = True
+        else:
+            print(nl + "corpus phase SKIPPED: needs MSVC, which GCC cannot stand "
+                  "in for here -- this phase exists to exercise MSVC's own "
+                  "codegen. Either a 32-bit MSVC, or build both wine images:"
+                  + nl + nl + _MSVC_BUILD_HINT + nl
+                  + nl + "The snippet phase above did run and did compare.",
+                  file=sys.stderr)
+            return 0
     fns = [f for f in CORPUS if not args.k or args.k in f["name"]]
     if not fns:
         return 0
@@ -387,7 +443,11 @@ def _run_corpus(vcvars, workdir, runtime_inc, args):
     # MSVC defaults to SSE2 and puts doubles in XMM, which no real Xbox binary
     # contains, so without this the corpus would test instructions the target
     # cannot execute and skip the x87 paths every Xbox title actually uses.
-    r = _cl(vcvars, workdir, "/c /O2 /GS- /arch:IA32 corpus.c")
+    if use_docker:
+        r = _msvc(_MSVC_AMD64, "linux/amd64", workdir,
+                  "cl /nologo /c /O2 /GS- /arch:IA32 corpus.c")
+    else:
+        r = _cl(vcvars, workdir, "/c /O2 /GS- /arch:IA32 corpus.c")
     if r.returncode != 0:
         print("corpus compile failed:" + nl + r.stdout + r.stderr,
               file=sys.stderr)
@@ -395,11 +455,15 @@ def _run_corpus(vcvars, workdir, runtime_inc, args):
 
     # Linked, at a fixed base with relocations stripped, so every address in
     # the image is final and the harness can map it where it was built for.
-    link = subprocess.run(
-        f'"{vcvars}" >nul 2>&1 && link /NOLOGO /DLL /NOENTRY /OUT:corpus.dll '
-        f'/MAP:corpus.map /BASE:0x{corpus_run.IMAGE_BASE:08X} /FIXED '
-        f'/INCREMENTAL:NO corpus.obj kernel32.lib',
-        cwd=workdir, shell=True, capture_output=True, text=True)
+    link_args = (f'/NOLOGO /DLL /NOENTRY /OUT:corpus.dll /MAP:corpus.map '
+                 f'/BASE:0x{corpus_run.IMAGE_BASE:08X} /FIXED /INCREMENTAL:NO '
+                 f'corpus.obj kernel32.lib')
+    if use_docker:
+        link = _msvc(_MSVC_AMD64, "linux/amd64", workdir, "link " + link_args)
+    else:
+        link = subprocess.run(f'"{vcvars}" >nul 2>&1 && link ' + link_args,
+                              cwd=workdir, shell=True, capture_output=True,
+                              text=True)
     if link.returncode != 0:
         print("corpus link failed:" + nl + link.stdout + link.stderr,
               file=sys.stderr)
@@ -435,15 +499,39 @@ def _run_corpus(vcvars, workdir, runtime_inc, args):
 
     with open(os.path.join(workdir, "corpus_harness.c"), "w") as f:
         f.write(corpus_run.harness_source(entries, lifted, dll, sections, base, addr_of))
-    r = _cl(vcvars, workdir,
-            f'/W3 /I"{runtime_inc}" corpus_harness.c corpus.obj '
-            f'/Fecorpus_harness.exe')
+    if use_docker:
+        # The runtime headers are copied in rather than mounted and passed with
+        # /I: an include path has to survive translation into wine's view of the
+        # filesystem, and "/I." sidesteps that question entirely.
+        import shutil
+        for h in os.listdir(runtime_inc):
+            if h.endswith(".h"):
+                shutil.copy(os.path.join(runtime_inc, h), workdir)
+        r = _msvc(_MSVC_AMD64, "linux/amd64", workdir,
+                  "cl /nologo /W3 /I. corpus_harness.c corpus.obj "
+                  "/Fecorpus_harness.exe")
+    else:
+        r = _cl(vcvars, workdir,
+                f'/W3 /I"{runtime_inc}" corpus_harness.c corpus.obj '
+                f'/Fecorpus_harness.exe')
     if r.returncode != 0:
         print("corpus harness build failed:" + nl + r.stdout + r.stderr,
               file=sys.stderr)
         return 1
-    run = subprocess.run([os.path.join(workdir, "corpus_harness.exe")],
-                         capture_output=True, text=True)
+    if use_docker:
+        # On the i386 image, because the harness is a 32-bit PE and Rosetta
+        # cannot run those. Wrapped in a timeout: a fault under QEMU dumps core
+        # and then hangs rather than exiting, so without this a crashing corpus
+        # function would wedge the run instead of failing it.
+        run = _msvc(_MSVC_I386, "linux/386", workdir,
+                    "timeout 900 wine corpus_harness.exe")
+        if run.returncode == 124:
+            print(nl + "corpus harness timed out after 900s (a fault under "
+                  "emulation hangs rather than exits).", file=sys.stderr)
+            return 1
+    else:
+        run = subprocess.run([os.path.join(workdir, "corpus_harness.exe")],
+                             capture_output=True, text=True)
     print(run.stdout.strip())
     if run.returncode < 0 or run.returncode > 1:
         print(nl + f"corpus harness terminated abnormally: exit "
@@ -458,10 +546,15 @@ def _run_corpus(vcvars, workdir, runtime_inc, args):
 def _run_xbe(vcvars, workdir, runtime_inc, args):
     """Phase three: a real title's own functions, lifted and run against it."""
     nl = chr(10)
+    use_docker = False
     if not vcvars:
-        print(nl + "xbe phase SKIPPED: needs a 32-bit MSVC to build its harness.",
-              file=sys.stderr)
-        return 0
+        if _image_present(_MSVC_AMD64) and _image_present(_MSVC_I386):
+            use_docker = True
+        else:
+            print(nl + "xbe phase SKIPPED: needs MSVC to build its harness. "
+                  "Either a 32-bit MSVC, or build both wine images:"
+                  + nl + nl + _MSVC_BUILD_HINT, file=sys.stderr)
+            return 0
     from tools.recomp.disasm import Disassembler
 
     data, sections, base = xbe_run.load(args.xbe)
@@ -487,8 +580,20 @@ def _run_xbe(vcvars, workdir, runtime_inc, args):
     with open(os.path.join(workdir, "xbe_harness.c"), "w") as f:
         f.write(xbe_run.harness_source(os.path.abspath(args.xbe), sections,
                                        lifted, callable_))
-    r = _cl(vcvars, workdir,
-            f'/W3 /EHa /I"{runtime_inc}" xbe_harness.c /Fexbe_harness.exe')
+    if use_docker:
+        # Built with the real MSVC, so the harness keeps its windows.h,
+        # __asm {} and __try/__except exactly as written -- porting those to
+        # POSIX would be a rewrite of the one file whose job is to survive
+        # hostile code. /EHa is what makes __except catch a fault.
+        import shutil
+        for h in os.listdir(runtime_inc):
+            if h.endswith(".h"):
+                shutil.copy(os.path.join(runtime_inc, h), workdir)
+        r = _msvc(_MSVC_AMD64, "linux/amd64", workdir,
+                  "cl /nologo /W3 /EHa /I. xbe_harness.c /Fexbe_harness.exe")
+    else:
+        r = _cl(vcvars, workdir,
+                f'/W3 /EHa /I"{runtime_inc}" xbe_harness.c /Fexbe_harness.exe')
     if r.returncode != 0:
         print("xbe harness build failed:" + nl + r.stdout + r.stderr,
               file=sys.stderr)
@@ -500,10 +605,24 @@ def _run_xbe(vcvars, workdir, runtime_inc, args):
     exe = os.path.join(workdir, "xbe_harness.exe")
     skips, run = [], None
     for _ in range(40):
-        cmd = [exe, os.path.abspath(args.xbe)]
-        if skips:
-            cmd.append(",".join(f"{va:08X}" for va in skips))
-        run = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if use_docker:
+            # The title is mounted read-only rather than copied: it is the one
+            # input the harness reads at runtime, and it can be large.
+            argv = "/xbe/" + os.path.basename(args.xbe)
+            if skips:
+                argv += " " + ",".join(f"{va:08X}" for va in skips)
+            # timeout, because a fault under QEMU dumps core and then hangs
+            # instead of exiting -- and this harness runs code chosen to fault.
+            run = _msvc(_MSVC_I386, "linux/386", workdir,
+                        f"timeout 600 wine xbe_harness.exe {argv}",
+                        mounts=[(os.path.dirname(os.path.abspath(args.xbe)),
+                                 "/xbe")])
+        else:
+            cmd = [exe, os.path.abspath(args.xbe)]
+            if skips:
+                cmd.append(",".join(f"{va:08X}" for va in skips))
+            run = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=600)
         started = re.findall(r"@RUN ([0-9A-Fa-f]{8})", run.stdout)
         if run.returncode in (0, 1):
             break

@@ -272,6 +272,14 @@ of its functions directly, run the lifted C over the same arguments, compare.
 No game files are needed to run the rest of the suite, and none are included
 here; the phase only runs when you point it at an XBE you own.
 
+No title to hand? `py -3 tools/conformance/mkxbe.py` writes a small synthetic
+one to `tools/conformance/test.xbe` — enough to exercise the phase, not a
+substitute for a real title.
+
+```
+py -3 -m tools.conformance --xbe tools/conformance/test.xbe
+```
+
 ### Choosing what to call
 
 A function qualifies if it ends in a plain `ret` — **not** `ret imm16`, since a

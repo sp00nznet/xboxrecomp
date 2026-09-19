@@ -1,0 +1,114 @@
+# MSVC under Wine, 64-bit host -- for the conformance CORPUS phase.
+#
+# See Dockerfile.i386 for the 32-bit sibling and why there are two.
+#
+# The corpus phase compiles a C corpus with MSVC, links it into a PE DLL at a
+# fixed base, and lifts the functions back out of the linked image. It exists to
+# exercise MSVC's *own* codegen -- the instruction selection and CRT helpers real
+# Xbox titles are built from -- so substituting GCC would test shapes no title
+# contains. Only the real MSVC will do.
+#
+# WHY THIS ONE IS amd64
+# ---------------------
+# The 32-bit image can run cl.exe but not link.exe: measured in a linux/386
+# container on Apple Silicon, linking three trivial functions did not finish in
+# over three hours and left a half-written 2MB image. cl is compute-bound and
+# survives emulation; link is I/O-bound over memory-mapped files and does not.
+#
+# A 64-bit host sidesteps that entirely. The Hostx64/x86 toolchain is a set of
+# 64-bit PEs that still emit 32-bit x86 output, and on Apple Silicon Rosetta
+# translates x86-64 at near-native speed -- no QEMU i386 anywhere in the path.
+#
+# The corpus harness it builds is a 32-bit PE, so *running* it still needs the
+# i386 image. Build here, execute there.
+# Two stages on purpose. Deleting files in a later layer does not reclaim the
+# space an earlier layer already committed -- the download layer writes ~3.3GB
+# and a later `rm` only adds whiteouts on top, leaving the image just as large.
+# Only what is COPYed out of the build stage ends up in the final image.
+FROM ubuntu:24.04 AS base
+
+# `wine`, not `wine64`: on Ubuntu 24.04 the wine64 package ships no binaries at
+# all (it is transitional), so wineboot is simply absent and the init below
+# fails with 127. The wine package carries wine/wineboot/wineserver, and a
+# 64-bit wine is all this image needs -- running 32-bit PEs is the i386
+# image's job, so its "wine32 is missing" notice is expected here.
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        wine python3 python3-simplejson msitools ca-certificates procps && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# cl.exe writes intermediate .il files to TEMP; without a writable one it stops
+# with "D8037: cannot create temporary il file".
+ENV WINEDEBUG=-all
+ENV TMP=/tmp TEMP=/tmp
+
+# Wait for wineserver to exit before the layer closes -- killing it mid-write
+# corrupts the prefix. Needs procps for pgrep.
+RUN $(command -v wine64 || command -v wine) wineboot --init && \
+    while pgrep wineserver > /dev/null; do sleep 1; done
+
+# Both stages start from `base`: installing wine twice was half the clean build
+# time (150s of 299s), and the wine prefix is identical either way.
+FROM base AS build
+
+WORKDIR /opt/msvc
+
+# Download and install are separate layers on purpose: the download is slow and
+# large, so iterating on install.sh must not re-fetch it.
+COPY vsdownload.py ./
+# MSVC_SKIP_SDK_ARCHS is a local patch to vsdownload.py: --architecture
+# filters the MSVC toolchains but not the Windows SDK, which arrives as one
+# set of per-architecture MSIs -- including a 219MB arm64 link library in an
+# image that only ever targets x86.
+RUN MSVC_SKIP_SDK_ARCHS=arm,arm64 PYTHONUNBUFFERED=1 \
+    ./vsdownload.py --accept-license --dest /opt/msvc \
+        --architecture x86 --host-arch x64 \
+        --with-atl no --with-dia no --with-msbuild no --with-asan no
+
+COPY lowercase fixinclude install.sh msvctricks.cpp ./
+COPY wrappers/ ./wrappers/
+
+# install.sh already defaults to an x64 host, so no MSVC_HOST_ARCH here. It is
+# still run under bash: the script is #!/usr/bin/env sh but uses `&>`, a
+# bashism that misparses under dash and takes the build down over a step the
+# script itself treats as optional.
+# Pruned in the same layer as the install, so the bytes are never committed to
+# an image layer at all. Everything here is unreachable from "compile C for
+# 32-bit x86 and link one DLL":
+#   - VC lib/onecore and lib/x64 are target libraries for platforms we never
+#     target. The x64 *host* tools are executables; they do not link against
+#     these.
+#   - arm/arm64 SDK libs survive the download filter because some of them ship
+#     inside arch-neutral MSIs, so they have to be removed here instead.
+#   - References, Redist and Testing are SDK extras nothing in this path opens.
+#   - MSBuild arrives despite --with-msbuild no.
+RUN bash ./install.sh /opt/msvc && \
+    rm -f lowercase fixinclude install.sh vsdownload.py && \
+    rm -rf wrappers && \
+    rm -rf /opt/msvc/VC/Tools/MSVC/*/lib/onecore \
+           /opt/msvc/VC/Tools/MSVC/*/lib/x64 \
+           "/opt/msvc/Windows Kits/10/lib"/*/um/arm64 \
+           "/opt/msvc/Windows Kits/10/lib"/*/um/arm \
+           "/opt/msvc/Windows Kits/10/lib"/*/ucrt/arm64 \
+           "/opt/msvc/Windows Kits/10/lib"/*/ucrt/arm \
+           "/opt/msvc/Windows Kits/10/lib"/*/ucrt_enclave/arm64 \
+           "/opt/msvc/Windows Kits/10/bin"/*/arm64 \
+           "/opt/msvc/Windows Kits/10/bin"/*/arm \
+           "/opt/msvc/Windows Kits/10/References" \
+           "/opt/msvc/Windows Kits/10/Redist" \
+           "/opt/msvc/Windows Kits/10/Testing" \
+           /opt/msvc/MSBuild && \
+    rm -f /opt/msvc/WinSDK-*-listing.txt
+
+
+
+# ---------------------------------------------------------------------------
+# Final image: the same base, plus only the pruned toolchain.
+# ---------------------------------------------------------------------------
+FROM base
+
+COPY --from=build /opt/msvc /opt/msvc
+
+ENV PATH="/opt/msvc/bin/x86:${PATH}"
+WORKDIR /w
