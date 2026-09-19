@@ -33,9 +33,11 @@ def _sar(dst, cnt):
     insn = Instruction(0, 2, "sar", "", "00")
     insn.operands = [dst, cnt]
     lifted = Lifter().lift_instruction(insn)
-    # needs_cf is off, so the only statement is the write.
-    assert len(lifted) == 1, lifted
-    return lifted[0]
+    # needs_cf is off, so the statements are the write and the result
+    # snapshot the condition reads -- see Lifter._result_snapshot. The sweep
+    # is about the write; the snapshot rides along harmlessly.
+    assert len(lifted) == 2, lifted
+    return " ".join(lifted)
 
 
 def _legacy(dst, cnt):
@@ -62,6 +64,11 @@ PRELUDE = r"""
 #define SET_LO8(r, v)  ((r) = ((r) & 0xFFFFFF00u) | ((uint32_t)(uint8_t)(v)))
 #define SET_HI8(r, v)  ((r) = ((r) & 0xFFFF00FFu) | (((uint32_t)(uint8_t)(v)) << 8))
 #define SET_LO16(r, v) ((r) = ((r) & 0xFFFF0000u) | ((uint32_t)(uint16_t)(v)))
+/* The result-setter family publishes its ZF/SF here next to the write,
+   so a later jcc reads the result and not a destination something
+   has since overwritten. */
+static uint32_t _fa, _fb;
+static int32_t _fas, _fbs;
 static uint8_t g_ram[64];
 #define MEM8(a)  (*(volatile uint8_t *)(g_ram + (a)))
 #define MEM16(a) (*(volatile uint16_t *)(g_ram + (a)))

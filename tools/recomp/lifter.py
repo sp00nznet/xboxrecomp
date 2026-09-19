@@ -347,6 +347,22 @@ FLAG_SETTERS = frozenset({
 # generic fallback is a _flags variable nothing ever assigns -- the condition
 # came out always-false. MSVC's bit-oriented decoders are built entirely from
 # this shape: "add reg, reg" to shift the top bit into CF, then jae on it.
+# Setters that WRITE their destination and whose ZF/SF a later jcc reads. The
+# destination can be overwritten between the two, so each of these publishes
+# its result into _fa/_fas next to the write and the condition reads that --
+# the rule inc/dec has followed since "Result at the flag-setting
+# instruction, before later MOVs". See Lifter._result_snapshot.
+_RESULT_SNAPSHOT_SETTERS = frozenset({
+    "and", "or", "xor", "adc", "sbb", "neg",
+    "shl", "sal", "shr", "sar", "shld", "shrd",
+    "add", "sub",
+})
+# ...and the two whose conditions also need the SOURCE, to recover the
+# original destination from the result. Theirs goes into _fb, captured before
+# the write because `sub eax, eax` would otherwise snapshot an operand it has
+# already destroyed.
+_RESULT_SRC_SETTERS = frozenset({"add", "sub"})
+
 CF_TRACKED = frozenset({
     "add", "sub", "adc", "sbb", "shl", "shr", "sar",
 })
@@ -450,6 +466,16 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if flag_setter in ("cmp", "test", "bsf", "bsr") and len(flag_ops) >= 2:
         signed = (cmp_macro in SIGNED) or (test_macro in SIGNED)
         lhs, rhs = ("_fas", "_fbs") if signed else ("_fa", "_fb")
+    elif flag_setter in _RESULT_SNAPSHOT_SETTERS and flag_ops:
+        # Same reason as the cmp/test snapshot above, for the family that
+        # WRITES its destination rather than only reading it.
+        lhs = "_fa"
+        if flag_setter in _RESULT_SRC_SETTERS and len(flag_ops) >= 2:
+            rhs = "_fb"
+        elif len(flag_ops) >= 2:
+            rhs = _fmt_operand_read(flag_ops[1])
+        else:
+            rhs = None
     elif len(flag_ops) >= 2:
         lhs = _fmt_operand_read(flag_ops[0])
         rhs = _fmt_operand_read(flag_ops[1])
@@ -1598,6 +1624,36 @@ class Lifter:
 
     # ── ALU binary operations ──
 
+    def _result_snapshot(self, ops, m, src_too=False):
+        """Publish a result-setter's flags where they are computed.
+
+        The consuming jcc can be several instructions -- or several basic
+        blocks -- after the write, and anything between them may have
+        replaced the destination: a mov, a pop, a lea, a reloaded loop
+        pointer. Reading it back at the branch then asks about the wrong
+        value, silently.
+
+        inc/dec already publish _fa for exactly this, and _make_condition
+        says why: "Result at the flag-setting instruction, before later
+        MOVs." This is that, for the rest of the family.
+
+        src_too captures the SOURCE into _fb instead, for add and sub, whose
+        carry and ordered conditions recover the original destination from
+        result and source. The caller emits it BEFORE the write.
+        """
+        size = _operand_width(ops[0])
+        if size not in self._SNAP_MASK:
+            size = 4
+        mask, sx = self._SNAP_MASK[size], self._SNAP_SX[size]
+        if src_too:
+            src = _fmt_operand_read(ops[1])
+            return (f"_fb = (uint32_t)({src}) & {mask};"
+                    f" _fbs = (int32_t){sx}(_fb);"
+                    f" /* {m} source, before the write */")
+        dst = _fmt_operand_read(ops[0])
+        return (f"_fa = (uint32_t)({dst}) & {mask};"
+                f" _fas = (int32_t){sx}(_fa); /* {m} result */")
+
     def _lift_alu_binop(self, insn, ops, m):
         if len(ops) < 2:
             return [f"/* {m}: bad operands */"]
@@ -1608,9 +1664,12 @@ class Lifter:
         if m == "xor" and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             out = ["_cf = 0; /* xor clears CF */"] if self.needs_cf else []
             out.append(_fmt_operand_write(ops[0], "0") + " /* xor self */")
+            out.append(self._result_snapshot(ops, m))
             return out
         expr = f"{dst} {c_op} {src}"
         out = []
+        if m in _RESULT_SRC_SETTERS:
+            out.append(self._result_snapshot(ops, m, src_too=True))
         if self.needs_cf:
             # CF must be computed from the pre-write operands.
             if m == "add":
@@ -1621,6 +1680,7 @@ class Lifter:
             else:
                 out.append("_cf = 0; /* logical op clears CF */")
         out.append(_fmt_operand_write(ops[0], expr))
+        out.append(self._result_snapshot(ops, m))
         return out
 
     def _lift_inc_dec(self, insn, ops, m):
@@ -1651,6 +1711,7 @@ class Lifter:
             # neg sets CF iff the operand was non-zero (neg/sbb sign-extract).
             out.append(f"_cf = (int)(({val}) != 0);")
         out.append(_fmt_operand_write(ops[0], f"(uint32_t)(-(int32_t){val})"))
+        out.append(self._result_snapshot(ops, "neg"))
         return out
 
     def _lift_not(self, insn, ops):
@@ -1667,11 +1728,14 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         # sbb reg, reg is a common idiom: result is 0 or 0xFFFFFFFF depending on CF
         if ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-            return [_fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0") + " /* sbb self (CF extend) */"]
+            return [_fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0")
+                    + " /* sbb self (CF extend) */",
+                    self._result_snapshot(ops, "sbb")]
         w = (_operand_width(ops[0]) or 4) * 8
         return ["{ uint64_t _t = (uint64_t)(%s) - (uint64_t)(%s) - (uint64_t)_cf;"
                 " _cf = (int)((_t >> %d) & 1); %s }  /* sbb */"
-                % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t"))]
+                % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t")),
+                self._result_snapshot(ops, "sbb")]
 
     def _lift_adc(self, insn, ops):
         """ADC: add with carry."""
@@ -1682,7 +1746,8 @@ class Lifter:
         w = (_operand_width(ops[0]) or 4) * 8
         return ["{ uint64_t _t = (uint64_t)(%s) + (uint64_t)(%s) + (uint64_t)_cf;"
                 " _cf = (int)((_t >> %d) & 1); %s }  /* adc */"
-                % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t"))]
+                % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t")),
+                self._result_snapshot(ops, "adc")]
 
     def _lift_shld(self, insn, ops):
         """SHLD: double-precision shift left."""
@@ -1692,7 +1757,8 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         cnt = _fmt_operand_read(ops[2])
         return [_fmt_operand_write(ops[0],
-            f"({dst} << {cnt}) | ({src} >> (32 - {cnt}))") + " /* shld */"]
+            f"({dst} << {cnt}) | ({src} >> (32 - {cnt}))") + " /* shld */",
+            self._result_snapshot(ops, "shld")]
 
     def _lift_shrd(self, insn, ops):
         """SHRD: double-precision shift right."""
@@ -1702,7 +1768,8 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         cnt = _fmt_operand_read(ops[2])
         return [_fmt_operand_write(ops[0],
-            f"({dst} >> {cnt}) | ({src} << (32 - {cnt}))") + " /* shrd */"]
+            f"({dst} >> {cnt}) | ({src} << (32 - {cnt}))") + " /* shrd */",
+            self._result_snapshot(ops, "shrd")]
 
     def _lift_imul(self, insn, ops):
         nops = len(ops)
@@ -1760,6 +1827,7 @@ class Lifter:
             bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
             out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
         out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}"))
+        out.append(self._result_snapshot(ops, "shift"))
         return out
 
     def _lift_sar(self, insn, ops):
@@ -1800,6 +1868,7 @@ class Lifter:
         if self.needs_cf:
             out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed}) >> (({cnt}) - 1)) & 1);")
         out.append(_fmt_operand_write(ops[0], f"(uint32_t)(({signed}) >> {cnt})"))
+        out.append(self._result_snapshot(ops, "sar"))
         return out
 
     def _lift_rotate(self, insn, ops, m):
