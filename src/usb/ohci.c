@@ -123,9 +123,15 @@ typedef struct {
     uint32_t reg[OHCI_REG_MAX / 4];
     unsigned reads, writes, decode_fail;
     int      index;
+    int      periodic_seen;
 } OhciController;
 
 static OhciController s_hc[2];
+/* Which controller carries the device, and so which one this thread services.
+ * XAPI numbers its four gamepad slots across both controllers, and which end
+ * it starts from decides whether a pad shows up as player 1 or player 3 --
+ * a mapping worth finding by measurement, not by assertion. */
+static int s_device_hc;
 static int s_enabled;
 static int s_trace;
 
@@ -609,8 +615,19 @@ static int ohci_run_periodic_list(OhciController *hc)
     completed = 0;
     for (slot = 0; slot < 32u; slot++) {
         ed = rd32(hcca + slot * 4u) & ED_PTR_MASK;
-        if (ed)
-            completed += ohci_walk_eds(hc, ed, &done_head);
+        if (!ed)
+            continue;
+        /* The first interrupt endpoint the driver publishes is the one the
+         * input reports ride on, so say so once: an enumerated pad whose
+         * table stays empty is a pad nobody opened, which is a different
+         * problem from a pad nobody serviced. */
+        if (!hc->periodic_seen) {
+            hc->periodic_seen = 1;
+            fprintf(stderr, "  [OHCI%d] periodic slot %u -> ED %08X "
+                    "info=%08X\n", hc->index, slot, ed, rd32(ed));
+            fflush(stderr);
+        }
+        completed += ohci_walk_eds(hc, ed, &done_head);
     }
     if (completed)
         ohci_publish_done(hc, done_head);
@@ -789,7 +806,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     }
 
     for (;;) {
-        OhciController *hc = &s_hc[0];
+        OhciController *hc = &s_hc[s_device_hc];
         uint32_t control, enable, status;
 
         Sleep(20);
@@ -926,6 +943,10 @@ void xbox_OhciInit(void)
     s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
+    {
+        const char *hcspec = getenv("RECOMP_USB_HC");
+        s_device_hc = (hcspec && atoi(hcspec) == 1) ? 1 : 0;
+    }
 
 #if defined(_WIN32)
     /* The registers have to fault to be answered. The MCPX aperture is mapped
