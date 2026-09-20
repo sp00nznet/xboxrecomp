@@ -40,8 +40,16 @@ static inline void xbox_path_normalize(char *p)
 #endif
 }
 
-/* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent on POSIX. */
-#if !defined(_MSC_VER)
+/* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent on POSIX.
+ *
+ * Guarded on _WIN32, not on _MSC_VER, because the question is whether the
+ * platform already supplies __debugbreak -- not whether the compiler is MSVC.
+ * MinGW is a Windows compiler that is not MSVC: _MSC_VER is undefined there,
+ * so the old guard defined this macro and it then mangled the declaration
+ * windows.h makes of the same name, with "macro __debugbreak passed 1
+ * arguments, but takes just 0". That made the tree impossible to build with
+ * any Windows toolchain except MSVC. */
+#if !defined(_WIN32)
 #define __debugbreak() __builtin_trap()
 #endif
 
