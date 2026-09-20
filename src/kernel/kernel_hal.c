@@ -12,6 +12,8 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -31,6 +33,66 @@
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
+/* How many threads are holding IRQL at or above DISPATCH_LEVEL.
+ *
+ * The level itself is per-thread, which is right for a guest that asks "what
+ * is my IRQL". It is wrong for the question a device model has to answer:
+ * raising IRQL on hardware masks the interrupt for the whole processor, and
+ * the title raises it precisely to keep an ISR out of structures it is in the
+ * middle of editing. With the level thread-local, a controller thread sees
+ * PASSIVE_LEVEL, calls the ISR anyway, and the two race over exactly the
+ * state the guest was protecting -- which surfaces as an intermittent fault
+ * on a garbage pointer, far from the code that dropped it.
+ *
+ * A count rather than a flag, because several threads can be raised at once
+ * and the last one out is what re-opens the gate. */
+static volatile LONG g_irql_raised_count = 0;
+
+/* Non-zero while any thread is at or above DISPATCH_LEVEL. Device models call
+ * this before delivering an interrupt; OHCI and the NV2A are level-triggered,
+ * so a deferred interrupt is delivered on the next poll rather than lost. */
+int xbox_IrqlBlocksInterrupts(void)
+{
+    return InterlockedCompareExchange(&g_irql_raised_count, 0, 0) != 0;
+}
+
+/* The raw depth, for callers that want to report it. A count that only ever
+ * grows is a leak somewhere in the raise/lower pairs, and the number says so
+ * where a yes/no cannot. */
+int xbox_IrqlRaisedCount(void)
+{
+    return (int)InterlockedCompareExchange(&g_irql_raised_count, 0, 0);
+}
+
+static int  s_trace = -1;
+static volatile LONG s_traced = 0;
+
+static void irql_track(KIRQL old_level, KIRQL new_level)
+{
+    int was = (old_level >= DISPATCH_LEVEL);
+    int now = (new_level >= DISPATCH_LEVEL);
+    LONG d;
+
+    if (now == was)
+        return;
+
+    d = now ? InterlockedIncrement(&g_irql_raised_count)
+            : InterlockedDecrement(&g_irql_raised_count);
+
+    /* RECOMP_IRQL_TRACE prints the first few transitions. The pairing is what
+     * matters: a raise to 2 followed by a lower from 2 nets out, and a lower
+     * whose old level is not the level the raise set is a calling-convention
+     * bug upstream of here, not a title doing something exotic. */
+    if (s_trace < 0)
+        s_trace = getenv("RECOMP_IRQL_TRACE") ? 1 : 0;
+    if (s_trace && InterlockedIncrement(&s_traced) <= 20) {
+        fprintf(stderr, "  [IRQL] tid %lu %s %d->%d depth=%ld\n",
+                (unsigned long)GetCurrentThreadId(),
+                now ? "raise" : "lower", old_level, new_level, (long)d);
+        fflush(stderr);
+    }
+}
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
@@ -45,6 +107,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
             old, NewIrql);
     }
 
+    irql_track(old, NewIrql);
     g_current_irql = NewIrql;
     return old;
 }
@@ -61,6 +124,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
             g_current_irql, NewIrql);
     }
 
+    irql_track(g_current_irql, NewIrql);
     g_current_irql = NewIrql;
 }
 
@@ -70,6 +134,8 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
+
+    irql_track(old, DISPATCH_LEVEL);
     g_current_irql = DISPATCH_LEVEL;
     return old;
 }
