@@ -597,7 +597,11 @@ static void clear_surface(uint32_t param)
      * would show the one nothing is writing. */
     /* The window has to read where the pixels actually are, which is the
      * resolved address rather than the DMA-object offset. */
-    xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+    /* Only until the title flips. Following the draw surface on every scan
+     * shows the buffer being written right now, half a frame at a time; past
+     * the first flip the window is repointed at the finished one instead. */
+    if (s_gpu.flips == 0)
+        xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
 
     /* And open the window, rather than waiting for AvSetDisplayMode to do it.
      *
@@ -1685,6 +1689,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
+        /* Hand the window a copy of the frame just finished.
+         *
+         * The buffer the title has finished is the one the last batch drew
+         * into, which is what drawn_offset holds and why it exists: by the
+         * flip, color_offset has already moved to the next buffer. Copying
+         * here, rather than letting the window read guest memory on its own
+         * clock, is what stops it showing a surface the rasteriser is still
+         * writing. */
+        if (s_gpu.pitch) {
+            extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
+            uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                               : s_gpu.color_offset;
+            if (done) {
+                xbox_FramebufferWindowSet(dma_resolve(done), s_gpu.pitch);
+                xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
+            }
+        }
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
             if (n++ < 8) {

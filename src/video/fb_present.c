@@ -28,6 +28,20 @@ static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
+/* A finished frame, taken at the flip and shown until the next one.
+ *
+ * The window used to convert straight out of guest memory every 16 ms. Even
+ * pointed at the buffer the title had just finished, that races the executor
+ * drawing the next frame into the other one and, whenever the two swap, puts
+ * a half-drawn image on the screen -- which is the flicker. Copying the
+ * finished frame once per flip means the window never reads memory the
+ * rasteriser is writing, so what it shows cannot be half of anything.
+ *
+ * Two buffers and an index, swapped after the copy completes, so the window
+ * thread is never reading the one being filled. */
+static uint32_t     *s_present[2];
+static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
     /* RECOMP_FB_VA pins the window to one guest address instead of following
@@ -39,6 +53,49 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
     s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
     if (pitch)
         s_fb_pitch = pitch;
+}
+
+/* Called by the pushbuffer executor when the title flips. */
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+{
+    const uint8_t *src;
+    LONG next;
+    uint32_t bpp, x, y;
+
+    if (!s_fb_running || !fb_va || !pitch)
+        return;
+    if (getenv("RECOMP_FB_VA"))
+        return;                       /* pinned: leave the old path alone */
+    next = (s_present_idx == 0) ? 1 : 0;
+    if (!s_present[next]) {
+        s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
+                                             4);
+        if (!s_present[next])
+            return;
+    }
+    bpp = pitch / s_fb_width;
+    src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
+    for (y = 0; y < s_fb_height; y++) {
+        const uint8_t *row = src + (size_t)y * pitch;
+        uint32_t *dst = s_present[next] + (size_t)y * s_fb_width;
+
+        if (bpp == 4) {
+            memcpy(dst, row, (size_t)s_fb_width * 4);
+        } else if (bpp == 2) {
+            const uint16_t *p = (const uint16_t *)row;
+            for (x = 0; x < s_fb_width; x++) {
+                uint16_t v = p[x];
+                uint32_t r = (uint32_t)((v >> 11) & 0x1F) * 255u / 31u;
+                uint32_t g = (uint32_t)((v >>  5) & 0x3F) * 255u / 63u;
+                uint32_t b = (uint32_t)( v        & 0x1F) * 255u / 31u;
+                dst[x] = (r << 16) | (g << 8) | b;
+            }
+        } else {
+            memset(dst, 0, (size_t)s_fb_width * 4);
+        }
+    }
+    /* Published only once it is whole. */
+    InterlockedExchange(&s_present_idx, next);
 }
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -172,7 +229,20 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_fb_va && s_fb_pitch && s_rgb) {
+        if (s_present_idx >= 0 && s_rgb) {
+            /* A finished frame, published by the flip. Copied into s_rgb so
+             * the dump path and GDI see one consistent image even if the
+             * next flip lands mid-blit. */
+            LONG idx = s_present_idx;
+            if (s_present[idx])
+                memcpy(s_rgb, s_present[idx],
+                       (size_t)s_fb_width * s_fb_height * 4);
+            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+                          0, 0, (int)s_fb_width, (int)s_fb_height,
+                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+        } else if (s_fb_va && s_fb_pitch && s_rgb) {
+            /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
+             * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
@@ -181,12 +251,27 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
         }
         {
-            /* One dump, a few seconds in, so the title has had time to render
-             * something rather than catching the first blank frame. */
+            /* One dump a few seconds in, so the title has had time to render
+             * something rather than catching the first blank frame.
+             *
+             * RECOMP_FB_WINDOW_DUMP_EVERY=<frames> dumps repeatedly instead.
+             * This window follows the address AvSetDisplayMode gave, which is
+             * what the CRTC scans and therefore what a person sees; the
+             * pushbuffer executor's own dump follows its draw surface. With
+             * double buffering those are different buffers, and measuring
+             * progress from the executor's dump reports a blank screen while
+             * the window is showing the title's logo. Ask the window. */
             const char *dump = getenv("RECOMP_FB_DUMP");
+            const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
             static int frames;
-            if (dump && ++frames == 600)
+            int period = every ? atoi(every) : 0;
+            frames++;
+            if (dump && period > 0) {
+                if (frames % period == 0)
+                    xbox_FramebufferDumpBmp(dump);
+            } else if (dump && frames == 600) {
                 xbox_FramebufferDumpBmp(dump);
+            }
         }
         Sleep(16);
     }
@@ -215,5 +300,6 @@ void xbox_FramebufferWindowStart(void)
 
 #else
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 #endif
