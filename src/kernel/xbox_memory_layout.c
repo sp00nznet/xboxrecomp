@@ -993,6 +993,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 RECOMP_TLS uint32_t g_seh_ebp = 0;
 RECOMP_TLS double g_fp_stack[8];
 RECOMP_TLS int g_fp_top = 0;
+
+/* Set once at startup. The generated code reads it at the ret of every
+ * --force-return function, so it has to be cheap and it has to default to
+ * off: a build carrying forced functions behaves normally until the
+ * variable is set. */
+int g_force_return = 0;
 /* x87 control and status. The reset default masks every exception and
  * rounds to nearest, which is what the CRT expects before _control87. */
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
@@ -1281,6 +1287,7 @@ volatile uint64_t g_icall_count = 0;
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
+    g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
     DWORD old_protect;
     const uint8_t *xbe = (const uint8_t *)xbe_data;
 

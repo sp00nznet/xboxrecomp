@@ -108,6 +108,11 @@ extern ptrdiff_t g_xbox_mem_offset;
  *
  * These replace a hardcoded 0x00400000 cutoff that was only ever right for one
  * title -- see the comment where they are defined in xbox_memory_layout.c. */
+/* --force-return: read once at startup, so the check at each forced ret is a
+ * load rather than a getenv. Zero unless RECOMP_FORCE_RETURN is set, which is
+ * what lets a build carrying forced functions behave normally by default. */
+extern int g_force_return;
+
 extern uint32_t g_xbox_code_lo;
 extern uint32_t g_xbox_code_hi;
 

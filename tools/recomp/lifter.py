@@ -1221,6 +1221,7 @@ class Lifter:
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
         self.publishes_ebp = False  # Set per-function: has a real frame
         self.trace_exit_name = None  # Set per-function when traced
+        self.force_return_value = None   # Set per-function by --force-return
         # Every direct call target we emit a name for, as {addr: name}. The
         # batch translator diffs this against the functions it actually defined
         # so it can stub out the remainder (see translate_batch_split).
@@ -2302,10 +2303,40 @@ class Lifter:
         if self.trace_exit_name:
             prefix = (f'RECOMP_TRACE_EXIT("{self.trace_exit_name}", '
                       f'0x{self.func_start:08X}); ') + prefix
+        # --force-return: hand the caller a constant instead of what the
+        # body computed.
+        #
+        # Set at the ret rather than skipped at the entry, which matters:
+        # the epilogue still runs, so esp is adjusted by the function's own
+        # ret -- 4 for a cdecl, 4+n for a stdcall -- and nothing has to guess
+        # the calling convention. The body's side effects still happen; only
+        # the answer changes. Off at run time unless RECOMP_FORCE_RETURN is
+        # set, so a build carrying it behaves normally by default.
+        if self.force_return_value is not None:
+            prefix = (f'if (g_force_return) eax = '
+                      f'0x{self.force_return_value:X}U; ') + prefix
+
         if len(ops) >= 1 and ops[0].type == "imm":
             n = ops[0].imm
             return [f"{prefix}esp += {4 + n}; return; /* ret {n} */"]
         return [f"{prefix}esp += 4; return; /* ret */"]
+
+    def _forced_tail(self, tail):
+        """Apply --force-return to a tail jump.
+
+        A tail call leaves through the target, not through a ret, so the
+        assignment has to land after the call and before the return -- the
+        target still runs, and the caller still gets the constant. Shin
+        Megami Tensei: Nine's XMV "is the movie finished" query ends in
+        exactly this shape, so without it the option would miss the function
+        that motivated it.
+        """
+        if self.force_return_value is None:
+            return tail
+        return tail.replace(
+            "; return;",
+            f"; if (g_force_return) eax = 0x{self.force_return_value:X}U;"
+            f" return;", 1)
 
     def _is_external_target(self, addr):
         """Check if a jump target is outside the current function."""
@@ -2392,7 +2423,7 @@ class Lifter:
                             f'"tail 0x{insn.jump_target:08X}");',
                             tail,
                         ]
-                    return [tail]
+                    return [self._forced_tail(tail)]
                 name = self._call_target_name(insn.jump_target)
                 tail = (f"g_seh_ebp = ebp; {name}(); return; "
                         f"/* tail jmp 0x{insn.jump_target:08X} */")
@@ -2403,7 +2434,7 @@ class Lifter:
                     # between measuring and guessing.
                     return [f'RECOMP_TRACE_ESP("{self.trace_exit_name}", '
                             f'"tail 0x{insn.jump_target:08X}");', tail]
-                return [tail]
+                return [self._forced_tail(tail)]
             return [f"goto loc_{insn.jump_target:08X};"]
         elif len(ops) >= 1:
             # Detect intra-function switch tables (computed gotos)
@@ -2442,7 +2473,9 @@ class Lifter:
                     lines.append("g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
                     return lines
             target = _fmt_operand_read(ops[0])
-            return [f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return; /* indirect tail jmp */"]
+            return [self._forced_tail(
+                f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return;"
+                f" /* indirect tail jmp */")]
         return ["/* jmp: no target */"]
 
     def _lift_jcc(self, insn):
