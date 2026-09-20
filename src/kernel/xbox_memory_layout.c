@@ -762,15 +762,19 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 *r |= NV2A_IDLE[i].idle_mask;
             }
         }
-        {
-            volatile uint32_t *put =
-                (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-            volatile uint32_t *get =
-                (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
-            if (*get != *put) {
-                *get = *put;
-            }
-        }
+        /* DMA_GET used to be set to DMA_PUT here, at the top of the tick,
+         * before the scan below had executed anything.
+         *
+         * GET is what tells the title how far the GPU has consumed, and D3D
+         * waits on it before reusing the ring. Reporting "all consumed"
+         * while the commands were still unread gave the title permission to
+         * overwrite them, and it took it: the executor then read whatever
+         * part of the segment had survived, so each pass drew a different
+         * subset of the frame. It looks like unstable geometry and is a
+         * lost-command race.
+         *
+         * The advance now happens after the scan, further down, which is
+         * also the only ordering that gives the title real back-pressure. */
         fence_mirrors_tick();
         counter_mirrors_tick();
         frame_counters_tick();
@@ -817,9 +821,39 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * The contiguous window IS the physical-address view, so
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
-                    if (last_put && put > last_put)
+                    /* The pushbuffer is a ring, so PUT coming back below
+                     * where it was is a wrap, not a rewind. Scanning only
+                     * forward segments dropped everything written across
+                     * the seam -- one whole submission each time round.
+                     *
+                     * The ring's bounds are not published anywhere this
+                     * code can read, so they are learned: the lowest and
+                     * highest PUT seen bracket it. That is approximate on
+                     * the first lap and exact afterwards, and scanning a
+                     * little short of the true end costs the same commands
+                     * that were being lost anyway. */
+                    static uint32_t put_lo, put_hi;
+                    if (!put_lo || put < put_lo) put_lo = put;
+                    if (put > put_hi) put_hi = put;
+                    if (last_put && put > last_put) {
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                    } else if (last_put && put < last_put) {
+                        if (put_hi > last_put)
+                            nv2a_pb_scan(
+                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
+                        if (put > put_lo)
+                            nv2a_pb_scan(
+                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
+                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
+                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
+                            static unsigned wraps;
+                            if (wraps++ < 8)
+                                fprintf(stderr, "  [NV2A] pushbuffer wrapped "
+                                        "(0x%08X -> 0x%08X)\n", last_put, put);
+                        }
+                    }
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
@@ -827,6 +861,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         last_report = now_ms;
                         nv2a_pb_scan_report();
                     }
+                }
+                /* Consumed, now that it has actually been executed. */
+                {
+                    volatile uint32_t *get =
+                        (volatile uint32_t *)((char *)regs
+                                              + NV2A_USER_DMA_GET);
+                    *get = put;
                 }
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
