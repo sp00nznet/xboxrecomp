@@ -1123,6 +1123,222 @@ static int peek_readable(uint32_t va)
     return 0;
 }
 
+/* ---- RECOMP_WATCH: name the guest code that changes a guest dword -------
+ *
+ * A peek says a value changed between two samples. It does not say who
+ * changed it, and for a value produced deep inside a middleware layer that
+ * is the only question that matters -- reading the lifted C outwards from
+ * the write is guesswork, and reading it inwards from the caller is worse.
+ *
+ * Same mechanism as the AC'97 trap above: make the page read-only, catch the
+ * write, single-step it, then report. What it adds is the guest call chain,
+ * scanned off the guest stack the way the watchdog does, which turns "the
+ * mask became 4" into a list of addresses to go and read.
+ *
+ * Off unless RECOMP_WATCH is set. Costs a page fault per write to that page,
+ * so it is a bring-up tool and says so.
+ */
+static uint32_t g_watch_va;
+static void    *g_watch_page;
+static uint32_t g_watch_last;
+static void    *g_watch_veh;
+static RECOMP_TLS int s_watch_stepping;
+
+/* A plausible guest code address: inside the image, above the headers. The
+ * bound is the end of XPP, which is the last section holding code here. */
+static int watch_is_code(uint32_t va)
+{
+    return va >= 0x00011000u && va < 0x00317460u;
+}
+
+static void watch_report(void)
+{
+    const uint8_t *mem = (const uint8_t *)g_memory_offset;
+    uint32_t now = *(const uint32_t *)(mem + g_watch_va);
+    uint32_t esp = g_esp, i, shown = 0;
+
+    if (now == g_watch_last)
+        return;
+    fprintf(stderr, "[WATCH] [%08X] %08X -> %08X  (esp=%08X)\n",
+            g_watch_va, g_watch_last, now, esp);
+    g_watch_last = now;
+
+    /* Return addresses the recompiled code pushed, innermost first. Values
+     * that merely look like code get printed too -- the chain is a lead, not
+     * a proof, and saying so is cheaper than a stack walk that cannot be
+     * done without frame information the lift does not keep. */
+    for (i = 0; esp && i < 256u && shown < 12u; i++) {
+        uint32_t slot = esp + i * 4u;
+        uint32_t v;
+        if (!peek_readable(slot))
+            break;
+        v = *(const uint32_t *)(mem + slot);
+        if (watch_is_code(v)) {
+            fprintf(stderr, "         [esp+%-4u] %08X\n", i * 4u, v);
+            shown++;
+        }
+    }
+
+    /* RECOMP_WATCH_RAW also prints the frame unfiltered. The filtered chain
+     * answers "who wrote this"; the raw frame answers "to what object", which
+     * is the next question every time -- saved registers and pointer
+     * arguments live there and look nothing like code. */
+    if (getenv("RECOMP_WATCH_RAW")) {
+        for (i = 0; esp && i < 24u; i++) {
+            uint32_t slot = esp + i * 4u;
+            if (!peek_readable(slot))
+                break;
+            fprintf(stderr, "         raw[esp+%-4u] %08X\n", i * 4u,
+                    *(const uint32_t *)(mem + slot));
+        }
+    }
+    fflush(stderr);
+}
+
+static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    DWORD old;
+
+    if (!g_watch_page)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (code == EXCEPTION_SINGLE_STEP && s_watch_stepping) {
+        s_watch_stepping = 0;
+        watch_report();
+        VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old);
+        ep->ContextRecord->EFlags &= ~0x100u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if (code == EXCEPTION_ACCESS_VIOLATION
+            && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+
+        if (fault >= (uintptr_t)g_watch_page
+                && fault < (uintptr_t)g_watch_page + 4096) {
+            if (!VirtualProtect(g_watch_page, 4096, PAGE_READWRITE, &old))
+                return EXCEPTION_CONTINUE_SEARCH;
+            s_watch_stepping = 1;
+            ep->ContextRecord->EFlags |= 0x100u;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* The target, which may be reached through pointers that do not exist yet.
+ *
+ * "[[0x006DF414]]+0x14" is two dereferences and an offset: the interesting
+ * field of a heap object whose address changes run to run, but which is
+ * always reachable from a static one. Without this the only way to watch such
+ * a field is to learn its address from one run and hope the allocator repeats
+ * it, which it does not. */
+static unsigned g_watch_derefs;
+static uint32_t g_watch_root;
+static uint32_t g_watch_off;
+
+static int watch_resolve(uint32_t *out)
+{
+    const uint8_t *mem = (const uint8_t *)g_memory_offset;
+    uint32_t a = g_watch_root;
+    unsigned k;
+
+    for (k = 0; k < g_watch_derefs; k++) {
+        if (!peek_readable(a))
+            return 0;
+        a = *(const uint32_t *)(mem + a);
+        if (!a)
+            return 0;
+    }
+    a += g_watch_off;
+    if (!peek_readable(a))
+        return 0;
+    *out = a;
+    return 1;
+}
+
+static int watch_arm(uint32_t va);
+
+/* Poll until the chain resolves, then arm. Twenty milliseconds, because the
+ * object appears once during bring-up and never again -- this thread exists
+ * for a few seconds and then does nothing for the rest of the run. */
+static DWORD WINAPI watch_resolver(LPVOID unused)
+{
+    unsigned tries;
+
+    (void)unused;
+    for (tries = 0; tries < 15000u && !g_watch_page; tries++) {
+        uint32_t va;
+        if (watch_resolve(&va) && watch_arm(va))
+            return 0;
+        Sleep(20);
+    }
+    if (!g_watch_page)
+        fprintf(stderr, "  WATCH: %u-deep chain from 0x%08X never resolved\n",
+                g_watch_derefs, g_watch_root);
+    return 0;
+}
+
+void xbox_WatchInit(void)
+{
+    const char *spec = getenv("RECOMP_WATCH");
+    const char *q;
+    char *endp;
+
+    if (!spec || !*spec || g_memory_base == NULL || g_watch_page)
+        return;
+
+    for (q = spec; *q == '['; q++)
+        g_watch_derefs++;
+    g_watch_root = (uint32_t)strtoul(q, &endp, 0);
+    while (*endp == ']')
+        endp++;
+    if (*endp == '+')
+        g_watch_off = (uint32_t)strtoul(endp + 1, NULL, 0);
+
+    if (g_watch_derefs) {
+        fprintf(stderr, "  WATCH: resolving %u-deep chain from 0x%08X "
+                        "+0x%X\n", g_watch_derefs, g_watch_root, g_watch_off);
+        CloseHandle(CreateThread(NULL, 0, watch_resolver, NULL, 0, NULL));
+        return;
+    }
+    watch_arm(g_watch_root + g_watch_off);
+}
+
+static int watch_arm(uint32_t va)
+{
+    DWORD old;
+
+    g_watch_va = va;
+    if (!peek_readable(g_watch_va)) {
+        fprintf(stderr, "  WATCH: 0x%08X is not in a mapped window; "
+                        "not armed\n", g_watch_va);
+        return 0;
+    }
+    g_watch_last = *(const uint32_t *)((const uint8_t *)g_memory_offset
+                                       + g_watch_va);
+    /* The page holding the guest dword, in host terms. */
+    g_watch_page = (void *)(((uintptr_t)((const uint8_t *)g_memory_offset
+                                         + g_watch_va)) & ~(uintptr_t)4095);
+    g_watch_veh = AddVectoredExceptionHandler(1, watch_veh);
+    if (!g_watch_veh
+            || !VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old)) {
+        if (g_watch_veh) {
+            RemoveVectoredExceptionHandler(g_watch_veh);
+            g_watch_veh = NULL;
+        }
+        g_watch_page = NULL;
+        fprintf(stderr, "  WATCH: cannot trap 0x%08X; not armed\n",
+                g_watch_va);
+        return 0;
+    }
+    fprintf(stderr, "  WATCH: writes to the page of 0x%08X are trapped "
+                    "(current %08X)\n", g_watch_va, g_watch_last);
+    fflush(stderr);
+    return 1;
+}
+
 /* Print the RECOMP_PEEK globals. Shared, because the two moments worth
  * sampling are a hang and an early exit, and only the first had it: a title
  * whose main() returns during init never reaches the watchdog, so the one
@@ -1140,14 +1356,33 @@ void xbox_PeekSample(const char *label)
     buf[sizeof buf - 1] = 0;
     fprintf(stderr, "  %s:", label ? label : "peek");
     for (q = buf; *q; ) {
-        unsigned long va = strtoul(q, &end, 0);
+        /* "[[0x006DF414]]+0x14" follows two pointers and adds an offset.
+         * The fields worth watching during bring-up are usually inside heap
+         * objects whose addresses change run to run but which are always
+         * reachable from a static one, and a peek that cannot follow a
+         * pointer cannot see them at all. */
+        unsigned derefs = 0, k;
+        unsigned long va;
+        uint32_t a;
+        int ok = 1;
+
+        while (*q == '[') { derefs++; q++; }
+        va = strtoul(q, &end, 0);
         if (end == q)
             break;
-        if (peek_readable((uint32_t)va))
-            fprintf(stderr, " [%08lX]=%08X", va,
-                    *(const uint32_t *)(mem + va));
+        while (*end == ']')
+            end++;
+        a = (uint32_t)va;
+        for (k = 0; k < derefs && ok; k++) {
+            if (!peek_readable(a) || !(a = *(const uint32_t *)(mem + a)))
+                ok = 0;
+        }
+        if (*end == '+')
+            a += (uint32_t)strtoul(end + 1, &end, 0);
+        if (ok && peek_readable(a))
+            fprintf(stderr, " [%08X]=%08X", a, *(const uint32_t *)(mem + a));
         else
-            fprintf(stderr, " [%08lX]=??", va);
+            fprintf(stderr, " [%08X]=??", a);
         q = (*end == ',') ? end + 1 : end;
     }
     fprintf(stderr, "\n");
@@ -2210,6 +2445,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+    xbox_WatchInit();
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }

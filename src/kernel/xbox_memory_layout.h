@@ -224,6 +224,7 @@ void xbox_WatchdogStart(void);
 /* Print the globals named by RECOMP_PEEK, tagged with `label`. No-op when
  * RECOMP_PEEK is unset. Called at a hang and at an early exit. */
 void xbox_PeekSample(const char *label);
+void xbox_WatchInit(void);
 
 /* ================================================================
  * Xbox stack for recompiled code
