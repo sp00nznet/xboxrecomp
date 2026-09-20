@@ -418,6 +418,134 @@ static void ac97_arm_write_trap(void)
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
 }
 
+/*
+ * Command words the DSP stub completes instantly. A bring-up probe, not a
+ * model.
+ *
+ * The GP and EP DSPs in src/apu are stubs -- effects bypass, encode
+ * passthrough -- and a stub that never completes is worse for a title than
+ * one that completes at once, because the title cannot get past it at all.
+ * DDS9 posts a command and waits for the DSP to clear it:
+ *
+ *     mov  [ebx], 3            ; ebx = scratch + 0x810
+ *   L: cmp  dword [ebx], 0
+ *     jne  L
+ *
+ * Unlike the AC'97 reset bit, this one re-reads every iteration, so clearing
+ * it from here is a race this side wins rather than loses.
+ *
+ * Why an environment variable rather than a registration API: the word's
+ * address is reached as *(*(*(this+8)+0x10)) + 0x810 from an object with no
+ * global anchor, and the APU never sees that address directly -- it reaches
+ * the block through the scatter-gather descriptors the title programmed. So
+ * the honest fix is for the GP stub to follow those descriptors, which is DSP
+ * work. This exists to answer, in one run and without that work, whether
+ * completing the command is in fact all the title is waiting for.
+ *
+ * RECOMP_DSP_ACK=0x804A8810[,...] -- up to 8 words, zeroed whenever non-zero.
+ */
+#define XBOX_MAX_DSP_ACK 8
+static uint32_t g_dsp_ack[XBOX_MAX_DSP_ACK];
+static int g_dsp_ack_count = 0;
+
+static void dsp_ack_init(void)
+{
+    const char *spec = getenv("RECOMP_DSP_ACK");
+    char buf[128], *q, *end;
+
+    if (!spec || !*spec)
+        return;
+    strncpy(buf, spec, sizeof buf - 1);
+    buf[sizeof buf - 1] = 0;
+    for (q = buf; *q && g_dsp_ack_count < XBOX_MAX_DSP_ACK; ) {
+        unsigned long va = strtoul(q, &end, 0);
+        if (end == q)
+            break;
+        g_dsp_ack[g_dsp_ack_count++] = (uint32_t)va;
+        q = (*end == ',') ? end + 1 : end;
+    }
+    if (g_dsp_ack_count)
+        fprintf(stderr, "  DSP ack: %d command word(s) will be completed"
+                        " immediately\n", g_dsp_ack_count);
+}
+
+static int fence_readable(uint32_t va, uint32_t bytes);  /* defined below */
+
+/* Hold a guest global at a value. A bring-up probe, like the DSP ack.
+ *
+ * There is exactly one reason this exists: to answer "is the title waiting on
+ * this?" in one run, before spending a day making the thing that would set it
+ * honestly. It is not a fix and must not be mistaken for one -- whatever it
+ * holds, nothing in the guest is producing, so the state it fakes is
+ * inconsistent with everything downstream of it by construction.
+ *
+ * RECOMP_POKE=0x30F234:1,0x30F238:1
+ */
+#define XBOX_MAX_POKE 8
+static struct { uint32_t va, value; } g_poke[XBOX_MAX_POKE];
+static int g_poke_count;
+
+static void poke_init(void)
+{
+    const char *spec = getenv("RECOMP_POKE");
+    char buf[192], *q, *end;
+
+    if (!spec || !*spec)
+        return;
+    strncpy(buf, spec, sizeof buf - 1);
+    buf[sizeof buf - 1] = 0;
+    for (q = buf; *q && g_poke_count < XBOX_MAX_POKE; ) {
+        unsigned long va = strtoul(q, &end, 0);
+        unsigned long val = 0;
+        if (end == q)
+            break;
+        if (*end == ':')
+            val = strtoul(end + 1, &end, 0);
+        g_poke[g_poke_count].va    = (uint32_t)va;
+        g_poke[g_poke_count].value = (uint32_t)val;
+        g_poke_count++;
+        q = (*end == ',') ? end + 1 : end;
+    }
+    if (g_poke_count)
+        fprintf(stderr, "  POKE: holding %d guest global(s) -- bring-up probe,"
+                        " not a fix\n", g_poke_count);
+}
+
+static void poke_tick(void)
+{
+    int i;
+
+    for (i = 0; i < g_poke_count; i++) {
+        if (!fence_readable(g_poke[i].va, 4))
+            continue;
+        {
+            volatile uint32_t *w = (volatile uint32_t *)
+                ((uintptr_t)g_poke[i].va + g_memory_offset);
+            if (*w != g_poke[i].value)
+                *w = g_poke[i].value;
+        }
+    }
+}
+
+static void dsp_ack_tick(void)
+{
+    int i;
+
+    for (i = 0; i < g_dsp_ack_count; i++) {
+        /* fence_readable rather than a bare bounds test: these land in the
+         * contiguous window, which a plain size check against the main map
+         * rejects. */
+        if (!fence_readable(g_dsp_ack[i], 4))
+            continue;
+        {
+            volatile uint32_t *w = (volatile uint32_t *)
+                ((uintptr_t)g_dsp_ack[i] + g_memory_offset);
+            if (*w)
+                *w = 0;
+        }
+    }
+}
+
 static const uint32_t MCPX_COUNTERS[] = {
     0x020010,   /* APU GP sample counter, DirectSound SetupVoiceProcessor */
 };
@@ -772,6 +900,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             }
         }
         fence_mirrors_tick();
+        dsp_ack_tick();
+        poke_tick();
         counter_mirrors_tick();
         frame_counters_tick();
         framebuffer_probe_tick();
@@ -882,6 +1012,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 
 static void xbox_Nv2aAckStart(void)
 {
+    dsp_ack_init();
+    poke_init();
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
