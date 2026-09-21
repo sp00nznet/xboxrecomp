@@ -133,6 +133,17 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 }
 
 /* NV097 methods this executor acts on. */
+/* Blending. The pair this title programs, read from its own pushbuffer
+ * rather than guessed: BLEND_ENABLE written 1168 times and left on,
+ * SFACTOR 0x0302 (SRC_ALPHA) and DFACTOR 0x0303 (ONE_MINUS_SRC_ALPHA).
+ * ALPHA_TEST_ENABLE is written 390 times and left at zero, so this is
+ * blending and not an alpha test. */
+#define NV097_SET_BLEND_ENABLE            0x0304
+#define NV097_SET_BLEND_FUNC_SFACTOR      0x0344
+#define NV097_SET_BLEND_FUNC_DFACTOR      0x0348
+#define NV_BLEND_SRC_ALPHA                0x0302
+#define NV_BLEND_ONE_MINUS_SRC_ALPHA      0x0303
+
 #define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
 #define NV097_SET_SURFACE_CLIP_VERTICAL   0x0204
 #define NV097_SET_SURFACE_FORMAT          0x0208
@@ -254,6 +265,7 @@ static struct {
      * identical on screen and want opposite fixes: the batch carried no
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
+    uint32_t blend_enable, blend_sfactor, blend_dfactor;
     Texture  tex;
 } s_gpu;
 
@@ -904,6 +916,43 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
     row = s_surface + (size_t)y * s_gpu.pitch;
+
+    /* src*srcAlpha + dst*(1-srcAlpha), and only that pair.
+     *
+     * Any other factor combination falls through to an opaque write rather
+     * than being approximated: a wrong blend is harder to recognise on
+     * screen than no blend, and this is the only pair this title sets.
+     *
+     * Fully opaque is left alone deliberately. It is the same arithmetic,
+     * but skipping it keeps the full-screen quads -- which are drawn with
+     * blending enabled and alpha 255 -- on exactly the path they were on
+     * before, so this cannot change what they produce. */
+    if (s_gpu.blend_enable
+        && s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
+        && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA
+        && (argb >> 24) != 0xFF) {
+        uint32_t sa = argb >> 24;
+        uint32_t dst = 0;
+        if (sa == 0)
+            return;                        /* nothing of the source survives */
+        if (bpp == 4) {
+            dst = ((const uint32_t *)row)[x];
+        } else if (bpp == 2) {
+            uint32_t t = ((const uint16_t *)row)[x];
+            dst = (((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
+                 | ((t & 0x001Fu) << 3));
+        }
+        {
+            uint32_t r = (((argb >> 16) & 0xFF) * sa
+                        + ((dst >> 16) & 0xFF) * (255u - sa) + 127u) / 255u;
+            uint32_t g = (((argb >>  8) & 0xFF) * sa
+                        + ((dst >>  8) & 0xFF) * (255u - sa) + 127u) / 255u;
+            uint32_t b = (((argb      ) & 0xFF) * sa
+                        + ((dst      ) & 0xFF) * (255u - sa) + 127u) / 255u;
+            argb = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+
     if (bpp == 4) {
         ((uint32_t *)row)[x] = argb;
     } else if (bpp == 2) {
@@ -1135,12 +1184,27 @@ static int batch_is_screen_space(void)
     return 1;
 }
 
-/* NV097 primitive types that are triangles under some winding. */
-#define NV_PRIM_TRIANGLES      4
-#define NV_PRIM_TRIANGLE_STRIP 5
-#define NV_PRIM_TRIANGLE_FAN   6
-#define NV_PRIM_QUADS          7
-#define NV_PRIM_QUAD_STRIP     8
+/* NV097 primitive types.
+ *
+ * These are the operand of SET_BEGIN_END, where 0 is END and the list starts
+ * at 1. They were each one too low, so every title's geometry was decomposed
+ * as the primitive below the one it asked for -- a strip as a fan, a fan as
+ * quads, and TRIANGLES, the one case whose vertex count must be a multiple
+ * of three, as a strip.
+ *
+ * The vertex order says which numbering is right without taking a table on
+ * trust: a strip arrives in Z order and a fan in cyclic order, and they only
+ * line up with the primitive under this one. */
+#define NV_PRIM_POINTS         1
+#define NV_PRIM_LINES          2
+#define NV_PRIM_LINE_LOOP      3
+#define NV_PRIM_LINE_STRIP     4
+#define NV_PRIM_TRIANGLES      5
+#define NV_PRIM_TRIANGLE_STRIP 6
+#define NV_PRIM_TRIANGLE_FAN   7
+#define NV_PRIM_QUADS          8
+#define NV_PRIM_QUAD_STRIP     9
+#define NV_PRIM_POLYGON        10
 
 /* How many post-draw captures to keep: enough to see whether the geometry
  * is stable from frame to frame, few enough not to fill a directory. */
@@ -1210,13 +1274,32 @@ static void raster_batch(void)
                            vertex_color(s_gpu.idx[i]));
         break;
     case NV_PRIM_TRIANGLE_FAN:
-    case NV_PRIM_QUADS:
-    case NV_PRIM_QUAD_STRIP:
-        /* A fan and a quad both rasterise as a triangle fan around index 0;
-         * for a quad that is exactly its two triangles. */
+    case NV_PRIM_POLYGON:
         for (i = 1; i + 1 < s_gpu.idx_count; i++)
             raster_indexed(s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i+1],
                            vertex_color(s_gpu.idx[0]));
+        break;
+    case NV_PRIM_QUADS:
+        /* Independent quads, four vertices each. A batch of eight is two
+         * quads, not one six-triangle fan around the first vertex; with
+         * exactly four the two agreed, which is why sharing the fan arm
+         * looked right. */
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 4) {
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+2], s_gpu.idx[i+3],
+                           vertex_color(s_gpu.idx[i]));
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        /* Each vertex pair past the first closes another quad against the
+         * pair before it. */
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 2) {
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+3],
+                           vertex_color(s_gpu.idx[i]));
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+3], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
+        }
         break;
     default:
         break;                             /* points and lines: not yet */
@@ -1590,6 +1673,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
         s_gpu.clear_color = param;
+        break;
+    case NV097_SET_BLEND_ENABLE:
+        s_gpu.blend_enable = param;
+        break;
+    case NV097_SET_BLEND_FUNC_SFACTOR:
+        s_gpu.blend_sfactor = param;
+        break;
+    case NV097_SET_BLEND_FUNC_DFACTOR:
+        s_gpu.blend_dfactor = param;
         break;
     case NV097_CLEAR_SURFACE:
         clear_surface(param);
