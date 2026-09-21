@@ -1135,12 +1135,27 @@ static int batch_is_screen_space(void)
     return 1;
 }
 
-/* NV097 primitive types that are triangles under some winding. */
-#define NV_PRIM_TRIANGLES      4
-#define NV_PRIM_TRIANGLE_STRIP 5
-#define NV_PRIM_TRIANGLE_FAN   6
-#define NV_PRIM_QUADS          7
-#define NV_PRIM_QUAD_STRIP     8
+/* NV097 primitive types.
+ *
+ * These are the operand of SET_BEGIN_END, where 0 is END and the list starts
+ * at 1. They were each one too low, so every title's geometry was decomposed
+ * as the primitive below the one it asked for -- a strip as a fan, a fan as
+ * quads, and TRIANGLES, the one case whose vertex count must be a multiple
+ * of three, as a strip.
+ *
+ * The vertex order says which numbering is right without taking a table on
+ * trust: a strip arrives in Z order and a fan in cyclic order, and they only
+ * line up with the primitive under this one. */
+#define NV_PRIM_POINTS         1
+#define NV_PRIM_LINES          2
+#define NV_PRIM_LINE_LOOP      3
+#define NV_PRIM_LINE_STRIP     4
+#define NV_PRIM_TRIANGLES      5
+#define NV_PRIM_TRIANGLE_STRIP 6
+#define NV_PRIM_TRIANGLE_FAN   7
+#define NV_PRIM_QUADS          8
+#define NV_PRIM_QUAD_STRIP     9
+#define NV_PRIM_POLYGON        10
 
 /* How many post-draw captures to keep: enough to see whether the geometry
  * is stable from frame to frame, few enough not to fill a directory. */
@@ -1210,13 +1225,32 @@ static void raster_batch(void)
                            vertex_color(s_gpu.idx[i]));
         break;
     case NV_PRIM_TRIANGLE_FAN:
-    case NV_PRIM_QUADS:
-    case NV_PRIM_QUAD_STRIP:
-        /* A fan and a quad both rasterise as a triangle fan around index 0;
-         * for a quad that is exactly its two triangles. */
+    case NV_PRIM_POLYGON:
         for (i = 1; i + 1 < s_gpu.idx_count; i++)
             raster_indexed(s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i+1],
                            vertex_color(s_gpu.idx[0]));
+        break;
+    case NV_PRIM_QUADS:
+        /* Independent quads, four vertices each. A batch of eight is two
+         * quads, not one six-triangle fan around the first vertex; with
+         * exactly four the two agreed, which is why sharing the fan arm
+         * looked right. */
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 4) {
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+2], s_gpu.idx[i+3],
+                           vertex_color(s_gpu.idx[i]));
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        /* Each vertex pair past the first closes another quad against the
+         * pair before it. */
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 2) {
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+3],
+                           vertex_color(s_gpu.idx[i]));
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+3], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
+        }
         break;
     default:
         break;                             /* points and lines: not yet */
