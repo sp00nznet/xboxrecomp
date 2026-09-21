@@ -537,8 +537,8 @@ static int g_pgraph_in_begin = 0;
 #define M_SET_COLOR_CLEAR_VALUE 0x01D4
 #define M_SET_BEGIN_END         0x17FC
 #define M_INLINE_ARRAY          0x1818
-#define M_FLIP_INCREMENT_WRITE  0x0114
-#define M_FLIP_STALL            0x0118
+#define M_FLIP_INCREMENT_WRITE  NV097_FLIP_INCREMENT_WRITE
+#define M_FLIP_STALL            NV097_FLIP_STALL
 #define M_SET_VIEWPORT_OFFSET   0x0A20
 #define M_SET_VIEWPORT_SCALE    0x0AF0
 

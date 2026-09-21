@@ -619,9 +619,11 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             method == 0x0398 ||                        /* TRANSFORM_PROGRAM_CXT_WRITE_EN */
             method == 0x039C ||                        /* TRANSFORM_PROGRAM_LOAD */
             method == 0x01E0 ||                        /* SHADER_STAGE_PROGRAM */
-            method == 0x0108 || method == 0x010C ||    /* FLIP_READ/WRITE */
-            method == 0x0110 || method == 0x0114 ||    /* FLIP_MODULO/INCREMENT */
-            method == 0x0118)                          /* FLIP_STALL */
+            method == NV097_SET_FLIP_READ ||           /* 0x0120 */
+            method == NV097_SET_FLIP_WRITE ||          /* 0x0124 */
+            method == NV097_SET_FLIP_MODULO ||         /* 0x0128 */
+            method == NV097_FLIP_INCREMENT_WRITE ||    /* 0x012C */
+            method == NV097_FLIP_STALL)                /* 0x0130 */
         {
             return 1;  /* Silently handled (ignored but acknowledged) */
         }
