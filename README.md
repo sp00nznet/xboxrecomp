@@ -233,7 +233,7 @@ cp -r templates/new-game ../mygame        # Windows cmd: xcopy /E /I templates\n
 #    --gen-dir writes the generated code into your game project, where the
 #    template's CMakeLists globs src/recomp/gen/*.c. Without it the output
 #    lands in this repo (src/game/recomp/gen/) and nothing compiles it.
-py -3 -m tools.recomp game_files/default.xbe --all --split 1000 --gen-dir ../mygame/src/recomp/gen
+py -3 -m tools.recomp game_files/default.xbe --all --split 250 --gen-dir ../mygame/src/recomp/gen
 #    Output: recomp_0000.c ... recomp_dispatch.c, recomp_funcs.h (millions of
 #    lines of C), plus recomp_types.h — the runtime register model the
 #    generated code includes. You do not supply that one; if the build says

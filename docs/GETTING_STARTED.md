@@ -195,7 +195,7 @@ Steps 2-4.6 all run from inside the `xboxrecomp` clone (that's where `tools/` li
 Point the generated code at **your** project with `--gen-dir`:
 
 ```bash
-py -3 -m tools.recomp game_files/default.xbe --all --split 1000 \
+py -3 -m tools.recomp game_files/default.xbe --all --split 250 \
     --gen-dir ../my_xbox_game/src/recomp/gen
 ```
 
@@ -210,6 +210,24 @@ This is the big one — it can take 5-15 minutes for a large game. Output:
 ├── recomp_funcs.h         # Forward declarations
 └── recomp_stubs.c         # Stubs for unresolvable targets
 ```
+
+### Why 250 and not 1000
+
+`--split` is functions per file, and the files it produces are enormous:
+these are whole programs rewritten as C, so a chunk of 1000 functions can
+reach a quarter of a gigabyte in one translation unit. GCC's memory use
+scales with that, and a 257 MB chunk **OOM-killed a 15 GB machine** — twice,
+losing half an hour of build each time — while the same generation at
+`--split 250` tops out near 100 MB and compiles without trouble.
+
+The cost of smaller chunks is more files and a little more link time. The
+cost of larger ones is a build that cannot be reproduced on an ordinary
+machine, which is worse.
+
+If you do hit it, the failure is not obvious: the compiler is killed by the
+kernel, `make` reports a signal rather than an error, and re-running picks
+up where it left off and dies on the same file. Check `dmesg` for the OOM
+killer before assuming the generated code is at fault.
 
 Without `--gen-dir` the code lands in `src/game/recomp/gen/` **inside the toolkit clone**,
 where no build target compiles it — which is why a plain toolkit build then still
