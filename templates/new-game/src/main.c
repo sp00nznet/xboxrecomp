@@ -155,6 +155,50 @@ static void print_guest_context(void *rip)
                 shown++;
             }
         }
+        /* When the frame is gone, say so, and fall back on what is left.
+         *
+         * A fault inside a block copy leaves no return address in range: the
+         * copy is a host memmove and its caller's frame is further up than
+         * this reaches. Worse, a copy that ran past its buffer overwrites the
+         * stack itself, so the list comes out empty exactly when it is most
+         * needed -- and an empty list under a promising heading reads like
+         * "nothing to see" rather than "the evidence is destroyed". */
+        if (!shown)
+            fprintf(stderr, "    (no return addresses in range)\n");
+
+        /* Everything below only pays for itself when the scan came back
+         * empty. A crash where the chain was recovered already says what
+         * happened, and burying that under another twenty lines makes the
+         * common report worse to read. */
+        if (!shown) {
+            uint32_t k;
+
+            /* The indirect-call history, which the stack cannot overwrite.
+             * recomp_manual.c prints this too, but only from
+             * recomp_icall_fail_log -- a page fault inside a block copy
+             * never reaches that path, and this is the same information by
+             * the route the fault actually took.
+             *
+             * Declared here rather than included: main.c does not pull in
+             * recomp_types.h, and recomp_manual.c spells it the same way. */
+            extern volatile uint32_t g_icall_trace[16];
+            extern volatile uint32_t g_icall_trace_idx;
+
+            fprintf(stderr, "  recent ICALL targets:");
+            for (k = 0; k < 16; k++)
+                fprintf(stderr, " %08X",
+                        g_icall_trace[(g_icall_trace_idx + k) & 15]);
+            fprintf(stderr, "\n");
+
+            /* The frame unfiltered. The pointers and lengths handed to
+             * whatever faulted live here and look nothing like code, so the
+             * filter above drops exactly what is wanted. On the crash this
+             * was written for, one of these words was the end of the mapped
+             * RAM mirror -- which is what identified the fault as a copy
+             * running off its buffer rather than a stray pointer. */
+            for (i = 0; i < 20; i++)
+                fprintf(stderr, "    raw[esp+%-4d] 0x%08X\n", i * 4, sp[i]);
+        }
     }
 }
 
