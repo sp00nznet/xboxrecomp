@@ -18,7 +18,7 @@ import os
 import re
 import struct
 
-from .disasm import Instruction, Operand
+from .disasm import Instruction, Operand, LOOP_JUMPS
 from .config import is_code_address, is_data_address, va_to_file_offset
 
 # Function export names of the Windows libraries the host exe links
@@ -418,6 +418,10 @@ _EFLAGS_PRESERVE = frozenset({
     "call",
     "int3", "int", "wait",
     "cld", "std", "cli", "sti",
+    # LOOP counts ECX down and branches on it; LOOPE/LOOPNE additionally
+    # read ZF. None of the three write EFLAGS, so a comparison before the
+    # loop still answers the jcc after it.
+    "loop", "loope", "loopne",
     # pushfd READS the flags and leaves them alone, so it belongs here.
     # popfd does NOT -- see _FLAGS_UNDEFINED.
     "pushfd", "pushal",
@@ -2460,6 +2464,9 @@ class Lifter:
                 return [f"if ({cond}) goto loc_{target:08X}; /* {jcc} */"]
             return [f"/* {jcc} - no target */"]
 
+        if jcc in LOOP_JUMPS:
+            return self._lift_loop(insn)
+
         cond_info = COND_MAP.get(jcc)
         desc = cond_info[2] if cond_info else jcc
 
@@ -2484,6 +2491,33 @@ class Lifter:
         return [f"/* {jcc}: {desc} - no target */"]
 
     # ── SETcc / CMOVcc ──
+
+    def _lift_loop(self, insn, zf_expr=None):
+        """LOOP/LOOPE/LOOPNE: count ECX down, branch while it is non-zero.
+
+        These reached the generic jcc path, which has no idea ECX is the
+        counter. It dropped the decrement entirely and emitted the `_flags`
+        fallback -- a variable nothing assigns -- so the back edge compiled
+        as never taken and the loop body ran exactly once.
+
+        LOOPE/LOOPNE also test ZF. ``zf_expr`` carries that condition when a
+        tracked instruction set the flags; without one, keep the existing
+        never-taken fallback rather than inventing a termination condition.
+        """
+        jcc = insn.mnemonic
+        stmts = [f"ecx -= 1; /* {jcc}: count down */"]
+        if jcc == "loop":
+            cond, desc = "ecx != 0", "ecx is non-zero"
+        else:
+            cond = f"(ecx != 0) && ({zf_expr or '_flags'})"
+            desc = ("ecx is non-zero and zero flag set" if jcc == "loope"
+                    else "ecx is non-zero and zero flag clear")
+        target = insn.jump_target
+        if target is None:
+            stmts.append(f"/* {jcc}: {desc} - no target */")
+            return stmts
+        stmts.append(_emit_cond_goto(cond, jcc, desc, target, self))
+        return stmts
 
     def _lift_setcc(self, insn, ops, m):
         if len(ops) < 1:
@@ -3538,6 +3572,21 @@ def lift_basic_block(lifter, bb, flag_state=None):
         if curr.mnemonic in ("jecxz", "jcxz"):
             results = lifter._lift_jcc(curr)
             stmts.extend(results)
+            i += 1
+            continue
+
+        # LOOP counts ECX down rather than reading a flag. LOOPE/LOOPNE also
+        # test ZF, which only has an expression while a tracked instruction
+        # still owns the flags.
+        if curr.mnemonic in LOOP_JUMPS:
+            zf_expr = None
+            if curr.mnemonic != "loop" and last_flag_setter:
+                probe = _make_condition(
+                    "je" if curr.mnemonic == "loope" else "jne",
+                    last_flag_setter, last_flag_ops)
+                if probe:
+                    zf_expr = probe[0]
+            stmts.extend(lifter._lift_loop(curr, zf_expr))
             i += 1
             continue
 

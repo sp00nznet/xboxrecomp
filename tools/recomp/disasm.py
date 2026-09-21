@@ -10,13 +10,16 @@ from typing import Optional
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_OP_IMM, CS_OP_MEM
 
 
+# LOOP family: ECX is the counter, not a flag. They branch, so they end a
+# block like any other conditional jump, but they need their own lifting.
+LOOP_JUMPS = frozenset({"loop", "loope", "loopne"})
+
 # x86 conditional jump mnemonics
 COND_JUMPS = frozenset({
     "jo", "jno", "jb", "jnb", "jae", "je", "jz", "jne", "jnz",
     "jbe", "ja", "jnae", "jna", "js", "jns", "jp", "jnp",
     "jl", "jge", "jle", "jg", "jcxz", "jecxz",
-    "loop", "loope", "loopne",
-})
+}) | LOOP_JUMPS
 
 
 @dataclass
