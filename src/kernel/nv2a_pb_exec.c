@@ -797,6 +797,37 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
         *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
         return 1;
 
+    /* 4:2:2 packed YUV, two texels per four bytes.
+     *
+     * This is how a title hands over a decoded video frame, and without it
+     * the frame falls through to `default` -- which returns 0, so the caller
+     * paints the quad's vertex colour and the movie is a flat rectangle.
+     *
+     * The chroma pair is shared between an even texel and the one after it,
+     * so the group is found by masking the bottom bit of the index. BT.601,
+     * the same coefficients the D3D8 upload path converts with, so the two
+     * paths agree rather than each having its own idea of the colour. */
+    case 0x24:                                      /* LC_CR8YB8CB8YA8, YUY2 */
+    case 0x25: {                                    /* LC_YB8CR8YA8CB8, UYVY */
+        uint32_t yoff = (fmt == 0x24) ? 0u : 1u;
+        const uint8_t *g = p + (size_t)(u & ~1u) * 2;
+        int c  = (int)g[(u & 1u) ? 2 + yoff : yoff] - 16;
+        int cu = (int)g[1 - yoff] - 128;
+        int cv = (int)g[3 - yoff] - 128;
+        int r = (298 * c + 409 * cv + 128) >> 8;
+        int gg = (298 * c - 100 * cu - 208 * cv + 128) >> 8;
+        int b = (298 * c + 516 * cu + 128) >> 8;
+        if (r < 0) r = 0;
+        if (r > 255) r = 255;
+        if (gg < 0) gg = 0;
+        if (gg > 255) gg = 255;
+        if (b < 0) b = 0;
+        if (b > 255) b = 255;
+        *argb = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)gg << 8)
+              | (uint32_t)b;
+        return 1;
+    }
+
     default:
         return 0;
     }
