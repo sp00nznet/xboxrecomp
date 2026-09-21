@@ -123,6 +123,10 @@ typedef struct {
     uint32_t reg[OHCI_REG_MAX / 4];
     unsigned reads, writes, decode_fail;
     int      index;
+    /* Bumped every time the driver writes HcInterruptStatus. The interrupt
+     * thread watches it to tell a source nobody is servicing from one that
+     * is simply busy -- see the delivery loop. */
+    volatile unsigned ack_seq;
 } OhciController;
 
 static OhciController s_hc[2];
@@ -225,6 +229,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
             hc->reg[HcDoneHead / 4] = 0;
         }
         *r &= ~v;                       /* write 1 to clear                 */
+        hc->ack_seq++;
         return;
 
     case HcInterruptEnable:
@@ -463,6 +468,16 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
                 g_ctrl_len = usb_gamepad_control(&g_setup, g_ctrl_buf,
                                                  (int)sizeof g_ctrl_buf);
                 if (g_ctrl_len < 0) {
+                    /* Worth saying out loud. A stall here halts the
+                     * endpoint until the driver clears it, and a driver
+                     * that sees one usually stops using the device -- so
+                     * an unhandled request is not a gap that degrades
+                     * gracefully, it is one that ends input. */
+                    fprintf(stderr, "  [OHCI%d] STALL: unhandled control "
+                            "request %02X %02X value %04X index %04X len %u\n",
+                            hc->index, g_setup.bmRequestType, g_setup.bRequest,
+                            g_setup.wValue, g_setup.wIndex, g_setup.wLength);
+                    fflush(stderr);
                     g_setup_pending = 0;
                     return TD_CC_STALL;
                 }
@@ -775,6 +790,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     int plugged = 0;
     uint32_t last_status = 0;
     unsigned repeats = 0;
+    unsigned last_ack = 0;
 
     (void)unused;
     {
@@ -889,19 +905,31 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         if (!status)
             continue;
 
-        /* A stuck source is one the handler never clears, which shows up as
-         * the same status delivered over and over. Counting deliveries alone
-         * would trip on a device that is simply busy. */
-        if (status == last_status) {
+        /* A stuck source is one the handler never clears. Repeating the
+         * same status value is not that.
+         *
+         * This counted deliveries of an unchanged status and gave up at
+         * 200, and a working gamepad trips that in two seconds: the pad
+         * reports at 100 Hz, every report completes a transfer descriptor,
+         * every completion raises WritebackDoneHead, and every one of them
+         * is the same status value. The driver was acknowledging each one
+         * -- 141 writes to HcInterruptStatus in the run this was found on
+         * -- and the count climbed anyway, because nothing reset it.
+         *
+         * What distinguishes the two is whether the driver wrote the
+         * register at all between one delivery and the next. */
+        if (status == last_status && hc->ack_seq == last_ack) {
             if (++repeats > 200) {
-                fprintf(stderr, "  [OHCI0] status %08X delivered 200 times "
-                                "without being cleared; stopping\n", status);
+                fprintf(stderr, "  [OHCI%d] status %08X delivered 200 times "
+                                "with no acknowledgement; stopping\n",
+                        hc->index, status);
                 fflush(stderr);
                 break;
             }
         } else {
             last_status = status;
-            repeats = 0;
+            last_ack    = hc->ack_seq;
+            repeats     = 0;
         }
         ohci_raise(hc, status);
     }
