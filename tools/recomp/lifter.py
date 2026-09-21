@@ -1593,8 +1593,7 @@ class Lifter:
         # reads them was already meaningless.
         if m in ("bsf", "bsr"):
             if len(ops) < 2:
-                self.unimplemented.setdefault(m, []).append(insn.address)
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return self._unimplemented(insn, m)
             dst = _fmt_operand_read(ops[0])
             src = _fmt_operand_read(ops[1])
             width = (_operand_width(ops[1]) or 4) * 8
@@ -1662,8 +1661,7 @@ class Lifter:
         # ── Unhandled ──
         #
         # Recorded, not merely commented -- see self.unimplemented.
-        self.unimplemented.setdefault(m, []).append(insn.address)
-        return [f"/* TODO: {m} {insn.op_str} */"]
+        return self._unimplemented(insn, m)
 
     # ── MOV family ──
 
@@ -2727,10 +2725,10 @@ class Lifter:
         if m in self._MMX_BINARY and len(ops) >= 2:
             a, b = src(dst), src(ops[1])
             if a is None or b is None:
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return self._unimplemented(insn, m)
             if is_mm(dst):
                 return [f"{dst.reg} = {self._MMX_BINARY[m]}({a}, {b}); /* {m} */"]
-            return [f"/* TODO: {m} {insn.op_str} (dst not mm) */"]
+            return self._unimplemented(insn, m, " (dst not mm)")
 
         if m in self._MMX_SHIFT and len(ops) >= 2 and is_mm(dst):
             count = ops[1]
@@ -2741,7 +2739,7 @@ class Lifter:
             elif count.type == "mem":
                 cnt = f"MMX_MEM({_fmt_mem(count)}).q"
             else:
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return self._unimplemented(insn, m)
             return [f"{dst.reg} = {self._MMX_SHIFT[m]}({dst.reg}, {cnt}); /* {m} */"]
 
         # cvtpi2ps: the other direction -- two dwords in, two singles out,
@@ -2760,7 +2758,7 @@ class Lifter:
             elif s_op.type == "mem":
                 a = f"MMX_MEM({_fmt_mem(s_op)})"
             else:
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return self._unimplemented(insn, m)
             return [f"{dst.reg} = XMM_FROM_PI({dst.reg}, {a}); /* cvtpi2ps */"]
 
         # cvtps2pi / cvttps2pi: two singles in, two dwords out. The source is
@@ -2775,20 +2773,20 @@ class Lifter:
                 addr = _fmt_mem(s_op)
                 lo, hi = f"MEMF({addr})", f"MEMF(({addr}) + 4)"
             else:
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return self._unimplemented(insn, m)
             return [f"{dst.reg} = MMX_FROM_PS({lo}, {hi}, {trunc}); /* {m} */"]
 
         if m == "pshufw" and len(ops) >= 3 and is_mm(dst):
             a = src(ops[1])
             if a is None:
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return self._unimplemented(insn, m)
             return [f"{dst.reg} = MMX_PSHUFW({a}, {ops[2].imm & 0xFF}u); /* pshufw */"]
 
         if m == "pinsrw" and len(ops) >= 3 and is_mm(dst):
             v = (f"{ops[1].reg}" if ops[1].type == "reg"
                  else f"MEM16({_fmt_mem(ops[1])})" if ops[1].type == "mem" else None)
             if v is None:
-                return [f"/* TODO: {m} {insn.op_str} */"]
+                return self._unimplemented(insn, m)
             return [f"{dst.reg} = MMX_PINSRW({dst.reg}, {v}, "
                     f"{ops[2].imm & 0xFF}u); /* pinsrw */"]
 
@@ -2820,14 +2818,39 @@ class Lifter:
                              " /* movd */"])
                 if dst.type == "reg":
                     return [f"{dst.reg} = {ops[1].reg}.ud[0]; /* movd */"]
-            return [f"/* TODO: {m} {insn.op_str} */"]
+            return self._unimplemented(insn, m)
 
         # movntq: a non-temporal store. The hint is irrelevant; the store is not.
         if m == "movntq" and len(ops) >= 2 and dst.type == "mem" and is_mm(ops[1]):
             return [f"MMX_STORE({_fmt_mem(dst)}, {ops[1].reg}); /* movntq */"]
 
+        return self._unimplemented(insn, m)
+
+    def _unimplemented(self, insn, m, note=""):
+        """The one way out for an instruction this lifter cannot translate.
+
+        Until 19 Sep 2026 that way out was a bare `/* TODO: ... */` comment,
+        which the C compiler reads as nothing at all: the instruction vanished
+        and the guest carried on with whatever the registers held. Nothing at
+        runtime could say the site had even been REACHED, so an untranslated
+        instruction surfaced as a subsystem failure somewhere else -- the
+        Wreckless heap (`bsf`), the Half-Life 2 intro (`cvtpi2ps`) -- and cost
+        an afternoon each time. The translator's end-of-run tally lists these
+        sites but cannot say which are live: on JSRF 122 sites sit in the
+        image and the mnemonics (`bound`, `arpl`, `daa`, `hlt`...) are what a
+        linear sweep reads over data, so most are probably dead. Probably.
+
+        So the site now carries RECOMP_UNIMPL(text, va): the runtime logs the
+        guest address and register state the first times it is reached, and
+        under RECOMP_UNIMPL_TRAP stops there, at the cause, instead of
+        somewhere downstream. The comment stays so `grep TODO:` still finds
+        every site. The tally in self.unimplemented is recorded here and
+        nowhere else, so every emitted marker is also a counted one.
+        """
         self.unimplemented.setdefault(m, []).append(insn.address)
-        return [f"/* TODO: {m} {insn.op_str} */"]
+        text = f"{m} {insn.op_str}".strip()
+        return [f'RECOMP_UNIMPL("{text}", 0x{insn.address:08X}u);'
+                f" /* TODO: {text}{note} */"]
 
     def _lift_sse(self, insn, m, ops):
         """Translate SSE instructions to C float operations."""

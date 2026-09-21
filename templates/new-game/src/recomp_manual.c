@@ -172,3 +172,28 @@ void recomp_icall_not_code_log(uint32_t va)
     fflush(stderr);
 }
 
+/* ── Untranslated instructions ───────────────────────────────────────────
+ *
+ * The lifter emits RECOMP_UNIMPL(text, va) at every instruction it has no
+ * translation for, in place of the bare comment it used to leave. The
+ * instruction is still a no-op; this only stops the omission being silent.
+ * RECOMP_UNIMPL_TRAP=1 aborts at the first hit, at the guest address of the
+ * cause rather than wherever the damage surfaces. */
+#include <stdlib.h>
+
+void recomp_unimpl(const char *text, uint32_t va)
+{
+    static int printed;
+    const char *trap = getenv("RECOMP_UNIMPL_TRAP");
+    int stop = trap && *trap && *trap != '0';
+
+    if (printed < 50 || stop) {
+        printed++;
+        fprintf(stderr,
+                "[UNIMPL] untranslated instruction REACHED: `%s` at 0x%08X"
+                " (a no-op; set RECOMP_UNIMPL_TRAP=1 to stop here)\n",
+                text, va);
+        fflush(stderr);
+    }
+    if (stop) abort();
+}

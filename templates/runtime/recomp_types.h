@@ -1228,4 +1228,22 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
  * function prototypes.
  * ================================================================ */
 
+/* An instruction the lifter has no translation for.
+ *
+ * The lifter used to emit a bare "TODO: mnemonic" C comment at such a site,
+ * and a comment is a no-op: the instruction vanished, the guest carried
+ * on, and nothing at runtime could say the site had been reached. Wreckless
+ * died inside RtlAllocateHeap because `bsf` was a comment; Half-Life 2 painted
+ * its intro red because `cvtpi2ps` was. Each was found by working backwards
+ * from a subsystem failure that had nothing to do with the cause.
+ *
+ * Now the site calls this, with the instruction text and its guest address.
+ * The instruction is STILL a no-op -- this changes no behaviour -- but the run
+ * says which untranslated sites it reached, how often, and with what register
+ * state, and with RECOMP_UNIMPL_TRAP=1 it stops at the first one. The lifter
+ * keeps the comment beside the call so `grep TODO:` over a gen tree still
+ * enumerates every site whether or not it is ever reached. */
+void recomp_unimpl(const char *text, uint32_t va);
+#define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
+
 #endif /* RECOMP_TYPES_H */
