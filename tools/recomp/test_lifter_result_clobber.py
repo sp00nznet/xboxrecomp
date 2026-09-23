@@ -144,7 +144,8 @@ def test_the_branch_survives_a_clobbered_destination():
 
 def test_negative_control_reading_the_destination_fails():
     """Put the pre-fix expression back; the sweep must catch it."""
-    src = _source(rewrite=lambda cond, dest: cond.replace("_fa", dest))
+    src = _source(rewrite=lambda cond, dest:
+                  cond.replace("_fas", dest).replace("_fa", dest))
     ran = _build_and_run(src)
     assert ran.returncode == 1, (
         "reading the live destination should disagree with x86 once a mov "

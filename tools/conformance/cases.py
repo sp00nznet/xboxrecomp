@@ -415,6 +415,14 @@ CASES = [
          ["test ax, ax", "setns al", "movzx eax, al"], _PAIRS),
     Case("js_cmp_i8", "sign flag after an 8-bit cmp, which truncates first",
          ["cmp al, cl", "sets al", "movzx eax, al"], _PAIRS),
+    Case("js_add_i8", "sign flag after an 8-bit add reads bit 7 of the result",
+         ["add al, cl", "sets al", "movzx eax, al"], _PAIRS),
+    Case("js_sub_i16", "sign flag after a 16-bit sub reads bit 15",
+         ["sub ax, cx", "sets al", "movzx eax, al"], _PAIRS),
+    Case("js_xor_i8", "sign flag after an 8-bit xor",
+         ["xor al, cl", "sets al", "movzx eax, al"], _PAIRS),
+    Case("js_sar_i8", "sign flag after an 8-bit sar",
+         ["sar al, 1", "sets al", "movzx eax, al"], _PAIRS),
 
     # Unsigned word saturation must clamp each lane, not wrap or drop the op.
     *[Case("mmx_" + op + "_" + form + "_" + str(half),
