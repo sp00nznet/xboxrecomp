@@ -225,7 +225,7 @@ class Disassembler:
         return [decoded[a] for a in sorted(decoded)]
 
     def disassemble_cfg(self, raw_bytes, start_va, end_va, entry_points,
-                        stop_addresses=None):
+                        stop_addresses=None, stop_mnemonics=()):
         """Decode reachable instruction streams from an explicit worklist."""
         size = end_va - start_va
         if size <= 0 or size > len(raw_bytes):
@@ -255,7 +255,7 @@ class Disassembler:
                             and start_va <= insn.jump_target < end_va):
                         worklist.append(insn.jump_target)
                     break
-                if insn.is_ret:
+                if insn.is_ret or insn.mnemonic in stop_mnemonics:
                     break
 
         return [decoded[addr] for addr in sorted(decoded)]
