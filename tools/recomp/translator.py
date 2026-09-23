@@ -16,6 +16,7 @@ import json
 import glob
 import os
 import struct
+import sys
 
 # Import the functions, not the VA constants: configure_from_xbe() rebinds those
 # at startup, so a by-value import would freeze the fallback layout.
@@ -23,7 +24,7 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
-                     _RESULT_SNAPSHOT_SETTERS,
+                     _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
 
@@ -266,7 +267,6 @@ def xbe_title(xbe_data, xbe_path):
     return os.path.splitext(os.path.basename(xbe_path))[0]
 
 
-
 def _seh_prologs_of(lifter):
     """Every __SEH_prolog address a lifter knows about, as a set.
 
@@ -279,6 +279,35 @@ def _seh_prologs_of(lifter):
         return set(prologs)
     one = getattr(lifter, "SEH_PROLOG", None)
     return {one} if one is not None else set()
+
+
+def load_coalescences(path):
+    """Read explicit, title-local owner bounds; never guess omitted starts."""
+    with open(path, encoding="utf-8") as stream:
+        entries = json.load(stream)
+    fields = {"start", "end", "coalesce_starts"}
+
+    def address(value):
+        if not isinstance(value, str) or not value.startswith("0x"):
+            raise ValueError(f"{path}: expected a hexadecimal address string")
+        number = int(value, 16)
+        if not 0 <= number <= 0xFFFFFFFF:
+            raise ValueError(f"{path}: address is outside the 32-bit range")
+        return number
+
+    if not isinstance(entries, list):
+        raise ValueError(f"{path}: expected an array of coalescence entries")
+    parsed = []
+    for entry in entries:
+        if (not isinstance(entry, dict) or set(entry) != fields
+                or not isinstance(entry["coalesce_starts"], list)):
+            raise ValueError(f"{path}: expected start, end and coalesce_starts")
+        parsed.append({
+            "start": address(entry["start"]),
+            "end": address(entry["end"]),
+            "coalesce_starts": [address(item) for item in entry["coalesce_starts"]],
+        })
+    return parsed
 
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
@@ -308,10 +337,12 @@ class FunctionTranslator:
                              seh_epilog=seh_epilog)
         self.owned_function_starts = set()
         self.recovered_function_starts = set()
+        self.coalesced_function_starts = set()
+        self.protected_function_starts = set()
         self._recovered_cfg = {}
         self._ownership_ready = False
 
-    def discover_static_indirect_targets(self):
+    def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover function entries from bounded static callback tables."""
         original_starts = sorted(self.func_db)
         recovered_callers = {}
@@ -329,8 +360,26 @@ class FunctionTranslator:
                 if targets is None:
                     continue
                 for target in targets:
-                    if target not in self.func_db:
-                        recovered_callers.setdefault(target, set()).add(caller)
+                    if target in self.func_db:
+                        if coalescing:
+                            callers = {
+                                int(value, 16) if isinstance(value, str) else value
+                                for value in self.func_db[target].get("called_by") or []
+                            }
+                            callers.add(caller)
+                            self.func_db[target]["called_by"] = [
+                                f"0x{value:08X}" for value in sorted(callers)]
+                        continue
+                    if coalescing:
+                        index = bisect.bisect_right(original_starts, target)
+                        if index:
+                            owner = original_starts[index - 1]
+                            if (owner in self.coalesced_function_starts
+                                    and target < self.func_db[owner]["end"]):
+                                raise ValueError(
+                                    f"Static callback 0x{target:08X} lies inside "
+                                    f"coalesced function 0x{owner:08X}")
+                    recovered_callers.setdefault(target, set()).add(caller)
 
         for target, callers in sorted(recovered_callers.items()):
             next_index = bisect.bisect_right(original_starts, target)
@@ -370,6 +419,250 @@ class FunctionTranslator:
             self.recovered_function_starts.add(target)
 
         return self.recovered_function_starts
+
+    def coalesce_function(self, target, end, expected_starts):
+        """Merge an explicitly named set of false interior function starts.
+
+        A false split can lose flags or turn a back-edge into host recursion.
+        Require the exact interior-start census, no independent entry evidence,
+        and a decoded CFG covering the requested extent without gaps. Reject
+        mismatches before changing any function metadata.
+        """
+        def reject(reason):
+            raise ValueError(
+                f"Invalid recovery coalescence "
+                f"0x{target:08X}->0x{end:08X}: {reason}")
+
+        if self._ownership_ready:
+            reject("coalesce before discovering CFG ownership")
+        if target not in self.func_db:
+            reject("start is not a detected function")
+        if end <= target:
+            reject("end does not follow start")
+
+        if self.func_db[target].get("end", target) > end:
+            reject("requested end shrinks the existing owner")
+        if any(start < target and info.get("end", start) > target
+               for start, info in self.func_db.items()):
+            reject("preceding function overlaps the requested owner")
+        sections = [section for section in _config._SECTIONS
+                    if section.is_code and section.va <= target
+                    and end <= section.va + section.va_size
+                    and end <= section.va + section.raw_size]
+        if not sections:
+            reject("extent is not backed by one code section")
+
+        expected = list(expected_starts)
+        if (not expected or expected != sorted(set(expected))
+                or any(start <= target or start >= end
+                       for start in expected)):
+            reject("coalesce_starts must be sorted unique interior starts")
+        actual = sorted(
+            start for start in self.func_db if target < start < end)
+        if actual != expected:
+            formatted = ", ".join(f"0x{start:08X}" for start in actual)
+            reject(f"current interior starts are [{formatted}]")
+        protected = [start for start in actual
+                     if start in self.protected_function_starts]
+        if protected:
+            reject(
+                f"interior start 0x{protected[0]:08X} is protected by manual code")
+        strong = [start for start in actual
+                  if self._is_strong_entry(self.func_db[start])
+                  or self.func_db[start].get("external_entry")
+                  or self.func_db[start].get("detection_method") in (
+                      "entry_point", "call_target", "indirect_call_slot",
+                      "seed_vtable_thunk", "static_indirect_table",
+                      "prologue", "prologue_alt",
+                      "tail_jump_target", "tail_jump_alias",
+                      "imm_ref_target", "data_ptr_target")]
+        if strong:
+            reject(
+                f"interior start 0x{strong[0]:08X} has independent evidence")
+        overruns = [
+            start for start in actual
+            if self.func_db[start].get("end", start) > end
+        ]
+        if overruns:
+            reject(f"interior function 0x{overruns[0]:08X} crosses end")
+
+        # Decode through the gap before the next detected function. A local
+        # jump table may begin exactly at ``end``; its entries are analysis
+        # input, not bytes owned by the coalesced function. The exact tiling
+        # checks below still fail closed if decoded code reaches past ``end``.
+        current_starts = sorted(self.func_db)
+        next_index = bisect.bisect_left(current_starts, end)
+        analysis_end = min(sections[0].va + sections[0].raw_size,
+                           sections[0].va + sections[0].va_size)
+        if next_index < len(current_starts):
+            analysis_end = min(analysis_end, current_starts[next_index])
+        recovered = self._recover_cfg(
+            target, analysis_end, set(), set(), coalescing=True)
+        if recovered is None:
+            reject("could not decode CFG")
+        instructions, jump_tables, _ = recovered
+        # Padding can close coverage gaps, but must not become an executable
+        # predecessor that discards flags at the following real block.
+        padding = self._alignment_padding_gaps(target, end, instructions)
+        for lower, upper in self._find_static_indirect_ranges(instructions):
+            callbacks = self._read_static_callback_table(
+                lower, upper, current_starts)
+            if callbacks and any(target < callback < end for callback in callbacks):
+                reject("interior start is a callback from the requested owner")
+        if any(instruction.is_call and instruction.call_target in actual
+               for instruction in instructions):
+            reject("interior start is called from the requested owner")
+        if not instructions or instructions[0].address != target:
+            reject("CFG does not start at the requested start")
+        covered_end = target
+        for instruction in instructions:
+            if covered_end in padding and instruction.address > covered_end:
+                covered_end = instruction.address
+            if instruction.address > covered_end:
+                gap = self._read_func_bytes(covered_end, instruction.address)
+                for table_va, targets in jump_tables.items():
+                    table = b"".join(struct.pack("<I", t) for t in targets)
+                    offset = gap.find(table) if gap is not None else -1
+                    while offset >= 0:
+                        table_start = covered_end + offset
+                        table_end = table_start + len(table)
+                        before = (table_start == covered_end
+                                  or self._is_alignment_padding_range(
+                                      covered_end, table_start))
+                        after = (table_end == instruction.address
+                                 or self._is_alignment_padding_range(
+                                     table_end, instruction.address))
+                        if (table_start <= table_va < table_end
+                                and (table_va - table_start) % 4 == 0
+                                and before and after):
+                            covered_end = instruction.address
+                            break
+                        offset = gap.find(table, offset + 1)
+                    if covered_end == instruction.address:
+                        break
+            if instruction.address != covered_end:
+                reject(f"CFG gap at 0x{covered_end:08X}")
+            if instruction.end_address > end:
+                reject(
+                    f"CFG reaches 0x{instruction.end_address:08X}, "
+                    "past the requested end")
+            covered_end = instruction.end_address
+        if covered_end != end:
+            reject(
+                f"CFG covers through 0x{covered_end:08X}, not the requested "
+                "end")
+
+        existing = self.func_db[target]
+        original_end = existing.get("end", target)
+        for start in actual:
+            del self.func_db[start]
+            self._recovered_cfg.pop(start, None)
+            self.owned_function_starts.discard(start)
+            self.recovered_function_starts.discard(start)
+        existing["end"] = end
+        existing["size"] = end - target
+        existing["num_instructions"] = len(instructions)
+        existing["detection_method"] = "external_coalescence"
+        existing["calls_to"] = sorted({
+            f"0x{instruction.call_target:08X}"
+            for instruction in instructions
+            if instruction.is_call and instruction.call_target is not None
+        })
+        self._recovered_cfg[target] = {
+            "end": end,
+            "instructions": instructions,
+            "jump_tables": jump_tables,
+        }
+        self.coalesced_function_starts.add(target)
+        print(
+            f"Coalesced detected function 0x{target:08X} from "
+            f"0x{original_end:08X} to 0x{end:08X}, removing "
+            f"{len(actual)} false interior starts "
+            f"({len(instructions)} instructions)",
+            file=sys.stderr)
+
+    @staticmethod
+    def _is_multi_byte_nop(instruction):
+        """Return whether one instruction is wide alignment padding.
+
+        An assembler aligns the next branch target with a single wide
+        instruction that has no effect: an explicit multi-byte ``nop``, the
+        classic ``lea reg, [reg]`` form, which reloads a register with its
+        own address, or a register self-move such as MSVC's two-byte
+        ``mov edi, edi``.
+        """
+        if instruction.size < 2:
+            return False
+        if instruction.mnemonic == "nop":
+            return True
+        if instruction.mnemonic == "mov" and len(instruction.operands) == 2:
+            destination, source = instruction.operands
+            return (destination.type == "reg" and source.type == "reg"
+                    and destination.reg == source.reg)
+        if instruction.mnemonic != "lea" or len(instruction.operands) != 2:
+            return False
+        destination, source = instruction.operands
+        return (destination.type == "reg" and source.type == "mem"
+                and source.mem_base == destination.reg
+                and not source.mem_index and source.mem_disp == 0)
+
+    def _alignment_padding_gaps(self, target, end, instructions):
+        """Return gap starts that hold a wide alignment no-op sequence.
+
+        A decode gap is only treated as padding when the bytes at the coverage
+        stop must start with a multi-byte no-op, contain only no-ops, and end
+        precisely where the decode picks up again. Real unreached code fails
+        that test, so this cannot invent a body: it only identifies padding
+        the assembler inserted before an already reachable branch target.
+        """
+        covered = {}
+        for instruction in instructions:
+            covered[instruction.address] = instruction.end_address
+        addresses = sorted(covered)
+        resume = set(addresses)
+        gaps = set()
+        cursor = target
+        for address in addresses:
+            if address > cursor:
+                if cursor >= end:
+                    break
+                raw_gap = self._read_func_bytes(cursor, end)
+                decoded = (
+                    self.disasm.disassemble_function(raw_gap, cursor, end)
+                    if raw_gap else None)
+                if decoded and self._is_multi_byte_nop(decoded[0]):
+                    padding_end = cursor
+                    for instruction in decoded:
+                        if (instruction.address != padding_end
+                                or instruction.end_address > address
+                                or (instruction.mnemonic != "nop"
+                                    and not self._is_multi_byte_nop(
+                                        instruction))):
+                            break
+                        padding_end = instruction.end_address
+                        if padding_end == address:
+                            if address in resume:
+                                gaps.add(cursor)
+                            break
+            cursor = max(cursor, covered[address])
+        return gaps
+
+    def _is_alignment_padding_range(self, start, end):
+        """Return whether an exact byte range is proven alignment padding."""
+        raw = self._read_func_bytes(start, end)
+        if not raw:
+            return False
+        decoded = self.disasm.disassemble_function(raw, start, end)
+        if not decoded or not self._is_multi_byte_nop(decoded[0]):
+            return False
+        cursor = start
+        for instruction in decoded:
+            if (instruction.address != cursor or instruction.end_address > end
+                    or (instruction.mnemonic != "nop"
+                        and not self._is_multi_byte_nop(instruction))):
+                return False
+            cursor = instruction.end_address
+        return cursor == end
 
     @staticmethod
     def _find_static_indirect_ranges(instructions, max_bytes=0x10000):
@@ -508,7 +801,8 @@ class FunctionTranslator:
                     "jump_tables": jump_tables,
                 }
 
-    def _recover_cfg(self, start, upper, bridge_targets, stop_addresses):
+    def _recover_cfg(self, start, upper, bridge_targets, stop_addresses,
+                     *, coalescing=False):
         """Decode direct CFG edges and local indexed-table destinations."""
         raw_bytes = self._read_func_bytes(start, upper)
         if not raw_bytes:
@@ -519,20 +813,47 @@ class FunctionTranslator:
         while True:
             instructions = self.disasm.disassemble_cfg(
                 raw_bytes, start, upper, entry_points,
-                stop_addresses=stop_addresses)
+                stop_addresses=stop_addresses,
+                stop_mnemonics=("int3", "ud2", "hlt") if coalescing else ())
             changed = False
+            if coalescing:
+                refs = self._indirect_code_refs(
+                    instructions, start, upper, proof_mode=coalescing)
+                if refs - entry_points:
+                    entry_points.update(refs)
+                    changed = True
+                debug_slides = self._debug_slide_int3s(
+                    instructions, include_direct_targets=True)
+                slide_continuations = {
+                    insn.end_address for insn in instructions
+                    if (insn.address in debug_slides
+                        and insn.end_address < upper)
+                }
+                if slide_continuations - entry_points:
+                    entry_points.update(slide_continuations)
+                    changed = True
             for insn in instructions:
                 if not insn.is_jump or insn.jump_target is not None:
                     continue
                 if not insn.operands or insn.operands[0].type != "mem":
                     continue
                 operand = insn.operands[0]
-                if not operand.mem_index or operand.mem_base:
+                if not (operand.mem_index or operand.mem_base):
+                    continue
+                if operand.mem_index and operand.mem_base:
+                    continue
+                if operand.mem_base and not coalescing:
                     continue
                 table_va = operand.mem_disp
                 if not (start <= table_va < upper):
                     continue
-                targets = self._read_local_jump_table(table_va, start, upper)
+                # Embedded tables must not absorb the jump's own displacement
+                # (or other decoded code) when scanning backward from the base.
+                minimum = max((i.end_address for i in instructions
+                               if i.end_address <= table_va), default=start)
+                targets = self._read_local_jump_table(
+                    table_va, start, upper,
+                    min_entry_va=minimum if coalescing else None)
                 if not targets:
                     continue
                 jump_tables[table_va] = targets
@@ -588,12 +909,14 @@ class FunctionTranslator:
         return 0
 
     def _read_local_jump_table(self, table_va, lower, upper,
-                               max_entries=256):
+                               max_entries=256, min_entry_va=None):
         """Read the contiguous pointer cluster around an indexed-jump base."""
         def scan(step, first):
             targets = []
             for index in range(first, max_entries + first):
                 entry_va = table_va + step * index * 4
+                if min_entry_va is not None and entry_va < min_entry_va:
+                    break
                 offset = va_to_file_offset(entry_va)
                 if offset is None or offset + 4 > len(self.xbe_data):
                     break
@@ -695,6 +1018,248 @@ class FunctionTranslator:
         return any(getattr(insn, "call_target", None) in seh_prologs
                    for insn in instructions)
 
+    @staticmethod
+    def _indirect_code_refs(instructions, start, end, proof_mode=False):
+        """Immediate continuations used by register-jump dispatch.
+
+        Normal translation keeps the historical address-ordered heuristic so
+        existing generated code does not lose labels. ``proof_mode`` is only
+        for destructive coalescence: there, a target must survive conservative
+        control-flow and clobber checks before it can justify deleting an
+        interior function entry.
+        """
+        refs = set()
+        aliases = {
+            "eax": "eax", "ax": "eax", "al": "eax", "ah": "eax",
+            "ebx": "ebx", "bx": "ebx", "bl": "ebx", "bh": "ebx",
+            "ecx": "ecx", "cx": "ecx", "cl": "ecx", "ch": "ecx",
+            "edx": "edx", "dx": "edx", "dl": "edx", "dh": "edx",
+            "esi": "esi", "si": "esi", "edi": "edi", "di": "edi",
+            "ebp": "ebp", "bp": "ebp", "esp": "esp", "sp": "esp",
+        }
+        full_registers = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"}
+        non_writers = {
+            "cmp", "test", "push", "jmp", "bt",
+            "prefetchnta", "prefetcht0", "prefetcht1", "prefetcht2",
+        }
+        implicit_clobbers = {
+            "cbw": {"eax"}, "cwde": {"eax"}, "cdq": {"edx"},
+            "cwd": {"edx"}, "cpuid": {"eax", "ebx", "ecx", "edx"},
+            "rdtsc": {"eax", "edx"}, "lahf": {"eax"},
+            "lodsb": {"eax", "esi"}, "lodsw": {"eax", "esi"},
+            "lodsd": {"eax", "esi"},
+            "movsb": {"esi", "edi"}, "movsw": {"esi", "edi"},
+            "stosb": {"edi"}, "stosw": {"edi"}, "stosd": {"edi"},
+            "scasb": {"edi"}, "scasw": {"edi"}, "scasd": {"edi"},
+            "cmpsb": {"esi", "edi"}, "cmpsw": {"esi", "edi"},
+            "loop": {"ecx"}, "loope": {"ecx"}, "loopne": {"ecx"},
+            "leave": {"esp", "ebp"}, "popad": set(full_registers),
+            "xlat": {"eax"}, "xlatb": {"eax"},
+        }
+
+        def transfer(insn, incoming):
+            constants = dict(incoming)
+            operands = insn.operands
+            preserved_writes = set()
+            if (insn.mnemonic == "mov" and len(operands) >= 2
+                    and operands[0].type == "reg"):
+                raw_destination = operands[0].reg
+                destination = aliases.get(raw_destination, raw_destination)
+                source = operands[1]
+                if raw_destination not in full_registers:
+                    constants.pop(destination, None)
+                elif source.type == "imm":
+                    constants[destination] = source.imm
+                    preserved_writes.add(destination)
+                elif (source.type == "reg" and source.reg in full_registers
+                      and source.reg in constants):
+                    constants[destination] = constants[source.reg]
+                    preserved_writes.add(destination)
+                else:
+                    constants.pop(destination, None)
+
+            for written in getattr(insn, "regs_written", ()):
+                register = aliases.get(written, written)
+                if register in full_registers and register not in preserved_writes:
+                    constants.pop(register, None)
+
+            mnemonic = insn.mnemonic.removeprefix("lock ")
+            if mnemonic in ("cmpxchg", "cmpxchg8b"):
+                constants.pop("eax", None)
+                if mnemonic == "cmpxchg8b":
+                    constants.pop("edx", None)
+
+            if insn.is_call:
+                for register in ("eax", "ecx", "edx"):
+                    constants.pop(register, None)
+            elif insn.mnemonic == "xchg":
+                for operand in operands[:2]:
+                    if operand.type == "reg":
+                        constants.pop(aliases.get(operand.reg, operand.reg), None)
+            elif (insn.mnemonic in ("mul", "div", "idiv")
+                  or (insn.mnemonic == "imul" and len(operands) == 1)):
+                constants.pop("eax", None)
+                constants.pop("edx", None)
+
+            clobbers = implicit_clobbers.get(insn.mnemonic, ())
+            if insn.mnemonic in ("movsd", "cmpsd"):
+                mem_bases = {operand.mem_base for operand in operands
+                             if operand.type == "mem"}
+                if {"esi", "edi"}.issubset(mem_bases):
+                    clobbers = {"esi", "edi"}
+            for register in clobbers:
+                constants.pop(register, None)
+            return constants
+
+        def target_from(insn, constants):
+            operands = insn.operands
+            if (insn.mnemonic == "jmp" and not insn.jump_target and operands
+                    and operands[0].type == "reg"):
+                target = constants.get(aliases.get(
+                    operands[0].reg, operands[0].reg))
+                if target is not None and start <= target < end:
+                    return target
+            return None
+
+        if not proof_mode:
+            constants = {}
+            for insn in instructions:
+                constants = transfer(insn, constants)
+                target = target_from(insn, constants)
+                if target is not None:
+                    refs.add(target)
+            return refs
+
+        # Coalescence uses these references as reachability evidence before
+        # deleting interior function entries. Track constants along actual CFG
+        # edges and keep one only when every incoming path agrees on its value.
+        ordered = sorted(instructions, key=lambda insn: insn.address)
+        if not ordered or ordered[0].address != start:
+            return refs
+        by_address = {insn.address: insn for insn in ordered}
+        fallthrough = {}
+        for current, following in zip(ordered, ordered[1:]):
+            if current.end_address == following.address:
+                fallthrough[current.address] = following.address
+        debug_slides = FunctionTranslator._debug_slide_int3s(ordered)
+
+        def static_successors(insn):
+            if (insn.is_ret or insn.mnemonic in ("ud2", "hlt")
+                    or (insn.mnemonic == "int3"
+                        and insn.address not in debug_slides)):
+                return ()
+            if insn.is_jump:
+                if insn.jump_target in by_address:
+                    return (insn.jump_target,)
+                return ()
+
+            out = []
+            if insn.is_cond_jump and insn.jump_target in by_address:
+                out.append(insn.jump_target)
+            next_address = fallthrough.get(insn.address)
+            if next_address is not None:
+                out.append(next_address)
+            return tuple(dict.fromkeys(out))
+
+        def merge_contributions(contributions):
+            states = list(contributions.values())
+            if not states:
+                return None
+            first = states[0]
+            return {
+                register: value
+                for register, value in first.items()
+                if all(state.get(register) == value for state in states[1:])
+            }
+
+        incoming_states = {start: {None: {}}}
+        entry_states = {start: {}}
+        dynamic_edges = {}
+        worklist = [start]
+        while worklist:
+            address = worklist.pop()
+            if address not in entry_states:
+                continue
+            insn = by_address[address]
+            outgoing = transfer(insn, entry_states[address])
+            static = set(static_successors(insn))
+            dynamic_target = target_from(insn, outgoing)
+            observed = dynamic_edges.setdefault(address, set())
+            if dynamic_target in by_address:
+                observed.add(dynamic_target)
+
+            # Dynamic edges are monotonic. Once a register jump has been proven
+            # to reach a local block, a later loop/join may weaken the register
+            # state so that exact target is no longer known. Removing the edge
+            # in that situation can make the worklist alternate forever between
+            # "edge present" and "edge absent". Keep the edge as a possible
+            # predecessor instead, but feed it unknown state unless it is still
+            # proven on this iteration. That can only discard constants and the
+            # finite dataflow therefore converges conservatively.
+            successors = static | observed
+            for successor in successors:
+                contributions = incoming_states.setdefault(successor, {})
+                if successor in static or successor == dynamic_target:
+                    contribution = dict(outgoing)
+                else:
+                    contribution = {}
+                if contributions.get(address) == contribution:
+                    continue
+                contributions[address] = contribution
+                merged = merge_contributions(contributions)
+                previous = entry_states.get(successor)
+                if previous != merged:
+                    entry_states[successor] = merged
+                    worklist.append(successor)
+
+        for address, incoming in entry_states.items():
+            insn = by_address[address]
+            target = target_from(insn, transfer(insn, incoming))
+            if target is not None:
+                refs.add(target)
+        return refs
+
+    @staticmethod
+    def _debug_slide_int3s(instructions, include_direct_targets=False):
+        """Return INT3 bytes that are unambiguous Xbox INT 2D slide bytes."""
+        slides = set()
+        direct_targets = {
+            insn.jump_target for insn in instructions
+            if insn.jump_target is not None
+        }
+        previous = None
+        for instruction in instructions:
+            if (instruction.mnemonic == "int3" and previous is not None
+                    and previous.end_address == instruction.address
+                    and previous.mnemonic == "int" and previous.operands
+                    and previous.operands[0].type == "imm"
+                    and previous.operands[0].imm == 0x2D
+                    and (include_direct_targets
+                         or instruction.address not in direct_targets)):
+                slides.add(instruction.address)
+            previous = instruction
+        return slides
+
+    @staticmethod
+    def _debug_slide_bypasses(instructions):
+        """Map INT 2D instructions to post-INT3 targets when INT3 has another entry."""
+        direct_targets = {
+            insn.jump_target for insn in instructions
+            if insn.jump_target is not None
+        }
+        bypasses = {}
+        previous = None
+        for instruction in instructions:
+            if (instruction.mnemonic == "int3" and previous is not None
+                    and instruction.address in direct_targets
+                    and previous.end_address == instruction.address
+                    and previous.mnemonic == "int" and previous.operands
+                    and previous.operands[0].type == "imm"
+                    and previous.operands[0].imm == 0x2D):
+                bypasses[previous.address] = instruction.end_address
+            previous = instruction
+        return bypasses
+
     def decode_function(self, start, end):
         """Recover instructions and blocks, including indirect-entry leaders."""
         recovered = self._recovered_cfg.get(start)
@@ -719,6 +1284,10 @@ class FunctionTranslator:
                         self.disasm.disassemble_function(raw_bytes, start, end))
         if not instructions:
             return [], []
+        coalesced = start in self.coalesced_function_starts
+        debug_slide_int3s = self._debug_slide_int3s(instructions)
+        debug_slide_bypasses = (self._debug_slide_bypasses(instructions)
+                                if coalesced else {})
 
         # Addresses this function loads as immediates into a register and
         # then jumps to. `mov ebx, 0x3A0DC; ... ; jmp ebx` is a continuation
@@ -727,23 +1296,18 @@ class FunctionTranslator:
         # that actually contain a register-operand indirect jmp, so a plain
         # `mov reg, <address of a function>` for a callback does not start
         # splitting blocks everywhere.
-        imm_refs = set()
-        if any(insn.mnemonic == "jmp" and not insn.jump_target and insn.operands
-               and insn.operands[0].type == "reg" for insn in instructions):
-            for insn in instructions:
-                if insn.mnemonic != "mov" or len(insn.operands) < 2:
-                    continue
-                if insn.operands[0].type != "reg":
-                    continue
-                if insn.operands[1].type != "imm":
-                    continue
-                value = insn.operands[1].imm
-                if start <= value < end:
-                    imm_refs.add(value)
+        imm_refs = self._indirect_code_refs(instructions, start, end)
         self.lifter.imm_code_refs = imm_refs
 
         # Collect switch table targets as extra block leaders
         switch_leaders = set(imm_refs)
+        switch_leaders.update(debug_slide_bypasses.values())
+        if coalesced:
+            instruction_starts = {insn.address for insn in instructions}
+            switch_leaders.update(
+                insn.end_address for insn in instructions
+                if (insn.mnemonic == "int3"
+                    and insn.end_address in instruction_starts))
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
                 targets = self.lifter._analyze_switch_table(insn.operands)
@@ -767,7 +1331,24 @@ class FunctionTranslator:
         # Build basic blocks
         blocks = self.disasm.build_basic_blocks(
             instructions, start, end,
-            extra_leaders=switch_leaders if switch_leaders else None)
+            extra_leaders=switch_leaders if switch_leaders else None,
+            stop_mnemonics=("ud2", "hlt") if coalesced else ())
+        if coalesced:
+            for block in blocks:
+                bypass = (debug_slide_bypasses.get(block.last_insn.address)
+                          if block.last_insn is not None else None)
+                if bypass is not None:
+                    slide = block.last_insn.end_address
+                    block.successors = [
+                        bypass if successor == slide else successor
+                        for successor in block.successors
+                    ]
+                    if bypass not in block.successors:
+                        block.successors.append(bypass)
+                if (block.last_insn is not None
+                        and block.last_insn.mnemonic == "int3"
+                        and block.last_insn.address not in debug_slide_int3s):
+                    block.successors = []
         return instructions, blocks
 
     def translate_function(self, func_addr, func_info):
@@ -826,11 +1407,18 @@ class FunctionTranslator:
         # usable target; anything else is an analysis boundary gap with no
         # callable symbol.
         last_insn = instructions[-1]
-        continues_past_end = not (
+        coalesced = start in self.coalesced_function_starts
+        debug_slide_int3s = self._debug_slide_int3s(instructions)
+        debug_slide_bypasses = (self._debug_slide_bypasses(instructions)
+                                if coalesced else {})
+        last_is_debug_slide = (coalesced
+                               and last_insn.address in debug_slide_int3s)
+        continues_past_end = last_is_debug_slide or not (
             last_insn.is_terminator
             or last_insn.mnemonic in ("int3", "ud2", "hlt"))
         fallthrough_target = None
-        if (continues_past_end and end in self.func_db
+        bypasses_to_end = end in debug_slide_bypasses.values()
+        if ((continues_past_end or bypasses_to_end) and end in self.func_db
                 and end not in self.owned_function_starts):
             fallthrough_target = end
 
@@ -1058,6 +1646,7 @@ class FunctionTranslator:
             if insn.jump_target and start <= insn.jump_target < end:
                 label_addrs.add(insn.jump_target)
         label_addrs |= self.lifter.imm_code_refs
+        label_addrs.update(debug_slide_bypasses.values())
         # Add switch table targets (indirect jmp with intra-function table)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
@@ -1076,11 +1665,17 @@ class FunctionTranslator:
             last = bb.instructions[-1] if bb.instructions else None
             if last is None:
                 continue
+            bypass = debug_slide_bypasses.get(last.address)
+            if bypass in preds:
+                preds[bypass].add(bb.start)
+                continue
             if last.jump_target in preds:
                 preds[last.jump_target].add(bb.start)
             # A conditional jump also falls through; ret and an unconditional
             # jmp do not.
-            leaves = last.is_ret or last.mnemonic in ("jmp", "int3", "ud2", "hlt")
+            leaves = (last.is_ret or last.mnemonic in ("jmp", "ud2", "hlt")
+                      or (last.mnemonic == "int3"
+                          and last.address not in debug_slide_int3s))
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
@@ -1156,11 +1751,22 @@ class FunctionTranslator:
                 self.lifter, bb, flag_state=incoming)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
+            bypass = debug_slide_bypasses.get(bb.last_insn.address)
+            if bypass is not None:
+                lines.append(
+                    f"    goto loc_{bypass:08X}; /* int 0x2d skips slide int3 */")
+            if (start in self.coalesced_function_starts
+                    and (bb.last_insn.mnemonic in ("ud2", "hlt")
+                         or (bb.last_insn.mnemonic == "int3"
+                             and bb.last_insn.address not in debug_slide_int3s))):
+                lines.append("    return; /* trap ends recovered control flow */")
 
             lines.append(f"")
 
         # Continue into the next function when control runs off the bottom.
         if fallthrough_target is not None:
+            if fallthrough_target in debug_slide_bypasses.values():
+                lines.append(f"loc_{fallthrough_target:08X}: ;")
             ft_name = self.lifter._call_target_name(fallthrough_target)
             lines.append(f"    g_seh_ebp = ebp; {ft_name}(); return;"
                          f" /* fallthrough 0x{fallthrough_target:08X} */")
@@ -1260,7 +1866,8 @@ class BatchTranslator:
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
                  output_dir=None, seh_prolog=None, seh_epilog=None,
-                 trace_functions=None):
+                 trace_functions=None, coalesce_json_paths=None,
+                 protected_function_starts=None):
         self.xbe_path = xbe_path
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(__file__), "output")
@@ -1310,27 +1917,49 @@ class BatchTranslator:
                 addr = int(entry["address"], 16)
                 self.abi_db[addr] = entry
 
-        # Detect the SEH helpers once here rather than per-Lifter, so the
-        # result can be reported and overridden from the command line.
+        # Recover boundaries before identifying helpers from complete bodies.
+        self.translator = FunctionTranslator(
+            self.xbe_data, self.func_db, self.label_db,
+            self.classification_db, self.abi_db,
+            seh_prolog=0, seh_epilog=0,
+            trace_functions=trace_functions)
+        self.translator.protected_function_starts = set(
+            protected_function_starts or ())
+        if coalesce_json_paths:
+            self.translator.discover_static_indirect_targets(coalescing=True)
+            for path in coalesce_json_paths:
+                for entry in load_coalescences(path):
+                    self.translator.coalesce_function(
+                        entry["start"], entry["end"], entry["coalesce_starts"])
+                    self.translator.discover_static_indirect_targets(
+                        coalescing=True)
+
+        # Detect once here so the result can be reported and overridden from
+        # the command line without retaining an address of a removed fragment.
         if seh_prolog is None or seh_epilog is None:
             found_prologs, found_epilog = detect_seh_helpers(
                 self.func_db, self.xbe_data, verbose=True)
             seh_prolog = seh_prolog if seh_prolog is not None else found_prologs
             seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
-        self.seh_prolog = seh_prolog
+        seh_prologs = tuple(sorted(_as_addr_set(seh_prolog)))
+        self.seh_prolog = (None if not seh_prologs else
+                           seh_prologs[0] if len(seh_prologs) == 1 else
+                           seh_prologs)
         self.seh_epilog = seh_epilog
 
         setjmp_fn, longjmp_fn = detect_setjmp_helpers(
             self.func_db, self.xbe_data, verbose=True)
 
-        # Create translator
-        self.translator = FunctionTranslator(
-            self.xbe_data, self.func_db, self.label_db,
-            self.classification_db, self.abi_db,
-            seh_prolog=seh_prolog, seh_epilog=seh_epilog,
-            setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
-            trace_functions=trace_functions)
-        self.translator.discover_static_indirect_targets()
+        seh_prologs = frozenset(seh_prologs)
+        self.translator.lifter.SEH_PROLOGS = seh_prologs
+        self.translator.lifter.SEH_PROLOG = min(seh_prologs) if seh_prologs else None
+        self.translator.lifter.SEH_EPILOG = seh_epilog
+        self.translator.lifter.SEH_HELPERS = seh_prologs | (
+            {seh_epilog} if seh_epilog is not None else set())
+        self.translator.lifter.SETJMP_FN = setjmp_fn
+        self.translator.lifter.LONGJMP_FN = longjmp_fn
+        if not coalesce_json_paths:
+            self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
 
     def get_functions_by_category(self, categories=None, exclude_categories=None):
