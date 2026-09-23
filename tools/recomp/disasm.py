@@ -225,7 +225,7 @@ class Disassembler:
         return [decoded[a] for a in sorted(decoded)]
 
     def disassemble_cfg(self, raw_bytes, start_va, end_va, entry_points,
-                        stop_addresses=None):
+                        stop_addresses=None, stop_mnemonics=()):
         """Decode reachable instruction streams from an explicit worklist."""
         size = end_va - start_va
         if size <= 0 or size > len(raw_bytes):
@@ -255,13 +255,13 @@ class Disassembler:
                             and start_va <= insn.jump_target < end_va):
                         worklist.append(insn.jump_target)
                     break
-                if insn.is_ret:
+                if insn.is_ret or insn.mnemonic in stop_mnemonics:
                     break
 
         return [decoded[addr] for addr in sorted(decoded)]
 
     def build_basic_blocks(self, instructions, func_start, func_end,
-                           extra_leaders=None):
+                           extra_leaders=None, stop_mnemonics=()):
         """
         Partition instructions into basic blocks.
         A new block starts at:
@@ -283,7 +283,7 @@ class Disassembler:
                     leaders.add(insn.jump_target)
                 # Instruction after the branch is also a leader
                 leaders.add(insn.end_address)
-            elif insn.is_call:
+            elif insn.is_call or insn.mnemonic in stop_mnemonics:
                 # Instruction after call is a leader (call might not return)
                 leaders.add(insn.end_address)
 
@@ -309,7 +309,7 @@ class Disassembler:
                 idx += 1
 
                 # Block ends at terminators
-                if insn.is_ret or insn.is_jump:
+                if insn.is_ret or insn.is_jump or insn.mnemonic in stop_mnemonics:
                     break
                 if insn.is_cond_jump:
                     break
@@ -317,7 +317,7 @@ class Disassembler:
             # Determine successors
             if bb.instructions:
                 last = bb.last_insn
-                if last.is_ret:
+                if last.is_ret or last.mnemonic in stop_mnemonics:
                     pass  # No successors
                 elif last.is_jump:
                     if last.jump_target and func_start <= last.jump_target < func_end:
