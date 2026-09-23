@@ -313,8 +313,15 @@ static inline int adpcm_decode_block(int16_t *outbuf, const uint8_t *inbuf,
 
     for (int ch = 0; ch < channels; ch++) {
         *outbuf++ = pcmdata[ch] = (int16_t)(inbuf[0] | (inbuf[1] << 8));
-        index[ch] = inbuf[2];
-        if (index[ch] < 0 || index[ch] > 88 || inbuf[3]) return 0;
+        /* The fourth header byte is RESERVED, not validated: the MCPX does not
+         * refuse a block over it, and titles ship blocks where it is non-zero
+         * (Jet Set Radio Future ends every ADPCM buffer in a 0x08 pad, and
+         * 3.5-4.4% of its blocks were silenced by this test). The step index
+         * is clamped for the same reason -- and it must be clamped, not
+         * trusted, because step_table has 89 entries. Refusing either returned
+         * 0 AFTER the first sample of each channel had been written. */
+        index[ch] = (int8_t)inbuf[2];
+        ADPCM_CLIP(index[ch], 0, 88);
         inbufsize -= 4;
         inbuf += 4;
     }
