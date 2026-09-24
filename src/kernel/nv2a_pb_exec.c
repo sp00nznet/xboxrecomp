@@ -312,6 +312,12 @@ static int s_tex_use_count;
 /* Defined below, next to the sampler it goes through. */
 static void dump_texture_bmp(uint32_t seq);
 
+/* Repeat dumps are numbered from well past the first-use sequence, so a
+ * listing sorts them after the textures they came from and no first-use file
+ * is ever overwritten by one. */
+#define TEX_DUMP_SEQ_BASE 1000u
+#define TEX_DUMP_SEQ_MAX  40u
+
 static void note_texture_use(void)
 {
     int i;
@@ -322,6 +328,33 @@ static void note_texture_use(void)
         if (s_tex_use[i].offset == s_gpu.tex.offset
          && s_tex_use[i].color  == s_gpu.tex.color) {
             s_tex_use[i].batches++;
+            /* Dump a surface that is redrawn, every Nth time it is bound.
+             *
+             * First use alone cannot tell a decode error that is wrong in
+             * every frame from one that accumulates across them. A block
+             * transform that is wrong is wrong on its own, in the keyframe
+             * as much as anywhere; motion compensation that is wrong starts
+             * from a clean keyframe and smears further with each predicted
+             * frame after it. In a single frame the two look identical, and
+             * in a sequence they look nothing alike -- so the sequence is
+             * what has to be captured.
+             *
+             * It belongs on this side of the return: a video surface keeps
+             * one address for the whole film, so after the first frame it is
+             * only ever found here, and the first-use dump below never fires
+             * for it again. RECOMP_TEX_DUMP_EVERY=<n> sets the interval, and
+             * RECOMP_TEX_DUMP still names the files. */
+            {
+                static int every = -1;
+                static unsigned binds, seq;
+                if (every < 0) {
+                    const char *e = getenv("RECOMP_TEX_DUMP_EVERY");
+                    every = e ? atoi(e) : 0;
+                }
+                if (every > 0 && ++binds % (unsigned)every == 0
+                    && seq < TEX_DUMP_SEQ_MAX)
+                    dump_texture_bmp(TEX_DUMP_SEQ_BASE + seq++);
+            }
             return;
         }
     }
