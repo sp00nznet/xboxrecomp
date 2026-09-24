@@ -953,11 +953,23 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
 
     # ── repe cmpsb / repne scasb: string comparison ──
+    #
+    # ZF lives in _flags. CF lives in _cf, which _rep_compare writes whenever
+    # the function declares it -- and _function_needs_cf declares it for
+    # exactly these carry conditions after a rep compare.
     if "cmps" in flag_setter or "scas" in flag_setter:
         if jcc in ("je", "jz"):
             return "(_flags != 0)", desc
         if jcc in ("jne", "jnz"):
             return "(_flags == 0)", desc
+        if jcc in ("jb", "jnae", "jc"):
+            return "_cf", desc
+        if jcc in ("jae", "jnb", "jnc"):
+            return "!_cf", desc
+        if jcc in ("jbe", "jna"):
+            return "(_cf || _flags != 0)", desc
+        if jcc in ("ja", "jnbe"):
+            return "(!_cf && _flags == 0)", desc
         return None
 
     return None
@@ -2569,27 +2581,9 @@ class Lifter:
                 "ecx = 0; /* rep stosw */"
             ]
         if "cmpsb" in m:
-            continue_on_equal = "repne" not in m and "repnz" not in m
-            stop_condition = "!_flags" if continue_on_equal else "_flags"
-            return [
-                "{ int32_t _st = RECOMP_DF_STEP(1);",
-                "while (ecx != 0) {",
-                "    _flags = (MEM8(esi) == MEM8(edi));",
-                "    esi += _st; edi += _st; ecx--;",
-                f"    if ({stop_condition}) break;",
-                f"}} }} /* {m} */",
-            ]
+            return self._rep_compare(m, "MEM8(esi)", "MEM8(edi)", 1, True)
         if "scasb" in m:
-            continue_on_equal = "repne" not in m and "repnz" not in m
-            stop_condition = "!_flags" if continue_on_equal else "_flags"
-            return [
-                "{ int32_t _st = RECOMP_DF_STEP(1);",
-                "while (ecx != 0) {",
-                "    _flags = (LO8(eax) == MEM8(edi));",
-                "    edi += _st; ecx--;",
-                f"    if ({stop_condition}) break;",
-                f"}} }} /* {m} */",
-            ]
+            return self._rep_compare(m, "LO8(eax)", "MEM8(edi)", 1, False)
         # The word and dword forms, same shape as the byte forms above. They
         # used to be a bare comment: nothing compared, esi/edi never advanced,
         # and the flags kept whatever the previous instruction left, so the jcc
@@ -2599,31 +2593,51 @@ class Lifter:
         if "cmpsw" in m or "cmpsd" in m:
             wide = "cmpsd" in m
             step, acc = (4, "MEM32") if wide else (2, "MEM16")
-            continue_on_equal = "repne" not in m and "repnz" not in m
-            stop_condition = "!_flags" if continue_on_equal else "_flags"
-            return [
-                f"{{ int32_t _st = RECOMP_DF_STEP({step});",
-                "while (ecx != 0) {",
-                f"    _flags = ({acc}(esi) == {acc}(edi));",
-                "    esi += _st; edi += _st; ecx--;",
-                f"    if ({stop_condition}) break;",
-                f"}} }} /* {m} */",
-            ]
+            return self._rep_compare(m, f"{acc}(esi)", f"{acc}(edi)", step,
+                                     True)
         if "scasw" in m or "scasd" in m:
             wide = "scasd" in m
             step, acc = (4, "MEM32") if wide else (2, "MEM16")
             value = "eax" if wide else "LO16(eax)"
-            continue_on_equal = "repne" not in m and "repnz" not in m
-            stop_condition = "!_flags" if continue_on_equal else "_flags"
-            return [
-                f"{{ int32_t _st = RECOMP_DF_STEP({step});",
-                "while (ecx != 0) {",
-                f"    _flags = ({value} == {acc}(edi));",
-                "    edi += _st; ecx--;",
-                f"    if ({stop_condition}) break;",
-                f"}} }} /* {m} */",
-            ]
+            return self._rep_compare(m, value, f"{acc}(edi)", step, False)
         return [f"/* {m} */"]
+
+    def _rep_compare(self, m, first, second, step, uses_esi):
+        """REPE/REPNE CMPS and SCAS: compare element by element.
+
+        `_flags` holds ZF of the last comparison, which is all je/jne/sete
+        ask. CF matters too wherever the function reads it: MSVC's memcmp
+        and basic_string::compare finish a mismatch with
+        `sbb eax, eax; sbb eax, -1`, which turns CF -- "the first differing
+        element of the first operand is below the second's" -- into -1 or
+        +1. Nothing wrote _cf here, so the sbb read whatever the last add or
+        xor left, and JSRF's string compare (sub_00179AE0, after
+        `xor eax, eax`: CF 0) answered +1 for every mismatch, "less" never.
+        The comparison is unsigned at the element's width, as the hardware
+        does it: cmps compares [esi] with [edi], scas the accumulator with
+        [edi].
+
+        A zero count leaves the flags as they were. _cf does that by itself
+        (only an iteration writes it); for _flags, lift_basic_block loads
+        the incoming ZF before this loop when a tracked setter provides it.
+        """
+        continue_on_equal = "repne" not in m and "repnz" not in m
+        stop_condition = "!_flags" if continue_on_equal else "_flags"
+        advance = ("esi += _st; edi += _st; ecx--;" if uses_esi
+                   else "edi += _st; ecx--;")
+        lines = [
+            f"{{ int32_t _st = RECOMP_DF_STEP({step});",
+            "while (ecx != 0) {",
+            f"    _flags = ({first} == {second});",
+        ]
+        if self.needs_cf:
+            lines.append(f"    _cf = ({first} < {second});")
+        lines += [
+            f"    {advance}",
+            f"    if ({stop_condition}) break;",
+            f"}} }} /* {m} */",
+        ]
+        return lines
 
     def _lift_string_op(self, insn, m):
         # Unprefixed forms; direction still comes from EFLAGS.DF.
@@ -3487,6 +3501,15 @@ class Lifter:
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
+def _is_rep_compare(insn):
+    """REPE/REPNE CMPS or SCAS -- the prefixed forms that write `_flags`."""
+    if not insn.mnemonic.startswith("rep"):
+        return False
+    text = f"{insn.mnemonic} {getattr(insn, 'op_str', '') or ''}"
+    return any(f in text for f in ("cmpsb", "cmpsw", "cmpsd",
+                                   "scasb", "scasw", "scasd"))
+
+
 def lift_basic_block(lifter, bb, flag_state=None):
     """
     Lift a basic block to C statements.
@@ -3603,6 +3626,18 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 curr, curr.operands, preserve_carry=preserve)
         else:
             results = lifter.lift_instruction(insns[i])
+            # A REPE/REPNE compare whose count is zero leaves EFLAGS alone,
+            # but `_flags` would keep whatever it last held -- 0 on entry --
+            # so the je after it read "not equal" where the hardware reads
+            # the ZF of the instruction before. MSVC's basic_string::compare
+            # is `xor eax, eax; repe cmpsb; je` with the count = the shorter
+            # length, so comparing against an empty string took the wrong
+            # arm. Load the incoming ZF first, when a tracked setter has one.
+            if _is_rep_compare(curr) and last_flag_setter:
+                zf = _make_condition("je", last_flag_setter, last_flag_ops)
+                if zf:
+                    stmts.append(f"_flags = ({zf[0]}) ? 1 : 0;"
+                                 " /* ZF in: a zero count keeps it */")
         stmts.extend(results)
 
         # Track flag-setting instructions
@@ -3640,10 +3675,15 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # repe cmpsb/repne scasb = comparison, sets flags
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
-            if "cmpsb" in raw_m or "scasb" in raw_m:
+            # Every width sets flags, not just the byte forms: a
+            # `repe cmpsd` left the xor before it as the tracked setter, so
+            # the sbb that follows read the xor's CF instead of the compare's.
+            _cmp_forms = ("cmpsb", "cmpsw", "cmpsd",
+                          "scasb", "scasw", "scasd")
+            if any(f in raw_m for f in _cmp_forms):
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
-            elif "cmpsb" in rest or "scasb" in rest:
+            elif any(f in rest for f in _cmp_forms):
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
             else:

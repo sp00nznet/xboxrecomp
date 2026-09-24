@@ -636,7 +636,8 @@ class FunctionTranslator:
     def _function_needs_cf(instructions):
         """True when something in the function reads CF."""
         from .lifter import (FLAG_SETTERS, CF_TRACKED, BT_MODIFY,
-                             _EFLAGS_SETTERS, _FLAGS_UNDEFINED)
+                             _EFLAGS_SETTERS, _FLAGS_UNDEFINED,
+                             _is_rep_compare)
 
         last_setter = None
         for insn in instructions:
@@ -653,10 +654,16 @@ class FunctionTranslator:
             if (cc in FunctionTranslator._CARRY_CC
                     and (last_setter in CF_TRACKED
                          or last_setter in ("inc", "dec")
-                         or last_setter in BT_MODIFY)):
+                         or last_setter in BT_MODIFY
+                         or last_setter == "rep-compare")):
                 return True
             if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
+            elif _is_rep_compare(insn):
+                # A REPE/REPNE CMPS/SCAS produces CF into _cf, so a jb/ja
+                # after one needs it declared. Anything else starting "rep"
+                # (movs/stos) leaves the flags and the setter alone.
+                last_setter = "rep-compare"
             elif m in _FLAGS_UNDEFINED:
                 last_setter = None
         return False
