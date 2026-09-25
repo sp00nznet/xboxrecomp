@@ -882,6 +882,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
     if flag_setter in ("rol", "ror", "rcl", "rcr"):
+        # rcl/rcr leave their carry-out in _cf (RC_ROT writes it back), and
+        # _function_needs_cf declares _cf for any function containing them.
+        if flag_setter in ("rcl", "rcr"):
+            if jcc in ("jb", "jnae", "jc"):
+                return "_cf", desc
+            if jcc in ("jae", "jnb", "jnc"):
+                return "!_cf", desc
         # ZF/SF not modified by rotations - can't resolve most conditions
         return None
 
@@ -1338,6 +1345,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("rcl", "rcr"):
+            return self._lift_rotate_carry(insn, ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -2040,6 +2049,37 @@ class Lifter:
         out.append(_fmt_operand_write(ops[0], f"(uint32_t)(({signed}) >> {cnt})"))
         out.append(self._result_snapshot(ops, "sar"))
         return out
+
+    def _lift_rotate_carry(self, insn, ops, m):
+        """rcl/rcr: the carry flag is one of the bits being rotated.
+
+        These were falling through to the TODO comment, which is a silent
+        no-op. Where they appear is the compiler's own 64-bit divide:
+
+            shr ecx, 1
+            rcr ebx, 1        <- carries ecx's bit 0 into ebx's bit 31
+            shr edx, 1
+            rcr eax, 1
+            or  ecx, ecx
+            jnz ...
+
+        That loop normalises a 128-bit pair down to something a 32-bit
+        divide can take. With the rcr dropped the low halves never move, so
+        the divisor and the dividend both go into the divide wrong -- and
+        nothing says so.
+        """
+        if len(ops) < 2:
+            return [f"/* {m}: bad operands */"]
+        width = (_operand_width(ops[0]) or 4) * 8
+        dst = _fmt_operand_read(ops[0])
+        cnt = _fmt_operand_read(ops[1])
+        left = 1 if m == "rcl" else 0
+        write = _fmt_operand_write(ops[0], "_rcv")
+        return [
+            f"{{ uint32_t _rcv = RC_ROT((uint32_t)({dst}), (unsigned)({cnt}),"
+            f" &_cf, {width}, {left});",
+            f"  {write} }} /* {m} */",
+        ]
 
     def _lift_rotate(self, insn, ops, m):
         """A rotate is at the OPERAND's width, not always at 32 bits.

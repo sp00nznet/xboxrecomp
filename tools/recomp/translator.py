@@ -641,7 +641,7 @@ class FunctionTranslator:
         last_setter = None
         for insn in instructions:
             m = insn.mnemonic
-            if m in ("adc", "sbb", "stc", "clc", "cmc"):
+            if m in ("adc", "sbb", "stc", "clc", "cmc", "rcl", "rcr"):
                 return True
             cc = None
             if m.startswith("j") and len(m) > 1:

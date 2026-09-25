@@ -129,6 +129,17 @@ CASES = [
     Case("neg_adc", "neg's carry into adc",
          ["neg eax", "adc ecx, 0", "mov eax, ecx"], _PAIRS),
 
+    # -- rotate through carry ------------------------------------------------
+    Case("rcr_divide_normaliser", "shr's carry into rcr, as MSVC's 64-bit divide",
+         ["shr ecx, 1", "rcr eax, 1"], _PAIRS),
+    Case("rcl_i32_cl", "rcl by a variable count",
+         ["stc", "rcl eax, cl"], _PAIRS),
+    Case("rcr_i8_cl_setc", "byte rcr, count mod 9, carry out read by setc",
+         ["stc", "rcr al, cl", "setc ah"], _PAIRS),
+    Case("rcl_i16_cl_setc", "word rcl, count mod 17, carry out read by setc",
+         ["clc", "rcl ax, cl", "setc cl", "movzx ecx, cl",
+          "shl ecx, 16", "movzx eax, ax", "or eax, ecx"], _PAIRS),
+
     # -- sign/zero extension -------------------------------------------------
     Case("movsx_8_32", "sign-extend byte to dword",
          ["movsx eax, al"], _PAIRS),

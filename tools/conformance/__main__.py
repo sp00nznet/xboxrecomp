@@ -224,6 +224,7 @@ def _lift(code_bytes):
     """
     from tools.recomp.disasm import BasicBlock, Disassembler
     from tools.recomp.lifter import Lifter, lift_basic_block
+    from tools.recomp.translator import FunctionTranslator
     d = Disassembler()
     insns, mnemonics = [], []
     for insn in d._cs.disasm(code_bytes, 0x00100000):
@@ -233,7 +234,7 @@ def _lift(code_bytes):
     # FunctionTranslator sets this per function, and the lifter only bothers
     # producing CF when something consumes it. Without it the snippet would be
     # lifted differently from how recomp would lift the same bytes.
-    lifter.needs_cf = any(i.mnemonic in ("sbb", "adc") for i in insns)
+    lifter.needs_cf = FunctionTranslator._function_needs_cf(insns)
     lines, _ = lift_basic_block(lifter, BasicBlock(start=0x00100000,
                                                    instructions=insns))
     return list(lines), mnemonics
