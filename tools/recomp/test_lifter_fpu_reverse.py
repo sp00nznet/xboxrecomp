@@ -67,7 +67,7 @@ class FpuReverseFormTest(unittest.TestCase):
             ("fpatan", "atan2(fp_st1(), fp_top())"),
             ("fsin", "sin(fp_top())"),
             ("fcos", "cos(fp_top())"),
-            ("frndint", "rint(fp_top())"),
+            ("frndint", "recomp_frndint(fp_top(), g_fp_control_word)"),
             ("fyl2x", "log2(fp_top())"),
         ):
             with self.subTest(mnemonic=mnemonic):

@@ -3372,7 +3372,14 @@ class Lifter:
         if m == "fscale":
             return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
         if m == "frndint":
-            return [f"fp_top() = rint(fp_top()); /* frndint */"]
+            # Rounds under the guest's x87 RC bits, like FIST. rint() used the
+            # host's rounding mode, which the guest's fldcw never reaches, so
+            # MSVC's floor() and ceil() -- fldcw RC=down/up around a frndint --
+            # both rounded to nearest: floor(2.7) returned 3. Code that indexes
+            # a table with floor() then reads one entry past it (in one title,
+            # a skeletal animation drew a frame of garbage bones per loop).
+            return [f"fp_top() = recomp_frndint(fp_top(), g_fp_control_word);"
+                    f" /* frndint */"]
         if m == "fldpi":
             return [f"fp_push(3.14159265358979323846); /* fldpi */"]
         if m == "fldl2e":
