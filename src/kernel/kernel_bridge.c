@@ -588,6 +588,12 @@ static void bridge_PsCreateSystemThreadEx(void)
  * NTSTATUS NtClose(HANDLE Handle)
  * Handle is a value (not a pointer), so safe for generic call.
  */
+
+/* Asynchronous-handle bookkeeping, defined with the file bridges below. */
+static void bridge_note_async_handle(uint32_t token);
+static void bridge_forget_async_handle(uint32_t token);
+static int  bridge_handle_is_async(uint32_t token);
+
 /* Handle-table helpers; defined further below. Xbox memory slots are 32-bit
  * but native HANDLEs are 64-bit pointers, so handles are kept in a table and
  * referenced by tagged 32-bit tokens. */
@@ -602,6 +608,8 @@ static void bridge_NtClose(void)
         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
         fflush(stderr);
     }
+
+    bridge_forget_async_handle(raw_handle);
 
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
@@ -2751,6 +2759,11 @@ static void bridge_NtCreateFile(void)
         handle_va, access, obj_attrs, iostatus,
         file_attrs, share, disposition, options);
 
+    /* FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT. Neither set
+     * means the caller wants asynchronous completion on this handle. */
+    if (g_eax == 0 && handle_va && (options & 0x30u) == 0u)
+        bridge_note_async_handle(BRIDGE_MEM32(handle_va));
+
     /* An FMV the host can decode itself.
      *
      * The title's own decoder is emulated like everything else, but it only
@@ -3023,6 +3036,61 @@ static void bridge_RtlUnwind(void)
         g_esp += 0x50;
 }
 
+
+/* Which open file handles were asked for asynchronously.
+ *
+ * NtCreateFile takes FILE_SYNCHRONOUS_IO_ALERT (0x10) and
+ * FILE_SYNCHRONOUS_IO_NONALERT (0x20) in CreateOptions. With neither, the
+ * handle is asynchronous: NtReadFile on it returns STATUS_PENDING even with
+ * no event, and the caller waits on the handle. Completing every read
+ * synchronously answers a different question than the one that was asked.
+ *
+ * A flat array because a title has a handful of files open at once and a
+ * linear scan of sixty-four entries costs less than a hash would.
+ */
+#define BRIDGE_ASYNC_MAX 64
+static uint32_t g_async_handles[BRIDGE_ASYNC_MAX];
+
+static void bridge_note_async_handle(uint32_t token)
+{
+    int i;
+    if (!token)
+        return;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (g_async_handles[i] == token)
+            return;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (!g_async_handles[i]) { g_async_handles[i] = token; return; }
+}
+
+static void bridge_forget_async_handle(uint32_t token)
+{
+    int i;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (g_async_handles[i] == token) { g_async_handles[i] = 0; return; }
+}
+
+static int bridge_handle_is_async(uint32_t token)
+{
+    int i;
+    if (!token)
+        return 0;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (g_async_handles[i] == token)
+            return 1;
+    return 0;
+}
+
+/* Off unless RECOMP_ASYNC_IO is set, so the two behaviours stay comparable
+ * rather than one being swapped in blind. */
+static int bridge_async_io_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_ASYNC_IO") ? 1 : 0;
+    return on;
+}
+
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
@@ -3056,13 +3124,15 @@ static void bridge_NtReadFile(void)
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller,
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
@@ -3071,6 +3141,24 @@ static void bridge_NtReadFile(void)
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
+
+    /* An asynchronous request returns STATUS_PENDING, even when the data was
+     * already there.
+     *
+     * A caller that asked to be told later is told later on Windows: the read
+     * returns 0x00000103 and the status block carries the result once the
+     * handle signals. Returning STATUS_SUCCESS instead is not a harmless
+     * shortcut, it is a different contract, and code written against the real
+     * one takes the branch that says nothing is in flight.
+     *
+     * The read itself stays synchronous here: the status block is already
+     * written and the event already signalled, so a caller that waits is
+     * satisfied immediately. Only the answer changes.
+     *
+     * An event or APC alone does not make a read asynchronous: on a
+     * synchronous handle the kernel waits and returns the final status. */
+    if (bridge_async_io_enabled() && bridge_handle_is_async(STACK_ARG(0)))
+        g_eax = STATUS_PENDING;
 }
 
 /* ── NtWriteFile (ordinal 236, 8 args = 32 bytes) ─────── */
