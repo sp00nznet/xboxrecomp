@@ -11,6 +11,8 @@
  * Input comes from the host through the existing xbox_input layer, so a real
  * pad plugged into the PC drives this one.
  */
+#include <stdlib.h>
+#include <stdio.h>
 #include "usb_gamepad.h"
 
 #include <string.h>
@@ -216,6 +218,40 @@ int usb_gamepad_report(uint8_t *out, int max)
 
     /* A disconnected host pad is not an error here: the device is present on
      * the bus either way, it just reports nothing pressed. */
+    /* RECOMP_INPUT_DIAG: the whole chain on one line, once a second.
+     *
+     * "Nothing happens when I press a key" has several candidate causes and
+     * guessing between them costs a rebuild each: the variable not read,
+     * XInput claiming a pad so the keyboard fallback never runs, the window
+     * not receiving the key, or the report going out without it. Printing
+     * all four together answers it in one run.
+     *
+     * It samples the held state, so pair it with the window's own
+     * RECOMP_KEY_TRACE: that answers "did the key arrive", this answers
+     * "is the chain wired". */
+    {
+        static int diag = -1;
+        if (diag < 0)
+            diag = getenv("RECOMP_INPUT_DIAG") != NULL;
+        if (diag) {
+            extern int xbox_FramebufferKeyDown(int vk);
+            static unsigned long last;
+            unsigned long now = (unsigned long)GetTickCount();
+            if (now - last > 1000) {
+                XBOX_INPUT_STATE probe;
+                DWORD rc = xbox_InputGetState(0, &probe);
+                last = now;
+                fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
+                        "InputGetState=%lu buttons=0x%04X\n",
+                        getenv("RECOMP_KEYBOARD") ? 1 : 0,
+                        xbox_FramebufferKeyDown(0x0D),
+                        (unsigned long)rc,
+                        rc == 0 ? probe.Gamepad.wButtons : 0);
+                fflush(stderr);
+            }
+        }
+    }
+
     if (xbox_InputGetState(0, &state) != 0)
         return 20;
 

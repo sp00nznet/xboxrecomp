@@ -58,6 +58,11 @@ int  video_dump_frame_bmp(const char *path);
 
 /* Show the guest framebuffer in its own window (RECOMP_FB_WINDOW). Whatever
  * the title renders into guest RAM appears there; nothing else scans it out. */
+/* Non-zero while that virtual key is held in the framebuffer window. Always
+ * zero when there is no window, which is the right answer: with nothing to
+ * focus there is nothing to type into. */
+int xbox_FramebufferKeyDown(int vk);
+
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 int  xbox_FramebufferDumpBmp(const char *path);
