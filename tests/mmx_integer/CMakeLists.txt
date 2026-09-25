@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(mmx_integer_test C)
+set(CMAKE_C_STANDARD 11)
+add_executable(mmx_integer_test test_main.c)
+# _mm_shuffle_pi16 and the extract/insert forms are SSE, not baseline MMX.
+if(NOT MSVC)
+    target_compile_options(mmx_integer_test PRIVATE -mmmx -msse)
+endif()
+enable_testing()
+add_test(NAME mmx_integer_test COMMAND mmx_integer_test)
