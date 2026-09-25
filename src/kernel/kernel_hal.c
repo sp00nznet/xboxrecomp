@@ -118,10 +118,56 @@ LARGE_INTEGER __stdcall xbox_KeQueryPerformanceFrequency(void)
  * January 1, 1601). Direct Win32 mapping.
  * ============================================================================ */
 
+static LONGLONG s_time_anchor_100ns;
+static LONGLONG s_time_anchor_counts;
+static LONGLONG s_time_freq_counts;
+static INIT_ONCE s_time_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK anchor_system_time(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    FILETIME ft;
+    LARGE_INTEGER f, now;
+    (void)once; (void)param; (void)ctx;
+    QueryPerformanceFrequency(&f);
+    GetSystemTimeAsFileTime(&ft);
+    QueryPerformanceCounter(&now);
+    s_time_freq_counts = f.QuadPart ? f.QuadPart : 1;
+    s_time_anchor_100ns = ((LONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    s_time_anchor_counts = now.QuadPart;
+    return TRUE;
+}
+
 VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
 {
-    if (CurrentTime)
-        GetSystemTimeAsFileTime((LPFILETIME)CurrentTime);
+    /* Anchored once to the wall clock, advanced by the performance counter.
+     *
+     * GetSystemTimeAsFileTime alone moves in steps of about 15.6 ms, the
+     * host's scheduler tick. The console's clock is far finer, and a title
+     * that busy-waits on this -- reading it until enough time has passed --
+     * spins for the whole of each step instead of a few iterations.
+     *
+     * Measured on Shin Megami Tensei: Nine: one such wait called this
+     * **11.8 million times in two seconds**, which is most of what the
+     * title was doing at that moment, and it came out of the spin in a
+     * state where it no longer polled the gamepad.
+     *
+     * The anchor keeps the absolute value right; the counter supplies the
+     * resolution between ticks.
+     *
+     * Whole seconds and the remainder are scaled separately: scaling the
+     * whole count by 10^7 overflows after about a day at 10 MHz. */
+    LARGE_INTEGER now;
+    LONGLONG delta;
+
+    if (!CurrentTime)
+        return;
+
+    InitOnceExecuteOnce(&s_time_once, anchor_system_time, NULL, NULL);
+    QueryPerformanceCounter(&now);
+    delta = now.QuadPart - s_time_anchor_counts;
+    CurrentTime->QuadPart = s_time_anchor_100ns
+        + (delta / s_time_freq_counts) * 10000000LL
+        + (delta % s_time_freq_counts) * 10000000LL / s_time_freq_counts;
 }
 
 /* ============================================================================

@@ -130,6 +130,30 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
         }
     }
 
+    /* Class requests on the interface -- GET_REPORT.
+     *
+     * XAPI reads the pad through the interrupt endpoint and also asks for
+     * the same report over the control pipe. Stalling that is not a small
+     * omission: a stalled control transfer reads to the driver as a broken
+     * device, and because the stall also halts the endpoint, the pad stops
+     * being polled for good.
+     *
+     * Measured on Shin Megami Tensei: Nine, the periodic list runs at about
+     * a hundred descriptors a second and then collapses to nothing the
+     * moment one `A1 01 value 0100 len 20` arrives.
+     *
+     * The answer is the report the interrupt endpoint would have sent.
+     */
+    if ((setup->bmRequestType & 0x60u) == 0x20u        /* class */
+        && setup->bRequest == 0x01u                    /* GET_REPORT */
+        && is_in) {
+        uint8_t report[20];
+        int n = usb_gamepad_report(report, (int)sizeof report);
+        if (n <= 0)
+            return -1;
+        return copy_out(out, max, report, n, setup->wLength);
+    }
+
     /* Vendor requests on the interface -- the XID protocol.
      *
      * This is how XAPI tells a controller from any other USB device. The
