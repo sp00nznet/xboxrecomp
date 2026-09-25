@@ -9,6 +9,7 @@
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
+#include "../kernel/kernel.h"
 #include "usb_gamepad.h"
 
 #include <stdio.h>
@@ -117,6 +118,11 @@ static void wr32(uint32_t va, uint32_t v);
 /* The MCPX gives each controller a small root hub. Two ports apiece covers
  * the console's four front sockets, which is what a title enumerates over. */
 #define OHCI_PORTS              2
+
+/* Passes this thread will keep an interrupt back while the guest is at
+ * DISPATCH_LEVEL or above. One pass is the 20 ms loop tick, so four is 80 ms:
+ * longer than any real critical section, shorter than a hang. */
+#define OHCI_IRQ_HOLDOFF        4
 
 typedef struct {
     uint32_t base;                      /* Xbox VA of the register block   */
@@ -775,6 +781,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     int plugged = 0;
     uint32_t last_status = 0;
     unsigned repeats = 0;
+    unsigned held_off = 0;
+    int      held_off_warned = 0, held_off_forced = 0;
 
     (void)unused;
     {
@@ -888,6 +896,34 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         status = hc->reg[HcInterruptStatus / 4] & enable & 0x7Fu;
         if (!status)
             continue;
+
+        /* Bounded, because the mask is a model and not the hardware.
+         *
+         * The depth is a count of raise/lower pairs across every thread, and
+         * one unmatched raise anywhere leaves the gate shut for the rest of
+         * the run -- which is how this first showed up: no interrupt was ever
+         * delivered and enumeration stopped at two empty control EDs. Real
+         * hardware is never masked for 80 ms, so past that the line is
+         * asserted anyway. The common case still holds the ISR out of the
+         * guest's critical section; the pathological case costs a delay
+         * instead of the device. */
+        if (xbox_IrqlBlocksInterrupts() && ++held_off <= OHCI_IRQ_HOLDOFF) {
+            if (!held_off_warned) {
+                held_off_warned = 1;
+                fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "
+                        "(depth %d, status=0x%02X)\n",
+                        hc->index, xbox_IrqlRaisedCount(), status);
+                fflush(stderr);
+            }
+            continue;
+        }
+        if (held_off > OHCI_IRQ_HOLDOFF && !held_off_forced) {
+            held_off_forced = 1;
+            fprintf(stderr, "  [OHCI%d] guest IRQL never dropped (depth %d); "
+                    "delivering anyway\n", hc->index, xbox_IrqlRaisedCount());
+            fflush(stderr);
+        }
+        held_off = 0;
 
         /* A stuck source is one the handler never clears, which shows up as
          * the same status delivered over and over. Counting deliveries alone
