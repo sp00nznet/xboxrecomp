@@ -19,6 +19,7 @@ set(KERNEL_SOURCES
     kernel_crypto.c
     kernel_thunks.c
     kernel_bridge.c
+    guest_vmem.c
     xbox_memory_layout.c
     icall_feedback.c
     recomp_trace.c
@@ -27,6 +28,14 @@ set(KERNEL_SOURCES
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
+
+# The device-model side of the kernel: interrupt lines and the contiguous
+# arena's bus range. Its own library so xbox_apu and xbox_usb can link it
+# without the bridge (see xbox_devbus.c).
+add_library(xbox_devbus STATIC xbox_devbus.c)
+target_include_directories(xbox_devbus PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(xbox_devbus PUBLIC platform)
+target_link_libraries(xbox_kernel PUBLIC xbox_devbus)
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().

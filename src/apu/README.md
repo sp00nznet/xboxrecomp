@@ -86,8 +86,8 @@ mcpx_apu_shutdown(apu);
                │ mixed samples
                ▼
    ┌──────────────────────────────┐
-   │    waveOut (48kHz stereo)    │
-   │  4 × 2048-sample buffers    │
+   │  XAudio2 (48kHz stereo)      │
+   │  waveOut fallback            │
    └──────────────────────────────┘
 ```
 
@@ -104,7 +104,7 @@ For games that program the APU directly. The game writes to MMIO registers at 0x
 // VEH intercepts → mcpx_apu_mmio_write() → VP processes voice
 ```
 
-The VP runs in a separate thread, mixing active voices at the hardware frame rate.
+The VP runs in its own thread. With XAudio2 active it renders whenever fewer than 8 blocks are queued, so the sound card's clock paces it; it raises the APU interrupt (vector 5) through `xbox_set_irq_line`, and resolves DirectSound's physical addresses through the contiguous arena. See [APU Audio](../../docs/technical/apu-audio.md).
 
 ### 2. Software Mixer (Direct API)
 
@@ -145,7 +145,7 @@ The VP processes 256 hardware voices per frame:
 
 - **ADPCM decode**: Xbox ADPCM (4-bit, 64-sample blocks)
 - **PCM formats**: 8-bit unsigned, 16-bit signed, 24-bit
-- **Pitch**: Log2 fixed-point (4.12 format). Pitch 0 = 48kHz native rate.
+- **Pitch**: Log2 fixed-point (4.12 format). Pitch 0 = 48kHz native rate. Each voice is resampled linearly to its own rate.
 - **Envelopes**: Multi-segment amplitude envelopes (attack, decay, sustain, release)
 - **HRTF**: Head-Related Transfer Function for 3D positional audio
 - **Mixbins**: 32 output channels, voices route to any combination

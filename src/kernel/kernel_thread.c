@@ -11,6 +11,7 @@
  *   - Thread priorities use NT KPRIORITY increments
  */
 
+#include <stdio.h>
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
 
@@ -190,12 +191,15 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         ms = (DWORD)(diff / 10000);
     }
 
+    xbox_kernel_busy(-1);               /* sleeping holds nothing: a safe point */
     if (Alertable) {
         DWORD result = SleepEx(ms, TRUE);
+        xbox_kernel_busy(1);
         if (result == WAIT_IO_COMPLETION)
             return STATUS_ALERTED;
     } else {
         Sleep(ms);
+        xbox_kernel_busy(1);
     }
 
     return STATUS_SUCCESS;
@@ -344,11 +348,67 @@ NTSTATUS __stdcall xbox_NtDuplicateObject(
     return STATUS_SUCCESS;
 }
 
+/* Safe points for NtSuspendThread.
+ *
+ * On the Xbox a suspended thread stops in title code or in a kernel wait; the
+ * kernel never leaves one frozen holding a kernel lock. Here a host
+ * SuspendThread can land anywhere, including inside a bridge call holding a
+ * bridge lock, the CRT's stderr lock or the heap lock -- and then every other
+ * thread that needs that lock stops too. CRI's movie/stream scheduler suspends
+ * and resumes its threads constantly, and this froze the game at boot and
+ * mid-level.
+ *
+ * Each thread counts how deep it is in the kernel (kernel_thunk_dispatch), and
+ * the host waits step out of the count while they block (they hold nothing).
+ * NtSuspendThread suspends, waits for the suspension to take effect, and if
+ * the thread is inside the kernel resumes it, yields and tries again, so it
+ * returns with the thread stopped at a safe point, as on hardware.
+ *
+ * ponytail: a fixed table keyed by host thread id, linear probe; 256 threads
+ * is far past what a title creates. Gives up after 100 ms and suspends anyway.
+ */
+#define KBUSY_SLOTS 256
+typedef struct {
+    volatile LONG tid;
+    volatile LONG busy;          /* kernel depth + raised IRQL */
+} KThreadSlot;
+static KThreadSlot g_kbusy[KBUSY_SLOTS];
+static XBOX_THREAD_LOCAL KThreadSlot *t_kslot;
+
+static KThreadSlot *kbusy_slot(DWORD tid, int create)
+{
+    unsigned i, h = (tid >> 2) % KBUSY_SLOTS;
+    for (i = 0; i < KBUSY_SLOTS; i++) {
+        unsigned s = (h + i) % KBUSY_SLOTS;
+        if ((DWORD)g_kbusy[s].tid == tid)
+            return &g_kbusy[s];
+        if (!g_kbusy[s].tid) {
+            if (!create)
+                return NULL;
+            if (InterlockedCompareExchange(&g_kbusy[s].tid, (LONG)tid, 0) == 0)
+                return &g_kbusy[s];
+            if ((DWORD)g_kbusy[s].tid == tid)
+                return &g_kbusy[s];
+        }
+    }
+    return NULL;
+}
+
+void xbox_kernel_busy(int delta)
+{
+    if (!t_kslot)
+        t_kslot = kbusy_slot(GetCurrentThreadId(), 1);
+    if (t_kslot)
+        t_kslot->busy += delta;
+}
+
 NTSTATUS __stdcall xbox_NtSuspendThread(
     HANDLE ThreadHandle,
     PULONG PreviousSuspendCount)
 {
-    DWORD prev;
+    DWORD prev, tid = GetThreadId(ThreadHandle);
+    KThreadSlot *k = tid != GetCurrentThreadId() ? kbusy_slot(tid, 0) : NULL;
+    ULONGLONG give_up = GetTickCount64() + 100;
 
     /*
      * SuspendThread returns the previous suspend count, or (DWORD)-1 on
@@ -356,11 +416,22 @@ NTSTATUS __stdcall xbox_NtSuspendThread(
      * the two are not interchangeable: -1 must become an error status rather
      * than a suspend count of 0xFFFFFFFF.
      */
-    prev = SuspendThread(ThreadHandle);
-    if (prev == (DWORD)-1) {
-        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
-            "NtSuspendThread: SuspendThread failed (error %u)", GetLastError());
-        return STATUS_UNSUCCESSFUL;
+    for (;;) {
+        CONTEXT c;
+        prev = SuspendThread(ThreadHandle);
+        if (prev == (DWORD)-1) {
+            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
+                "NtSuspendThread: SuspendThread failed (error %u)", GetLastError());
+            return STATUS_UNSUCCESSFUL;
+        }
+        if (prev || !k)
+            break;                      /* already stopped, or never in the kernel */
+        c.ContextFlags = CONTEXT_CONTROL;
+        GetThreadContext(ThreadHandle, &c);   /* returns once it has really stopped */
+        if (k->busy <= 0 || GetTickCount64() > give_up)
+            break;
+        ResumeThread(ThreadHandle);
+        SwitchToThread();
     }
 
     if (PreviousSuspendCount)
@@ -383,9 +454,27 @@ NTSTATUS __stdcall xbox_NtResumeThread(
     if (prev == (DWORD)-1) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
             "NtResumeThread: ResumeThread failed (error %u)", GetLastError());
+        {   /* diagnostic: which handle, and is it a thread at all */
+            static int shown;
+            if (shown++ < 10)
+                fprintf(stderr, "  [KERNEL] NtResumeThread(%p) failed: error %lu, tid %lu\n",
+                        ThreadHandle, GetLastError(), GetThreadId(ThreadHandle));
+        }
         return STATUS_UNSUCCESSFUL;
     }
-
+    {   /* diagnostic: a resume loop that never wakes anything */
+        static XBOX_THREAD_LOCAL HANDLE last;
+        static XBOX_THREAD_LOCAL unsigned idle;
+        if (prev == 0 && ThreadHandle == last) {
+            if (++idle == 20000)
+                fprintf(stderr, "  [KERNEL] NtResumeThread: tid %lu resumes tid %lu (handle %p)"
+                                " 20000 times; it is never suspended\n",
+                        GetCurrentThreadId(), GetThreadId(ThreadHandle), ThreadHandle);
+        } else {
+            idle = 0;
+            last = ThreadHandle;
+        }
+    }
     if (PreviousSuspendCount)
         *PreviousSuspendCount = (ULONG)prev;
 

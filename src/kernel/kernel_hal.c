@@ -31,6 +31,51 @@
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
+/* The one-CPU guarantee IRQL gives, on a many-CPU host.
+ *
+ * On the Xbox, code at DISPATCH_LEVEL or above cannot be interrupted by a DPC
+ * or (at device IRQL) by an ISR, because there is one CPU and it is busy. Here
+ * ISRs and DPCs run on the kernel timer thread, in parallel with the game, so
+ * a driver's protected section (DirectSound walking its voice lists) could
+ * be torn by its own interrupt handler. Every thread that goes to DISPATCH or
+ * above therefore holds this lock until it drops below, and the timer thread
+ * raises to DISPATCH (taking it) before calling any ISR or DPC.
+ *
+ * ponytail: one lock for DISPATCH and every device IRQL alike; a thread that
+ * waits while raised (illegal on hardware) would stall ISRs and DPCs.
+ */
+#if defined(_WIN32)
+static CRITICAL_SECTION g_dispatch_lock;
+static INIT_ONCE        g_dispatch_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_dispatch_lock);
+    return TRUE;
+}
+
+static void irql_transition(KIRQL from, KIRQL to)
+{
+    InitOnceExecuteOnce(&g_dispatch_once, dispatch_lock_init, NULL, NULL);
+    /* Raised also counts as busy for NtSuspendThread: suspension is an APC,
+     * which the Xbox only delivers below DISPATCH, and a thread frozen here
+     * would hold the dispatch lock (every ISR, DPC and raised section) with
+     * it. */
+    if (from < DISPATCH_LEVEL && to >= DISPATCH_LEVEL) {
+        EnterCriticalSection(&g_dispatch_lock);
+        xbox_kernel_busy(1);
+    } else if (from >= DISPATCH_LEVEL && to < DISPATCH_LEVEL) {
+        xbox_kernel_busy(-1);
+        LeaveCriticalSection(&g_dispatch_lock);
+    }
+}
+#else
+static void irql_transition(KIRQL from, KIRQL to) { (void)from; (void)to; }
+#endif
+
+KIRQL xbox_CurrentIrql(void) { return g_current_irql; }
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
@@ -45,6 +90,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
             old, NewIrql);
     }
 
+    irql_transition(old, NewIrql);
     g_current_irql = NewIrql;
     return old;
 }
@@ -61,6 +107,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
             g_current_irql, NewIrql);
     }
 
+    irql_transition(g_current_irql, NewIrql);
     g_current_irql = NewIrql;
 }
 
@@ -70,6 +117,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
+    irql_transition(old, DISPATCH_LEVEL);
     g_current_irql = DISPATCH_LEVEL;
     return old;
 }
@@ -120,8 +168,11 @@ LARGE_INTEGER __stdcall xbox_KeQueryPerformanceFrequency(void)
 
 VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
 {
+    /* Precise: GetSystemTimeAsFileTime moves only once per system tick (up to
+     * 15.6 ms); a frame loop pacing itself on this rounds every frame up to
+     * whole ticks. */
     if (CurrentTime)
-        GetSystemTimeAsFileTime((LPFILETIME)CurrentTime);
+        GetSystemTimePreciseAsFileTime((LPFILETIME)CurrentTime);
 }
 
 /* ============================================================================

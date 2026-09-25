@@ -200,7 +200,10 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObject(
     PLARGE_INTEGER Timeout)
 {
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    DWORD result;
+    xbox_kernel_busy(-1);   /* blocked in a wait: a safe point */
+    result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    xbox_kernel_busy(1);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -220,7 +223,9 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
      */
     (void)WaitMode;
 
+    xbox_kernel_busy(-1);   /* blocked in a wait: a safe point */
     result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    xbox_kernel_busy(1);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -238,7 +243,9 @@ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
     /* WaitType: 0 = WaitAll, 1 = WaitAny (matches NT definitions) */
     bWaitAll = (WaitType == 0) ? TRUE : FALSE;
 
+    xbox_kernel_busy(-1);   /* blocked in a wait: a safe point */
     result = WaitForMultipleObjectsEx(Count, Handles, bWaitAll, ms, Alertable);
+    xbox_kernel_busy(1);
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 
@@ -259,7 +266,10 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
 
     HANDLE hObject = (HANDLE)Object;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = WaitForSingleObjectEx(hObject, ms, Alertable);
+    DWORD result;
+    xbox_kernel_busy(-1);   /* blocked in a wait: a safe point */
+    result = WaitForSingleObjectEx(hObject, ms, Alertable);
+    xbox_kernel_busy(1);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -281,8 +291,11 @@ NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
 
     /* Objects[] is an array of PVOID which we treat as HANDLE[] */
-    DWORD result = WaitForMultipleObjectsEx(Count, (HANDLE*)Objects,
+    DWORD result;
+    xbox_kernel_busy(-1);   /* blocked in a wait: a safe point */
+    result = WaitForMultipleObjectsEx(Count, (HANDLE*)Objects,
                                             bWaitAll, ms, Alertable);
+    xbox_kernel_busy(1);
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 

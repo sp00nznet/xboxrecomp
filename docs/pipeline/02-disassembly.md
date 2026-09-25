@@ -212,6 +212,97 @@ jmp eax
 
 These must be analyzed to determine all possible targets. If the range is unknown, the disassembler logs a warning and the lifter may need a manual override.
 
+## Functions the Detector Misses
+
+Four patterns cost *X-Men Legends* boot time, and none of them is specific to
+that title. Each ends the same way: an address the title calls has no dispatch
+entry, and the run logs `[ICALL] Failed to resolve VA 0x...` — or, worse, logs
+nothing and silently skips the work. All four are fixed the same way today, by
+seeding the entry (`--seed-functions`, an array of `{"start": "0x..."}`) and
+re-running disassembly. `tools.seed_from_log` and `tools.recomp.icall_feedback`
+turn a run's failed targets into seeds; the patterns below are what to look
+for *before* a run, and why a seed is sometimes the wrong fix.
+
+Where the failed address lands tells the patterns apart. Ask Ghidra with
+`ClassifyTargets.java` ([Triage without the GUI](../../tools/ghidra_naming/README.md#triage-without-the-gui)):
+between two functions is the first pattern; inside a function, right after a
+`ret`, is the second or third.
+
+### Reached only through a pointer
+
+A callback pushed as an argument (`push 0x22E280`), a vtable slot in `.rdata`,
+a thread start routine, an entry in a function table inside a *library*
+section (D3D's own table at `0x36A5E4`): nothing `call`s these, so the call
+graph never reaches them. The `imm_ref_target` and vtable passes catch some,
+but they do not scan library sections.
+
+The scan that found 152 of them in *X-Men Legends* — three blocking boot on
+their own — takes every immediate **and** every aligned dword in **every**
+section, keeps those pointing into a code section, and reports the ones that
+land in a gap right after a `ret`, `ret N` or padding. Confirm each in Ghidra
+before seeding it: a data word pointing at data seeds garbage, and seeding data
+splits real functions (see `tools/seed_from_log` for how badly).
+
+A quieter variant: `gap_prologue` sometimes invents a function that starts a
+few bytes *before* a real one, in padding, and runs on through it. The real
+function (`0x11F170`, a vtable method) is then "inside" a known function and
+nothing flags it. Treat `gap_prologue` functions as guesses: a pointer into one
+that lands on a prologue is still a missing function. The same heuristic is
+how data gets lifted as code — see
+[Privileged registers](04-lifting.md#privileged-registers).
+
+### Back-to-back functions, merged
+
+MSVC pads between functions with `int 3`, and the detector uses that as a
+boundary. Some library code is packed with no padding at all:
+
+```
+... c2 04 00        ret 4          <- end of function A
+53                  push ebx       <- start of function B
+```
+
+If B is reached only by pointer, nothing splits A from B. In Ghidra the address
+is an ordinary function start; export them with `DumpEntries.java` and every
+Ghidra entry that lies inside one of ours, straight after a `ret`, is a merge.
+*X-Men Legends* had 17. A `ret` followed immediately by a referenced
+`push ebx/esi/edi/ebp` should be treated as a boundary.
+
+### A no-return call swallows the next function
+
+The CRT's `_endthreadex` ends with a call to `PsTerminateSystemThread`, then a
+single `int 3`. The detector does not know that call never returns, so it walks
+on into the next function — `_threadstartex`, the start routine of **every**
+CRT thread, reached only as `push offset _threadstartex`. Every thread the CRT
+starts then fails. The build says so, if you look:
+
+```
+warning C4717: 'sub_00345449': recursive on all control paths
+```
+
+A call to a known no-return target — `PsTerminateSystemThread`,
+`HalReturnToFirmware`, `KeBugCheck`, the CRT exit helpers — should end the
+function, and the `int 3` after it is a boundary.
+
+### Library sections with no functions at all
+
+Some middleware lives in its own sections and is entered only through a table.
+CRI Sofdec's picture decoders are one section per picture type, chosen from a
+table in `.data` (`+0x08` → `PSFD_I`, `+0x0C` → `PSFD_P`, `+0x10` → inside
+`PSFD_B`). No `call` targets them, so even with the sections named in
+`--extra-sections`:
+
+```
+PSFD00   funcs=20
+PSFD_I   funcs=0     <- a whole code section, nothing detected
+PSFD_B   funcs=4
+PSFD_P   funcs=0
+```
+
+Nothing fails at boot; the first movie does. Count functions per code section
+in `functions.json`: an executable section with code and zero functions is this.
+The pointer scan above, run over all sections, finds the table entries; the
+first byte of every library code section is also worth probing as an entry.
+
 ## Output Files
 
 The disassembler produces four JSON files:

@@ -93,34 +93,47 @@ static inline void qemu_thread_join(QemuThread *t) {
  * We access Xbox RAM via a global pointer, same as NV2A.
  * ============================================================ */
 
-extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+extern uint8_t *g_apu_ram_ptr; /* Set at init: host address of guest VA 0 */
+
+/* Where physical address P lives. DirectSound builds its buffer tables
+ * (SGE/SSL pages, voice data) from MmGetPhysicalAddress of contiguous
+ * allocations, and this runtime serves those from the window at 0x80000000:
+ * physical P is guest VA 0x80000000 + P. Reading guest VA P instead (as this
+ * did) fetched unrelated low memory -- gameplay voices played silence, and
+ * streams played whatever else lived there. Same rule as the GPU's
+ * dma_resolve. */
+extern int xbox_ContiguousIsPhysical(uint32_t phys);
+static inline uint8_t *apu_phys(hwaddr addr) {
+    uint32_t p = (uint32_t)addr & 0x03FFFFFF;
+    return g_apu_ram_ptr + (xbox_ContiguousIsPhysical(p) ? 0x80000000u + p : p);
+}
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint32_t *)apu_phys(addr);
 }
 static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint16_t *)apu_phys(addr);
 }
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *apu_phys(addr);
 }
 
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
     (void)as;
-    *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint32_t *)apu_phys(addr) = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
     (void)as;
-    *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint16_t *)apu_phys(addr) = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
     (void)as;
-    *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *apu_phys(addr) = val;
 }
 
 /* Stub address space - just passed to ldl_le_phys etc. (ignored) */

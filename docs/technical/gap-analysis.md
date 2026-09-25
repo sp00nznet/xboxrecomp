@@ -16,7 +16,7 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 |---------|------|-----------|--------|----------|
 | NV2A register read/write (PMC, PFB, PTIMER, etc.) | Full | Full | DONE | - |
 | MMIO interception (VEH-based) | N/A (LLE) | Full | DONE | - |
-| Push buffer parsing (PFIFO DMA pusher) | Full | Stub | N/A | Low (D3D8 API intercept instead) |
+| Push buffer parsing (PFIFO DMA pusher) | Full | Walks JUMP/CALL/RETURN and ring wraps like the DMA engine; executed under `RECOMP_PB_EXEC` ([Pushbuffer Executor](pushbuffer-executor.md)) | PARTIAL | Medium (titles with statically linked XDK D3D) |
 | PGRAPH → D3D11 method translator | N/A | From burnout3 | ADDED | High |
 | Push buffer replay | N/A | From burnout3 | ADDED | Medium |
 | **Register combiners (pixel shaders)** | Full (8 stages, RGB/alpha, final combiner) | Full (8 stages, HLSL generation, 128-entry cache) | DONE | - |
@@ -67,18 +67,18 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 |---------|--------|-------|
 | Memory management (147 ordinals) | DONE | Win32 heap backend |
 | File I/O with path translation | DONE | Xbox paths → host filesystem |
-| Threading | DONE | Single-thread cooperative model |
+| Threading | DONE | Host threads, started when the creator yields; priorities; suspend at safe points ([details](kernel-replacement.md#threads-priorities-and-irql)) |
 | Synchronization (events, semaphores, waits) | DONE | Win32 primitives |
 | Timers and DPCs | DONE | |
 | Crypto (SHA, RC4, RSA, DES) | DONE | Full implementation |
 | Object manager | DONE | Basic reference counting |
 | I/O manager | DONE | IRP stubs |
-| HAL (IRQL, perf counters, PCI) | DONE | Simulated, not enforced |
+| HAL (IRQL, perf counters, PCI) | DONE | IRQL ≥ DISPATCH takes a process-wide dispatch lock; device interrupts delivered on the timer thread |
 | **EEPROM data** | ADDED | Region, language, video standard populated |
 | **AV pack / video mode detection** | ADDED | Returns HDTV/component, 480p capable |
 | **SMBus / SMC** | ADDED | Version, tray state, AV pack, temperature |
 | Xbox Live / network | Stub | PhyGetLinkState returns "no link" |
-| USB/OHCI gamepad | N/A | Bypassed via XInput |
+| USB/OHCI gamepad | PARTIAL | OHCI model enumerates the pad; XAPI's done-queue handler still fails, so replace XAPI input for now ([details](kernel-replacement.md#titles-that-drive-usb-themselves)) |
 | DVD/disc drive | N/A | Host filesystem instead |
 
 ## Audio
@@ -87,7 +87,7 @@ Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 |---------|--------|-------|
 | DirectSound buffer creation | DONE | Stub buffers accept all calls |
 | Buffer Play/Stop/Volume/Frequency | DONE | Routed to APU mixer |
-| APU Voice Processor (VP) | DONE | 64 voices, PCM/ADPCM |
+| APU Voice Processor (VP) | DONE | 64 voices, PCM/ADPCM, resampled to each voice's pitch; interrupt delivered ([APU Audio](apu-audio.md)) |
 | APU GP DSP effects (reverb, chorus) | Stub | Bypassed |
 | APU EP final encode | Stub | Direct passthrough |
 | Audio mute flag for testing | ADDED | g_audio_muted global |

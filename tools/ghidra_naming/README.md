@@ -20,6 +20,8 @@ tools/ghidra_naming/
   ghidra_scripts/
     SetAnalysisOptions.java   # pre-analysis: enable FidDb/RTTI/demangler/etc.
     ExportXbeNames.py            # post-analysis: export the 3 JSONs (Jython)
+    ClassifyTargets.java         # triage: what is at each of these addresses?
+    DumpEntries.java             # every Ghidra function entry, for diffing
   work/                          # generated: flat image, Ghidra project, logs, run_headless.bat
   export/                        # generated: functions.json, symbols.json, decompiled.json
   ghidra_names.json              # generated: {address: meaningful_name} for the recompiler
@@ -87,6 +89,30 @@ overlap (~6,287 → ~7,370) but **slightly lowers** FidDb name matches (~131 →
 are the goal, seeding is **not** used by default. To enable, add
 `-preScript SeedFunctions.py` before the `SetAnalysisOptions` pre-script
 in `work/run_headless.bat` (or `run_ghidra.sh`).
+
+## Triage without the GUI
+
+Once `run_ghidra.sh` has built the project, two small scripts answer function
+questions against it in about 30 seconds, without opening Ghidra and without
+re-running analysis. `-readOnly` leaves the project untouched, and one run can
+take hundreds of addresses. `<project>` is the name `run_ghidra.sh` gave the
+project: the folder the XBE sits in.
+
+```bash
+"$GHIDRA_HOME/support/analyzeHeadless" tools/ghidra_naming/work/ghidra_project <project> \
+    -process xbe_flat.bin -readOnly -noanalysis \
+    -scriptPath tools/ghidra_naming/ghidra_scripts \
+    -postScript ClassifyTargets.java 0x22E280 0x1E05B0
+```
+
+- `ClassifyTargets.java` — for each address: its block, the function containing
+  it, and whether it is an instruction start, mid-instruction, or data. Feed it
+  the addresses a run logged as `[ICALL] Failed to resolve VA`.
+- `DumpEntries.java <out.txt>` — every entry Ghidra knows. Entries inside one
+  of `functions.json`'s functions, right after a `ret`, are merged functions.
+
+What to do with the answers is in
+[Disassembly: Functions the Detector Misses](../../docs/pipeline/02-disassembly.md#functions-the-detector-misses).
 
 ## Run it (Git Bash)
 

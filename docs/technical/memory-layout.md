@@ -35,7 +35,9 @@ The Xbox has 64 MB of unified RAM shared between CPU and GPU. Key regions:
 | 0x0036B7C0-0x003B2354 | .rdata (constants, strings, vtables) | 280 KB |
 | 0x003B2360-0x0076EFFF | .data + BSS (globals, zero-initialized data) | 3.9 MB |
 | 0x00780000-0x00F7FFFF | Stack (8 MB, grows downward) | 8 MB |
-| 0x00F80000-0x03FFFFFF | Dynamic heap (bump allocator) | ~49 MB |
+| 0x00F80000-0x03FFFFFF | Dynamic heap (block allocator) | ~49 MB |
+| 0x04000000-0x7FFFFFFF | RAM mirrors, then reservable space above RAM | — |
+| 0x80000000-0x83FFFFFF | Contiguous arena (`MmAllocateContiguousMemory`) | 64 MB |
 | 0x80010000+ | Xbox kernel PE header (fake, 1 page) | 4 KB |
 | 0xFD000000+ | NV2A GPU registers (on-demand allocation) | Variable |
 | 0xFE000000+ | Kernel function thunks (synthetic VAs) | ~600 B |
@@ -225,32 +227,96 @@ memset(kernel_page, 0, 4096);
 // NumberOfSections = 0, so the INIT section search finds nothing
 ```
 
-## Dynamic Heap: Bump Allocator
+## Dynamic Heap
 
-The Xbox heap serves allocations from `MmAllocateContiguousMemory` and similar kernel functions. A simple bump allocator works because Xbox games rarely free memory:
+`xbox_HeapAlloc` started as a bump allocator — increment a pointer, never
+reclaim — on the reasoning that Xbox titles allocate while loading and hold
+everything. That holds for Burnout 3 and not in general: middleware churns.
+*X-Men Legends* frees and reallocates 2 MB pool segments on every cutscene, and
+with nothing reclaimed it ran out within minutes:
 
-```c
-static uint32_t g_heap_next = XBOX_HEAP_BASE;  // 0x00880000
-
-uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment) {
-    if (size < 4096) size = 4096;  // minimum to prevent overlapping zero-size allocs
-
-    uint32_t result = (g_heap_next + alignment - 1) & ~(alignment - 1);
-
-    if (result + size > XBOX_HEAP_BASE + XBOX_HEAP_SIZE)
-        return 0;  // out of memory
-
-    g_heap_next = result + size;
-    memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
-    return result;  // returns Xbox VA, not native pointer
-}
-
-void xbox_HeapFree(uint32_t xbox_va) {
-    (void)xbox_va;  // no-op
-}
+```
+xbox_HeapAlloc: out of memory
+out of thread stacks, running worker inline
 ```
 
-The minimum allocation size of 4096 bytes prevents a subtle bug: Xbox D3D8 code sometimes computes resource sizes from GPU capabilities that return 0 (no real NV2A hardware), causing zero-size allocations that all return the same address and overlap.
+— and then froze when the inline worker suspended the thread that created it.
+
+The heap is now a block table: allocations are recorded in address order,
+`xbox_HeapFree` marks a block free and coalesces it with free neighbours, and a
+request reuses the first free block that fits. Three rules make reuse actually
+return memory:
+
+- **Carve, don't hand over.** Reuse takes only the aligned piece it needs and
+  leaves the front and back free. Handing a whole freed block (2 MB) to a
+  16-byte request leaks the rest just as surely as never freeing.
+- **Coalescing steps over empty slots.** A merge leaves a zero-size slot behind;
+  a neighbour check that stops at it stops every later merge.
+- **One lock.** DirectSound, the movie threads and the title allocate at once.
+
+`NtFreeVirtualMemory` on heap-backed memory releases the block (`MEM_RELEASE`)
+and treats `MEM_DECOMMIT` as a no-op. It used to fall through to a host
+`VirtualFree`, passing a guest address to Windows as a 64-bit pointer, so
+nothing came back.
+
+The minimum allocation of 4096 bytes stays: Xbox D3D8 code sometimes computes
+resource sizes from GPU capabilities that read 0, and zero-size allocations
+would all return the same address.
+
+## Memory Above RAM
+
+Some titles manage address space themselves: reserve a range, commit pieces of
+it, and check they got the address they asked for. The MSVC CRT heap does this
+when it grows, starting at `0x04000000` — the first address past RAM. Three
+things went wrong there:
+
+| Problem | Effect |
+|---|---|
+| `NtQueryVirtualMemory` reported the RAM mirrors as free | the CRT's scanner picked `0x04000000`, was refused, and asked again forever |
+| `NtAllocateVirtualMemory` with an explicit base above RAM went to the heap, which ignores the requested base | the title got a different address, noticed, and failed |
+| nothing on the host backed those addresses | even correct bookkeeping had nothing to hand out |
+
+`guest_vmem.c` tracks reservations and commits above RAM per 4 KB page,
+honours the exact requested base or fails with a status the caller's retry
+logic understands, and answers queries from its own records. The mirrors are
+reported as **reserved**, so scanners step past them. `xbox_MemoryLayoutInit`
+reserves host memory for the range right after mapping the mirrors, committing
+pieces only when the title commits them.
+
+The status matters as much as the answer. A refused base is
+`STATUS_CONFLICTING_ADDRESSES` (`0xC0000018`); Windows maps that to
+`ERROR_INVALID_ADDRESS` (487), and 487 is the only error on which the CRT tries
+another address. `RtlNtStatusToDosError` had no mapping for it, so it returned
+the generic 317 and the heap stopped growing.
+
+A title executable should link with `/DYNAMICBASE:NO`: with address-space
+randomisation the host kept taking the fixed range first.
+
+## The Contiguous Arena
+
+`MmAllocateContiguousMemory` hands out memory from a window at
+`XBOX_CONTIG_BASE` (`0x80000000`), and `MmGetPhysicalAddress` answers
+`va - XBOX_CONTIG_BASE` for it. Titles give those physical addresses to
+hardware: DirectSound fills the APU's scatter-gather tables with them, the USB
+driver links its descriptors with them, and D3D writes them into the
+pushbuffer. Every device model therefore has to turn a physical address back
+into memory it can read, and they did not agree on how.
+
+The ambiguity was structural. The arena's physical addresses started at 0 — the
+same numbers as the title image's own addresses — and `MmGetPhysicalAddress`
+passes anything outside the arena through unchanged. *X-Men Legends*' USB stack
+hands the controller both kinds: contiguous descriptors (physical
+`0x006DC6A0`) and a static buffer in `.data` (VA `0x005DCE24`). No rule can tell
+those apart, and the model that guessed "VA" read the title's own globals and
+wrote its frame counter into them.
+
+The arena now starts above the loaded image, so the two ranges cannot overlap,
+and `xbox_ContiguousIsPhysical(phys)` answers exactly: true for addresses the
+arena handed out, which are reached at `XBOX_CONTIG_BASE + phys`; anything else
+is a pass-through VA. The APU (`apu_phys`), the OHCI model (`bus_to_va`), the
+pushbuffer executor (`dma_resolve`) and the display-mode bridge all use that
+one rule. It lives in the small `xbox_devbus` library, with the device
+interrupt lines, so a device model can link it without the kernel bridge.
 
 ## NV2A GPU Registers
 
@@ -294,7 +360,7 @@ The allocated pages are zeroed, so GPU register reads return 0 (safe defaults). 
 0x00780000  ├──────────────────────┤
             │ Stack (8 MB)         │  g_esp starts at top
 0x00F80000  ├──────────────────────┤
-            │ Dynamic Heap         │  ~49 MB (bump allocator)
+            │ Dynamic Heap         │  ~49 MB (block allocator)
 0x03FFFFFF  └──────────────────────┘  End of 64 MB region
             │ ... 28 mirror views  │  Each 64 MB, aliased to base
 0x80010000  │ Fake kernel PE hdr   │  1 page

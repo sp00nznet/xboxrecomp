@@ -222,7 +222,8 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
             uint32_t hcca = hc->reg[HcHCCA / 4];
             if (hcca)
                 wr32(hcca + HCCA_DONE_HEAD, 0);
-            hc->reg[HcDoneHead / 4] = 0;
+            /* HcDoneHead is NOT cleared: it may hold TDs retired while the
+             * driver was busy, which ohci_flush_done publishes next frame. */
         }
         *r &= ~v;                       /* write 1 to clear                 */
         return;
@@ -338,6 +339,8 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 #define TD_DP_IN       2u
 #define TD_CC_NOERROR  0u
 #define TD_CC_STALL    4u
+#define TD_CC_DATAUNDERRUN 9u
+#define TD_ROUNDING    (1u << 18)   /* bufferRounding: a short packet is fine */
 
 
 static uint32_t g_setup_pending;      /* wLength of the last SETUP seen */
@@ -391,20 +394,45 @@ static int guest_ok(uint32_t va, uint32_t bytes)
     return (uint64_t)va + bytes <= (uint64_t)mapped;
 }
 
-static uint32_t rd32(uint32_t va)
+/* Every address a USB driver gives the controller -- HcHCCA, HcControlHeadED,
+ * ED/TD links, buffer pointers -- is a bus (physical) address, obtained with
+ * MmGetPhysicalAddress. For MmAllocateContiguousMemory memory that now returns
+ * the physical offset (VA - 0x80000000), not the VA: DDS9's 0x80408940 above
+ * dates from when it returned the VA unchanged. Used as a VA, a physical offset
+ * lands in low RAM -- on X-Men Legends inside the title's own .data -- so the
+ * walker saw an empty ED list (enumeration never happened) and every frame
+ * wrote HccaFrameNumber/DoneHead into the game's globals.
+ *
+ * The same rule the pushbuffer executor uses (dma_resolve): an address inside
+ * the contiguous arena is contiguous memory, reached through the window;
+ * anything else (a pass-through VA, e.g. a static .data buffer) is used as-is.
+ * The arena starts above the image so the two cannot collide. */
+extern int xbox_ContiguousIsPhysical(uint32_t phys);
+
+static uint32_t bus_to_va(uint32_t bus)
 {
+    if (bus && xbox_ContiguousIsPhysical(bus))
+        return OHCI_CONTIG_BASE + bus;
+    return bus;
+}
+
+static uint32_t rd32(uint32_t bus)
+{
+    uint32_t va = bus_to_va(bus);
     if (!guest_ok(va, 4))
         return 0;
     return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
 }
-static void wr32(uint32_t va, uint32_t v)
+static void wr32(uint32_t bus, uint32_t v)
 {
+    uint32_t va = bus_to_va(bus);
     if (!guest_ok(va, 4))
         return;
     *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
 }
-static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
+static uint8_t *guest_ptr(uint32_t bus, uint32_t bytes)
 {
+    uint32_t va = bus_to_va(bus);
     return guest_ok(va, bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
 }
@@ -503,6 +531,17 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     /* CBP is zero when everything asked for moved, and otherwise points past
      * what did. A driver computes the transferred length from it. */
     wr32(td + 4, (moved >= len) ? 0u : cbp + (uint32_t)moved);
+
+    /* A short IN packet on a TD without bufferRounding is DATA UNDERRUN: the
+     * controller retires this TD with that code and halts the endpoint (the
+     * walker does so for any non-zero code), leaving the rest of the transfer
+     * for the driver to retire. Reporting NOERROR instead -- and completing
+     * the trailing TDs with zero bytes -- sent XAPI's done-queue handler down
+     * its success path, which walks from the ED head into the dummy tail TD
+     * and follows its garbage link: X-Men Legends asks for 80 bytes of
+     * configuration descriptor, gets 32, and faulted there. */
+    if (dp == TD_DP_IN && moved < len && !(info & TD_ROUNDING))
+        return TD_CC_DATAUNDERRUN;
     return TD_CC_NOERROR;
 }
 
@@ -541,6 +580,34 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
             uint32_t next = rd32(td + 8) & ED_PTR_MASK;
             uint32_t cc = ohci_do_td(hc, ed0, td);
 
+            /* A non-zero completion code is what sends a driver down its
+             * error path; always worth a line, trace or not. */
+            if (cc != TD_CC_NOERROR) {
+                static unsigned shown;
+                if (shown++ < 32) {
+                    uint32_t t = next, k;
+                    fprintf(stderr, "  [OHCI%d] TD %08X ep %u -> cc %u (ED %08X info %08X,"
+                                    " TD info %08X, next %08X, ED tail %08X)"
+                                    " own | %08X %08X %08X %08X\n",
+                            hc->index, td, (ed0 >> 7) & 0xFu, cc, ed, ed0,
+                            rd32(td), next, tail,
+                            rd32(td + 16), rd32(td + 20), rd32(td + 24), rd32(td + 28));
+                    /* The rest of the transfer, as the driver will walk it:
+                     * hardware words, then its own +0x10..+0x1F fields. */
+                    for (k = 0; k < 10 && t && t != tail; k++) {
+                        fprintf(stderr, "    TD %08X info %08X cbp %08X next %08X be %08X"
+                                        " | %08X %08X %08X %08X\n",
+                                t, rd32(t), rd32(t + 4), rd32(t + 8), rd32(t + 12),
+                                rd32(t + 16), rd32(t + 20), rd32(t + 24), rd32(t + 28));
+                        t = rd32(t + 8) & ED_PTR_MASK;
+                    }
+                    fprintf(stderr, "    tail TD %08X info %08X next %08X | %08X %08X %08X %08X\n",
+                            tail, rd32(tail), rd32(tail + 8), rd32(tail + 16),
+                            rd32(tail + 20), rd32(tail + 24), rd32(tail + 28));
+                    fflush(stderr);
+                }
+            }
+
             /* Report the outcome where the driver reads it, then put the
              * descriptor on the done queue, newest first. */
             wr32(td, (rd32(td) & 0x0FFFFFFFu) | (cc << 28));
@@ -561,15 +628,57 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
     return completed;
 }
 
-/* Publish the done queue where the driver reads it and say so. */
-static void ohci_publish_done(OhciController *hc, uint32_t done_head)
+/* Write the held done queue to HccaDoneHead, if the driver is ready for it.
+ *
+ * OHCI 1.0a 6.4.4 / 7.1.4: the controller keeps retired TDs in HcDoneHead and
+ * writes them to HccaDoneHead only while WritebackDoneHead is clear; after
+ * writing it sets WDH and clears HcDoneHead. While WDH is set the HCCA list
+ * belongs to the driver. Overwriting it whenever something completed replaced
+ * lists the driver was still walking, and XAPI then processed (and freed) the
+ * same TDs twice: X-Men Legends faulted on a freed TD's free-list link read
+ * back as its ED pointer. */
+static void ohci_flush_done(OhciController *hc)
 {
     uint32_t hcca = hc->reg[HcHCCA / 4];
+    uint32_t held = hc->reg[HcDoneHead / 4];
 
+    if (!held || (hc->reg[HcInterruptStatus / 4] & INTR_WDH))
+        return;
     if (hcca)
-        wr32(hcca + HCCA_DONE_HEAD, done_head);
-    hc->reg[HcDoneHead / 4] = done_head;
+        wr32(hcca + HCCA_DONE_HEAD, held);
+    if (s_trace) {
+        static unsigned n;
+        uint32_t t = held, k;
+        if (n++ < 40) {
+            fprintf(stderr, "  [OHCI%d] done list:", hc->index);
+            for (k = 0; t && k < 12; k++) {
+                fprintf(stderr, " %08X", t);
+                t = rd32(t + 8) & ED_PTR_MASK;
+            }
+            fprintf(stderr, "%s\n", t ? " ..." : " (end)");
+            fflush(stderr);
+        }
+    }
+    hc->reg[HcDoneHead / 4] = 0;
     hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
+}
+
+/* Retire a freshly completed list: chain it in front of anything already
+ * held (newest first, as hardware orders the done queue), then publish if
+ * the driver has acknowledged the previous list. */
+static void ohci_publish_done(OhciController *hc, uint32_t done_head)
+{
+    uint32_t held = hc->reg[HcDoneHead / 4];
+
+    if (held) {
+        uint32_t t = done_head, guard = 0, nxt;
+        while (t && ++guard < 256 && (nxt = rd32(t + 8) & ED_PTR_MASK) != 0)
+            t = nxt;
+        if (t)
+            wr32(t + 8, held);
+    }
+    hc->reg[HcDoneHead / 4] = done_head;
+    ohci_flush_done(hc);
 }
 
 static int ohci_run_control_list(OhciController *hc)
@@ -647,6 +756,21 @@ static int ohci_call_isr(OhciController *hc)
     if (!routine)
         return -1;
 
+    /* A context whose first dword is not a controller base is what the
+     * driver's ISR faults on; say what changed, once per change. */
+    {
+        static uint32_t last_ctx, last_first;
+        uint32_t first = context ? *(uint32_t *)(mem + context) : 0;
+        if (context != last_ctx || first != last_first) {
+            fprintf(stderr, "  [OHCI%d] ISR 0x%08X kinterrupt 0x%08X context 0x%08X"
+                            " [context]=0x%08X\n",
+                    hc->index, routine, kinterrupt, context, first);
+            fflush(stderr);
+            last_ctx = context;
+            last_first = first;
+        }
+    }
+
     fn = recomp_lookup(routine);
     if (!fn) {
         fprintf(stderr, "  [OHCI%d] ISR 0x%08X has no translation\n",
@@ -666,6 +790,15 @@ static int ohci_call_isr(OhciController *hc)
     }
 
     g_esp = XBOX_WORKER_STACK_TOP(slot);
+    {
+        static int last_slot = -1;
+        if (slot != last_slot) {
+            fprintf(stderr, "  [OHCI%d] ISR on worker stack slice %d (top 0x%08X)\n",
+                    hc->index, slot, g_esp);
+            fflush(stderr);
+            last_slot = slot;
+        }
+    }
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
 
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = context;      /* arg 2 */
@@ -843,7 +976,14 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * moves. */
         {
             uint32_t hcca = hc->reg[HcHCCA / 4];
+            static uint32_t shown_hcca;
 
+            if (hcca && hcca != shown_hcca) {
+                shown_hcca = hcca;
+                fprintf(stderr, "  [OHCI%d] HcHCCA = 0x%08X, HcControlHeadED = 0x%08X\n",
+                        hc->index, hcca, hc->reg[0x20 / 4]);
+                fflush(stderr);
+            }
             hc->reg[HcFmNumber / 4] =
                 (hc->reg[HcFmNumber / 4] + 20u) & 0xFFFFu;
             /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
@@ -885,6 +1025,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * set, the line is asserted. The handler clears the status bit, so
          * this stops on its own -- and if it ever does not, the cap below says
          * so rather than spinning the ISR forever. */
+        ohci_flush_done(hc);    /* publish TDs held while WDH was set */
         status = hc->reg[HcInterruptStatus / 4] & enable & 0x7Fu;
         if (!status)
             continue;

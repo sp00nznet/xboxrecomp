@@ -63,6 +63,14 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
 
         if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
+        } else if (bpp == 8) {
+            /* A 2x-wide anti-aliased 32-bit surface (pitch = 2 * width * 4):
+             * take every other pixel. X-Men Legends renders its 640-wide
+             * frame into a 1280-wide surface, which read as "8 bytes per
+             * pixel" and showed black. */
+            const uint32_t *p = (const uint32_t *)row;
+            for (x = 0; x < s_fb_width; x++)
+                dst[x] = p[x * 2];
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
             for (x = 0; x < s_fb_width; x++) {

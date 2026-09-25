@@ -185,15 +185,16 @@ Xbox file paths use device notation (`\Device\CdRom0\`, `D:\`, `T:\`) which must
 
 | Xbox Function | Implementation |
 |---------------|---------------|
-| PsCreateSystemThreadEx | Runs start routine synchronously (single-threaded model) |
-| KeSetEvent / KeResetEvent | Stubbed (no real threading) |
-| KeWaitForSingleObject | Returns immediately (STATUS_SUCCESS) |
-| KeInitializeDpc / KeInsertQueueDpc | Stubbed |
-| KeInitializeCriticalSection | No-op |
-| KeEnterCriticalSection | No-op |
-| KeLeaveCriticalSection | No-op |
+| PsCreateSystemThreadEx | Host thread, created suspended; see *Threads* below |
+| KeSetEvent / KeResetEvent / KeWaitForSingleObject | Win32 events and waits |
+| KeInitializeDpc / KeInsertQueueDpc | Queued, run on the kernel timer thread at DISPATCH_LEVEL |
+| RtlEnterCriticalSection / RtlLeaveCriticalSection | Host `CRITICAL_SECTION`, shadowed per guest structure |
+| KeSetBasePriorityThread / KeSetPriorityThread | Host thread priority, through the thread's KTHREAD |
+| NtSuspendThread / NtResumeThread | Host suspend, only at a safe point |
 
-The recompiled game runs single-threaded. The first PsCreateSystemThreadEx call (the main game thread) runs synchronously, inheriting the current register state. Subsequent calls (worker threads) are deferred -- running them synchronously would corrupt game state.
+Guest threads are real host threads, and the console's rules about them are
+not free on a many-core host. The section *Threads, Priorities and IRQL* below
+is what they cost to reproduce.
 
 ### Graphics (~10 ordinals)
 
@@ -216,6 +217,8 @@ void NV2A_PushCommand(uint32_t cmd) {
 
 Allocating the NV2A register page via VEH prevents the access violation, but the while loop spins forever because the register reads as 0. The entire function must be stubbed.
 
+That holds when nothing executes the pushbuffer. A title that links the XDK's own D3D needs the pushbuffer executed, and there the better fix is to answer the register the title polls — see [Pushbuffer Executor](pushbuffer-executor.md).
+
 ### Input (~3 ordinals)
 
 | Xbox Function | Win32 Equivalent |
@@ -226,15 +229,55 @@ Allocating the NV2A register page via VEH prevents the access violation, but the
 
 Xbox input is nearly 1:1 with the Win32 XInput API. The main difference is the Xbox controller struct layout.
 
-### Audio (~5 ordinals)
+### Titles That Drive USB Themselves
 
-| Xbox Function | Implementation |
-|---------------|---------------|
-| DirectSoundCreate | Returns stub object (no audio) |
-| DirectSoundCreateBuffer | Returns stub buffer |
-| DirectSoundDoWork | No-op |
+The XInput mapping above is for titles whose input goes through the D3D8/XAPI
+layer the toolkit replaces. A title that statically links the XDK's own USB
+stack talks to an OHCI host controller instead, and `src/usb/` models one with
+an emulated Xbox pad. Two things stood between the model and a controller:
 
-Audio is fully stubbed in the current implementation. XAudio2 integration is planned but not yet implemented.
+1. **Nothing starts it.** `xbox_OhciInit()` must run after the memory layout is
+   up, and the title's VEH must route faults in the controller's range to
+   `xbox_OhciHandleMmio()`. `ohci.h` says the title's VEH does this; the
+   template's `veh_handler` only knows the APU, so with `RECOMP_USB=1` the log
+   has no `[OHCI0]` lines at all. Add both next to the APU's:
+
+   ```c
+   if (xbox_OhciOwnsAddress(xbox_va) && xbox_OhciHandleMmio(ep->ContextRecord, xbox_va))
+       return EXCEPTION_CONTINUE_EXECUTION;
+   ...
+   xbox_OhciInit();          /* no-op unless RECOMP_USB is set */
+   ```
+
+2. **Descriptors are physical addresses.** The driver links its endpoint and
+   transfer descriptors with `MmGetPhysicalAddress`, and the model read them as
+   guest VAs: all-zero descriptors under `RECOMP_USB_TRACE=1`, and the frame
+   counter and done-queue head written into the title's own `.data` every
+   frame. The model now resolves them through the contiguous arena — see
+   [Memory Layout: The Contiguous Arena](memory-layout.md#the-contiguous-arena).
+
+Two OHCI 1.0a rules the model also broke: a short IN packet on a TD without
+`bufferRounding` is DATA UNDERRUN (code 9) and halts the endpoint, where the
+model reported success and XAPI walked into the dummy tail TD; and the done
+queue goes to `HccaDoneHead` only while WDH is clear, where the model
+overwrote it whenever anything completed, replacing lists the driver was
+walking. With those fixed, enumeration runs through SET_ADDRESS,
+GET_DESCRIPTOR, SET_CONFIGURATION and the XID descriptor. XAPI's done-queue
+handler then touches a descriptor it has already freed, so the path is not
+finished.
+
+For most titles, replacing XAPI's seven input functions (`XInitDevices`,
+`XGetDevices`, `XGetDeviceChanges`, `XInputOpen`, `XInputGetState`,
+`XInputSetState`, `XInputClose`) with host code in `recomp_manual.c` is the more
+robust route: the USB stack never starts, and any host pad works. Emulated USB
+matters for titles that talk to unusual devices directly.
+
+### Audio
+
+A title that links the XDK's DirectSound drives the MCPX APU directly, through
+its registers and DMA, and the toolkit emulates the APU (`src/apu/`). That path
+needs the device interrupt and real IRQL described below; the rest of what it
+took is in [APU Audio](apu-audio.md).
 
 ### HAL and System (~20 ordinals)
 
@@ -245,7 +288,85 @@ Audio is fully stubbed in the current implementation. XAudio2 integration is pla
 | KeBugCheck / KeBugCheckEx | Logs and continues (does not crash) |
 | KeQueryPerformanceCounter | QueryPerformanceCounter |
 | KeQueryPerformanceFrequency | QueryPerformanceFrequency |
-| RtlEnterCriticalSection | No-op (single-threaded) |
+| RtlEnterCriticalSection | Host `CRITICAL_SECTION` (see Threading) |
+
+## Threads, Priorities and IRQL
+
+The Xbox has one CPU, strict priorities and a kernel that only preempts where
+it is safe. Titles depend on all three without saying so. A host with many
+cores and its own scheduler breaks each one in its own way.
+
+### Threads start when their creator lets them
+
+On one CPU a new thread does not run until its creator blocks or yields, so
+titles create a thread and *then* store its handle where the thread will read
+it. A host thread that starts at once on another core reads the handle first —
+in *X-Men Legends* it then suspended a reused handle's thread forever.
+`PsCreateSystemThreadEx` therefore creates the host thread suspended:
+
+- `CreateSuspended` (argument 8) is honoured; such a thread waits for
+  `NtResumeThread`. It used to start anyway.
+- Any other new thread starts at its creator's next kernel call, or after 5 ms
+  from the timer thread if the creator makes none.
+- The thread's KTHREAD exists from creation. It was registered on first run, so
+  `ObReferenceObjectByHandle` on a fresh thread polled 200 × 1 ms for it — a
+  2–3 s stall every time a title set a new thread's priority.
+
+### KTHREAD and priorities
+
+The bridge gave every thread the KTHREAD pointer `0`: `KeGetCurrentThread`
+returned it, `ObReferenceObjectByHandle` wrote it, and
+`KeSetBasePriorityThread` passed the guest pointer to Windows as a `HANDLE` and
+failed. Every priority change was silently lost. Now each guest thread's
+KTHREAD is its own TIB address — real guest memory, unique per thread, so a
+stray read of a KTHREAD field is harmless — and a table maps it to a duplicated
+host handle. `KeSetPriorityThread` maps absolute priorities 0–31 onto Win32
+levels (16 and above → time critical). The first 16 calls are logged; a
+`-- unknown thread` suffix means a KTHREAD was not in the table.
+
+Priorities restore ordering, not exclusion. Threads still run on different
+cores at once, so a title that relies on "the high-priority thread finishes its
+step before anything else runs" is still exposed. Pinning every guest thread to
+one core was tried and rejected: with real priorities, above-normal sound
+threads spinning on critical sections starved the main thread.
+
+### Suspend only at a safe point
+
+The Xbox suspends a thread with an APC, delivered below DISPATCH_LEVEL — never
+while it holds a kernel lock. A host `SuspendThread` can stop a guest thread
+inside a bridge call holding a bridge lock, the CRT's stderr lock or the heap
+lock, or at raised IRQL holding the dispatch lock, and then every thread that
+needs that lock stops too. Middleware schedulers suspend and resume
+constantly, so this showed up as intermittent whole-game freezes during movies.
+
+Each thread now counts how deep it is in the kernel (`kernel_thunk_dispatch`)
+plus whether it is at raised IRQL; host waits and sleeps step out of the count.
+`NtSuspendThread` suspends, waits until the suspension has taken effect
+(`GetThreadContext`), and if the thread is busy resumes it, yields and tries
+again, giving up after 100 ms.
+
+### Device interrupts and IRQL
+
+`KfRaiseIrql` and `KeRaiseIrqlToDpcLevel` used to record a number and nothing
+else. On the console, code at DISPATCH_LEVEL or above cannot be interrupted by
+a DPC or an ISR; here ISRs and DPCs run on the kernel timer thread, in parallel
+with the title, so a driver's protected section was torn by its own interrupt
+handler. Raising to DISPATCH_LEVEL or above now takes one process-wide dispatch
+lock (`kernel_hal.c`), and the timer thread raises to DISPATCH before any ISR or
+DPC. `KeRaiseIrqlToSynchLevel`, `KeGetCurrentIrql` and `KeSynchronizeExecution`
+follow the same rule.
+
+Device models raise interrupts with `xbox_set_irq_line(vector, level)`
+(`xbox_devbus.c`). Lines are level-triggered: the timer thread wakes at once
+and calls the connected ISR, and keeps calling it each tick while the line is
+up. The APU is vector 5. `irq 5 -> ISR claimed it` at boot means the APU's ISR
+runs.
+
+The vertical-blank interrupt is off unless `RECOMP_VBLANK` is set, and
+`RECOMP_VBLANK=0` means off, so a launcher can default it on and still let a
+user disable it. Turn it on for any title whose frame or movie loop calls D3D's
+`BlockUntilVerticalBlank`: that waits on an event only the vblank ISR sets, and
+without it the thread spins instead of waiting and starves the others.
 
 ## Implementation Breakdown
 
@@ -301,3 +422,35 @@ Some arguments are pointers (Xbox VAs that need translation), others are plain v
 ### Stdcall Stack Cleanup
 
 Xbox kernel functions use stdcall convention (callee cleans stack). The translated code handles this -- after the ICALL returns, the generated code adjusts esp by the expected amount. The bridge function does NOT need to manipulate g_esp for argument cleanup.
+
+### Pseudo-Handles Are Negative
+
+`NtCurrentThread()` is `(HANDLE)-2`, the 32-bit `0xFFFFFFFE`. Widened as
+unsigned on a 64-bit host it becomes `0x00000000FFFFFFFE`, which Windows does
+not recognise as its own `-2`, so `DuplicateHandle` fails and the CRT, which
+duplicates the current thread handle, retries forever:
+
+```
+[KERNEL] ordinal 197 (NtDuplicateObject) → returned 0xC0000001
+[KERNEL] ordinal 301 (RtlNtStatusToDosError) → returned 0x0000013D
+```
+
+Handle tokens at `0xFFFFFFF0` and above are sign-extended in
+`bridge_resolve_handle`, and the first few `NtDuplicateObject` failures are
+logged with the handle and the Windows error.
+
+### Counters Outlive 32 Bits
+
+A title polling the clock through the kernel — *X-Men Legends* calls
+`KeQuerySystemTime` hundreds of millions of times a minute — passes 2^31 kernel
+calls within minutes. The call counter was an `int`; it wrapped negative, and
+`KERNEL_LOG_ON()`, which is `count <= budget`, turned "log the first N calls"
+into "log every call". The frame rate fell to about 1 FPS with every thread
+queued on the stderr lock. The counter is `long long`.
+
+### Declare What You Call
+
+`apu_mmio_hook.c` called `getenv` without `<stdlib.h>`. C then assumes an `int`
+return, and on x64 the pointer is cut to 32 bits — a crash only when the
+variable is set, which is why it hid. MSVC says so, as warning C4013; treat
+C4013 as an error in runtime code.

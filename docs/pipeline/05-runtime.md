@@ -125,25 +125,13 @@ This makes GPU spin-waits return immediately (reading 0), which is correct since
 
 ### Heap Allocator
 
-The runtime provides a bump allocator for Xbox heap allocations (MmAllocateContiguousMemory, etc.):
-
-```c
-#define XBOX_HEAP_BASE  0x00880000   // above stack
-#define XBOX_HEAP_SIZE  (~55.5 MB)   // fills remaining 64 MB
-
-static uint32_t heap_cursor = XBOX_HEAP_BASE;
-
-uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment) {
-    heap_cursor = (heap_cursor + alignment - 1) & ~(alignment - 1);
-    uint32_t result = heap_cursor;
-    heap_cursor += size;
-    if (heap_cursor >= XBOX_HEAP_BASE + XBOX_HEAP_SIZE)
-        return 0;  // out of memory
-    return result;
-}
-```
-
-A bump allocator is sufficient because Xbox games rarely free memory -- they allocate during loading and hold everything for the level's duration.
+The runtime serves Xbox heap allocations (`MmAllocateContiguousMemory`,
+`NtAllocateVirtualMemory`, the CRT heap) from the RAM above the stack, starting
+at `XBOX_HEAP_BASE` (`0x00F80000`). It began as a bump allocator and is now a
+block table that frees, coalesces and reuses, because middleware churns even
+where the title itself does not. Contiguous memory comes from a separate
+arena, and addresses above RAM from a page tracker that honours a requested
+base. See [Memory Layout: Dynamic Heap](../technical/memory-layout.md#dynamic-heap).
 
 ## Kernel Shim
 
@@ -351,6 +339,33 @@ Manual overrides are the primary debugging tool. When a function crashes or prod
 
 For Burnout 3, approximately 33 functions have manual overrides, including the physics engine, frame pump, resource loader, and several RenderWare initialization functions.
 
+### Registers in recomp_manual.c
+
+The registers are thread-local (`RECOMP_TLS` in `recomp_types.h`), and an
+override has to see them that way. The template `recomp_manual.c` declares
+`extern uint32_t g_eax;` — a plain global, a different variable — and does not
+include `recomp_types.h`, so the compiler cannot see the mismatch. It links, and
+an override that sets `g_eax` sets nothing the caller reads: return values that
+"don't stick", arguments that read as garbage. Include the header and drop the
+hand-written `extern`s:
+
+```c
+#include "recomp_types.h"   /* thread-local register declarations */
+```
+
+### Replace, Don't Wrap
+
+`--exclude-manual` recognises two shapes. A function `recomp_manual.c`
+*defines* as `sub_X` is a **replacement**: the generator skips its body and
+every caller — direct calls in generated code and the dispatch table — reaches
+yours. A function it calls as `sub_X_gen` is a **wrapper**: the body is emitted
+as `sub_X_gen`, and so is every call to it. Only code that names `sub_X` by
+hand reaches the wrapper; generated code never does, so logging or a fix
+placed there silently never runs.
+
+To change behaviour for every caller, replace. Clean up the stack the way the
+original did (`g_esp += 12` for a `ret 8`).
+
 ## Build System
 
 The entire project is built with CMake:
@@ -370,6 +385,31 @@ The output is a single executable (`bin/burnout3.exe`) that links:
 - The main scaffold (entry point, window creation, game loop)
 
 System dependencies: `d3d11.lib`, `dxgi.lib`, `d3dcompiler.lib`, `xinput.lib`, `ws2_32.lib`.
+
+### RECOMP_ABI_CHECK Needs Both Halves
+
+The stack-balance checker is split: the check (`RECOMP_ABI_CALL`) is compiled
+into generated code through `recomp_types.h`, and the logger it calls,
+`recomp_abi_violation_log()`, into `xbox_kernel`. Defining the switch with
+`target_compile_definitions(<game> PRIVATE ...)` reaches only the first, and
+the link fails once per generated file:
+
+```
+recomp_0024.obj : error LNK2001: unresolved external symbol recomp_abi_violation_log
+```
+
+Define it for both, before the toolkit is added:
+
+```cmake
+option(RECOMP_ABI_CHECK "Log callee ABI violations at every lifted call" OFF)
+if(RECOMP_ABI_CHECK)
+    add_compile_definitions(RECOMP_ABI_CHECK=1)
+endif()
+add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
+```
+
+What it reports on every title, and why those reports are correct, is in
+[Iterative Debugging](06-debugging.md#reports-recomp_abi_check-always-gives).
 
 ## Startup Sequence
 

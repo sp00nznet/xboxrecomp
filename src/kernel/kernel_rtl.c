@@ -565,6 +565,7 @@ ULONG __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status)
         case STATUS_NOT_SUPPORTED:              return ERROR_NOT_SUPPORTED;
         case STATUS_CANCELLED:                  return ERROR_CANCELLED;
         case STATUS_ALREADY_COMMITTED:          return ERROR_COMMITMENT_LIMIT;
+        case STATUS_CONFLICTING_ADDRESSES:      return ERROR_INVALID_ADDRESS;
         default:
             /* Fall back to RtlNtStatusToDosError from ntdll if available */
             xbox_log(XBOX_LOG_WARN, XBOX_LOG_RTL,

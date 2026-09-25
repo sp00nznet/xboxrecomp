@@ -304,6 +304,7 @@ xboxrecomp/
 
 ### Start Here
 - **[Getting Started Guide](docs/GETTING_STARTED.md)** — End-to-end walkthrough from XBE to running game
+- **[Documentation Index](docs/INDEX.md)** — Every document in one place, and the same pages again by symptom
 - **[Decompilation Guide](docs/DECOMP.md)** — Using this as a function splitter instead: one byte-exact `.s` per function, with signatures and the call graph. You never run the recompiler
 - **[Tools Reference](tools/README.md)** — Detailed usage for every pipeline tool
 - **[Runtime Libraries](src/README.md)** — Architecture, build instructions, integration guide
@@ -335,6 +336,8 @@ xboxrecomp/
 - [SEH and Exception Handling](docs/technical/seh-handling.md) — Structured exception handling in recompiled code
 - [Lessons Learned](docs/technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
 - [Gap Analysis vs xemu](docs/technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
+- [Pushbuffer Executor](docs/technical/pushbuffer-executor.md) — Executing a statically linked XDK D3D title's pushbuffer: DMA-engine walk, kickoff flags, fixed-function transform, vertex programs, vertices behind the camera, render back ends
+- [APU Audio](docs/technical/apu-audio.md) — From a reachable APU to a playable one: output rate, the APU interrupt, physical addresses, pitch and pacing
 - [Microsoft's Own Recompiler](docs/technical/ms-fusion-recompiler.md) — White-room analysis of Ficl/Fission: pipeline, address map, HLE boundary
 - [Ficl/Fission Codegen Teardown](docs/technical/ms-fusion-codegen-teardown.md) — IDA/Hex-Rays teardown of both their translators, and how it reframes our roadmap
 - [SVOD Extraction](docs/technical/svod-extraction.md) — reading the BC package container to get the donor title's guest XBE out, and the validation gate that catches a plausible-looking bad extraction
@@ -536,6 +539,107 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### Unreleased
+
+*Bringing up* X-Men Legends *— a title that links the XDK's own D3D,
+DirectSound and USB stack rather than calling the toolkit's — and every one of
+the defects below was a wait on something the runtime was supposed to answer.
+A fence nothing released. A flush bit cleared once a frame. A voice stop no
+interrupt acknowledged. A thread that ran before its creator had stored its
+handle. Each looked like a hang, or like slowness, and none of them said what
+it was waiting for.* —
+*[@BearddOddity](https://github.com/BearddOddity)*
+
+**The pushbuffer executor draws a 3D level.** It walked the bytes between two
+`DMA_PUT`s in a straight line, so every CALL into a pre-built state block,
+every JUMP and every ring wrap was lost; it now walks like the DMA engine, with
+its own GET, and advances `DMA_GET` only once it has read that far. Primitive
+codes were off by one against `nv2a_regs.h`, so every triangle strip — most of
+all geometry — drew as a fan around its first vertex. Quads became one fan per
+batch, vertex programs were used as screen positions, indices were cut to 16
+bits, and the fixed-function composite matrix and anti-aliased surfaces were
+ignored: `rasterised 0 triangles; 8073 batches skipped`. There is now a CPU
+vertex-program interpreter, a fixed-function transform, and a render back-end
+interface (`nv2a_backend.h`) a game project can put a D3D11 renderer behind.
+Vertices behind the camera no longer drop their whole batch, which had removed
+every street and sidewalk from a top-down camera. See
+[Pushbuffer Executor](docs/technical/pushbuffer-executor.md).
+
+**Every GPU kickoff waited for a frame.** `CDevice::KickOff` spins on a
+write-combine flush bit, and the bit was cleared by the thread that also
+executes and draws the pushbuffer. A level load is thousands of kickoffs; the
+flags have their own thread now, and the frame rate rose about sevenfold.
+
+**Faking "GPU caught up" corrupts a title the executor is running.** Pointing
+D3D's progress pointer at its own write sequence is fine while nothing reads
+the pushbuffer; once something does, D3D reuses ring space and vertex memory
+the executor has not read, and render state arrives as vertex data. The
+executor now writes semaphore releases to the title's real semaphore
+(`nv2a_pb_set_semaphore_target`). The fence-wait trick itself is not Burnout's:
+it is stock XDK D3D. See
+[D3D8LTCG Device Context](docs/technical/d3d8ltcg-device-context.md#the-same-loop-in-other-titles).
+
+**The APU plays.** Its interrupt was an empty stub, so DirectSound never heard
+about a voice: silence, and 0.5 s for every voice stop. Delivered, it raced the
+game threads, because IRQL was a number nobody enforced. The APU read sound
+data as guest addresses when DirectSound hands it physical ones; ignored every
+voice's pitch (22.05 kHz speech an octave up); spun forever on a voice with no
+samples; paced itself by the wall clock against a sound card with its own; and
+the XAudio2 path wiped the DSP's output and submitted it at four times real
+time. Every output path now ends in a master volume and a soft limiter that
+never exceeds −6 dBFS. See [APU Audio](docs/technical/apu-audio.md).
+
+**Threads, priorities and IRQL behave like one CPU where titles rely on it.**
+New threads start when their creator yields, `CreateSuspended` is honoured,
+and a KTHREAD exists from creation; it was 0 for every thread, so every
+priority change failed silently. `NtSuspendThread` stops a thread only outside
+the kernel and below DISPATCH_LEVEL — a host suspend inside a bridge call froze
+every thread that needed its lock. Raising IRQL to DISPATCH takes a dispatch
+lock, and device interrupts are delivered through `xbox_set_irq_line`. See
+[Kernel Replacement](docs/technical/kernel-replacement.md#threads-priorities-and-irql).
+
+**Memory.** Addresses above RAM are tracked per page and honour a requested
+base (`guest_vmem.c`); the mirrors report as reserved, and
+`STATUS_CONFLICTING_ADDRESSES` maps to 487, the one error on which the CRT
+heap tries elsewhere. The heap carves reused blocks instead of handing a 2 MB
+block to a 16-byte request, and `NtFreeVirtualMemory` releases heap memory
+instead of passing a guest address to `VirtualFree`. The contiguous arena
+starts above the image, so a physical address is never ambiguous with a VA,
+and the APU, the OHCI model, the executor and the display bridge share one
+rule for it. See [Memory Layout](docs/technical/memory-layout.md#dynamic-heap).
+
+**Smaller, each one silent.** `NtCurrentThread()` was widened as unsigned on a
+64-bit host, so `DuplicateHandle` never recognised it and the CRT retried
+forever. The kernel call counter wrapped after 2^31 calls and turned "log the
+first N" into "log everything" — about 1 FPS some minutes into a level.
+`getenv` was called undeclared in `apu_mmio_hook.c`, cutting the pointer to 32
+bits. `XBOX_THREAD_LOCAL` tested `_WIN32`, and MinGW ignores
+`__declspec(thread)` with only a warning, so on that host every thread-local
+in the kernel was one variable. The OHCI model now reports DATA UNDERRUN and
+respects WDH, and enumerates the pad.
+
+**Documented, not yet fixed.** Four ways function detection misses or merges
+functions, with the check for each
+([Disassembly](docs/pipeline/02-disassembly.md#functions-the-detector-misses));
+a negative-index jump table in the CRT's `memcpy` lifted as a failing tail
+call, and privileged registers from data decoded as code
+([Lifting](docs/pipeline/04-lifting.md#tables-the-pattern-match-misses));
+the template's non-thread-local `g_eax`, wrappers that no generated caller
+reaches, and `RECOMP_ABI_CHECK` needing both halves
+([Building the Runtime](docs/pipeline/05-runtime.md#registers-in-recomp_manualc));
+and what the ABI checker always reports, and why that is correct
+([Iterative Debugging](docs/pipeline/06-debugging.md#reports-recomp_abi_check-always-gives)).
+Two Ghidra scripts answer "is this a real function?" headless in about 30
+seconds ([Triage without the GUI](tools/ghidra_naming/README.md#triage-without-the-gui)).
+
+**Also.** The APU and OHCI models now link a small `xbox_devbus` library
+instead of the kernel, so `tests/apu_mixdown` still links the APU alone. The
+XAudio2 test's fake voice follows `XA2_NUM_BUFS`, which went from 3 to 12. The
+Windows regression suite, built with MinGW-w64 and run under Wine, gives the
+same results before and after: 12 suites pass, and `wma_decoder` (no Media
+Foundation under Wine) and `d3d8_smoke` (does not configure for that host) fail
+on both. Nothing under `tools/` changed; `pytest tools/` is 386 passed.
 
 ### v0.11.0 — *"Nothing Said So"* (September 2026)
 

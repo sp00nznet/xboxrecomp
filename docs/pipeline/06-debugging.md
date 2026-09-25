@@ -295,6 +295,40 @@ void sub_001CFDD0(void) {  // NtFlushBuffersFile or push buffer wait
 ```
 Then add a stub in `recomp_manual.c` that returns immediately.
 
+That was the answer when nothing executed the pushbuffer. A title that links
+the XDK's own D3D and DirectSound hangs in more places, and most of them are a
+wait on something the runtime is supposed to answer. Set `RECOMP_WATCHDOG_SECS`
+and read the section the stack is in:
+
+| Stack in | Waiting for | See |
+|---|---|---|
+| `D3D`, under `Present`/`Swap` | GPU progress at `device + 0x30` | [D3D8LTCG: The Same Loop in Other Titles](../technical/d3d8ltcg-device-context.md#the-same-loop-in-other-titles) |
+| `D3D`, `CDevice::KickOff`, reading `nv2a + 0x100410` | the write-combine flush bit | [Pushbuffer Executor: Kickoffs](../technical/pushbuffer-executor.md#kickoffs-must-not-wait-for-a-frame) |
+| `DSOUND`, `KeStallExecutionProcessor` | the AC'97 codec | `RECOMP_AC97_READY` |
+| `DSOUND`, `MmGetPhysicalAddress` then a tight loop | the DSP command doorbell | `RECOMP_APU_DSP_ACK`, `apu_dsp.c` |
+
+A loop that *looks* frozen may be slow instead. Sample the main thread two or
+three times a few seconds apart (`cdb -p <pid> -c "~0kn 8; qd"`); if it is in
+the same polling loop most of the time and another thread is busy, the wait is
+being answered too late rather than never.
+
+### Whole-Process Freezes
+
+**Symptom**: every thread stops, no CPU use.
+
+**Cause**: a lock held by a thread that will not release it. A thread suspended
+inside a bridge call holding a bridge, heap or CRT lock
+([safe points](../technical/kernel-replacement.md#suspend-only-at-a-safe-point)),
+or a device thread spinning while holding its own lock
+([APU Audio](../technical/apu-audio.md#a-voice-with-nothing-to-play)).
+
+**Diagnosis**: every thread's stack, taken once. A title's own monitor can do
+this without a debugger: when no frame has been presented for 2 s, suspend each
+thread in turn, capture its context and walk its stack, resume it, and only
+then symbolise — symbolising while threads are suspended can deadlock on the
+very lock being diagnosed. One thread in `ZwSuspendThread` and the rest in
+`RtlEnterCriticalSection` is the suspend case.
+
 ### Access Violation at 0x00000000
 
 **Symptom**: crash reading or writing address 0.
@@ -318,6 +352,74 @@ Then add a stub in `recomp_manual.c` that returns immediately.
 **Cause**: stack leak from failed ICALLs. Each failed indirect call leaks 4-16 bytes of simulated stack space. Over thousands of frames, the stack underflows.
 
 **Fix**: ensure all ICALL failure paths clean up the stack. Use `RECOMP_ICALL_SAFE` for stdcall callsites. Monitor `g_esp` trend.
+
+## Vital Signs
+
+A title that boots is not a title that plays. The runtime keeps counters a game
+project can poll once a second and print as one line, so a playthrough log says
+where it went wrong:
+
+| Getter | Returns |
+|---|---|
+| `xa2_get_stats(Xa2Stats *)` | blocks submitted and dropped, underruns, clipped samples, peak |
+| `apu_vp_get_stats(int *voices, float *peak)` | most voices active, VP mix peak |
+| `xbox_io_get_stats(uint64_t out[5], char *last, int n)` | opens, failed opens, reads, bytes, slowest read (µs); the last path opened |
+| `nv2a_pb_exec_get_stats(uint32_t out[4])` | batches drawn, batches skipped as untransformed, lit batches that came out black, triangles |
+| `nv2a_exec_busy_percent()` | pushbuffer executor load over the last second |
+
+Turning thresholds into event lines — fps below 40, any underrun or drop,
+clipping, a read slower than 100 ms, a burst of black lit batches — makes
+`grep "\[EVENT\]"` the first thing to run on a log. A frame gap over 100 ms
+is worth one more step: suspend the main thread once and name the function it
+is in.
+
+`RECOMP_KERNEL_LOG_BUDGET` sets how many kernel calls are logged (0 = none).
+Keep it small for long runs: logging is synchronous on stderr.
+
+## Reports RECOMP_ABI_CHECK Always Gives
+
+With `RECOMP_ABI_CHECK` on (see
+[Building the Runtime](05-runtime.md#recomp_abi_check-needs-both-halves)), a
+handful of MSVC CRT helpers are reported on every title, and they are correct
+as reported: they break the register rules on purpose.
+
+| Helper | How to recognise it | Why it is reported |
+|---|---|---|
+| `__SEH_prolog` | `push <handler>; mov eax, fs:[0]; push eax; ... sub esp, eax; push ebx; push esi; push edi` | builds the **caller's** frame, so esp is lower on return |
+| `__SEH_epilog` | `mov ecx, [ebp-0x10]; mov fs:[0], ecx; pop ecx; pop edi; pop esi; pop ebx; leave; push ecx` | restores the **caller's** ebx/esi/edi |
+| `_chkstk` / `_alloca_probe` | `test eax, eax; ... neg eax; add eax, esp; add eax, 4; test [eax], eax` | moves esp down for the caller |
+| `_aulldvrm` / `_alldvrm` | 64-bit divide; `push esi` or `push edi; push esi; push ebp`, then `div` | returns the remainder in **ebx:ecx** |
+| CRT maths dispatcher fragments (`_trandisp` family) | `[ebp-0xA4]`, `fldcw`, `fxam` | shares the caller's frame; sets ebx to a table |
+
+On *X-Men Legends* the full report after booting to the title screen was
+exactly these six. Anything else — in game code, a changed ebx/esi/edi or a
+short esp after a call — is a missing epilogue or a wrong `ret N`. The checker
+would be more useful with an allow-list, or with these recognised by
+signature.
+
+## Reading Guest Registers in cdb
+
+The guest registers are thread-local, so a debugger has to take their address
+first. `dwo(&module!g_eax)` fails; this works:
+
+```
+r? @$t1 = &mygame!g_esp
+r  @$t0 = poi(mygame!g_xbox_mem_offset)
+.printf "guest esp=%08x\n", dwo(@$t1)
+dd @$t0+dwo(@$t1) L40          $$ guest stack
+```
+
+`r?` evaluates in the current thread's TLS, so switch thread (`~Ns`) first.
+
+| Rule | Why |
+|---|---|
+| `dwo()`, not `poi()`, for guest values | guest values are 32-bit; `poi` reads 64 bits on x64 |
+| guest address G is at `poi(g_xbox_mem_offset) + G` | guest memory is one block in the host process |
+| `@ecx` and friends are **host** registers | the guest's are the `g_*` variables |
+| `sub_X+0x393` in a stack is a host offset | not a guest instruction offset |
+For "is this address a real function?", Ghidra's headless mode answers faster
+than any debugger — see
+[Triage without the GUI](../../tools/ghidra_naming/README.md#triage-without-the-gui).
 
 ## Debugging Workflow
 

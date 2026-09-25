@@ -283,6 +283,11 @@ cmake --build build --config Release
 build\Release\my_game.exe 2>stderr.txt      # named after project() in your CMakeLists
 ```
 
+From Git Bash, pass MSBuild's parallel flag through CMake (`--parallel`), not as
+`-- /m`: Git Bash rewrites arguments that look like paths, `/m` arrives as `M:/`,
+and MSBuild stops with `MSB1008: Only one project can be specified`
+(`MSYS_NO_PATHCONV=1` also works).
+
 This configure step builds the toolkit's libraries as a subdirectory *and* links
 them into your `.exe`. If you get libraries and no `.exe`, you are building the
 toolkit's `CMakeLists.txt` instead of your project's.

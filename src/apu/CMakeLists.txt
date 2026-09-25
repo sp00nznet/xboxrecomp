@@ -45,3 +45,9 @@ else()
     find_package(SDL2 REQUIRED)
     target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
 endif()
+
+# The APU raises its interrupt (xbox_set_irq_line) and resolves DMA addresses
+# through the contiguous arena (xbox_ContiguousIsPhysical). xbox_devbus, not
+# xbox_kernel: the kernel would pull in recomp_lookup, which only a title
+# provides, and tests/apu_mixdown links the APU alone.
+target_link_libraries(xbox_apu PUBLIC xbox_devbus)

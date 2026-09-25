@@ -632,6 +632,31 @@ nothing about it.
   DDS9 carries both forms, and returning the first match meant which one won
   depended on nothing but the lower address.
 
+### BearddOddity — [@BearddOddity](https://github.com/BearddOddity)
+A bring-up batch on *X-Men Legends*, a title that links the XDK's own D3D,
+DirectSound and USB stack. Almost every item was a wait on something the
+runtime was supposed to answer, and none of them said what it was waiting for.
+Developed with Claude Code.
+
+- **The pushbuffer executor draws a 3D level** — it walks the pushbuffer like
+  the DMA engine (JUMP, CALL/RETURN, ring wraps); primitive codes match
+  `nv2a_regs.h`, where every triangle strip had been a fan; quads, 32-bit
+  indices, vertex programs, the fixed-function transform, anti-aliased surfaces
+  and vertices behind the camera; and a render back-end interface.
+- **Every GPU kickoff waited for a whole frame** — the write-combine flush bit
+  was cleared by the thread that also draws. About sevenfold on frame rate.
+- **The APU plays** — its interrupt was a stub, it read physical addresses as
+  guest addresses, ignored pitch, spun on an empty voice, and the XAudio2 path
+  ran at four times real time. Output ends in a limiter below −6 dBFS.
+- **Threads, priorities and IRQL** — threads start when their creator yields,
+  KTHREADs exist (every priority change had failed silently), suspend waits for
+  a safe point, and IRQL at DISPATCH is enforced.
+- **Memory** — addresses above RAM honour a requested base, the CRT heap's
+  487, heap reuse that returns memory, and a contiguous arena that cannot be
+  mistaken for the image.
+- **Documented** — four ways function detection misses functions, lifter gaps,
+  template and build traps, and a documentation index by symptom.
+
 ---
 
 ## Issue reports and testing

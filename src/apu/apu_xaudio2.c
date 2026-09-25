@@ -9,7 +9,28 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "apu_xaudio2.h"
+
+/* Hearing safety, for every output path: master volume, then a soft limiter
+ * whose output never exceeds -6 dBFS (16384). c * tanh(x / c) is linear for
+ * quiet signals and bends smoothly towards the ceiling for loud ones, so a
+ * spike (a mixdown summing many bins, a decoder glitch) is capped without the
+ * harsh edge of hard clipping. */
+static float g_xa2_volume = 0.5f;
+
+void apu_output_safety(const int16_t *in, int16_t *out, int n)
+{
+    const float ceiling = 16384.0f;
+    int i;
+    for (i = 0; i < n; i++)
+        out[i] = (int16_t)(ceiling * tanhf((float)in[i] * g_xa2_volume / ceiling));
+}
+
+void xa2_set_master_volume(float v)
+{
+    g_xa2_volume = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+}
 
 /* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
  * stubbed to report inactive; real audio output via SDL2 comes later. */
@@ -25,7 +46,7 @@
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+#define XA2_NUM_BUFS      12     /* 12 x 256-sample blocks = 64 ms of headroom */
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
@@ -34,6 +55,7 @@ static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
 static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
+static Xa2Stats                g_xa2_stats;
 
 int xa2_init(void)
 {
@@ -138,11 +160,36 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) {
+        g_xa2_stats.dropped++;
+        return 0;
+    }
+    {
+        static LARGE_INTEGER f, prev;
+        LARGE_INTEGER now;
+        if (!f.QuadPart) QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&now);
+        if (state.BuffersQueued == 0 && g_xa2_stats.submitted) {
+            g_xa2_stats.underruns++;
+            if (getenv("RECOMP_APU_TRACE") && g_xa2_stats.underruns < 20)
+                fprintf(stderr, "[XA2] underrun: %.1f ms since the previous block\n",
+                        (now.QuadPart - prev.QuadPart) * 1000.0 / f.QuadPart);
+        }
+        prev = now;
+    }
 
     idx = g_xa2_next_buf;
     copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
-    memcpy(g_xa2_bufs[idx], samples, copy_samples * XA2_CHANNELS * sizeof(int16_t));
+    {
+        int i, n = copy_samples * XA2_CHANNELS;
+        for (i = 0; i < n; i++) {
+            int a = samples[i] < 0 ? -samples[i] : samples[i];
+            if (a >= 32767) g_xa2_stats.clipped++;
+            if (a > g_xa2_stats.peak) g_xa2_stats.peak = a;
+        }
+        g_xa2_stats.samples += (uint64_t)copy_samples;
+    }
+    apu_output_safety(samples, &g_xa2_bufs[idx][0][0], copy_samples * XA2_CHANNELS);
 
     memset(&xbuf, 0, sizeof(xbuf));
     xbuf.AudioBytes = copy_samples * XA2_CHANNELS * sizeof(int16_t);
@@ -153,12 +200,27 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
     g_xa2_frames_written++;
+    g_xa2_stats.submitted++;
     return 1;
 }
 
 int xa2_get_buffer_size(void)
 {
     return XA2_BUF_SAMPLES;
+}
+
+int xa2_queued(void)
+{
+    XAUDIO2_VOICE_STATE state;
+    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    return (int)state.BuffersQueued;
+}
+
+void xa2_get_stats(Xa2Stats *out)
+{
+    *out = g_xa2_stats;          /* ponytail: unlocked; counters only grow */
+    g_xa2_stats.peak = 0;
 }
 
 #else /* !_WIN32 -- POSIX stubs (no audio output yet) */
@@ -168,5 +230,7 @@ void xa2_shutdown(void)                               {}
 int  xa2_is_active(void)                              { return 0; }
 int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
 int  xa2_get_buffer_size(void)                        { return 0; }
+int  xa2_queued(void)                                 { return 0; }
+void xa2_get_stats(Xa2Stats *out)                     { memset(out, 0, sizeof *out); }
 
 #endif /* _WIN32 */
