@@ -30,6 +30,7 @@
 #ifdef RECOMP_ICALL_FEEDBACK
 
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 
 #include "recomp_icall_feedback.h"
@@ -38,6 +39,97 @@
  * only commits the pages actually touched, so a title that reaches 4k distinct
  * targets does not resident 8 MiB. */
 volatile unsigned char g_icall_seen[RECOMP_ICALL_FB_SIZE];
+
+/* Guarded indirect-call arms taken and missed (RECOMP_ICALL_GUARD_HIT/MISS in
+ * recomp_types.h), reported beside the per-site dump. */
+volatile uint64_t g_icall_guard_hits = 0;
+volatile uint64_t g_icall_guard_misses = 0;
+
+/* Per-site targets. Open addressing over 32K slots (a large title has a few
+ * thousand indirect call sites); each slot holds up to SITE_MAX distinct
+ * targets and a saturation mark beyond that, which the lifter reads as "do
+ * not guard this one". */
+uint32_t g_icall_site_hs[65536];
+uint32_t g_icall_site_hl[65536];
+#define SITE_SLOTS 32768u
+#define SITE_MAX 6
+typedef struct {
+    uint32_t site;
+    uint8_t n;
+    uint8_t saturated;
+    uint32_t t[SITE_MAX];
+} icall_site_rec;
+static icall_site_rec s_sites[SITE_SLOTS];
+static unsigned long s_site_records, s_site_saturated;
+
+void recomp_icall_observe_site(uint32_t site, uint32_t va)
+{
+    if (!site)
+        return;
+    uint32_t h = (site * 2654435761u) >> 17;
+    for (unsigned probe = 0; probe < SITE_SLOTS; probe++) {
+        icall_site_rec *r = &s_sites[(h + probe) & (SITE_SLOTS - 1u)];
+        if (r->site == 0) {
+            r->site = site; r->t[0] = va; r->n = 1;
+            s_site_records++;
+            return;
+        }
+        if (r->site != site)
+            continue;
+        for (unsigned i = 0; i < r->n; i++)
+            if (r->t[i] == va)
+                return;
+        if (r->n < SITE_MAX) {
+            r->t[r->n++] = va;
+        } else if (!r->saturated) {
+            r->saturated = 1;
+            s_site_saturated++;
+        }
+        return;
+    }
+}
+
+/* icall_sites.dump beside the targets dump: `site t1 t2 ... [+]`, where `+`
+ * says the site reached more targets than the record holds. */
+static void dump_sites(const char *targets_path)
+{
+    char path[1024];
+    size_t n = strlen(targets_path);
+    const char *suffix = "targets.dump";
+    size_t sl = strlen(suffix);
+    if (n >= sl && strcmp(targets_path + n - sl, suffix) == 0
+            && n - sl + 12 < sizeof path) {
+        memcpy(path, targets_path, n - sl);
+        memcpy(path + n - sl, "sites.dump", 11);
+    } else if (n + 7 < sizeof path) {
+        memcpy(path, targets_path, n);
+        memcpy(path + n, ".sites", 7);
+    } else {
+        return;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "# icall-sites v1\n");
+    fprintf(f, "# site target...   (+ = more targets than recorded)\n");
+    for (unsigned i = 0; i < SITE_SLOTS; i++) {
+        const icall_site_rec *r = &s_sites[i];
+        if (!r->site)
+            continue;
+        fprintf(f, "%08X", (unsigned)r->site);
+        for (unsigned k = 0; k < r->n; k++)
+            fprintf(f, " %08X", (unsigned)r->t[k]);
+        if (r->saturated)
+            fprintf(f, " +");
+        fputc('\n', f);
+    }
+    fclose(f);
+    fprintf(stderr, "[icall-feedback] %s: %lu sites, %lu saturated;"
+            " guarded arms hit=%llu missed=%llu\n",
+            path, s_site_records, s_site_saturated,
+            (unsigned long long)g_icall_guard_hits,
+            (unsigned long long)g_icall_guard_misses);
+}
 
 void recomp_icall_feedback_dump(const char *path)
 {
@@ -66,6 +158,7 @@ void recomp_icall_feedback_dump(const char *path)
 
     fprintf(stderr, "[icall-feedback] %s: %lu resolved, %lu unresolved targets\n",
             path, resolved, unresolved);
+    dump_sites(path);
 }
 
 static void dump_at_exit(void)

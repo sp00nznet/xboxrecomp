@@ -1255,6 +1255,12 @@ class Lifter:
         self.SETJMP_FN = setjmp_fn
         self.LONGJMP_FN = longjmp_fn
         self.jump_table_targets = {}
+        # call-site VA -> targets the title was measured reaching from it
+        # (tools/recomp/output/icall_sites.json). A site whose whole recorded
+        # set is small and translated is guarded with direct calls; the
+        # generic dispatch stays as the fallback, so an unseen target is
+        # slow, never wrong. See _lift_call.
+        self.icall_site_targets = {}
         # Addresses loaded as immediates into a register inside the current
         # function, used to resolve `jmp <reg>`. See _lift_jmp.
         self.imm_code_refs = set()
@@ -2280,10 +2286,23 @@ class Lifter:
             # target -- `call dword ptr [esp+8]`, the shape MSVC gives a
             # callback invoked through a stack argument -- is read four bytes
             # low and dispatches through the wrong slot.
-            return [f"{{ uint32_t _icall_target = {target}; "
-                    f"PUSH32(esp, 0x{ret_va:08X}u); "
-                    "RECOMP_ICALL_SAFE(_icall_target, _icall_esp); }"
-                    " /* indirect call */"]
+            site = insn.address
+            head = (f"{{ uint32_t _icall_target = {target}; "
+                    f"PUSH32(esp, 0x{ret_va:08X}u); ")
+            fallback = (f"RECOMP_ICALL_SAFE_AT(_icall_target, _icall_esp, "
+                        f"0x{site:08X}u); }}")
+            recorded = self.icall_site_targets.get(site)
+            guards = [t for t in (recorded or [])
+                      if t in self.func_db and t not in self.manual_functions]
+            if recorded and 0 < len(recorded) <= 4 and len(guards) == len(recorded):
+                arms = " else ".join(
+                    f"if (_icall_target == 0x{t:08X}u) {{ RECOMP_ICALL_GUARD_HIT(); "
+                    f"RECOMP_ABI_CALL(0x{t:08X}u, {self._call_target_name(t)}); }}"
+                    for t in sorted(set(guards)))
+                return [head + arms + " else { RECOMP_ICALL_GUARD_MISS(); "
+                        + fallback + " }"
+                        + f" /* indirect call, guarded {len(set(guards))} */"]
+            return [head + fallback + " /* indirect call */"]
         return ["/* call: no target */"]
 
     def _lift_ret(self, insn, ops):

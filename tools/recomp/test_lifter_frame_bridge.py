@@ -14,7 +14,7 @@ class FrameBridgeLifterTest(unittest.TestCase):
         self.assertEqual(len(lifted), 1)
         self.assertIn("uint32_t _icall_target = eax", lifted[0])
         self.assertIn(
-            "RECOMP_ICALL_SAFE(_icall_target, _icall_esp)", lifted[0])
+            "RECOMP_ICALL_SAFE_AT(_icall_target, _icall_esp, ", lifted[0])
 
     def test_esp_relative_indirect_call_snapshots_target_before_push(self):
         instruction = Instruction(0, 4, "call", "dword ptr [esp + 0xc]", "ff54240c")
@@ -29,7 +29,7 @@ class FrameBridgeLifterTest(unittest.TestCase):
             lifted[0].index("uint32_t _icall_target"),
             lifted[0].index("PUSH32(esp,"))
         self.assertIn(
-            "RECOMP_ICALL_SAFE(_icall_target, _icall_esp)", lifted[0])
+            "RECOMP_ICALL_SAFE_AT(_icall_target, _icall_esp, ", lifted[0])
 
     def test_call_without_local_ebp_keeps_existing_bridge(self):
         instruction = Instruction(0, 5, "call", "0x123456", "e800000000")
