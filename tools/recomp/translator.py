@@ -155,7 +155,7 @@ def _fixup_icall_esp_save(lines):
     # Find indices of all ICALL_SAFE lines
     icall_indices = []
     for i, line in enumerate(lines):
-        if 'RECOMP_ICALL_SAFE(' in line:
+        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
             icall_indices.append(i)
 
     if not icall_indices:
@@ -215,7 +215,7 @@ def _fixup_icall_esp_save(lines):
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
         result.append(line)
-        if 'RECOMP_ICALL_SAFE(' in line:
+        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}}}")
 
@@ -286,9 +286,11 @@ class FunctionTranslator:
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
-                 trace_functions=None):
+                 trace_functions=None, icall_sites=None):
         """
         xbe_data: bytes - raw XBE file contents
+        icall_sites: dict - call-site VA -> [target VAs] a recorded run saw
+                     that site reach (tools.recomp.icall_feedback merge)
         func_db: dict - addr → function info from functions.json
         label_db: dict - addr → name from labels.json
         classification_db: dict - addr → classification from identified_functions.json
@@ -297,6 +299,7 @@ class FunctionTranslator:
         """
         self.xbe_data = xbe_data
         self.func_db = func_db
+        self.icall_sites = dict(icall_sites or {})
         self.label_db = label_db or {}
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
@@ -713,6 +716,7 @@ class FunctionTranslator:
         self.lifter.func_end = end
         self.lifter.jump_table_targets = (
             recovered["jump_tables"] if recovered else {})
+        self.lifter.icall_site_targets = self.icall_sites
 
         # Disassemble
         instructions = (recovered["instructions"] if recovered else
@@ -1260,8 +1264,18 @@ class BatchTranslator:
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
                  output_dir=None, seh_prolog=None, seh_epilog=None,
-                 trace_functions=None):
+                 trace_functions=None, icall_sites_json_path=None):
         self.xbe_path = xbe_path
+        # Per-site indirect-call targets. A saturated site reached more
+        # targets than the runtime records, so it is never guarded.
+        self.icall_sites = {}
+        if icall_sites_json_path and os.path.exists(icall_sites_json_path):
+            with open(icall_sites_json_path, "r") as f:
+                for key, rec in json.load(f).items():
+                    if rec.get("saturated"):
+                        continue
+                    self.icall_sites[int(key, 16)] = [
+                        int(t, 16) for t in rec.get("targets", [])]
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(__file__), "output")
 
@@ -1329,7 +1343,7 @@ class BatchTranslator:
             self.classification_db, self.abi_db,
             seh_prolog=seh_prolog, seh_epilog=seh_epilog,
             setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
-            trace_functions=trace_functions)
+            trace_functions=trace_functions, icall_sites=self.icall_sites)
         self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
 

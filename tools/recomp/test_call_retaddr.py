@@ -69,7 +69,7 @@ def test_indirect_call_pushes_following_address():
                  address=0x00130000, size=2, call_target=None)
     out = "\n".join(Lifter().lift_instruction(insn))
     assert "PUSH32(esp, 0x00130002u);" in out, out
-    assert "RECOMP_ICALL_SAFE(" in out, out
+    assert "RECOMP_ICALL_SAFE_AT(" in out, out
 
 
 def test_retaddr_is_the_instruction_after_the_call():
