@@ -413,43 +413,73 @@ class DisasmEngine:
         that happens to disassemble, and stopping at an unconditional jmp keeps
         this out of tail-call territory, which _pass_tail_jump_targets already
         covers with better evidence. Conditional branches are fine: a real
-        function has them.
+        function has them. So is a switch dispatch through a table that
+        resync_jump_tables has measured: the probe continues in its arms.
         """
         section = self.image.get_section_at_va(addr)
         if section is None or not section.executable:
             return False
-        data = self.image.read_bytes_at_va(addr, max_insns * 8)
-        if not data:
-            return False
-
-        limit = addr + len(data)
         count = 0
-        for decoded in self._cs.disasm(data, addr):
-            count += 1
-            mnemonic = decoded.mnemonic.lower()
-            if mnemonic in config.RET_MNEMONICS:
-                return True
-            if mnemonic in config.JMP_MNEMONICS:
-                # An unconditional jump forward, still inside the window being
-                # probed, is ordinary control flow -- MSVC emits it constantly
-                # to skip an else-branch. Only a jump that leaves the window,
-                # or goes backwards, is tail-call shaped and ends the probe.
-                #
-                # Rejecting every jmp cost Half-Life 2 its CreateInterface list
-                # walk (0x00427F80): a clean 90-byte function that happens to
-                # contain one `jmp` over four instructions.
-                try:
-                    ops = decoded.operands
-                except Exception:
-                    return False
-                if not ops or ops[0].type != CS_OP_IMM:
-                    return False
-                target = ops[0].imm & 0xFFFFFFFF
-                if not (decoded.address < target < limit):
-                    return False
-            if count >= max_insns:
+        resume = addr
+        # One pass per straight-line segment. A segment ends at a ret (yes),
+        # at anything tail-call shaped (no), or at a switch dispatch through
+        # a table this engine has already measured -- which is neither: the
+        # function continues in its arms, so the probe resumes at the first
+        # arm past the jump and keeps its instruction budget. A function
+        # reached only as an immediate, with no prologue, that opens with
+        # exactly that dispatch was otherwise refused, and the switch tables
+        # it owns were translated nowhere.
+        while resume is not None and count < max_insns:
+            data = self.image.read_bytes_at_va(resume, (max_insns - count) * 8)
+            if not data:
                 return False
+            limit = resume + len(data)
+            start = resume
+            resume = None
+            for decoded in self._cs.disasm(data, start):
+                count += 1
+                mnemonic = decoded.mnemonic.lower()
+                if mnemonic in config.RET_MNEMONICS:
+                    return True
+                if mnemonic in config.JMP_MNEMONICS:
+                    # An unconditional jump forward, still inside the window
+                    # being probed, is ordinary control flow -- MSVC emits it
+                    # constantly to skip an else-branch. Only a jump that
+                    # leaves the window, or goes backwards, is tail-call
+                    # shaped and ends the probe.
+                    #
+                    # Rejecting every jmp cost Half-Life 2 its
+                    # CreateInterface list walk (0x00427F80): a clean 90-byte
+                    # function that happens to contain one `jmp` over four
+                    # instructions.
+                    try:
+                        ops = decoded.operands
+                    except Exception:
+                        return False
+                    if not ops:
+                        return False
+                    if ops[0].type == CS_OP_MEM and ops[0].mem.index != 0:
+                        arm = self._first_arm_after(
+                            ops[0].mem.disp & 0xFFFFFFFF, decoded.address)
+                        if arm is None:
+                            return False
+                        resume = arm
+                        break
+                    if ops[0].type != CS_OP_IMM:
+                        return False
+                    target = ops[0].imm & 0xFFFFFFFF
+                    if not (decoded.address < target < limit):
+                        return False
+                if count >= max_insns:
+                    return False
         return False
+
+    def _first_arm_after(self, table: int, site: int) -> Optional[int]:
+        """The lowest entry of a measured jump table that lies past `site`,
+        or None when `table` is not one this engine has measured."""
+        entries = self.jump_table_entries(table)
+        later = [a for a in entries if a > site]
+        return min(later) if later else None
 
     def probes_as_vcall_thunk(self, addr: int) -> bool:
         """Is this MSVC's virtual-call thunk?
