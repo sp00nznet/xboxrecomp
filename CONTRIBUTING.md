@@ -196,3 +196,20 @@ The exception is the xemu-derived code under `src/apu/` and
 `src/nv2a/nv2a_regs.h`, which is LGPL-2.1-or-later and stays that way — see
 [NOTICE](NOTICE). If you patch those files, your change is LGPL too, and the
 existing copyright headers must stay intact.
+
+### Where your code comes from
+
+Contributions must be your own work, or come from a source whose licence is
+compatible with MIT (MIT, BSD, zlib, Apache-2.0, public domain). Specifically:
+
+- **Don't port code from GPL projects** -- Cxbx-Reloaded, the GPL parts of
+  xemu, MAME's GPL drivers, or other Xbox recompilation projects under the GPL.
+  Rewriting it line by line doesn't change that. Reading one to understand how
+  the hardware behaves is fine; carrying its code or structure across is not.
+  A fix you saw in another project is best submitted as a description of the
+  bug, and we'll write it fresh.
+- **If something came from elsewhere, say so in the PR**, with a link, and
+  keep any copyright header. A licence problem found at review costs a
+  comment; one found after release means untangling history.
+- The same applies to AI-assisted code: if it looks like it reproduces an
+  existing project, check where it came from before submitting it.
