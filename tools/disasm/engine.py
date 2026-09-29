@@ -95,6 +95,11 @@ class DisasmEngine:
         # recorded during the sweep.
         self.jump_tables: Dict[int, int] = {}
         self._jt_candidates: Set[int] = set()
+        # Indexed-jump displacement -> the (start, end) of each instruction
+        # that dispatches through it, and -> the table start it resolves to
+        # when the displacement is not the table's first slot.
+        self._jt_sites: Dict[int, List[Tuple[int, int]]] = {}
+        self._jt_base: Dict[int, int] = {}
 
     def _classify_instruction(self, cs_insn: CsInsn) -> Instruction:
         """Convert a Capstone instruction to our Instruction type."""
@@ -144,6 +149,8 @@ class DisasmEngine:
                             self.image.base_address + self.image.image_size):
                         insn.jump_table = disp
                         self._jt_candidates.add(disp)
+                        self._jt_sites.setdefault(disp, []).append(
+                            (insn.address, insn.end_address))
 
             # Check for memory references in non-branch instructions
             if not (insn.is_call or insn.is_branch) and insn.memory_ref is None:
@@ -273,6 +280,43 @@ class DisasmEngine:
                 if target is None or not (lo <= target < hi):
                     break
                 entries += 1
+            # The displacement need not be the first slot. MSVC's memmove
+            # dispatches its backward tail through `jmp [ecx*4 + LAST]`, the
+            # table's last entry, with the index counting down from there --
+            # measured forward that is a one-entry table, dropped as too short,
+            # so the function ended at it and lost every arm and its epilogue.
+            # Walk down as well, stopping before the bytes of any instruction
+            # that dispatches through this table: a table parked right after
+            # its jmp would otherwise read the jmp's own displacement, which is
+            # an in-section address, as a slot.
+            #
+            # "Points into the section" is far too weak going down: the bytes
+            # before a table are usually the function's last instruction, and
+            # `ret N` (c2 NN 00) plus the byte before it reads as a small
+            # in-section address -- Wreckless lost three epilogues that way.
+            # A real slot points at the same arms, so the walk only accepts
+            # targets within ARM_WINDOW of the slot the displacement names --
+            # the one entry known to be real. Not of the whole forward run:
+            # that can over-read into a following byte-index table, whose
+            # `00 01 02 00` is itself an in-section address, and a window that
+            # wide let HL2's `leave; ret 4` in as a slot.
+            ARM_WINDOW = 0x400
+            sites = self._jt_sites.get(tbl, ())
+            anchor = self.image.read_u32_at_va(tbl) if entries else None
+            back = 0
+            while anchor is not None and entries + back < max_entries:
+                slot = tbl - (back + 1) * 4
+                if any(a < slot + 4 and slot < e for a, e in sites):
+                    break
+                target = self.image.read_u32_at_va(slot)
+                if (target is None or not (lo <= target < hi)
+                        or abs(target - anchor) > ARM_WINDOW):
+                    break
+                back += 1
+            entries += back
+            if back:
+                self._jt_base[tbl] = tbl - back * 4
+                tbl -= back * 4
             if entries < min_entries:
                 # Too short to distinguish from code that merely looks like
                 # pointers. Leaving it alone costs nothing; a wrong skip here
@@ -294,6 +338,7 @@ class DisasmEngine:
 
     def jump_table_entries(self, tbl: int) -> List[int]:
         """Code pointers held by a resynced jump table, or [] if unknown."""
+        tbl = self._jt_base.get(tbl, tbl)
         end = self.jump_tables.get(tbl)
         if end is None:
             return []

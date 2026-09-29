@@ -2470,6 +2470,42 @@ class Lifter:
             targets.append(val)
         return targets
 
+    def _read_local_table(self, table_va):
+        """The run of this function's own code pointers around `table_va`.
+
+        Used when the translator recovered no table for this dispatch. MSVC
+        does not always name a table by its first slot, and all three shapes
+        below are in its hand-written CRT memcpy/memmove, which every XDK
+        title links:
+
+          - biased: the index starts at 1, so slot 0 is never read and holds
+            whatever precedes the real entries (`jmp [eax*4 + T]`, eax = 1..3);
+          - counted down from the last slot (`jmp [ecx*4 + LAST]`);
+          - counted up from one past the end (`jmp [ecx*4 + END]`, ecx < 0).
+
+        Reading forward from the displacement only, each became an indirect
+        tail jump into the middle of memcpy, which the runtime cannot resolve,
+        so the copy silently did nothing. The translator (_read_local_jump_table)
+        and the disassembler (resync_jump_tables) already read both ways.
+        """
+        def run(va, step):
+            out = []
+            while len(out) < 256:
+                val = self._read_jump_table(va, max_entries=1)
+                if not val or not (self.func_start <= val[0] < self.func_end):
+                    break
+                out.append(val[0])
+                va += step
+            return out
+
+        up = run(table_va, 4) or run(table_va + 4, 4)
+        if len(up) >= 2:
+            # An ordinary table. Reading down as well would only fold a
+            # neighbouring table's arms into this switch.
+            return up
+        down = run(table_va - 4, -4)
+        return down[::-1] + up
+
     def _analyze_switch_table(self, ops):
         """Detect if an indirect jmp operand is an intra-function switch table.
         Pattern: jmp [reg*scale + table_base] or jmp [reg + table_base]
@@ -2484,7 +2520,7 @@ class Lifter:
         table_va = op.mem_disp
         targets = self.jump_table_targets.get(table_va)
         if targets is None:
-            targets = self._read_jump_table(table_va)
+            targets = self._read_local_table(table_va)
         if not targets:
             return []
         # Truncate at the first entry outside the function rather than
