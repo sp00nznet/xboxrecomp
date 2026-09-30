@@ -467,6 +467,9 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
     g_esp += 12;
 }
 
+void guest_cpu_join(void);
+void guest_cpu_part(void);
+
 static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
@@ -492,7 +495,9 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     }
     free(s);
 
+    guest_cpu_join();
     bridge_run_thread_inline(fn, ctx1, ctx2);
+    guest_cpu_part();
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
@@ -1385,6 +1390,7 @@ static void bridge_NtCreateEvent(void)
 static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
+static HANDLE ke_guest_event(uint32_t guest_va, int *type);
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
@@ -1397,6 +1403,16 @@ static void bridge_KeSetEvent(void)
     (void)increment;
     (void)wait;
 
+    {   /* An event the title built itself (see ke_guest_event). */
+        int type;
+        HANDLE ge = ke_guest_event(guest_va, &type);
+        if (ge) {
+            g_eax = BRIDGE_MEM32(guest_va + 4) != 0;   /* previous state */
+            BRIDGE_MEM32(guest_va + 4) = 1;
+            SetEvent(ge);
+            return;
+        }
+    }
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = bridge_resolve_handle(guest_va);
@@ -1417,6 +1433,28 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
+
+    {   /* An event the title built itself (see ke_guest_event). Its
+         * SignalState in guest memory is the truth -- XDK code resets it by
+         * writing 0 there -- so bring the host event in line first. */
+        int type;
+        HANDLE ge = ke_guest_event(object, &type);
+        if (ge) {
+            if (BRIDGE_MEM32(object + 4) == 0) {
+                ResetEvent(ge);
+                if (BRIDGE_MEM32(object + 4) != 0)     /* set meanwhile */
+                    SetEvent(ge);
+            } else {
+                SetEvent(ge);                          /* set by a header write */
+            }
+            g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+                ge, wait_reason, wait_mode,
+                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+            if (g_eax == 0 && type == 1)               /* synchronization: consumed */
+                BRIDGE_MEM32(object + 4) = 0;
+            return;
+        }
+    }
 
     h = ke_shadow_lookup(object);
     if (!h)
@@ -6012,6 +6050,77 @@ static void ke_shadow_remove(uint32_t guest_va)
     LeaveCriticalSection(&g_ke_shadow_cs);
 }
 
+/* Events a title initialises itself (RECOMP_TITLE_KEVENTS=1, off by default).
+ *
+ * Shadows are made by KeInitializeEvent, but XDK code can build a KEVENT by
+ * writing its header directly: one title (T()NY) does not even import
+ * KeInitializeEvent, and its D3D waits on the event at miniport + 0x1A4, which
+ * the graphics interrupt sets for software method 5. With no shadow, the guest
+ * address itself went to Win32 as a HANDLE: SetEvent failed silently, and every
+ * wait failed at once with STATUS_UNSUCCESSFUL, which BlockOnTime's
+ * "while (KeWaitForSingleObject(...))" retried forever -- the menu froze.
+ *
+ * So on first use, an object whose header reads as an event (Type 0 notification
+ * or 1 synchronization, Size 4 dwords) gets a host event with the same type and
+ * state, marked in_use = 2. For those the bridges keep SignalState in guest
+ * memory up to date, because XDK code resets it by writing 0 there.
+ * Returns NULL for anything else (the old paths apply).
+ *
+ * Opt-in because it changes what every such wait does: a wait that failed at
+ * once now blocks until the event is set, and on a title whose setter the
+ * runtime does not model yet (a GPU interrupt, say) that turns a spin into a
+ * hang. Turn it on for a title that waits on events it built itself. */
+static HANDLE ke_guest_event(uint32_t guest_va, int *type)
+{
+    static int enabled = -1;
+    uint32_t hdr, i;
+    HANDLE h = NULL;
+
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_TITLE_KEVENTS");
+        enabled = e && *e == '1';
+    }
+    if (!enabled)
+        return NULL;
+    if (guest_va < 0x10000u || (guest_va & 3u))
+        return NULL;
+    if (guest_va >= 0x04000000u && (guest_va < 0x80000000u || guest_va >= 0x84000000u))
+        return NULL;                               /* RAM or the contiguous window */
+    hdr = BRIDGE_MEM32(guest_va);
+    if (((hdr & 0xFFu) != 0 && (hdr & 0xFFu) != 1) || ((hdr >> 16) & 0xFFu) != 4)
+        return NULL;
+    *type = (int)(hdr & 0xFFu);
+
+    ke_shadow_init();
+    EnterCriticalSection(&g_ke_shadow_cs);
+    for (i = 0; i < KE_SHADOW_SIZE; i++) {
+        if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
+            h = g_ke_shadow[i].in_use == 2 ? g_ke_shadow[i].host_handle : NULL;
+            LeaveCriticalSection(&g_ke_shadow_cs);
+            return h;                              /* a KeInitializeEvent shadow: old path */
+        }
+    }
+    for (i = 0; i < KE_SHADOW_SIZE; i++) {
+        if (!g_ke_shadow[i].in_use) {
+            h = CreateEventA(NULL, *type == 0, BRIDGE_MEM32(guest_va + 4) != 0, NULL);
+            if (h) {
+                g_ke_shadow[i].in_use      = 2;
+                g_ke_shadow[i].guest_va    = guest_va;
+                g_ke_shadow[i].host_handle = h;
+            }
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_ke_shadow_cs);
+    if (h) {
+        static int shown;
+        if (shown++ < 16)
+            fprintf(stderr, "  [KERNEL] event 0x%08X built by the title: host event created "
+                            "(%s)\n", guest_va, *type ? "synchronization" : "notification");
+    }
+    return h;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Data Exports (102, 120, 154, 240, 245, 249)
  *
@@ -6813,6 +6922,16 @@ static void bridge_KeReleaseSemaphore(void)
     (void)increment;
     (void)wait;
 
+    {
+        int type;
+        HANDLE ge = ke_guest_event(guest_va, &type);
+        if (ge) {
+            PulseEvent(ge);
+            BRIDGE_MEM32(guest_va + 4) = 0;
+            g_eax = 0;
+            return;
+        }
+    }
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
@@ -6828,6 +6947,16 @@ static void bridge_KeResetEvent(void)
     uint32_t guest_va = STACK_ARG(0);
     HANDLE h;
 
+    {
+        int type;
+        HANDLE ge = ke_guest_event(guest_va, &type);
+        if (ge) {
+            BRIDGE_MEM32(guest_va + 4) = 0;
+            ResetEvent(ge);
+            g_eax = 0;
+            return;
+        }
+    }
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
@@ -9064,7 +9193,87 @@ static void kernel_watch_arm_once(void)
 /* Current dispatching slot */
 static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
+static void kernel_thunk_dispatch_body(void);
+
+/* The guest CPU lock (RECOMP_GUEST_LOCK=1).
+ *
+ * The Xbox has one CPU: two guest threads never run guest code at the same
+ * instant, and titles lean on that without knowing it -- a worker fills a
+ * buffer and sets a flag with plain stores, and the reader trusts the order.
+ * Here every guest thread runs on its own host core, and the lifted C gives
+ * no ordering either. T()NY crashes somewhere different on every run
+ * once its loader workers start.
+ *
+ * With the lock on, a guest thread holds it while it runs guest code and
+ * lets go for the length of every kernel call -- the waits, sleeps and I/O
+ * where the console's scheduler would switch threads anyway. Host threads
+ * that only run a guest callback (vblank, interrupts) never take it.
+ *
+ * ponytail: a guest thread that spins in guest code on a flag another guest
+ * thread sets, with no kernel call in the loop, deadlocks here. The console
+ * would preempt it on its quantum; the upgrade is a periodic yield point in
+ * the lifted code's backward branches. */
+static CRITICAL_SECTION g_guest_cpu;
+static int g_guest_cpu_on = -1;
+static RECOMP_TLS int t_guest_thread;     /* this host thread runs a guest thread */
+static RECOMP_TLS int t_guest_held;       /* and holds the guest CPU */
+static RECOMP_TLS int t_dispatch_depth;
+
+static int guest_cpu_enabled(void)
+{
+    if (g_guest_cpu_on < 0) {
+        const char *e = getenv("RECOMP_GUEST_LOCK");
+        InitializeCriticalSection(&g_guest_cpu);
+        g_guest_cpu_on = e && *e == '1';
+        if (g_guest_cpu_on)
+            fprintf(stderr, "  [KERNEL] guest CPU lock on: one guest thread runs at a time\n");
+    }
+    return g_guest_cpu_on;
+}
+
+/* Called once on each host thread that runs a guest thread, before its first
+ * guest instruction. */
+void guest_cpu_join(void)
+{
+    t_guest_thread = 1;
+    if (guest_cpu_enabled() && !t_guest_held) {
+        EnterCriticalSection(&g_guest_cpu);
+        t_guest_held = 1;
+    }
+}
+
+void guest_cpu_part(void)
+{
+    if (t_guest_held) {
+        t_guest_held = 0;
+        LeaveCriticalSection(&g_guest_cpu);
+    }
+    t_guest_thread = 0;
+}
+
+/* A guest thread lets go of the guest CPU for the length of every kernel
+ * call. */
 static void kernel_thunk_dispatch(void)
+{
+    int held = t_guest_held;
+    if (held) {                        /* let other guest threads run meanwhile */
+        t_guest_held = 0;
+        LeaveCriticalSection(&g_guest_cpu);
+    }
+    t_dispatch_depth++;
+    kernel_thunk_dispatch_body();
+    t_dispatch_depth--;
+    /* Back to guest code: take the CPU again. Only at the outermost call --
+     * a guest callback a bridge runs (an APC) returns into the bridge, not to
+     * the thread's own code -- and only if the thread still exists as one. */
+    if (t_guest_thread && t_dispatch_depth == 0 && guest_cpu_enabled()) {
+        EnterCriticalSection(&g_guest_cpu);
+        t_guest_held = 1;
+    }
+    (void)held;
+}
+
+static void kernel_thunk_dispatch_body(void)
 {
     int slot = g_kernel_dispatch_slot;
     bridge_func_t bridge;
@@ -9315,6 +9524,7 @@ void xbox_kernel_bridge_init(void)
     int unbridged = 0;
     DWORD old_protect;
 
+    guest_cpu_join();          /* the caller goes on to run the title's entry point */
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
             g_thunk_table_count, g_thunk_table_base);
 
