@@ -28,6 +28,16 @@ from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
 
+# Float compares snapshot at the compare as well, and their conditions read
+# nothing else: comiss/ucomiss/comisd/ucomisd store both operands into the
+# doubles _fca/_fcb (a float widens to double exactly, and the ordered and
+# unordered forms set identical flags), and the fcomi family stores the
+# ordering into g_fp_cmp. So a join of any two members of one family is the
+# same state whatever the operands were.
+_SSE_COMPARES = frozenset({"comiss", "ucomiss", "comisd", "ucomisd"})
+_FPU_COMPARES = frozenset({"fcomi", "fcomip", "fcompi", "fucomi", "fucomip", "fucompi"})
+
+
 def _merge_flag_states(states):
     """Merge comparable snapshots without requiring identical source operands.
 
@@ -35,12 +45,20 @@ def _merge_flag_states(states):
     runtime. A shared consumer can use whichever predecessor executed. Keep
     operation and width equal because sign/parity handling depends on them;
     arithmetic states still reconstruct operands and cannot use this merge.
+
+    Float compares join the same way (see _SSE_COMPARES). Without that, a jbe
+    after "comiss xmm3, xmm0" on one edge and "comiss xmm0, xmm3" on the other
+    -- MSVC's shape for a clamp whose direction depends on a sign -- fell back
+    to the never-assigned _flags, and the clamp always fired. T()NY zeroed its driven wheels' torque that way; the car crawled.
     """
     if not states or any(not state or not state[0] for state in states):
         return None
     first = states[0]
     if all(state == first for state in states[1:]):
         return first
+    for family in (_SSE_COMPARES, _FPU_COMPARES):
+        if all(state[0] in family for state in states):
+            return first
     if first[0] in ("cmp", "test") and len(first[1]) == 2:
         width = _operand_width(first[1][0]) or _operand_width(first[1][1])
         for kind, ops in states[1:]:
@@ -94,6 +112,71 @@ def _incoming_flag_state(sources, known, is_entry):
     if not all(p in known for p in sources):
         return None
     return _merge_flag_states([known[p] for p in sources])
+
+
+_REG_TOKEN = None
+
+
+def _edge_flag_plan(bb, sources, known):
+    """Evaluate a join's flag condition on each incoming edge instead.
+
+    When the predecessors reach a join with states that do not merge -- a
+    `test eax, eax` on one edge and a `cmp eax, 1` on the other -- no single
+    condition at the join is right, and the jcc there lifted to the _flags
+    fallback, which nothing assigns: the branch was never taken. But each
+    predecessor knows its own state, so each can compute the join's
+    condition itself just before it transfers control, into a variable the
+    join then tests.
+
+    Returns (consumer mnemonic, {predecessor: condition}) or None. Only the
+    first flag reader of the join counts, and only when every predecessor's
+    condition is known. Instructions between the join's label and that reader
+    must leave the flags alone, and when there are any, a condition that reads
+    a live register (rather than a compare snapshot) is refused, because those
+    instructions may have changed it.
+    """
+    import re
+    from .lifter import (_EFLAGS_PRESERVE, _make_condition, _make_setcc_value,
+                         _make_cmovcc_cond)
+    global _REG_TOKEN
+    if _REG_TOKEN is None:
+        _REG_TOKEN = re.compile(
+            r"\b(e?[abcd]x|[abcd][lh]|e?[sd]il?|e?[sb]pl?|xmm\d|MEM\w*|LO8|HI8)\b")
+    if not sources or not all(known.get(p) for p in sources):
+        return None
+    consumer, before = None, 0
+    for insn in bb.instructions:
+        m = insn.mnemonic
+        if insn.is_cond_jump:
+            if m in ("jecxz", "jcxz", "loop", "loope", "loopne", "loopz", "loopnz"):
+                return None
+            consumer = insn
+            break
+        if m.startswith("set") or m.startswith("cmov"):
+            consumer = insn
+            break
+        if (m in _EFLAGS_PRESERVE and not insn.is_branch and not insn.is_call
+                and not insn.is_ret):
+            before += 1
+            continue
+        return None
+    if consumer is None:
+        return None
+    m = consumer.mnemonic
+    conds = {}
+    for p in sources:
+        setter, ops = known[p]
+        if consumer.is_cond_jump:
+            r = _make_condition(m, setter, ops)
+            c = r[0] if r else None
+        elif m.startswith("set"):
+            c = _make_setcc_value(m, setter, ops)
+        else:
+            c = _make_cmovcc_cond(m, setter, ops)
+        if not c or (before and _REG_TOKEN.search(c)):
+            return None
+        conds[p] = c
+    return m, conds
 
 
 def write_if_changed(path, text):
@@ -2303,6 +2386,12 @@ class FunctionTranslator:
             settled_state = out_state
             out_state = {}
 
+        unseen_entries = set(self.lifter.imm_code_refs)
+        for insn in instructions:
+            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
+                unseen_entries.update(self.lifter._analyze_switch_table(insn.operands))
+        edge_vars, edge_sets, block_lines = [], [], {}
+
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -2323,8 +2412,31 @@ class FunctionTranslator:
 
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
+
+            # A join whose predecessors disagree: let each edge evaluate the
+            # condition (see _edge_flag_plan). Blocks that may be entered
+            # from somewhere the edge list does not know -- a switch table, a
+            # code address taken as an immediate, the function entry -- keep
+            # the fallback, since an unseen edge would leave the variable
+            # holding another edge's answer.
+            if incoming is None and bb.start != start and bb.start not in unseen_entries:
+                plan = _edge_flag_plan(bb, preds[bb.start], settled_state)
+                if plan:
+                    m, conds = plan
+                    var = f"_jf_{bb.start:08X}"
+                    for k, stmt in enumerate(stmts):
+                        if f"_flags /* {m}" in stmt:
+                            stmts[k] = stmt.replace(f"_flags /* {m}", f"{var} /* {m}", 1)
+                            edge_vars.append(var)
+                            edge_sets.extend((p, var, c) for p, c in conds.items())
+                            break
+
+            first = len(lines)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
+            last = bb.instructions[-1] if bb.instructions else None
+            block_lines[bb.start] = (first, len(lines),
+                                     bool(last and (last.is_branch or last.is_ret)))
             bypass = debug_slide_bypasses.get(bb.last_insn.address)
             if bypass is not None:
                 lines.append(
@@ -2336,6 +2448,23 @@ class FunctionTranslator:
                 lines.append("    return; /* trap ends recovered control flow */")
 
             lines.append(f"")
+
+        # Each predecessor of such a join sets the join's variable as its last
+        # act before the jump (or at its end when it falls through). Inserted
+        # back to front so the recorded line numbers stay valid.
+        inserts = []
+        for p, var, cond in edge_sets:
+            first, stop, transfers = block_lines.get(p, (0, 0, False))
+            if stop > first:
+                inserts.append((stop - 1 if transfers else stop,
+                                f"    {var} = ({cond}) ? 1 : 0; /* flags of this edge */"))
+        for at, text in sorted(inserts, key=lambda t: -t[0]):
+            lines.insert(at, text)
+        if edge_vars:
+            decl = next((k for k, ln in enumerate(lines) if "fallback flag var" in ln), None)
+            if decl is not None:
+                lines.insert(decl + 1, "    int " + ", ".join(f"{v} = 0" for v in edge_vars)
+                             + "; /* per-edge flags of joins */")
 
         # Continue into the next function when control runs off the bottom.
         if fallthrough_target is not None:

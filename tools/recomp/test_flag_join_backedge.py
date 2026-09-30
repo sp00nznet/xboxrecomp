@@ -25,8 +25,10 @@ until it left mapped memory, taking the process with it. Settling the flag
 state to a fixed point before emitting gives the jcc its comparison back.
 
 The second property matters as much: when the predecessors genuinely
-disagree, the fallback must stay. Inheriting the wrong flags is worse than
-inheriting none, because the branch then looks right and goes the wrong way.
+disagree, neither one's flags may be inherited. Inheriting the wrong flags is
+worse than inheriting none, because the branch then looks right and goes the
+wrong way. Such a join now has each edge evaluate the condition itself into a
+variable of the join (translator._edge_flag_plan) instead of the fallback.
 """
 
 import os
@@ -69,7 +71,8 @@ def test_loop_head_inherits_flags_from_both_predecessors():
 
 def test_disagreeing_predecessors_keep_the_fallback():
     # Two predecessors reach the jz: one after `sub`, one after `inc`, whose
-    # flags come from a different operand. The join must refuse.
+    # flags come from a different operand. The join must not inherit either:
+    # each edge sets the join's own variable from its own result.
     #   +0  sub eax, ecx
     #   +2  jmp +3            -> the jz at +5
     #   +4  inc edx           (falls through to the jz, different flag source)
@@ -81,7 +84,9 @@ def test_disagreeing_predecessors_keep_the_fallback():
              b"\x74\x00"          # jz +0 -> +7
              b"\xC3")             # ret
     code = _translate(image)
-    assert "_flags /*" in code, code
+    assert "if (_flags /*" not in code, code
+    assert "if (_jf_00010005 /* je" in code, code
+    assert code.count("_jf_00010005 = ((_fa == 0)) ? 1 : 0;") == 2, code
 
 
 if __name__ == "__main__":
