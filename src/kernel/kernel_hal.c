@@ -450,6 +450,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
 {
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
         "*** KeBugCheck: code=0x%08X ***", BugCheckCode);
+    fprintf(stderr, "[EXIT] KeBugCheck 0x%08X\n", (unsigned)BugCheckCode);
 
 #ifdef _DEBUG
     DebugBreak();
@@ -468,6 +469,7 @@ VOID __stdcall xbox_KeBugCheckEx(
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
         "*** KeBugCheckEx: code=0x%08X, params=(0x%p, 0x%p, 0x%p, 0x%p) ***",
         BugCheckCode, (void*)Param1, (void*)Param2, (void*)Param3, (void*)Param4);
+    fprintf(stderr, "[EXIT] KeBugCheckEx 0x%08X\n", (unsigned)BugCheckCode);
 
 #ifdef _DEBUG
     DebugBreak();
@@ -518,12 +520,16 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "HalReturnToFirmware: routine=%u (exiting)", Routine);
+    /* stderr too: the kernel log file is rewritten on every run, so a title
+     * that ends itself otherwise leaves no trace in the run's own log. */
+    fprintf(stderr, "[EXIT] HalReturnToFirmware routine=%u\n", (unsigned)Routine);
     ExitProcess(0);
 }
 
 VOID __stdcall xbox_HalInitiateShutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL, "HalInitiateShutdown (exiting)");
+    fprintf(stderr, "[EXIT] HalInitiateShutdown\n");
     ExitProcess(0);
 }
 

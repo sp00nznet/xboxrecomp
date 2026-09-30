@@ -936,6 +936,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
         recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
 } while(0)
+#elif defined(RECOMP_CALL_PROFILE)
+/* Opt-in profiling: every direct call reports its target to the project, which
+ * keeps the counts (a project defines recomp_call_profile_hit). Diffing the counts
+ * of two situations shows which functions one of them runs and the other does not. */
+void recomp_call_profile_hit(uint32_t va);
+#define RECOMP_ABI_CALL(va, fn) do { recomp_call_profile_hit(va); (fn)(); } while(0)
 #else
 #define RECOMP_ABI_CALL(va, fn) (fn)()
 #endif

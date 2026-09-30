@@ -17,6 +17,10 @@
 #include <string.h>
 #include <ctype.h>
 
+/* A project may set this to watch every guest path the kernel translates (for
+ * example to print who opened a file). NULL by default. */
+void (*g_xbox_path_hook)(const char *xbox_path) = NULL;
+
 /*
  * Helper: check if an ANSI string starts with a prefix (case-insensitive).
  * Returns the number of chars consumed from the prefix, or 0 if no match.
@@ -418,6 +422,8 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     return TRUE;
 
 translate:
+    if (g_xbox_path_hook)
+        g_xbox_path_hook(xbox_path);
     fprintf(stderr, "  [PATH] %s\n", xbox_path);
     fflush(stderr);
     {
