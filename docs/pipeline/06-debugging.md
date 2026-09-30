@@ -347,6 +347,51 @@ usually moves the stall rather than fixing it. Find the probe that failed.
 
 **Fix**: ensure all ICALL failure paths clean up the stack. Use `RECOMP_ICALL_SAFE` for stdcall callsites. Monitor `g_esp` trend.
 
+## Reports RECOMP_ABI_CHECK Always Gives
+
+With `RECOMP_ABI_CHECK` on (see
+[Building the Runtime](05-runtime.md#recomp_abi_check-needs-both-halves)), a
+handful of MSVC CRT helpers are reported on every title, and they are correct
+as reported: they break the register rules on purpose.
+
+| Helper | How to recognise it | Why it is reported |
+|---|---|---|
+| `__SEH_prolog` | `push <handler>; mov eax, fs:[0]; push eax; ... sub esp, eax; push ebx; push esi; push edi` | builds the **caller's** frame, so esp is lower on return |
+| `__SEH_epilog` | `mov ecx, [ebp-0x10]; mov fs:[0], ecx; pop ecx; pop edi; pop esi; pop ebx; leave; push ecx` | restores the **caller's** ebx/esi/edi |
+| `_chkstk` / `_alloca_probe` | `test eax, eax; ... neg eax; add eax, esp; add eax, 4; test [eax], eax` | moves esp down for the caller |
+| `_aulldvrm` / `_alldvrm` | 64-bit divide; `push esi` or `push edi; push esi; push ebp`, then `div` | returns the remainder in **ebx:ecx** |
+| CRT maths dispatcher fragments (`_trandisp` family) | `[ebp-0xA4]`, `fldcw`, `fxam` | shares the caller's frame; sets ebx to a table |
+
+On *X-Men Legends* the full report after booting to the title screen was
+exactly these six. Anything else — in game code, a changed ebx/esi/edi or a
+short esp after a call — is a missing epilogue or a wrong `ret N`. The checker
+would be more useful with an allow-list, or with these recognised by
+signature.
+
+## Reading Guest Registers in cdb
+
+The guest registers are thread-local, so a debugger has to take their address
+first. `dwo(&module!g_eax)` fails; this works:
+
+```
+r? @$t1 = &mygame!g_esp
+r  @$t0 = poi(mygame!g_xbox_mem_offset)
+.printf "guest esp=%08x\n", dwo(@$t1)
+dd @$t0+dwo(@$t1) L40          $$ guest stack
+```
+
+`r?` evaluates in the current thread's TLS, so switch thread (`~Ns`) first.
+
+| Rule | Why |
+|---|---|
+| `dwo()`, not `poi()`, for guest values | guest values are 32-bit; `poi` reads 64 bits on x64 |
+| guest address G is at `poi(g_xbox_mem_offset) + G` | guest memory is one block in the host process |
+| `@ecx` and friends are **host** registers | the guest's are the `g_*` variables |
+| `sub_X+0x393` in a stack is a host offset | not a guest instruction offset |
+For "is this address a real function?", Ghidra's headless mode answers faster
+than any debugger — see
+[Triage without the GUI](../../tools/ghidra_naming/README.md#triage-without-the-gui).
+
 ## Debugging Workflow
 
 1. **Run the game**. It crashes.

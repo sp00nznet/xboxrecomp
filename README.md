@@ -304,6 +304,7 @@ xboxrecomp/
 
 ### Start Here
 - **[Getting Started Guide](docs/GETTING_STARTED.md)** — End-to-end walkthrough from XBE to running game
+- **[Documentation Index](docs/INDEX.md)** — Every document in one place, and the same pages again by symptom
 - **[Decompilation Guide](docs/DECOMP.md)** — Using this as a function splitter instead: one byte-exact `.s` per function, with signatures and the call graph. You never run the recompiler
 - **[Tools Reference](tools/README.md)** — Detailed usage for every pipeline tool
 - **[Runtime Libraries](src/README.md)** — Architecture, build instructions, integration guide

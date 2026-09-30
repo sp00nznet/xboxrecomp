@@ -392,6 +392,8 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 #define TD_DP_IN       2u
 #define TD_CC_NOERROR  0u
 #define TD_CC_STALL    4u
+#define TD_CC_DATAUNDERRUN 9u
+#define TD_ROUNDING    (1u << 18)   /* bufferRounding: a short packet is fine */
 
 
 /* Per pad: each device on the bus has its own control pipe state. */
@@ -648,6 +650,19 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     /* CBP is zero when everything asked for moved, and otherwise points past
      * what did. A driver computes the transferred length from it. */
     wr32(td + 4, (moved >= len) ? 0u : cbp + (uint32_t)moved);
+
+    /* A short IN packet on a TD without bufferRounding is DATA UNDERRUN
+     * (OHCI 1.0a): the controller retires this TD with that code
+     * and halts the endpoint -- the walker does so for any non-zero code --
+     * leaving the rest of the transfer for the driver to retire. A short
+     * packet still ends the stage; what the driver needs to see is that it
+     * did. Reporting NOERROR, and completing the trailing TDs with zero
+     * bytes, sent XAPI's done-queue handler down its success path, which
+     * walks from the ED head into the dummy tail TD and follows its garbage
+     * link: X-Men Legends asks for 80 bytes of configuration descriptor,
+     * gets 32, and faulted there. */
+    if (dp == TD_DP_IN && moved < len && !(info & TD_ROUNDING))
+        return TD_CC_DATAUNDERRUN;
     return TD_CC_NOERROR;
 }
 

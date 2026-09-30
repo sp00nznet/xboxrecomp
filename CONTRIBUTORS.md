@@ -710,6 +710,25 @@ nothing about it.
   frame counter counted the wrong method, `WAIT_FOR_IDLE` was swallowed as a
   flip, and the real flip methods fell through to the unhandled path.
 
+### BearddOddity — [@BearddOddity](https://github.com/BearddOddity)
+A bring-up batch on *X-Men Legends*, a title that links the XDK's own D3D,
+DirectSound and USB stack. Developed with Claude Code.
+
+- **`XBOX_THREAD_LOCAL` tested `_WIN32`, not the compiler** — MinGW targets
+  Windows but is GCC, which ignores `__declspec(thread)` with only a warning,
+  so on that host every kernel thread-local was one process-wide variable.
+- **`NtCurrentThread()` widened as unsigned on x64** — `DuplicateHandle`
+  never recognised it, and the CRT retried forever.
+- **The kernel call counter wrapped after 2^31 calls** — and "log the first
+  N" became "log everything": about 1 FPS some minutes into a level.
+- **`STATUS_CONFLICTING_ADDRESSES` had no DOS error** — 487 is the only
+  answer on which the CRT heap tries another address when it grows.
+- **A short IN packet without bufferRounding is DATA UNDERRUN** — the OHCI
+  model reported success, and XAPI followed a dead TD link.
+- **Documented** — four ways function detection misses functions, lifter
+  gaps, template and build traps, the ABI checker's standing reports, two
+  Ghidra scripts for headless triage, and a documentation index by symptom.
+
 ---
 
 ## Issue reports and testing

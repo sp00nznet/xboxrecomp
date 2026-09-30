@@ -305,3 +305,37 @@ Some arguments are pointers (Xbox VAs that need translation), others are plain v
 ### Stdcall Stack Cleanup
 
 Xbox kernel functions use stdcall convention (callee cleans stack). The translated code handles this -- after the ICALL returns, the generated code adjusts esp by the expected amount. The bridge function does NOT need to manipulate g_esp for argument cleanup.
+
+### Pseudo-Handles Are Negative
+
+`NtCurrentThread()` is `(HANDLE)-2`, the 32-bit `0xFFFFFFFE`. Widened as
+unsigned on a 64-bit host it becomes `0x00000000FFFFFFFE`, which Windows does
+not recognise as its own `-2`, so `DuplicateHandle` fails and the CRT, which
+duplicates the current thread handle, retries forever:
+
+```
+[KERNEL] ordinal 197 (NtDuplicateObject) → returned 0xC0000001
+[KERNEL] ordinal 301 (RtlNtStatusToDosError) → returned 0x0000013D
+```
+
+Handle tokens at `0xFFFFFFF0` and above are sign-extended in
+`bridge_resolve_handle`, and the first few `NtDuplicateObject` failures are
+logged with the handle and the Windows error.
+
+### The Heap Grows Only on 487
+
+When `NtAllocateVirtualMemory` refuses a requested base it answers
+`STATUS_CONFLICTING_ADDRESSES` (`0xC0000018`). Windows maps that to
+`ERROR_INVALID_ADDRESS` (487), and 487 is the only error on which the MSVC CRT
+heap tries another address when it grows. With no mapping,
+`RtlNtStatusToDosError` answered the generic 317 and the heap stopped growing.
+Both status tables, the bridge's and `kernel_rtl.c`'s, carry it.
+
+### Counters Outlive 32 Bits
+
+A title polling the clock through the kernel — *X-Men Legends* calls
+`KeQuerySystemTime` hundreds of millions of times a minute — passes 2^31 kernel
+calls within minutes. The call counter was an `int`; it wrapped negative, and
+`KERNEL_LOG_ON()`, which is `count <= budget`, turned "log the first N calls"
+into "log every call". The frame rate fell to about 1 FPS with every thread
+queued on the stderr lock. The counter is `long long`.

@@ -343,6 +343,49 @@ C:    if (eax > 12) goto loc_default;
 
 This is more readable and compiles more efficiently than the original indirect jump.
 
+### Tables the Pattern Match Misses
+
+The match expects the usual `cmp` / `ja` bounds check and a non-negative index.
+The CRT's own `memcpy` and `memmove` finish their last 0–3 bytes through a
+table indexed with a **negative** number:
+
+```asm
+neg  ecx
+jmp  dword ptr [ecx*4 + 0x342D38]
+```
+
+Unrecognised, it is lifted as an indirect tail jump to "some other function":
+
+```c
+RECOMP_ITAIL(MEM32(ecx * 4 + 0x342D38)); return;  /* indirect tail jmp */
+```
+
+The target is a label inside the same function, so the dispatch lookup fails,
+the run logs `[ICALL] Failed to resolve VA` for an address in the **middle** of
+a known function, and the copy does not happen. Nothing crashes there; the
+crash comes much later, on data that was never written. Every MSVC title that
+links the CRT's `memcpy`/`memmove` has at least these two. Find them with
+
+```bash
+grep -n "RECOMP_ITAIL(MEM32(.* \* 4 + 0x" src/recomp/gen/*.c
+```
+
+and keep the hits whose table address falls inside the same function. The fix
+in the lifter: an indirect `jmp` through a table whose entries all point inside
+the current function is a `switch`, whatever the index sign. Until then, a
+manual override with the host `memmove` is shorter, faster and correct for
+overlap:
+
+```c
+static void crt_memmove(void)
+{
+    uint32_t dst = MEM32(g_esp + 4), src = MEM32(g_esp + 8), n = MEM32(g_esp + 12);
+    if (n) memmove((void *)XBOX_PTR(dst), (const void *)XBOX_PTR(src), n);
+    g_eax = dst;
+    g_esp += 4; /* ret; cdecl caller pops args */
+}
+```
+
 ## Output Files
 
 ### Generated Code Structure
@@ -453,3 +496,20 @@ Maintain a checklist of required patches and re-apply them after every regenerat
 3. **Precise flag behavior**: the `CMP_*` macros handle common flag patterns, but exotic sequences (e.g., using carry flag from arithmetic to feed into a conditional branch 10 instructions later) may require manual intervention.
 
 4. **Exception handling**: the original code uses SEH for error recovery (e.g., catching access violations from bad pointers). The translated code cannot use SEH in the same way because it's not real x86 code. A Vectored Exception Handler (VEH) partially bridges this gap.
+
+5. **Privileged registers**: see below.
+
+### Privileged Registers
+
+Game code never touches `dr0`–`dr7` or `cr0`–`cr4`, so a function that does is
+almost always data the detector decoded as code (typically a `gap_prologue`
+guess with no callers). The lifter prints the register name as-is, and one line
+in millions fails to compile:
+
+```
+recomp_0010.c(2703,11): error C2065: 'dr2': undeclared identifier
+```
+
+Stub that address in `recomp_manual.c` with a function that logs if it is ever
+reached. The lifter should emit a logged trap for these instead of an unknown
+identifier.
