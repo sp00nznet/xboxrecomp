@@ -323,6 +323,27 @@ _FLAG_WRITERS = frozenset({
 })
 
 
+
+def load_label_db(labels_json_path):
+    """addr -> name from labels.json, for naming call targets and functions.
+
+    String-reference labels are left out. They name data (str_<text>), the
+    same text at two addresses gets the same name, and a function recovered
+    at such an address -- data that decodes and ends in a ret -- was emitted
+    twice under one name: Steel Battalion's two "MAIN_L" strings gave two
+    `void str_MAIN_L(void)` bodies and the build stopped at C2084. Such a
+    target falls back to sub_XXXXXXXX, which is unique by construction.
+    """
+    label_db = {}
+    if labels_json_path and os.path.exists(labels_json_path):
+        with open(labels_json_path, "r") as f:
+            labels = json.load(f)
+        for lbl in labels:
+            if lbl.get("type") == "string_ref":
+                continue
+            label_db[int(lbl["address"], 16)] = lbl["name"]
+    return label_db
+
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
@@ -2455,13 +2476,7 @@ class BatchTranslator:
             self.func_db[addr] = func
 
         # Load labels
-        self.label_db = {}
-        if labels_json_path and os.path.exists(labels_json_path):
-            with open(labels_json_path, "r") as f:
-                labels = json.load(f)
-            for lbl in labels:
-                addr = int(lbl["address"], 16)
-                self.label_db[addr] = lbl["name"]
+        self.label_db = load_label_db(labels_json_path)
 
         # Load classifications
         self.classification_db = {}
