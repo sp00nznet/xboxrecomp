@@ -38,7 +38,8 @@ class Disassembler:
                  verbose: bool = False,
                  force: bool = False,
                  extra_sections: Optional[list] = None,
-                 seed_functions: Optional[list] = None):
+                 seed_functions: Optional[list] = None,
+                 observed_seeds: Optional[set] = None):
         self.xbe_path = xbe_path
         self.analysis_json = analysis_json
         self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
@@ -48,6 +49,9 @@ class Disassembler:
         self.force = force
         self.extra_sections = extra_sections or []
         self.seed_functions = seed_functions or []
+        # Seeds a run actually reached (see _load_seed_functions). They are
+        # not guesses, so the mid-instruction guard below does not apply.
+        self.observed_seeds = observed_seeds or set()
 
         # Components (initialized during run)
         self.image: Optional[BinaryImage] = None
@@ -56,6 +60,16 @@ class Disassembler:
         self.xrefs: Optional[XRefTracker] = None
         self.func_detector: Optional[FunctionDetector] = None
         self.strings: List[dict] = []
+
+    def _trust_mid_instruction_seed(self, addr: int) -> bool:
+        """A seed inside an instruction the sweep decoded: keep it anyway?
+
+        Yes when a run reached it (observed_seeds), or when it decodes as a
+        prologue, which means the sweep is the one out of phase. See the
+        seeding loop in run() for the cases behind each.
+        """
+        return (addr in self.observed_seeds
+                or self.engine.probes_as_prologue(addr))
 
     def run(self) -> bool:
         """
@@ -210,7 +224,18 @@ class Disassembler:
                     # A prologue is the evidence that separates the two cases:
                     # the bad HL2 seed at 0x00202C2E is six bytes into a mov
                     # and decodes as nothing of the kind.
-                    if self.engine.probes_as_prologue(addr):
+                    #
+                    # Or unless a run actually got there. A seed from
+                    # tools.seed_from_log is an address the CPU called, or a
+                    # thread the title started -- where execution went, not
+                    # an inference from a table -- and seed_from_log only
+                    # writes one that decodes as a function body. The guard
+                    # above exists for RTTI vtable slots, which are guesses.
+                    # Halo's XPP has an init function at 0x001CF6AC that
+                    # opens `cmp [flag], 0` right after a pointer table the
+                    # sweep walked as code; rejecting its observed seed left
+                    # the USB driver's indirect call to it unresolved.
+                    if self._trust_mid_instruction_seed(addr):
                         if self.engine.decode_at(addr):
                             realigned += 1
                             self.func_detector._add_candidate(

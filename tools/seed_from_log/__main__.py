@@ -136,8 +136,8 @@ def main(argv=None):
         inside = i >= 0 and bounds[i][0] < va < bounds[i][1]
         where = ("alias inside " + bounds[i][2]) if inside else "new function"
         print("  + %08X  %s  (%s)" % (va, where, reason))
-        existing.append({"start": key, "note": reason + "; decodes as a "
-                                                        "function body."})
+        existing.append({"start": key, "observed": True,
+                         "note": reason + "; decodes as a function body."})
         added += 1
 
     if args.dry_run:
