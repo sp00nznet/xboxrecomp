@@ -233,6 +233,16 @@ class Disassembler:
                                            point):
                 if cs_insn.address in decoded:
                     break          # rejoined a stream we already have
+                # The misaligned stream did not only straddle `point`: until
+                # it rejoins, every instruction it decoded starts *inside* one
+                # of the real ones being decoded here. Those are gone too, or
+                # they are lifted beside the real ones. In MechAssault's CRT
+                # memcpy the `44` inside `mov [edi+ecx*4-0x1C], eax` survived
+                # as `inc esp`, so every short copy returned with esp one byte
+                # off and popped garbage into the caller's esi and edi.
+                for inner in range(cs_insn.address + 1,
+                                   cs_insn.address + cs_insn.size):
+                    decoded.pop(inner, None)
                 decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
         return [decoded[a] for a in sorted(decoded)]
