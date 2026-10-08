@@ -37,11 +37,13 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
 
-enum { S_SET, S_WAIT, S_RESET, N_SLOTS };
+enum { S_SET, S_WAIT, S_RESET, S_MULTI, S_INIT, N_SLOTS };
 static const uint32_t ORD[N_SLOTS] = {
     145,   /* KeSetEvent */
     159,   /* KeWaitForSingleObject */
     138,   /* KeResetEvent */
+    158,   /* KeWaitForMultipleObjects */
+    108,   /* KeInitializeEvent */
 };
 
 #define STATUS_TIMEOUT 0x00000102u
@@ -52,6 +54,12 @@ static uint32_t scratch;                 /* guest VA of a 64 KB block */
 #define ZERO_VA  (scratch + 0x2000)      /* a LARGE_INTEGER timeout of 0 */
 #define SYNC_VA  (scratch + 0x3000)
 #define NOTIF_VA (scratch + 0x3100)
+#define SECOND_VA (scratch + 0x3200)
+#define EXPLICIT_VA (scratch + 0x3300)
+#define ARRAY_VA (scratch + 0x3400)
+#define FRESH_A (scratch + 0x3500)
+#define FRESH_B (scratch + 0x3600)
+#define EXPLICIT_B (scratch + 0x3700)
 
 static uint32_t slot_va[N_SLOTS];
 static int failures;
@@ -80,6 +88,7 @@ static uint32_t call(int slot, int nargs, const uint32_t *args)
     g_esp = STACK_VA;
     g_eax = 0xDEADBEEFu;
     recomp_lookup_kernel(slot_va[slot])();
+    check(g_esp == STACK_VA + 4u + 4u * nargs, "stdcall stack cleanup", NULL);
     return g_eax;
 }
 
@@ -109,6 +118,20 @@ static uint32_t ke_reset(uint32_t va)
 {
     uint32_t args[1] = { va };
     return call(S_RESET, 1, args);
+}
+
+static uint32_t ke_multi(uint32_t a, uint32_t b, int wait_all)
+{
+    uint32_t args[8] = {2, ARRAY_VA, wait_all ? 0u : 1u, 0, 0, 0, ZERO_VA, 0};
+    G(ARRAY_VA)[0] = a;
+    G(ARRAY_VA)[1] = b;
+    return call(S_MULTI, 8, args);
+}
+
+static void ke_init(uint32_t va)
+{
+    uint32_t args[3] = {va, 0, 1}; /* notification, initially signalled */
+    call(S_INIT, 3, args);
 }
 
 static unsigned char *load_file(const char *path, size_t *len)
@@ -147,8 +170,7 @@ int main(int argc, char **argv)
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
-    if (on)
-        _putenv_s("RECOMP_TITLE_KEVENTS", "1");
+    _putenv_s("RECOMP_TITLE_KEVENTS", on ? "1" : "");
 
     xbe = load_file(path, &xbe_len);
     if (!xbe) {
@@ -174,6 +196,21 @@ int main(int argc, char **argv)
     }
     G(ZERO_VA)[0] = G(ZERO_VA)[1] = 0;
     printf("mode: %s\n", mode);
+
+    ke_init(EXPLICIT_VA);
+    ke_init(EXPLICIT_B);
+    check(ke_multi(EXPLICIT_VA, EXPLICIT_B, 1) == 0,
+          "explicit events resolve through shadows in either mode", NULL);
+
+    build_event(FRESH_A, 1, 0);
+    build_event(FRESH_B, 1, 1);
+    st = ke_multi(FRESH_A, FRESH_B, 0);
+    if (on)
+        check(st == 1 && G(FRESH_A)[1] == 0 && G(FRESH_B)[1] == 0,
+              "first access via WaitAny resolves nonzero index and consumes it", NULL);
+    else
+        check(st != 0 && st != 1 && st != STATUS_TIMEOUT && G(FRESH_B)[1] == 1,
+              "default multiple wait rejects header events without consumption", NULL);
 
     build_event(SYNC_VA, 1, 0);
     build_event(NOTIF_VA, 0, 0);
@@ -217,6 +254,39 @@ int main(int argc, char **argv)
         snprintf(d, sizeof d, "status 0x%08X, SignalState %u", st, G(NOTIF_VA)[1]);
         check(st == STATUS_TIMEOUT && G(NOTIF_VA)[1] == 0,
               "KeResetEvent clears it", d);
+    }
+
+    if (on) {
+        build_event(SECOND_VA, 1, 1);
+        G(SYNC_VA)[1] = 1;
+        st = ke_multi(SYNC_VA, SECOND_VA, 0);
+        check(st == 0 && G(SYNC_VA)[1] == 0 && G(SECOND_VA)[1] == 1,
+              "WaitAny consumes only its selected synchronization event", NULL);
+        G(SECOND_VA)[1] = 0;
+        check(ke_multi(SYNC_VA, SECOND_VA, 0) == STATUS_TIMEOUT,
+              "header reset before multiple wait clears stale host signal", NULL);
+        G(SYNC_VA)[1] = 1;
+        st = ke_multi(SYNC_VA, SECOND_VA, 1);
+        check(st == STATUS_TIMEOUT && G(SYNC_VA)[1] == 1,
+              "WaitAll timeout preserves signalled guest state", NULL);
+        G(SECOND_VA)[1] = 1;
+        st = ke_multi(SYNC_VA, SECOND_VA, 1);
+        check(st == 0 && G(SYNC_VA)[1] == 0 && G(SECOND_VA)[1] == 0,
+              "WaitAll success consumes both synchronization events", NULL);
+        G(NOTIF_VA)[1] = G(SYNC_VA)[1] = 1;
+        st = ke_multi(NOTIF_VA, SYNC_VA, 1);
+        check(st == 0 && G(NOTIF_VA)[1] == 1 && G(SYNC_VA)[1] == 0,
+              "mixed notification and synchronization WaitAll", NULL);
+        st = ke_multi(NOTIF_VA, SYNC_VA, 0);
+        check(st == 0 && ke_multi(NOTIF_VA, SYNC_VA, 0) == 0 && G(NOTIF_VA)[1] == 1,
+              "notification persists across multiple waits", NULL);
+        G(SYNC_VA)[1] = 1;
+        st = ke_multi(SYNC_VA, 0, 1);
+        check(st != 0 && st != STATUS_TIMEOUT && G(SYNC_VA)[1] == 1,
+              "failed multiple wait does not consume header state", NULL);
+        st = ke_multi(SYNC_VA, EXPLICIT_VA, 1);
+        check(st == 0 && G(SYNC_VA)[1] == 0,
+              "mixed header and explicitly initialized event resolves", NULL);
     }
 
     xbox_MemoryLayoutShutdown();

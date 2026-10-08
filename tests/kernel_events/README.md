@@ -31,3 +31,17 @@ the switch:
 Not covered: a wait that really blocks and is released from another thread
 (the bridges use a host event for exactly that, so a zero timeout checks the
 same state), and any title.
+
+The fixture also checks `KeWaitForMultipleObjects` through the dispatcher:
+first access at a nonzero WaitAny index; only the selected synchronization
+event being consumed; WaitAll success and timeout; header writes clearing a
+stale host signal; notification persistence; failed waits preserving guest
+state; and mixed header/explicitly initialized events. Every call checks
+stdcall stack cleanup. Explicit events resolve in both modes; header events
+remain opt-in, and the default multiple-wait rejection preserves their state.
+
+The new multiple-wait checks fail against upstream main `193e2995` and pass
+with the bridge fix. These zero-timeout tests do not establish correctness for
+concurrent guest header writes, event reinitialization, abandoned mutexes, or
+cross-title compatibility. Synthetic `test.xbe` is generated locally and is
+not part of the contribution.
