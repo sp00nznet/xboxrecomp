@@ -35,7 +35,8 @@ class FrndintLiftTest(unittest.TestCase):
 
 class FrndintRuntimeTest(unittest.TestCase):
     def test_each_rounding_control_rounds_its_own_way(self):
-        cc = next(filter(None, map(shutil.which, ("cc", "gcc", "clang"))), None)
+        from .c_fixture import compiler, command
+        cc = compiler()
         if not cc:
             self.skipTest("no C compiler available")
         source = r'''
@@ -83,14 +84,14 @@ int main(void) {
 '''
         with tempfile.TemporaryDirectory(prefix="frndint-runtime-") as tmp:
             tmp = Path(tmp)
-            src, exe = tmp / "test.c", tmp / "test"
+            src, exe = tmp / "test.c", tmp / "test.exe"
             src.write_text(source, encoding="utf-8")
             built = subprocess.run(
-                [cc, "-std=c11", "-Wall", "-Wextra", "-Werror",
-                 "-I", str(_ROOT / "templates" / "runtime"),
-                 str(src), "-o", str(exe)]
-                    + ([] if os.name == "nt" else ["-lm"]),
-                capture_output=True, text=True)
+                command(cc, [src], exe,
+                        include_dirs=[_ROOT / "templates" / "runtime"],
+                        gnu_flags=['-std=c11', '-Wall', '-Wextra', '-Werror']
+                            + ([] if os.name == 'nt' else ['-lm'])),
+                cwd=tmp, capture_output=True, text=True)
             self.assertEqual(0, built.returncode, built.stdout + built.stderr)
             ran = subprocess.run([str(exe)], capture_output=True, text=True)
             self.assertEqual(0, ran.returncode,

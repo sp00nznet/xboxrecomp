@@ -54,10 +54,8 @@ SHARP_MSVC = ("onexit",)
 
 
 def _find_cc():
-    cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
-    if not cc and os.path.exists(r"C:\Program Files\LLVM\bin\clang.exe"):
-        cc = r"C:\Program Files\LLVM\bin\clang.exe"
-    return cc
+    from .c_fixture import compiler
+    return compiler()
 
 
 def _targets_msvc_crt():
@@ -76,9 +74,13 @@ def _compile(body):
         src = os.path.join(tmp, "t.c")
         with open(src, "w") as f:
             f.write(HEADERS + body)
-        r = subprocess.run([cc, "-c", src, "-o", os.path.join(tmp, "t.o")],
-                           capture_output=True, text=True)
-        return r.returncode, r.stderr
+        from .c_fixture import command
+        # MSVC diagnoses some conflicting declarations as warnings; require
+        # those diagnostics to reject the negative control as GCC does.
+        r = subprocess.run(command(cc, [src], os.path.join(tmp, "t.obj"),
+                                   compile_only=True, gnu_flags=['-Werror']),
+                           cwd=tmp, capture_output=True, text=True)
+        return r.returncode, r.stdout + r.stderr
 
 
 class ReservedIdentTest(unittest.TestCase):

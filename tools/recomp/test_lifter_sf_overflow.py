@@ -85,8 +85,8 @@ class SignFlagOverflowTest(unittest.TestCase):
         This is the arm that would have caught the defect. At -O0 the old
         expression answers correctly and the test would have passed.
         """
-        cc = (os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc")
-              or shutil.which("clang"))   # Windows has no cc/gcc; clang is the one
+        from .c_fixture import compiler, command
+        cc = os.environ.get("CC") or compiler()
         if not cc:
             self.skipTest("no C compiler available")
 
@@ -114,12 +114,12 @@ int main(void) {
 
         with tempfile.TemporaryDirectory() as d:
             c = os.path.join(d, "sf.c")
-            exe = os.path.join(d, "sf")
+            exe = os.path.join(d, "sf.exe")
             with open(c, "w") as f:
                 f.write(src)
             build = subprocess.run(
-                [cc, "-O2", "-fstrict-overflow", "-o", exe, c],
-                capture_output=True, text=True)
+                command(cc, [c], exe, gnu_flags=['-fstrict-overflow']),
+                cwd=d, capture_output=True, text=True)
             self.assertEqual(build.returncode, 0, build.stderr)
             run = subprocess.run([exe], capture_output=True, text=True)
             self.assertEqual(run.returncode, 0,
@@ -136,10 +136,13 @@ int main(void) {
         fix is for is "this expression is undefined", and that holds whatever
         the optimiser chooses to do with it in any given year.
         """
-        cc = (os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc")
-              or shutil.which("clang"))   # Windows has no cc/gcc; clang is the one
+        from .c_fixture import compiler, is_msvc
+        cc = os.environ.get("CC") or compiler()
         if not cc:
             self.skipTest("no C compiler available")
+
+        if is_msvc(cc):
+            self.skipTest("MSVC has no signed-integer-overflow sanitizer")
 
         def build_and_run(body):
             src = (

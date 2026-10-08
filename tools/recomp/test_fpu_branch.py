@@ -123,19 +123,17 @@ int main(void){
 
 
 def test_idiom_semantics_compiled():
-    import shutil
-    cc = shutil.which("clang") or shutil.which("gcc") \
-        or (r"C:\Program Files\LLVM\bin\clang.exe"
-            if os.path.exists(r"C:\Program Files\LLVM\bin\clang.exe") else None)
+    from tools.recomp.c_fixture import compiler, command
+    cc = compiler()
     if not cc:
-        print("  SKIP no C compiler")
-        return
+        import pytest
+        pytest.skip('no C compiler on PATH')
     with tempfile.TemporaryDirectory() as tmp:
         c = os.path.join(tmp, "t.c")
         open(c, "w").write(C_HELPER)
         exe = os.path.join(tmp, "t.exe")
-        r = subprocess.run([cc, "-w", c, "-o", exe], capture_output=True, text=True)
-        assert r.returncode == 0, r.stderr[-1500:]
+        r = subprocess.run(command(cc, [c], exe), cwd=tmp, capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr)[-1500:]
         r = subprocess.run([exe], capture_output=True, text=True)
         assert r.returncode == 0 and r.stdout.startswith("OK"), r.stdout + r.stderr
         print("     " + r.stdout.strip())
