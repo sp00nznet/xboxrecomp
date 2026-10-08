@@ -1513,6 +1513,23 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
 static HANDLE ke_guest_event(uint32_t guest_va, int *type);
 
+/* Bring a header-owned host event in line with guest SignalState before a
+ * wait. Explicitly initialized shadows keep their existing host-state policy. */
+static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
+{
+    HANDLE h = ke_guest_event(guest_va, type);
+    if (h) {
+        if (BRIDGE_MEM32(guest_va + 4) == 0) {
+            ResetEvent(h);
+            if (BRIDGE_MEM32(guest_va + 4) != 0) /* set meanwhile */
+                SetEvent(h);
+        } else {
+            SetEvent(h);
+        }
+    }
+    return h;
+}
+
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
 {
@@ -1559,15 +1576,8 @@ static void bridge_KeWaitForSingleObject(void)
          * SignalState in guest memory is the truth -- XDK code resets it by
          * writing 0 there -- so bring the host event in line first. */
         int type;
-        HANDLE ge = ke_guest_event(object, &type);
+        HANDLE ge = ke_guest_event_prepare(object, &type);
         if (ge) {
-            if (BRIDGE_MEM32(object + 4) == 0) {
-                ResetEvent(ge);
-                if (BRIDGE_MEM32(object + 4) != 0)     /* set meanwhile */
-                    SetEvent(ge);
-            } else {
-                SetEvent(ge);                          /* set by a header write */
-            }
             g_eax = (uint32_t)xbox_KeWaitForSingleObject(
                 ge, wait_reason, wait_mode,
                 (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
@@ -4453,7 +4463,8 @@ static void bridge_KeAlertThread(void)
  *
  * KeWaitForSingleObject is routed; the multiple-object sibling was not. Like
  * NtWaitForMultipleObjectsEx, the Objects[] array in guest memory holds 32-bit
- * handle tokens, so each is resolved before the native wait sees it. */
+ * handle tokens or guest dispatcher-object addresses, so each is resolved
+ * before the native wait sees it. */
 #define BRIDGE_MAXIMUM_WAIT_OBJECTS 64
 
 static void bridge_KeWaitForMultipleObjects(void)
@@ -4464,6 +4475,8 @@ static void bridge_KeWaitForMultipleObjects(void)
     uint32_t alertable  = STACK_ARG(5);   /* 3=WaitReason, 4=WaitMode */
     uint32_t timeout_va = STACK_ARG(6);
     HANDLE handles[BRIDGE_MAXIMUM_WAIT_OBJECTS];
+    uint32_t guest_events[BRIDGE_MAXIMUM_WAIT_OBJECTS] = {0};
+    int event_types[BRIDGE_MAXIMUM_WAIT_OBJECTS];
     uint32_t i;
 
     if (count == 0) {
@@ -4472,15 +4485,32 @@ static void bridge_KeWaitForMultipleObjects(void)
     }
     if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
         count = BRIDGE_MAXIMUM_WAIT_OBJECTS;
-    for (i = 0; i < count; i++)
-        handles[i] = bridge_resolve_handle(
-            objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
+    for (i = 0; i < count; i++) {
+        uint32_t object = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
+        handles[i] = ke_guest_event_prepare(object, &event_types[i]);
+        if (handles[i]) {
+            guest_events[i] = object;
+        } else {
+            handles[i] = ke_shadow_lookup(object);
+            if (!handles[i])
+                handles[i] = bridge_resolve_handle(object);
+        }
+    }
 
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
         count, (PVOID *)handles, wait_type,
         STACK_ARG(3), (KPROCESSOR_MODE)STACK_ARG(4),
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
         XBOX_TO_NATIVE(STACK_ARG(7)));
+
+    /* Only a successful wait consumes synchronization events. WaitAny's
+     * result selects one member; WaitAll consumes every signalled member. */
+    for (i = 0; i < count; i++) {
+        if (guest_events[i] && event_types[i] == 1 &&
+            ((wait_type == 0 && g_eax == 0) ||
+             (wait_type != 0 && g_eax < count && g_eax == i)))
+            BRIDGE_MEM32(guest_events[i] + 4) = 0;
+    }
 }
 
 #undef BRIDGE_MAXIMUM_WAIT_OBJECTS
