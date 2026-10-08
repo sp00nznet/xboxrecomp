@@ -75,7 +75,25 @@ def test_arm_leaving_the_gap_keeps_the_cut():
     print("ok  arm_leaving_the_gap_keeps_the_cut")
 
 
+def test_callback_discovery_leaves_the_arms_to_their_function():
+    # Discovery runs first. An immediate naming an arm after a ret must not
+    # become a start that cuts the gap before the arms are recovered.
+    translator = _translator(b"\x48\xEB\xEB")    # dec eax; jmp LOOP
+    del translator.func_db[ALIAS]
+    registrar = BASE + 0x30                     # push ARM1; call eax; ret
+    image = bytearray(translator.xbe_data)
+    image[0x30:0x38] = b"\x68" + ARM1.to_bytes(4, "little") + b"\xFF\xD0\xC3"
+    translator.xbe_data = bytes(image)
+    translator.func_db[registrar] = _entry(registrar, registrar + 8)
+    translator.discover_static_indirect_targets()
+    assert ARM1 not in translator.func_db
+    translator.discover_jump_table_entries()
+    assert translator.func_db[BASE]["end"] == ARM1 + 3
+    print("ok  callback_discovery_leaves_the_arms_to_their_function")
+
+
 if __name__ == "__main__":
     test_arms_after_their_table_become_in_function_gotos()
     test_arm_leaving_the_gap_keeps_the_cut()
+    test_callback_discovery_leaves_the_arms_to_their_function()
     print("trailing_jump_tables: ALL PASS")

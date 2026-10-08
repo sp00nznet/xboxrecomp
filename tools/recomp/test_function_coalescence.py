@@ -644,6 +644,598 @@ def test_static_callback_rescan_uses_recovered_cfg():
     assert subject.func_db[callback]["called_by"] == [f"0x{BASE:08X}"]
 
 
+def static_callback_subject(cover, callback_code, inner=None):
+    # An _initterm-style caller walks [table, table+4); its one callback sits
+    # after a gap alias (or a real function) whose end runs past it. `inner`
+    # is an optional alias start inside the callback's own code.
+    table = BASE + 0x300
+    alias = BASE + 0x40
+    callback = BASE + 0x80
+    following = BASE + 0x100
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x40] = raw[0x100] = 0xC3
+    raw[0x80:0x80 + len(callback_code)] = callback_code
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        alias: {**function(alias, following), "detection_method": cover},
+        following: function(following, following + 1),
+    })
+    if inner is not None:
+        subject.func_db[inner] = {
+            **function(inner, following), "detection_method": "tail_jump_alias"}
+    subject.discover_static_indirect_targets()
+    return subject, callback
+
+
+@pytest.mark.parametrize("cover, recovered", [
+    ("tail_jump_alias", True), ("prologue", False)])
+def test_static_callback_inside_alias_range_is_recovered(cover, recovered):
+    # Only a real function's range may hide the callback.
+    subject, callback = static_callback_subject(cover, b"\xc3")
+    assert (callback in subject.func_db) is recovered
+    if recovered:
+        assert subject.func_db[callback]["end"] == callback + 1
+        assert subject.func_db[callback]["detection_method"] == (
+            "static_indirect_table")
+
+
+@pytest.mark.parametrize("inner, recovered", [
+    (BASE + 0x84, True), (BASE + 0x83, False)])
+def test_static_callback_may_fall_into_an_alias(inner, recovered):
+    # nop x4 then the alias's ret: no ret before the alias start, but the
+    # decode lands exactly on it. A start mid-instruction is not a fallthrough.
+    code = b"\x90" * 4 + b"\xc3" if inner == BASE + 0x84 else b"\x90\x90\x05" + b"\x00" * 4
+    subject, callback = static_callback_subject("tail_jump_alias", code, inner)
+    assert (callback in subject.func_db) is recovered
+    if recovered:
+        assert subject.func_db[callback]["end"] == inner
+        body = subject.translate_function(callback, subject.func_db[callback])
+        assert f"sub_{inner:08X}" in body, body
+
+
+@pytest.mark.parametrize("code, recovered", [
+    (b"\xc3", True), (b"\xcc", False),
+    (bytes.fromhex("ebfe"), True),  # closed non-returning task loop
+    (bytes.fromhex("83e001ff2485") + (BASE + 0x90).to_bytes(4, "little")
+     + bytes.fromhex("40ebf348ebf0")
+     + (BASE + 0x8a).to_bytes(4, "little")
+     + (BASE + 0x8d).to_bytes(4, "little"), True),  # both table arms loop
+    (bytes.fromhex("85c074fceb7a"), True),  # loop can tail-call a known function
+    (bytes.fromhex("85c074fceb79"), False),  # exit has no known entry
+    (bytes.fromhex("85c0747cebfa"), True),  # conditional tail call to a known function
+    (bytes.fromhex("85c0747bebfa"), False),  # conditional exit has no known entry
+    (bytes.fromhex("85c0747c"), False),  # conditional tail call, trap fallthrough
+    (bytes.fromhex("85c074fc"), False),  # loop with a trap fallthrough
+    (bytes.fromhex("85c074fce877000000"), True),  # loop, then no-return call
+    (bytes.fromhex("85c07402ebfac3"), True),  # loop that leaves through a ret
+    (bytes.fromhex("ffe0"), True),  # tail call through a register
+    (bytes.fromhex("ccc3"), False),  # a ret is decodable but not reachable
+])
+def test_immediate_callback_in_gap_is_recovered(code, recovered):
+    # `push callback; call eax; ret`: the callback sits in a gap and has no
+    # table. A closed CFG that returns or loops is valid; traps and escaping
+    # edges are not, even when a ret decodes after them.
+    callback = BASE + 0x80
+    following = BASE + 0x100
+    pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x80 + len(code)] = code
+    raw[0x100:0x102] = bytes.fromhex("ebfe")  # never returns, like ExitThread
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 2),
+    })
+    subject.discover_static_indirect_targets()
+    assert (callback in subject.func_db) is recovered
+    if recovered:
+        assert subject.func_db[callback]["called_by"] == [BASE]
+
+
+@pytest.mark.parametrize("cover", ["tail_jump_alias", "prologue"])
+def test_immediate_inside_another_range_is_not_a_callback(cover):
+    # A constant that lands in an alias's code decodes into its ret, but only
+    # a callback table may claim bytes inside an alias's range. A real owner
+    # keeps them unless its own CFG and tables provably end first.
+    alias, constant, following = BASE + 0x40, BASE + 0x42, BASE + 0x100
+    pattern = b"\x68" + constant.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x40:0x44] = bytes.fromhex("9090c3c3")
+    raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        alias: {**function(alias, alias + 4), "detection_method": cover},
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert constant not in subject.func_db
+
+
+# Unlisted code in the gap: push ebp; mov ebp, esp; mov eax, 0x41414141;
+# pop ebp; ret. From +3 or +4 the bytes still decode to a closed ret.
+UNLISTED = bytes.fromhex("558bec b841414141 5dc3".replace(" ", ""))
+
+
+@pytest.mark.parametrize("offset, recovered", [
+    (0, True),  # after int3 padding
+    (3, False),  # an instruction boundary inside the function
+    (4, False),  # mid-instruction
+])
+def test_immediate_inside_unlisted_code_is_not_a_callback(offset, recovered):
+    unlisted, following = BASE + 0x20, BASE + 0x100
+    constant = unlisted + offset
+    pattern = b"\x68" + constant.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x20:0x20 + len(UNLISTED)] = UNLISTED
+    raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert (constant in subject.func_db) is recovered
+
+
+def test_branch_from_a_weak_callback_stays_weak():
+    # A callback found only through an immediate calls into the middle of
+    # unlisted code. That edge must pass the same checks as an immediate.
+    unlisted, callback, following = BASE + 0x40, BASE + 0x80, BASE + 0x100
+    pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x40:0x40 + len(UNLISTED)] = UNLISTED
+    raw[0x80:0x86] = (b"\xe8" + (unlisted + 4 - callback - 5).to_bytes(
+        4, "little", signed=True) + b"\xc3")
+    raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert unlisted + 4 not in subject.func_db
+
+
+def test_unreachable_immediate_is_not_a_callback():
+    # The push decodes after the caller's ret, so it never runs.
+    callback, following = BASE + 0x80, BASE + 0x100
+    pattern = b"\xc3\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x80] = raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback not in subject.func_db
+
+
+def test_immediate_inside_a_callback_found_in_the_same_pass_is_rejected():
+    # A table names the callback; a constant points at its second
+    # instruction. Both are candidates in one pass, so original_starts cannot
+    # show that the callback already owns those bytes.
+    callback, following = BASE + 0x80, BASE + 0x100
+    constant = callback + 1
+    table = BASE + 0x300
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0")
+               + b"\x68" + constant.to_bytes(4, "little") + b"\xc3")
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x83] = bytes.fromhex("9090c3")
+    raw[0x100] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert constant not in subject.func_db
+
+
+def test_immediate_inside_a_same_pass_callback_table_is_rejected():
+    # The callback's switch table follows its last instruction. A constant
+    # pointing into the table must not become a function even though the
+    # table bytes decode to a closed run ending in a ret.
+    callback, following = BASE + 0x80, BASE + 0x100
+    table = BASE + 0x90
+    constant = table
+    pattern = (b"\x68" + callback.to_bytes(4, "little")
+               + b"\x68" + constant.to_bytes(4, "little") + bytes.fromhex("ffd0c3"))
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    code = (bytes.fromhex("83e001ff2485") + table.to_bytes(4, "little")
+            + bytes.fromhex("40ebf348ebf0")
+            + (BASE + 0x8a).to_bytes(4, "little")
+            + (BASE + 0x8d).to_bytes(4, "little"))
+    raw[0x80:0x80 + len(code)] = code
+    raw[0x98] = 0xC3
+    raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert constant not in subject.func_db
+
+
+def test_recovered_callback_exposes_a_later_helper():
+    # The callback calls a helper later in the same gap. The callback's range
+    # ends with the code it reaches, so the helper gets a body of its own.
+    callback, helper, following = BASE + 0x80, BASE + 0xa0, BASE + 0x100
+    pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x86] = b"\xe8" + (helper - callback - 5).to_bytes(4, "little") + b"\xc3"
+    raw[0xa0] = raw[0x100] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert helper in subject.func_db
+    assert subject.func_db[callback]["end"] == callback + 6
+
+
+def test_callback_table_outside_its_range_claims_nothing_after_it(monkeypatch):
+    # The callback's switch table lives in .data, past its range. Only code
+    # and tables inside the callback are claimed, so a later immediate
+    # callback in another gap is still recovered.
+    callback, following, later, last = (
+        BASE + 0x80, BASE + 0x100, BASE + 0x180, BASE + 0x200)
+    table = BASE + 0x300
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", BASE, 0x280, 0, 0x280, True),
+        config.Section(".data", BASE + 0x280, 0x180, 0x280, 0x180, False),
+    ])
+    pattern = (b"\x68" + callback.to_bytes(4, "little")
+               + b"\x68" + later.to_bytes(4, "little") + bytes.fromhex("ffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    code = (bytes.fromhex("83e001ff2485") + table.to_bytes(4, "little")
+            + bytes.fromhex("40ebf348ebf0"))
+    raw[0x80:0x80 + len(code)] = code
+    raw[0x300:0x308] = ((BASE + 0x8a).to_bytes(4, "little")
+                        + (BASE + 0x8d).to_bytes(4, "little"))
+    raw[0x100] = raw[0x180] = raw[0x200] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+        last: function(last, last + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert later in subject.func_db
+
+
+def test_callback_in_a_sections_last_gap_stops_at_its_section(monkeypatch):
+    # The next start is in a later code section whose bytes are elsewhere in
+    # the file, so decoding must stop at the callback's own section end.
+    callback, second = BASE + 0x80, BASE + 0x1000
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", BASE, 0x100, 0, 0x100, True),
+        config.Section("LIB", second, 0x100, 0x100, 0x100, True),
+    ])
+    pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x80] = 0xC3
+    raw[0x100] = 0xC3
+    subject = FunctionTranslator(bytes(raw), {
+        BASE: function(BASE, BASE + len(pattern)),
+        second: {**function(second, second + 1), "section": "LIB"},
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert subject.func_db[callback]["end"] == callback + 1
+    assert subject.func_db[callback]["section"] == ".text"
+
+
+def test_owner_with_a_data_switch_table_still_yields_a_later_callback(monkeypatch):
+    # The owner indexes a table in .data, far above the callback. Only
+    # embedded table storage can overlap the callback, so the owner is
+    # trimmed and the callback gets a body.
+    owner, callback, following = BASE + 0x40, BASE + 0x80, BASE + 0x100
+    table = BASE + 0x300
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", BASE, 0x280, 0, 0x280, True),
+        config.Section(".data", BASE + 0x280, 0x180, 0x280, 0x180, False),
+    ])
+    registration = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(registration)] = registration
+    body = bytes.fromhex("31c0ff2485") + table.to_bytes(4, "little")
+    raw[0x40:0x40 + len(body)] = body
+    raw[0x50] = raw[0x51] = raw[0x80] = raw[0x100] = 0xC3
+    raw[0x300:0x308] = ((BASE + 0x50).to_bytes(4, "little")
+                        + (BASE + 0x51).to_bytes(4, "little"))
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(registration)),
+        owner: function(owner, callback + 1),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert subject.func_db[owner]["end"] == callback
+
+
+def test_dependencies_come_only_from_reachable_callback_code():
+    # A table callback returns at once; a call decoded after its ret cannot
+    # run, so its target is not a dependency.
+    callback, stray, following = BASE + 0x80, BASE + 0xc0, BASE + 0x100
+    table = BASE + 0x300
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x86] = b"\xc3\xe8" + (stray - callback - 6).to_bytes(4, "little")
+    raw[0xc0] = raw[0x100] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert stray not in subject.func_db
+
+
+def test_callback_conditional_tail_target_is_a_dependency():
+    # The lifter emits a jcc that leaves the body as a tail call, so its
+    # target needs a body just like a jmp target.
+    callback, callee, following = BASE + 0x80, BASE + 0x40, BASE + 0x100
+    table = BASE + 0x300
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x89] = (bytes.fromhex("85c00f84")
+                      + (callee - callback - 8).to_bytes(4, "little", signed=True)
+                      + b"\xc3")
+    raw[0x40] = raw[0x100] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert subject.func_db[callee]["called_by"] == [callback]
+
+
+def test_callback_dependency_before_the_first_start_is_recovered():
+    callee, register, callback, following = (
+        BASE, BASE + 0x20, BASE + 0x80, BASE + 0x100)
+    table = BASE + 0x300
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[0x20:0x20 + len(pattern)] = pattern
+    raw[0x80:0x86] = b"\xe8" + (callee - callback - 5).to_bytes(4, "little", signed=True) + b"\xc3"
+    raw[0] = raw[0x100] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        register: function(register, register + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert subject.func_db[callee]["called_by"] == [callback]
+
+
+def test_callback_dependency_in_a_data_section_is_rejected(monkeypatch):
+    # .data1 is data even though its name is not .rdata or .data.
+    callback, stray, following = BASE + 0x80, BASE + 0x200, BASE + 0x100
+    table = BASE + 0x300
+    monkeypatch.setattr(config, "_SECTIONS", [
+        config.Section(".text", BASE, 0x200, 0, 0x200, True),
+        config.Section(".data1", stray, 0x200, 0x200, 0x200, False),
+    ])
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x86] = b"\xe9" + (stray - callback - 5).to_bytes(4, "little") + b"\xc3"
+    raw[0x100] = raw[0x200] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert stray not in subject.func_db
+
+
+@pytest.mark.parametrize("coalescing", [False, True])
+def test_callback_call_to_a_known_function_is_entry_evidence(coalescing):
+    # A recovered callback calls an existing function directly. The callback
+    # is new to the function list, so that call is caller evidence the
+    # ownership pass and coalescence would otherwise lack.
+    callback, known, following = BASE + 0x80, BASE + 0x40, BASE + 0x100
+    pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(pattern)] = pattern
+    raw[0x40] = raw[0x100] = 0xC3
+    raw[0x80:0x86] = b"\xe8" + (known - callback - 5).to_bytes(4, "little", signed=True) + b"\xc3"
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        known: function(known, known + 1),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets(coalescing=coalescing)
+    assert callback in subject.func_db
+    assert f"0x{callback:08X}" in subject.func_db[known]["called_by"]
+
+
+def test_immediate_callback_after_the_last_start_is_recovered():
+    callback = BASE + 0x80
+    pattern = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80] = 0xC3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db[BASE] = function(BASE, BASE + len(pattern))
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert subject.func_db[callback]["end"] == callback + 1
+
+
+def test_linear_callback_claims_its_embedded_table():
+    # A table callback is accepted for its linear ret, so it has no saved
+    # CFG. Its embedded switch table must still be claimed: the table bytes
+    # decode to a closed run ending in ret, and a constant points at them.
+    callback, table, following = BASE + 0x80, BASE + 0xa0, BASE + 0x100
+    walk = BASE + 0x300
+    pattern = (b"\xbe" + walk.to_bytes(4, "little")
+               + b"\xbf" + (walk + 4).to_bytes(4, "little")
+               + bytes.fromhex("39fe")
+               + b"\x68" + table.to_bytes(4, "little") + bytes.fromhex("ffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x8b] = (bytes.fromhex("83e001ff2485") + table.to_bytes(4, "little")
+                      + b"\xc3")
+    raw[0x8b] = 0xC3
+    raw[0xa0:0xa8] = ((BASE + 0x8a).to_bytes(4, "little")
+                      + (BASE + 0x8b).to_bytes(4, "little"))
+    raw[0xa8] = raw[0x100] = 0xC3
+    raw[0x300:0x304] = callback.to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert callback not in subject._recovered_cfg
+    assert table not in subject.func_db
+
+
+def _table_callback_subject(callback_code, extra=()):
+    # An _initterm-style table names one callback at BASE+0x80; `extra`
+    # places (address, bytes) elsewhere. A function at BASE+0x200 closes the
+    # second gap.
+    table = BASE + 0x300
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39feffd0c3"))
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80:0x80 + len(callback_code)] = callback_code
+    for address, code in extra:
+        raw[address - BASE:address - BASE + len(code)] = code
+    raw[0x100] = raw[0x200] = 0xC3
+    raw[0x300:0x304] = (BASE + 0x80).to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        BASE + 0x100: function(BASE + 0x100, BASE + 0x101),
+        BASE + 0x200: function(BASE + 0x200, BASE + 0x201),
+    })
+    return subject
+
+
+def test_constants_come_only_from_reachable_callback_code():
+    # A push decoded after the callback's ret cannot run, so the code it
+    # names in the next gap is not a callback.
+    stray = BASE + 0x180
+    subject = _table_callback_subject(
+        b"\xc3\x68" + stray.to_bytes(4, "little"), [(stray, b"\xc3")])
+    subject.discover_static_indirect_targets()
+    assert BASE + 0x80 in subject.func_db
+    assert stray not in subject.func_db
+
+
+def test_callback_claims_only_the_code_it_reaches():
+    # The table callback returns at once; a constant in the registration
+    # names a separate function later in the same gap. Linear decoding of
+    # the callback runs over it, but the callback does not reach it.
+    later = BASE + 0xa0
+    table = BASE + 0x300
+    pattern = (b"\xbe" + table.to_bytes(4, "little")
+               + b"\xbf" + (table + 4).to_bytes(4, "little")
+               + bytes.fromhex("39fe")
+               + b"\x68" + later.to_bytes(4, "little") + bytes.fromhex("ffd0c3"))
+    raw = bytearray(b"\x90" * 0x400)
+    raw[:len(pattern)] = pattern
+    raw[0x80] = raw[0xa0] = raw[0x100] = 0xC3
+    raw[0x300:0x304] = (BASE + 0x80).to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(pattern)),
+        BASE + 0x100: function(BASE + 0x100, BASE + 0x101),
+    })
+    subject.discover_static_indirect_targets()
+    assert BASE + 0x80 in subject.func_db
+    assert later in subject.func_db
+
+
+@pytest.mark.parametrize("arms, base, expected", [
+    ([BASE + 0x50, BASE + 0x51], BASE + 0x300, (BASE + 0x300, BASE + 0x308)),
+    # slot 0 is not an arm: the base points one dword before the entries
+    ([BASE + 0x50, BASE + 0x51], BASE + 0x2fc, (BASE + 0x300, BASE + 0x308)),
+    # the reader scanned backward from the base
+    ([BASE + 0x50, BASE + 0x51], BASE + 0x304, (BASE + 0x300, BASE + 0x308)),
+])
+def test_table_storage_finds_the_entries(arms, base, expected):
+    raw = bytearray(b"\xcc" * 0x400)
+    raw[0x2f8:0x2fc] = b"\x00" * 4
+    raw[0x300:0x308] = b"".join(arm.to_bytes(4, "little") for arm in arms)
+    subject = translator(bytes(raw), [])
+    assert subject._table_storage(base, arms) == expected
+
+
 def test_jump_table_case_can_recover_register_continuation():
     case = BASE + 7
     continuation = case + 7
@@ -1252,3 +1844,52 @@ def test_batch_preserves_callbacks_exposed_between_repairs(
         bounds.write_text(json.dumps(repairs), encoding="utf-8")
     with pytest.raises(ValueError, match="independent evidence|callback"):
         BatchTranslator(image, functions, coalesce_json_paths=paths)
+
+
+@pytest.mark.parametrize("opcode", [0xe8, 0xe9])
+def test_recovered_callback_recovers_gap_callee(opcode):
+    callback, callee, following = BASE + 0x80, BASE + 0x40, BASE + 0x100
+    registration = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(registration)] = registration
+    # The trailing ret also permits the tail-jump thunk to be discovered by
+    # the existing linear callback probe; its target must receive a body too.
+    body = bytes([opcode]) + (callee - callback - 5).to_bytes(4, "little", signed=True) + b"\xc3"
+    raw[0x80:0x80 + len(body)] = body
+    raw[0x40] = raw[0x100] = 0xc3
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(registration)),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert callback in subject.func_db
+    assert callee in subject.func_db
+    assert subject.func_db[callee]["called_by"] == [callback]
+
+
+@pytest.mark.parametrize("reachable", [False, True])
+def test_callback_after_switch_table_is_not_owned_by_linear_extent(reachable):
+    owner, callback, following = BASE + 0x40, BASE + 0x80, BASE + 0x100
+    registration = b"\x68" + callback.to_bytes(4, "little") + bytes.fromhex("ffd0c3")
+    raw = bytearray(b"\xcc" * 0x200)
+    raw[:len(registration)] = registration
+    body = bytes.fromhex("31c0ff2485") + (BASE + 0x60).to_bytes(4, "little")
+    raw[0x40:0x40 + len(body)] = body
+    raw[0x50] = raw[0x51] = raw[0x80] = raw[0x100] = 0xc3
+    raw[0x60:0x64] = (callback if reachable else BASE + 0x50).to_bytes(4, "little")
+    raw[0x64:0x68] = (BASE + 0x51).to_bytes(4, "little")
+    subject = translator(bytes(raw), [])
+    subject.func_db.clear()
+    subject.func_db.update({
+        BASE: function(BASE, BASE + len(registration)),
+        owner: function(owner, callback + 1),
+        following: function(following, following + 1),
+    })
+    subject.discover_static_indirect_targets()
+    assert (callback in subject.func_db) is not reachable
+    assert subject.func_db[owner]["end"] == (callback + 1 if reachable else callback)
+    if not reachable:
+        body = subject.translate_function(owner, subject.func_db[owner])
+        assert f"loc_{callback:08X}" not in body
