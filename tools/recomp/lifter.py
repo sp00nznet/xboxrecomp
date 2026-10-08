@@ -3316,7 +3316,11 @@ class Lifter:
                 # frequently a write to a register the operand address was
                 # built from -- so the operands have to be read now, while
                 # they still mean what the compare meant.
-                return [f"_fca = {_sse_read(ops[0])}; _fcb = {_sse_read(ops[1])};"
+                def compare_read(op):
+                    if m.endswith("sd") and _is_xmm(op):
+                        return f"{op.reg}.d[0]"
+                    return _sse_read(op)
+                return [f"_fca = {compare_read(ops[0])}; _fcb = {compare_read(ops[1])};"
                         f" /* {m} */"]
 
         # ── Bitwise ──

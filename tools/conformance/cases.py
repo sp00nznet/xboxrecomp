@@ -87,6 +87,12 @@ _SSE = [
 ]
 
 CASES = [
+    Case("comisd_register_lane", "double register compare uses the 64-bit lane",
+         ["movsd xmm0, qword ptr [eax]", "movsd xmm1, qword ptr [eax+16]",
+          "comisd xmm0, xmm1", "setb al", "movzx eax, al"], _FP_NAN, kind="fpu"),
+    Case("ucomisd_register_lane", "double register compare uses the 64-bit lane",
+         ["movsd xmm0, qword ptr [eax]", "movsd xmm1, qword ptr [eax+16]",
+          "ucomisd xmm0, xmm1", "setb al", "movzx eax, al"], _FP_NAN, kind="fpu"),
     # -- signed compare width (the RECOMP_SIGNED vs SXV decision) -------------
     Case("setl_i8", "cmp at byte width, then jl's condition",
          ["cmp al, cl", "setl al", "movzx eax, al"], _PAIRS),
