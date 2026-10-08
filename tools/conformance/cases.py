@@ -87,6 +87,22 @@ _SSE = [
 ]
 
 CASES = [
+    Case("cmp_setp", "parity reader after a known flag producer",
+         ['cmp eax, ecx', 'setp al', 'movzx eax, al'], _PAIRS),
+    Case("cmp_setnp", "parity reader after a known flag producer",
+         ['cmp eax, ecx', 'setnp al', 'movzx eax, al'], _PAIRS),
+    Case("cmp_cmovp", "parity reader after a known flag producer",
+         ['cmp eax, ecx', 'cmovp eax, ecx'], _PAIRS),
+    Case("cmp_cmovnp", "parity reader after a known flag producer",
+         ['cmp eax, ecx', 'cmovnp eax, ecx'], _PAIRS),
+    Case("test_setp", "parity reader after a known flag producer",
+         ['test eax, ecx', 'setp al', 'movzx eax, al'], _PAIRS),
+    Case("test_setnp", "parity reader after a known flag producer",
+         ['test eax, ecx', 'setnp al', 'movzx eax, al'], _PAIRS),
+    Case("test_cmovp", "parity reader after a known flag producer",
+         ['test eax, ecx', 'cmovp eax, ecx'], _PAIRS),
+    Case("test_cmovnp", "parity reader after a known flag producer",
+         ['test eax, ecx', 'cmovnp eax, ecx'], _PAIRS),
     # -- signed compare width (the RECOMP_SIGNED vs SXV decision) -------------
     Case("setl_i8", "cmp at byte width, then jl's condition",
          ["cmp al, cl", "setl al", "movzx eax, al"], _PAIRS),
