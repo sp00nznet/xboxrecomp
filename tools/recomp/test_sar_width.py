@@ -4,11 +4,10 @@ import shutil, subprocess, tempfile
 import pytest
 from . import config
 from .translator import FunctionTranslator
+from .c_fixture import compiler, command
 
 def test_sar_width_and_carry_compiled():
-    cc=shutil.which('clang') or shutil.which('gcc')
-    if not cc and Path(r'C:\Program Files\LLVM\bin\clang.exe').exists():
-        cc=r'C:\Program Files\LLVM\bin\clang.exe'
+    cc=compiler()
     if not cc: pytest.skip('C compiler unavailable')
     code='''#include <stdint.h>
     #include <stdio.h>
@@ -17,6 +16,7 @@ def test_sar_width_and_carry_compiled():
     #define LO16(v) ((uint16_t)(v))
     #define SET_LO8(v,x) ((v)=((v)&0xffffff00u)|(uint8_t)(x))
     #define SET_LO16(v,x) ((v)=((v)&0xffff0000u)|(uint16_t)(x))
+    #define RECOMP_PARITY8(v) ((0x9669u >> (((v) ^ ((v) >> 4)) & 15u)) & 1u)
     '''
     for w,op in ((8,'d2f8'),(16,'66d3f8'),(32,'d3f8')):
         b=bytes.fromhex('f9'+op+'83d200c3');base=0x10000
@@ -43,7 +43,7 @@ def test_sar_width_and_carry_compiled():
     with tempfile.TemporaryDirectory() as temp:
         path=Path(temp)/'test.c'; path.write_text(code)
         exe=Path(temp)/'test.exe'
-        compiled=subprocess.run([cc,str(path),'-o',str(exe)],capture_output=True,text=True)
+        compiled=subprocess.run(command(cc,[path],exe),capture_output=True,text=True)
         assert compiled.returncode==0,compiled.stderr
         result=subprocess.run([str(exe)],capture_output=True,text=True)
         assert result.returncode==0,result.stdout+result.stderr

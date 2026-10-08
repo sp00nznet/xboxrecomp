@@ -6,6 +6,7 @@ import tempfile
 import pytest
 from . import config
 from .translator import FunctionTranslator
+from .c_fixture import compiler, command
 
 ALU = {'add': 0, 'or': 1, 'adc': 2, 'sbb': 3, 'and': 4, 'sub': 5, 'xor': 6}
 SHIFT = {'shl': 0xE0, 'sar': 0xF8}
@@ -33,9 +34,7 @@ def _sign(op, width, a):
 
 
 def test_result_sign_uses_operand_width():
-    cc = shutil.which('clang') or shutil.which('gcc')
-    if not cc and Path(r'C:\Program Files\LLVM\bin\clang.exe').exists():
-        cc = r'C:\Program Files\LLVM\bin\clang.exe'
+    cc = compiler()
     if not cc:
         pytest.skip('C compiler unavailable')
     code = '''#include <stdint.h>
@@ -47,6 +46,7 @@ static uint32_t eax,esp;
 #define SET_LO8(v,x) ((v)=((v)&0xffffff00u)|(uint8_t)(x))
 #define SET_HI8(v,x) ((v)=((v)&0xffff00ffu)|((uint32_t)(uint8_t)(x)<<8))
 #define SET_LO16(v,x) ((v)=((v)&0xffff0000u)|(uint16_t)(x))
+#define RECOMP_PARITY8(v) ((0x9669u >> (((v) ^ ((v) >> 4)) & 15u)) & 1u)
 '''
     names, cases = [], []
     base = 0x10000
@@ -77,7 +77,7 @@ static uint32_t eax,esp;
         source = Path(temp) / 'test.c'
         source.write_text(code)
         exe = Path(temp) / 'test.exe'
-        result = subprocess.run([cc, str(source), '-o', str(exe)], capture_output=True, text=True)
+        result = subprocess.run(command(cc, [source], exe), capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
         result = subprocess.run([str(exe)], capture_output=True, text=True)
         assert result.returncode == 0, result.stdout + result.stderr

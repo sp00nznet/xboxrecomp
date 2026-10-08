@@ -8,11 +8,10 @@ import tempfile
 import pytest
 from .disasm import Instruction, Operand
 from .lifter import Lifter
+from .c_fixture import compiler, command as compile_command
 
 def test_classification_status_compiled():
-    cc=shutil.which('clang') or shutil.which('gcc')
-    if not cc and Path(r'C:\Program Files\LLVM\bin\clang.exe').exists():
-        cc=r'C:\Program Files\LLVM\bin\clang.exe'
+    cc=compiler()
     if not cc: pytest.skip('C compiler unavailable')
     header=(Path(__file__).resolve().parents[2]/'templates/runtime/recomp_types.h').read_text()
     helper=re.search(r'static inline uint16_t recomp_fxam\(.*?\n}',header,re.S).group()
@@ -49,8 +48,7 @@ int main(void) {
     with tempfile.TemporaryDirectory() as tmp:
         path=Path(tmp)/'classify.c'; path.write_text(source)
         exe=Path(tmp)/'classify.exe'
-        command=[cc,str(path),'-o',str(exe)]
-        if os.name!='nt': command.append('-lm')
+        command=compile_command(cc,[path],exe,gnu_flags=[] if os.name=='nt' else ['-lm'])
         result=subprocess.run(command,capture_output=True,text=True)
         assert result.returncode==0,result.stderr
         result=subprocess.run([str(exe)],capture_output=True,text=True)

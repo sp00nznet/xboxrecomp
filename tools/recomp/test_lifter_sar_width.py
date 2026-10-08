@@ -123,7 +123,8 @@ CASES = {
 
 
 def _find_cc():
-    return shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
+    from .c_fixture import compiler
+    return compiler()
 
 
 class SarWidthTest(unittest.TestCase):
@@ -153,7 +154,8 @@ class SarWidthTest(unittest.TestCase):
             with open(c, "w") as f:
                 f.write(src)
             exe = os.path.join(tmp, "t.exe")
-            r = subprocess.run([cc, "-w", "-O2", c, "-o", exe],
+            from .c_fixture import command
+            r = subprocess.run(command(cc, [c], exe),
                                capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr[-1500:] + "\n" + src)
             r = subprocess.run([exe], capture_output=True, text=True)

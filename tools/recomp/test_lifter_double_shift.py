@@ -29,6 +29,7 @@ import pytest
 
 from .disasm import Instruction, Operand
 from .lifter import Lifter
+from .c_fixture import compiler, command
 
 _VALUES = (0x00000000, 0x00000001, 0x80000000, 0xFFFFFFFF,
            0x12345678, 0xDEADBEEF, 0x0000FFFF, 0xFFFF0000)
@@ -105,16 +106,14 @@ int main(void)
 
 
 def _build_and_run(source):
-    cc = shutil.which("clang") or shutil.which("gcc")
-    if not cc and Path(r"C:\Program Files\LLVM\bin\clang.exe").exists():
-        cc = r"C:\Program Files\LLVM\bin\clang.exe"
+    cc = compiler()
     if not cc:
         pytest.skip("C compiler unavailable")
     with tempfile.TemporaryDirectory() as temp:
         src = Path(temp) / "test.c"
         src.write_text(source)
         exe = Path(temp) / "test.exe"
-        built = subprocess.run([cc, str(src), "-o", str(exe)],
+        built = subprocess.run(command(cc, [src], exe),
                                capture_output=True, text=True)
         assert built.returncode == 0, built.stderr
         return subprocess.run([str(exe)], capture_output=True, text=True)
