@@ -785,6 +785,31 @@ static void frame_counters_tick(void)
     }
 }
 
+/* Guest VA of the title's GPU fence word, found through the first registered
+ * mirror, or 0 when none is registered or the chain does not resolve into the
+ * contiguous window (where a GPU-visible word has to be). Read-only: the
+ * pushbuffer executor uses it to keep the NV2A's fence latch consistent with
+ * what the mirror writes. */
+uint32_t xbox_Nv2aFenceWordVa(void)
+{
+    for (int i = 0; i < g_fence_mirror_count; i++) {
+        uint32_t dev, get_ptr;
+
+        if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
+                                     + g_memory_offset);
+        if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4))
+            continue;
+        get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
+                                         + g_memory_offset);
+        if (get_ptr >= 0x80000000u && get_ptr - 0x80000000u <= 0x04000000u - 4u
+                && !(get_ptr & 3u) && fence_readable(get_ptr, 4))
+            return get_ptr;
+    }
+    return 0;
+}
+
 static void fence_mirrors_tick(void)
 {
     for (int i = 0; i < g_fence_mirror_count; i++) {
@@ -873,17 +898,45 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* Clear the request bits "hardware" would clear on its own.
+ *
+ * Also called by the pushbuffer walker between commands. This thread executes
+ * the pushbuffer below, and under RECOMP_PB_EXEC one pass can take a whole
+ * rendered frame; with the bits cleared only here, every XDK D3D kickoff --
+ * which sets 0x100410 bit 16 and spins until it clears -- waited that long,
+ * and a level load, thousands of kickoffs long, looked frozen. Clearing them
+ * from inside the walk answers the kickoff within a few hundred commands,
+ * without a thread of its own spinning on a host core. */
+void xbox_Nv2aAckBusyBits(void)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
+
+    if (!regs)
+        return;
+    for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+        if (*r & NV2A_ACK[i].busy_mask) {
+            *r &= ~NV2A_ACK[i].busy_mask;
+        }
+    }
+}
+
+/* One word of the NV2A register file (offset from the register base), or NULL
+ * before it is mapped. The pushbuffer executor writes what the GPU would when
+ * it executes a command: PGRAPH state a title reads back, and DMA_GET. */
+volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
+{
+    if (!g_nv2a_memory || offset + 4 > XBOX_NV2A_SIZE)
+        return NULL;
+    return (volatile uint32_t *)((char *)g_nv2a_memory + offset);
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            if (*r & NV2A_ACK[i].busy_mask) {
-                *r &= ~NV2A_ACK[i].busy_mask;
-            }
-        }
+        xbox_Nv2aAckBusyBits();
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
@@ -929,12 +982,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
              * is being drawn and the missing piece is upstream of the GPU. */
             static DWORD  last_put_ms;
             static uint32_t last_put;
+            static uint32_t get_written = 0xFFFFFFFFu;  /* GET as we last left it */
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             if (put != last_put || (now_ms - last_put_ms) > 2000) {
                 /* Survey the segment the title just submitted, once. */
                 {
-                    extern void nv2a_pb_scan(uint32_t, uint32_t);
+                    extern void nv2a_pb_scan(uint32_t);
                     extern void nv2a_pb_scan_report(void);
                     static DWORD last_report;
 
@@ -952,37 +1006,44 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * The contiguous window IS the physical-address view, so
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
-                    /* The pushbuffer is a ring, so PUT coming back below
-                     * where it was is a wrap, not a rewind. Scanning only
-                     * forward segments dropped everything written across
-                     * the seam -- one whole submission each time round.
-                     *
-                     * The ring's bounds are not published anywhere this
-                     * code can read, so they are learned: the lowest and
-                     * highest PUT seen bracket it. That is approximate on
-                     * the first lap and exact afterwards, and scanning a
-                     * little short of the true end costs the same commands
-                     * that were being lost anyway. */
-                    static uint32_t put_lo, put_hi;
-                    if (!put_lo || put < put_lo) put_lo = put;
-                    if (put > put_hi) put_hi = put;
-                    if (last_put && put > last_put) {
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    } else if (last_put && put < last_put) {
-                        if (put_hi > last_put)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                        if (put > put_lo)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
-                            static unsigned wraps;
-                            if (wraps++ < 8)
-                                fprintf(stderr, "  [NV2A] pushbuffer wrapped "
-                                        "(0x%08X -> 0x%08X)\n", last_put, put);
+                    extern void nv2a_pb_resync(uint32_t);
+                    extern int  nv2a_pb_dma_walk(void);
+                    extern void nv2a_pb_scan_segment(uint32_t, uint32_t);
+
+                    if (nv2a_pb_dma_walk()) {
+                        uint32_t get_now = *(volatile uint32_t *)
+                                           ((char *)regs + NV2A_USER_DMA_GET);
+                        /* GET is ours to advance; if it is not what we last
+                         * wrote, the title reset the ring. The first time, it
+                         * is where D3D started the ring: walking from there
+                         * rather than from the first PUT keeps the one-time
+                         * device state (depth function, and so on) sent
+                         * before it. */
+                        if (get_written == 0xFFFFFFFFu || get_now != get_written)
+                            nv2a_pb_resync(get_now);
+                        if (put != last_put)
+                            nv2a_pb_scan(put);
+                    } else {
+                        /* The segment scan, the default: the bytes between
+                         * the previous PUT and this one. The pushbuffer is a
+                         * ring, so PUT coming back below where it was is a
+                         * wrap, not a rewind; the ring's bounds are learned
+                         * from the lowest and highest PUT seen. */
+                        static uint32_t put_lo, put_hi;
+                        if (!put_lo || put < put_lo) put_lo = put;
+                        if (put > put_hi) put_hi = put;
+                        if (last_put && put > last_put) {
+                            nv2a_pb_scan_segment(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                                 XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                        } else if (last_put && put < last_put) {
+                            if (put_hi > last_put)
+                                nv2a_pb_scan_segment(
+                                    XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                    XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
+                            if (put > put_lo)
+                                nv2a_pb_scan_segment(
+                                    XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
+                                    XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
                         }
                     }
                     /* Periodic, because what the title submits at init is not
@@ -1009,6 +1070,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         (volatile uint32_t *)((char *)regs
                                               + NV2A_USER_DMA_GET);
                     *get = put;
+                    get_written = put;
                 }
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either

@@ -178,6 +178,9 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
  * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
  * stands down, so the count follows what was actually drawn. */
 void xbox_Nv2aFrameCounterFlip(void);
+/* A word of the NV2A register file (offset from the register base); NULL until
+ * the aperture is mapped. */
+volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
@@ -191,6 +194,10 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
+
+/* Where the mirrored fence word is (0 if none is registered or it does not
+ * resolve into the contiguous window). For the pushbuffer executor. */
+uint32_t xbox_Nv2aFenceWordVa(void);
 
 void xbox_MemoryLayoutShutdown(void);
 

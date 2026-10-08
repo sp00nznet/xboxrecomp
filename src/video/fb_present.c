@@ -55,6 +55,16 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
         s_fb_pitch = pitch;
 }
 
+/* Vertical anti-aliasing factor of the surface being shown: 2 for 2x2, where
+ * the surface has twice the rows as well as twice the columns, and 1 for
+ * everything else (2x1 included). Only the pushbuffer executor knows it. */
+static uint32_t s_fb_aa_sy = 1;
+
+void xbox_FramebufferWindowSetAA(uint32_t sy)
+{
+    s_fb_aa_sy = sy ? sy : 1;
+}
+
 /* Called by the pushbuffer executor when the title flips. */
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 {
@@ -76,11 +86,17 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     bpp = pitch / s_fb_width;
     src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
     for (y = 0; y < s_fb_height; y++) {
-        const uint8_t *row = src + (size_t)y * pitch;
+        const uint8_t *row = src + (size_t)y * pitch * (bpp == 8 ? s_fb_aa_sy : 1);
         uint32_t *dst = s_present[next] + (size_t)y * s_fb_width;
 
         if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
+        } else if (bpp == 8) {
+            /* 2x-wide anti-aliased 32-bit surface: every other pixel, as in
+             * fb_convert. */
+            const uint32_t *p = (const uint32_t *)row;
+            for (x = 0; x < s_fb_width; x++)
+                dst[x] = p[x * 2];
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
             for (x = 0; x < s_fb_width; x++) {
@@ -192,11 +208,20 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
     uint32_t x, y;
 
     for (y = 0; y < s_fb_height; y++) {
-        const uint8_t *row = src + (size_t)y * s_fb_pitch;
+        const uint8_t *row = src + (size_t)y * s_fb_pitch
+                           * (bpp == 8 ? s_fb_aa_sy : 1);
         uint32_t *dst = s_rgb + (size_t)y * s_fb_width;
 
         if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
+        } else if (bpp == 8) {
+            /* A 2x-wide anti-aliased 32-bit surface (pitch = 2 * width * 4):
+             * take every other pixel. X-Men Legends renders its 640-wide
+             * frame into a 1280-wide surface, which read as "8 bytes per
+             * pixel" and showed black. */
+            const uint32_t *p = (const uint32_t *)row;
+            for (x = 0; x < s_fb_width; x++)
+                dst[x] = p[x * 2];
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
             for (x = 0; x < s_fb_width; x++) {

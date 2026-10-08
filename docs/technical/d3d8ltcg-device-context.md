@@ -98,6 +98,93 @@ MEM32(device + 0x30) = device + 0x2C;
 
 This makes GPU_read == write_seq → available == 0 → space check always passes → no spin loop. The D3D8LTCG code exits immediately at its first buffer space check.
 
+### The Same Loop in Other Titles
+
+None of this is RenderWare's. It is the stock XDK D3D library, and the same
+device layout — write sequence at `+0x2C`, pointer to the GPU's progress at
+`+0x30` — appears in *X-Men Legends*, where the fence wait froze the title on
+its first `Present`. The watchdog shows the guest stack inside the `D3D`
+section under `Present`/`Swap`, and `NV2A USER PUT=GET`: the pushbuffer looks
+consumed, but nothing ran it. Decompile the innermost D3D function; a loop
+comparing `device[0xB]` with `*device[0xC]` is this.
+
+Two things differ per title: the address of the device pointer and of the
+fence wait (`D3D_BlockOnTime`). Replace the fence wait rather than wrapping it
+— a `sub_X_gen` wrapper is bypassed by every generated caller, which calls
+the generated body directly — and
+re-apply the pointer on every call, because D3D rewrites the field on device
+reset:
+
+```c
+static void d3d_gpu_caught_up(void)
+{
+    uint32_t dev = MEM32(XDK_D3D_DEVICE_PTR);      /* title-specific */
+    if (dev)
+        MEM32(dev + 0x30) = dev + 0x2C;             /* "GPU" is always caught up */
+}
+```
+
+### When Something Does Read the Pushbuffer
+
+"Always caught up" is only safe while nothing executes the pushbuffer. With
+`RECOMP_PB_EXEC` on ([Pushbuffer Executor](pushbuffer-executor.md)), the
+executor runs behind the title's thread, and D3D reads the same semaphore to
+decide when ring space and vertex memory can be reused. Told the GPU has
+finished everything, it:
+
+1. writes new commands over ring space the executor has not walked yet, and
+2. rewrites vertex buffers and pre-built pushbuffers (CALL targets) that queued
+   draws still use.
+
+The executor then renders data as state: blend factors like `0x04730472` (two
+16-bit vertex indices), a transform mode of `268636`, and `[PB] bad target`
+lines where it read vertex data as JUMP and CALL commands, usually just after
+the ring wrapped. In *X-Men Legends* some objects drew black, others with
+random blending.
+
+The honest version keeps the real semaphore. On the first call, the fence-wait
+replacement reads the semaphore pointer at `device + 0x30` and hands it to the
+executor with `nv2a_pb_set_semaphore_target()` (`nv2a_backend.h`). The
+executor writes `BACK_END_WRITE_SEMAPHORE_RELEASE` (`0x1D70`) values there as
+it finishes work, and the replacement waits until the semaphore reaches the
+fence, bounded at 250 ms. D3D's make-space path reads the same semaphore, so it
+becomes honest without being replaced. The log shows
+`[D3D] GPU semaphore at 0x...` once, and no bad targets; desyncs went from
+hundreds a minute to none.
+
+The replacement must also do what the original does first. `D3D_BlockOnTime`
+begins with "if this fence is the newest one (`== device + 0x2C`), kick off the
+pushbuffer that contains its release". A wait that skips the kickoff waits for
+a release nothing has submitted, and runs out its bound every time: frames of
+exactly 250 ms, 500 ms or 1 s whenever vertex buffers are reused quickly, with
+the executor idle throughout.
+
+A second wait in the same library, in the function the fence wait calls to see
+how far behind the GPU is, compares the semaphore with an NV2A register
+instead of with a fence:
+
+```asm
+mov  edx, [esi+0x934]        ; register base
+mov  edi, [esi+0x30]         ; GPU semaphore
+mov  eax, [edx+0x400B10]     ; loop: read PGRAPH 0x400B10 ...
+mov  ecx, [edi]
+shl  ecx, 2
+xor  ecx, eax
+test cl, 0x7C                ; ... until its fence bits match the semaphore's
+jne  loop
+```
+
+Nothing wrote `0x400B10`, so the loop ended only when the semaphore's low five
+bits happened to be zero. The register is the latch of method `0x0310` on
+subchannel 5, which `KickOff` ends every kick with. A related trap: when D3D
+judges the GPU far behind (by `DMA_GET`), it patches a "signal me" NOP into the
+pushbuffer at the fence and sleeps on an event, and a `DMA_GET` that lagged the
+executor — it used to move only when a walk reached PUT — made it patch commands
+the executor had already run. The executor models both (`0x0310`'s latch, and
+`DMA_GET` published before every command;
+[Answering the Title While It Runs](pushbuffer-executor.md#answering-the-title-while-it-runs)),
+so no wrapper is needed for either.
+
 ## D3D8LTCG Stub Functions
 
 The D3D8LTCG library is a single giant function (0x34C2E0-0x360A54, ~83KB) with many mid-entry points. In recompilation, each entry point becomes a separate function. Many are stubs that must clean the Xbox stack correctly.
