@@ -3672,7 +3672,8 @@ class Lifter:
             # fprem truncates toward zero, fprem1 rounds to nearest (IEEE), which
             # is the difference between fmod and remainder.
             fn = "fmod" if m == "fprem" else "remainder"
-            return [f"fp_top() = {fn}(fp_top(), fp_st1()); /* {m} */"]
+            return [f"fp_top() = {fn}(fp_top(), fp_st1()); /* {m} */",
+                    "g_fp_cc &= (uint16_t)~0x0400u; /* completed reduction: C2 = 0 */"]
         if m == "fscale":
             return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
         if m == "frndint":

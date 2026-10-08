@@ -471,6 +471,22 @@ CASES = [
     # model reported "equal", so `fucompp; fnstsw ax; test ah,44h; jp` -- how
     # this era's CRT asks "is this a NaN" -- answered no every time. Found by
     # running Crimson Skies' own float classification against itself.
+    Case("fpu_fprem_completion", "FPREM clears FXAM's C2 after complete reduction",
+         ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fxam",
+          "fprem", "fnstsw ax", "and eax, 0400h"],
+         [(7.5, 3.0), (-7.5, 3.0), (7.5, -3.0), (0.0, 3.0),
+          (100.0, 7.0), (2.5, 2.0)], "fpu"),
+    Case("fpu_fprem1_completion", "FPREM1 clears C2 and rounds the quotient to nearest",
+         ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fxam",
+          "fprem1", "fnstsw ax", "and eax, 0400h"],
+         [(7.5, 3.0), (-7.5, 3.0), (7.5, -3.0), (0.0, 3.0),
+          (100.0, 7.0), (2.5, 2.0)], "fpu"),
+
+    # ══ SSE ═════════════════════════════════════════════════════════════════
+    #
+    # All four lanes are compared, which is the whole point: modelling XMM as a
+    # scalar float made movaps move 4 of 16 bytes and nothing noticed.
+
     Case("fpu_nan_unordered",
          "comparing a value with itself is the isnan idiom; NaN is unordered",
          ["fld qword ptr [eax]", "fld qword ptr [eax]", "fucompp",
