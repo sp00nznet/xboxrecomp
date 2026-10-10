@@ -46,6 +46,11 @@ class _Image:
 
 
 class _Engine:
+    jump_tables = {}
+
+    def get_instruction(self, addr):
+        return self.instructions.get(addr)
+
     def __init__(self, insns, prologues):
         self.instructions = {i.address: i for i in insns}
         self._prologues = set(prologues)
@@ -110,6 +115,13 @@ class GapPrologueTest(unittest.TestCase):
         det = _detector(insns, funcs, prologues=set())
         det.engine._stub = True
         self.assertFalse(det._pass_gap_prologues([]))
+
+    def test_padding_before_a_jump_table_is_not_a_function(self):
+        insns = [_Insn(0x1000, 1, is_ret=True), _Insn(0x1001, 2)]
+        det = _detector(insns, [_Func(0x1000, 0x1001)], {0x1001})
+        det.engine.jump_tables = {0x1003: 0x1013}
+        self.assertFalse(det._pass_gap_prologues([]))
+        self.assertEqual(det.added, [])
 
     def test_a_non_ret_instruction_starts_nothing(self):
         insns = [_Insn(0x00476EAF, 1, is_ret=False)]

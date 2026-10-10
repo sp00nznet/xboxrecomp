@@ -64,9 +64,10 @@ class Disassembler:
     def _trust_mid_instruction_seed(self, addr: int) -> bool:
         """A seed inside an instruction the sweep decoded: keep it anyway?
 
-        Yes when a run reached it (observed_seeds), or when it decodes as a
-        prologue, which means the sweep is the one out of phase. See the
-        seeding loop in run() for the cases behind each.
+        Yes when a run reached it (observed_seeds; Halo's XPP init at
+        0x001CF6AC), or when it decodes as a prologue, which means the sweep
+        is the one out of phase (default.xbe's push ebp at 0x00069538). An
+        RTTI guess six bytes into a mov (HL2's 0x00202C2E) is neither.
         """
         return (addr in self.observed_seeds
                 or self.engine.probes_as_prologue(addr))
@@ -174,78 +175,35 @@ class Disassembler:
         self.func_detector = FunctionDetector(
             self.engine, self.image, self.xrefs, self.labels)
 
-        # Add seed functions from vtable scanner or other sources
+        # Measure bodies before accepting a seed inside a sweep instruction.
         if self.seed_functions:
+            self.func_detector.detect_all(sections)
             realigned = 0
             mid_instruction = 0
+            accepted = []
             for addr in self.seed_functions:
-                # Decode there first if the sweep stepped over it. A seed is an
-                # explicit claim that a function starts at this address, and it
-                # is usually the only evidence available -- seeds exist for
-                # entry points that nothing in the image references. But
-                # _build_functions needs instructions at the address to build a
-                # body from, and where the sweep came out of phase there are
-                # none, so the seed was dropped silently.
-                #
-                # Same treatment _pass_call_targets already gives a call target
-                # it has to realign, and for the same reason.
-                # A seed landing *inside* an instruction the sweep already
-                # decoded is not a stream out of phase -- it is a bad seed.
-                # Accepting it manufactures a boundary mid-instruction, and the
-                # new "function" then clamps the end of the real one it sits
-                # in, which loses that function its epilogue.
-                #
-                # Checked before the realign test, not inside it: an earlier
-                # seed's decode_at can already have laid a chain through this
-                # address, which made the address look like a legitimate
-                # boundary and skipped the guard entirely.
-                #
-                # Half-Life 2 has two such slots out of 12,288, and one
-                # (0x00202C2E, six bytes into a 9-byte mov) cut sub_00202BB9
-                # short at 0x00202C31 instead of 0x00202D4F. That function has
-                # 250 callers, and every one got back an unrestored
-                # ebx/esi/ebp/edi and a leaked frame -- which drifts esp until
-                # some later `pop esi` lifts a float off the stack and it gets
-                # used as a `this` pointer.
                 covering = self.engine.instruction_covering(addr)
                 if covering is not None:
-                    # ...unless the seed decodes as a function prologue, in
-                    # which case the sweep is the one out of phase. It drifts
-                    # whenever it walks zero padding or a data table as
-                    # instructions and runs off the end into real code:
-                    # default.xbe's XPP section decodes 001C950600558D at
-                    # 0x00069533, which swallows the `push ebp` at 0x00069538
-                    # that a tail jump targets. Rejecting that seed left the
-                    # target stubbed, and the stub returned without the
-                    # callee's `ret 8` -- which walked esp off by 4 and moved
-                    # the loader's object pointer out from under its own
-                    # vtable.
-                    #
-                    # A prologue is the evidence that separates the two cases:
-                    # the bad HL2 seed at 0x00202C2E is six bytes into a mov
-                    # and decodes as nothing of the kind.
-                    #
-                    # Or unless a run actually got there. A seed from
-                    # tools.seed_from_log is an address the CPU called, or a
-                    # thread the title started -- where execution went, not
-                    # an inference from a table -- and seed_from_log only
-                    # writes one that decodes as a function body. The guard
-                    # above exists for RTTI vtable slots, which are guesses.
-                    # Halo's XPP has an init function at 0x001CF6AC that
-                    # opens `cmp [flag], 0` right after a pointer table the
-                    # sweep walked as code; rejecting its observed seed left
-                    # the USB driver's indirect call to it unresolved.
-                    if self._trust_mid_instruction_seed(addr):
-                        if self.engine.decode_at(addr):
-                            realigned += 1
-                            self.func_detector._add_candidate(
-                                addr, 0.95, "seed_vtable_thunk")
-                            continue
-                    mid_instruction += 1
-                    continue
-                if addr not in self.engine.instructions:
+                    # Unclaimed sweep bytes may be replaced by the seed's
+                    # decode; a detected body only yields to trusted seeds.
+                    unclaimed = self.func_detector.get_function_at(addr) is None
+                    if not (unclaimed or self._trust_mid_instruction_seed(addr)):
+                        mid_instruction += 1
+                        continue
+                    if not self.engine.decode_at(addr, replace_overlaps=unclaimed):
+                        continue
+                    realigned += 1
+                elif addr not in self.engine.instructions:
                     if self.engine.decode_at(addr):
                         realigned += 1
+                accepted.append(addr)
+
+            # Rebuild from the corrected stream, without candidates or xrefs
+            # left over from the discarded sweep instructions.
+            self.xrefs = build_xrefs(self.engine, self.image)
+            self.func_detector = FunctionDetector(
+                self.engine, self.image, self.xrefs, self.labels)
+            for addr in accepted:
                 self.func_detector._add_candidate(addr, 0.95, "seed_vtable_thunk")
             if realigned:
                 print(f"  Realigned {realigned} seeded address(es) the sweep "
@@ -257,6 +215,8 @@ class Disassembler:
                 print(f"  Seeded {len(self.seed_functions)} function addresses")
 
         num_funcs = self.func_detector.detect_all(sections)
+        # Detection can realign the stream (tail targets); export its xrefs.
+        self.xrefs = build_xrefs(self.engine, self.image)
         if self.verbose:
             summary = self.func_detector.summary()
             print(f"  Total functions: {num_funcs:,d}")

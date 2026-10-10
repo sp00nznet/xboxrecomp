@@ -55,6 +55,9 @@ class _Engine:
     def get_instruction(self, addr):
         return self.instructions.get(addr)
 
+    def probes_as_prologue(self, addr):
+        return True
+
 
 def _run(terminator_mnemonic, terminator_size, is_ret, is_jump):
     """Lay out <filler><terminator><int3 padding><next function> and detect."""

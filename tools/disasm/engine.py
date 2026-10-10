@@ -11,7 +11,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CsInsn
-from capstone import CS_OP_IMM, CS_OP_MEM, CS_OP_REG
+from capstone import (CS_OP_IMM, CS_OP_MEM, CS_OP_REG,
+                      CS_GRP_INT, CS_GRP_IRET, CS_GRP_PRIVILEGE)
+from capstone.x86_const import (
+    X86_REG_EFLAGS,
+)
+from capstone import x86_const
 
 from . import config
 from .loader import BinaryImage, SectionInfo
@@ -345,7 +350,8 @@ class DisasmEngine:
         return [self.image.read_u32_at_va(a) or 0
                 for a in range(tbl, end, 4)]
 
-    def decode_at(self, addr: int, max_insns: int = 4096) -> int:
+    def decode_at(self, addr: int, max_insns: int = 4096,
+                  replace_overlaps: bool = False) -> int:
         """
         Decode a stream starting exactly at `addr`, realigning the sweep.
 
@@ -372,7 +378,8 @@ class DisasmEngine:
         valid instruction streams really can share bytes, and the callers that
         matter walk forward by end_address from a known start, so each follows
         its own chain. Evicting the old one would corrupt whichever function
-        was already using it.
+        was already using it. With replace_overlaps, the caller has verified
+        that the old stream is unclaimed, so its overlapping instructions go.
 
         Returns the number of instructions newly decoded.
         """
@@ -388,9 +395,17 @@ class DisasmEngine:
             return 0
 
         added = 0
+        overlaps = set()
         for cs_insn in self._cs.disasm(data[offset:], addr):
             if cs_insn.address != addr and cs_insn.address in self.instructions:
                 break  # resynced with the existing stream
+            if replace_overlaps:
+                overlaps.update(old.address for old in
+                                self.get_instructions_in_range(
+                                    cs_insn.address - 15,
+                                    cs_insn.address + cs_insn.size)
+                                if old.address != cs_insn.address
+                                and old.end_address > cs_insn.address)
             if cs_insn.address not in self.instructions:
                 self.instructions[cs_insn.address] = \
                     self._classify_instruction(cs_insn)
@@ -401,7 +416,9 @@ class DisasmEngine:
             if added >= max_insns:
                 break
 
-        if added:
+        for old_addr in overlaps:
+            del self.instructions[old_addr]
+        if added or overlaps:
             self._sorted_addrs = None
         return added
 
@@ -424,7 +441,10 @@ class DisasmEngine:
         section = self.image.get_section_at_va(addr)
         if section is None or not section.executable:
             return None
-        data = self.image.read_bytes_at_va(addr, max_insns * 8)
+        # Stay inside the section's file bytes: a long bound past the end of
+        # the image would otherwise read nothing at all.
+        data = self.image.get_section_data(section)
+        data = data[addr - section.virtual_addr:][:max_insns * 8]
         if not data:
             return None
 
@@ -518,6 +538,140 @@ class DisasmEngine:
                 if count >= max_insns:
                     return False
         return False
+
+    def probes_as_callback_body(self, addr: int, upper: int,
+                                lower: Optional[int] = None,
+                                tail_targets=(), *, require_entry_frame=False,
+                                allow_indirect_tails=False) -> bool:
+        """Read-only proof of a closed callback CFG inside an unclaimed gap.
+
+        Calls may return from other functions; branches and fallthrough must
+        stay on decoded instruction boundaries. Reuse the translator's CFG
+        decoder and the sweep's measured switch tables, without a size cap.
+        """
+        from ..recomp.disasm import Disassembler
+
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        lower = addr if lower is None else max(lower, section.virtual_addr)
+        upper = min(upper, section.virtual_addr + len(data))
+        raw = data[lower - section.virtual_addr:upper - section.virtual_addr]
+        if require_entry_frame:
+            # A weak table word may name a suffix after its owner's cmp.
+            # Reject an entry prefix that reads arithmetic flags before
+            # producing them. String operations may read the ABI's DF. A
+            # writer defines only its own flags: inc and dec leave CF.
+            pending = {"AF", "CF", "OF", "PF", "SF", "ZF"}
+            flag = lambda kind, name: getattr(x86_const, f"X86_EFLAGS_{kind}_{name}")
+            for insn in self._cs.disasm(raw[addr - lower:], addr):
+                if (X86_REG_EFLAGS in insn.regs_read
+                        and (not insn.eflags or any(
+                            insn.eflags & flag("TEST", f) for f in pending))):
+                    return False
+                if X86_REG_EFLAGS in insn.regs_write:
+                    pending = {f for f in pending if insn.eflags and not any(
+                        insn.eflags & flag(kind, f)
+                        for kind in ("MODIFY", "SET", "RESET", "UNDEFINED"))}
+                if not pending or insn.mnemonic in ("call", "jmp", "ret", "retn"):
+                    break
+        decoder = Disassembler()
+        entries = {addr}
+        tables = {}
+        indirect_tails = set()
+        while True:
+            decoded = decoder.disassemble_cfg(
+                raw, lower, upper, entries,
+                stop_mnemonics=("int3", "int", "ud2", "hlt", "iret", "iretd"))
+            arms = set()
+            for insn in decoded:
+                if not insn.is_jump or insn.jump_target is not None:
+                    continue
+                if not insn.operands:
+                    return False
+                op = insn.operands[0]
+                if (allow_indirect_tails
+                        and (op.type != "mem" or not op.mem_index
+                             or not self.jump_table_entries(op.mem_disp))):
+                    indirect_tails.add(insn.address)
+                    continue
+                if (op.type != "mem" or not op.mem_index or op.mem_base
+                        or op.mem_scale != 4 or op.mem_seg):
+                    return False
+                targets = self.jump_table_entries(op.mem_disp)
+                if not targets or any(not lower <= t < upper for t in targets):
+                    return False
+                tables[insn.address] = targets
+                arms.update(targets)
+            if arms <= entries:
+                break
+            entries.update(arms)
+
+        starts = {insn.address for insn in decoded}
+        call_ends = {insn.end_address for insn in decoded if insn.is_call}
+        branch_targets = {insn.jump_target for insn in decoded if insn.is_branch}
+        branch_targets.update(arms)
+        end = lower
+        exits = backward = False
+        for insn in decoded:
+            if insn.address < end or insn.end_address > upper:
+                return False  # two reachable streams overlap
+            end = insn.end_address
+            # Same no-return shape as static callback recovery. A branch into
+            # the padding is a trap, not evidence that the call never returns.
+            if (insn.mnemonic == "int3" and insn.address in call_ends
+                    and insn.address not in branch_targets):
+                exits = True
+                continue
+            if (set(insn.groups) & {CS_GRP_INT, CS_GRP_IRET, CS_GRP_PRIVILEGE}
+                    or insn.mnemonic.split()[-1] in (
+                        "ud2", "ud0", "ud1", "retf", "in", "out",
+                        "insb", "insw", "insd", "outsb", "outsw", "outsd")):
+                return False
+            if insn.is_ret or insn.address in indirect_tails:
+                exits = True
+                continue
+            edges = []
+            if insn.is_branch:
+                edges = ([insn.jump_target] if insn.jump_target is not None
+                         else tables.get(insn.address, []))
+                if not edges:
+                    return False
+            if not insn.is_jump:
+                edges = [*edges, insn.end_address]
+            for edge in edges:
+                if edge in starts:
+                    continue
+                if edge == insn.jump_target and edge in tail_targets:
+                    exits = True  # preserve proven tails to existing bodies
+                    continue
+                return False
+            backward |= any(edge in starts and edge <= insn.address for edge in edges)
+        if require_entry_frame:
+            saved = {insn.op_str for insn in decoded if insn.mnemonic == "push"}
+            restored = {insn.op_str for insn in decoded if insn.mnemonic == "pop"}
+            restored &= {"ebx", "esi", "edi", "ebp"}
+            # A callable shared body must supply its own saved registers. An
+            # epilogue suffix that consumes its owner's saves is not an entry.
+            if restored - saved:
+                return False
+            # Nor may it free a frame or stack it never built.
+            # shortcut: checks which instructions appear, not stack depth;
+            # walk the depth per path if a suffix ever frees more than it built.
+            esp = lambda insn, m: insn.mnemonic == m and insn.op_str.startswith("esp,")
+            if any(insn.mnemonic == "leave" for insn in decoded) and "ebp" not in saved:
+                return False
+            if (any(esp(insn, "add") for insn in decoded)
+                    and not any(insn.mnemonic in ("push", "enter") or esp(insn, "sub")
+                                for insn in decoded)):
+                return False
+            if not (backward or restored or any(insn.is_ret for insn in decoded)
+                    or any(insn.mnemonic == "int3" and insn.address in call_ends
+                           for insn in decoded)
+                    or all("esp" not in insn.regs_written for insn in decoded)):
+                return False
+        return bool(decoded) and (exits or backward)
 
     def _first_arm_after(self, table: int, site: int) -> Optional[int]:
         """The lowest entry of a measured jump table that lies past `site`,

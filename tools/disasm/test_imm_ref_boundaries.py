@@ -42,3 +42,12 @@ def test_virtual_dispatch_thunk_can_realign_an_overlapping_sweep():
     assert det.engine.instruction_covering(target) is not None
     det._pass_imm_ref_targets([sec])
     assert target in det._candidates
+
+
+def test_immediate_direct_thunk_requires_a_returning_destination():
+    # The address-taken entry jumps backward to a separate returning body.
+    for destination, recovered in [(b"\xc3", True), (b"\xcc", False)]:
+        det, sec, target = detector(
+            destination + b"\x90" * 5 + bytes.fromhex("e9f5ffffff"), 16)
+        det._pass_imm_ref_targets([sec])
+        assert (target in det._candidates) is recovered
