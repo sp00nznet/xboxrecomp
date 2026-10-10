@@ -37,15 +37,17 @@ if __name__ == "__main__":
 
 
 class FpuUnorderedTest(unittest.TestCase):
-    """fcomi/fucomi/sahf set ZF, PF and CF on an unordered compare; g_fp_cmp
-    is 2 then, which must not read as "greater"."""
+    """fcomi/fucomi/sahf set ZF, PF and CF on an unordered compare. The
+    conditions read those bits from the _fa snapshot that the setter takes,
+    so a later x87 compare or AH edit cannot change them; sahf takes a new
+    snapshot from AH."""
 
     def test_ja_is_false_and_jb_true_when_unordered(self):
         from .lifter import _make_condition
         ja = _make_condition("ja", "fucomip", [])[0]
         jb = _make_condition("jb", "fucomip", [])[0]
         jp = _make_condition("jp", "sahf", [])[0]
-        self.assertIn("g_fp_cmp == 1", ja)
-        self.assertNotIn(">", ja)
-        self.assertIn("g_fp_cmp == 2", jb)
-        self.assertIn("g_fp_cmp == 2", jp)
+        self.assertIn("(!(_fa & 1u) && !(_fa & 0x40u))", ja)
+        self.assertIn("(_fa & 1u)", jb)
+        self.assertIn("(_fa & 4u)", jp)
+        self.assertNotIn("g_fp_cmp", ja + jb + jp)

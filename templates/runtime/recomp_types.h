@@ -62,6 +62,7 @@
 #include <math.h>
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
 #include <xmmintrin.h>
+#include <emmintrin.h>
 #endif
 
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
@@ -330,6 +331,75 @@ static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits)
     return (int64_t)rounded;
 }
 
+/* fld/fstp tbyte: 64-bit significand with an explicit integer bit, 15-bit
+ * exponent biased by 16383, sign on top. The stack is double, so a load
+ * rounds to 53 bits and a store is exact. */
+static inline double recomp_f80_load(uint64_t mant, uint16_t se) {
+    int e = se & 0x7fff;
+    double v = e == 0x7fff ? ((mant << 1) ? NAN : INFINITY)
+                           : ldexp((double)mant, e - 16383 - 63);
+    return (se & 0x8000u) ? -v : v;
+}
+static inline uint16_t recomp_f80_store(double v, uint64_t *mant) {
+    union { double d; uint64_t u; } bits;
+    uint16_t sign = signbit(v) ? 0x8000u : 0u;
+    int e;
+    bits.d = v;
+    if (v != v) { *mant = 0x8000000000000000ull | (bits.u << 11); return sign | 0x7fffu; }
+    if (isinf(v)) { *mant = 0x8000000000000000ull; return sign | 0x7fffu; }
+    if (v == 0.0) { *mant = 0; return sign; }
+    v = frexp(fabs(v), &e);
+    *mant = (uint64_t)(int64_t)ldexp(v, 63) << 1;
+    return (uint16_t)(sign | (e + 16382));
+}
+
+/* Trig range failure leaves both value and stack depth unchanged. */
+static inline int recomp_fp_trig_in_range(double value) {
+    if (isfinite(value) && fabs(value) >= 0x1p63) {
+        g_fp_cc |= 0x0400u;
+        return 0;
+    }
+    g_fp_cc &= (uint16_t)~0x0400u;
+    return 1;
+}
+
+static inline double recomp_fscale(double value, double scale) {
+    if (isnan(value) || isnan(scale)) return value + scale;
+    if (scale == INFINITY)
+        return value == 0.0 ? NAN : copysign(INFINITY, value);
+    if (scale == -INFINITY)
+        return isinf(value) ? NAN : copysign(0.0, value);
+    /* Finite exponents beyond this clamp already overflow/underflow double.
+     * Avoid an undefined float-to-int cast for the much larger x87 inputs. */
+    return scalbn(value, scale > 4096 ? 4096 : scale < -4096 ? -4096 : (int)scale);
+}
+
+static inline double recomp_fprem(double a, double b, int nearest) {
+    int quotient = 0, ea = 0, eb = 0;
+    unsigned q;
+    double result;
+    if (isfinite(a) && isfinite(b) && a != 0.0 && b != 0.0) {
+        frexp(a, &ea); frexp(b, &eb);
+        if (ea - eb >= 64) {
+            /* Intel permits 32..63 bits of quotient per partial reduction.
+             * Keep C2 set; the guest repeats until a complete reduction. */
+            g_fp_cc |= 0x0400u;
+            return fmod(a, scalbn(b, ea - eb - 32));
+        }
+    }
+    result = remquo(a, b, &quotient);
+    /* remquo's quotient is round-to-nearest; FPREM chops. Step back one in
+     * magnitude, on the low bits remquo returns, before reading C0/C3/C1. */
+    q = (unsigned)(quotient < 0 ? -quotient : quotient);
+    if (!nearest && result != 0.0 && isfinite(result) && signbit(result) != signbit(a)) {
+        result += copysign(fabs(b), a);
+        q -= 1u;
+    }
+    /* C0/C3/C1 contain quotient bits 2/1/0; C2 says complete. */
+    g_fp_cc = (uint16_t)(((q & 4u) << 6) | ((q & 2u) << 13) | ((q & 1u) << 9));
+    return result;
+}
+
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
  * ================================================================ */
@@ -588,8 +658,24 @@ static inline RecompXmm XMM_CMP_PRED(RecompXmm a, RecompXmm b, int p) {
 }
 /* Packed unary ops; the first argument is unused, as for the binary forms. */
 RECOMP_XMM_LANEWISE(XMM_SQRT,  sqrtf(b.f[i]))
-RECOMP_XMM_LANEWISE(XMM_RSQRT, 1.0f / sqrtf(b.f[i]))
-RECOMP_XMM_LANEWISE(XMM_RCP,   1.0f / b.f[i])
+/* These instructions deliberately approximate and treat denormals as zero.
+ * Exact division changes Newton refinement and zero-mask idioms. */
+static inline float recomp_rcpss(float x) {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return _mm_cvtss_f32(_mm_rcp_ss(_mm_set_ss(x)));
+#else
+    return 1.0f / (fpclassify(x) == FP_SUBNORMAL ? copysignf(0.0f, x) : x);
+#endif
+}
+static inline float recomp_rsqrtss(float x) {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(x)));
+#else
+    return 1.0f / sqrtf(fpclassify(x) == FP_SUBNORMAL ? copysignf(0.0f, x) : x);
+#endif
+}
+RECOMP_XMM_LANEWISE(XMM_RSQRT, recomp_rsqrtss(b.f[i]))
+RECOMP_XMM_LANEWISE(XMM_RCP, recomp_rcpss(b.f[i]))
 
 /** movmskps: the four lane sign bits, packed into the low nibble. */
 static inline uint32_t XMM_MOVEMASK(RecompXmm a) {
@@ -1186,6 +1272,22 @@ static inline RecompMmx MMX_FROM_PS(float lo, float hi, int truncate)
     RecompMmx r;
     r.d[0] = MMX_CVT_F2I(lo, truncate);
     r.d[1] = MMX_CVT_F2I(hi, truncate);
+    return r;
+}
+
+static inline int32_t recomp_sse_d2i(double v, int truncate) {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return truncate ? _mm_cvttsd_si32(_mm_set_sd(v))
+                    : _mm_cvtsd_si32(_mm_set_sd(v));
+#else
+    double rounded = truncate ? trunc(v) : nearbyint(v);
+    return rounded >= -2147483648.0 && rounded < 2147483648.0
+        ? (int32_t)rounded : INT32_MIN;
+#endif
+}
+static inline RecompXmm XMM_CVT_PS2DQ(RecompXmm v, int truncate) {
+    RecompXmm r; int i;
+    for (i = 0; i < 4; ++i) r.i[i] = MMX_CVT_F2I(v.f[i], truncate);
     return r;
 }
 

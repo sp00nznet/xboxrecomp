@@ -76,8 +76,8 @@ class FpuReverseFormTest(unittest.TestCase):
                 self.assertNotIn("/* FPU:", lifted[0])
 
     def test_fptan_pushes_the_implicit_one(self):
-        """FPTAN leaves tan(x) and then 1.0 on the stack."""
-        self.assertIn("fp_push(1.0);", _lift("fptan", "", [])[0])
+        """FPTAN leaves tan(x) and then 1.0 (NaN for a non-finite x)."""
+        self.assertIn("fp_push(isfinite(_a) ? 1.0 : _a - _a);", _lift("fptan", "", [])[0])
 
 
 if __name__ == "__main__":
