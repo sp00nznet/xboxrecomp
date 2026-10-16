@@ -2582,30 +2582,28 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
  * race frame's triangles went this way.
  *
  * Clipping has to happen in clip space, but the D3D epilogue has already
- * divided x, y and z by w and applied the viewport (c[58] scale, c[59]
- * offset) while leaving w itself alone. So each vertex is taken back to clip
- * space first: clip = (screen - offset) / scale * w. Everything else the
- * vertex carries -- colours, fog, texture coordinates -- is linear in clip
- * space and is interpolated directly. The polygon is clipped against
- * w = NV_CLIP_W (Sutherland-Hodgman, one plane), re-projected, and fanned.
- * ponytail: the near plane only; x/y/far fall to the rasteriser's bounds
+ * divided x, y and z by w and applied the viewport, leaving w alone. Each
+ * vertex is taken to (x*w, y*w, z*w, w): screen = clip / w * scale + offset
+ * makes that an affine image of clip space, so clipping and interpolating
+ * there is exact without knowing the scale. That matters: the viewport is
+ * the title's own business -- c[58]/c[59] for most, but SSX 3's programs
+ * keep it elsewhere and c[58] reads 0, which turned every clipped triangle
+ * into a point. Everything else the vertex carries -- colours, fog, texture
+ * coordinates -- is linear in clip space and is interpolated directly.
+ *
+ * The polygon is clipped against w = NV_CLIP_W and then the near plane
+ * z = 0 (Sutherland-Hodgman), divided back by w, and fanned. The near plane
+ * is screen z = the viewport's z offset (s_xf_o[2], 0 for D3D). Clipping at
+ * w alone let geometry between the eye and the near plane through at huge
+ * screen coordinates: torn streaks at the frame's edges. RECOMP_CLIP_NEAR_Z=0
+ * clips at w only.
+ * ponytail: near planes only; x/y/far fall to the rasteriser's bounds
  * check, which is correct, just slower for huge off-screen triangles. */
 #define NV_CLIP_W 1e-3f
 
-/* The screen-space transform of the current batch, for taking vertices back
- * to clip space: screen = clip.xyz / w * k + o. A program's is the viewport
- * constants c[58] / c[59]; the fixed-function unit's is the offset c[59]
- * (the scale is in the composite matrix). Both are scaled for anti-aliasing,
- * like the vertices. Set by xf_set_viewport() for each batch. */
-static float s_xf_k[3], s_xf_o[3];
-
-static void xf_to_clip(const Nv2aVshOutput *v, const float k[3],
-                       const float o[3], float c[3])
-{
-    int i;
-    for (i = 0; i < 3; i++)
-        c[i] = k[i] != 0.0f ? (v->pos[i] - o[i]) / k[i] * v->pos[3] : 0.0f;
-}
+/* The z offset of the current batch's screen-space transform (the near
+ * plane, see above), scaled like the vertices. Set by xf_set_viewport(). */
+static float s_xf_o[3];
 
 static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
                     Nv2aVshOutput *out)
@@ -2617,49 +2615,74 @@ static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
         po[i] = pa[i] + (pb[i] - pa[i]) * t;
 }
 
+/* Signed distance of a vertex in (x*w, y*w, z*w, w) to clip plane `pl`:
+ * 0 is w = NV_CLIP_W, 1 the near plane. */
+static float xf_clip_dist(const Nv2aVshOutput *v, int pl)
+{
+    return pl == 0 ? v->pos[3] - NV_CLIP_W : v->pos[2] - s_xf_o[2] * v->pos[3];
+}
+
+/* Sutherland-Hodgman: clip polygon in[0..n) against plane pl into out. */
+static int xf_clip_poly(const Nv2aVshOutput *in, int n, int pl,
+                        Nv2aVshOutput *out)
+{
+    int i, m = 0;
+    for (i = 0; i < n; i++) {
+        const Nv2aVshOutput *p = &in[i], *q = &in[(i + 1) % n];
+        float dp = xf_clip_dist(p, pl), dq = xf_clip_dist(q, pl);
+        if (dp >= 0.0f)
+            out[m++] = *p;
+        if ((dp >= 0.0f) != (dq >= 0.0f))
+            xf_lerp(p, q, dp / (dp - dq), &out[m++]);
+    }
+    return m;
+}
+
 static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
                               const Nv2aVshOutput *c)
 {
+    static int near_z = -1;
     const Nv2aVshOutput *in[3];
-    Nv2aVshOutput poly[4], va, vb;
-    float k[3], o[3], ca[3], cb[3];
-    int n = 0, i, j;
+    Nv2aVshOutput p0[8], p1[8];
+    int n = 3, i, j, pl, planes, inside = 1;
 
-    if (a->pos[3] > NV_CLIP_W && b->pos[3] > NV_CLIP_W && c->pos[3] > NV_CLIP_W) {
+    if (near_z < 0) {
+        const char *e = getenv("RECOMP_CLIP_NEAR_Z");
+        near_z = !(e && e[0] == '0');
+    }
+    planes = near_z ? 2 : 1;
+    in[0] = a; in[1] = b; in[2] = c;
+    for (i = 0; i < 3; i++) {
+        p0[i] = *in[i];
+        for (j = 0; j < 3; j++)
+            p0[i].pos[j] = in[i]->pos[j] * in[i]->pos[3];
+        for (pl = 0; pl < planes; pl++) {
+            float d = xf_clip_dist(&p0[i], pl);
+            if (d != d || d - d != 0.0f)
+                return;                       /* not finite: no position at all */
+            if (d < 0.0f)
+                inside = 0;
+        }
+    }
+    if (inside) {
         raster_xf_triangle(a, b, c);
         return;
     }
-    if (a->pos[3] <= NV_CLIP_W && b->pos[3] <= NV_CLIP_W
-        && c->pos[3] <= NV_CLIP_W) {
-        s_gpu.tris_behind++;                  /* wholly behind: nothing */
+    n = xf_clip_poly(p0, n, 0, p1);
+    if (planes > 1 && n)
+        n = xf_clip_poly(p1, n, 1, p0);
+    else
+        memcpy(p0, p1, sizeof p1);
+    if (n < 3) {
+        s_gpu.tris_behind++;                  /* wholly clipped away */
         return;
     }
-    for (i = 0; i < 3; i++) { k[i] = s_xf_k[i]; o[i] = s_xf_o[i]; }
-    in[0] = a; in[1] = b; in[2] = c;
-    for (i = 0; i < 3; i++) {
-        const Nv2aVshOutput *p = in[i], *q = in[(i + 1) % 3];
-        int pin = p->pos[3] > NV_CLIP_W, qin = q->pos[3] > NV_CLIP_W;
-        if (pin) {
-            va = *p;
-            xf_to_clip(p, k, o, ca);
-            for (j = 0; j < 3; j++) va.pos[j] = ca[j];
-            poly[n++] = va;
-        }
-        if (pin != qin) {
-            float t = (NV_CLIP_W - p->pos[3]) / (q->pos[3] - p->pos[3]);
-            va = *p; vb = *q;
-            xf_to_clip(p, k, o, ca);
-            xf_to_clip(q, k, o, cb);
-            for (j = 0; j < 3; j++) { va.pos[j] = ca[j]; vb.pos[j] = cb[j]; }
-            xf_lerp(&va, &vb, t, &poly[n++]);
-        }
-    }
-    /* Back to screen space: divide by the (now positive) w, viewport. */
+    /* Back to screen space: divide by the (now positive) w. */
     for (i = 0; i < n; i++)
         for (j = 0; j < 3; j++)
-            poly[i].pos[j] = poly[i].pos[j] / poly[i].pos[3] * k[j] + o[j];
+            p0[i].pos[j] /= p0[i].pos[3];
     for (i = 1; i + 1 < n; i++)
-        raster_xf_triangle(&poly[0], &poly[i], &poly[i + 1]);
+        raster_xf_triangle(&p0[0], &p0[i], &p0[i + 1]);
 }
 
 /* About 7 MB, so allocated by the first batch that transforms rather than
@@ -2705,17 +2728,7 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 static void xf_set_viewport(void)
 {
     const float *of = nv2a_vsh_constant(59);
-    int i;
 
-    if (batch_uses_program()) {
-        const float *sc = nv2a_vsh_constant(58);
-        for (i = 0; i < 3; i++)
-            s_xf_k[i] = sc[i];
-    } else {
-        s_xf_k[0] = s_xf_k[1] = s_xf_k[2] = 1.0f;
-    }
-    s_xf_k[0] *= s_gpu.aa_sx;
-    s_xf_k[1] *= s_gpu.aa_sy;
     s_xf_o[0] = of[0] * s_gpu.aa_sx;
     s_xf_o[1] = of[1] * s_gpu.aa_sy;
     s_xf_o[2] = of[2];
