@@ -48,6 +48,12 @@ class _Image:
     def get_section_at_va(self, addr):
         return self.section() if SEC_LO <= addr < SEC_HI else None
 
+    def get_section_data(self, sec):
+        # As BinaryImage: the file bytes, then up to 14 bytes of the
+        # loader's zero fill to finish an instruction cut by raw_size.
+        fill = max(min(sec.virtual_size - sec.raw_size, 14), 0)
+        return bytes(sec.raw_size + fill)
+
 
 class _Engine:
     jump_tables = {}
@@ -113,10 +119,24 @@ class AliasBoundsTest(unittest.TestCase):
         self.assertEqual(ends, {0x10F0: SEC_HI})
 
     def test_gap_alias_stops_at_its_sections_backed_bytes(self):
+        # The fill past raw_size only finishes a cut instruction; with none
+        # cut, the bound is the backed bytes, never the virtual tail.
         insns = _code(0x10A0, 0x1120)
         ends = _built(insns, [(0x1000, 0x1010)], {0x10A0: 0x1200},
                       section=_ShortSection)
         self.assertEqual(ends, {0x10A0: SEC_LO + 0xC0})
+
+    def test_gap_alias_keeps_a_ret_cut_by_raw_size(self):
+        # Spartan's D3DX: `leave; ret 0x10` with the ret's last byte in the
+        # zero fill. Clamping at raw_size dropped the ret from the alias.
+        insns = _code(0x10A0, 0x10BC)
+        leave = _Insn(0x10BC)
+        leave.end_address = 0x10BD
+        ret = _Insn(0x10BD, ret=True)
+        ret.end_address = 0x10C0 + 1
+        ends = _built(insns + [leave, ret], [(0x1000, 0x1010)],
+                      {0x10A0: 0x1200}, section=_ShortSection)
+        self.assertEqual(ends, {0x10A0: 0x10C1})
 
     def test_alias_inside_a_function_shares_its_end(self):
         insns = _code(0x1000, 0x1080, rets={0x1024, 0x1044})

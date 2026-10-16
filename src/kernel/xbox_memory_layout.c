@@ -2423,6 +2423,9 @@ RECOMP_TLS uint32_t g_ebp = 0;
  * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
  * in different lifted bodies of the same guest routine. */
 RECOMP_TLS int g_df = 0;
+/* EFLAGS: the image pushfd and popfd use (see recomp_types.h). Bit 1 is
+ * always set and IF is on, as in any guest thread the kernel schedules. */
+RECOMP_TLS uint32_t g_eflags = 0x00000202u;
 
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};

@@ -1133,3 +1133,65 @@ void xbox_PortOut(uint32_t port, uint32_t value, int width)
         fflush(stderr);
     }
 }
+
+/* =========================================================================
+ * cpuid
+ *
+ * The Xbox CPU is a 733 MHz Coppermine-based Pentium III with MMX, FXSR and
+ * SSE, and that is what is reported by default. Leaf 1 eax 0x683 is family
+ * 6, model 8 (Coppermine), stepping 3: one of the Coppermine signatures in
+ * Intel's Pentium III Processor Specification Update. Which stepping the
+ * console ships is not documented, so software should key on family and
+ * model only. The max basic leaf is 2 and there are no extended leaves.
+ * Leaf 1's edx is the P3 feature set (FPU..CMOV, PAT, PSE-36, MMX, FXSR,
+ * SSE).
+ *
+ * Leaf 2 gives the P6 TLB and 16 KB 4-way L1 descriptors (0x01-0x04, 0x08,
+ * 0x0C). The L2 byte is 0, the null descriptor: the console's 128 KB L2 is
+ * reported to be 8-way, and the SDM's 128 KB 32-byte-line descriptor (0x41)
+ * says 4-way, so no L2 is described rather than a wrong one.
+ *
+ * A leaf above the maximum, extended ones included, returns the highest
+ * basic leaf's data: Intel SDM vol. 2A, CPUID, "If a value entered for
+ * CPUID.EAX is higher than the maximum input value for basic or extended
+ * function for that processor then the data for the highest basic
+ * information leaf is returned." So 0x80000000 reads eax 0x03020101, below
+ * 0x80000001, which is how software learns there are no extended leaves.
+ *
+ * RECOMP_CPUID_NO_SIMD=1 is an opt-out for a title whose MMX or SSE paths
+ * do not lift correctly: it clears MMX, FXSR and SSE together (bits 23-25),
+ * so the title takes its scalar path. Masking only MMX would describe a CPU
+ * with SSE but no MMX, which never existed: SSE's integer extensions use
+ * the MMX registers, and FXSAVE/FXRSTOR arrived with SSE to save that state.
+ * ========================================================================= */
+void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
+{
+    static int no_simd = -1;
+
+    if (no_simd < 0) {
+        const char *e = getenv("RECOMP_CPUID_NO_SIMD");
+        no_simd = e && *e && *e != '0';
+    }
+    (void)subleaf;
+    out[0] = out[1] = out[2] = out[3] = 0;
+    if (leaf > 2)
+        leaf = 2;
+    switch (leaf) {
+    case 0:
+        out[0] = 2;
+        out[1] = 0x756E6547u;   /* "Genu" */
+        out[3] = 0x49656E69u;   /* "ineI" */
+        out[2] = 0x6C65746Eu;   /* "ntel" */
+        break;
+    case 1:
+        out[0] = 0x00000683u;
+        out[3] = 0x0383F9FFu;
+        if (no_simd)
+            out[3] &= ~0x03800000u;     /* MMX, FXSR, SSE */
+        break;
+    default:
+        out[0] = 0x03020101u;
+        out[3] = 0x0C040800u;   /* L1 D, DTLB 4M, L1 I, no L2 */
+        break;
+    }
+}

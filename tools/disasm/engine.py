@@ -76,6 +76,32 @@ class Instruction:
         return d
 
 
+def _file_end(section, data) -> int:
+    """VA where a section's file bytes end.
+
+    get_section_data appends a little of the loader's zero fill so that an
+    instruction starting in the file bytes can finish (BinaryImage
+    .get_section_data says why). No instruction may start in that fill:
+    decoding it would hand every title zeros dressed up as code.
+
+    linear_sweep and decode_at are the only places that insert into
+    `instructions`, so they are the only ones that need this bound. The
+    other readers of get_section_data only test bytes: the prologue-shape
+    and terminator helpers here decode zeros as `add [eax], al`, which is
+    neither; the prologue and CC-padding passes in functions.py match
+    nothing in zeros and only add candidates at addresses already decoded.
+    labels.py's string scan reads .rdata, which XBEs flag executable, so it
+    gets the fill too: a string running up to .rdata's raw end now finds
+    its terminator in the fill and gets a label, as the loaded image would
+    have it. The gap-alias clamp in functions.py ends an alias past raw_size
+    only at the end of the instruction that crosses it, or at raw_size.
+    """
+    raw = getattr(section, "raw_size", None)
+    if raw is None:
+        raw = len(data)
+    return section.virtual_addr + min(raw, len(data))
+
+
 class DisasmEngine:
     """
     x86-32 disassembly engine backed by Capstone.
@@ -105,6 +131,12 @@ class DisasmEngine:
         # when the displacement is not the table's first slot.
         self._jt_sites: Dict[int, List[Tuple[int, int]]] = {}
         self._jt_base: Dict[int, int] = {}
+        # Byte-sized tables read through an index, `movzx eax, byte ptr
+        # [eax + disp]`. MSVC's two-level switch maps a sparse case value to a
+        # dense arm number this way and parks the byte table straight after
+        # the dword table it feeds. disp -> addresses of the reads, so that
+        # index_table_length() can find the bound check in front of one.
+        self.byte_tables: Dict[int, List[int]] = {}
 
     def _classify_instruction(self, cs_insn: CsInsn) -> Instruction:
         """Convert a Capstone instruction to our Instruction type."""
@@ -157,6 +189,19 @@ class DisasmEngine:
                         self._jt_sites.setdefault(disp, []).append(
                             (insn.address, insn.end_address))
 
+            # Only the widening loads. `cmp byte ptr [esi + disp], 0` reads a
+            # byte field of a static struct, not an index table.
+            if mnemonic in ("movzx", "movsx") and len(operands) == 2:
+                src = operands[1]
+                if (src.type == CS_OP_MEM and src.size == 1
+                        and (src.mem.index != 0 or src.mem.base != 0)):
+                    disp = src.mem.disp & 0xFFFFFFFF
+                    if self.image.base_address <= disp < (
+                            self.image.base_address
+                            + self.image.image_size):
+                        self.byte_tables.setdefault(disp, []).append(
+                            insn.address)
+
             # Check for memory references in non-branch instructions
             if not (insn.is_call or insn.is_branch) and insn.memory_ref is None:
                 for operand in operands:
@@ -200,7 +245,8 @@ class DisasmEngine:
             return 0
 
         va_start = section.virtual_addr
-        total = len(data)
+        file_end = _file_end(section, data)
+        total = file_end - va_start
         count = 0
         offset = 0
 
@@ -211,6 +257,8 @@ class DisasmEngine:
             last_end_offset = offset
 
             for cs_insn in self._cs.disasm(chunk, chunk_va):
+                if cs_insn.address >= file_end:
+                    break  # the loader's zero fill finishes, never starts, code
                 insn = self._classify_instruction(cs_insn)
                 self.instructions[insn.address] = insn
                 count += 1
@@ -341,6 +389,49 @@ class DisasmEngine:
 
         return resynced
 
+    def index_table_length(self, table: int) -> Optional[int]:
+        """Entries in the byte index table at `table`, read from the bound
+        check in front of a load from it, or None when there is none.
+
+        MSVC guards the load with the switch range:
+
+            cmp  eax, N
+            ja   default
+            movzx eax, byte ptr [eax + table]
+            jmp  dword ptr [eax*4 + arms]
+
+        so the index is 0..N and the table holds N + 1 bytes.
+        """
+        for site in self.byte_tables.get(table, ()):
+            ja = self._instruction_ending_at(site)
+            if ja is None or ja.mnemonic.lower() not in ("ja", "jae"):
+                continue
+            cmp = self._instruction_ending_at(ja.address)
+            if cmp is None or cmp.mnemonic.lower() != "cmp":
+                continue
+            _, _, imm = cmp.op_str.replace(" ", "").partition(",")
+            try:
+                bound = int(imm, 0)
+            except ValueError:
+                continue
+            if bound < 0:
+                continue
+            return bound + 1 if ja.mnemonic.lower() == "ja" else bound
+        return None
+
+    def _instruction_ending_at(self, addr: int) -> Optional[Instruction]:
+        for back in range(1, 16):
+            insn = self.instructions.get(addr - back)
+            if insn is not None and insn.end_address == addr:
+                return insn
+        return None
+
+    def is_jump_table_ref(self, addr: int) -> bool:
+        """Does some `jmp [reg*4 + disp]` name `addr` as its table, measured
+        or not? resync_jump_tables skips tables shorter than min_entries, but
+        they are still tables."""
+        return addr in self._jt_candidates
+
     def jump_table_entries(self, tbl: int) -> List[int]:
         """Code pointers held by a resynced jump table, or [] if unknown."""
         tbl = self._jt_base.get(tbl, tbl)
@@ -391,12 +482,15 @@ class DisasmEngine:
             return 0
 
         offset = addr - section.virtual_addr
-        if offset < 0 or offset >= len(data):
+        file_end = _file_end(section, data)
+        if offset < 0 or addr >= file_end:
             return 0
 
         added = 0
         overlaps = set()
         for cs_insn in self._cs.disasm(data[offset:], addr):
+            if cs_insn.address >= file_end:
+                break
             if cs_insn.address != addr and cs_insn.address in self.instructions:
                 break  # resynced with the existing stream
             if replace_overlaps:
@@ -481,9 +575,38 @@ class DisasmEngine:
         function has them. So is a switch dispatch through a table that
         resync_jump_tables has measured: the probe continues in its arms.
         """
+        return self._probe_straight_line(addr, max_insns) == ("ret", None)
+
+    def probe_tail_call(self, addr: int,
+                        max_insns: int = 64) -> Optional[int]:
+        """
+        Where the body at `addr` tail-jumps, when the walk
+        probes_as_returning_body makes ends in a direct `jmp` out of the window
+        rather than a ret. None otherwise.
+
+        The tail jump on its own is not evidence -- data disassembles into a
+        stray `jmp` readily -- so this only reports the destination. A caller
+        that finds it is the exact start of a known function has a body that
+        ends in "return f(...)", which is how MSVC emits frameless wrappers and
+        the `mov eax, <FuncInfo>; jmp __CxxFrameHandler` handler thunks.
+        """
+        kind, target = self._probe_straight_line(addr, max_insns)
+        return target if kind == "tail" else None
+
+    def _probe_straight_line(self, addr: int, max_insns: int):
+        """Shared walk for the two probes above.
+
+        Returns ("ret", None), ("tail", target) for a direct jmp that leaves
+        the window or goes backwards, or (None, None) for anything else.
+
+        A walk that crossed int3 never counts as a tail call: it started in
+        alignment padding and ran into the function after it. One title has
+        an immediate naming the last int3 before a function that tail-jumps.
+        """
+        crossed_padding = False
         section = self.image.get_section_at_va(addr)
         if section is None or not section.executable:
-            return False
+            return None, None
         count = 0
         resume = addr
         # One pass per straight-line segment. A segment ends at a ret (yes),
@@ -497,15 +620,17 @@ class DisasmEngine:
         while resume is not None and count < max_insns:
             data = self.image.read_bytes_at_va(resume, (max_insns - count) * 8)
             if not data:
-                return False
+                return None, None
             limit = resume + len(data)
             start = resume
             resume = None
             for decoded in self._cs.disasm(data, start):
                 count += 1
                 mnemonic = decoded.mnemonic.lower()
+                if mnemonic == "int3":
+                    crossed_padding = True
                 if mnemonic in config.RET_MNEMONICS:
-                    return True
+                    return "ret", None
                 if mnemonic in config.JMP_MNEMONICS:
                     # An unconditional jump forward, still inside the window
                     # being probed, is ordinary control flow -- MSVC emits it
@@ -520,24 +645,26 @@ class DisasmEngine:
                     try:
                         ops = decoded.operands
                     except Exception:
-                        return False
+                        return None, None
                     if not ops:
-                        return False
+                        return None, None
                     if ops[0].type == CS_OP_MEM and ops[0].mem.index != 0:
                         arm = self._first_arm_after(
                             ops[0].mem.disp & 0xFFFFFFFF, decoded.address)
                         if arm is None:
-                            return False
+                            return None, None
                         resume = arm
                         break
                     if ops[0].type != CS_OP_IMM:
-                        return False
+                        return None, None
                     target = ops[0].imm & 0xFFFFFFFF
                     if not (decoded.address < target < limit):
-                        return False
+                        if crossed_padding:
+                            return None, None
+                        return "tail", target
                 if count >= max_insns:
-                    return False
-        return False
+                    return None, None
+        return None, None
 
     def probes_as_callback_body(self, addr: int, upper: int,
                                 lower: Optional[int] = None,

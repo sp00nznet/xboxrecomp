@@ -319,6 +319,10 @@ Wreckless did exactly this and reached its main loop with no renderer set up.
 - `RECOMP_WATCH=<va>` names the guest code that writes a value (a callback
   table slot, a "ready" flag); `RECOMP_UNIMPL_TRAP=1` stops at the first
   untranslated instruction that is actually reached.
+- `RECOMP_STUB_LOG=1` prints each unresolved stub (code no pass found, in
+  `recomp_stubs_unresolved.c`) the first time it runs, with the return address
+  and esp. Reaching one skips that code, so a stall or a wrong value far
+  downstream can start there.
 
 A shim that makes a wait return without making the thing it waits for happen
 usually moves the stall rather than fixing it. Find the probe that failed.

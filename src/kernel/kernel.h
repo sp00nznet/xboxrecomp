@@ -1127,6 +1127,10 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
  * parity that the field pin (port 0x80C0) reports. */
 uint32_t xbox_VblankCount(void);
 
+/* cpuid for lifted code (kernel_hal.c): the Xbox's Pentium III. Also declared
+ * in templates/runtime/recomp_types.h for generated code. */
+void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
+
 #ifdef __cplusplus
 }
 #endif

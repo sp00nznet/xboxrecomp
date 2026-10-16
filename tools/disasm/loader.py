@@ -23,6 +23,11 @@ DATA_SECTION_NAMES = frozenset({
 })
 
 
+# The longest x86 instruction the decoder accepts. tools/recomp/config.py
+# keeps its own copy for the lifter's readable end; the two must agree.
+MAX_INSN_LEN = 15
+
+
 @dataclass
 class SectionInfo:
     """Parsed section metadata."""
@@ -118,8 +123,28 @@ class BinaryImage:
         return struct.unpack_from('<I', data)[0]
 
     def get_section_data(self, section: SectionInfo) -> bytes:
-        """Get the raw bytes for a section."""
-        return self.raw_data[section.raw_addr:section.raw_addr + section.raw_size]
+        """Get the bytes for a section, as the loader maps them.
+
+        The XBE loader zero-fills a section from raw_size up to virtual_size,
+        and linkers rely on it: Spartan's D3DX section (XDK 5849) has a raw
+        size that stops one byte short of its last instruction, the
+        `ret 0x10` of D3DXMatrixLookAtLH, whose immediate's high byte is that
+        zero fill. Cut at raw_size, the ret fails to decode, the function
+        ends at `leave`, and the translated body returns without popping its
+        return address and arguments -- the caller's callee-saved registers
+        then come back as stack garbage.
+
+        Code sections get just enough of the fill to finish an instruction
+        that starts in the file bytes (an x86 instruction is at most 15
+        bytes); more would hand the sweeps zeros to decode as code.
+        """
+        data = self.raw_data[section.raw_addr:section.raw_addr + section.raw_size]
+        # A BSS-only section (no file bytes) has nothing to finish.
+        if (section.executable and section.raw_size > 0
+                and section.virtual_size > section.raw_size):
+            data += bytes(min(section.virtual_size - section.raw_size,
+                              MAX_INSN_LEN - 1))
+        return data
 
     def get_kernel_import_at_thunk(self, thunk_addr: int) -> Optional[KernelImport]:
         """Look up a kernel import by its thunk address."""

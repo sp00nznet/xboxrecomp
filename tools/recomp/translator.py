@@ -486,6 +486,12 @@ class FunctionTranslator:
         self._weak_function_starts = set()
         self._reach_memo = {}
         self._ownership_ready = False
+        # (start, end) bodies already reported as ending past their code
+        # section's readable bytes, so each is named once.
+        self._unreadable_reported = set()
+        # (end, last instruction) of cut bodies already warned about: the
+        # tail_jump_aliases that share a cut parent's end would repeat it.
+        self._teardown_reported = set()
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover callbacks and the gap entries their bodies reference."""
@@ -662,7 +668,9 @@ class FunctionTranslator:
                          if s.va <= target < s.va + s.va_size), None)
             if home is None:
                 continue
-            bound = home.va + min(home.va_size, home.raw_size)
+            # readable_end: a callback whose last instruction crosses the
+            # raw end into the loader's zero fill keeps that instruction.
+            bound = min(home.va + home.va_size, _config.readable_end(home))
             if next_start is not None:
                 bound = min(bound, next_start)
             if bound <= target:
@@ -928,7 +936,7 @@ class FunctionTranslator:
         sections = [section for section in _config._SECTIONS
                     if section.is_code and section.va <= target
                     and end <= section.va + section.va_size
-                    and end <= section.va + section.raw_size]
+                    and end <= _config.readable_end(section)]
         if not sections:
             reject("extent is not backed by one code section")
 
@@ -965,7 +973,7 @@ class FunctionTranslator:
         # checks below still fail closed if decoded code reaches past ``end``.
         current_starts = sorted(self.func_db)
         next_index = bisect.bisect_left(current_starts, end)
-        analysis_end = min(sections[0].va + sections[0].raw_size,
+        analysis_end = min(_config.readable_end(sections[0]),
                            sections[0].va + sections[0].va_size)
         if next_index < len(current_starts):
             analysis_end = min(analysis_end, current_starts[next_index])
@@ -1446,6 +1454,11 @@ class FunctionTranslator:
         if following >= len(bounds) or bounds[following] <= end:
             return None
         upper = bounds[following]
+        # The next start can be in the next section (Spartan's last D3D
+        # function before D3DX); the arms and tables never are.
+        section = _config.section_at(start)
+        if section is not None and section.is_code:
+            upper = min(upper, _config.readable_end(section))
         raw_bytes = self._read_func_bytes(start, end)
         if not raw_bytes or not any(
                 insn.mnemonic == "jmp" and insn.jump_target is None
@@ -1690,10 +1703,35 @@ class FunctionTranslator:
         return backward + forward
 
     def _read_func_bytes(self, start_va, end_va):
-        """Read raw bytes for a function from the XBE."""
+        """Read raw bytes for a function from the XBE.
+
+        Past raw_size the loader zero-fills every section, and the file bytes
+        there belong to whatever follows the section on disk, so the read is
+        zero-filled; the disassembler decodes the same zeros (a FORCE_DATA
+        *Xlate section is flagged executable and gets the fill too). A code
+        section is readable for one instruction past raw_size
+        (config.readable_end); a body ending further comes from a bad seed
+        or coalesce request, not from the detector, so it is refused.
+        """
         offset = va_to_file_offset(start_va)
         if offset is None:
             return None
+        section = _config.section_at(start_va)
+        raw_end = section.va + section.raw_size if section else end_va
+        if section is not None and end_va > raw_end:
+            readable = _config.readable_end(section)
+            if section.is_code and end_va > readable:
+                key = (start_va, end_va)
+                if key not in self._unreadable_reported:
+                    self._unreadable_reported.add(key)
+                    print(f"  WARN: sub_{start_va:08X} ends at 0x{end_va:08X}, "
+                          f"past {section.name}'s readable end "
+                          f"0x{readable:08X}; not read", file=sys.stderr)
+                return None
+            file_end = section.raw_addr + section.raw_size
+            if file_end > len(self.xbe_data):
+                return None
+            return self.xbe_data[offset:file_end] + bytes(end_va - raw_end)
         size = end_va - start_va
         if offset + size > len(self.xbe_data):
             return None
@@ -1730,6 +1768,10 @@ class FunctionTranslator:
                 cc = m[3:]
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
+            elif m in ("pushfd", "lahf"):
+                # Both copy CF out of the tracked setter, through _cf when
+                # that setter keeps its carry there.
+                cc = "b"
             if (cc in FunctionTranslator._CARRY_CC
                     and (last_setter in CF_TRACKED
                          or last_setter in ("inc", "dec")
@@ -1743,7 +1785,8 @@ class FunctionTranslator:
                 # after one needs it declared. Anything else starting "rep"
                 # (movs/stos) leaves the flags and the setter alone.
                 last_setter = "rep-compare"
-            elif m in _FLAGS_UNDEFINED:
+            elif m in _FLAGS_UNDEFINED or m == "popfd":
+                # A carry test after popfd reads g_eflags, not _cf.
                 last_setter = None
         return False
 
@@ -1755,6 +1798,29 @@ class FunctionTranslator:
                 instructions[0].op_str == "ebp" and
                 instructions[1].mnemonic == "mov" and
                 instructions[1].op_str == "ebp, esp")
+
+    def _func_has_offset_frame(self, instructions):
+        """Check for MSVC's offset frame: push ebp; lea ebp, [esp +/- N].
+
+        MSVC biases ebp into a large frame so more locals fit in a signed
+        8-bit displacement: "push ebp; lea ebp, [esp-0x70]; sub esp, 0x274;
+        ... add ebp, 0x70; leave". The frame is as real as a classic one, and
+        it has to be published across calls for the same reasons -- most
+        sharply for setjmp, which saves g_seh_ebp into the jmp_buf. Left
+        unpublished, that slot held the caller's frame, so the longjmp resumed
+        with the wrong ebp and the "add ebp, N; leave" epilogue returned with
+        esp moved. One case is libjpeg's error recovery in D3DX's JPEG
+        loader: a texture that is not a JPEG longjmps out, the loader returns
+        0x90 bytes high, and the caller pops ebx = 0xFFFFFFFF and spins
+        forever counting a mip chain that never meets it.
+        """
+        if len(instructions) < 2:
+            return False
+        return (instructions[0].mnemonic == "push" and
+                instructions[0].op_str == "ebp" and
+                instructions[1].mnemonic == "lea" and
+                instructions[1].op_str.replace(" ", "").startswith(
+                    ("ebp,[esp+", "ebp,[esp-")))
 
     def _func_owns_a_frame(self, instructions):
         """True when the function has a frame, however it got one.
@@ -1774,6 +1840,8 @@ class FunctionTranslator:
         a pointer.
         """
         if self._func_has_prologue(instructions):
+            return True
+        if self._func_has_offset_frame(instructions):
             return True
         seh_prologs = _seh_prologs_of(self.lifter)
         if not seh_prologs:
@@ -2493,6 +2561,25 @@ class FunctionTranslator:
         if ((continues_past_end or bypasses_to_end) and end in self.func_db
                 and end not in self.owned_function_starts):
             fallthrough_target = end
+        # `leave` and `pop ebp` tear a frame down and in compiler output only
+        # ever precede a ret, so a body that ends on one with nowhere to fall
+        # is cut short, not data: Spartan's D3DXMatrixLookAtLH lost its
+        # `ret 0x10` to a raw size one byte short, and its translation
+        # returned without popping its arguments. Generation goes on, but say
+        # so -- the caller's callee-saved registers come back as stack garbage.
+        if (continues_past_end and fallthrough_target is None
+                and (last_insn.mnemonic == "leave"
+                     or (last_insn.mnemonic == "pop"
+                         and last_insn.op_str.strip() == "ebp"))
+                and (end, last_insn.address) not in self._teardown_reported):
+            self._teardown_reported.add((end, last_insn.address))
+            section = _config.section_at(start)
+            raw_end = (f"0x{section.va + section.raw_size:08X}"
+                       if section else "unknown")
+            text = f"{last_insn.mnemonic} {last_insn.op_str}".strip()
+            print(f"  WARN: sub_{start:08X} ends on `{text}` at "
+                  f"0x{last_insn.address:08X} with no terminator "
+                  f"(section raw end {raw_end})", file=sys.stderr)
 
         # Ensure ebp tracked if function has tail jumps (lifter emits
         # g_seh_ebp = ebp before external jmp, external jcc, and indirect jmp,
@@ -3528,11 +3615,40 @@ class BatchTranslator:
             stub_lines.append(
                 " * esp off by N on every call. */")
             stub_lines.append("")
+            # A stub skips whatever code really lives at its address, so one
+            # reached at runtime is a likely cause of a silent stall or a wrong
+            # result far downstream. RECOMP_STUB_LOG=1 names each stub the
+            # first time it runs, with the return address on the guest stack
+            # (for a tail jump, that is the caller's caller). Off by default:
+            # the check is one cached getenv per stub per process.
+            stub_lines += [
+                "#include <stdio.h>",
+                "#include <stdlib.h>",
+                "",
+                "static int recomp_stub_log_on(void)",
+                "{",
+                "    static int on = -1;",
+                "    if (on < 0) {",
+                '        const char *e = getenv("RECOMP_STUB_LOG");',
+                "        on = e && *e && *e != '0';",
+                "    }",
+                "    return on;",
+                "}",
+                "",
+                "#define RECOMP_STUB_HIT(va) do { static int _seen; \\",
+                "    if (!_seen && recomp_stub_log_on()) { _seen = 1; \\",
+                '        fprintf(stderr, "[STUB] unresolved 0x%08X reached, " \\',
+                '                "return 0x%08X esp 0x%08X\\n", (unsigned)(va), \\',
+                "                (unsigned)MEM32(g_esp), (unsigned)g_esp); \\",
+                "        fflush(stderr); } } while (0)",
+                "",
+            ]
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"void {unresolved[addr]}(void) {{ "
+                    f"RECOMP_STUB_HIT(0x{addr:08X}u); g_esp += {4 + popped}; "
                     f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
