@@ -126,9 +126,11 @@ static void wr32(uint32_t va, uint32_t v);
 #define PORT_W_PPS_SET_POWER    0x00000100u   /* SetPortPower                */
 #define PORT_W_CLEAR_POWER      0x00000200u   /* ClearPortPower              */
 
-/* The MCPX gives each controller a small root hub. Two ports apiece covers
- * the console's four front sockets, which is what a title enumerates over. */
-#define OHCI_PORTS              2
+/* The root hub the pads are plugged into. With four ports XAPI numbers the
+ * controller slots from them as root port 3 = controller port 1 (player 1),
+ * 4 = 2, 1 = 3, 2 = 4 -- measured: SSX 3's debug quick-start menu reads
+ * controller slot 0 only, and saw the pad only on root port 3. */
+#define OHCI_PORTS              4
 
 /* Passes this thread will keep an interrupt back while the guest is at
  * DISPATCH_LEVEL or above. One pass is the OHCI_TICK_MS (4 ms) loop tick, so
@@ -175,9 +177,8 @@ static OhciController s_hc[2];
  * it starts from decides whether a pad shows up as player 1 or player 3 --
  * a mapping worth finding by measurement, not by assertion. */
 static int s_device_hc;
-/* Downstream ports the root hub reports in HcRhDescriptorA. Two is what the
- * MCPX's own hubs have; RECOMP_USB_NDP exists because which slot XAPI gives a
- * pad is decided somewhere in here and the mapping is worth measuring. */
+/* Downstream ports the root hub reports in HcRhDescriptorA (RECOMP_USB_NDP,
+ * 1-4). Which slot XAPI gives a pad is decided by its port: see OHCI_PORTS. */
 static unsigned s_ndp = OHCI_PORTS;
 static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_enabled;
@@ -1064,11 +1065,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * arrives. */
         if (!plugged && (enable & INTR_RHSC)) {
             /* Which port the device appears on decides which controller slot
-             * XAPI assigns it, and a title that reads "player 1" looks at slot
-             * 0. RECOMP_USB_PORT picks it (0..1 on this controller) so the
-             * mapping can be found by measurement rather than assumed. */
+             * XAPI assigns it, and a title that reads "player 1" without
+             * asking which port pressed Start looks at slot 0. The default is
+             * root port 3 (index 2), controller port 1, when there are four;
+             * RECOMP_USB_PORT (0..3) picks another. */
             const char *pspec = getenv("RECOMP_USB_PORT");
-            unsigned port = pspec ? (unsigned)atoi(pspec) : 0u;
+            unsigned port = pspec ? (unsigned)atoi(pspec) : (s_ndp >= 4 ? 2u : 0u);
             if (port >= s_ndp) port = s_ndp - 1u;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
@@ -1076,7 +1078,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             s_plugged_pads = 1;
             first_port = port;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port 1\n", waited * 20);
+                            "arriving on port %u\n", waited * 20, port + 1);
             fflush(stderr);
         }
 
