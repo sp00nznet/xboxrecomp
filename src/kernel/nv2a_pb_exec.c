@@ -342,6 +342,11 @@ static struct {
     int xf_nfmt, xf_seeded;
     uint32_t depth_test, depth_func, depth_mask;
     uint32_t zeta_offset, zstencil_clear;
+    /* SET_CLEAR_RECT_HORIZONTAL / _VERTICAL (x0 | x1 << 16, inclusive):
+     * the area CLEAR_SURFACE covers on a swizzled surface (clear_surface).
+     * clear_rect_set: whether the title has sent them at all. */
+    uint32_t clear_rect_h, clear_rect_v;
+    int clear_rect_set;
     /* Fixed-function transform: the composite matrix (world * view *
      * projection * viewport, as D3D uploads it) and whether the title has
      * sent one. The viewport offset is the constant-file entry c[59]. */
@@ -846,6 +851,31 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
     return ok;
 }
 
+/* Swizzled colour surfaces (SURFACE_FORMAT type 2, log2 width/height in bits
+ * 16-19/24-27): render-to-texture. The pixel at (x, y) lives at the same
+ * Morton offset a swizzled texture of that size uses, so the texture sampler
+ * reads back what was drawn. Written row-major instead, every render target a
+ * title samples later comes back scrambled -- SSX 3 draws six 128x128 rider
+ * shadow maps per frame and projects them onto the snow. s_swz_* are set with
+ * the surface, before the batch's pixels. RECOMP_SWIZZLED_RT=0 writes
+ * row-major. */
+static int s_swz_on;
+static uint32_t s_swz_mx, s_swz_my;
+
+static void surface_swizzle_update(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_SWIZZLED_RT");
+        enabled = !(e && e[0] == '0');
+    }
+    s_swz_on = enabled && ((s_gpu.format >> 8) & 0xF) == 2;
+    if (s_swz_on)
+        xbox_swizzle_masks(1u << ((s_gpu.format >> 16) & 0xF),
+                           1u << ((s_gpu.format >> 24) & 0xF),
+                           &s_swz_mx, &s_swz_my);
+}
+
 static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
@@ -880,6 +910,35 @@ static void clear_surface(uint32_t param)
         s_gpu.color_base = base;
     }
 
+    surface_swizzle_update();
+    if (s_swz_on) {
+        /* The clear covers CLEAR_RECT, not the surface clip: SSX 3 clears
+         * its 128x128 shadow maps whole but draws them through a 124x124
+         * clip, and samples them clamped -- the ring the clip leaves must be
+         * the clear colour, or everything outside a shadow is dark. */
+        uint8_t *base = mem + s_gpu.color_base;
+        uint32_t sw = 1u << ((s_gpu.format >> 16) & 0xF);
+        uint32_t sh = 1u << ((s_gpu.format >> 24) & 0xF);
+        uint32_t x0 = s_gpu.clip_x, x1 = s_gpu.clip_x + s_gpu.clip_w;
+        uint32_t y0 = s_gpu.clip_y, y1 = s_gpu.clip_y + s_gpu.clip_h;
+        uint16_t v16 = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
+                                | ((s_gpu.clear_color >> 5) & 0x07E0)
+                                | ((s_gpu.clear_color >> 3) & 0x001F));
+        if (s_gpu.clear_rect_set) {
+            x0 = s_gpu.clear_rect_h & 0xFFFF; x1 = (s_gpu.clear_rect_h >> 16) + 1;
+            y0 = s_gpu.clear_rect_v & 0xFFFF; y1 = (s_gpu.clear_rect_v >> 16) + 1;
+        }
+        if (x1 > sw) x1 = sw;
+        if (y1 > sh) y1 = sh;
+        for (y = y0; y < y1; y++)
+            for (x = x0; x < x1; x++) {
+                size_t i = swizzle_deposit(x, s_swz_mx) | swizzle_deposit(y, s_swz_my);
+                if (bpp == 4)
+                    ((uint32_t *)base)[i] = s_gpu.clear_color;
+                else if (bpp == 2)
+                    ((uint16_t *)base)[i] = v16;
+            }
+    } else
     for (y = 0; y < s_gpu.clip_h; y++) {
         uint8_t *row = mem + s_gpu.color_base
                      + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
@@ -1330,9 +1389,24 @@ static void dump_texture_bmp(uint32_t seq)
  * playback rate. */
 static uint8_t *s_surface;          /* host address of surface row 0 */
 
+/* Element index of pixel (x, y) in the current colour surface, relative to
+ * the `row` it sets: the row itself, or the surface base for a swizzled one. */
+static inline size_t surface_index(int x, int y, uint8_t **row)
+{
+    if (s_swz_on) {
+        *row = s_surface;
+        return swizzle_deposit((uint32_t)x, s_swz_mx)
+             | swizzle_deposit((uint32_t)y, s_swz_my);
+    }
+    *row = s_surface + (size_t)y * s_gpu.pitch;
+    return (size_t)x;
+}
+
 static int surface_begin_batch(const uint8_t *mem)
 {
     uint32_t base = dma_resolve(s_gpu.color_offset);
+
+    surface_swizzle_update();
 
     if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return 0;
@@ -1374,6 +1448,7 @@ static void blend_factor(uint32_t f, const float s[4], const float d[4],
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
     uint8_t *row;
+    size_t xi;
 
     (void)mem;
     if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
@@ -1383,7 +1458,7 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     s_gpu.pixels++;
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
-    row = s_surface + (size_t)y * s_gpu.pitch;
+    xi = surface_index(x, y, &row);
 
     /* Blending, with the GL factor set and equations the NV2A takes.
      *
@@ -1397,9 +1472,9 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         float sc[4], dc[4], sf[4], df[4], out[4];
         int k;
         if (bpp == 4) {
-            dst = ((const uint32_t *)row)[x];
+            dst = ((const uint32_t *)row)[xi];
         } else if (bpp == 2) {
-            uint32_t t = ((const uint16_t *)row)[x];
+            uint32_t t = ((const uint16_t *)row)[xi];
             dst = 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
                 | ((t & 0x001Fu) << 3);
         }
@@ -1432,17 +1507,17 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         if (keep == 0xFFFFFFFFu)
             return;
         if (bpp == 4) {
-            old = ((const uint32_t *)row)[x];
+            old = ((const uint32_t *)row)[xi];
         } else {
-            uint32_t t = ((const uint16_t *)row)[x];
+            uint32_t t = ((const uint16_t *)row)[xi];
             old = ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5) | ((t & 0x001Fu) << 3);
         }
         argb = (argb & ~keep) | (old & keep);
     }
     if (bpp == 4) {
-        ((uint32_t *)row)[x] = argb;
+        ((uint32_t *)row)[xi] = argb;
     } else if (bpp == 2) {
-        ((uint16_t *)row)[x] = (uint16_t)(((argb >> 8) & 0xF800)
+        ((uint16_t *)row)[xi] = (uint16_t)(((argb >> 8) & 0xF800)
                                         | ((argb >> 5) & 0x07E0)
                                         | ((argb >> 3) & 0x001F));
     }
@@ -3570,6 +3645,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_SURFACE_FORMAT:
         s_gpu.format = param;
         surface_apply_clip();
+        break;
+    case 0x1D98:                       /* SET_CLEAR_RECT_HORIZONTAL */
+        s_gpu.clear_rect_h = param;
+        s_gpu.clear_rect_set = 1;
+        break;
+    case 0x1D9C:                       /* SET_CLEAR_RECT_VERTICAL */
+        s_gpu.clear_rect_v = param;
+        s_gpu.clear_rect_set = 1;
         break;
     case NV097_SET_SURFACE_PITCH:
         s_gpu.pitch = param & 0xFFFF;      /* colour pitch; zeta is the top half */
