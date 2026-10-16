@@ -12,6 +12,7 @@
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
+#include "../input/xinput_xbox.h"   /* xbox_InputSetState: rumble */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -642,14 +643,36 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             moved = n;
         }
     } else {
-        /* OUT: the status stage of an IN control transfer, or rumble. Both
-         * are accepted and discarded -- but only the control pipe's ends a
-         * control transfer. A rumble packet on endpoint 2 used to clear the
-         * pending setup too, so a force-feedback write landing between a
-         * control request's stages broke that request; Burnout 3 starts its
-         * engine-rev rumble on the Crash countdown and then paused with the
-         * pad unresponsive. */
+        /* OUT: the status stage of an IN control transfer, or rumble. Only
+         * the control pipe's ends a control transfer. A rumble packet on
+         * endpoint 2 used to clear the pending setup too, so a force-feedback
+         * write landing between a control request's stages broke that
+         * request; Burnout 3 starts its engine-rev rumble on the Crash
+         * countdown and then paused with the pad unresponsive. */
         moved = len;
+        /* Rumble: an XID output report -- 00 06, left motor, right motor
+         * (16-bit each) -- on the interrupt OUT endpoint, or as the data of
+         * a SET_REPORT (21 09) on the control pipe. Forwarded to the host
+         * pad; RECOMP_RUMBLE=0 ignores it. */
+        if (len >= 6 && guest_ptr(cbp, 6u)
+            && (endpoint != 0 || (g_setup_pending && g_setup.bmRequestType == 0x21
+                                  && g_setup.bRequest == 0x09))) {
+            static int rumble = -1;
+            const uint8_t *r = (const uint8_t *)guest_ptr(cbp, 6u);
+            if (rumble < 0) {
+                const char *e = getenv("RECOMP_RUMBLE");
+                rumble = !(e && *e == '0');
+            }
+            if (rumble && r[0] == 0x00 && r[1] >= 6) {
+                XBOX_VIBRATION v;
+                v.wLeftMotorSpeed  = (WORD)(r[2] | r[3] << 8);
+                v.wRightMotorSpeed = (WORD)(r[4] | r[5] << 8);
+                if (s_trace)
+                    fprintf(stderr, "  [OHCI%d] rumble pad %d left %u right %u (ep %u)\n",
+                            hc->index, pad, v.wLeftMotorSpeed, v.wRightMotorSpeed, endpoint);
+                xbox_InputSetState((DWORD)pad, &v);
+            }
+        }
         if (endpoint == 0) {
             g_setup_pending = 0;
             s_n_out_ep0++;
