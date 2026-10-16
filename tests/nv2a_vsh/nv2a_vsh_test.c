@@ -63,6 +63,35 @@ int main(void)
                o.pos[0], o.pos[1], o.pos[2], o.pos[3]);
         return 1;
     }
+
+    /* The colour outputs are clamped to 0..1, as the NV2A does before it
+     * interpolates them: mov oD0, c[0] / mov oD1, -c[0] with c[0] out of
+     * range. Lighting programs push oD0 well above 1, and unclamped every
+     * lit model came out washed out. */
+    {
+        uint32_t d0[4] = {0}, d1[4] = {0};
+        const float c0[4] = {2.0f, -1.0f, 0.5f, 1.0f};
+        d0[1] = (1u << 21);                     /* MAC mov, c[0] */
+        src(d0, 0, C, 0, XYZW);
+        d0[3] |= (0xFu << 12) | (1u << 11) | (3u << 3);         /* oD0 = o[3] */
+        d1[1] = (1u << 21);
+        src(d1, 0, C, 0, XYZW);
+        d1[1] |= 1u << 8;                       /* negate a */
+        d1[3] |= (0xFu << 12) | (1u << 11) | (4u << 3) | 1u;    /* oD1 = o[4], final */
+        nv2a_vsh_set_instruction(0, d0);
+        nv2a_vsh_set_instruction(1, d1);
+        nv2a_vsh_set_constant(0, c0);
+        if (!nv2a_vsh_run((const float (*)[4])in, &o)) {
+            puts("FAIL: colour program did not run");
+            return 1;
+        }
+        if (o.d0[0] != 1.0f || o.d0[1] != 0.0f || o.d0[2] != 0.5f || o.d0[3] != 1.0f
+            || o.d1[0] != 0.0f || o.d1[1] != 1.0f || o.d1[2] != 0.0f || o.d1[3] != 0.0f) {
+            printf("FAIL: oD0 %g %g %g %g (want 1 0 0.5 1), oD1 %g %g %g %g (want 0 1 0 0)\n",
+                   o.d0[0], o.d0[1], o.d0[2], o.d0[3], o.d1[0], o.d1[1], o.d1[2], o.d1[3]);
+            return 1;
+        }
+    }
     puts("ok");
     return 0;
 }

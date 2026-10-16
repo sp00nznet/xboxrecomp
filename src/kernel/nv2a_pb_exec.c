@@ -261,6 +261,8 @@ typedef struct {
     uint32_t palette;                   /* guest address of the CLUT, P8 */
     uint32_t levels;                    /* mip levels, from FORMAT       */
     uint32_t filter;                    /* SET_TEXTURE_FILTER            */
+    uint32_t border;                    /* SET_TEXTURE_BORDER_COLOR      */
+    int      border_color;              /* FORMAT: BORDER reads `border` */
     int      cube;                      /* FORMAT: six faces, not one    */
     int      valid;
 } Texture;
@@ -1038,6 +1040,10 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
         return 0;
     if (mode == 1)                         /* wrap */
         return (uint32_t)(((sc % n) + n) % n);
+    if (mode == 2) {                       /* mirror */
+        int32_t m = ((sc % (2 * n)) + 2 * n) % (2 * n);
+        return (uint32_t)(m < n ? m : 2 * n - 1 - m);
+    }
     return sc < 0 ? 0u : (sc >= n ? size - 1 : c);   /* clamp, and the rest */
 }
 
@@ -1078,6 +1084,16 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
 
     if (!t->valid)
         return 0;
+    /* BORDER (4) with FORMAT's border source set to "colour": texels outside
+     * the image read SET_TEXTURE_BORDER_COLOR. Projected shadow maps rely on
+     * it -- clamped instead, everything outside the projection takes the
+     * edge texel and the shadow's frustum is drawn as a dark wedge.
+     * (Coordinates are signed in unsigned: a negative one is >= the size.) */
+    if (t->border_color
+        && ((t->addr_u == 4 && u >= t->width) || (t->addr_v == 4 && v >= t->height))) {
+        *argb = t->border;
+        return 1;
+    }
     u = wrap_coord(u, t->width,  t->addr_u);
     v = wrap_coord(v, t->height, t->addr_v);
 
@@ -2684,8 +2700,19 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 
     if (!batch_uses_program())
         return ffp_vertex(index, out);
-    for (a = 0; a < NV2A_VSH_INPUTS; a++)
-        fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
+    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+        /* An attribute with no array (size 0) reads its current value, the
+         * one the SET_VERTEX_DATA* methods left -- as the hardware does --
+         * not a fixed 0,0,0,1. SSX 3's sprite program passes its 4x4
+         * transforms in v8..v15 this way, set per batch with
+         * SET_VERTEX_DATA4F; reading 0,0,0,1 there sent every vertex of
+         * its front end to the viewport offset. imm_attr starts at 0,0,0,1,
+         * so an attribute nobody set still reads the old default. */
+        if (!s_gpu.attr[a].size && a < NV_VERTEX_ATTRS)
+            memcpy(in[a], s_gpu.imm_attr[a], sizeof in[a]);
+        else
+            fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
+    }
     if (!nv2a_vsh_run((const float (*)[4])in, out))
         return 0;
     /* oPos.w == 0 comes from a program that never divided by w: x, y and z
@@ -3405,6 +3432,7 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     case NV097_SET_TEXTURE_FORMAT:
         t->color = (param >> 8) & 0xFF;
         t->cube = (param >> 2) & 1;
+        t->border_color = (param >> 3) & 1;    /* BORDER_SOURCE: colour */
         t->levels = (param >> 16) & 0xF;
         /* A swizzled texture carries its own dimensions here, as log2 in
          * BASE_SIZE_U/V. It has to: IMAGE_RECT describes a linear image, and
@@ -3419,8 +3447,8 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         t->palette = dma_resolve(param & ~0x3Fu);
         break;
     case NV097_SET_TEXTURE_ADDRESS:
-        /* Four bits per axis. 1 is wrap, 3 clamp-to-edge; mirror and border
-         * fall back to clamp, wrong at an edge rather than everywhere. */
+        /* Four bits per axis: 1 wrap, 2 mirror, 3 clamp-to-edge, 4 border
+         * (the border colour when FORMAT selects it, else clamped). */
         t->addr_u =  param        & 0xF;
         t->addr_v = (param >>  8) & 0xF;
         break;
@@ -3433,6 +3461,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         break;
     case 0x1B14:                                  /* SET_TEXTURE_FILTER */
         t->filter = param;
+        break;
+    case 0x1B24:                                  /* SET_TEXTURE_BORDER_COLOR */
+        t->border = param;
         break;
     default:
         break;
@@ -3882,6 +3913,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         if (method >= 0x0AF0 && method < 0x0B00) {
             nv2a_vsh_constant_component(58, (method - 0x0AF0) / 4, param);
+            break;
+        }
+        /* The rest of the transform context that shares the constant file:
+         * SET_FOG_PLANE is c[57] and SET_EYE_POSITION c[56]. Vertex programs
+         * read them like any constant -- SSX 3's shadow-caster program takes
+         * its colour from c[57] -- and dropped, they read whatever an earlier
+         * constant upload left there: half its shadow maps came out opaque. */
+        if (method >= 0x09D0 && method < 0x09E0) {         /* SET_FOG_PLANE */
+            nv2a_vsh_constant_component(57, (method - 0x09D0) / 4, param);
+            break;
+        }
+        if (method >= 0x0A50 && method < 0x0A60) {         /* SET_EYE_POSITION */
+            nv2a_vsh_constant_component(56, (method - 0x0A50) / 4, param);
             break;
         }
         if (method >= 0x0B00 && method < 0x0B80) {    /* TRANSFORM_PROGRAM(i) */

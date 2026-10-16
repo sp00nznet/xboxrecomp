@@ -411,8 +411,15 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         }
         if (field(ins, 3, 0, 1)) {
             memcpy(out->pos, opos.v, sizeof out->pos);
-            memcpy(out->d0, outregs[3], sizeof out->d0);
-            memcpy(out->d1, outregs[4], sizeof out->d1);
+            /* The NV2A clamps the colour outputs to 0..1 before they are
+             * interpolated, as the fixed-function path already does here.
+             * Lighting programs push them well above 1 (SSX 3's riders), and
+             * unclamped every lit model came out washed out. */
+            for (int k = 0; k < 4; k++) {
+                float c0 = outregs[3][k], c1 = outregs[4][k];
+                out->d0[k] = c0 > 1.0f ? 1.0f : (c0 >= 0.0f ? c0 : 0.0f);
+                out->d1[k] = c1 > 1.0f ? 1.0f : (c1 >= 0.0f ? c1 : 0.0f);
+            }
             memcpy(out->fog, outregs[5], sizeof out->fog);
             memcpy(out->tex[0], outregs[9], sizeof out->tex[0]);
             memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
