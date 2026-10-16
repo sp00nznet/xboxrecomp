@@ -11,6 +11,14 @@
  * whatever the guest actually wrote, so the fewer stages between guest memory
  * and the screen the better -- and it must keep working while the D3D8 layer
  * is busy with something else, such as the FMV player's own window.
+ * RECOMP_D3D_PRESENT=1 shows the same frames through a D3D11 swap chain of
+ * the window's own instead (gpu_present.c): scaled on the GPU, vsync-paced.
+ *
+ * The window opens at RECOMP_WINDOW_SCALE times the frame (default 2, made
+ * smaller until it fits the desktop) and can be resized; the frame is
+ * letterboxed to its 4:3 shape. F11 or Alt+Enter toggles borderless
+ * fullscreen, RECOMP_FULLSCREEN=1 starts in it. Closing the window ends the
+ * process, as the SDL window does.
  *
  * Off unless RECOMP_FB_WINDOW is set.
  */
@@ -30,6 +38,8 @@
  * is the thing that receives the keys, so that is what has to remember
  * them. */
 #include "keyboard.h"   /* src/input */
+#include "gpu_present.h"
+#include "recomp_exit_hook.h"   /* src/platform */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -145,12 +155,64 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
     InterlockedExchange(&s_frame_draws, (LONG)draws);
 }
 
+/* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
+ * (DXGI's own Alt+Enter, exclusive mode at the frame's 640x480, is off --
+ * gpu_present.c; both presenters letterbox to any size.) */
+static void fb_toggle_fullscreen(HWND h)
+{
+    static int full;
+    static RECT saved;
+    static LONG_PTR saved_style;
+    if (!full) {
+        MONITORINFO mi;
+        mi.cbSize = sizeof mi;
+        if (!GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
+            return;
+        GetWindowRect(h, &saved);
+        saved_style = GetWindowLongPtrA(h, GWL_STYLE);
+        SetWindowLongPtrA(h, GWL_STYLE, (saved_style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        full = 1;
+    } else {
+        SetWindowLongPtrA(h, GWL_STYLE, saved_style);
+        SetWindowPos(h, NULL, saved.left, saved.top, saved.right - saved.left,
+                     saved.bottom - saved.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW);
+        full = 0;
+    }
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    /* First press only (bit 30: the key was already down), and with Alt held
+     * (bit 29) for Enter; neither reaches the key table. */
+    if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30)))
+        || (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30)))) {
+        fb_toggle_fullscreen(h);
+        return 0;
+    }
+    if (m == WM_SYSKEYDOWN && w == VK_RETURN)
+        return 0;                       /* auto-repeat of Alt+Enter */
     switch (m) {
     case WM_CLOSE:
     case WM_DESTROY:
+        /* Closing the window ends the run. Only stopping this thread left
+         * every other one running -- audio played on, and the process had
+         * to be ended from Task Manager. The guest has no exit path of its
+         * own to ask. TerminateProcess rather than ExitProcess: the guest
+         * threads are still running, and ExitProcess's cleanup can wait on
+         * a lock one of them held. The exit hook does the reporting that
+         * would otherwise be skipped. RECOMP_CLOSE_KEEPS_RUNNING=1 only
+         * closes the window, as before. */
         InterlockedExchange(&s_fb_running, 0);
+        if (!getenv("RECOMP_CLOSE_KEEPS_RUNNING")) {
+            fprintf(stderr, "  [FBWIN] window closed: exiting\n");
+            recomp_exit_hook_run("window");
+            fflush(stdout);
+            fflush(stderr);
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
         return 0;
 
     case WM_KEYDOWN:
@@ -268,6 +330,43 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
+/* GDI: the frame letterboxed into the client area, like the D3D11
+ * presenter; the borders are cleared when the size changes. */
+static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+{
+    static LONG lw, lh;
+    RECT c;
+    LONG cw, ch, w, h;
+    GetClientRect(hwnd, &c);
+    cw = c.right - c.left; ch = c.bottom - c.top;
+    if (cw <= 0 || ch <= 0)
+        return;
+    if (cw != lw || ch != lh) {
+        FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        lw = cw; lh = ch;
+    }
+    if ((long long)cw * s_fb_height <= (long long)ch * s_fb_width) {
+        w = cw; h = (LONG)((long long)cw * s_fb_height / s_fb_width);
+    } else {
+        h = ch; w = (LONG)((long long)ch * s_fb_width / s_fb_height);
+    }
+    SetStretchBltMode(hdc, HALFTONE);
+    SetBrushOrgEx(hdc, 0, 0, NULL);     /* HALFTONE wants it after the mode */
+    StretchDIBits(hdc, (cw - w) / 2, (ch - h) / 2, w, h,
+                  0, 0, (int)s_fb_width, (int)s_fb_height,
+                  s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
+}
+
+/* The converted frame in s_rgb, on screen: D3D11 when it is up (which waits
+ * for vsync, so returns 1 when the loop is already paced), else GDI. */
+static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+{
+    if (gpu_present_active())
+        return gpu_present_frame(s_rgb);
+    gdi_blit(hwnd, hdc, bi);
+    return 0;
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
@@ -286,18 +385,43 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
-    r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                           CW_USEDEFAULT, CW_USEDEFAULT,
-                           r.right - r.left, r.bottom - r.top,
-                           NULL, NULL, GetModuleHandleA(NULL), NULL);
+    {
+        /* RECOMP_WINDOW_SCALE (1-8, default 2, as in the SDL window): the
+         * client area is the frame times this, made smaller until the window
+         * fits the desktop work area, and centred on it. */
+        const char *e = getenv("RECOMP_WINDOW_SCALE");
+        int scale = e ? atoi(e) : 2;
+        RECT work;
+        if (scale < 1 || scale > 8)
+            scale = 2;
+        if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
+            work.left = work.top = 0; work.right = 1920; work.bottom = 1080;
+        }
+        for (;; scale--) {
+            r.left = 0; r.top = 0;
+            r.right = (LONG)s_fb_width * scale; r.bottom = (LONG)s_fb_height * scale;
+            AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+            if (scale <= 1 || (r.right - r.left <= work.right - work.left
+                               && r.bottom - r.top <= work.bottom - work.top))
+                break;
+        }
+        hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
+                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                               work.left + ((work.right - work.left) - (r.right - r.left)) / 2,
+                               work.top + ((work.bottom - work.top) - (r.bottom - r.top)) / 2,
+                               r.right - r.left, r.bottom - r.top,
+                               NULL, NULL, GetModuleHandleA(NULL), NULL);
+    }
     if (!hwnd) {
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
     hdc = GetDC(hwnd);
+    {
+        const char *fs = getenv("RECOMP_FULLSCREEN");
+        if (fs && *fs && *fs != '0')
+            fb_toggle_fullscreen(hwnd);
+    }
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -311,9 +435,12 @@ static DWORD WINAPI fb_thread(LPVOID unused)
 
     fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
             s_fb_width, s_fb_height);
+    if (gpu_present_enabled())
+        gpu_present_init(hwnd, s_fb_width, s_fb_height);
 
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         MSG msg;
+        int paced = 0;
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
@@ -326,18 +453,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            paced = fb_show(hwnd, hdc, &bi);
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            paced = fb_show(hwnd, hdc, &bi);
         }
         {
             /* One dump a few seconds in, so the title has had time to render
@@ -377,9 +500,11 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 t0 = now; f0 = f;
             }
         }
-        Sleep(16);
+        if (!paced)
+            Sleep(16);                  /* D3D11's Present waited for vsync */
     }
 
+    gpu_present_shutdown();
     ReleaseDC(hwnd, hdc);
     DestroyWindow(hwnd);
     free(s_rgb);
