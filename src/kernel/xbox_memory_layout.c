@@ -19,6 +19,7 @@
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "kernel_missing.h"
+#include "nv2a_flip_hold.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1142,12 +1143,59 @@ static void counter_mirrors_tick(void)
 #define XBOX_MAX_FRAME_COUNTERS 4
 #define XBOX_FRAME_PERIOD_MS    16      /* ~60 Hz */
 
+/* A counter can belong to the title after all. A title may register the
+ * miniport's own vblank count, which D3D's vblank DPC bumps itself once
+ * vblanks reach the title (RECOMP_VBLANK); bumped here per flip as well, it
+ * ran at 60 Hz plus the flip rate, and video and loads timed on it played
+ * several times too fast. So under the flip hold each bump first checks
+ * whether something else moved the counter since the last one; one that
+ * keeps moving on its own is the title's and is left alone for as long as
+ * it keeps moving (nv2a_flip_hold.h). The first bump only seeds: a field
+ * D3D initialised is not the title counting. */
 static struct {
     uint32_t device_ptr_va;
     uint32_t counter_off;
+    XboxFrameCounterBump bump;
 } g_frame_counters[XBOX_MAX_FRAME_COUNTERS];
 static int   g_frame_counter_count = 0;
 static DWORD g_frame_counter_last_ms = 0;
+static uint32_t g_frame_counters_owned;
+
+extern int nv2a_pb_exec_flip_pacing(void);
+
+/* Registered counters the title is moving itself right now. */
+uint32_t xbox_Nv2aFrameCountersOwned(void) { return g_frame_counters_owned; }
+
+static void frame_counter_bump(int i)
+{
+    uint32_t dev;
+    volatile uint32_t *p;
+    int r;
+
+    if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
+        return;
+    dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
+                                 + g_memory_offset);
+    if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
+        return;
+    p = (volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
+                              + g_memory_offset);
+    r = xbox_FrameCounterBump(&g_frame_counters[i].bump, p,
+                              nv2a_pb_exec_flip_pacing(), GetTickCount());
+    if (r == XBOX_FRAME_COUNTER_HANDED_OVER) {
+        g_frame_counters_owned++;
+        fprintf(stderr, "  Frame counter: device at 0x%08X, count +0x%X keeps"
+                " moving on its own (0x%08X): the title counts it, the"
+                " toolkit stops\n", g_frame_counters[i].device_ptr_va,
+                g_frame_counters[i].counter_off, *p);
+    } else if (r == XBOX_FRAME_COUNTER_HANDED_BACK) {
+        g_frame_counters_owned--;
+        fprintf(stderr, "  Frame counter: device at 0x%08X, count +0x%X has"
+                " stopped moving on its own: the toolkit bumps it again\n",
+                g_frame_counters[i].device_ptr_va,
+                g_frame_counters[i].counter_off);
+    }
+}
 
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
 {
@@ -1181,18 +1229,8 @@ void xbox_Nv2aFrameCounterFlip(void)
     g_frame_counter_flip_ms = GetTickCount();
     if (!g_frame_counter_flip_ms)
         g_frame_counter_flip_ms = 1;          /* 0 means "never" */
-    for (i = 0; i < g_frame_counter_count; i++) {
-        uint32_t dev;
-
-        if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
-            continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
-                                     + g_memory_offset);
-        if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
-            continue;
-        *(volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
-                               + g_memory_offset) += 1;
-    }
+    for (i = 0; i < g_frame_counter_count; i++)
+        frame_counter_bump(i);
 }
 
 static void frame_counters_tick(void)
@@ -1214,18 +1252,8 @@ static void frame_counters_tick(void)
     }
     g_frame_counter_last_ms = now;
 
-    for (i = 0; i < g_frame_counter_count; i++) {
-        uint32_t dev;
-
-        if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
-            continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
-                                     + g_memory_offset);
-        if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
-            continue;
-        *(volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
-                               + g_memory_offset) += 1;
-    }
+    for (i = 0; i < g_frame_counter_count; i++)
+        frame_counter_bump(i);
 }
 
 /* Guest VA of the title's GPU fence word, found through the first registered
@@ -1341,6 +1369,14 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* The PFB flush kick (NV2A_ACK above), which D3D's KickOff waits on. */
+#define NV2A_ACK_PFB_FLUSH          0x100410u
+/* The vblank's two status bits, which the vblank-ack thread owns. */
+#define NV2A_ACK_PMC_INTR_0         0x000100u
+#define NV2A_ACK_PMC_INTR_PCRTC     (1u << 24)
+#define NV2A_ACK_PCRTC_INTR_0       0x600100u
+#define NV2A_ACK_PCRTC_INTR_VBLANK  (1u << 0)
+
 /* Clear the request bits "hardware" would clear on its own.
  *
  * Also called by the pushbuffer walker between commands. This thread executes
@@ -1350,7 +1386,7 @@ static void framebuffer_probe_tick(void)
  * and a level load, thousands of kickoffs long, looked frozen. Clearing them
  * from inside the walk answers the kickoff within a few hundred commands,
  * without a thread of its own spinning on a host core. */
-void xbox_Nv2aAckBusyBits(void)
+static void nv2a_ack_busy_bits(int flip_held)
 {
     volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
 
@@ -1359,10 +1395,31 @@ void xbox_Nv2aAckBusyBits(void)
     for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
         volatile uint32_t *r =
             (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-        if (*r & NV2A_ACK[i].busy_mask) {
-            *r &= ~NV2A_ACK[i].busy_mask;
+        uint32_t mask = NV2A_ACK[i].busy_mask;
+        if (flip_held && NV2A_ACK[i].offset == NV2A_ACK_PFB_FLUSH)
+            continue;
+        /* Once the vblank is delivered its two bits belong to the
+         * vblank-ack thread (kernel_bridge.c), which clears them on the
+         * DPC's ack. Cleared here too, a pass that landed between the
+         * vblank and the DPC's read of PMC_INTR_0 took the vblank away
+         * from the DPC: no ack, no count, and the title's present at
+         * vblank slipped a frame. */
+        if (xbox_VblankAckHeld()) {
+            if (NV2A_ACK[i].offset == NV2A_ACK_PMC_INTR_0)
+                mask &= ~NV2A_ACK_PMC_INTR_PCRTC;
+            else if (NV2A_ACK[i].offset == NV2A_ACK_PCRTC_INTR_0)
+                mask &= ~NV2A_ACK_PCRTC_INTR_VBLANK;
         }
+        /* Interlocked: the vblank-ack thread and the guest change other
+         * bits of the same word meanwhile. */
+        if (*r & mask)
+            InterlockedAnd((volatile LONG *)r, (LONG)~mask);
     }
+}
+
+void xbox_Nv2aAckBusyBits(void)
+{
+    nv2a_ack_busy_bits(0);
 }
 
 /* One word of the NV2A register file (offset from the register base), or NULL
@@ -1379,7 +1436,20 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        xbox_Nv2aAckBusyBits();
+        /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
+         * nothing, leaves DMA_GET where it is and acknowledges no PFB flush,
+         * which is how the title feels the console's FLIP_STALL. Nothing is
+         * locked while it waits; the release depends only on the vblank
+         * count and the clock.
+         *
+         * The hold is per submitted segment: the walk that arms it finishes
+         * its segment and sets GET to PUT, and the next segment waits. A
+         * D3D present kicks off right after its stall, so the stall ends
+         * its segment and the two are the same; a segment carrying two
+         * flips paces only the last. */
+        extern int nv2a_pb_exec_flip_poll(void);
+        int flip_held = nv2a_pb_exec_flip_poll();
+        nv2a_ack_busy_bits(flip_held);
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
@@ -1428,7 +1498,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             static uint32_t get_written = 0xFFFFFFFFu;  /* GET as we last left it */
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-            if (put != last_put || (now_ms - last_put_ms) > 2000) {
+            if (!flip_held
+                    && (put != last_put || (now_ms - last_put_ms) > 2000)) {
                 /* Survey the segment the title just submitted, once. */
                 {
                     extern void nv2a_pb_scan(uint32_t);

@@ -13,6 +13,9 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* ============================================================================
  * Thread Start Wrapper
@@ -105,6 +108,9 @@ NTSTATUS __stdcall xbox_PsCreateSystemThreadEx(
     if (KernelStackSize == 0)
         KernelStackSize = 65536;
 
+    /* Not pinned to the guest core (xbox_GuestThreadPin): this thunk-table
+     * path is for native-call titles, and the bridge titles that showed the
+     * need go through bridge_PsCreateSystemThreadEx. */
     hThread = CreateThread(NULL, KernelStackSize, xbox_thread_wrapper, info,
                            dwCreationFlags, &dwThreadId);
     if (!hThread) {
@@ -440,4 +446,86 @@ void xbox_worker_stack_free(int slot)
 {
     if (slot >= 0 && slot < XBOX_WORKER_STACK_COUNT)
         InterlockedExchange(&g_worker_stack_used[slot], 0);
+}
+
+/* ============================================================================
+ * One host core for the title's threads
+ *
+ * The console has one CPU, and titles lean on it: two threads of equal
+ * priority only interleave at a quantum boundary or a wait, so a short
+ * read-modify-write on a shared global never sees the other thread's half.
+ * A title's level load can spawn a loader thread that, with the main
+ * thread, adds entries to one global pool with "slot = count; fill; count =
+ * slot + 1". On two host cores the two loops run at the same time and lose
+ * each other's entries. Pinning every guest thread to one core gives the
+ * console's interleaving back: the host still preempts at its tick, but
+ * inside a window of a few instructions that is as rare as it was on the
+ * hardware.
+ *
+ * Pinned: the main guest thread and every PsCreateSystemThreadEx worker,
+ * the threads the title schedules. Not pinned: the kernel timer thread,
+ * which runs the title's DPCs and timer routines, and the device models'
+ * threads (APU, OHCI, nv2a), which deliver ISRs while the one-CPU gate is
+ * free. They do run lifted code, but they stand in for interrupts, which
+ * on the console ran between any two instructions of the thread they
+ * interrupted; the gate already orders them against guest code at
+ * DISPATCH_LEVEL, and putting them on the guest core would queue a DPC
+ * behind a main thread spinning in its frame wait. The GPU and the audio
+ * keep their cores for the same reason.
+ *
+ * Opt-in, like the one-CPU gate it was made beside: RECOMP_GUEST_CPUS=one
+ * pins to the lowest core the process may use, =<n> picks the core (cpu 0
+ * takes most of the IRQ work on Linux). Unset or =all, the title's threads
+ * go wherever the host scheduler puts them, as before.
+ */
+DWORD_PTR xbox_GuestCpuMask(void)
+{
+    const char *mode = getenv("RECOMP_GUEST_CPUS");
+    DWORD_PTR proc = 0, sys = 0;
+
+    if (!mode || !*mode || !strcmp(mode, "all"))
+        return 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc)
+        return 0;
+    if (*mode >= '0' && *mode <= '9') {
+        long n = strtol(mode, NULL, 10);
+        if (n >= 0 && n < (long)(8 * sizeof proc) && (proc & ((DWORD_PTR)1 << n)))
+            return (DWORD_PTR)1 << n;
+        fprintf(stderr, "  [KERNEL] RECOMP_GUEST_CPUS=%s: not a core the process"
+                        " may use (mask %#lx); taking the lowest\n", mode,
+                (unsigned long)proc);
+    }
+    /* The lowest core the process may use: fixed, so every thread lands
+     * on the same one whatever core it was created from. */
+    return proc & (DWORD_PTR)(-(intptr_t)proc);
+}
+
+void xbox_GuestThreadPin(const char *role)
+{
+    static int announced, failed;
+    DWORD_PTR mask = xbox_GuestCpuMask();
+    int core = 0;
+
+    if (!mask)
+        return;
+    while (!((mask >> core) & 1))
+        core++;
+    if (!SetThreadAffinityMask(GetCurrentThread(), mask)) {
+        if (!failed) {
+            failed = 1;
+            fprintf(stderr, "  [KERNEL] guest threads: this host sets no thread"
+                            " affinity; the title's threads stay on every core\n");
+            fflush(stderr);
+        }
+        return;
+    }
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr, "  [KERNEL] guest threads on one host core (cpu %d),"
+                        " as on the console (RECOMP_GUEST_CPUS=%s)\n",
+                core, getenv("RECOMP_GUEST_CPUS"));
+        fflush(stderr);
+    }
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "guest thread %s on cpu %d",
+             role ? role : "?", core);
 }

@@ -176,11 +176,15 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
 /* Advance those counters now, because a swap really completed. Called by the
  * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
- * stands down, so the count follows what was actually drawn. */
+ * stands down, so the count follows what was actually drawn. A counter the
+ * title is seen to move itself is no longer bumped by either. */
 void xbox_Nv2aFrameCounterFlip(void);
 /* A word of the NV2A register file (offset from the register base); NULL until
  * the aperture is mapped. */
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
+/* Registered counters the title turned out to move itself (its vblank DPC),
+ * which the toolkit has stopped bumping; for the [GPU] report. */
+uint32_t xbox_Nv2aFrameCountersOwned(void);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);

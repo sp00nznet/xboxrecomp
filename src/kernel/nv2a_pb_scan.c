@@ -460,6 +460,11 @@ int nv2a_pb_dma_walk(void)
  * wrap is handled by the caller, which scans the two pieces separately.
  * Addresses are physical, like PUT's, and reach guest memory through the
  * contiguous window. */
+/* Whether the walk is inside a pushbuffer CALL, for the executor: a flip
+ * hold is only armed at the top level (nv2a_pb_exec.c). */
+static int s_in_call;
+int nv2a_pb_scan_in_call(void) { return s_in_call; }
+
 static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                                 uint32_t *jumps, uint32_t *unknown)
 {
@@ -490,7 +495,9 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             if (!in_call) {
                 uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
                 s_tot_calls++;
+                s_in_call = 1;
                 words += pb_walk_segment(sub, sub + 0x400000u, 1, jumps, unknown);
+                s_in_call = 0;
             }
             continue;
         }
@@ -525,6 +532,10 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
+    if (s_exec_enabled) {
+        extern void nv2a_pb_exec_walk_begin(void);
+        nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
+    }
     words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
 
     s_tot_words += words;

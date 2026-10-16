@@ -15,6 +15,7 @@ import bisect
 import json
 import glob
 import os
+import re
 import struct
 import sys
 
@@ -437,6 +438,38 @@ def load_label_db(labels_json_path):
             label_db[int(lbl["address"], 16)] = lbl["name"]
     return label_db
 
+_BACK_EDGE_GOTO_RE = re.compile(r"goto loc_([0-9A-Fa-f]{8});")
+
+
+def _mark_back_edges(bb, stmts):
+    """The block's statements with every jump back to the block's start or
+    earlier -- a loop's back edge -- calling RECOMP_BACK_EDGE first, the guest
+    CPU's quantum check (templates/runtime/recomp_types.h): with the lock on,
+    a thread that has run its quantum with another waiting hands over there,
+    as the console's timer tick preempted it; otherwise it is one relaxed
+    load and a branch not taken. Blocks have one entry, so a target at or
+    before the block's start is the only backward target a jump at its end
+    can have."""
+    va = bb.instructions[-1].address if bb.instructions else bb.start
+
+    def mark(m):
+        target = int(m.group(1), 16)
+        if target > bb.start:
+            return m.group(0)
+        return "{ RECOMP_BACK_EDGE(0x%08Xu); goto loc_%08X; }" % (va, target)
+
+    out = None
+    for i, stmt in enumerate(stmts):
+        if "goto loc_" not in stmt:
+            continue
+        new = _BACK_EDGE_GOTO_RE.sub(mark, stmt)
+        if new != stmt:
+            if out is None:
+                out = list(stmts)
+            out[i] = new
+    return stmts if out is None else out
+
+
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
@@ -486,6 +519,9 @@ class FunctionTranslator:
         self._weak_function_starts = set()
         self._reach_memo = {}
         self._ownership_ready = False
+        # The guest CPU's quantum check at every loop back edge
+        # (RECOMP_BACK_EDGE), with --back-edge-yield; off, edges stay bare.
+        self.back_edge_yield = False
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover callbacks and the gap entries their bodies reference."""
@@ -2872,6 +2908,9 @@ class FunctionTranslator:
                             edge_sets.extend((p, var, c) for p, c in conds.items())
                             break
 
+            if self.back_edge_yield:
+                stmts = _mark_back_edges(bb, stmts)
+
             first = len(lines)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
@@ -3012,8 +3051,11 @@ class BatchTranslator:
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
-                 icall_sites_json_path=None):
+                 icall_sites_json_path=None, back_edge_yield=False):
+        """back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
+        (--back-edge-yield; off by default)."""
         self.xbe_path = xbe_path
+        self.back_edge_yield = back_edge_yield
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
         self.icall_sites = {}
@@ -3073,6 +3115,7 @@ class BatchTranslator:
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions,
             force_returns=force_returns, icall_sites=self.icall_sites)
+        self.translator.back_edge_yield = self.back_edge_yield
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         for explicit_helper in (seh_prolog, seh_epilog):

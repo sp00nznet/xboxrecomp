@@ -221,6 +221,17 @@ extern uint32_t xbox_AllocThreadTib(void);
 extern int xbox_IrqlBlocksInterrupts(void);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
+extern int  xbox_DispatchGateOn(void);
+extern int  xbox_DispatchGateTryEnter(void);
+extern void xbox_DispatchGateLeave(void);
+/* kernel/kernel.h's xbox_Irq* (the device-interrupt post), declared here as
+ * the rest are: the APU does not include the kernel header. */
+enum { XBOX_IRQ_APU = 1 };
+enum { XBOX_IRQ_POSTED = 0, XBOX_IRQ_GATED = 1, XBOX_IRQ_UNGATED = 2 };
+extern int  xbox_IrqSafePointsOn(void);
+extern void xbox_IrqSetHandler(int line, void (*run)(void));
+extern int  xbox_IrqPost(int line);
+extern void xbox_IrqNoteUngated(int line);
 #if defined(_MSC_VER)
 #  define APU_TLS __declspec(thread)
 #else
@@ -231,55 +242,31 @@ extern APU_TLS uint32_t g_fs_base;
 
 /* Call the connected service routine while the line is up, from the frame
  * thread, the way the OHCI model delivers USB interrupts (ohci_call_isr):
- * a worker stack for the call, a TIB of this thread's own, and a hold-off
- * while a guest thread sits at raised IRQL, which is when the single-CPU
- * console could not have taken the interrupt. The routine acknowledges by
- * writing ISTS, which drops the line through update_irq. */
-static void apu_deliver_irq(MCPXAPUState *d)
+ * a worker stack for the call and a TIB of this thread's own. When a guest
+ * thread or DPC holds the one-CPU gate, which is when the single-CPU console
+ * could not have taken the interrupt beside it, the interrupt is posted and
+ * the holder runs it at its next safe point (xbox_IrqPost). The routine
+ * acknowledges by writing ISTS, which drops the line through update_irq. */
+
+/* Push the routine's arguments on g_esp and call it at the device IRQL.
+ * Returns what it returned, or -1 with nothing connected. */
+static int apu_call_isr(void)
 {
-    /* Per thread, like the g_fs_base it guards: a new instance's frame
-     * thread is a new OS thread and needs its own TIB. g_fs_base itself
-     * cannot tell, as every thread starts at the main thread's TIB. */
-    static APU_TLS int tib_ready;
-    static unsigned held_off;
     uint32_t kint, routine, context;
     apu_guest_fn fn;
-    int slot;
 
-    if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
-        return;
-    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50)
-        return;
-    held_off = 0;
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
-        return;
+        return -1;
     routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
     context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
     fn = routine ? recomp_lookup(routine) : NULL;
     if (!fn)
-        return;
-    if (!tib_ready) {
-        uint32_t tib = xbox_AllocThreadTib();
-        if (!tib)
-            return;
-        g_fs_base = tib;
-        tib_ready = 1;
-    }
-    slot = xbox_worker_stack_alloc();
-    if (slot < 0)
-        return;
-
-    qemu_mutex_unlock(&d->lock);
-    g_esp = XBOX_WORKER_STACK_TOP(slot);
-    g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
+        return -1;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
-    xbox_worker_stack_free(slot);
-    qemu_mutex_lock(&d->lock);
-
     {
         static unsigned n;
         if (n++ < 3) {
@@ -288,6 +275,93 @@ static void apu_deliver_irq(MCPXAPUState *d)
             fflush(stderr);
         }
     }
+    return (int)(g_eax & 1u);
+}
+
+/* The gate holder's run of a posted APU interrupt (kernel_hal.c has put it
+ * on a worker stack). The routine reads the APU registers through the MMIO
+ * trap, which takes d->lock as any guest access does; the frame thread is
+ * not holding it here (apu_deliver_irq drops it before posting). If the line
+ * dropped since the post, the routine reads ISTS and declines, as on
+ * hardware. */
+static void apu_isr_on_holder(void)
+{
+    apu_call_isr();
+}
+
+static void apu_deliver_irq(MCPXAPUState *d)
+{
+    /* Per thread, like the g_fs_base it guards: a new instance's frame
+     * thread is a new OS thread and needs its own TIB. g_fs_base itself
+     * cannot tell, as every thread starts at the main thread's TIB. */
+    static APU_TLS int tib_ready;
+    static unsigned held_off;
+    uint32_t kint, routine;
+    int slot, how;
+
+    if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
+        return;
+    kint = xbox_GetConnectedInterrupt(APU_VECTOR);
+    if (!kint)
+        return;
+    routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
+    if (!routine || !recomp_lookup(routine))
+        return;
+    if (!tib_ready) {
+        uint32_t tib = xbox_AllocThreadTib();
+        if (!tib)
+            return;
+        g_fs_base = tib;
+        tib_ready = 1;
+    }
+
+    qemu_mutex_unlock(&d->lock);
+    xbox_IrqSetHandler(XBOX_IRQ_APU, apu_isr_on_holder);
+    /* The one-CPU gate (xbox_DispatchGateTryEnter): with it, no thread at
+     * DISPATCH_LEVEL, no DPC and no KeSynchronizeExecution routine runs
+     * alongside the routine. Held: posted, and this thread goes on with its
+     * frame. It must never wait for the gate: a DirectSound DPC holding it
+     * can be waiting on this thread to clear a trapped FE method. The post
+     * happens without d->lock, since the release of the gate it may take
+     * runs other lines' routines here. */
+    if (xbox_IrqSafePointsOn()) {
+        how = xbox_IrqPost(XBOX_IRQ_APU);
+        if (how == XBOX_IRQ_POSTED) {
+            qemu_mutex_lock(&d->lock);
+            return;
+        }
+    } else if (!xbox_DispatchGateOn()) {
+        /* No gate (the default): a hold-off while a guest thread sits at
+         * raised IRQL, which is when the single-CPU console could not have
+         * taken the interrupt, then delivered anyway. */
+        if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50) {
+            qemu_mutex_lock(&d->lock);
+            return;
+        }
+        held_off = 0;
+        how = XBOX_IRQ_GATED;   /* an absent gate's leave takes nothing */
+    } else {
+        /* RECOMP_IRQ_SAFE_POINTS=0: the bounded hold-off, then beside the
+         * holder. */
+        how = xbox_DispatchGateTryEnter() ? XBOX_IRQ_GATED : XBOX_IRQ_UNGATED;
+        if (how == XBOX_IRQ_UNGATED && ++held_off <= 50) {
+            qemu_mutex_lock(&d->lock);
+            return;
+        }
+        held_off = 0;
+    }
+    if (how == XBOX_IRQ_UNGATED)
+        xbox_IrqNoteUngated(XBOX_IRQ_APU);
+    slot = xbox_worker_stack_alloc();
+    if (slot >= 0) {
+        g_esp = XBOX_WORKER_STACK_TOP(slot);
+        g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
+        apu_call_isr();
+        xbox_worker_stack_free(slot);
+    }
+    if (how == XBOX_IRQ_GATED)
+        xbox_DispatchGateLeave();
+    qemu_mutex_lock(&d->lock);
 }
 
 /* ============================================================

@@ -1074,6 +1074,27 @@ extern volatile uint64_t g_icall_guard_misses;
 #define RECOMP_ICALL_GUARD_MISS() ((void)0)
 #endif
 
+/* Every loop back edge in code lifted with --back-edge-yield (tools.recomp;
+ * off by default, so a title lifted without it has none): the guest CPU's
+ * quantum check. A guest thread that has waited its quantum for the CPU
+ * (RECOMP_GUEST_LOCK) sets the flag, and the holder hands over at its next
+ * back edge, as the console's timer tick preempted it wherever it was; a
+ * kernel call checks the quantum too, but a frame of lifted code can go
+ * without one. With the lock off the flag is never set: one relaxed atomic
+ * load and a branch not taken per back edge. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define RECOMP_LOAD_RELAXED32(p) \
+    ((int32_t)__iso_volatile_load32((const volatile __int32 *)(p)))
+#else
+#define RECOMP_LOAD_RELAXED32(p) __atomic_load_n((p), __ATOMIC_RELAXED)
+#endif
+extern int32_t g_xbox_guest_cpu_preempt;
+void xbox_GuestCpuPreempt(uint32_t va);
+#define RECOMP_BACK_EDGE(va) \
+    do { if (RECOMP_LOAD_RELAXED32(&g_xbox_guest_cpu_preempt)) \
+             xbox_GuestCpuPreempt(va); } while (0)
+
 /**
  * RECOMP_ICALL - Indirect call through the dispatch table.
  *

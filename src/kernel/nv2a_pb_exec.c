@@ -32,6 +32,8 @@
 #include <time.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
+#include "nv2a_flip_hold.h"
+#include "platform/host_time.h"   /* xbox_HostNowNs */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
@@ -196,10 +198,13 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
  * asks for a flip, and waits for it in a loop that makes no kernel calls
  * and burns no dispatch, which reads as a hang with no cause.
  *
- * ponytail: the flip completes the moment it is asked for, because there is
- * no scanout to be in the middle of. That makes every frame land instantly
- * and a title that paces itself on the flip runs as fast as it can draw.
- * Pacing wants the vblank clock in the kernel, not a sleep in here. */
+ * The flip completes here at once, because there is no scanout to be in the
+ * middle of; what the console's stall did to the title (wait for the vblank
+ * the swap asked for) is the flip hold's job: FLIP_STALL arms it, and the
+ * ack loop holds the next walk until the guest's vblank count allows the
+ * flip (nv2a_flip_hold.h). The swap's interval comes from the NO_OPERATION
+ * D3D pushes before it, software method 1. */
+#define NV097_NO_OPERATION                0x0100
 #define NV097_SET_FLIP_READ               0x0120
 #define NV097_SET_FLIP_WRITE              0x0124
 #define NV097_SET_FLIP_MODULO             0x0128
@@ -3442,6 +3447,96 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         record_tex_reg(method, param);
 }
 
+/* The flip hold (nv2a_flip_hold.h). The executor arms it at FLIP_STALL; the
+ * ack loop in xbox_memory_layout.c polls it each pass and, while it holds,
+ * walks nothing, leaves DMA_GET behind PUT and the PFB flush unacknowledged.
+ * Both run on the ack thread, so the state needs no lock. */
+static XboxFlipHold s_flip_hold;
+static uint32_t s_vbl_count;        /* the vblank count last seen to move */
+static uint64_t s_vbl_moved_ns;
+/* The vblank count when the walk that reaches a FLIP_STALL began, which is
+ * close to when the title submitted the segment holding its Swap. Sampled
+ * at the FLIP_STALL instead, the segment's own draw time (several ms) moved
+ * a frame the title swapped just before a vblank past it; the title's next
+ * frame then counted as a second flip in the same vblank and was held for
+ * most of a frame. */
+static uint32_t s_walk_vbl;
+
+void nv2a_pb_exec_walk_begin(void)
+{
+    s_walk_vbl = xbox_VblankCount();
+}
+
+/* RECOMP_FLIP_PACING: unset or 0 off (flips complete at once and frame
+ * counters are bumped on every flip, as before), edge (D3D's rule: a late
+ * frame waits for the next vblank), anything else on. Opt-in: it holds the
+ * title's GPU on the guest vblank clock, which only runs under RECOMP_VBLANK,
+ * and a held flip is a stall a title's own pacing has never seen here.
+ * The first caller can be the timer thread, a KeSetTimer caller (through
+ * the vblank mode) or the ack thread. Two first callers read the same
+ * variable and store the same values, the edge flag before the mode, so the
+ * race costs at most a second log line. No Interlocked: tests link the
+ * executor without the platform layer (tests/nv2a_ffp_backend). */
+int nv2a_pb_exec_flip_pacing(void)
+{
+    static volatile int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_FLIP_PACING");
+        int m = (!e || !*e || !strcmp(e, "0")) ? 0
+                : !strcmp(e, "edge") ? 2 : 1;
+        s_flip_hold.edge = m == 2;
+        mode = m;
+        if (e)
+            fprintf(stderr, "  [GPU] flip pacing %s (RECOMP_FLIP_PACING=%s)\n",
+                    m == 0 ? "off" : m == 2 ? "edge" : "on", e);
+    }
+    return mode;
+}
+
+/* The guest vblank count, and whether it is a running clock: vblanks are on
+ * and the count moved within XBOX_FLIP_CLOCK_STALE_NS. Without it a hold
+ * would only ever end on its timeout. */
+static uint32_t flip_clock(uint64_t now_ns, int *ok)
+{
+    uint32_t c = xbox_VblankCount();
+    if (c != s_vbl_count) {
+        s_vbl_count = c;
+        s_vbl_moved_ns = now_ns;
+    }
+    *ok = s_vbl_moved_ns && now_ns - s_vbl_moved_ns < XBOX_FLIP_CLOCK_STALE_NS;
+    return c;
+}
+
+/* Once per pass of the ack loop: 1 while a flip is held. */
+int nv2a_pb_exec_flip_poll(void)
+{
+    uint64_t now;
+    uint32_t c;
+    int ok;
+
+    if (!s_flip_hold.held)
+        return 0;
+    now = xbox_HostNowNs();
+    c = flip_clock(now, &ok);
+    return xbox_FlipHoldPoll(&s_flip_hold, c, now, ok);
+}
+
+/* The hold's line in the periodic [GPU] report, then reset. */
+static void flip_hold_report(void)
+{
+    XboxFlipHold *h = &s_flip_hold;
+    if (nv2a_pb_exec_flip_pacing() == 0)
+        return;
+    fprintf(stderr, "[GPU] flip hold: holds %u held_ms %.1f hold_timeouts %u"
+            " clock_stops %u iv0 %u iv1 %u iv2 %u iv3 %u nonop %u"
+            " counters_owned %u\n", h->holds, h->held_ns / 1e6, h->timeouts,
+            h->clock_stops, h->iv[0], h->iv[1], h->iv[2], h->iv[3], h->nonop,
+            xbox_Nv2aFrameCountersOwned());
+    h->holds = h->timeouts = h->clock_stops = h->nonop = 0;
+    h->iv[0] = h->iv[1] = h->iv[2] = h->iv[3] = 0;
+    h->held_ns = 0;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -3715,6 +3810,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES)
             s_gpu.idx[s_gpu.idx_count++] = param;
         break;
+    case NV097_NO_OPERATION:
+        /* Non-zero, it is one of D3D's software methods, which the GPU traps
+         * to D3D's interrupt handler on the console. Only the swap's interval
+         * matters here (nv2a_flip_hold.h); the rest stays a no-op. */
+        if (!nv2a_pb_exec_flip_pacing()) {
+            if (!imm_vertex_method(method, param))
+                note_unhandled(method, param);   /* as before the hold */
+            break;
+        }
+        if (param)
+            xbox_FlipHoldSwap(&s_flip_hold, param);
+        return;
 
     case NV097_SET_FLIP_READ:
         if (s_ftrace == 2)
@@ -3740,12 +3847,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         frame_trace_flip();
         return;
 
-    case NV097_FLIP_STALL:
+    case NV097_FLIP_STALL: {
+        /* The flip is measured from the vblank the title swapped in (the
+         * walk's start, s_walk_vbl); the hold's clock starts here, before
+         * the present below: a vsynced present can hold this thread for a
+         * host frame, and that time counts against the hold. */
+        uint64_t stall_ns = xbox_HostNowNs();
+        int clock_ok;
+        uint32_t stall_vbl;
+        (void)flip_clock(stall_ns, &clock_ok);
+        stall_vbl = s_walk_vbl;
         if (s_ftrace == 2)
             fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
                     s_gpu.drawn_offset, s_gpu.color_offset, 10);
         /* The stall ends when the buffer being read is the one just finished.
-         * There is no scanout here to wait for, so that is now. */
+         * There is no scanout here to wait for, so that is now; when the
+         * title may go on is the flip hold's (below). */
         s_gpu.flip_read = s_gpu.flip_write;
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
@@ -3809,8 +3926,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 fflush(stderr);
             }
         }
+        /* Arm the hold. Not inside a pushbuffer CALL: the subroutine's
+         * return lives in this walk alone, so the hold could not resume
+         * there; that flip completes at once and still sets the count the
+         * next one is measured from. The swap above (frame counter,
+         * present) is counted now, when the hold is armed, not at its
+         * release: what the title waits on is GET and the PFB flush, and
+         * a title polling its swap counter sees the flip up to a vblank
+         * early. */
+        if (nv2a_pb_exec_flip_pacing()) {
+            extern int nv2a_pb_scan_in_call(void);
+            xbox_FlipHoldStall(&s_flip_hold, stall_vbl, stall_ns,
+                               clock_ok && !nv2a_pb_scan_in_call());
+        }
         return;
-
+    }
 
     /* Vertex programs and their constants: forwarded as they arrive. */
     case 0x1E94:                                  /* TRANSFORM_EXECUTION_MODE */
@@ -4098,6 +4228,7 @@ void nv2a_pb_exec_report(void)
         last_flips = s_gpu.flips;
         last_ms = now;
     }
+    flip_hold_report();
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                     " clears %u | %u unhandled methods (%d distinct)\n",
             s_gpu.color_offset, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,

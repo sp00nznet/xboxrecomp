@@ -48,6 +48,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 }
 void nv2a_pb_exec_report(void) {}
 void xbox_Nv2aAckBusyBits(void) {}
+void nv2a_pb_exec_walk_begin(void) {}       /* the flip hold's vblank sample */
 
 void nv2a_pb_resync(uint32_t get_phys);
 void nv2a_pb_scan(uint32_t put_phys);

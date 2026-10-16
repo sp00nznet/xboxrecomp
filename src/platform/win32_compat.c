@@ -56,6 +56,9 @@ LONG InterlockedDecrement(volatile LONG *p)        { return __atomic_sub_fetch(p
 LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
 
+LONG InterlockedAnd(volatile LONG *p, LONG v)      { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
+LONG InterlockedOr(volatile LONG *p, LONG v)       { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
+
 LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
 {
     __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
@@ -703,11 +706,56 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+/* Win32 gives a new thread the process's CPU mask; pthread_create copies
+ * the creator's. A guest thread pinned to one core (xbox_GuestThreadPin)
+ * would otherwise hand that core to every host thread it creates, the
+ * kernel timer thread from KeSetTimer among them. The mask is taken once,
+ * from the first thread to ask, before any pin. */
+static DWORD_PTR s_process_mask;
+
+static DWORD_PTR process_mask_capture(void)
+{
+    DWORD_PTR mask = 0;
+    if (s_process_mask)
+        return s_process_mask;
+#if defined(__linux__)
+    {
+        cpu_set_t set;
+        int i;
+        if (sched_getaffinity(0, sizeof set, &set) == 0)
+            for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
+                if (CPU_ISSET(i, &set))
+                    mask |= (DWORD_PTR)1 << i;
+    }
+#endif
+    if (!mask) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n < 1) n = 1;
+        if (n >= (long)(8 * sizeof mask)) n = (long)(8 * sizeof mask) - 1;
+        mask = ((DWORD_PTR)1 << n) - 1;
+    }
+    s_process_mask = mask;
+    return mask;
+}
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+
+#if defined(__linux__)
+    /* The process mask, not the creator's: see process_mask_capture. */
+    if (s_process_mask) {
+        cpu_set_t set;
+        int i;
+        CPU_ZERO(&set);
+        for (i = 0; i < (int)(8 * sizeof s_process_mask) && i < CPU_SETSIZE; i++)
+            if (s_process_mask & ((DWORD_PTR)1 << i))
+                CPU_SET(i, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    }
+#endif
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -843,6 +891,51 @@ int GetThreadPriority(HANDLE h)
 {
     w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
+}
+
+DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
+{
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    pthread_t th = (o && o->kind == K_THREAD) ? o->thread : pthread_self();
+    (void)th;
+    if (!mask)
+        return 0;
+    process_mask_capture();   /* before this thread's mask shrinks */
+#if defined(__linux__)
+    {
+        DWORD_PTR prev = 0;
+        cpu_set_t set;
+        int i;
+        if (pthread_getaffinity_np(th, sizeof set, &set) == 0)
+            for (i = 0; i < (int)(8 * sizeof prev) && i < CPU_SETSIZE; i++)
+                if (CPU_ISSET(i, &set))
+                    prev |= (DWORD_PTR)1 << i;
+        CPU_ZERO(&set);
+        for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
+            if (mask & ((DWORD_PTR)1 << i))
+                CPU_SET(i, &set);
+        if (pthread_setaffinity_np(th, sizeof set, &set) != 0)
+            return 0;
+        return prev ? prev : mask;
+    }
+#else
+    /* No thread affinity on this host: macOS has only affinity tags, a
+     * hint, so the guest threads' one-core pin (RECOMP_GUEST_CPUS) does
+     * nothing here and returns 0 as a failed call would. */
+    return 0;
+#endif
+}
+
+BOOL GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
+                            DWORD_PTR *system_mask)
+{
+    /* The process's mask, captured before any thread shrank its own:
+     * sched_getaffinity(0) would answer for the calling thread. */
+    DWORD_PTR mask = process_mask_capture();
+    (void)process;
+    if (process_mask) *process_mask = mask;
+    if (system_mask)  *system_mask  = mask;
+    return TRUE;
 }
 
 VOID SwitchToThread(void) { sched_yield(); }

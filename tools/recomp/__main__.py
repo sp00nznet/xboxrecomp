@@ -271,6 +271,13 @@ def main():
     parser.add_argument("--coalesce-functions", metavar="JSON", action="append",
                         help="Explicit owner bounds and false interior starts "
                              "to merge before translation; repeatable")
+    parser.add_argument("--back-edge-yield", action="store_true",
+                        help="Call RECOMP_BACK_EDGE, the guest CPU's quantum "
+                             "check, at every loop back edge. The guest CPU "
+                             "lock (RECOMP_GUEST_LOCK=1) needs it to preempt "
+                             "a loop that makes no kernel call; it costs a "
+                             "load and a branch per edge when the lock is "
+                             "off. Off by default: edges stay bare")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -348,6 +355,7 @@ def main():
         icall_sites_json_path=args.icall_sites or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "output",
             "icall_sites.json"),
+        back_edge_yield=args.back_edge_yield,
     )
 
     t_load = time.time() - t0

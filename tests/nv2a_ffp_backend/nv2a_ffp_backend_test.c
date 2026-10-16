@@ -40,6 +40,12 @@ void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
 void xbox_Nv2aFrameCounterFlip(void) {}
+/* The flip hold (nv2a_flip_hold.c, linked in). No vblank moves here, so the
+ * executor never holds a flip; the walk is never inside a pushbuffer CALL. */
+int nv2a_pb_scan_in_call(void) { return 0; }
+uint32_t xbox_VblankCount(void) { return 0; }
+uint64_t xbox_HostNowNs(void) { return 0; }
+uint32_t xbox_Nv2aFrameCountersOwned(void) { return 0; }
 
 static volatile uint32_t s_pgraph_400b10;
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
@@ -101,6 +107,13 @@ int main(void)
     uint32_t i;
 
     nv2a_backend_register(&s_backend);
+
+    /* The flip hold is opt-in: unset, RECOMP_FLIP_PACING leaves every flip
+     * completing at once and method 0x100 an unhandled no-op, as before. */
+    if (!getenv("RECOMP_FLIP_PACING")) {
+        extern int nv2a_pb_exec_flip_pacing(void);
+        CHECK(nv2a_pb_exec_flip_pacing() == 0);
+    }
 
     /* A 640x480 surface at 2x2 anti-aliasing: SET_SURFACE_CLIP is in logical
      * pixels, the real surface is 1280x960 with a 5120-byte pitch. */
