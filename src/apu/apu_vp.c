@@ -71,6 +71,7 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
+    d->vp.filters[v].gain_valid = false;     /* a new voice starts at its level */
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
     if (d->vp.filters[v].resampler) {
         src_reset(d->vp.filters[v].resampler);
@@ -143,27 +144,34 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
+/* Per voice, as in xemu. A title's VOICE_LOCK arrives on its own thread while
+ * the frame thread holds d->lock across every voice of a frame, so taking
+ * d->lock here made each lock wait out the whole frame. The title only has to
+ * wait while the voice processor is working on the voice it locks. */
+static void voice_spin_lock(MCPXAPUState *d, uint16_t v)
+{
+    while (InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
+        SwitchToThread();
+}
+
+static void voice_spin_unlock(MCPXAPUState *d, uint16_t v)
+{
+    InterlockedExchange(&d->vp.voice_spin[v], 0);
+}
+
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    qemu_mutex_lock(&d->lock);
-
-    uint64_t mask = 1ULL << (v % 64);
-    if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
-    } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
-    }
-
+    voice_spin_lock(d, v);
+    d->vp.voice_locked[v] = lock;
+    voice_spin_unlock(d, v);
     qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    uint64_t mask = 1ULL << (v % 64);
-    return (qatomic_read(&d->vp.voice_locked[v / 64]) & mask) != 0;
+    return d->vp.voice_locked[v] != 0;
 }
 
 /* ============================================================
@@ -1107,8 +1115,9 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     size_t block_size;
 
     int adpcm_block_index = -1;
-    uint32_t adpcm_block[36 * 2 / 4];
-    int16_t adpcm_decoded[65 * 2];
+    /* Room for the largest block the MCPX accepts (see the check below). */
+    uint32_t adpcm_block[36 * ADPCM_MAX_BLOCKS / 4];
+    int16_t adpcm_decoded[65 * ADPCM_MAX_BLOCKS * 2];
 
     voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_NEW_VOICE, 0);
@@ -1167,6 +1176,17 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         (container_size_index == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM);
 
     if (adpcm) {
+        /* The block is 36 bytes per channel times the descriptor's 5-bit
+         * samples-per-block field, read into the fixed buffers above. A
+         * value past what they hold overran the stack. */
+        if (samples_per_block > ADPCM_MAX_BLOCKS) {
+            static int warned;
+            if (!warned++)
+                fprintf(stderr, "[APU] voice %u: ADPCM samples per block %u "
+                        "is above %d; voice skipped\n",
+                        v, samples_per_block, ADPCM_MAX_BLOCKS);
+            return -1;
+        }
         block_size = 36;
     } else {
         block_size = container_size;
@@ -1569,10 +1589,20 @@ static void voice_process(MCPXAPUState *d,
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
         g *= attenuate(vol[b]) / hr;
+        /* The volumes are target registers: the hardware moves the level
+         * toward them rather than jumping. Stepping to each frame's level
+         * every 32 samples turned a voice whose volume the title changes
+         * every frame (an engine that follows the revs) into a buzz at the
+         * frame rate. Ramp from the gain the last frame ended on. */
+        MCPXAPUVoiceFilter *f = &d->vp.filters[v];
+        float g0 = f->gain_valid ? f->gain_prev[b] : g;
+        float step = (g - g0) / NUM_SAMPLES_PER_FRAME;
+        f->gain_prev[b] = g;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            mixbins[bin[b]][i] += g * samples[i][b % channels];
+            mixbins[bin[b]][i] += (g0 + step * (i + 1)) * samples[i][b % channels];
         }
     }
+    d->vp.filters[v].gain_valid = true;
 
     /* VP monitor mix */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
@@ -1663,7 +1693,9 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                     fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
                 /* Process voice directly (single-threaded) */
+                voice_spin_lock(d, v);
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                voice_spin_unlock(d, v);
             }
             d->regs[current] = d->regs[next];
         }
@@ -1732,7 +1764,7 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     memset(d->vp.ssl, 0, sizeof(d->vp.ssl));
     memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
-    memset(d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
+    memset((void *)d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         hrtf_filter_init(&d->vp.filters[v].hrtf);
     }
