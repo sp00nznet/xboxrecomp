@@ -30,6 +30,9 @@
  * is the thing that receives the keys, so that is what has to remember
  * them. */
 #include "keyboard.h"   /* src/input */
+#include <stdbool.h>
+#include "pvideo_scanout.h"
+#include "../nv2a/nv2a_mmio_hook.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -50,6 +53,70 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  * thread is never reading the one being filled. */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+
+/* The last PVIDEO frame shown. A frame stays on screen until the next one or
+ * STOP, but once its bank is consumed the title may reuse the memory, so the
+ * pixels are kept here rather than read again. */
+static uint8_t      *s_pvideo_source;
+static size_t        s_pvideo_bytes;
+static unsigned      s_pvideo_bank;
+static uint32_t      s_pvideo_regs[0x1000 / 4];
+
+/* Draw the video overlay over s_rgb: a newly submitted bank if there is one
+ * (copied, drawn, then handed back to the title), else the last frame. */
+static void fb_overlay(void)
+{
+    uint32_t regs[0x1000 / 4];
+    unsigned bank;
+    bool presented = false;
+
+    if (!s_rgb || !nv2a_hook_pvideo_snapshot(regs)) return;
+    if ((regs[NV_PVIDEO_STOP / 4] & 1u) ||
+        (s_pvideo_source &&
+         regs[(NV_PVIDEO_SIZE_IN + s_pvideo_bank * 4) / 4] == UINT32_MAX)) {
+        free(s_pvideo_source);
+        s_pvideo_source = NULL;
+        if (regs[NV_PVIDEO_STOP / 4] & 1u) return;
+    }
+    for (bank = 0; bank < 2; ++bank) {
+        uint64_t physical = (uint64_t)regs[(NV_PVIDEO_BASE + bank * 4) / 4] +
+                            regs[(NV_PVIDEO_OFFSET + bank * 4) / 4];
+        unsigned pitch = regs[(NV_PVIDEO_FORMAT + bank * 4) / 4] & NV_PVIDEO_FORMAT_PITCH;
+        unsigned height = (regs[(NV_PVIDEO_SIZE_IN + bank * 4) / 4] >> 16) & 0x7ff;
+        uint64_t bytes = (uint64_t)pitch * height;
+        uintptr_t va;
+        MEMORY_BASIC_INFORMATION mapping;
+        uint8_t *snapshot;
+
+        if (!(regs[NV_PVIDEO_BUFFER / 4] & (1u << (bank * 4u)))) continue;
+        if (!bytes || physical + bytes > 0x04000000u) continue;
+        va = (uintptr_t)(0x80000000u + (uint32_t)physical) +
+             (uintptr_t)xbox_GetMemoryOffset();
+        if (!VirtualQuery((const void *)va, &mapping, sizeof(mapping)) ||
+            mapping.State != MEM_COMMIT ||
+            (mapping.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+            bytes > mapping.RegionSize - (size_t)(va - (uintptr_t)mapping.BaseAddress))
+            continue;
+        snapshot = (uint8_t *)malloc((size_t)bytes);
+        if (!snapshot) continue;
+        memcpy(snapshot, (const void *)va, (size_t)bytes);
+        if (!pvideo_scanout(regs, snapshot, (size_t)bytes, s_rgb,
+                            s_fb_width, s_fb_height, bank)) {
+            free(snapshot);
+            continue;
+        }
+        free(s_pvideo_source);
+        s_pvideo_source = snapshot;
+        s_pvideo_bytes = (size_t)bytes;
+        s_pvideo_bank = bank;
+        memcpy(s_pvideo_regs, regs, sizeof(s_pvideo_regs));
+        presented = true;
+        nv2a_hook_pvideo_consume(bank);
+    }
+    if (!presented && s_pvideo_source)
+        pvideo_scanout(s_pvideo_regs, s_pvideo_source, s_pvideo_bytes, s_rgb,
+                       s_fb_width, s_fb_height, s_pvideo_bank);
+}
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -274,6 +341,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     HDC hdc;
     BITMAPINFO bi;
     RECT r;
+    int fb_pinned;
 
     (void)unused;
 
@@ -308,6 +376,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     bi.bmiHeader.biCompression = BI_RGB;
 
     s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+    /* A window pinned to one address shows that memory and nothing else. */
+    fb_pinned = getenv("RECOMP_FB_VA") != NULL;
 
     fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
             s_fb_width, s_fb_height);
@@ -326,6 +396,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
+            if (!fb_pinned)
+                fb_overlay();
             StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
@@ -335,6 +407,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
+            if (!fb_pinned)
+                fb_overlay();
             StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
@@ -384,6 +458,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     DestroyWindow(hwnd);
     free(s_rgb);
     s_rgb = NULL;
+    free(s_pvideo_source);
+    s_pvideo_source = NULL;
     return 0;
 }
 
