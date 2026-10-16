@@ -580,7 +580,7 @@ enum {
     XBOX_TREE_UNKNOWN = 0,
     XBOX_TREE_GAME,     /* the game files directory: D:, CdRom0, E:, C:, Y: */
     XBOX_TREE_HDD,      /* the HDD root: T:, U:, Z:, the cache partitions   */
-    XBOX_TREE_USER,     /* the UDATA/TDATA saves                            */
+    XBOX_TREE_USER,     /* the UDATA/TDATA saves and the E:\CACHE scratch   */
     XBOX_TREE_DEVICE,   /* a bare device: CdRom0, a PartitionN image        */
 };
 int xbox_path_tree(const char *xbox_path);
