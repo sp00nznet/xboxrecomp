@@ -276,8 +276,34 @@ def main():
     parser.add_argument("--seh-epilog", metavar="ADDR",
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
+    parser.add_argument("--seeds", metavar="JSON", action="append",
+                        default=[],
+                        help="seed_functions.json; the flag-fallback report "
+                             "lists its sites in the seeds marked observed")
+    parser.add_argument("--no-back-edge-yield", action="store_true",
+                        help="Leave loop back edges bare. By default every "
+                             "back edge calls RECOMP_BACK_EDGE, the guest "
+                             "CPU's quantum check (RECOMP_GUEST_LOCK): a load "
+                             "and a branch when the lock is off")
+    parser.add_argument("--spin-waits", metavar="JSON",
+                        help="Lower guest busy-wait loops to RECOMP_SPIN_WAIT "
+                             "(the runtime sleeps in them when its pacing "
+                             "mode is sleep): {\"auto\": bool, \"sites\": "
+                             "[{\"va\": ...}], \"exclude\": [...]}. Writes "
+                             "spin_waits.json (every candidate) to -o. Without "
+                             "it nothing is matched and the output is "
+                             "unchanged")
+
     args = parser.parse_args()
 
+    spin_waits = None
+    if args.spin_waits:
+        from .spin_waits import SpinWaitConfig
+        try:
+            spin_waits = SpinWaitConfig.load(args.spin_waits)
+        except (OSError, ValueError, KeyError) as e:
+            print(f"ERROR: --spin-waits {args.spin_waits}: {e}", file=sys.stderr)
+            sys.exit(1)
     # Reset on every CLI invocation, including one with no manual file.
     from . import translator as translator_module
     from .manual_scan import entry_hooks
@@ -348,7 +374,10 @@ def main():
         icall_sites_json_path=args.icall_sites or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "output",
             "icall_sites.json"),
+        spin_waits=spin_waits,
+        back_edge_yield=not args.no_back_edge_yield,
     )
+    translator.observed_seeds = _load_observed_seeds(args.seeds)
 
     t_load = time.time() - t0
     print(f"Loaded {len(translator.func_db)} functions, "
@@ -511,6 +540,16 @@ def main():
               f"{stats['total_lines']} lines of C, "
               f"{stats['num_chunks']} source files",
               file=sys.stderr)
+        falloffs = sorted(set(
+            getattr(translator, "translator", translator).falloffs))
+        if falloffs:
+            # Each is a body cut short (a misdetected start inside it) or data
+            # decoded after a ret; the first kind hung a BLiNX 2 rank exam.
+            names = ", ".join(f"sub_{a:08X}" for a, _ in falloffs[:8])
+            print(f"WARN: {len(falloffs)} bodies run off their end with"
+                  f" no function there, tail-dispatched by address ({names}"
+                  f"{', ...' if len(falloffs) > 8 else ''})",
+                  file=sys.stderr)
         if stats.get("unresolved_stubs"):
             print(f"{stats['unresolved_stubs']} unresolved call targets stubbed "
                   f"(addresses called but not detected as functions)",
@@ -536,6 +575,59 @@ def main():
         os.path.dirname(__file__), "output")
     summary_path = write_summary(stats, output_dir)
     print(f"\nSummary: {summary_path}", file=sys.stderr)
+    if "flag_fallbacks" in stats:
+        _write_flag_fallbacks(translator, output_dir)
+
+    if translator.translator.spin_waits is not None:
+        _finish_spin_waits(translator.translator.spin_waits, output_dir)
+
+
+def _load_observed_seeds(paths):
+    """Starts of the seeds marked `"observed": true` (seen at runtime)."""
+    starts = set()
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as fh:
+            for entry in json.load(fh):
+                if isinstance(entry, dict) and entry.get("observed"):
+                    starts.add(int(str(entry["start"]), 16))
+    return starts
+
+
+def _write_flag_fallbacks(translator, output_dir):
+    """flag_fallbacks.json and one summary line (flag_fallbacks.py says why
+    this is a report and not an error)."""
+    report = translator.translator.flag_fallbacks
+    doc = report.to_json(translator.observed_seeds)
+    path = os.path.join(output_dir, "flag_fallbacks.json")
+    with open(path, "w", newline="\n") as f:
+        json.dump(doc, f, indent=1)
+        f.write("\n")
+    print(f"Flag fallbacks: {doc['unique_sites']} unique sites "
+          f"({doc['emitted']} emitted), {doc['joins']} at joins ({path})",
+          file=sys.stderr)
+    if doc["observed_functions"]:
+        print("  in observed seeds: " + ", ".join(doc["observed_functions"]),
+              file=sys.stderr)
+
+
+def _finish_spin_waits(report, output_dir):
+    """Write the candidate report; a listed site that did not lower in every
+    body that has it fails the run (the generated files are already written,
+    so the stage's regeneration marker stays and gen/ counts as stale)."""
+    errors = report.finish()
+    doc = report.to_json()
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "spin_waits.json")
+    with open(path, "w", newline="\n") as f:
+        json.dump(doc, f, indent=1)
+        f.write("\n")
+    print(f"Spin waits: {doc['lowered_sites']} sites lowered in "
+          f"{doc['lowered_bodies']} bodies, {doc['candidates']} candidates "
+          f"({path})", file=sys.stderr)
+    if errors:
+        for e in errors:
+            print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

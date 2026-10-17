@@ -336,6 +336,8 @@
 #define NUM_MIXBINS 32
 
 #define ADPCM_SAMPLES_PER_BLOCK 64 // FIXME: Should be 65? Check interpolation
+/* The largest samples-per-block value an ADPCM voice may use. */
+#define ADPCM_MAX_BLOCKS 18
 
 #define MCPX_HW_MAX_PRD_ENTRIES_PER_SSL     16
 #define MCPX_HW_SSLS_PER_VOICE              2

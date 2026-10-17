@@ -426,7 +426,27 @@ typedef struct MCPXAPUVPState {
     uint8_t hrtf_submix[4];
     uint8_t submix_headroom[NUM_MIXBINS];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
-    uint64_t voice_locked[4];
+    /* Updated with 64-bit atomics (qatomic_or64 and friends), which need
+     * natural alignment: an unaligned 64-bit locked op splits across cache
+     * lines on x86 and faults on arm64. */
+    _Alignas(8) uint64_t voice_locked[4];
+    /* The mix's hold on a queued voice the title has locked (apu_vp.c,
+     * vp_hold_locked_voices). hold_waiting is 1 while the frame thread waits
+     * there, so voice_lock wakes it only then; it is read by the title side
+     * and written by the frame thread, with the same 64-bit atomics. The
+     * rest belong to the frame thread. */
+    _Alignas(8) uint64_t hold_waiting;
+    uint64_t hold_exempt[4];   /* locked through a whole bound: not held again until unlocked */
+    uint64_t hold_count;       /* frames that waited */
+    uint64_t hold_timeouts;    /* waits that ran out the bound */
+    uint64_t hold_max_us;      /* longest wait */
+    /* Holds that cleared after their first 1 ms wait returned in under
+     * 0.9 ms. Meant to count voice_lock's broadcast, but any early return
+     * counts: a spurious wake, the ISTS/FECTL broadcasts in apu_core.c, the
+     * apu_mixer_play signal, or SleepConditionVariableCS returning early on
+     * native Windows. So it is an upper bound on the wakes, which is why
+     * the ctest only asserts a floor (a wake that works shows up). */
+    uint64_t hold_wakes;
 
     struct {
         int current_entry;
@@ -532,6 +552,8 @@ void mcpx_apu_vp_init(MCPXAPUState *d);
 void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_vp_reset(MCPXAPUState *d);
+/* Write the VP's buffered trace lines; frame thread, after it drops d->lock. */
+void mcpx_apu_vp_trace_flush(void);
 
 /* DSP functions (stubbed) */
 void mcpx_apu_dsp_init(MCPXAPUState *d);
@@ -580,10 +602,13 @@ extern struct McpxApuDebug g_dbg, g_dbg_cache;
 extern int g_dbg_voice_monitor;
 extern uint64_t g_dbg_muted_voices[4];
 
-/* RECOMP_APU_TRACE: idle-voice traps against the frames that ran. Traps are
- * counted under the APU lock, the rest by the frame thread. */
+/* RECOMP_APU_TRACE: idle-voice traps against interrupt deliveries. Traps are
+ * counted under the APU lock, holder_delivered by the gate holder, the rest
+ * by the frame thread. */
 typedef struct {
-    unsigned traps;             /* front-end traps latched (fe_method) */
+    unsigned traps, delivered, held_frames, forced;
+    unsigned posted;            /* found the gate held: left for its holder */
+    unsigned holder_delivered;  /* run by the gate holder at a safe point */
     unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
     unsigned fe_trapped_frames; /* frames that found FECTL trapped */
 } ApuIrqStats;

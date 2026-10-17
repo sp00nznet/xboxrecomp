@@ -126,6 +126,11 @@ static void d3d_gpu_caught_up(void)
 
 ### When Something Does Read the Pushbuffer
 
+> **In this fork** there is no `nv2a_pb_set_semaphore_target()` or
+> `nv2a_backend.h`: the fork's executor writes the release at the semaphore
+> context DMA's base plus offset, and `xbox_Nv2aPgraphFenceTick` keeps
+> `0x400B10` in step (see the note on [Pushbuffer Executor](pushbuffer-executor.md)).
+
 "Always caught up" is only safe while nothing executes the pushbuffer. With
 `RECOMP_PB_EXEC` on ([Pushbuffer Executor](pushbuffer-executor.md)), the
 executor runs behind the title's thread, and D3D reads the same semaphore to

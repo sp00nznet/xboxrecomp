@@ -59,12 +59,26 @@ Derived algorithms — credited, independently implemented
     NV2A register-combiner translation. Cites xemu's pgraph combiner
     implementation as a reference for the hardware's behaviour.
 
+  src/kernel/nv2a_vsh_fields.h
+    The NV2A vertex-program field table, as (word, shift, bits). Cites
+    xemu's hw/xbox/nv2a/pgraph/vsh.c as the reference for the layout.
+
+  src/kernel/nv2a_combiner.h
+    NV2A register-combiner field table and CPU evaluator. Cites xemu's
+    hw/xbox/nv2a/pgraph/glsl/psh.c as the reference for the encoding and
+    the combiner semantics.
+
+  src/kernel/nv2a_backend_common.h
+    Cube-map face selection and face stride. Cites xemu's
+    hw/xbox/nv2a/pgraph texture code (texture.c) as the reference for the
+    face order and the per-face layout.
+
   Algorithms and hardware behaviour are not themselves copyrightable, and
   these are our own implementations. They are listed here because the debt is
   real and should be visible even where no licence obligation attaches. If
-  anyone believes either file crosses from "implements the same algorithm"
-  into "copies the expression", raise an issue and we will rewrite or
-  relicense it — getting the credit right matters more to us than the licence
+  anyone believes any of these files crosses from "implements the same
+  algorithm" into "copies the expression", raise an issue and we will rewrite
+  or relicense it — getting the credit right matters more to us than the licence
   label.
 
 

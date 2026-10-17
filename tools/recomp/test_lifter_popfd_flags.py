@@ -31,6 +31,9 @@ behaviour is a pre-existing weakness in how unresolved conditions are handled
 at all (it affects mul, div, cpuid and rdtsc identically) and this change
 merely reaches it in one more place. Implementing popfd's flag effect properly
 is the fix that would do better, and it is a larger change than this one.
+
+That fix has since landed: popfd loads g_eflags and is its own flag setter, so
+the branch after it reads the restored flags (test_lifter_eflags_cpuid.py).
 """
 import unittest
 
@@ -61,7 +64,11 @@ def _lift(middle):
 class PopfdFlagTrackingTest(unittest.TestCase):
     def test_popfd_is_not_treated_as_flag_preserving(self):
         self.assertNotIn("popfd", _EFLAGS_PRESERVE)
-        self.assertIn("popfd", _FLAGS_UNDEFINED)
+        # Not "undefined" either: it is its own setter now.
+        self.assertNotIn("popfd", _FLAGS_UNDEFINED)
+
+    def test_a_branch_after_popfd_reads_the_restored_flags(self):
+        self.assertIn("(g_eflags & 0x040u) /* popfd */", _lift(["popfd"]))
 
     def test_pushfd_still_is(self):
         # pushfd reads the flags without changing them; it must stay.

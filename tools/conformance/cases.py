@@ -60,6 +60,20 @@ _FP = [
     (1e10, 3.0), (1e-10, 3.0), (65536.0, 256.0),
 ]
 
+# Operands for the x87 trig cases. The x87 reduces with a 66-bit pi, so above
+# pi/4 it returns f(x * pi / pi66), not libm's f(x): 1e10 is the vector that
+# first showed it, 355 and pi land near a zero where the shift is many ulps,
+# and 2^63 and up are out of range (st0 kept, nothing pushed, C2 set).
+_FP_TRIG = [
+    (1e10, 1.0), (-1e10, 1.0), (1e15, 1.0), (1e18, 1.0), (2.0**62, 1.0),
+    (-(2.0**62), 1.0), (355.0, 1.0), (-355.0, 1.0),
+    (3.141592653589793, 1.0), (100.0, 1.0), (0.5, 1.0),
+    (2.0**63, 1.0), (-(2.0**63), 1.0), (2.0**64, 1.0), (1e300, 1.0),
+    # inf and NaN: the default NaN with C2 clear (invalid is masked), not
+    # out of range -- put on the hardware oracle rather than assumed.
+    (float("inf"), 1.0), (float("-inf"), 1.0), (float("nan"), 1.0),
+]
+
 # Only for the cases that mask fnstsw down to the condition codes. The
 # status word's low byte carries the exception flags -- invalid is set by
 # a NaN compare -- and those are not modelled, so a case comparing the
@@ -365,9 +379,22 @@ CASES = [
          _FP, "fpu", tol=1e-15),
     Case("fpu_sincos_pair", "fsin and fcos",
          ["fld qword ptr [eax]", "fsin", "fld qword ptr [eax]", "fcos"],
-         _FP, "fpu", tol=1e-15),
+         _FP + _FP_TRIG, "fpu", tol=1e-15),
     Case("fpu_ptan", "fptan replaces st0 and pushes 1.0 -- depth grows by one",
-         ["fld qword ptr [eax]", "fptan"], _FP, "fpu", tol=1e-15),
+         ["fld qword ptr [eax]", "fptan"], _FP + _FP_TRIG, "fpu", tol=1e-15),
+    Case("fpu_sincos_pushes",
+         "fsincos leaves sin in st1 and cos in st0, and pushes nothing out "
+         "of range",
+         ["fld qword ptr [eax]", "fsincos"], _FP + _FP_TRIG, "fpu", tol=1e-15),
+    # C2 is what MSVC's CRT checks after fsin, through both paths a status
+    # word reaches a branch: AH read directly, and AH loaded into EFLAGS by
+    # sahf, where C2 is PF. The second is the one `_CIsin` uses.
+    Case("fpu_sin_c2_status", "fsin sets C2 only out of range (fnstsw ax)",
+         ["fld qword ptr [eax]", "fsin", "fnstsw ax", "and eax, 0x0400"],
+         _FP_TRIG, "fpu", tol=1e-15),
+    Case("fpu_sin_c2_sahf", "fsin's C2 reaches PF through sahf",
+         ["fld qword ptr [eax]", "fsin", "fnstsw ax", "sahf", "setp al",
+          "movzx eax, al"], _FP_TRIG, "fpu", tol=1e-15),
 
     # ══ SSE ═════════════════════════════════════════════════════════════════
     #

@@ -215,6 +215,21 @@ class Disassembler:
                 print(f"  Seeded {len(self.seed_functions)} function addresses")
 
         num_funcs = self.func_detector.detect_all(sections)
+        refused = self.func_detector.mid_instruction_starts
+        if refused:
+            print(f"  Refused {len(refused)} start(s) inside an instruction of"
+                  f" the body before them: " + ", ".join(
+                      f"0x{a:08X} (in 0x{i:08X})"
+                      for a, i in sorted(refused.items())[:8])
+                  + (", ..." if len(refused) > 8 else ""))
+            # Real code reaching a refused start means one of the two
+            # decodes is wrong; say where so it can be checked by hand.
+            callers = self.func_detector.refused_start_callers(sections)
+            for addr, sites in sorted(callers.items()):
+                print(f"  Refused start 0x{addr:08X} is called from "
+                      + ", ".join(f"sub_{f:08X} (at 0x{site:08X})"
+                                  for f, site in sites[:4])
+                      + (", ..." if len(sites) > 4 else ""))
         # Detection can realign the stream (tail targets); export its xrefs.
         self.xrefs = build_xrefs(self.engine, self.image)
         if self.verbose:

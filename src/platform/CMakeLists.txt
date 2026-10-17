@@ -20,17 +20,20 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # declares its own project().
 get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
-# recomp_exit_hook: work that must run when a window ends the process with
-# ExitProcess, which skips atexit (recomp_exit_hook.h). A real library on
-# every host, carried by platform, so the D3D windows can call it without
-# linking the kernel.
-add_library(recomp_exit_hook STATIC recomp_exit_hook.c)
-target_include_directories(recomp_exit_hook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# recomp_env: every environment variable the runtime reads, read once
+# (recomp_env.h). A real library on every host; platform carries it to all
+# of the runtime's libraries, so the host clock (host_time.h) and the window
+# exit hook (recomp_exit_hook.h) ride with it.
+add_library(recomp_env STATIC recomp_env.c recomp_exe_dir.c recomp_exit_hook.c host_time.c)
+target_include_directories(recomp_env PUBLIC
+    ${XBOXRECOMP_SRC_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 if(WIN32)
     add_library(platform INTERFACE)
+    target_link_libraries(platform INTERFACE recomp_env)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
-    target_link_libraries(platform INTERFACE recomp_exit_hook)
 else()
     add_library(platform STATIC win32_compat.c)
     target_include_directories(platform PUBLIC
@@ -38,9 +41,17 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     find_package(Threads REQUIRED)
-    target_link_libraries(platform PUBLIC Threads::Threads recomp_exit_hook)
+    target_link_libraries(platform PUBLIC Threads::Threads recomp_env)
     if(NOT APPLE)
         target_link_libraries(platform PUBLIC m)   # feclearexcept etc.; libSystem has them on macOS
     endif()
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
+    # glibc declares pthread_setname_np, pthread_[gs]etaffinity_np, the
+    # CPU_* set macros and dladdr only under _GNU_SOURCE, and a header that
+    # pulls in <pthread.h> first (win32_compat.h) settles it for the whole
+    # file, so a #define in one .c is too late for the others. Every target
+    # that links the platform layer gets it on the command line.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_compile_definitions(platform PUBLIC _GNU_SOURCE)
+    endif()
 endif()

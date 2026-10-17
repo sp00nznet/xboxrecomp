@@ -191,6 +191,36 @@ def va_to_file_offset(va):
     return None
 
 
+# The longest x86 instruction. The loader's zero fill past a code section's
+# raw_size is readable for this many bytes less one -- enough to finish an
+# instruction that starts in the file bytes. Must equal
+# tools/disasm/loader.py's MAX_INSN_LEN, which bounds the disassembler's fill.
+MAX_INSN_LEN = 15
+
+
+def section_at(va) -> Optional[Section]:
+    """The section whose virtual range holds VA, or None."""
+    for s in _SECTIONS:
+        if s.va <= va < s.va + s.va_size:
+            return s
+    return None
+
+
+def readable_end(section: Section) -> int:
+    """Exclusive end of the bytes a code section's functions may read.
+
+    The XBE loader zero-fills from raw_size to virtual_size, and Spartan's
+    D3DX section relies on it: its raw size stops one byte short of the
+    `ret 0x10` that ends D3DXMatrixLookAtLH. The disassembler reads that
+    fill for at most one instruction, so the lifter does too; a start in it
+    is still not code (va_to_file_offset returns None there).
+    """
+    raw_end = section.va + section.raw_size
+    if not section.is_code or section.va_size <= section.raw_size:
+        return raw_end
+    return raw_end + min(section.va_size - section.raw_size, MAX_INSN_LEN - 1)
+
+
 def is_code_address(va):
     """Check if VA is in an executable section (.text or XDK library sections)."""
     for s in _SECTIONS:

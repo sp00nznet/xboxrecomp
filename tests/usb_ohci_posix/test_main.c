@@ -80,8 +80,9 @@ int main(int argc, char **argv)
                 argv[0]);
         return 2;
     }
-    /* The model is opt-in. */
-    setenv("RECOMP_USB", "1", 1);
+    /* Before anything reads the environment: recomp_env takes its snapshot
+     * on the first read, and xbox_MemoryLayoutInit is one. */
+    setenv("RECOMP_DEBUG", "ohci", 1);
     if (!xbox_MemoryLayoutInit(xbe, xbe_len)) {
         fprintf(stderr, "xbox_MemoryLayoutInit failed\n");
         return 2;

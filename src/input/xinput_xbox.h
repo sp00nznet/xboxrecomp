@@ -83,16 +83,40 @@ typedef struct XBOX_INPUT_CAPABILITIES {
  * ================================================================ */
 
 /**
- * Initialize the input system.
- * Maps Xbox controller ports to XInput slots.
+ * Initialize the input system (idempotent; the other calls do it lazily).
+ * Port N is XInput user index N, or SDL GameController slot N. Registers
+ * xbox_InputShutdown() with atexit().
  */
 void xbox_InputInit(void);
 
 /**
- * Get the state of a controller.
- * Port: 0-3 (Xbox controller ports)
+ * Stop every motor the title started. Safe to call more than once.
+ */
+void xbox_InputShutdown(void);
+
+/**
+ * Get the state of a controller, mapped to the Duke layout (input_map.h).
+ * Port: 0-3 (Xbox controller ports). A port last seen disconnected returns
+ * ERROR_DEVICE_NOT_CONNECTED without asking the host until a second has
+ * passed since it was last probed.
  */
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
+
+/**
+ * The host pad on `slot` alone: the same probe and cache rule as
+ * xbox_InputGetState, without the keyboard and mouse merge on 0. For a
+ * game that maps host slots onto its ports itself and merges the keyboard
+ * on its own port 0 (once a poll: the keyboard read consumes mouse motion).
+ */
+DWORD xbox_InputGetPadState(DWORD slot, XBOX_INPUT_STATE *pState);
+
+/**
+ * The keyboard-and-mouse state `kb` merged on top of the pad state `pad`,
+ * as xbox_InputGetState does on port 0: buttons OR-ed, analog values the
+ * larger, a non-zero key or mouse axis replacing the stick's, and the
+ * keyboard's packet number (the title's input layer looks for edges).
+ */
+void xbox_InputMergeKbm(XBOX_INPUT_STATE *pad, const XBOX_INPUT_STATE *kb);
 
 /**
  * Set controller vibration.
@@ -100,7 +124,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
 
 /**
- * Check if a controller is connected.
+ * Check if a controller is connected (the cache; refreshed at most once a
+ * second for a port the title does not read).
  */
 BOOL xbox_InputIsConnected(DWORD dwPort);
 

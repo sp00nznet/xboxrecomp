@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_directory_test C)
+if(NOT WIN32)
+    message(FATAL_ERROR "This harness uses Win32 directory handles (FILE_FLAG_BACKUP_SEMANTICS); run it on Windows or under Proton.")
+endif()
 set(CMAKE_C_STANDARD 11)
 add_subdirectory(../.. runtime)
 add_executable(kernel_directory_test test_main.c)

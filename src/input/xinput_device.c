@@ -1,52 +1,21 @@
 /**
  * Xbox Input Compatibility Layer
  *
- * Translates the Xbox controller API to a host gamepad backend.
- * Handles the structural differences between the Xbox gamepad
- * (analog buttons as bytes, separate trigger channels) and the host
- * (digital face buttons, trigger axes).
+ * The host backends behind input_core.c (input_backend.h): each one reads
+ * a host pad and maps it to the Duke layout through the table in
+ * input_map.c, so both hosts map controls the same way.
  *
- *   _WIN32 -> Windows XInput
+ *   _WIN32 -> Windows XInput (also Proton/Wine)
  *   POSIX  -> SDL2 GameController
  */
 
-#include "xinput_xbox.h"
+#include "input_backend.h"
+#include "recomp_env.h"
+#include "input_map.h"
 #include "keyboard.h"
-#include "mkb_input.h"
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Merge the keyboard on top of a pad on port 0 rather than only standing in
- * for a missing one.
- *
- * The first version put the keyboard behind XInput's failure, on the
- * assumption that with nothing plugged in the call would fail. It does
- * not: under Wine XInputGetState returns ERROR_SUCCESS and a gamepad
- * with every button at rest, so the fallback was unreachable and
- * pressing a key did nothing at all.
- *
- * Merging is also the better rule. A real pad keeps working -- its
- * buttons are already in pState and the keyboard only adds to them --
- * and there is no special case left to get wrong. */
-static void keyboard_merge(XBOX_INPUT_STATE *pState)
-{
-    XBOX_INPUT_STATE kb;
-    int i;
-
-    if (!xbox_InputKeyboardPoll(&kb))
-        return;
-    pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
-    for (i = 0; i < 8; i++)
-        if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
-            pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
-    if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
-    if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
-    if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
-    if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
-    /* The input layer records edges, so an unchanged packet number is
-     * read as the same state and the press never happens. */
-    pState->dwPacketNumber = kb.dwPacketNumber;
-}
 
 /* ======================================================================== */
 #if defined(_WIN32)
@@ -56,119 +25,44 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
 #include <xinput.h>
 #pragma comment(lib, "xinput.lib")
 
-static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
-static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+/* The keyboard on port 0 is shared with the SDL backend (keyboard.c); the
+ * window procedures in fb_present.c and nv2a_pb_d3d11.c record the keys. */
 
-/* The keyboard on port 0 (RECOMP_KEYBOARD=1) comes from keyboard.c, shared
- * with the SDL backend; the GDI window in fb_present.c records the keys. */
+_Static_assert(sizeof(XINPUT_GAMEPAD) == sizeof(XBOX_HOST_XINPUT_GAMEPAD)
+               && offsetof(XINPUT_GAMEPAD, bLeftTrigger) == offsetof(XBOX_HOST_XINPUT_GAMEPAD, bLeftTrigger)
+               && offsetof(XINPUT_GAMEPAD, sThumbRY) == offsetof(XBOX_HOST_XINPUT_GAMEPAD, sThumbRY),
+               "XBOX_HOST_XINPUT_GAMEPAD must match XINPUT_GAMEPAD");
 
-void xbox_InputInit(void)
+static DWORD xi_get_state(DWORD port, XBOX_INPUT_STATE *out)
 {
-    for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
-        XINPUT_STATE state;
-        DWORD result = XInputGetState(i, &state);
-        g_controller_connected[i] = (result == ERROR_SUCCESS);
-    }
-}
+    XINPUT_STATE xi;
+    XBOX_HOST_XINPUT_GAMEPAD pad;
+    DWORD rc = XInputGetState(port, &xi);
 
-DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
-{
-    XINPUT_STATE xi_state;
-    DWORD result;
-
-    if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
-        return ERROR_DEVICE_NOT_CONNECTED;
-
-    result = XInputGetState(dwPort, &xi_state);
-    if (result != ERROR_SUCCESS) {
-        g_controller_connected[dwPort] = FALSE;
-        if (dwPort == 0) {
-            /* Keyboard and mouse stand in for an absent pad, so the game is
-             * playable with no controller plugged in. */
-            int kb;
-            memset(pState, 0, sizeof *pState);
-            kb = xbox_InputKeyboardPoll(pState);
-            if (mkb_merge(dwPort, pState))
-                g_controller_connected[dwPort] = TRUE;
-            if (kb || mkb_enabled())
-                return ERROR_SUCCESS;
-        }
-        return result;
-    }
-
-    g_controller_connected[dwPort] = TRUE;
-    g_last_packet[dwPort] = xi_state.dwPacketNumber;
-
-    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
-    pState->dwPacketNumber = xi_state.dwPacketNumber;
-    pState->Gamepad.wButtons = xi_state.Gamepad.wButtons & 0x00FF;
-
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_A) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_B) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
-
-    pState->Gamepad.sThumbLX = xi_state.Gamepad.sThumbLX;
-    pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
-    pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
-    pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
-
-    if (dwPort == 0)
-        keyboard_merge(pState);
-
-    /* Mouse+keyboard merges on top of a real pad too: the mouse owns the
-     * aim stick while it is moving, WASD owns movement while held. */
-    if (dwPort == 0)
-        mkb_merge(dwPort, pState);
-
+    if (rc != ERROR_SUCCESS)
+        return rc;
+    memcpy(&pad, &xi.Gamepad, sizeof pad);
+    out->dwPacketNumber = xi.dwPacketNumber;
+    xbox_InputMapXInput(&pad, &out->Gamepad);
     return ERROR_SUCCESS;
 }
 
-DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+static DWORD xi_set_state(DWORD port, const XBOX_VIBRATION *v)
 {
-    XINPUT_VIBRATION xi_vib;
-
-    if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
-        return ERROR_DEVICE_NOT_CONNECTED;
-
-    xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
-    xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-    return XInputSetState(dwPort, &xi_vib);
+    XINPUT_VIBRATION xv;
+    xv.wLeftMotorSpeed  = v->wLeftMotorSpeed;
+    xv.wRightMotorSpeed = v->wRightMotorSpeed;
+    return XInputSetState(port, &xv);
 }
 
-BOOL xbox_InputIsConnected(DWORD dwPort)
-{
-    if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
-    return g_controller_connected[dwPort];
-}
+static uint64_t xi_now_ms(void) { return GetTickCount64(); }
 
-DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
-{
-    XINPUT_CAPABILITIES xi_caps;
-    DWORD result;
-
-    if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
-        return ERROR_DEVICE_NOT_CONNECTED;
-
-    result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
-    if (result != ERROR_SUCCESS) return result;
-
-    memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
-    pCaps->Type = xi_caps.Type;
-    pCaps->SubType = xi_caps.SubType;
-    pCaps->Flags = xi_caps.Flags;
-    return ERROR_SUCCESS;
-}
+/* Under Wine XInputGetState has been seen to return ERROR_SUCCESS and an
+ * idle pad for an empty user index. If a Wine/Proton build does that, the
+ * connection probe has to move to XInputGetCapabilities. */
+const xbox_input_backend xbox_input_host_backend = {
+    NULL, xi_get_state, xi_set_state, xbox_InputKbmPoll, xi_now_ms
+};
 
 /* ======================================================================== */
 #else /* !_WIN32 */
@@ -176,154 +70,288 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 /* ======================================================================== */
 
 #include <SDL.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <time.h>
 
-static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
-static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
-static DWORD g_packet[XBOX_MAX_CONTROLLERS];
+/* Hot-plug. A port holds one open controller for as long as SDL reports it
+ * attached; ports never shift, so player 1 keeps port 0 while pads come and
+ * go on other ports. A removed pad frees its port. A new pad takes, in
+ * order: the port the same model (joystick GUID) last held, if it is free
+ * and another pad is still connected; else the lowest free port. So a pad
+ * pulled and replugged comes back as the same player, and a pad that
+ * connects while no other is connected is player 1. A pad left alone on a
+ * higher port stays there (ports never shift, as on the Xbox). Pads beyond
+ * XBOX_MAX_CONTROLLERS wait for a free port.
+ *
+ * Threads: the game's poll threads read the table (get_state, set_state)
+ * while the window thread pumps SDL (fb_present_sdl.c). Every call that
+ * takes a device index (SDL_NumJoysticks, SDL_GameControllerOpen, ...) runs
+ * on the thread that pumps SDL events, because sdl2-compat keeps the index
+ * list in an unlocked global that its event conversion rebuilds when it
+ * pops or posts a device event: a poll thread enumerating beside the
+ * window's pump double-frees that list. So with a window the window thread
+ * opens the subsystem and rescans (xbox_InputSdlPadSync, once per loop),
+ * and the poll threads only use open pads by pointer; headless, the poll
+ * thread is the pump and rescans itself, with SDL_GameControllerUpdate
+ * posting the events. Both run under g_slot_lock, which is taken before
+ * SDL's joystick lock (inside every SDL call), never after: SDL runs event
+ * watches with its lock held, so the watch only raises g_rescan. A rescan
+ * runs on that flag, or at most once a second without it. */
+struct sdl_slot {
+    SDL_GameController *pad;
+    SDL_JoystickID      id;     /* instance id while open */
+    SDL_JoystickGUID    guid;   /* the last pad held; kept after removal */
+    int                 had;    /* guid is set */
+};
+static struct sdl_slot  g_slot[XBOX_MAX_CONTROLLERS];
+static pthread_mutex_t  g_slot_lock = PTHREAD_MUTEX_INITIALIZER;
+static int              g_rescan;       /* atomic: a device came or went */
+static uint64_t         g_last_scan;
+static int              g_wanted;       /* atomic: sdl_init ran (host pads on) */
+static int              g_ready;        /* subsystem up and watched; lock held */
+static pthread_cond_t   g_ready_cv = PTHREAD_COND_INITIALIZER;
 
-/* Set while the framebuffer window's main thread pumps SDL events
- * (src/video/fb_present_sdl.c). The pump already updates the controllers,
- * and SDL_GameControllerUpdate pumps events itself, which on macOS must only
- * happen on the main thread; so then this side only reads them. */
+/* How long the first poll waits for the window thread to open the pads, so
+ * a pad plugged in before launch is connected at the title's first read
+ * (XGetDevices) and not inserted a second later. Bounded: the window loop
+ * wakes at least every 100 ms, and a caller that is the window thread
+ * itself, or one the window is waiting on, only loses this much. */
+#define XBOX_SDL_BOOT_WAIT_MS 250
+
+/* Set by the window (src/video/fb_present_sdl.c) when the process main thread
+ * runs the SDL event loop. Its SDL_PumpEvents already updates the
+ * controllers, so this side only reads them: one event loop, not two threads
+ * racing to pump. */
 static volatile int g_main_pump;
+void xbox_InputSetMainPump(int on) { g_main_pump = on; }
 
-void xbox_InputSetMainPump(int on)
-{
-    g_main_pump = on;
-}
-
-/* Whether any controller is open: SDL must stay up for it at shutdown. */
+/* Whether a controller is open, i.e. whether SDL may still be in use here.
+ * Pads open only on the window thread, which is the one that asks. */
 int xbox_InputAnyOpen(void)
 {
+    int any = 0;
+    pthread_mutex_lock(&g_slot_lock);
     for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
-        if (g_pads[i])
-            return 1;
-    return 0;
+        any |= g_slot[i].pad != NULL;
+    pthread_mutex_unlock(&g_slot_lock);
+    return any;
+}
+static DWORD g_packet[XBOX_MAX_CONTROLLERS];
+
+_Static_assert(SDL_CONTROLLER_BUTTON_A == XBOX_SDL_BUTTON_A
+               && SDL_CONTROLLER_BUTTON_START == XBOX_SDL_BUTTON_START
+               && SDL_CONTROLLER_BUTTON_LEFTSHOULDER == XBOX_SDL_BUTTON_LEFTSHOULDER
+               && SDL_CONTROLLER_BUTTON_DPAD_RIGHT == XBOX_SDL_BUTTON_DPAD_RIGHT,
+               "XBOX_SDL_BUTTON_* must match SDL_GameControllerButton");
+_Static_assert(SDL_CONTROLLER_AXIS_LEFTX == XBOX_SDL_AXIS_LEFTX
+               && SDL_CONTROLLER_AXIS_RIGHTY == XBOX_SDL_AXIS_RIGHTY
+               && SDL_CONTROLLER_AXIS_TRIGGERRIGHT == XBOX_SDL_AXIS_TRIGGERRIGHT,
+               "XBOX_SDL_AXIS_* must match SDL_GameControllerAxis");
+
+static uint64_t sdl_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
-/* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
-static void open_controllers(void)
+/* Runs on whichever thread posts the event, with SDL's locks held: raise the
+ * flag and nothing else (see above). */
+static int SDLCALL device_watch(void *ud, SDL_Event *ev)
 {
-    int slot = 0;
-    for (int i = 0; i < SDL_NumJoysticks() && slot < XBOX_MAX_CONTROLLERS; i++) {
-        if (!SDL_IsGameController(i))
-            continue;
-        if (!g_pads[slot]) {
-            g_pads[slot] = SDL_GameControllerOpen(i);
-            g_controller_connected[slot] = (g_pads[slot] != NULL);
-        }
-        slot++;
+    (void)ud;
+    switch (ev->type) {
+    case SDL_JOYDEVICEADDED:
+    case SDL_JOYDEVICEREMOVED:
+    case SDL_CONTROLLERDEVICEADDED:
+    case SDL_CONTROLLERDEVICEREMOVED:
+        __atomic_store_n(&g_rescan, 1, __ATOMIC_RELEASE);
+        break;
+    default:
+        break;
+    }
+    return 1;
+}
+
+/* g_slot_lock held; any thread, as closing goes by pointer. */
+static void close_slot(int port)
+{
+    SDL_GameControllerClose(g_slot[port].pad);
+    g_slot[port].pad = NULL;
+    fprintf(stderr, "[INPUT] host pad removed port=%d\n", port);
+    fflush(stderr);
+    /* A pad waiting for a free port can take this one at the next poll. */
+    __atomic_store_n(&g_rescan, 1, __ATOMIC_RELEASE);
+}
+
+/* g_slot_lock held, on the pumping thread. Open device index i into the
+ * port it should have. */
+static void open_device(int i)
+{
+    SDL_JoystickGUID g = SDL_JoystickGetDeviceGUID(i);
+    SDL_GameController *c;
+    const char *name;
+    int port = -1, others = 0;
+
+    for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+        others |= g_slot[p].pad != NULL;
+    if (others)
+        for (int p = 0; p < XBOX_MAX_CONTROLLERS && port < 0; p++)
+            if (!g_slot[p].pad && g_slot[p].had
+                && !memcmp(&g_slot[p].guid, &g, sizeof g))
+                port = p;
+    for (int p = 0; p < XBOX_MAX_CONTROLLERS && port < 0; p++)
+        if (!g_slot[p].pad)
+            port = p;
+    if (port < 0 || !(c = SDL_GameControllerOpen(i)))
+        return;
+    g_slot[port].pad  = c;
+    g_slot[port].id   = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(c));
+    g_slot[port].guid = g;
+    g_slot[port].had  = 1;
+    name = SDL_GameControllerName(c);
+    fprintf(stderr, "[INPUT] host pad added port=%d \"%s\"\n", port, name ? name : "?");
+    fflush(stderr);
+}
+
+/* g_slot_lock held, on the pumping thread. Close what SDL lost, open what
+ * it gained. */
+static void rescan(void)
+{
+    int n;
+
+    /* With nothing pumping, device detection runs here. */
+    if (!g_main_pump)
+        SDL_GameControllerUpdate();
+    for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+        if (g_slot[p].pad && !SDL_GameControllerGetAttached(g_slot[p].pad))
+            close_slot(p);
+    n = SDL_NumJoysticks();
+    for (int i = 0; i < n; i++) {
+        SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(i);
+        int open = 0;
+        for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+            open |= g_slot[p].pad && g_slot[p].id == id;
+        if (!open && SDL_IsGameController(i))
+            open_device(i);
     }
 }
 
-void xbox_InputInit(void)
+/* g_slot_lock held, on the pumping thread. On a device event, else at most
+ * once a second. */
+static void maybe_rescan(void)
 {
-    /* Keep the default SIGINT/SIGTERM: SDL would turn them into an SDL_QUIT
-     * that nothing reads without a window, and Ctrl-C would stop working. */
+    uint64_t now = sdl_now_ms();
+
+    /* Cleared before the scan, so an event posted during it is not lost. */
+    if (__atomic_exchange_n(&g_rescan, 0, __ATOMIC_ACQ_REL)
+        || now - g_last_scan >= XBOX_INPUT_PROBE_MS) {
+        g_last_scan = now;
+        rescan();
+    }
+}
+
+/* g_slot_lock held, on the pumping thread. */
+static void start_sdl(void)
+{
+    /* Game controllers pull in SDL events; keep SIGINT/SIGTERM default. */
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
-    open_controllers();
+    SDL_AddEventWatch(device_watch, NULL);
+    g_ready = 1;
+    g_last_scan = sdl_now_ms();
+    __atomic_store_n(&g_rescan, 0, __ATOMIC_RELEASE);
+    rescan();
+    pthread_cond_broadcast(&g_ready_cv);
 }
 
-DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+/* Window thread, once per event loop (fb_present_sdl.c): the controller
+ * subsystem's first open and every rescan happen here while it pumps. */
+void xbox_InputSdlPadSync(void)
 {
-    if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
-        return ERROR_DEVICE_NOT_CONNECTED;
+    if (!__atomic_load_n(&g_wanted, __ATOMIC_ACQUIRE))
+        return;         /* host pads are off, or no poll yet */
+    pthread_mutex_lock(&g_slot_lock);
+    if (!g_ready)
+        start_sdl();
+    else
+        maybe_rescan();
+    pthread_mutex_unlock(&g_slot_lock);
+}
 
-    SDL_GameController *c = g_pads[dwPort];
-    if (!c || !SDL_GameControllerGetAttached(c)) {
-        g_controller_connected[dwPort] = FALSE;
-        if (dwPort == 0 && xbox_InputKeyboardPoll(pState))
-            return ERROR_SUCCESS;
+static void sdl_init(void)
+{
+    __atomic_store_n(&g_wanted, 1, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&g_slot_lock);
+    if (!g_main_pump) {
+        if (!g_ready)
+            start_sdl();
+    } else if (!g_ready) {
+        /* The window's next loop opens the pads; wait for it, a bounded
+         * time (the wait drops g_slot_lock, which that loop takes). Past
+         * the bound the ports read as empty and the core asks again
+         * within a second. */
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_nsec += XBOX_SDL_BOOT_WAIT_MS * 1000000L;
+        dl.tv_sec  += dl.tv_nsec / 1000000000L;
+        dl.tv_nsec %= 1000000000L;
+        while (!g_ready
+               && pthread_cond_timedwait(&g_ready_cv, &g_slot_lock, &dl) != ETIMEDOUT)
+            ;
+    }
+    pthread_mutex_unlock(&g_slot_lock);
+}
+
+static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
+{
+    SDL_GameController *c;
+    XBOX_HOST_SDL_GAMEPAD pad;
+
+    pthread_mutex_lock(&g_slot_lock);
+    if (!g_main_pump && g_ready)
+        maybe_rescan();
+    c = g_slot[port].pad;
+    if (c && !g_main_pump)
+        SDL_GameControllerUpdate();
+    if (c && !SDL_GameControllerGetAttached(c)) {
+        close_slot((int)port);
+        c = NULL;
+    }
+    if (!c) {
+        pthread_mutex_unlock(&g_slot_lock);
         return ERROR_DEVICE_NOT_CONNECTED;
     }
-
-    if (!g_main_pump)
-        SDL_GameControllerUpdate();
-    g_controller_connected[dwPort] = TRUE;
-
-    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
-    pState->dwPacketNumber = ++g_packet[dwPort];
-
-    WORD btn = 0;
-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_UP))    btn |= XBOX_GAMEPAD_DPAD_UP;
-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  btn |= XBOX_GAMEPAD_DPAD_DOWN;
-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  btn |= XBOX_GAMEPAD_DPAD_LEFT;
-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) btn |= XBOX_GAMEPAD_DPAD_RIGHT;
-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_START))      btn |= XBOX_GAMEPAD_START;
-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_BACK))       btn |= XBOX_GAMEPAD_BACK;
-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSTICK))  btn |= XBOX_GAMEPAD_LEFT_THUMB;
-    if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) btn |= XBOX_GAMEPAD_RIGHT_THUMB;
-    pState->Gamepad.wButtons = btn;
-
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_A) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_B) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_X) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_Y) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) ? 255 : 0;
-
-    /* SDL trigger axes are 0..32767 -> Xbox analog button 0..255 */
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] =
-        (BYTE)(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERLEFT) >> 7);
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] =
-        (BYTE)(SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) >> 7);
-
-    /* SDL Y axis points down; the Xbox Y axis points up -- invert.
-     * Use (-1 - v) so v = -32768 does not overflow SHORT. */
-    pState->Gamepad.sThumbLX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX);
-    pState->Gamepad.sThumbLY =
-        (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY));
-    pState->Gamepad.sThumbRX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
-    pState->Gamepad.sThumbRY =
-        (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
-
-    if (dwPort == 0)
-        keyboard_merge(pState);
+    for (int b = 0; b < XBOX_SDL_BUTTON_COUNT; b++)
+        pad.button[b] = SDL_GameControllerGetButton(c, (SDL_GameControllerButton)b) ? 1 : 0;
+    for (int a = 0; a < XBOX_SDL_AXIS_COUNT; a++)
+        pad.axis[a] = SDL_GameControllerGetAxis(c, (SDL_GameControllerAxis)a);
+    pthread_mutex_unlock(&g_slot_lock);
+    out->dwPacketNumber = ++g_packet[port];
+    xbox_InputMapSdl(&pad, &out->Gamepad);
     return ERROR_SUCCESS;
 }
 
-DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
 {
-    if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
-        return ERROR_DEVICE_NOT_CONNECTED;
+    SDL_GameController *c;
 
-    SDL_GameController *c = g_pads[dwPort];
-    if (!c) return ERROR_DEVICE_NOT_CONNECTED;
-
+    pthread_mutex_lock(&g_slot_lock);
+    c = g_slot[port].pad;
     /* SDL rumble needs a duration; refresh for ~1s on each call (the game
-     * polls vibration continuously). */
-    SDL_GameControllerRumble(c, pVibration->wLeftMotorSpeed,
-                             pVibration->wRightMotorSpeed, 1000);
-    return ERROR_SUCCESS;
+     * polls vibration continuously). 0 stops it. */
+    if (c)
+        SDL_GameControllerRumble(c, v->wLeftMotorSpeed, v->wRightMotorSpeed,
+                                 (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 1000 : 0);
+    pthread_mutex_unlock(&g_slot_lock);
+    return c ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }
 
-BOOL xbox_InputIsConnected(DWORD dwPort)
-{
-    if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
-    return g_controller_connected[dwPort];
-}
-
-DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
-{
-    (void)dwFlags;
-    if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
-        return ERROR_DEVICE_NOT_CONNECTED;
-    if (!g_pads[dwPort])
-        return ERROR_DEVICE_NOT_CONNECTED;
-
-    memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
-    pCaps->Type    = 1;   /* XINPUT_DEVTYPE_GAMEPAD */
-    pCaps->SubType = 1;   /* XINPUT_DEVSUBTYPE_GAMEPAD */
-    pCaps->Flags   = 0;
-    return ERROR_SUCCESS;
-}
+const xbox_input_backend xbox_input_host_backend = {
+    sdl_init, sdl_get_state, sdl_set_state, xbox_InputKbmPoll, sdl_now_ms
+};
 
 #endif /* _WIN32 */

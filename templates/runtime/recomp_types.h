@@ -251,6 +251,37 @@ extern RECOMP_TLS uint32_t g_ebp;
 extern RECOMP_TLS int g_df;
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
+/* EFLAGS as pushfd and popfd see it.
+ *
+ * The arithmetic flags are lazy: a jcc rebuilds them from the instruction
+ * that set them, so no EFLAGS word exists until pushfd needs one. g_eflags is
+ * the last image popfd loaded, masked to the bits a P3 lets ring 0 write
+ * (CF PF AF ZF SF TF IF DF OF IOPL NT AC ID), with bit 1 always set. The ID
+ * bit (21) round-trips, which is how code learns the CPU has cpuid; a jcc
+ * right after popfd reads its flags from here.
+ *
+ * recomp_pushfd(known, bits) builds the word: the flags in `known` from
+ * `bits` (what the lifter rebuilt from the tracked setter), DF from g_df, the
+ * rest from g_eflags. Thread-local like g_df.
+ *
+ * Only popfd writes g_eflags. cli and sti do not update its IF bit (they
+ * have no lift that touches it), so a pushfd after them reports the IF of
+ * the last popfd image -- set, unless the guest popped it clear. */
+extern RECOMP_TLS uint32_t g_eflags;
+#define RECOMP_EFL_WRITABLE 0x00247FD5u
+static inline uint32_t recomp_pushfd(uint32_t known, uint32_t bits) {
+    return (g_eflags & ~(known | 0x400u)) | (bits & known) | 0x2u
+         | (g_df ? 0x400u : 0u);
+}
+static inline void recomp_popfd(uint32_t v) {
+    g_eflags = (v & RECOMP_EFL_WRITABLE) | 0x2u;
+    g_df = (int)((v >> 10) & 1u);
+}
+
+/* cpuid: out[0..3] = eax, ebx, ecx, edx for leaf `leaf` (subleaf unused).
+ * The runtime answers as the Xbox's Coppermine-class Pentium III. */
+void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
+
 /* x87 control and status. Thread-local for the same reason the x87 stack
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control
@@ -296,6 +327,73 @@ static inline uint16_t recomp_fxam(double value) {
     return (uint16_t)((signbit(value) ? 0x0200u : 0u) |
         (isnan(value) ? 0x0100u : isinf(value) ? 0x0500u :
          value == 0.0 ? 0x4000u : 0x0400u));
+}
+
+/* x87 FSIN, FCOS, FSINCOS and FPTAN values, for an operand that
+ * recomp_fp_trig_in_range has let through.
+ *
+ * The x87 reduces the operand modulo pi/4 with a 66-bit pi,
+ * 0xC90FDAA22168C234C * 2^-66, not the true pi libm reduces with. The
+ * reduced argument is off by k * (pi - pi66) / 4 for k eighth-turns removed,
+ * so the hardware returns f(x * (1 + D)), D = (pi - pi66) / pi66, where libm
+ * returns f(x). At x = 1e10 the two cosines differ in the 11th digit, and the
+ * x87's fsin(pi) is 1.2246063538223773e-16, not 1.2246467991473532e-16. A
+ * title that runs sin() on an accumulated, never-wrapped angle drifts from
+ * libm that way on a Pentium III, so the recompiled one has to drift too.
+ *
+ * 1 + D rounds to 1, so the shift is applied as a correction to libm's s and
+ * c by angle addition, in the versine form (v = 1 - cos e = 2 sin^2(e/2)):
+ * the correction stays small next to s and the sum rounds once, which keeps a
+ * result near a zero of the function accurate. Below |e| = 2^-26 (|x| under
+ * about 1.16e13) sin e is e and v is below half an ulp, so that costs no
+ * libm call beyond the other one of the pair. tests/x87_trig/model.py derives
+ * the vectors and the error budget (a third of the conformance tolerance).
+ * tan = sin/cos loses relative accuracy as cos(x * (1 + D)) nears 0, as the
+ * hardware's own tan does there; the budget sweep leaves out |cos| < 1e-2.
+ *
+ * For |x| <= pi/4 the hardware does no reduction and libm's value is
+ * returned as it is. No precision-control rounding: PC only narrows FADD,
+ * FSUB, FMUL, FDIV and FSQRT, and the transcendentals always deliver 64 bits.
+ * Inf and NaN give NaN (invalid is masked), as libm's do. */
+#define RECOMP_X87_PI66_D 1.2874146789751208e-21 /* 0x1.8518e2da2e893p-70 */
+static inline int recomp_x87_reduces(double x) {
+    return isfinite(x) && fabs(x) > 0.78539816339744830962;
+}
+static inline void recomp_x87_sincos_pi66(double x, double *s, double *c) {
+    double e = x * RECOMP_X87_PI66_D, se, v, sx = sin(x), cx = cos(x);
+    if (fabs(e) < 1.4901161193847656e-08) { /* 2^-26 */
+        se = e; v = 0.0;
+    } else {
+        double h = sin(0.5 * e);
+        se = sin(e); v = 2.0 * h * h;
+    }
+    *s = sx + (cx * se - sx * v);
+    *c = cx - (sx * se + cx * v);
+}
+static inline double recomp_x87_sin(double x) {
+    double s, c;
+    if (!recomp_x87_reduces(x)) return sin(x);
+    recomp_x87_sincos_pi66(x, &s, &c);
+    return s;
+}
+static inline double recomp_x87_cos(double x) {
+    double s, c;
+    if (!recomp_x87_reduces(x)) return cos(x);
+    recomp_x87_sincos_pi66(x, &s, &c);
+    return c;
+}
+/* Returns the sine; *c is the cosine FSINCOS then pushes. */
+static inline double recomp_x87_sincos(double x, double *c) {
+    double s;
+    if (!recomp_x87_reduces(x)) { *c = cos(x); return sin(x); }
+    recomp_x87_sincos_pi66(x, &s, c);
+    return s;
+}
+static inline double recomp_x87_tan(double x) {
+    double s, c;
+    if (!recomp_x87_reduces(x)) return tan(x);
+    recomp_x87_sincos_pi66(x, &s, &c);
+    return s / c;
 }
 
 /* Result of an x87 compare, in the shape the status word wants:
@@ -481,6 +579,37 @@ void recomp_icall_not_code_log(uint32_t va);
  * to the console's rate instead. */
 uint64_t xbox_ReadTimeStampCounter(void);
 
+/* A guest busy-wait loop, lowered by tools.recomp --spin-waits: the back
+ * edge of a loop that only reads memory and branches back calls this once
+ * the condition was seen still true. In the "spin" pacing mode (the default)
+ * it does nothing and the loop spins as on the console; in "sleep" the
+ * thread blocks until the kernel signals a state change or 1 ms passes
+ * (src/kernel/kernel_pacing.h). */
+extern volatile int g_xbox_spin_sleep;
+/* Non-zero while a device interrupt waits for the one-CPU gate holder: the
+ * wait is then also the holder's safe point to run it, at any pacing
+ * (src/kernel/kernel_hal.c, xbox_IrqPost). */
+extern volatile int g_xbox_irq_pending;
+/* Non-zero while another guest thread waits for the guest CPU
+ * (RECOMP_GUEST_LOCK, src/kernel/kernel_guest_cpu.c): the pass then hands
+ * it over, the console's quantum expiry, at any pacing. */
+extern volatile int g_xbox_guest_cpu_waiters;
+void xbox_SpinWait(uint32_t va);
+#define RECOMP_SPIN_WAIT(va) \
+    do { if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters) xbox_SpinWait(va); } while (0)
+
+/* Every loop back edge in lifted code (tools.recomp, --no-back-edge-yield
+ * leaves them bare): the guest CPU's quantum check. A guest thread that has
+ * waited its quantum for the CPU (RECOMP_GUEST_LOCK) sets the flag, and the
+ * holder hands over at its next back edge, as the console's timer tick
+ * preempted it wherever it was; a kernel call checks the quantum too, but a
+ * frame of lifted code can go without one. With the lock off the flag is
+ * never set: one relaxed load and a branch not taken per back edge. */
+extern volatile int g_xbox_guest_cpu_preempt;
+void xbox_GuestCpuPreempt(uint32_t va);
+#define RECOMP_BACK_EDGE(va) \
+    do { if (g_xbox_guest_cpu_preempt) xbox_GuestCpuPreempt(va); } while (0)
+
 /* x86 port I/O (`in`/`out`). width is 1, 2 or 4 bytes. The runtime models
  * the ports titles are known to read (the field pin at 0x80C0) and logs the
  * first access to any other. */
@@ -512,6 +641,20 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
+
+/** A mov at a constant address in the trapped APU window (0xFE800000-
+ *  0xFE82FFFF). The lifter emits these instead of MEMxx so the access calls
+ *  the APU model directly rather than taking a page fault, which costs about
+ *  51 us under Proton. xbox_memory_layout.c falls back to the plain access
+ *  when audio is off. A store is one statement, like `MEM32(a) = v;`. */
+uint32_t xbox_MmioRead(uint32_t va, int size);
+void xbox_MmioWrite(uint32_t va, uint32_t value, int size);
+#define XBOX_MMIO_R8(addr)      ((uint8_t)xbox_MmioRead((addr), 1))
+#define XBOX_MMIO_R16(addr)     ((uint16_t)xbox_MmioRead((addr), 2))
+#define XBOX_MMIO_R32(addr)     xbox_MmioRead((addr), 4)
+#define XBOX_MMIO_W8(addr, v)   xbox_MmioWrite((addr), (uint8_t)(v), 1)
+#define XBOX_MMIO_W16(addr, v)  xbox_MmioWrite((addr), (uint16_t)(v), 2)
+#define XBOX_MMIO_W32(addr, v)  xbox_MmioWrite((addr), (uint32_t)(v), 4)
 
 /** Signed memory reads. */
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
@@ -922,10 +1065,18 @@ static inline int recomp_parity8(uint32_t x) {
 }
 #define RECOMP_PARITY8(x) recomp_parity8((uint32_t)(x))
 
-/** Pop a 32-bit value from the simulated stack. */
+/**
+ * Pop a 32-bit value from the simulated stack.
+ * Writes dst AFTER incrementing sp: for `pop esp` (dst == sp) x86 leaves ESP
+ * equal to the popped value, not popped value + 4 (Intel SDM, POP). The old
+ * read-then-increment order left every lifted `pop esp` 4 bytes high, so the
+ * round-to-int idiom `push esp; push eax; ...; pop eax; pop esp` drifted the
+ * stack and later pops read the wrong slots.
+ */
 #define POP32(sp, dst) do { \
-    (dst) = MEM32(sp); \
+    uint32_t _pv = MEM32(sp); \
     (sp) += 4; \
+    (dst) = _pv; \
 } while(0)
 
 /* ================================================================
@@ -1220,6 +1371,24 @@ extern volatile uint64_t g_icall_guard_misses;
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
+} while(0)
+
+/* RECOMP_FALLOFF_TAIL - a body that runs off its end into code no function
+ * claims (tools/recomp/translator.py). It dispatches by address like
+ * RECOMP_ITAIL, but a miss is logged once per site: a body that falls off
+ * usually sits in a loop, and one line per pass buried every other log. */
+#define RECOMP_FALLOFF_TAIL(xbox_va) do { \
+    static int _miss_logged; \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           if (!_miss_logged) { _miss_logged = 1; \
+                                recomp_icall_fail_log(_va); } \
+           g_esp += 4; g_eax = 0; } \
 } while(0)
 
 /* ================================================================

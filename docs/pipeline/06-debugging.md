@@ -308,12 +308,14 @@ a title that links the XDK's own DirectSound checks the AC'97 codec, and when
 Wreckless did exactly this and reached its main loop with no renderer set up.
 
 **Diagnose before shimming**:
-- `RECOMP_AC97_READY=1` reports the codec ready and routes the APU aperture to
-  the emulated APU. If behaviour changes with it, the audio probe was the gate.
+- `RECOMP_AC97_READY` (on by default where the host can trap MMIO: x86-64
+  Windows/Proton, and macOS/Linux arm64 through the A64 decoder) reports the codec ready and routes the APU aperture to the
+  emulated APU. If behaviour changes with `RECOMP_AC97_READY=0`, the audio
+  probe was the gate.
 - NV2A register space has no semantics by default and nothing raises a GPU
   interrupt, so a D3D callback driven by one (swap, fence, notifier) never
   fires. `RECOMP_NV2A_TRACE=1` shows whether `DMA_PUT` moves at all;
-  `RECOMP_PB_EXEC=1` actually consumes the pushbuffer.
+  `RECOMP_PB_EXEC` (on by default, `=0` off) consumes the pushbuffer.
 - `RECOMP_WATCHDOG_SECS=N` dumps registers, PUT/GET and the guest stack when
   the title stops making progress -- it names the wait.
 - `RECOMP_WATCH=<va>` names the guest code that writes a value (a callback

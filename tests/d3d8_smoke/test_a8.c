@@ -185,9 +185,10 @@ int main(void)
             stages[c][D3DTSS_COLORARG1] = c == stage ? D3DTA_TEXTURE : D3DTA_CURRENT;
             stages[c][D3DTSS_ALPHAARG1] = c == stage ? D3DTA_TEXTURE : D3DTA_CURRENT;
         }
-        /* Final combiner: D.rgb and G.a select the sampled texture. */
-        states[D3DRS_PSFINALCOMBINERINPUTSABCD] = (NV2A_REG_T0 + stage) << 24;
-        states[D3DRS_PSFINALCOMBINERINPUTSEFG] = (NV2A_REG_T0 + stage) << 16;
+        /* Final combiner: D.rgb (ABCD [7:0]) and G.a (EFG [15:8], alpha
+         * channel) select the sampled texture. */
+        states[D3DRS_PSFINALCOMBINERINPUTSABCD] = NV2A_REG_T0 + stage;
+        states[D3DRS_PSFINALCOMBINERINPUTSEFG] = ((NV2A_REG_T0 + stage) | 0x10) << 8;
         d3d8_combiners_mark_dirty();
         UINT mode = kind == 1 ? NV2A_TEXMODE_CUBEMAP : kind == 2 ? NV2A_TEXMODE_3D : NV2A_TEXMODE_2D;
         d3d8_combiners_set_pixel_shader(1u | (mode << (8 + 4 * stage)));

@@ -42,11 +42,14 @@ class ZeroTestNormalisationTest(unittest.TestCase):
         self.assertEqual(ops[1].type, "imm")
         self.assertEqual(ops[1].imm, 0)
 
-    def test_a_test_of_two_different_registers_is_left_alone(self):
-        """`test eax, ebx` is a bitwise and, not a comparison with zero."""
+    def test_a_test_of_two_different_registers_compares_their_and(self):
+        """`test eax, ebx` is `cmp (eax & ebx), 0`: the same flags, and the
+        form every other compare takes, so it merges at a join too."""
         kind, ops = normalise_zero_test("test", [_reg("eax"), _reg("ebx")])
-        self.assertEqual(kind, "test")
-        self.assertIs(ops[1].reg, "ebx")
+        self.assertEqual(kind, "cmp")
+        self.assertEqual(ops[0].type, "expr")
+        self.assertEqual(ops[0].expr, "(eax) & (ebx)")
+        self.assertEqual(ops[1].imm, 0)
 
     def test_the_emitted_snapshot_compares_against_zero(self):
         out = _emit("test", [_reg("eax"), _reg("eax")])
@@ -67,7 +70,9 @@ class ZeroTestNormalisationTest(unittest.TestCase):
         self.assertEqual(merged[0], "cmp")
 
     def test_a_genuine_test_still_refuses_to_merge_with_a_compare(self):
-        """`test eax, ebx` is a different operation and must not be folded in."""
+        """A raw `test` state no longer comes out of the lifter (it is
+        normalised to a cmp), but the merge itself still refuses to fold a
+        different operation in."""
         mem = Operand(type="mem", mem_base="ebp", mem_disp=-0x14, mem_size=4)
         from_cmp = ("cmp", [mem, Operand(type="imm", imm=0, mem_size=4)])
         from_test = ("test", [_reg("eax"), _reg("ebx")])

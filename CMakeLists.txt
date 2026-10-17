@@ -16,6 +16,11 @@ project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# macOS: the Metal render backend (src/d3d/nv2a_pb_metal.m) is Objective-C.
+if(APPLE)
+    enable_language(OBJC)
+endif()
+
 # Common definitions for all targets
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
@@ -30,6 +35,17 @@ add_compile_definitions(
 # Win32 host primitives. Carries no Xbox semantics; provides the foundation
 # the kernel HLE and the graphics/audio/input layers build on.
 add_subdirectory(src/platform)
+
+# Enhancements (render scale, aspect, frame pacing, mods) and their config
+# files, config.toml over config.default.toml. Opt-in: off by default; a
+# title turns it on and calls it.
+# ON adds the xbox_enhance library and the layer's RECOMP_* config keys
+# (recomp_env.h, RECOMP_ENV_HAVE_ENHANCE_KEYS).
+option(XBOXRECOMP_ENHANCE "Build the opt-in enhancements layer (src/enhance)" OFF)
+if(XBOXRECOMP_ENHANCE)
+    target_compile_definitions(recomp_env PUBLIC RECOMP_ENV_HAVE_ENHANCE_KEYS)
+    add_subdirectory(src/enhance)
+endif()
 
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
@@ -69,6 +85,10 @@ set(XBOXRECOMP_LIBS
     xbox_nv2a
     xbox_video
 )
+if(XBOXRECOMP_ENHANCE)
+    # In the list, so GNU ld sees it inside the group below.
+    list(APPEND XBOXRECOMP_LIBS xbox_enhance)
+endif()
 add_library(xboxrecomp INTERFACE)
 if(UNIX AND NOT APPLE)
     # The archives call each other both ways (the APU reaches the kernel's
@@ -79,4 +99,3 @@ if(UNIX AND NOT APPLE)
 else()
     target_link_libraries(xboxrecomp INTERFACE ${XBOXRECOMP_LIBS})
 endif()
-

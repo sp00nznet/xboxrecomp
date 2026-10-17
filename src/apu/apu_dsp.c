@@ -23,6 +23,7 @@
  */
 
 #include "apu_state.h"
+#include "recomp_env.h"
 #include "fpconv.h"
 
 #include <stdlib.h>
@@ -70,7 +71,7 @@ static volatile int s_gp_in_reset;        /* last GPRST write held the GP */
 
 static void dsp_ack_init(void)
 {
-    const char *spec = getenv("RECOMP_APU_DSP_ACK");
+    const char *spec = recomp_env(RENV_APU_DSP_ACK);
     char buf[256], *p, *end;
 
     s_dsp_ack_count = 0;
@@ -108,7 +109,7 @@ static int mcpx_apu_mixdown_all(void)
 {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
+        const char *e = recomp_env(RENV_APU_MIXDOWN_ALL);
         on = (e && *e) ? (atoi(e) != 0) : 1;
     }
     return on;

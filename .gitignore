@@ -2,7 +2,6 @@
 __pycache__/
 *.pyc
 *.pyo
-.venv/
 
 # Tool output (regenerated per-game)
 tools/disasm/output/
@@ -37,3 +36,4 @@ bin/
 *.obj
 *.exe
 tools/split/output/
+.venv

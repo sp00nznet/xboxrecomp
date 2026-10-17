@@ -11,7 +11,9 @@
 #if !defined(_WIN32)
 
 /* Enable memfd_create, MAP_FIXED_NOREPLACE, timegm. Must precede all #includes. */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /* Darwin: exposes memset_s, its explicit_bzero equivalent. */
 #define __STDC_WANT_LIB_EXT1__ 1
 
@@ -29,6 +31,8 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <limits.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -55,6 +59,8 @@ LONG InterlockedIncrement(volatile LONG *p)        { return __atomic_add_fetch(p
 LONG InterlockedDecrement(volatile LONG *p)        { return __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
+LONG InterlockedAnd(volatile LONG *p, LONG v)      { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
+LONG InterlockedOr(volatile LONG *p, LONG v)       { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
 
 LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
 {
@@ -327,6 +333,104 @@ DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 
+/* Live fd-backed file handles.
+ *
+ * A file HANDLE is a pointer to its w32_object, and the guest can hand back
+ * anything: a title that ignores a failed open passes INVALID_HANDLE_VALUE
+ * on to NtQueryInformationFile, and the bridge lets synthetic values such as
+ * 0xDEAD0001 through untouched. Reading o->kind off either one faulted
+ * (BLiNX 2 on a first boot, at 0xFFFFFFFFFFFFFFFF). So the w32_handle_*
+ * helpers look the pointer up here first and only then dereference it.
+ * Open addressing on the pointer value; the lookup never touches the object. */
+#define FILES_TOMB ((w32_object *)(uintptr_t)1)
+
+static pthread_mutex_t s_files_lock = PTHREAD_MUTEX_INITIALIZER;
+static w32_object    **s_files;
+static size_t          s_files_cap;    /* a power of two, or 0 */
+static size_t          s_files_used;   /* live entries plus tombstones */
+static size_t          s_files_live;
+
+static size_t files_hash(const void *p)
+{
+    uint64_t h = (uint64_t)(uintptr_t)p >> 4;
+    h ^= h >> 31;
+    h *= 0x9E3779B97F4A7C15ull;
+    h ^= h >> 29;
+    return (size_t)h;
+}
+
+/* The slot holding o, or SIZE_MAX. Caller holds s_files_lock. */
+static size_t files_find(const void *o)
+{
+    size_t i, n;
+    if (!s_files_cap || o == FILES_TOMB) return SIZE_MAX;
+    for (i = files_hash(o) & (s_files_cap - 1), n = 0; n < s_files_cap;
+         i = (i + 1) & (s_files_cap - 1), n++) {
+        if (s_files[i] == NULL) return SIZE_MAX;
+        if (s_files[i] == o) return i;
+    }
+    return SIZE_MAX;
+}
+
+static int files_insert(w32_object *o)
+{
+    size_t i;
+    pthread_mutex_lock(&s_files_lock);
+    if ((s_files_used + 1) * 2 > s_files_cap) {
+        /* Grow, or rebuild at the same size to drop tombstones. */
+        size_t cap = s_files_cap ? s_files_cap : 64;
+        while ((s_files_live + 1) * 4 > cap) cap *= 2;
+        w32_object **t = (w32_object **)calloc(cap, sizeof *t);
+        if (!t) { pthread_mutex_unlock(&s_files_lock); return 0; }
+        for (size_t k = 0; k < s_files_cap; k++) {
+            w32_object *e = s_files[k];
+            if (!e || e == FILES_TOMB) continue;
+            for (i = files_hash(e) & (cap - 1); t[i]; i = (i + 1) & (cap - 1)) {}
+            t[i] = e;
+        }
+        free(s_files);
+        s_files = t;
+        s_files_cap = cap;
+        s_files_used = s_files_live;
+    }
+    for (i = files_hash(o) & (s_files_cap - 1);
+         s_files[i] && s_files[i] != FILES_TOMB; i = (i + 1) & (s_files_cap - 1)) {}
+    if (!s_files[i]) s_files_used++;
+    s_files[i] = o;
+    s_files_live++;
+    pthread_mutex_unlock(&s_files_lock);
+    return 1;
+}
+
+static void files_remove(w32_object *o)
+{
+    size_t i;
+    pthread_mutex_lock(&s_files_lock);
+    i = files_find(o);
+    if (i != SIZE_MAX) {
+        s_files[i] = FILES_TOMB;
+        s_files_live--;
+    }
+    pthread_mutex_unlock(&s_files_lock);
+}
+
+/* h as a live file object, or NULL. Caller holds s_files_lock. */
+static w32_object *files_lookup(HANDLE h)
+{
+    if (!h || h == INVALID_HANDLE_VALUE || h == PSEUDO_CURRENT_THREAD)
+        return NULL;
+    return files_find(h) != SIZE_MAX ? (w32_object *)h : NULL;
+}
+
+int w32_open_file_handles(void)
+{
+    int n;
+    pthread_mutex_lock(&s_files_lock);
+    n = (int)s_files_live;
+    pthread_mutex_unlock(&s_files_lock);
+    return n;
+}
+
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
@@ -343,6 +447,7 @@ static void obj_release(w32_object *o)
     if (InterlockedDecrement(&o->refcount) > 0)
         return;
     if (o->kind == K_FILE) {
+        files_remove(o);
         if (o->fd >= 0) close(o->fd);
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
@@ -362,31 +467,106 @@ HANDLE w32_open_handle(int fd, const char *host_path)
     w32_object *o = obj_alloc(K_FILE);
     o->fd        = fd;
     o->file_path = host_path ? strdup(host_path) : NULL;
+    if (!files_insert(o)) {
+        /* Unregistered, no helper would ever accept it: fail the open.
+         * The release closes the fd. */
+        obj_release(o);
+        return NULL;
+    }
     return (HANDLE)o;
 }
 
 int w32_handle_fd(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    return (o && o->kind == K_FILE) ? o->fd : -1;
+    w32_object *o;
+    int fd;
+    pthread_mutex_lock(&s_files_lock);
+    o  = files_lookup(h);
+    fd = o ? o->fd : -1;
+    pthread_mutex_unlock(&s_files_lock);
+    return fd;
 }
 
 const char *w32_handle_path(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    return (o && o->kind == K_FILE) ? o->file_path : NULL;
+    w32_object *o;
+    const char *p;
+    pthread_mutex_lock(&s_files_lock);
+    o = files_lookup(h);
+    p = o ? o->file_path : NULL;
+    pthread_mutex_unlock(&s_files_lock);
+    return p;
 }
 
 void w32_handle_set_path(HANDLE h, const char *host_path)
 {
-    w32_object *o = (w32_object *)h;
-    char *old;
+    w32_object *o;
+    char *old = NULL;
 
-    if (!o || o->kind != K_FILE)
-        return;
-    old = o->file_path;
-    o->file_path = host_path ? strdup(host_path) : NULL;
+    pthread_mutex_lock(&s_files_lock);
+    o = files_lookup(h);
+    if (o) {
+        old = o->file_path;
+        o->file_path = host_path ? strdup(host_path) : NULL;
+    }
+    pthread_mutex_unlock(&s_files_lock);
     free(old);
+}
+
+/* Raise the soft open-file limit to the hard one, at most W32_FD_LIMIT_CAP.
+ *
+ * A title may keep a file open for every entry of its Z: cache, as the
+ * console's kernel has no per-process limit. BLiNX 2 keeps one per cache
+ * file, 363 for a full cache. macOS gives an app launched from Finder a soft
+ * limit of 256, so a first boot failed its 247th open (EMFILE). There the
+ * hard limit is usually RLIM_INFINITY, which setrlimit may refuse for
+ * RLIMIT_NOFILE and which the kernel caps at kern.maxfilesperproc anyway, so
+ * the target is that, then OPEN_MAX if even that is refused. Linux hard
+ * limits from systemd run from 524288 to about 2^30 in containers, and the
+ * raised limit reaches every child too, where select() (FD_SETSIZE) and fd
+ * sweeps up to the limit break or crawl. A title needs a few hundred, so the
+ * target is capped. Returns 1 when the limit changed, 0 when it was already
+ * there, -1 on failure; *after is the limit in force, read back. */
+#define W32_FD_LIMIT_CAP 65536
+
+int w32_raise_fd_limit(unsigned long long *before, unsigned long long *after)
+{
+    struct rlimit rl;
+    rlim_t was, want;
+
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return -1;
+    was = rl.rlim_cur;
+    if (before) *before = (unsigned long long)was;
+    if (after)  *after  = (unsigned long long)was;
+    want = rl.rlim_max;
+    if (want == RLIM_INFINITY || want > W32_FD_LIMIT_CAP)
+        want = W32_FD_LIMIT_CAP;
+#if defined(__APPLE__)
+    {
+        int per_proc = 0;
+        size_t len = sizeof per_proc;
+        if (sysctlbyname("kern.maxfilesperproc", &per_proc, &len, NULL, 0) == 0
+                && per_proc > 0 && (rlim_t)per_proc < want)
+            want = (rlim_t)per_proc;
+    }
+#endif
+    if (want <= was)
+        return 0;
+    rl.rlim_cur = want;
+    if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+#if defined(__APPLE__)
+        rl.rlim_cur = OPEN_MAX < rl.rlim_max ? OPEN_MAX : rl.rlim_max;
+        if (rl.rlim_cur <= was || setrlimit(RLIMIT_NOFILE, &rl) != 0)
+            return -1;
+#else
+        return -1;
+#endif
+    }
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return -1;
+    if (after) *after = (unsigned long long)rl.rlim_cur;
+    return rl.rlim_cur > was ? 1 : -1;
 }
 
 BOOL CloseHandle(HANDLE h)
@@ -703,11 +883,56 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+/* Win32 gives a new thread the process's CPU mask; pthread_create copies
+ * the creator's. A guest thread pinned to one core (xbox_GuestThreadPin)
+ * would otherwise hand that core to every host thread it creates, the
+ * kernel timer thread from KeSetTimer among them. The mask is taken once,
+ * from the first thread to ask, before any pin. */
+static DWORD_PTR s_process_mask;
+
+static DWORD_PTR process_mask_capture(void)
+{
+    DWORD_PTR mask = 0;
+    if (s_process_mask)
+        return s_process_mask;
+#if defined(__linux__)
+    {
+        cpu_set_t set;
+        int i;
+        if (sched_getaffinity(0, sizeof set, &set) == 0)
+            for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
+                if (CPU_ISSET(i, &set))
+                    mask |= (DWORD_PTR)1 << i;
+    }
+#endif
+    if (!mask) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n < 1) n = 1;
+        if (n >= (long)(8 * sizeof mask)) n = (long)(8 * sizeof mask) - 1;
+        mask = ((DWORD_PTR)1 << n) - 1;
+    }
+    s_process_mask = mask;
+    return mask;
+}
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+
+#if defined(__linux__)
+    /* The process mask, not the creator's: see process_mask_capture. */
+    if (s_process_mask) {
+        cpu_set_t set;
+        int i;
+        CPU_ZERO(&set);
+        for (i = 0; i < (int)(8 * sizeof s_process_mask) && i < CPU_SETSIZE; i++)
+            if (s_process_mask & ((DWORD_PTR)1 << i))
+                CPU_SET(i, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    }
+#endif
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -843,6 +1068,48 @@ int GetThreadPriority(HANDLE h)
 {
     w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
+}
+
+DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
+{
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    pthread_t th = (o && o->kind == K_THREAD) ? o->thread : pthread_self();
+    (void)th;
+    if (!mask)
+        return 0;
+    process_mask_capture();   /* before this thread's mask shrinks */
+#if defined(__linux__)
+    {
+        DWORD_PTR prev = 0;
+        cpu_set_t set;
+        int i;
+        if (pthread_getaffinity_np(th, sizeof set, &set) == 0)
+            for (i = 0; i < (int)(8 * sizeof prev) && i < CPU_SETSIZE; i++)
+                if (CPU_ISSET(i, &set))
+                    prev |= (DWORD_PTR)1 << i;
+        CPU_ZERO(&set);
+        for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
+            if (mask & ((DWORD_PTR)1 << i))
+                CPU_SET(i, &set);
+        if (pthread_setaffinity_np(th, sizeof set, &set) != 0)
+            return 0;
+        return prev ? prev : mask;
+    }
+#else
+    return 0;   /* no thread affinity on this host */
+#endif
+}
+
+BOOL GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
+                            DWORD_PTR *system_mask)
+{
+    /* The process's mask, captured before any thread shrank its own:
+     * sched_getaffinity(0) would answer for the calling thread. */
+    DWORD_PTR mask = process_mask_capture();
+    (void)process;
+    if (process_mask) *process_mask = mask;
+    if (system_mask)  *system_mask  = mask;
+    return TRUE;
 }
 
 VOID SwitchToThread(void) { sched_yield(); }
@@ -1079,18 +1346,42 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem)
 /* Virtual memory                                                        */
 /* ===================================================================== */
 
+/* The guest's PAGE_EXECUTE* requests map without PROT_EXEC. Static
+ * recompilation never runs guest bytes: the title's code is host code in the
+ * executable, and nothing here generates code at run time. Asking for exec
+ * only costs: Apple silicon refuses a writable+executable mapping without
+ * MAP_JIT (macOS and iOS alike), so a guest PAGE_EXECUTE_READWRITE used to
+ * come back NULL. The read/write sense is kept; on x86 an executable page is
+ * always readable, so PAGE_EXECUTE alone is read-only. Logged once. */
+static void exec_dropped(DWORD protect)
+{
+    static int said;
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "[win32_compat] guest asked for executable memory "
+                "(protect 0x%02X); mapped without execute, since recompiled "
+                "code never runs guest pages (logged once)\n",
+                (unsigned)(protect & 0xFF));
+}
+
 static int prot_from_page(DWORD protect)
 {
     switch (protect & 0xFF) {
     case PAGE_NOACCESS:          return PROT_NONE;
     case PAGE_READONLY:          return PROT_READ;
     case PAGE_READWRITE:         return PROT_READ | PROT_WRITE;
-    case PAGE_EXECUTE:           return PROT_EXEC;
-    case PAGE_EXECUTE_READ:      return PROT_READ | PROT_EXEC;
-    case PAGE_EXECUTE_READWRITE: return PROT_READ | PROT_WRITE | PROT_EXEC;
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:      exec_dropped(protect); return PROT_READ;
+    case PAGE_EXECUTE_READWRITE: exec_dropped(protect); return PROT_READ | PROT_WRITE;
     default:                     return PROT_READ | PROT_WRITE;
     }
 }
+
+/* Length registry, defined with the view helpers below. Win32 frees by address
+ * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
+ * documented to take size 0 -- so the length has to be recoverable here or
+ * munmap cannot be called at all. */
+void view_register(void *addr, size_t len);
+size_t view_take(const void *addr);
 
 #if defined(__APPLE__)
 /* Darwin has no MAP_FIXED_NOREPLACE, and the two mmap options are both wrong

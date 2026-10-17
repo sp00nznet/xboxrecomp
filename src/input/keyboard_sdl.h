@@ -14,6 +14,9 @@ extern "C" {
 /* An SDL keycode (SDL_Keycode, unmodified) as a Windows VK, or 0 when the
  * key is not one the table records. */
 int  xbox_InputSdlKeyToVk(int sdl_keycode);
+/* The same with the sides kept: LShift/RShift, LCtrl/RCtrl, LAlt/RAlt and
+ * keypad Enter get input_names.h's own codes. The event path uses this. */
+int  xbox_InputSdlKeyToCode(int sdl_keycode);
 /* Once the window exists: stop SDL's text input. */
 void xbox_InputSdlInit(void);
 /* Every event of the main loop: keys, and the window events that release

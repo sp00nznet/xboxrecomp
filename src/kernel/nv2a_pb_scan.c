@@ -19,12 +19,27 @@
  *   (w & 0xFFFF0003) == 0x00020000  return
  * For a method header: count = (w >> 18) & 0x7FF, subchannel = (w >> 13) & 7,
  * method = w & 0x1FFC.
+ *
+ * The walk goes from GET to PUT the way the DMA engine does: a jump moves
+ * GET to its target (new style w & ~3, old style w & 0x1FFFFFFC), a call
+ * does the same and keeps one return address, and a return goes back to it.
+ * So a ring wrap is the title's own jump back to the start, and a segment
+ * with a jump in it goes on after it to PUT.
+ *
+ * Anything else is a word the walk is out of step on, and it stops there
+ * rather than guess: an unknown word, a call inside a call, or a word or
+ * target outside the contiguous window (a parameter misread as a jump can
+ * point anywhere in 256 MB, and only 64 MB is mapped).
  */
 #include <stdio.h>
+#include "recomp_env.h"
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+
+#include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
+#include "nv2a_pb_state.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -38,45 +53,49 @@ static int s_seen_count;
  * looking method numbers out of parameter data, and the counts then describe
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
-static uint32_t s_tot_calls;
+
+/* Walks that stopped short of PUT. Counted because after eight warning lines
+ * a stop is otherwise silent. */
+static uint32_t s_tot_stops, s_tot_salvaged, s_catchups;
+uint32_t nv2a_pb_scan_stops(void) { return s_tot_stops; }
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+extern uint32_t nv2a_pb_exec_semaphore_last_value(void);
+extern uint32_t nv2a_pb_exec_semaphore_releases(void);
+extern void nv2a_pb_perf_scan_begin(void);
+extern void nv2a_pb_perf_scan_end(void);
 static int s_exec_enabled = -1;
-static int s_scan_enabled = -1;
+static int s_scan_enabled = -1;   /* RECOMP_PB_SCAN, read once */
 
-/* Clears the NV2A request bits (xbox_memory_layout.c); called every 256
- * words while executing, so kickoffs are answered mid-walk. */
-extern void xbox_Nv2aAckBusyBits(void);
-static uint32_t s_ack_tick;
-
-/* Either switch, read once. The answer "not set" has to be cached as well as
- * "set": this runs on every pass of the NV2A poll loop, and on the default
- * path -- neither switch set -- a cache that only remembered "set" called
- * getenv on every pass, which walks the whole environment. */
-static int pb_walk_enabled(void)
-{
-    if (s_exec_enabled < 0)
-        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (s_scan_enabled < 0)
-        s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
-    return s_exec_enabled || s_scan_enabled;
-}
-
-/* Slot + 1 of each (subchannel, method) in s_seen. note() runs for every
- * pushbuffer word, so a linear search here was the executor's largest cost
- * (about 40% of its thread in X-Men Legends' levels). */
+/* s_seen's slot for each (subchannel, method), plus one (0: not seen yet).
+ * The walker calls note() for every method in the stream, ~100,000 a frame in
+ * a busy scene, and a linear search of a few hundred pairs there was
+ * half the walker's time. s_seen keeps first-seen order for the report. */
 static uint16_t s_seen_slot[8][0x2000 / 4];
 
 static void note(uint32_t subch, uint32_t method)
 {
-    uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
+    static uint16_t none;
+    uint16_t *slot = &none;
 
-    if (*slot) {
-        s_seen[*slot - 1].count++;
-        return;
+    /* An incrementing run can carry the method past 0x1FFC; those (rare)
+     * keep the linear search. */
+    if (method < 0x2000 && !(method & 3)) {
+        slot = &s_seen_slot[subch & 7][method >> 2];
+        if (*slot) {
+            s_seen[*slot - 1].count++;
+            return;
+        }
+    } else {
+        for (int i = 0; i < s_seen_count; i++) {
+            if (s_seen[i].method == method && s_seen[i].subch == subch) {
+                s_seen[i].count++;
+                return;
+            }
+        }
     }
     if (s_seen_count >= PB_MAX_METHODS) {
         /* Silently dropping past the cap is how a truncated inventory reads as
@@ -94,7 +113,8 @@ static void note(uint32_t subch, uint32_t method)
         s_seen[s_seen_count].subch  = subch;
         s_seen[s_seen_count].count  = 1;
         s_seen_count++;
-        *slot = (uint16_t)s_seen_count;
+        if (slot != &none)
+            *slot = (uint16_t)s_seen_count;
     }
 }
 
@@ -106,7 +126,13 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x0000, "SET_OBJECT" },
     { 0x0100, "NO_OPERATION" },
     { 0x0104, "SET_WARNING_ENABLE" },
-    { 0x0130, "SET_FLIP_READ" },
+    { 0x0110, "WAIT_FOR_IDLE" },
+    { 0x0120, "SET_FLIP_READ" },
+    { 0x0124, "SET_FLIP_WRITE" },
+    { 0x0128, "SET_FLIP_MODULO" },
+    { 0x012C, "FLIP_INCREMENT_WRITE" },
+    { 0x0130, "FLIP_STALL" },
+    { 0x01A4, "SET_CONTEXT_DMA_SEMAPHORE" },
     { 0x0200, "SET_SURFACE_CLIP_HORIZONTAL" },
     { 0x0204, "SET_SURFACE_CLIP_VERTICAL" },
     { 0x0208, "SET_SURFACE_FORMAT" },
@@ -121,23 +147,30 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x033C, "SET_CULL_FACE_ENABLE" },
     { 0x0340, "SET_DEPTH_MASK" },
     { 0x0350, "SET_CLEAR_DEPTH_VALUE" },
-    { 0x1D8C, "SET_CLEAR_DEPTH" },
+    { 0x1D8C, "SET_ZSTENCIL_CLEAR_VALUE" },
     { 0x1D90, "SET_COLOR_CLEAR_VALUE" },
     { 0x1D94, "CLEAR_SURFACE" },
-    { 0x1D6C, "SET_ZSTENCIL_CLEAR" },
-    { 0x0B80, "SET_TRANSFORM_PROGRAM" },
-    { 0x0B00, "SET_TRANSFORM_CONSTANT" },
+    { 0x1D6C, "SET_SEMAPHORE_OFFSET" },
+    { 0x1D70, "BACK_END_WRITE_SEMAPHORE_RELEASE" },
+    { 0x1D98, "SET_CLEAR_RECT_HORIZONTAL" },
+    { 0x1D9C, "SET_CLEAR_RECT_VERTICAL" },
+    { 0x0B00, "SET_TRANSFORM_PROGRAM" },
+    { 0x0B80, "SET_TRANSFORM_CONSTANT" },
+    { 0x1EA4, "SET_TRANSFORM_CONSTANT_LOAD" },
     { 0x1720, "SET_VERTEX_DATA_ARRAY_OFFSET" },
     { 0x1760, "SET_VERTEX_DATA_ARRAY_FORMAT" },
     { 0x17FC, "SET_BEGIN_END" },
     { 0x1800, "ARRAY_ELEMENT16" },
-    { 0x1808, "INLINE_ARRAY" },
+    { 0x1808, "ARRAY_ELEMENT32" },
     { 0x1810, "DRAW_ARRAYS" },
+    { 0x1818, "INLINE_ARRAY" },
     { 0x1B00, "SET_TEXTURE_OFFSET" },
     { 0x1B04, "SET_TEXTURE_FORMAT" },
     { 0x1B08, "SET_TEXTURE_ADDRESS" },
     { 0x1B0C, "SET_TEXTURE_CONTROL0" },
-    { 0x1B14, "SET_TEXTURE_IMAGE_RECT" },
+    { 0x1B10, "SET_TEXTURE_CONTROL1" },
+    { 0x1B14, "SET_TEXTURE_FILTER" },
+    { 0x1B1C, "SET_TEXTURE_IMAGE_RECT" },
     { 0x0FD8, "SET_COMBINER_*" },
     { 0x0000, NULL },
 };
@@ -155,17 +188,15 @@ void nv2a_pb_scan_report(void)
 {
     int i;
 
-    if (s_exec_enabled > 0) {
+    if (s_exec_enabled > 0)
         nv2a_pb_exec_report();
-        fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
-    }
-    if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
+    if (!s_seen_count || !recomp_env(RENV_PB_SCAN))
         return;
-    fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u calls,"
-                    " %u unrecognised -- %d distinct (subchannel, method)"
-                    " pairs\n",
-            s_tot_segments, s_tot_words, s_tot_jumps, s_tot_calls,
-            s_tot_unknown, s_seen_count);
+    fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised,"
+                    " %u stopped (%u with a fence release salvaged, %u catch-ups)"
+                    " -- %d distinct (subchannel, method) pairs\n",
+            s_tot_segments, s_tot_words, s_tot_jumps, s_tot_unknown,
+            s_tot_stops, s_tot_salvaged, s_catchups, s_seen_count);
     for (i = 0; i < s_seen_count; i++)
         fprintf(stderr, "  [PB]   subch %u  method 0x%04X  x%-6u %s\n",
                 s_seen[i].subch, s_seen[i].method, s_seen[i].count,
@@ -173,360 +204,213 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
-/* Walk the pushbuffer the way the GPU's DMA engine does, from our own read
- * position up to the title's DMA_PUT.
- *
- * This used to scan only the bytes between the previous PUT and this one,
- * stop at the first jump, skip subroutine calls, and skip the whole segment
- * whenever PUT wrapped back to the start of the ring. Each of those drops
- * commands: XDK D3D sends state and vertex-program uploads through CALLs into
- * pre-built pushbuffers, and every wrap lost a segment. What survived drew
- * with stale state -- untransformed meshes run through the pre-transformed
- * pass-through program, garbled text.
- *
- * So: keep a GET of our own (physical, like the register), follow JUMP and
- * CALL/RETURN (NV2A has one level of subroutine), and stop when GET reaches
- * PUT. Addresses are physical; the contiguous window at XBOX_CONTIG_BASE is
- * the physical view.
- *
- * ponytail: if the walk desynchronises (a run of words that decode as
- * nothing), GET snaps to PUT rather than wandering through guest RAM. */
-#define PB_PHYS_MASK 0x0FFFFFFCu
-#define PB_RAM_BYTES (64u * 1024u * 1024u)   /* XBOX_CONTIG_SIZE */
-
-/* A jump or call outside RAM means the walk is reading data as commands. */
-/* The last command headers decoded, so a desync can be traced back to the
- * command that caused it. */
-#define PB_HIST 8
-static struct { uint32_t at, w; } s_hist[PB_HIST];
-static unsigned s_hist_n;
-/* The last jumps/calls/returns taken, and resyncs (w = 0xFFFFFFFF). */
-static struct { uint32_t at, w, to; } s_flow[PB_HIST];
-static unsigned s_flow_n;
-static void pb_flow(uint32_t at, uint32_t w, uint32_t to)
+/* Once per pass of the ack thread's loop: the backend's on_poll, so the
+ * queries of reports already settled can come back to the pool while no
+ * pushbuffer comes. The walk itself settles its reports
+ * (nv2a_pb_exec_walk_end). */
+void nv2a_pb_poll(void)
 {
-    s_flow[s_flow_n % PB_HIST].at = at;
-    s_flow[s_flow_n % PB_HIST].w = w;
-    s_flow[s_flow_n % PB_HIST].to = to;
-    s_flow_n++;
-}
-
-static int pb_bad_target(uint32_t w, uint32_t at, uint32_t target, uint32_t put)
-{
-    static unsigned total;
-    unsigned k;
-    if (target < PB_RAM_BYTES)
-        return 0;
-    if (++total <= 16 || total % 100 == 0) {
-        fprintf(stderr, "  [PB] bad target #%u 0x%08X from word 0x%08X at 0x%08X"
-                        " (PUT 0x%08X); resync\n", total, target, w, at, put);
-        if (total <= 4)
-            for (k = 0; k < PB_HIST && k < s_hist_n; k++) {
-                unsigned i = (s_hist_n - 1 - k) % PB_HIST;
-                fprintf(stderr, "  [PB]   earlier header 0x%08X at 0x%08X\n",
-                        s_hist[i].w, s_hist[i].at);
-            }
-        if (total <= 4)
-            for (k = 0; k < PB_HIST && k < s_flow_n; k++) {
-                unsigned i = (s_flow_n - 1 - k) % PB_HIST;
-                fprintf(stderr, "  [PB]   earlier flow 0x%08X at 0x%08X -> 0x%08X\n",
-                        s_flow[i].w, s_flow[i].at, s_flow[i].to);
-            }
-    }
-    return 1;
-}
-static uint32_t s_get = 0xFFFFFFFFu, s_ret;
-static int      s_in_call;
-
-/* A method whose parameters the walk has not all reached: the header said
- * `count` words and PUT came first. The DMA engine stalls at PUT and carries
- * on with the same method when PUT moves; reading the next word as a new
- * header instead would decode vertex data as commands. (D3D streams large
- * inline arrays across several kicks, so this is routine, not a desync.) */
-static uint32_t s_pend_left, s_pend_i, s_pend_method, s_pend_subch;
-static int      s_pend_noninc;
-
-/* DMA_GET is the GPU's fetch pointer: nothing at or past it has been read, and
- * XDK D3D relies on exactly that. Its fence wait reads GET and, when the fence
- * is far enough on, patches a "wake me" software method into the pushbuffer at
- * the fence and sleeps on an event. If GET lagged the executor -- it used to
- * move only when the walk reached PUT -- D3D patched commands the executor had
- * already passed and slept for good. So under RECOMP_PB_EXEC the walk publishes
- * its position before every command (s_pub is the last value it wrote); a GET
- * that is not what it last wrote means the title moved it, and the walk
- * follows. */
-extern volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
-#define NV2A_USER_DMA_GET 0x800044u
-static uint32_t s_pub = 0xFFFFFFFFu;
-
-/* The title moved GET itself: XDK D3D resets the ring by writing DMA_PUT and
- * DMA_GET together (CDevice::KickOff's restart path). Walking on from the old
- * position would read whatever lies between as commands. */
-void nv2a_pb_resync(uint32_t get_phys)
-{
-    if (!pb_walk_enabled())
+    const struct nv2a_pb_backend *b;
+    if (s_exec_enabled <= 0)
         return;
-    pb_flow(s_get, 0xFFFFFFFFu, get_phys & PB_PHYS_MASK);
-    s_get = get_phys & PB_PHYS_MASK;
-    s_in_call = 0;
-    s_pend_left = 0;
-    s_pub = s_get;
+    b = nv2a_pb_get_backend();
+    if (b && b->on_poll)
+        b->on_poll();
 }
 
-/* Feed the parameters of the method in progress to the survey and the
- * executor, up to PUT. */
-static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
+static int pb_in_window(uint32_t va)
 {
-    while (s_pend_left && s_get < PB_RAM_BYTES && s_get != put) {
-        uint32_t m = s_pend_noninc ? s_pend_method : s_pend_method + s_pend_i * 4;
-        uint32_t param = *(const uint32_t *)(mem + (0x80000000u | s_get));
-
-        note(s_pend_subch, m);
-        /* Same walk, two consumers: the survey counts, the executor
-         * acts. Keeping them on one decode means they can never
-         * disagree about what the stream said. */
-        if (s_exec_enabled)
-            nv2a_pb_exec_method(s_pend_subch, m, param);
-        s_get = (s_get + 4) & PB_PHYS_MASK;
-        s_pend_i++;
-        s_pend_left--;
-        (*words)++;
-    }
+    return (va & 3u) == 0 && va - XBOX_CONTIG_BASE <= XBOX_CONTIG_SIZE - 4u;
 }
 
-void nv2a_pb_scan(uint32_t put_phys)
+/* The words from a stop to PUT are never executed, and they may hold the
+ * semaphore release the title's next fence wait spins on. stop_salvage
+ * runs that release itself. When it cannot search the span, or finds
+ * releases there but none it trusts, it asks for a catch-up instead: the
+ * fence mirror then writes the title's submitted count once
+ * (fence_mirrors_tick). */
+uint32_t nv2a_pb_scan_catchups(void) { return s_catchups; }
+
+/* The XDK writes a fence as the pair (BACK_END_WRITE_SEMAPHORE_RELEASE,
+ * count 1, subchannel 0) and its value. Run the last such release found in
+ * [from, to): releasing that one marks all the earlier ones done too, and
+ * none beyond PUT. Mirroring the submitted count would also pass fences
+ * the title has not yet handed over, and a resource it is still using
+ * could then be freed.
+ *
+ * The pair can also be data: ARRAY_ELEMENT16 indices 7536, 4 read as
+ * 0x00041D70. A value taken from data could jump the fence far ahead,
+ * which would turn fences off for the rest of the run. So a candidate
+ * counts only if it looks like the next fence: odd (the XDK's fence values
+ * are), after the last release, and at most 128 past it. Returns how the
+ * fence was handled, for the log. */
+static const char *stop_salvage(const uint8_t *mem, uint32_t from, uint32_t to,
+                                uint32_t *value)
+{
+    uint32_t va, last, rel;
+    int found = 0, seen = 0;
+
+    if (!s_exec_enabled)
+        return "not executing";
+    if (from >= to || !pb_in_window(from) || !pb_in_window(to - 4)) {
+        s_catchups++;
+        return "span wraps or is unreadable; fence catch-up requested";
+    }
+    last = nv2a_pb_exec_semaphore_last_value();
+    for (va = from; va + 4 < to; va += 4) {
+        if (*(const uint32_t *)(mem + va) == 0x00041D70u) {
+            uint32_t v = *(const uint32_t *)(mem + va + 4);
+            seen++;
+            if ((v & 1u) && (int32_t)(v - last) > 0 && v - last <= 128u) {
+                last = v;
+                found = 1;
+            }
+        }
+    }
+    if (!found && seen) {
+        /* Data, or a real release the check turned down (an even value,
+         * or one far past a stale last value): not running it could leave
+         * the title waiting for ever, so fall back to the mirror. */
+        s_catchups++;
+        return "release(s) in the rest but none plausible; catch-up requested";
+    }
+    if (!found)
+        return "no fence release in the rest";
+    rel = nv2a_pb_exec_semaphore_releases();
+    nv2a_pb_exec_method(0, 0x1D70u, last);
+    *value = last;
+    if (nv2a_pb_exec_semaphore_releases() == rel)
+        return "fence release found but refused by the executor";
+    s_tot_salvaged++;
+    return "fence release salvaged";
+}
+
+/* A method header's parameters can go past PUT: the title may submit
+ * the header and some of its data now and the rest with the next PUT. So
+ * the method in progress outlives one walk. */
+static uint32_t s_left, s_subch, s_method;
+static int s_noninc;
+
+/* Whether the walk is inside a pushbuffer CALL, for the executor: a flip
+ * hold can only resume a walk at the top level, since the return address
+ * lives in this walk alone. */
+static int s_in_call;
+int nv2a_pb_scan_in_call(void) { return s_in_call; }
+
+void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t put = put_phys & PB_PHYS_MASK;
-    volatile uint32_t *get_reg = NULL;
+    uint32_t va = start_va, ret_va = 0, at = start_va, w = 0;
     uint32_t words = 0, jumps = 0, unknown = 0;
+    static int inject = -1;
+    const char *why = NULL;
+    int in_call = 0;
 
-    if (!pb_walk_enabled())
+    if (s_exec_enabled < 0)
+        s_exec_enabled = recomp_env(RENV_PB_EXEC) != NULL;
+    if (s_scan_enabled < 0)
+        s_scan_enabled = recomp_env(RENV_PB_SCAN) != NULL;
+    if (!(s_scan_enabled || s_exec_enabled) || end_va == start_va)
         return;
-    if (s_get == 0xFFFFFFFFu) {               /* never resynced: start at PUT */
-        s_get = put, s_pend_left = 0;
-        return;
+    if (s_exec_enabled) {
+        extern void nv2a_pb_exec_walk_begin(void);
+        nv2a_pb_perf_scan_begin();
+        nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
     }
-    if (s_exec_enabled)
-        get_reg = xbox_Nv2aRegPtr(NV2A_USER_DMA_GET);
+    /* Test hook: RECOMP_PB_INJECT_STOP=N stops every Nth walk at its first
+     * word, so the recovery from a stop can be seen without a real desync.
+     * Never the first walk: it sets up the semaphore, and without that the
+     * executor never takes the fence over and there is nothing to recover. */
+    if (inject < 0)
+        inject = recomp_env(RENV_PB_INJECT_STOP)
+               ? atoi(recomp_env(RENV_PB_INJECT_STOP)) : 0;
+    if (inject > 0 && s_tot_segments && s_tot_segments % (uint32_t)inject == 0)
+        why = "injected (RECOMP_DEBUG=pb_inject_stop)";
 
-    pb_consume(mem, put, &words);             /* the method PUT stalled inside */
+    /* Bounded at 4 MB of words, a sane single-frame amount: GET that never
+     * reaches PUT is a stream this walk is out of step with. */
+    while (!why && va != end_va) {
+        uint32_t tgt;
 
-    while (s_get != put) {
-        uint32_t at, target;
-        uint32_t w;
-
-        if (get_reg) {
-            uint32_t g = *get_reg;
-
-            if (g != s_pub) {                 /* the title moved GET mid-walk */
-                pb_flow(s_get, 0xFFFFFFFFu, g & PB_PHYS_MASK);
-                s_get = g & PB_PHYS_MASK;
-                s_in_call = 0;
-                s_pend_left = 0;
-                s_pub = s_get;
-                continue;
-            }
-            *get_reg = s_get;
-            s_pub = s_get;
-        }
-        at = s_get;
-
-        /* Keep answering kickoffs while executing; see xbox_Nv2aAckBusyBits. */
-        if (s_exec_enabled && (++s_ack_tick & 0xFFu) == 0)
-            xbox_Nv2aAckBusyBits();
-
-        if (s_get >= PB_RAM_BYTES) {
-            s_get = put, s_pend_left = 0;
-            break;
-        }
-        w = *(const uint32_t *)(mem + (0x80000000u | s_get));
-        s_hist[s_hist_n % PB_HIST].at = at;
-        s_hist[s_hist_n % PB_HIST].w = w;
-        s_hist_n++;
-
-        if (++words > 0x400000u || unknown > 64) {
-            s_get = put, s_pend_left = 0;                      /* lost sync, or runaway */
-            break;
-        }
-        s_get = (s_get + 4) & PB_PHYS_MASK;
-
-        if ((w & 0xE0000003u) == 0x20000000u) {         /* old-style jump */
-            target = w & 0x1FFFFFFCu;
-            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0; break; }
-            pb_flow(at, w, target);
-            s_get = target;
-            jumps++;
-            continue;
-        }
-        if ((w & 3u) == 1u) {                            /* jump */
-            target = w & 0xFFFFFFFCu;
-            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0; break; }
-            pb_flow(at, w, target);
-            s_get = target;
-            jumps++;
-            continue;
-        }
-        if ((w & 3u) == 2u) {                            /* call */
-            target = w & 0xFFFFFFFCu;
-            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0; break; }
-            if (s_in_call) {
-                /* One level only: the hardware raises a CALL error and stops
-                 * the pusher. Taking it would overwrite the return address
-                 * and send the first RETURN to the wrong place. */
-                s_in_call = 0;
-                s_get = put, s_pend_left = 0;
-                break;
-            }
-            s_ret = s_get;
-            s_in_call = 1;
-            s_tot_calls++;
-            pb_flow(at, w, target);
-            s_get = target;
-            continue;
-        }
-        if ((w & 0xFFFF0003u) == 0x00020000u) {          /* return */
-            if (s_in_call) {
-                pb_flow(at, w, s_ret);
-                s_get = s_ret;
-                s_in_call = 0;
-            }
-            continue;
-        }
-        if ((w & 0x00030003u) == 0u) {
-            uint32_t count  = (w >> 18) & 0x7FFu;
-            uint32_t subch  = (w >> 13) & 7u;
-            uint32_t method =  w & 0x1FFCu;
-            int noninc = (w & 0xE0000000u) == 0x40000000u;
-
-            /* PUT bounds the parameters too. A count that runs past it must
-             * not carry s_get beyond PUT (the outer loop would then replay a
-             * lap of stale ring contents), nor be forgotten (the leftover
-             * parameters would be read as headers): the method stays pending
-             * and the next walk finishes it. */
-            s_pend_left = count;
-            s_pend_i = 0;
-            s_pend_method = method;
-            s_pend_subch = subch;
-            s_pend_noninc = noninc;
-            pb_consume(mem, put, &words);
-            unknown = 0;
-            continue;
-        }
-        unknown++;
-    }
-
-    if (get_reg) {                            /* what the poll thread writes too */
-        *get_reg = s_get;
-        s_pub = s_get;
-    }
-    s_tot_words += words;
-    s_tot_unknown += unknown;
-    s_tot_jumps += jumps;
-    s_tot_segments++;
-}
-
-/* RECOMP_PB_WALK=dma selects the DMA-engine walk above. The default is the
- * segment scan below, which is what the executor did before the walk existed.
- *
- * The walk is the more faithful of the two: it follows JUMPs and ring wraps,
- * keeps its own GET, publishes it before every command, and answers kickoffs
- * mid-walk. That fidelity changes what XDK D3D does. Told exactly how far the
- * GPU has got, D3D's fence code takes its "GPU far behind" path: it patches a
- * software method (NO_OPERATION with a value) into the pushbuffer and sleeps
- * on an event that the GPU's interrupt for that method signals. A runtime that
- * does not deliver that interrupt leaves the title asleep for good -- a title
- * that ran under the segment scan froze on the first screen whose pushbuffer
- * made the walk long enough. So the walk is opt-in, for projects that deliver
- * the GPU's software-method interrupt. */
-int nv2a_pb_dma_walk(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_PB_WALK");
-        on = e && !strcmp(e, "dma");
-    }
-    return on;
-}
-
-/* The segment scan: walk commands from va to end_va. Returns the words
- * consumed.
- *
- * A CALL runs a subroutine -- a pushbuffer somewhere else in memory -- up to
- * its RETURN, then carries on after the CALL. RenderWare on the Xbox compiles
- * static geometry into pushbuffers and draws it with a CALL, so skipping CALLs
- * loses whole meshes. The NV2A has one level of subroutine, so a CALL inside a
- * call is not followed. A JUMP outside a call ends the segment: the ring's
- * wrap is handled by the caller, which scans the two pieces separately.
- * Addresses are physical, like PUT's, and reach guest memory through the
- * contiguous window. */
-static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
-                                uint32_t *jumps, uint32_t *unknown)
-{
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t words = 0;
-
-    while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+        at = va;
+        w = 0;
+        if (words >= 0x100000u) { why = "word limit"; break; }
+        if (!pb_in_window(va)) { why = "outside the contiguous window"; break; }
+        w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
 
+        if (s_left) {                         /* a parameter */
+            note(s_subch, s_method);
+            /* Same walk, two consumers: the survey counts, the executor
+             * acts. Keeping them on one decode means they can never
+             * disagree about what the stream said. */
+            if (s_exec_enabled)
+                nv2a_pb_exec_method(s_subch, s_method, w);
+            if (!s_noninc)
+                s_method += 4;
+            s_left--;
+            continue;
+        }
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
-            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
-                                             : (w & 0x1FFFFFFCu);
-            (*jumps)++;
-            if (!in_call)
-                break;                        /* the ring: a jump ends it */
-            va = 0x80000000u | (target & 0x0FFFFFFFu);
-            end_va = va + 0x400000u;
+            jumps++;
+            tgt = (w & 3u) == 1u ? w & ~3u : w & 0x1FFFFFFCu;
+            if (tgt >= XBOX_CONTIG_SIZE) { why = "jump outside the window"; break; }
+            va = XBOX_CONTIG_BASE | tgt;
             continue;
         }
-        if ((w & 0xFFFF0003u) == 0x00020000u) {  /* RETURN */
-            if (in_call)
-                break;
+        if ((w & 3u) == 2u) {                 /* call */
+            jumps++;
+            tgt = w & ~3u;
+            if (in_call) { why = "call inside a call"; break; }
+            if (tgt >= XBOX_CONTIG_SIZE) { why = "call outside the window"; break; }
+            ret_va = va;
+            in_call = s_in_call = 1;
+            va = XBOX_CONTIG_BASE | tgt;
             continue;
         }
-        if ((w & 3u) == 2u) {                    /* CALL */
-            if (!in_call) {
-                uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
-                s_tot_calls++;
-                words += pb_walk_segment(sub, sub + 0x400000u, 1, jumps, unknown);
-            }
+        if (w == 0x00020000u) {               /* return */
+            if (!in_call) { why = "return outside a call"; break; }
+            va = ret_va;
+            in_call = s_in_call = 0;
             continue;
         }
-        if ((w & 0x00030003u) == 0u) {
-            uint32_t count  = (w >> 18) & 0x7FFu;
-            uint32_t subch  = (w >> 13) & 7u;
-            uint32_t method =  w & 0x1FFCu;
-            int noninc = (w & 0xE0000000u) == 0x40000000u;
-
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
-                uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
-                if (s_exec_enabled)
-                    nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
-                va += 4;
-                words++;
-            }
+        if ((w & 0xE0030003u) == 0u || (w & 0xE0030003u) == 0x40000000u) {
+            s_left   = (w >> 18) & 0x7FFu;
+            s_subch  = (w >> 13) & 7u;
+            s_method =  w & 0x1FFCu;
+            s_noninc = (w & 0xE0000000u) == 0x40000000u;
             continue;
         }
-        (*unknown)++;
+        unknown++;
+        why = "unknown word";
+        break;
     }
-    return words;
-}
+    s_in_call = 0;
+    /* The walk's reports, before GET moves or a stop's salvage releases a
+     * semaphore: the title may read them once either happens. */
+    if (s_exec_enabled) {
+        extern void nv2a_pb_exec_walk_end(void);
+        nv2a_pb_exec_walk_end();
+    }
+    if (why) {
+        static unsigned said;
+        extern void nv2a_pb_exec_flip_cancel(void);
+        s_left = 0;                 /* out of step: drop the method in progress */
+        if (s_exec_enabled)
+            nv2a_pb_exec_flip_cancel();
+        uint32_t v = 0;
+        const char *fence = stop_salvage(mem, at, end_va, &v);
+        s_tot_stops++;
+        if (said++ < 8)
+            fprintf(stderr, "[PB] walk 0x%08X -> 0x%08X stopped at 0x%08X"
+                    " (word 0x%08X) after %u words without reaching PUT (%s);"
+                    " %s 0x%08X\n",
+                    start_va, end_va, at, w, words, why, fence, v);
+    }
 
-void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
-{
-    uint32_t words, jumps = 0, unknown = 0;
-
-    if (!pb_walk_enabled() || end_va <= start_va)
-        return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
-        end_va = start_va + 0x400000u;
-
-    words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
-
+    if (s_exec_enabled)
+        nv2a_pb_perf_scan_end();
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;

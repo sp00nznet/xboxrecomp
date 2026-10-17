@@ -89,6 +89,11 @@ class Operand:
     # Xbox -- it is how a title reaches the TIB -- but dropping the prefix put
     # fs:[0] at linear address 0, which is also where a null pointer lands.
     mem_seg: str = None
+    # For expr: a C expression already formatted at mem_size, and the source
+    # instruction it stands for (the comment the snapshot keeps). Only
+    # normalise_zero_test makes one: the AND of a `test`.
+    expr: Optional[str] = None
+    expr_src: Optional[str] = None
 
 
 @dataclass
@@ -107,6 +112,29 @@ class BasicBlock:
     @property
     def last_insn(self):
         return self.instructions[-1] if self.instructions else None
+
+
+def disasm_lazily(cs, code, address, batch=32):
+    """cs.disasm(code, address), decoded a batch at a time.
+
+    Capstone's disasm decodes the whole buffer, with detail, before it yields
+    the first instruction. The CFG walks stop at the first jmp or ret but are
+    handed every byte up to the next function start (a section's end at
+    worst), so each probe paid for the whole tail: Burnout 3's 16,842
+    boundary probes spent 370 s in capstone for 204,348 instructions kept.
+    Same instructions, same stop at an invalid one: a batch of `batch`
+    instructions always fits in batch * 15 bytes, so a short batch can only
+    mean an invalid instruction or the end of `code`.
+    """
+    offset = 0
+    while offset < len(code):
+        n = 0
+        for insn in cs.disasm(code[offset:offset + batch * 15], address + offset, batch):
+            n += 1
+            yield insn
+        if n < batch:
+            return
+        offset = insn.address + insn.size - address
 
 
 # Capstone register ID → name mapping (populated on init)
@@ -249,9 +277,51 @@ class Disassembler:
 
         return [decoded[a] for a in sorted(decoded)]
 
+    def _stream(self, raw_bytes, start_va, size, entry, cache):
+        """Instructions from `entry` on, as disasm_lazily would decode them.
+
+        `cache` (address -> Instruction) is shared by calls on one image: the
+        disassembler's data-pointer pass proves about 100,000 CFGs on BLiNX 2,
+        mostly over the same bodies, and decoding them again was 650 of the
+        1,146 seconds a profiled run took. A decode depends only on the address and the instruction's
+        own bytes, so a cached one is used only where this buffer holds the
+        same bytes in full; anything else (a buffer ending inside it, bytes
+        patched since) is decoded afresh.
+        """
+        if cache is None:
+            for cs_insn in disasm_lazily(self._cs, raw_bytes[entry - start_va:size], entry):
+                yield self._decode_instruction(cs_insn)
+            return
+        end_va = start_va + size
+        addr = entry
+        while addr < end_va:
+            insn = cache.get(addr)
+            offset = addr - start_va
+            if (insn is not None and insn.end_address <= end_va
+                    and raw_bytes[offset:offset + insn.size].hex() == insn.bytes_hex):
+                yield insn
+                addr = insn.end_address
+                continue
+            n = 0
+            for cs_insn in self._cs.disasm(raw_bytes[offset:min(offset + 32 * 15, size)], addr, 32):
+                n += 1
+                insn = self._decode_instruction(cs_insn)
+                # Kept only when 15 more bytes follow it here, so no buffer end
+                # can have shaped the decode.
+                if insn.end_address + 15 <= end_va:
+                    cache[insn.address] = insn
+                yield insn
+                addr = insn.end_address
+            if n == 0:
+                return
+
     def disassemble_cfg(self, raw_bytes, start_va, end_va, entry_points,
-                        stop_addresses=None, stop_mnemonics=()):
-        """Decode reachable instruction streams from an explicit worklist."""
+                        stop_addresses=None, stop_mnemonics=(), cache=None):
+        """Decode reachable instruction streams from an explicit worklist.
+
+        `cache`: see _stream. The Instructions in it are shared, so a caller
+        that passes one must not change what it gets back.
+        """
         size = end_va - start_va
         if size <= 0 or size > len(raw_bytes):
             return []
@@ -263,13 +333,11 @@ class Disassembler:
             entry = worklist.pop()
             if not (start_va <= entry < end_va) or entry in decoded:
                 continue
-            offset = entry - start_va
-            for cs_insn in self._cs.disasm(raw_bytes[offset:size], entry):
-                if cs_insn.address != entry and cs_insn.address in stop_addresses:
+            for insn in self._stream(raw_bytes, start_va, size, entry, cache):
+                if insn.address != entry and insn.address in stop_addresses:
                     break
-                if cs_insn.address >= end_va or cs_insn.address in decoded:
+                if insn.address >= end_va or insn.address in decoded:
                     break
-                insn = self._decode_instruction(cs_insn)
                 decoded[insn.address] = insn
 
                 if (insn.is_cond_jump and insn.jump_target is not None

@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_object_paths_test C)
+if(NOT WIN32)
+    message(FATAL_ERROR "This harness uses Win32 file APIs to build its object tree; run it on Windows or under Proton.")
+endif()
 set(CMAKE_C_STANDARD 11)
 add_subdirectory(../.. runtime)
 add_executable(kernel_object_paths_test test_main.c)

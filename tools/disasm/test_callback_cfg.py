@@ -135,6 +135,39 @@ def test_table_thunk_chain_requires_a_proven_destination(valid):
     assert (BASE + 16 in detector._alias_entries) == valid
 
 
+@pytest.mark.parametrize('valid', [True, False])
+def test_tail_proof_memo_reuses_a_chain_with_the_same_answer(valid):
+    # A table of suffixes into one long body walks the same tail chain for
+    # every word; the memo must answer the repeat without decoding again.
+    from tools.disasm.engine import DisasmEngine
+    body = bytearray(b'\xcc' * 460)
+    for off in (0, 32, 96):
+        body[off] = 0xc3
+    for source, target in ((16, 64), (64, 128)):
+        body[source:source + 5] = b'\xe9' + struct.pack('<i', target - source - 5)
+    body[128:449] = b'\x40' * 320 + b'\xc3'
+    if not valid:
+        body[128] = 0xf4
+    text = SectionInfo('.text', BASE, len(body), 0, len(body), False, True, '')
+    image = BinaryImage('synthetic', bytes(body), 0, 0x20000, BASE, 0, [text])
+    engine = DisasmEngine(image)
+    engine.linear_sweep(text)
+    detector = FunctionDetector(engine, image, None, LabelManager())
+    for off in (0, 32, 96):
+        detector.functions[BASE + off] = Function(BASE + off, BASE + off + 1, 'known')
+    starts = sorted(detector.functions)
+    calls = []
+    probe = engine.probes_as_callback_body
+    engine.probes_as_callback_body = lambda *a, **k: calls.append(a[0]) or probe(*a, **k)
+    memo = {}
+    first = detector._probes_as_tail_body(BASE + 16, starts, [text], memo=memo)
+    decoded = len(calls)
+    assert first == valid and decoded
+    assert detector._probes_as_tail_body(BASE + 16, starts, [text], memo=memo) == first
+    assert len(calls) == decoded
+    assert detector._probes_as_tail_body(BASE + 16, starts, [text]) == first
+
+
 def test_entry_frame_rejects_an_epilogue_without_its_saves():
     for body, accepted in ((b'\x5b\xc3', False), (b'\x53\x5b\xc3', True),
                            (b'\x83\xc4\x08\xc3', False),  # add esp,8; ret

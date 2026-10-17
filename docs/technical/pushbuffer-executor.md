@@ -1,5 +1,14 @@
 # Pushbuffer Executor
 
+> **In this fork** (`posix-host/portability`) this page describes upstream's
+> v0.14.0 executor, which the fork did not take. The fork runs its own
+> executor (`nv2a_pb_scan.c`, `nv2a_pb_exec.c`) behind `nv2a_pb_state.h`, with
+> a CPU rasteriser, D3D11 and Metal: it walks from GET to PUT through the
+> title's own jumps, writes semaphore releases itself and keeps PGRAPH
+> 0x400B10 in step with the completed fence (`xbox_Nv2aPgraphFenceTick`). There
+> is no `nv2a_backend.h`, `RECOMP_PB_WALK=dma`, fixed-function transform or
+> anti-aliased surface support here.
+
 A title that statically links the XDK's Direct3D never calls the toolkit's
 D3D8 layer. It writes NV2A methods into a pushbuffer and kicks the GPU, and the
 only way to see its frames is to execute that pushbuffer. `RECOMP_PB_SCAN`

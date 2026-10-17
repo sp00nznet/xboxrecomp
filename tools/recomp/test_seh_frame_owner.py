@@ -33,6 +33,7 @@ class _T:
     from tools.recomp.translator import FunctionTranslator
     _func_has_prologue = FunctionTranslator._func_has_prologue
     _func_owns_a_frame = FunctionTranslator._func_owns_a_frame
+    _func_has_offset_frame = FunctionTranslator._func_has_offset_frame
 
     def __init__(self):
         self.lifter = _Lifter()
@@ -64,4 +65,15 @@ class SehFrameOwnerTest(unittest.TestCase):
     def test_no_seh_prolog_in_the_binary_is_not_a_frame(self):
         self.t.lifter.SEH_PROLOG = None
         insns = [_Insn("call", "0x5b2d78", call_target=0x005B2D78)]
+        self.assertFalse(self.t._func_owns_a_frame(insns))
+
+    def test_msvc_offset_frame_owns_a_frame(self):
+        # MSVC offset frame: push ebp; lea ebp, [esp - 0x70]
+        insns = [_Insn("push", "ebp"), _Insn("lea", "ebp, [esp - 0x70]"),
+                 _Insn("sub", "esp, 0x274")]
+        self.assertFalse(self.t._func_has_prologue(insns))
+        self.assertTrue(self.t._func_owns_a_frame(insns))
+
+    def test_lea_ebp_from_another_register_is_not_a_frame(self):
+        insns = [_Insn("push", "ebp"), _Insn("lea", "ebp, [eax + 4]")]
         self.assertFalse(self.t._func_owns_a_frame(insns))

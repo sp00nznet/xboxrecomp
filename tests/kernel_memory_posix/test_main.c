@@ -229,6 +229,34 @@ int main(void)
         }
     }
 
+    /*
+     * 7. A guest asking for executable memory gets usable memory.
+     *
+     * PAGE_EXECUTE_READWRITE became PROT_READ|PROT_WRITE|PROT_EXEC, which
+     * Apple silicon refuses without MAP_JIT, so the title's allocation came
+     * back NULL on every Mac. Recompiled code never runs guest pages, so the
+     * shim maps it read-write; PAGE_EXECUTE_READ stays read-only.
+     */
+    {
+        SIZE_T sz = 64 * 1024;
+        PVOID base = NULL;
+        NTSTATUS st = xbox_NtAllocateVirtualMemory(&base, 0, &sz,
+                                                   MEM_COMMIT | MEM_RESERVE,
+                                                   PAGE_EXECUTE_READWRITE);
+        check(st == 0 && base != NULL,
+              "NtAllocateVirtualMemory(PAGE_EXECUTE_READWRITE) maps",
+              "refused: the shim still asks the host for PROT_EXEC");
+        if (st == 0 && base) {
+            memset(base, 0x5A, sz);
+            check(((unsigned char *)base)[sz - 1] == 0x5A,
+                  "executable guest memory is writable", NULL);
+            DWORD old;
+            check(VirtualProtect(base, sz, PAGE_EXECUTE_READ, &old) != 0,
+                  "VirtualProtect(PAGE_EXECUTE_READ) succeeds", NULL);
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
+    }
+
     printf("\n%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

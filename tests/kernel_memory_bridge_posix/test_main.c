@@ -207,10 +207,65 @@ static void test_virtual_memory(void)
     st = CALL(ORD_NTFREE, pbase, psize, 0x8000 /* MEM_RELEASE */);
     snprintf(d, sizeof d, "status 0x%08X size 0x%X", st, G32(psize));
     check(st == 0 && G32(psize) == 0x10000, "MEM_RELEASE frees the region", d);
+    G32(pbase) = 0;
+    G32(psize) = 0x10000;
+    CALL(ORD_NTALLOC, pbase, 0, psize, 0x3000, 4);
+    snprintf(d, sizeof d, "got 0x%08X, released 0x%08X", G32(pbase), base);
+    check(G32(pbase) == base, "released region is reused", d);
+
     G32(pbase) = 0x00001000;
     G32(psize) = 0;
     st = CALL(ORD_NTFREE, pbase, psize, 0x8000);
     check(st == 0xC00000A0u, "free below the heap is refused, not zeroed", NULL);
+}
+
+/* ---- contiguous arena -------------------------------------------------- */
+static void test_contiguous(void)
+{
+    char d[160];
+    uint32_t a, b, c, e, big, i, ok = 1;
+
+    printf("contiguous arena\n");
+    a = CALL(ORD_MMALLOC, 0x2000);
+    b = CALL(ORD_MMALLOC, 0x1000);
+    snprintf(d, sizeof d, "a=0x%08X b=0x%08X", a, b);
+    check(a >= XBOX_CONTIG_BASE && b >= XBOX_CONTIG_BASE && a != b,
+          "allocations come from the window", d);
+    snprintf(d, sizeof d, "got %u", CALL(ORD_MMQUERYSIZE, a));
+    check(CALL(ORD_MMQUERYSIZE, a) == 0x2000,
+          "MmQueryAllocationSize answers for a contiguous block", d);
+    check(CALL(ORD_MMQUERYSIZE, a + 0x1800) == 0x800,
+          "MmQueryAllocationSize on an interior address", NULL);
+    CALL(ORD_MMFREE, a);
+    check(CALL(ORD_MMQUERYSIZE, a) == 0, "freed block reports size 0", NULL);
+    c = CALL(ORD_MMALLOC, 0x1000);
+    snprintf(d, sizeof d, "c=0x%08X a=0x%08X", c, a);
+    check(c == a, "freed pages are reused", d);
+
+    /* MmAllocateContiguousMemoryEx: range and alignment honoured. */
+    e = CALL(ORD_MMALLOCEX, 0x3000, 0x01000000, 0x01FFFFFF, 0x10000, 4);
+    snprintf(d, sizeof d, "e=0x%08X", e);
+    check(e && (e - XBOX_CONTIG_BASE) >= 0x01000000
+            && (e - XBOX_CONTIG_BASE) + 0x3000 - 1 <= 0x01FFFFFF
+            && (e & 0xFFFF) == 0,
+          "Ex honours lowest/highest and alignment", d);
+    check(CALL(ORD_MMALLOCEX, 0x1000, 0x5000000, 0x4000000, 0, 4) == 0,
+          "Ex with highest < lowest fails", NULL);
+    CALL(ORD_MMFREE, e);
+    CALL(ORD_MMFREE, b);
+    CALL(ORD_MMFREE, c);
+
+    /* Churn: 40 MB allocated and freed eight times would exhaust a bump
+     * allocator over a 64 MB window on the second pass. */
+    for (i = 0; i < 8 && ok; i++) {
+        big = CALL(ORD_MMALLOC, 40u << 20);
+        ok = big != 0;
+        if (ok) CALL(ORD_MMFREE, big);
+    }
+    check(ok, "allocate/free 40 MB eight times without exhausting", NULL);
+    snprintf(d, sizeof d, "%u bytes still in use",
+             xbox_ContiguousInUseBytes());
+    check(xbox_ContiguousInUseBytes() == 0, "everything freed is released", d);
 }
 
 /* ---- FileRenameInformation -------------------------------------------- */
@@ -469,6 +524,7 @@ int main(int argc, char **argv)
     xbox_kernel_bridge_init();
 
     test_virtual_memory();
+    test_contiguous();
     test_rename(cache);
     test_overwrite(cache);
     test_threads();
