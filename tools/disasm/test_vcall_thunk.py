@@ -97,3 +97,28 @@ class VcallThunkTest(unittest.TestCase):
     def test_non_executable_section_is_rejected(self):
         eng, va = _engine(THUNK + b"\x90" * 8, executable=False)
         self.assertFalse(eng.probes_as_vcall_thunk(va))
+
+
+class ThisAdjustingThunkTest(unittest.TestCase):
+    """Half-Life 2's 0x00452AC0: forward to a member subobject's vtable."""
+
+    def test_mov_adjust_is_recognised(self):
+        # mov ecx, [ecx+8]; mov eax, [ecx]; jmp [eax+0x80]
+        eng, va = _engine(bytes.fromhex("8b4908") + bytes.fromhex("8b01")
+                          + bytes.fromhex("ffa080000000") + b"\xcc" * 8)
+        self.assertTrue(eng.probes_as_vcall_thunk(va))
+
+    def test_add_adjust_is_recognised(self):
+        # add ecx, 4; mov eax, [ecx]; jmp [eax+0x10]
+        eng, va = _engine(bytes.fromhex("83c104") + THUNK_SHORT + b"\xcc" * 8)
+        self.assertTrue(eng.probes_as_vcall_thunk(va))
+
+    def test_global_object_is_recognised(self):
+        # mov ecx, [0x0080C1F0]; mov eax, [ecx]; jmp [eax+0x10]
+        eng, va = _engine(bytes.fromhex("8b0df0c18000") + THUNK_SHORT + bytes([0xcc]) * 8)
+        self.assertTrue(eng.probes_as_vcall_thunk(va))
+
+    def test_adjusting_another_register_is_not(self):
+        # mov edx, [edx+8]; mov eax, [ecx]; jmp [eax+0x10]
+        eng, va = _engine(bytes.fromhex("8b5208") + THUNK_SHORT + b"\xcc" * 8)
+        self.assertFalse(eng.probes_as_vcall_thunk(va))

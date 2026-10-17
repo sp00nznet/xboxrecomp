@@ -180,3 +180,11 @@ class SehPrologueShapeTest(unittest.TestCase):
         code = bytes.fromhex("6a18") + bytes.fromhex("c3") + bytes([0x90]) * 8
         self.assertFalse(self._probe(code))
 
+    def test_chkstk_prologue_is_a_prologue(self):
+        # mov eax, 0x8028 ; call rel32 -- Half-Life 2's 0x00426370
+        code = bytes.fromhex("b828800000") + bytes.fromhex("e8067a1800")
+        self.assertTrue(self._probe(code))
+
+    def test_mov_eax_without_a_call_is_not(self):
+        code = bytes.fromhex("b828800000") + bytes.fromhex("c3") + bytes([0x90]) * 8
+        self.assertFalse(self._probe(code))

@@ -2660,7 +2660,7 @@ class FunctionTranslator:
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
                                  "lock cmpxchg", "inc", "dec", "sahf", "fcomi",
                                  "fcomip", "fcompi", "fucomi", "fucomip", "fucompi")
-               or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
+               or insn.mnemonic.removeprefix("lock ") in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
