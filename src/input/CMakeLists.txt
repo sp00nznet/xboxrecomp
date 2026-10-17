@@ -7,6 +7,11 @@ add_library(xbox_input STATIC
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# The mapping rules (bindings, remapping, deadzones), also buildable alone;
+# keyboard.c resolves its key map through them.
+add_subdirectory(mapping)
+target_link_libraries(xbox_input PUBLIC xbox_input_map)
+
 if(WIN32)
     # Mouse+keyboard pad (RECOMP_MKB) reads Win32 raw input.
     target_sources(xbox_input PRIVATE mkb_input.c)

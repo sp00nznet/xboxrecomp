@@ -156,6 +156,13 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
         xbox_InputKeySet((int)w, 1);
+        /* A Shift, Ctrl or Alt is also its side's key, for bindings to
+         * "lshift" and the like; wParam stays the either-side one. */
+        {
+            int side = xbox_InputWin32SideVk((int)w, (uint32_t)l);
+            if (side)
+                xbox_InputKeySet(side, 1);
+        }
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
          *
          * The obvious diagnostic -- sampling which keys are held, once a
@@ -177,7 +184,31 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KEYUP:
     case WM_SYSKEYUP:
         xbox_InputKeySet((int)w, 0);
+        {
+            int side = xbox_InputWin32SideVk((int)w, (uint32_t)l);
+            if (side)
+                xbox_InputKeySet(side, 0);
+        }
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
+
+    /* Mouse buttons go in the same table, for bindings that name them.
+     * Capturing the mouse while one is down delivers its release even
+     * outside the window. */
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+    case WM_XBUTTONDOWN: case WM_XBUTTONUP:
+        {
+            int down = 0;
+            int vk = xbox_InputWin32MouseVk(m, (uint32_t)w, &down);
+            if (vk)
+                xbox_InputKeySet(vk, down);
+            if (down)
+                SetCapture(h);
+            else if (!(w & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2)))
+                ReleaseCapture();
+        }
+        return m == WM_XBUTTONDOWN || m == WM_XBUTTONUP ? TRUE : 0;
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
