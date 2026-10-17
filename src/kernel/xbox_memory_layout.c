@@ -3149,6 +3149,30 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /*
+     * The synthetic kernel thunk range, as readable guest memory.
+     *
+     * The bridge answers calls through the kernel thunks by VAs of its own
+     * (0xFE000000 + slot * 4, KERNEL_VA_BASE in kernel_bridge.c); the bytes
+     * there are never executed -- recomp_lookup_kernel intercepts the call
+     * before anything runs. They are read: XAPILIB fingerprints the kernel
+     * by loading a thunk and testing a byte of the code behind it. Black's
+     * USB stack loads IoCreateSymbolicLink's entry and compares byte 5
+     * against 0xA1 before it will register the host controller's interrupt,
+     * and the read faults if the range is not backed, which takes the
+     * title's whole input initialisation down with it. One zeroed page
+     * covers the table (0x378 slots = 0xDE0 bytes) with room to spare, and
+     * a zero reads as "not that kernel" -- the retail answer, whose
+     * consequences the titles were built for.
+     */
+    {
+        uintptr_t synth_native = 0xFE000000u + g_memory_offset;
+        void *synth = layout_commit_at((LPVOID)synth_native, 0x1000u);
+        if (!synth)
+            fprintf(stderr, "  WARNING: synthetic thunk range at 0xFE000000 "
+                            "unmapped; kernel fingerprint reads will fault\n");
+    }
+
+    /*
      * MCPX device apertures.
      *
      * The NV2A block above is not the only hardware the title touches
