@@ -1,4 +1,5 @@
 #include "guest_vmem.h"
+#include "recomp_env.h"
 #include "xbox_memory_layout.h"
 #include <stddef.h>
 #include <stdio.h>
@@ -69,7 +70,7 @@ int guest_vmem_init(ptrdiff_t offset, uint64_t mirror_lo, uint64_t mirror_top)
     size_t bytes;
     void *host;
 
-    if (s_pages || !getenv("RECOMP_EXT_VMA"))
+    if (s_pages || !recomp_env(RENV_EXT_VMA))
         return 0;
     if (mirror_top >= GUEST_VMEM_TOP) {
         fprintf(stderr, "  Extended VMA: the mirrors reach 0x%llX, past user space;"

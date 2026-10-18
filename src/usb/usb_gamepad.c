@@ -12,6 +12,7 @@
  * pad plugged into the PC drives this one.
  */
 #include "usb_gamepad.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -220,6 +221,7 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
 /* The host's own pad, through the layer that already maps one to XInput.
  * A real controller plugged into the PC drives this emulated one. */
 #include "../input/xinput_xbox.h"
+#include "../input/keyboard.h"   /* xbox_FramebufferKeyDown */
 
 /*
  * The Xbox report is 20 bytes and fixed:
@@ -252,7 +254,7 @@ static uint8_t synthetic_buttons(void)
     unsigned long now, phase;
 
     if (configured < 0) {
-        const char *spec = getenv("RECOMP_PAD_PRESS");
+        const char *spec = recomp_env(RENV_PAD_PRESS);
         configured = 0;
         if (spec && *spec) {
             char *end;
@@ -408,7 +410,7 @@ static void pad_script_parse(const char *text)
 
 static void pad_script_load(void)
 {
-    const char *spec = getenv("RECOMP_PAD_SCRIPT");
+    const char *spec = recomp_env(RENV_PAD_SCRIPT);
 
     s_script_len = 0;
     if (!spec || !*spec)
@@ -458,7 +460,7 @@ static void pad_live_poll(unsigned long t)
 
     if (!checked) {
         checked = 1;
-        path = getenv("RECOMP_PAD_LIVE");
+        path = recomp_env(RENV_PAD_LIVE);
         if (path && *path) {
             fprintf(stderr, "  PAD: live input from %s\n", path);
             fflush(stderr);
@@ -585,18 +587,17 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     {
         static int diag = -1;
         if (diag < 0)
-            diag = getenv("RECOMP_INPUT_DIAG") != NULL;
+            diag = recomp_env(RENV_INPUT_DIAG) != NULL;
         if (diag) {
-            extern int xbox_FramebufferKeyDown(int vk);
             static unsigned long last;
             unsigned long now = (unsigned long)GetTickCount();
             if (now - last > 1000) {
                 XBOX_INPUT_STATE probe;
                 DWORD rc = xbox_InputGetState(0, &probe);
                 last = now;
-                fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
+                fprintf(stderr, "  [INPUT] keyboard=%d window_has_RETURN=%d "
                         "InputGetState=%lu buttons=0x%04X\n",
-                        getenv("RECOMP_KEYBOARD") ? 1 : 0,
+                        xbox_InputKeyboardOn(),
                         xbox_FramebufferKeyDown(0x0D),
                         (unsigned long)rc,
                         rc == 0 ? probe.Gamepad.wButtons : 0);

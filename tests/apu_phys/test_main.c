@@ -22,6 +22,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* Provided by the generated title; this harness has none. */
 typedef void (*recomp_func_t)(void);
@@ -101,6 +102,7 @@ int main(int argc, char **argv)
     /* The arena hands out the same physical numbers as window pages. */
     xbox_ContiguousClaim(XBOX_CONTIG_BASE + a, (c + 0x2000) - a);
     check(side(a + 0x10) == 1, "an unnamed window page reads the window");
+    check(!strcmp(mcpx_apu_phys_class(a), "win"), "  ...and its trace class is win");
 
     /* DirectSound names each page of a heap buffer. */
     for (w = a; w < a + 0x3000; w += 0x1000)
@@ -109,6 +111,7 @@ int main(int argc, char **argv)
     xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)b);
     check(side(a + 0x10) == 0 && side(a + 0x2FF0) == 0,
           "a page named from the heap reads RAM");
+    check(!strcmp(mcpx_apu_phys_class(a), "named"), "  ...and its trace class is named");
     check(side(c + 0x1800) == 1, "a page nobody named still reads the window");
 
     xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)(XBOX_CONTIG_BASE + a));

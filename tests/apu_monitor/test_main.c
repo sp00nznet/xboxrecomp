@@ -10,6 +10,9 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "apu_regs.h"
+#include "recomp_env.h"
+
+#include <math.h>
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -98,7 +101,7 @@ static int16_t want_r(int s) { return (int16_t)(right_of(s / SUB, s % SUB) * 327
 
 static int16_t clamp16(int v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
 
-/* ---- the voice position trace ----
+/* ---- 2.6: the voice position trace ----
  * One looping 16-bit mono voice in fake guest RAM, run through the real VP
  * for 120 frames. stderr is captured to a file. With RECOMP_APU_TRACE on
  * (the apu_monitor ctest) two "[APU] voice 0 pos=" lines must appear, with
@@ -158,6 +161,9 @@ static void voice_trace_case(void)
         memset(mixbins, 0, sizeof(mixbins));
         mcpx_apu_vp_frame(d, mixbins);
     }
+    /* The VP buffers its trace lines; the frame thread prints them once it
+     * drops d->lock, and here nothing else does. */
+    mcpx_apu_vp_trace_flush();
     fflush(stderr);
 
     f = fopen(path, "r");
@@ -187,7 +193,7 @@ static void voice_trace_case(void)
  * refills the block two ahead of the cursor each time the cursor enters a
  * block: every block plays new data each lap, so nothing is stale. Then
  * the writer stops, and from the next lap each block replays its last lap.
- * With RECOMP_APU_RING set, phase one must log no stale block and phase two
+ * With apu_ring set (RECOMP_TRACE=apu_ring), phase one must log no stale block and phase two
  * at least a lap of them; unset or 0, no [APU-RING] line at all. */
 static unsigned count_lines(const char *path, const char *prefix)
 {
@@ -253,6 +259,7 @@ static void ring_case(void)
             memset(mixbins, 0, sizeof(mixbins));
             mcpx_apu_vp_frame(d, mixbins);
         }
+        mcpx_apu_vp_trace_flush();
         fflush(stderr);
     }
 
@@ -262,7 +269,7 @@ static void ring_case(void)
     printf("ring: %u fills, %u stale while written, %u after the writer stopped\n",
            fills, stale_a, stale_b);
     if (!ring) {
-        CHECK("no ring lines with RECOMP_APU_RING unset or 0", any == 0);
+        CHECK("no ring lines with apu_ring unset or 0", any == 0);
     } else {
         CHECK("writer kept up: no stale block", stale_a == 0);
         CHECK("writer stopped: a lap of stale blocks", stale_b >= NBLK);
@@ -378,14 +385,15 @@ static void starve_case(void)
     CHECK("an announced drain reports nothing", r_drain == 0);
 }
 
-/* ---- pacing by queue depth ----
+/* ---- 2.3: pacing by queue depth ----
  * The frame thread's decision (mcpx_apu_pace_step) against the fake queue,
  * on a simulated clock: the device consumes 48 samples per millisecond
  * except during a stall. Rendering takes no simulated time, which is the
  * worst case for running ahead. */
 static uint64_t sim_consumed_at(int64_t now_us, int64_t stall_from,
-                                int64_t stall_us)
+                                int64_t stall_us, uint64_t *played_us)
 {
+    (void)played_us;
     int64_t t = now_us;
     if (t > stall_from)
         t = (t < stall_from + stall_us) ? stall_from : t - stall_us;
@@ -408,7 +416,7 @@ static void pacing_case(void)
     dev_model = 1; dev_tail = dev_head = 0; dev_seq_errors = 0;
 
     while (periods < 1000) {
-        uint64_t c = sim_consumed_at(now, stall_from, stall_us);
+        uint64_t c = sim_consumed_at(now, stall_from, stall_us, NULL);
         int q;
         if (c > dev_tail) {                  /* ran dry: plays silence */
             underruns++;
@@ -479,7 +487,7 @@ struct loop_stats {
 static void consume(int64_t now, int64_t stall_from, int64_t stall_us,
                     struct loop_stats *st)
 {
-    uint64_t c = sim_consumed_at(now, stall_from, stall_us);
+    uint64_t c = sim_consumed_at(now, stall_from, stall_us, NULL);
     if (c > dev_tail) {                      /* ran dry: plays silence */
         st->underruns++;
         dev_head = dev_tail;
@@ -620,15 +628,16 @@ static void stall_fallback_case(void)
 }
 
 /* ---- the switches ----
- * The reader against what the ctest set: on with =1, off unset or =0. */
+ * The readers against what the ctest set: on with =1 (or the trace-list
+ * key), off unset or =0. */
 static void switch_case(void)
 {
     CHECK("RECOMP_APU_TRACE reads as the ctest set it",
-          apu_env_on("RECOMP_APU_TRACE") == g_expect_on);
-    CHECK("RECOMP_AUDIO_HOST reads as the ctest set it",
-          apu_env_on("RECOMP_AUDIO_HOST") == g_expect_on);
-    CHECK("RECOMP_APU_RING reads as the ctest set it",
-          apu_env_on("RECOMP_APU_RING") == g_expect_on);
+          recomp_env_on(RENV_APU_TRACE) == g_expect_on);
+    CHECK("audio_host reads as the ctest set it",
+          recomp_env_on(RENV_AUDIO_HOST) == g_expect_on);
+    CHECK("apu_ring reads as the ctest set it",
+          recomp_env_on(RENV_APU_RING) == g_expect_on);
 }
 
 int main(int argc, char **argv)

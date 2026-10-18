@@ -25,6 +25,7 @@
  * in an answer nobody has established.
  */
 #include "xbox_memory_layout.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -130,6 +131,11 @@ int main(int argc, char **argv)
      * output is discarded when they do -- leaving a crash with no indication
      * of which check reached it. */
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* Audio defaults on where the host traps MMIO (arm64 here), and then the
+     * MCPX aperture is left PROT_NONE for the trap. This test checks plain
+     * mappings, so it runs without it. */
+    recomp_env_set(RENV_AC97_READY, NULL);
 
     const char *path = argc > 1 ? argv[1] : "tools/conformance/test.xbe";
     size_t n = 0;
@@ -263,7 +269,7 @@ int main(int argc, char **argv)
      * that traps page zero by clobbering the TIB is not a fix.
      */
     {
-        setenv("RECOMP_TRAP_NULL", "1", 1);
+        recomp_env_set(RENV_TRAP_NULL, "1");
         BOOL trapped = xbox_MemoryLayoutInit(xbe, n);
         check(trapped, "init succeeds with RECOMP_TRAP_NULL set",
               "the guard must not cost the run");
@@ -290,7 +296,7 @@ int main(int argc, char **argv)
 
             xbox_MemoryLayoutShutdown();
         }
-        unsetenv("RECOMP_TRAP_NULL");
+        recomp_env_set(RENV_TRAP_NULL, NULL);
     }
 
     /*

@@ -86,14 +86,15 @@ The Xbox stack lives in Xbox memory. `g_esp` is an Xbox virtual address pointing
     MEM32(sp) = _pv;                   \
 } while(0)
 
-// Pop: read value, then increment ESP
+// Pop: read value, increment ESP, then write dst
 #define POP32(sp, dst) do {            \
-    (dst) = MEM32(sp);                 \
+    uint32_t _pv = MEM32(sp);          \
     (sp) += 4;                         \
+    (dst) = _pv;                       \
 } while(0)
 ```
 
-Note that `PUSH32` evaluates the value *before* decrementing `sp`. This matches x86 semantics where `push [esp+N]` reads the operand at the old ESP before adjusting.
+Note that `PUSH32` evaluates the value *before* decrementing `sp`. This matches x86 semantics where `push [esp+N]` reads the operand at the old ESP before adjusting. `POP32` writes `dst` *after* incrementing `sp`, so `pop esp` leaves ESP equal to the popped value, as on x86.
 
 The stack is initialized to `XBOX_STACK_TOP` (0x00F7FFF0) -- the top of an 8 MB region allocated in Xbox memory space.
 
@@ -473,8 +474,66 @@ Options:
 - `--split N`: maximum functions per output file
 - `--output-dir <dir>`: where to write generated files (default: `src/game/recomp/gen/`)
 - `--verbose`: print per-function translation progress
+- `--spin-waits FILE`: lower the busy-wait loops the file selects (see
+  [Spin waits](#spin-waits))
 
 The output directory is typically gitignored because the generated files are large (200+ MB total) and can be regenerated from the XBE at any time.
+
+## Spin waits
+
+A title that waits for its next frame often does it in a loop that only
+reads memory and branches back to itself (`L: cmp [counter], eax; jl L`).
+Lifted as is, the loop holds a host core for as long as it waits. With
+`--spin-waits FILE` the lifter finds such loops and calls `RECOMP_SPIN_WAIT`
+on the taken back edge only:
+
+```c
+loc_00012340: ;
+    ...
+    if (CMP_L(...)) { RECOMP_SPIN_WAIT(0x00012340u); goto loc_00012340; }
+```
+
+The first test of the condition never waits. `RECOMP_SPIN_WAIT`
+(`templates/runtime/recomp_types.h`) does nothing unless the runtime's
+pacing mode is `sleep` (the `present.pacing` key,
+[config](../runtime/config.md)); then the thread blocks until
+the kernel signals a state change or 1 ms passes (`src/kernel/kernel_pacing.h`).
+
+The matcher (`tools/recomp/spin_waits.py`) is deliberately narrow. A
+candidate is one basic block ending in a conditional jump to its own start,
+whose other instructions are only:
+
+- `cmp` or `test` reading memory, or a register the block loads from memory;
+- `mov`, `movzx` or `movsx` of memory or an immediate into a register that no
+  address in the block uses;
+- `pause`.
+
+Anything that writes memory, calls, pushes or pops, uses a string, locked,
+port, `cpuid`, `rdtsc` or FPU instruction, changes a register an address
+uses, or reads no memory at all is refused.
+
+The file is JSON:
+
+```json
+{"auto": false,
+ "sites": [{"va": "0x00012340", "note": "main loop's vblank wait"}],
+ "exclude": []}
+```
+
+- `"auto": false` lowers only the listed `sites`; `true` lowers every
+  candidate except those in `exclude`.
+- A listed site that fails the matcher in any body that contains it, or that
+  no body has as a self-loop, is an error naming the VA, the body and the
+  rule. The run finishes and then exits 1; a refused shape is never forced
+  through.
+- The run writes `spin_waits.json` to the `-o` directory: every self-loop
+  block seen, per VA, with its state (`lowered`, `rejected` with the
+  reasons, `excluded`, or `candidate (not listed)`), the number of bodies
+  that contain it, and the errors. The unlisted candidates are where to look
+  for further sites.
+
+Without the flag the matcher does not run, and the output is byte for byte
+what it was. Tests: `tools/recomp/test_spin_waits.py`.
 
 ## Post-Generation Patches
 

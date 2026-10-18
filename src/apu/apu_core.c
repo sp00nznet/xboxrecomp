@@ -20,11 +20,14 @@
  */
 
 #include "apu_state.h"
+#include "recomp_env.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "apu_wav.h"
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
+#include "../kernel/kernel_prof.h"          /* RECOMP_TRACE=dpc: ISR, se_frame */
+#include "apu_lockstat.h"                    /* RECOMP_TRACE=apu_lock */
 
 /* ============================================================
  * Globals
@@ -155,20 +158,12 @@ const char *mcpx_apu_phys_class(uint64_t addr)
     return "ram";
 }
 
-/* A diagnostic switch is on when set to anything but empty or a leading
- * '0', as RECOMP_HEADLESS is read: =0 turns it off rather than on. */
-int apu_env_on(const char *name)
-{
-    const char *e = getenv(name);
-    return e && *e && *e != '0';
-}
-
 /* RECOMP_APU_TRACE register lines, read once: every MMIO access tests it. */
 static int apu_mmio_trace(void)
 {
     static int on = -1;
     if (on < 0)
-        on = apu_env_on("RECOMP_APU_TRACE");
+        on = recomp_env_on(RENV_APU_TRACE);
     return on;
 }
 
@@ -209,7 +204,7 @@ static void update_irq(MCPXAPUState *d)
 /* ---- delivering it ---------------------------------------------------- */
 
 /* HalGetInterruptVector(5) -- the APU's IRQ -- is what DirectSound connects
- * its service routine to (0x002F8E81 in Burnout 3). */
+ * its service routine to. */
 #define APU_VECTOR 5
 
 typedef void (*apu_guest_fn)(void);
@@ -221,6 +216,16 @@ extern uint32_t xbox_AllocThreadTib(void);
 extern int xbox_IrqlBlocksInterrupts(void);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
+extern int  xbox_DispatchGateTryEnter(void);
+extern void xbox_DispatchGateLeave(void);
+/* kernel/kernel.h's xbox_Irq* (the device-interrupt post), declared here as
+ * the rest are: the APU does not include the kernel header. */
+enum { XBOX_IRQ_APU = 1 };
+enum { XBOX_IRQ_POSTED = 0, XBOX_IRQ_GATED = 1, XBOX_IRQ_UNGATED = 2 };
+extern int  xbox_IrqSafePointsOn(void);
+extern void xbox_IrqSetHandler(int line, void (*run)(void));
+extern int  xbox_IrqPost(int line);
+extern void xbox_IrqNoteUngated(int line);
 #if defined(_MSC_VER)
 #  define APU_TLS __declspec(thread)
 #else
@@ -231,55 +236,71 @@ extern APU_TLS uint32_t g_fs_base;
 
 /* Call the connected service routine while the line is up, from the frame
  * thread, the way the OHCI model delivers USB interrupts (ohci_call_isr):
- * a worker stack for the call, a TIB of this thread's own, and a hold-off
- * while a guest thread sits at raised IRQL, which is when the single-CPU
- * console could not have taken the interrupt. The routine acknowledges by
- * writing ISTS, which drops the line through update_irq. */
-static void apu_deliver_irq(MCPXAPUState *d)
+ * a worker stack for the call and a TIB of this thread's own. When a guest
+ * thread or DPC holds the one-CPU gate, which is when the single-CPU console
+ * could not have taken the interrupt beside it, the interrupt is posted and
+ * the holder runs it at its next safe point (xbox_IrqPost). The routine
+ * acknowledges by writing ISTS, which drops the line through update_irq. */
+ApuIrqStats apu_irq_stats;
+
+/* Every 5 s under RECOMP_APU_TRACE: traps, deliveries (by this thread, and
+ * by the gate holder after a post), posts, frames held off and deliveries
+ * forced (irq_safe_points=0, or irq_safe_force), the running count of
+ * VP/DSP frames (se_frame) and the device underruns. Traps well above
+ * deliveries, many forced ones, or se_frames standing still are what costs
+ * playback. */
+static int s_irq_trace = -1;
+static uint64_t s_irq_next_ns;
+
+static void apu_irq_stats_line(void)
 {
-    /* Per thread, like the g_fs_base it guards: a new instance's frame
-     * thread is a new OS thread and needs its own TIB. g_fs_base itself
-     * cannot tell, as every thread starts at the main thread's TIB. */
-    static APU_TLS int tib_ready;
-    static unsigned held_off;
+    uint64_t now;
+
+    if (s_irq_trace < 0)
+        s_irq_trace = recomp_env_on(RENV_APU_TRACE);
+    if (!s_irq_trace)
+        return;
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (now < s_irq_next_ns)
+        return;
+    if (s_irq_next_ns)
+        fprintf(stderr, "[APU-IRQ] traps %u delivered %u posted %u holder-delivered %u held-frames %u forced %u se_frames %u fe-trapped-frames %u underruns %u\n",
+                apu_irq_stats.traps, apu_irq_stats.delivered,
+                apu_irq_stats.posted, apu_irq_stats.holder_delivered,
+                apu_irq_stats.held_frames, apu_irq_stats.forced,
+                apu_irq_stats.se_frames, apu_irq_stats.fe_trapped_frames,
+                xa2_underruns());
+    s_irq_next_ns = now + 5000000000ull;
+}
+
+/* Push the routine's arguments on g_esp and call it at the device IRQL.
+ * Returns what it returned, or -1 with nothing connected. */
+static int apu_call_isr(void)
+{
     uint32_t kint, routine, context;
     apu_guest_fn fn;
-    int slot;
 
-    if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
-        return;
-    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50)
-        return;
-    held_off = 0;
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
-        return;
+        return -1;
     routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
     context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
     fn = routine ? recomp_lookup(routine) : NULL;
     if (!fn)
-        return;
-    if (!tib_ready) {
-        uint32_t tib = xbox_AllocThreadTib();
-        if (!tib)
-            return;
-        g_fs_base = tib;
-        tib_ready = 1;
-    }
-    slot = xbox_worker_stack_alloc();
-    if (slot < 0)
-        return;
-
-    qemu_mutex_unlock(&d->lock);
-    g_esp = XBOX_WORKER_STACK_TOP(slot);
-    g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
+        return -1;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
-    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
-    xbox_worker_stack_free(slot);
-    qemu_mutex_lock(&d->lock);
-
+    if (xbox_ProfOn()) {
+        void *prev = xbox_ProfBegin(XBOX_PROF_ISR_APU, routine);
+        int _irql = xbox_IrqlEnterInterrupt(16);
+        long long t0 = xbox_ProfNowUs();
+        fn();
+        xbox_ProfEnd(prev, xbox_ProfNowUs() - t0);
+        xbox_IrqlLeaveInterrupt(_irql);
+    } else {
+        int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql);
+    }
     {
         static unsigned n;
         if (n++ < 3) {
@@ -288,6 +309,92 @@ static void apu_deliver_irq(MCPXAPUState *d)
             fflush(stderr);
         }
     }
+    return (int)(g_eax & 1u);
+}
+
+/* The gate holder's run of a posted APU interrupt (kernel_hal.c has put it
+ * on a worker stack). The routine reads the APU registers through the MMIO
+ * trap, which takes d->lock as any guest access does; the frame thread is
+ * not holding it here (apu_deliver_irq drops it before posting). If the line
+ * dropped since the post, the routine reads ISTS and declines, as on
+ * hardware. */
+static void apu_isr_on_holder(void)
+{
+    if (apu_call_isr() >= 0)
+        apu_irq_stats.holder_delivered++;
+}
+
+static void apu_deliver_irq(MCPXAPUState *d)
+{
+    /* Per thread, like the g_fs_base it guards: a new instance's frame
+     * thread is a new OS thread and needs its own TIB. g_fs_base itself
+     * cannot tell, as every thread starts at the main thread's TIB. */
+    static APU_TLS int tib_ready;
+    static unsigned held_off;
+    uint32_t kint, routine;
+    int slot, how;
+
+    apu_irq_stats_line();
+    if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
+        return;
+    kint = xbox_GetConnectedInterrupt(APU_VECTOR);
+    if (!kint)
+        return;
+    routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
+    if (!routine || !recomp_lookup(routine))
+        return;
+    if (!tib_ready) {
+        uint32_t tib = xbox_AllocThreadTib();
+        if (!tib)
+            return;
+        g_fs_base = tib;
+        tib_ready = 1;
+    }
+    xbox_IrqSetHandler(XBOX_IRQ_APU, apu_isr_on_holder);
+    /* The one-CPU gate (xbox_DispatchGateTryEnter): with it, no thread at
+     * DISPATCH_LEVEL, no DPC and no KeSynchronizeExecution routine runs
+     * alongside the routine. Held: posted, and this thread goes on with its
+     * frame. It must never wait for the gate: a DSOUND DPC holding it can be
+     * waiting on this thread to clear a trapped FE method (Burnout 3's
+     * vehicle select froze on that pair). The post happens without d->lock,
+     * since the release of the gate it may take runs other lines' routines
+     * here. */
+    apu_lockstat_unlock(d, APU_LOCK_FRAME);
+    if (xbox_IrqSafePointsOn()) {
+        how = xbox_IrqPost(XBOX_IRQ_APU);
+        if (how == XBOX_IRQ_POSTED) {
+            apu_irq_stats.posted++;
+            apu_lockstat_lock(d, APU_LOCK_FRAME);
+            return;
+        }
+        if (how == XBOX_IRQ_UNGATED)
+            apu_irq_stats.forced++;
+    } else {
+        /* irq_safe_points=0: the old bounded hold-off, then beside the
+         * holder. */
+        how = xbox_DispatchGateTryEnter() ? XBOX_IRQ_GATED : XBOX_IRQ_UNGATED;
+        if (how == XBOX_IRQ_UNGATED && ++held_off <= 50) {
+            apu_irq_stats.held_frames++;
+            apu_lockstat_lock(d, APU_LOCK_FRAME);
+            return;
+        }
+        if (held_off > 50)
+            apu_irq_stats.forced++;
+        held_off = 0;
+    }
+    if (how == XBOX_IRQ_UNGATED)
+        xbox_IrqNoteUngated(XBOX_IRQ_APU);
+    slot = xbox_worker_stack_alloc();
+    if (slot >= 0) {
+        g_esp = XBOX_WORKER_STACK_TOP(slot);
+        g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
+        if (apu_call_isr() >= 0)
+            apu_irq_stats.delivered++;
+        xbox_worker_stack_free(slot);
+    }
+    if (how == XBOX_IRQ_GATED)
+        xbox_DispatchGateLeave();
+    apu_lockstat_lock(d, APU_LOCK_FRAME);
 }
 
 /* ============================================================
@@ -437,11 +544,10 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
 
-    /* RECOMP_AUDIO_WAV=<path>: dump exactly what the device is given,
-     * capped at RECOMP_AUDIO_WAV_SECS seconds when that is set. */
+    /* RECOMP_AUDIO_WAV=<path>: dump exactly what the device is given. */
     {
-        const char *wav = getenv("RECOMP_AUDIO_WAV");
-        const char *secs = getenv("RECOMP_AUDIO_WAV_SECS");
+        const char *wav = recomp_env(RENV_AUDIO_WAV);
+        const char *secs = recomp_env(RENV_AUDIO_WAV_SECS);
         if (wav && *wav)
             apu_wav_open(wav, secs ? atof(secs) : 0.0);
     }
@@ -518,7 +624,7 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 }
 
 /* ============================================================
- * Host playback accounting (RECOMP_AUDIO_HOST, or RECOMP_APU_TRACE)
+ * Host playback accounting (RECOMP_TRACE=apu or RECOMP_TRACE=audio_host)
  *
  * The WAV tap records what the APU hands the device backend, back to back,
  * so it cannot show a period that reached the device late: the device
@@ -622,8 +728,8 @@ static struct {
 static int hs_on(void)
 {
     if (g_hs.on < 0)
-        g_hs.on = apu_env_on("RECOMP_APU_TRACE") ||
-                  apu_env_on("RECOMP_AUDIO_HOST");
+        g_hs.on = recomp_env_on(RENV_APU_TRACE) ||
+                  recomp_env_on(RENV_AUDIO_HOST);
     return g_hs.on;
 }
 
@@ -842,10 +948,13 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
     if (xa2_is_active()) {
         if (!d->pace_stalled) {
+            uint64_t t0 = apu_lockstat_on() ? apu_lockstat_now_ns() : 0;
             int q = hs_poll();
             hs_submit(MIXER_FRAME_SAMPLES,
                       xa2_submit_samples((const int16_t *)period,
                                          MIXER_FRAME_SAMPLES), q);
+            if (t0)
+                apu_lockstat_stage(APU_STAGE_XA2, apu_lockstat_now_ns() - t0);
         }
         return;
     }
@@ -973,8 +1082,11 @@ static void throttle(MCPXAPUState *d)
             d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
         if (wait_us <= 0)
             break;
+        apu_lockstat_pace_wait();
+        apu_lockstat_hold_end(APU_LOCK_FRAME);
         qemu_cond_timedwait(&d->cond, &d->lock,
                             (int)((wait_us + 999) / 1000));
+        apu_lockstat_hold_begin(APU_LOCK_FRAME);
     }
 
     d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us);
@@ -1007,9 +1119,21 @@ static void se_frame(MCPXAPUState *d)
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memset(mixbins, 0, sizeof(mixbins));
 
-    mcpx_apu_vp_frame(d, mixbins);
-    mcpx_apu_dsp_frame(d, mixbins);
-    mcpx_apu_monitor_frame(d);
+    if (apu_lockstat_on()) {
+        uint64_t t0 = apu_lockstat_now_ns(), t1, t2;
+        mcpx_apu_vp_frame(d, mixbins);
+        t1 = apu_lockstat_now_ns();
+        mcpx_apu_dsp_frame(d, mixbins);
+        t2 = apu_lockstat_now_ns();
+        mcpx_apu_monitor_frame(d);
+        apu_lockstat_stage(APU_STAGE_VP, t1 - t0);
+        apu_lockstat_stage(APU_STAGE_DSP, t2 - t1);
+        apu_lockstat_stage(APU_STAGE_MON, apu_lockstat_now_ns() - t2);
+    } else {
+        mcpx_apu_vp_frame(d, mixbins);
+        mcpx_apu_dsp_frame(d, mixbins);
+        mcpx_apu_monitor_frame(d);
+    }
 
     d->ep_frame_div++;
 
@@ -1020,38 +1144,10 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
-ApuIrqStats apu_irq_stats;
-
-/* Every 5 s under RECOMP_APU_TRACE: front-end traps, the running count of
- * VP/DSP frames (se_frame), the frames that found FECTL trapped, and the
- * device underruns. Trapped frames climbing while se_frames stands still is
- * the service routine not clearing the trap; underruns with se_frames
- * advancing is the host, not the title. */
-static int s_irq_trace = -1;
-static uint64_t s_irq_next_ns;
-
-static void apu_irq_stats_line(void)
-{
-    uint64_t now;
-
-    if (s_irq_trace < 0)
-        s_irq_trace = apu_env_on("RECOMP_APU_TRACE");
-    if (!s_irq_trace)
-        return;
-    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    if (now < s_irq_next_ns)
-        return;
-    if (s_irq_next_ns)
-        fprintf(stderr, "[APU-IRQ] traps %u se_frames %u fe-trapped-frames %u underruns %u\n",
-                apu_irq_stats.traps, apu_irq_stats.se_frames,
-                apu_irq_stats.fe_trapped_frames, xa2_underruns());
-    s_irq_next_ns = now + 5000000000ull;
-}
-
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
-    qemu_mutex_lock(&d->lock);
+    apu_lockstat_lock(d, APU_LOCK_FRAME);
 
     while (!qatomic_read(&d->exiting)) {
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
@@ -1060,7 +1156,9 @@ static void *mcpx_apu_frame_thread(void *arg)
                 xa2_expect_drain();     /* a pause, not an underrun */
             hs_rebase();
             qemu_cond_signal(&d->idle_cond);
+            apu_lockstat_hold_end(APU_LOCK_FRAME);
             qemu_cond_wait(&d->cond, &d->lock);
+            apu_lockstat_hold_begin(APU_LOCK_FRAME);
             d->is_idle = false;
             continue;
         }
@@ -1074,8 +1172,8 @@ static void *mcpx_apu_frame_thread(void *arg)
         /* The doorbell ack stands in for the GP DSP, which on hardware runs
          * whatever the front end is doing. Tying it to se_frame stopped it
          * whenever FECTL was trapped or halted, and DirectSound then waits
-         * forever to post its next command: Burnout 3 stalls in
-         * sub_002F805E polling the same doorbell it was acked on at init. */
+         * forever to post its next command: Burnout 3's DSOUND submit
+         * stalls polling the same doorbell it was acked on at init. */
         mcpx_apu_dsp_ack_poll(d);
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
@@ -1095,7 +1193,21 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
-            se_frame(d);
+            if (xbox_ProfOn()) {
+                long long t0 = xbox_ProfNowUs();
+                se_frame(d);
+                xbox_ProfCount(XBOX_PROF_SE_FRAME, xbox_ProfNowUs() - t0);
+            } else if (apu_lockstat_on()) {
+                LARGE_INTEGER f, a, b;
+                QueryPerformanceFrequency(&f);
+                QueryPerformanceCounter(&a);
+                se_frame(d);
+                QueryPerformanceCounter(&b);
+                apu_lockstat_se_frame((uint64_t)((double)(b.QuadPart - a.QuadPart) * 1e9 /
+                                                 (double)f.QuadPart));
+            } else {
+                se_frame(d);
+            }
         } else if (fe_trapped) {
             /* The title has the APU on, but the front end is trapped (a voice
              * went idle under FETFORCE1) and stays so until DirectSound's
@@ -1151,32 +1263,41 @@ static void *mcpx_apu_frame_thread(void *arg)
             d->set_irq = false;
         }
         apu_deliver_irq(d);
-        apu_irq_stats_line();
 
-        /* Let the guest in once per frame.
+        /* Drop the lock once per frame.
          *
          * The thread holds d->lock for its whole loop and only drops it inside
          * throttle()'s wait. Once voices really play, processing can run
          * behind real time, throttle never waits, and the lock is never
-         * released -- while every VOICE_ON/OFF/RELEASE the title writes needs
-         * it (voice_lock). A critical section is not fair, so the title's
-         * thread starved there indefinitely: Burnout 3 froze on its vehicle
-         * select, blocked in voice_lock at raised IRQL, which in turn held
-         * off every USB interrupt. */
-        qemu_mutex_unlock(&d->lock);
+         * released. A critical section is not fair, so a taker starves:
+         * Burnout 3 froze on its vehicle select when voice_lock still took
+         * the lock, blocked in it at raised IRQL, which in turn held off
+         * every USB interrupt. voice_lock is a lock-free bit flip now, so
+         * what this still serves is apu_mixer_play, which takes the lock to
+         * wake this thread, and the trapped-FE path: the yield lets the
+         * title's service routine run and clear FECTL before the check
+         * below. The trace text formatted under the lock is printed here,
+         * with the lock dropped. */
+        apu_lockstat_report();
+        apu_lockstat_unlock(d, APU_LOCK_FRAME);
+        apu_lockstat_flush();
+        mcpx_apu_vp_trace_flush();
         SwitchToThread();
-        qemu_mutex_lock(&d->lock);
+        apu_lockstat_lock(d, APU_LOCK_FRAME);
         if (fe_trapped &&
             (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
              NV_PAPU_FECTL_FEMETHMODE_TRAPPED)) {
             /* Still trapped after the delivery (held off at raised IRQL, or
              * cleared from a DPC): give the title a millisecond with the lock
              * dropped rather than spinning on it. */
+            apu_lockstat_hold_end(APU_LOCK_FRAME);
             qemu_cond_timedwait(&d->cond, &d->lock, 1);
+            apu_lockstat_hold_begin(APU_LOCK_FRAME);
         }
     }
 
-    qemu_mutex_unlock(&d->lock);
+    apu_lockstat_unlock(d, APU_LOCK_FRAME);
+    mcpx_apu_vp_trace_flush();
     return NULL;
 }
 
@@ -1251,10 +1372,10 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     InterlockedExchange(&s_irq_line, 0);
     apu_diag_reset();
 
-    /* RECOMP_APU_SOLO=<voice>: mute every other voice in the mix, for
+    /* RECOMP_DEBUG=apu_solo=<voice>: mute every other voice in the mix, for
      * telling which voice a sound (or a noise) comes from. */
     {
-        const char *solo = getenv("RECOMP_APU_SOLO");
+        const char *solo = recomp_env(RENV_APU_SOLO);
         if (solo && *solo) {
             g_dbg_voice_monitor = atoi(solo);
             fprintf(stderr, "[APU] solo: only voice %d is mixed\n",
@@ -1271,6 +1392,9 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     qemu_mutex_lock(&d->lock);
     qemu_cond_init(&d->cond);
     qemu_cond_init(&d->idle_cond);
+
+    /* RECOMP_APU_TRACE reporter: here, not on the first trapped access. */
+    apu_hook_trace_start();
 
     /* Init VP (voice processor) */
     mcpx_apu_vp_init(d);
@@ -1538,10 +1662,10 @@ void apu_mixer_play(int slot, int looping)
     /* The frame thread takes the APU lock before the mixer lock. */
     extern MCPXAPUState *g_state;
     if (g_state) {
-        qemu_mutex_lock(&g_state->lock);
+        apu_lockstat_lock(g_state, APU_LOCK_OTHER);
         g_state->pause_requested = false;
         qemu_cond_signal(&g_state->cond);
-        qemu_mutex_unlock(&g_state->lock);
+        apu_lockstat_unlock(g_state, APU_LOCK_OTHER);
     }
 }
 

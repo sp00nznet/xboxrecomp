@@ -8,6 +8,7 @@
  */
 
 #include "kernel.h"
+#include "recomp_env.h"
 /* RECOMP_TLS, and the guest stack pointer the contention report walks. */
 #include "xbox_memory_layout.h"
 #include <stdio.h>
@@ -249,10 +250,10 @@ static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
 static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
 {
     if (g_cs_single_mode < 0) {
-        const char* mode = getenv("RECOMP_CS_MODE");
+        const char* mode = recomp_env(RENV_CS_MODE);
         g_cs_single_mode = (mode && !strcmp(mode, "single")) ? 1 : 0;
         if (g_cs_single_mode)
-            fprintf(stderr, "  [CS] RECOMP_CS_MODE=single: every guest lock "
+            fprintf(stderr, "  [CS] cs_mode=single: every guest lock "
                             "shares one recursive lock\n");
     }
     if (g_cs_single_mode) {
@@ -401,7 +402,7 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
     uint32_t va;
 
     if (enabled < 0) {
-        const char *v = getenv("RECOMP_CS_TRACE_CRT");
+        const char *v = recomp_env(RENV_CS_TRACE_CRT);
         enabled = v != NULL;
         all = v && !strcmp(v, "all");
     }
@@ -422,7 +423,7 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
         static int watch = -1;
         static uint32_t watch_va;
         if (watch < 0) {
-            const char *w = getenv("RECOMP_CS_WATCH");
+            const char *w = recomp_env(RENV_CS_WATCH);
             watch = w != NULL;
             watch_va = w ? (uint32_t)strtoul(w, NULL, 0) : 0;
         }
@@ -510,6 +511,9 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         xbox_guest_backtrace(10);
         fflush(stderr);
     }
+    /* Contended: the holder is a guest thread that needs the CPU to leave
+     * it (RECOMP_GUEST_LOCK), so tell the waiters the CPU is free now. */
+    xbox_GuestCpuBlocked();
     EnterCriticalSection(cs);
     xbox_cs_note_owner(cs);
     if (g_cs_contention_reports <= 16) {

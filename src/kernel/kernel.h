@@ -141,6 +141,9 @@ enum {
 #ifndef STATUS_NOT_SUPPORTED
 #define STATUS_NOT_SUPPORTED            ((NTSTATUS)0xC00000BBL)
 #endif
+#ifndef STATUS_TOO_MANY_OPENED_FILES
+#define STATUS_TOO_MANY_OPENED_FILES    ((NTSTATUS)0xC000011FL)
+#endif
 #ifndef STATUS_INTERNAL_ERROR
 #define STATUS_INTERNAL_ERROR           ((NTSTATUS)0xC00000E5L)
 #endif
@@ -515,6 +518,11 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
 
+/* The [KERNEL] summary block (calls since boot, the latest call, the six
+ * most-called ordinals), once per process with why in its first line. The
+ * exit paths and the watchdog's hang report print it. */
+void xbox_kernel_summary_report(const char *why);
+
 /**
  * Per-title kernel ordinal remap.
  *
@@ -562,13 +570,6 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
-/* Optional: a project sets this to see the guest paths the kernel translates
- * (for example to print who opened a file). NULL by default; called before the
- * path is translated, on the calling guest thread. Only paths a drive or
- * device rule matches reach it: partition images and unrecognised paths
- * do not. */
-extern void (*g_xbox_path_hook)(const char *xbox_path);
-
 /*
  * Which tree a guest path lands in, from the same rule that translates it
  * (after the title's own drive links). Prints nothing and creates nothing,
@@ -580,13 +581,19 @@ enum {
     XBOX_TREE_UNKNOWN = 0,
     XBOX_TREE_GAME,     /* the game files directory: D:, CdRom0, E:, C:, Y: */
     XBOX_TREE_HDD,      /* the HDD root: T:, U:, Z:, the cache partitions   */
-    XBOX_TREE_USER,     /* the UDATA/TDATA saves                            */
+    XBOX_TREE_USER,     /* the UDATA/TDATA saves and the E:\CACHE scratch   */
     XBOX_TREE_DEVICE,   /* a bare device: CdRom0, a PartitionN image        */
 };
 int xbox_path_tree(const char *xbox_path);
 
 /* 1 when the directory holding host_path exists (kernel_file.c, per backend). */
 int xbox_host_parent_exists(const xbox_host_char *host_path);
+/* Optional: a project sets this to see the guest paths the kernel translates
+ * (for example to print who opened a file). NULL by default; called before the
+ * path is translated, on the calling guest thread. Only paths a drive or
+ * device rule matches reach it: partition images and unrecognised paths
+ * do not. */
+extern void (*g_xbox_path_hook)(const char *xbox_path);
 
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
@@ -769,6 +776,63 @@ NTSTATUS __stdcall xbox_KeAlertThread(PVOID Thread, KPROCESSOR_MODE AlertMode);
 NTSTATUS __stdcall xbox_NtYieldExecution(void);
 NTSTATUS __stdcall xbox_NtDuplicateObject(HANDLE SourceHandle, PHANDLE TargetHandle, ULONG Options);
 
+/* The title's threads share one host core, as they shared the console's one
+ * CPU (kernel_thread.c). xbox_GuestCpuMask is the core as a mask, 0 when
+ * RECOMP_GUEST_CPUS=all leaves them on every core; xbox_GuestThreadPin puts
+ * the calling thread on it. xbox_log_thread_role calls it for the guest
+ * roles, so that is where the set of guest threads is defined. */
+DWORD_PTR xbox_GuestCpuMask(void);
+void      xbox_GuestThreadPin(const char *role);
+
+/* The guest CPU (kernel_guest_cpu.c, RECOMP_GUEST_LOCK=1): one guest thread
+ * runs guest code at a time, as on the console. A guest thread joins before
+ * its first guest instruction and parts at its end; the kernel thunk
+ * dispatch releases it for the length of every kernel call and takes it
+ * back (a call that returns at once switches nobody; one past the thread's
+ * quantum, a yield or a blocking call hands over); a lowered spin-wait's
+ * pass yields it to a waiting guest thread; a bridge that runs guest code on
+ * a guest thread takes it around the call. ISRs and DPCs never take it.
+ * Off, every call is a no-op. */
+enum {
+    XBOX_GUEST_CPU_KERNEL,      /* released at a kernel call: where = ordinal */
+    XBOX_GUEST_CPU_SPIN,        /* a lowered loop's pass: where = its VA */
+    XBOX_GUEST_CPU_CALLBACK,    /* the end of a bridge-run guest routine */
+    XBOX_GUEST_CPU_HOST,        /* a host wait outside a kernel call (a replaced XDK routine): where = its VA */
+    XBOX_GUEST_CPU_PREEMPT,     /* a loop back edge past the quantum with a waiter (RECOMP_BACK_EDGE): where = the jump's VA */
+    XBOX_GUEST_CPU_EXIT         /* the thread ended */
+};
+int      xbox_GuestCpuOn(void);
+void     xbox_GuestCpuReloadConfig(void);       /* tests, after recomp_env_set */
+void     xbox_GuestCpuJoin(void);
+void     xbox_GuestCpuPart(void);
+int      xbox_GuestCpuHeld(void);
+int      xbox_GuestCpuIsGuestThread(void);
+int      xbox_GuestCpuRelease(int kind, uint32_t where);   /* 1 if it was held */
+void     xbox_GuestCpuAcquire(void);
+void     xbox_GuestCpuBlocked(void);   /* a bridge blocks inside a non-blocking ordinal */
+int      xbox_GuestCpuYield(uint32_t va);   /* 1: handed over */
+void     xbox_GuestCpuPreempt(uint32_t va); /* RECOMP_BACK_EDGE with the flag set */
+int      xbox_GuestCpuEnterCallback(void);      /* 1 when it took the CPU */
+void     xbox_GuestCpuLeaveCallback(int took);
+unsigned long xbox_GuestCpuOwner(void);         /* the holder's tid, 0 when free */
+/* Read by RECOMP_SPIN_WAIT: guest threads blocked waiting for the CPU. */
+extern volatile int g_xbox_guest_cpu_waiters;
+/* Read by RECOMP_BACK_EDGE: a waiter has waited its quantum; the holder
+ * hands over at its next loop back edge. */
+extern volatile int g_xbox_guest_cpu_preempt;
+typedef struct {
+    long turns;         /* turns ended by a hand-off or by another thread taking the CPU */
+    long releases;      /* kernel calls that let go (soft) */
+    long switches;      /* of those, ones a waiter took the CPU at */
+    long waits, yields;
+    long preempts;      /* turns ended at a loop back edge (RECOMP_BACK_EDGE) */
+    long max_turn_us, max_wait_us;
+    int max_turn_kind;                  /* XBOX_GUEST_CPU_* */
+    uint32_t max_turn_where;
+} XboxGuestCpuStats;
+void     xbox_GuestCpuStatsGet(XboxGuestCpuStats *out, int reset);
+void     xbox_GuestCpuReport(void);             /* under the [PACING] summary */
+
 /* ============================================================================
  * Synchronization (kernel_sync.c)
  * ============================================================================ */
@@ -822,12 +886,89 @@ KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
 int     xbox_IrqlBlocksInterrupts(void);
 int     xbox_IrqlRaisedCount(void);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
+int     xbox_DispatchGateTryEnter(void);       /* the one-CPU gate: ISR delivery */
+void    xbox_DispatchGateEnter(void);
+void    xbox_DispatchGateLeave(void);
 void    xbox_IrqlLeaveInterrupt(int saved);
+/* This thread is at DISPATCH_LEVEL or above, or holds the one-CPU gate. */
+int     xbox_IrqlThisThreadBlocksDpcs(void);
+/* This thread's IRQL (KPCR.Irql), for tests and reports. */
+int     xbox_IrqlCurrent(void);
+
+/* Device interrupts on the one-CPU gate holder (kernel_hal.c).
+ *
+ * A device model whose interrupt finds the gate held posts it; the holder
+ * runs it on its own thread at its next safe point (a kernel call, a
+ * spin-wait yield, the gate's release), never alongside. */
+enum {
+    XBOX_IRQ_VBLANK,
+    XBOX_IRQ_APU,
+    XBOX_IRQ_OHCI,
+    XBOX_IRQ_LINES
+};
+/* What xbox_IrqPost tells the device model to do. */
+enum {
+    XBOX_IRQ_POSTED   = 0,  /* left for the holder (or already run) */
+    XBOX_IRQ_GATED    = 1,  /* the caller has the gate: deliver, then
+                               xbox_DispatchGateLeave */
+    XBOX_IRQ_UNGATED  = 2   /* deliver without the gate (irq_safe_force, or
+                               irq_safe_points=0) */
+};
+/* 0 under RECOMP_DEBUG=irq_safe_points=0: the models' old hold-off. */
+int     xbox_IrqSafePointsOn(void);
+/* The routine the holder runs for a line: it finds the connected ISR and
+ * calls it on g_esp (a worker stack the caller set up) at the device IRQL. */
+void    xbox_IrqSetHandler(int line, void (*run)(void));
+int     xbox_IrqPost(int line);
+void    xbox_IrqSafePoint(void);
+/* The [IRQ] summary line, once per 600 vblanks when anything was posted. */
+void    xbox_IrqReport(void);
+/* The thread holding the gate (0 when free), for the ungated-delivery logs. */
+unsigned long xbox_DispatchGateOwner(void);
+/* A model is about to run an ISR without the gate (irq_safe_points=0, or
+ * irq_safe_force): one line naming the holder it runs beside (the first 20
+ * per line), and a count in the [IRQ] summary. */
+void    xbox_IrqNoteUngated(int line);
+
+/* DPCs queued by an interrupt (the queue in kernel_bridge.c). On the console
+ * one runs when the processor drops below DISPATCH, before the interrupted
+ * thread resumes; here a guest thread runs the queue on its raise to
+ * DISPATCH and at its gate release (kernel_hal.c), and the timer thread
+ * drains what no guest thread took, woken by KeInsertQueueDpc. */
+int     xbox_DpcQueue(uint32_t dpc_va, uint32_t arg1, uint32_t arg2);
+int     xbox_DpcPending(void);          /* an unlocked look */
+int     xbox_DpcDrainHere(void);        /* the caller holds the gate; DPCs run */
+/* The timer thread's drain: takes the gate only when it is free, never
+ * waits; 1 when DPCs stayed queued on a busy gate. *ran counts what ran. */
+int     xbox_DpcDrainTimer(int *ran);
+void    xbox_DpcMarkGuestThread(void);  /* this thread runs guest code */
+int     xbox_DpcOnRaise(void);          /* 0 under RECOMP_DEBUG=dpc_on_raise=0 */
+
+typedef struct {
+    long posted[XBOX_IRQ_LINES];       /* posts that found the gate held */
+    long on_holder[XBOX_IRQ_LINES];    /* run by the holder at a safe point */
+    long second_try[XBOX_IRQ_LINES];   /* taken back by the poster's retry */
+    long forced[XBOX_IRQ_LINES];       /* irq_safe_force deliveries */
+    long ungated[XBOX_IRQ_LINES];      /* run beside a holder (any mode) */
+    long max_wait_us[XBOX_IRQ_LINES];  /* longest post-to-run wait */
+    long wait_logs;                    /* holder-without-safe-point lines */
+    long refused;                      /* safe points that could not run */
+} XboxIrqStats;
+void    xbox_IrqStatsGet(XboxIrqStats *out, int reset);
+/* Tests: re-read irq_safe_* after recomp_env_set, and a hook run between
+ * the poster's first try and its post (the lost-post window). */
+void    xbox_IrqReloadConfig(void);
+void    xbox_IrqSetPostHook(void (*hook)(int line));
+/* Tests: a hook run inside the lower that gives the gate back, after its
+ * safe point and before the leave (the window the release point covers). */
+void    xbox_IrqSetReleaseHook(void (*hook)(void));
 
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
  * A depth that is non-zero while this stops moving is stuck, not busy. */
 int     xbox_IrqlTransitions(void);
 void    xbox_IrqlDumpHolders(void);
+
+#include "kernel_prof.h"            /* RECOMP_TRACE=dpc */
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
 
@@ -956,6 +1097,9 @@ ULONG   __stdcall xbox_AvGetSavedDataAddress(void);
 VOID    __stdcall xbox_AvSendTVEncoderOption(PVOID RegisterBase, ULONG Option, ULONG Param, PULONG Result);
 VOID    __stdcall xbox_AvSetSavedDataAddress(ULONG Address);
 VOID    __stdcall xbox_AvSetDisplayMode(PVOID RegisterBase, ULONG Step, ULONG Mode, ULONG Format, ULONG Pitch, ULONG FrameBuffer);
+/* The frame an AV mode word scans out: *w x *h from the word's timing byte,
+ * 1 when it is known, 0 (and 0x0) when it is not. Not a kernel export. */
+int xbox_AvModeSize(ULONG Mode, ULONG *w, ULONG *h);
 
 /* SMBus (HalReadSMBusValue / HalWriteSMBusValue) */
 NTSTATUS __stdcall xbox_HalReadSMBusValue(UCHAR SlaveAddress, UCHAR CommandCode, BOOLEAN ReadWordValue, PULONG DataValue);
@@ -1122,10 +1266,61 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
 #define XBOX_LOG_THUNK   "THUNK"
 #define XBOX_LOG_PATH    "PATH"
 
+/* One "[THREAD] tid=.. role=.." line per host thread, so a tid in top -H or
+ * Process Explorer maps to a role. routine is the guest start address, or 0.
+ * xbox_log_ms is the ms clock shared by the [NV2A] and [GPU] flip lines. */
+void xbox_log_thread_role(const char *role, uint32_t routine);
+unsigned long xbox_log_ms(void);
+
+/* Called after every NtCreateFile with the guest's path and the NTSTATUS, when
+ * set. The title-side code that wants to react to a file open (a scripted
+ * pad waiting for a movie, say) installs it before the game starts. */
+extern void (*xbox_FileOpenHook)(const char *guest_path, uint32_t status);
+
 /* Vblanks the runtime has raised since start (0 while RECOMP_VBLANK is off).
  * Interlaced output shows one field per vblank, so its low bit is the field
  * parity that the field pin (port 0x80C0) reports. */
 uint32_t xbox_VblankCount(void);
+
+/* One vblank's acknowledgement (kernel_bridge.c, the vblank-ack thread):
+ * waits for the DPC's write of the PCRTC_INTR_0 vblank bit and clears it and
+ * PMC_INTR_0's PCRTC bit. Yields for 2 ms, then waits on `rearm` in 1 ms
+ * steps, and past a second in 16 ms ones, for as long as the PMC bit is up.
+ * While *tick_busy is set the PCRTC bit is a vblank being raised, not an
+ * ack, and is left. late_ms is how late a late ack came. Not static so
+ * tests/vblank_ack can drive it against plain words. */
+enum { XBOX_VBL_ACK_ON_TIME, XBOX_VBL_ACK_LATE, XBOX_VBL_ACK_REARMED,
+       XBOX_VBL_ACK_NONE };
+int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_intr,
+                       volatile LONG *tick_busy, HANDLE rearm, long *late_ms);
+/* One vblank's status bits (kernel_bridge.c, kernel_vblank_raise): latches
+ * PMC_INTR_0's PCRTC bit and returns whether the NV2A's interrupt line goes
+ * up. With PMC_INTR_EN_0 at 0 (the XDK ISR's mask while its DPC is queued or
+ * running) it stays down: 0, PCRTC_INTR_0 and *tick_busy are left, and no
+ * ISR is to be posted. Otherwise 1, with PCRTC_INTR_0's bit and *tick_busy
+ * set for the ISR. Not static so tests/vblank_ack can drive it. */
+int xbox_VblankRaiseBits(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_intr,
+                         volatile uint32_t *pmc_intr_en, volatile LONG *tick_busy);
+/* The bits half of arming the vblank ack watch (kernel_bridge.c): with
+ * `raised` (this tick set PCRTC_INTR_0's vblank bit for the ISR) the bit is
+ * cleared, then *tick_busy is dropped. A masked tick passes 0: it set no
+ * PCRTC bit, so one that is up is the DPC's ack, and it is left for the
+ * watch. Not static so tests/vblank_ack can drive it. */
+void xbox_VblankArmBits(volatile uint32_t *pcrtc_intr, volatile LONG *tick_busy,
+                        int raised);
+/* Whether the nv2a-ack thread should leave PMC_INTR_0's PCRTC bit and
+ * PCRTC_INTR_0's vblank bit to the vblank-ack thread: it runs, and an ack
+ * has come (or a vblank is being raised) within the last second. */
+int xbox_VblankAckHeld(void);
+
+/* x86 port I/O for lifted `in`/`out` (kernel_hal.c); width is 1, 2 or 4.
+ * Also declared in templates/runtime/recomp_types.h for generated code. */
+uint32_t xbox_PortIn(uint32_t port, int width);
+void     xbox_PortOut(uint32_t port, uint32_t value, int width);
+
+/* cpuid for lifted code (kernel_hal.c): the Xbox's Pentium III. Also declared
+ * in templates/runtime/recomp_types.h for generated code. */
+void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
 
 #ifdef __cplusplus
 }

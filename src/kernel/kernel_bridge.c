@@ -26,11 +26,19 @@
  */
 
 #include "kernel.h"
+#include "kernel_missing.h"
+#include "kernel_pacing.h"
+#include "recomp_env.h"
+#include "platform/host_time.h"
+#include "recomp_exit_hook.h"
 #include "guest_vmem.h"
 #include "kernel_missing.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
  * to 32 bits and sign-extended it into a `struct bridge_thread_start *`. Every
@@ -238,7 +246,7 @@ static void kernel_data_init(void)
      * a level the way the console would tell it: "+map intro".
      */
     {
-        const char *cmdline = getenv("RECOMP_CMDLINE");
+        const char *cmdline = recomp_env(RENV_CMDLINE);
 
         if (cmdline && *cmdline) {
             uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
@@ -389,7 +397,7 @@ static long kernel_log_budget(void)
     static long budget = -1;
 
     if (budget < 0) {
-        const char *env = getenv("RECOMP_KERNEL_LOG_BUDGET");
+        const char *env = recomp_env(RENV_KERNEL_LOG_BUDGET);
         budget = env ? strtol(env, NULL, 0) : 200;
         if (budget < 0)
             budget = 0;
@@ -457,7 +465,7 @@ static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 
 struct bridge_thread_start {
     recomp_func_t fn;
-    uint32_t ctx1, ctx2, stack_top, obj_va, tls_size;
+    uint32_t ctx1, ctx2, stack_top, routine, obj_va, tls_size;
 };
 
 /* Lay out a thread's TLS the way the Xbox kernel does.
@@ -491,6 +499,84 @@ static uint32_t bridge_layout_tls(uint32_t kthread, uint32_t top,
     BRIDGE_MEM32(kthread + 0x28) = data;              /* KTHREAD.TlsData */
     BRIDGE_MEM32(g_fs_base + 0x04) = data + tls_size; /* NtTib.StackBase */
     return data + tls_size;
+}
+
+/* Name the calling thread for the OS, because under Wine GetCurrentThreadId is
+ * the Windows tid and top -H shows the Linux one; the name is what joins them.
+ * 15 characters is the Linux comm limit. */
+static void thread_set_os_name(const char *name)
+{
+#ifdef _WIN32
+    typedef HRESULT (WINAPI *set_desc_fn)(HANDLE, PCWSTR);
+    static set_desc_fn set_desc;
+    static int resolved;
+    WCHAR w[16];
+    int i;
+
+    if (!resolved) {
+        HMODULE m = GetModuleHandleA("kernelbase.dll");
+        if (!m) m = GetModuleHandleA("kernel32.dll");
+        if (m) set_desc = (set_desc_fn)(void *)GetProcAddress(m, "SetThreadDescription");
+        resolved = 1;
+    }
+    if (!set_desc)
+        return;
+    for (i = 0; name[i] && i < 15; i++)
+        w[i] = (WCHAR)name[i];
+    w[i] = 0;
+    set_desc(GetCurrentThread(), w);
+#elif defined(__APPLE__)
+    pthread_setname_np(name);
+#else
+    pthread_setname_np(pthread_self(), name);
+#endif
+}
+
+void xbox_log_thread_role(const char *role, uint32_t routine)
+{
+    static DWORD main_tid;   /* the thread that logged process-main */
+    char os[16];
+
+    /* Workers are told apart by the low 16 bits of their routine. */
+    if (routine && !strcmp(role, "guest-worker"))
+        snprintf(os, sizeof os, "guest-w-%04X", (unsigned)(routine & 0xFFFF));
+    else
+        snprintf(os, sizeof os, "%.15s", role);
+    if (!strcmp(role, "process-main"))
+        main_tid = GetCurrentThreadId();
+    /* Not the initial thread: on Linux (Wine included) its name is the
+     * process comm, so renaming it to guest-main breaks pgrep and ps. */
+    if (GetCurrentThreadId() != main_tid)
+        thread_set_os_name(os);
+    if (routine)
+        fprintf(stderr, "[THREAD] tid=%lu role=%s routine=0x%08X\n",
+                (unsigned long)GetCurrentThreadId(), role, routine);
+    else
+        fprintf(stderr, "[THREAD] tid=%lu role=%s\n",
+                (unsigned long)GetCurrentThreadId(), role);
+    fflush(stderr);
+    /* The guest threads, the ones that run the title's code: they drain
+     * queued DPCs at their raises and releases (kernel_hal.c) and share one
+     * host core (kernel_thread.c). The timer, ack and device-model threads
+     * do neither. The pin waits for the title's entry point (routine != 0):
+     * the host's main logs guest-main earlier, with no routine, and goes on
+     * to start host threads that must keep the process mask. */
+    if (!strcmp(role, "guest-main") || !strcmp(role, "guest-worker")) {
+        xbox_DpcMarkGuestThread();
+        if (routine)
+            xbox_GuestThreadPin(role);
+    }
+}
+
+/* Milliseconds since the first call (GetTickCount, monotonic). */
+unsigned long xbox_log_ms(void)
+{
+    static DWORD t0;
+    DWORD now = GetTickCount();
+
+    if (!t0)
+        t0 = now ? now : 1;
+    return (unsigned long)(now - t0);
 }
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
@@ -566,7 +652,7 @@ static uint32_t thobj_alloc(void)
         if (s_thobj_refs[i] == 0)
             break;
     if (i == s_thobj_count && s_thobj_count < THOBJ_MAX) {
-        uint32_t page = xbox_ContiguousAlloc(0x1000, 0x1000);
+        uint32_t page = xbox_ContiguousAllocEx(0x1000, 0x1000, 0, 0xFFFFFFFFu);
         uint32_t k;
 
         if (page) {
@@ -677,12 +763,18 @@ static uint32_t thobj_current(void)
 static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
                                      uint32_t ctx2)
 {
+    /* The worker's code is guest code on a guest thread: it holds the guest
+     * CPU, which the creating call let go of (kernel_thunk_dispatch). On
+     * the spawned path bridge_thread_main joins instead. */
+    int took = xbox_GuestCpuEnterCallback();
+
     g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx2;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx1;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     g_seh_ebp = g_esp;
     fn();
     g_esp += 12;
+    xbox_GuestCpuLeaveCallback(took);
 }
 
 void guest_cpu_join(void);
@@ -693,6 +785,8 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
+
+    xbox_log_thread_role("guest-worker", s->routine);
 
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
@@ -741,13 +835,15 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
                                   uint32_t ctx2, uint32_t stack_top,
-                                  uint32_t obj_va, uint32_t tls_size)
+                                  uint32_t routine, uint32_t obj_va,
+                                  uint32_t tls_size)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    s->routine = routine;
     s->obj_va = obj_va;
     s->tls_size = tls_size;
 
@@ -766,13 +862,14 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
  * of the host thread handle, which is what KeWaitForSingleObject waits on. */
 static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
                                         uint32_t ctx2, uint32_t stack_top,
-                                        uint32_t handle_va, uint32_t tls_size)
+                                        uint32_t routine, uint32_t handle_va,
+                                        uint32_t tls_size)
 {
     uint32_t obj = thobj_alloc();
     HANDLE th, shadow = NULL;
 
     thobj_ref(obj);
-    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, obj, tls_size);
+    th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, routine, obj, tls_size);
     if (!th) {
         thobj_unref(obj);   /* the thread's own: it never ran */
     } else {
@@ -842,6 +939,7 @@ static void bridge_PsCreateSystemThreadEx(void)
         if (fn) {
             if (is_first_call) {
                 /* Main game thread: run directly, inheriting register state */
+                xbox_log_thread_role("guest-main", start_routine);
                 /* Its TLS too: the stack is already in use, so the block
                  * comes from the heap, and the main TIB's fs:[0x28] object
                  * gets the TlsData pointer (see bridge_layout_tls). */
@@ -858,7 +956,16 @@ static void bridge_PsCreateSystemThreadEx(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                fn();
+                /* The title's main thread runs inside this kernel call, which
+                 * let the guest CPU go (RECOMP_GUEST_LOCK): take it back for
+                 * the thread's whole life, as for any guest code a bridge
+                 * runs, or the main thread runs unlocked against every
+                 * worker, the race the lock is for. */
+                {
+                    int took = xbox_GuestCpuEnterCallback();
+                    fn();
+                    xbox_GuestCpuLeaveCallback(took);
+                }
                 g_esp += 12;
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
                 fflush(stderr);
@@ -883,11 +990,11 @@ static void bridge_PsCreateSystemThreadEx(void)
                  * only goes wrong with two guest threads running, this says so
                  * in one run, and the answer separates a concurrency bug from
                  * everything else it might have been. */
-                const char *inline_workers = getenv("RECOMP_WORKERS");
+                const char *inline_workers = recomp_env(RENV_WORKERS);
                 uint32_t stack_top;
 
                 if (inline_workers && !strcmp(inline_workers, "inline")) {
-                    fprintf(stderr, "  [KERNEL] RECOMP_WORKERS=inline: running "
+                    fprintf(stderr, "  [KERNEL] workers=inline: running "
                             "worker 0x%08X on this thread\n", start_routine);
                     fflush(stderr);
                     bridge_run_thread_inline(fn, start_context1, start_context2);
@@ -904,8 +1011,8 @@ static void bridge_PsCreateSystemThreadEx(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
-                                              stack_top, xbox_handle_ptr,
-                                              tls_size);
+                                              stack_top, start_routine,
+                                              xbox_handle_ptr, tls_size);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -1091,7 +1198,6 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
             fprintf(stderr, "\n");
         }
     }
-
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
                 size, align, xbox_va);
@@ -1107,8 +1213,11 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    /* Contiguous blocks come from their own arena, not the heap: passing
-     * them to xbox_HeapFree found nothing, so none ever came back. */
+
+    /* Back to the arena it came from. This used to call xbox_HeapFree, which
+     * never matches a window address, so nothing contiguous was ever
+     * reclaimed. The heap is still tried for an address the arena does not
+     * own, which is harmless: it ignores what it never handed out. */
     if (!xbox_ContiguousFree(addr))
         xbox_HeapFree(addr);
     g_eax = 0;
@@ -1553,9 +1662,7 @@ static void bridge_NtFreeVirtualMemory(void)
         }
     }
 
-    /* Memory NtAllocateVirtualMemory took from the guest heap. The call below
-     * reads the 32-bit guest slots as host pointers and hands them to
-     * VirtualFree, which fails, so none of it ever came back. Under
+    /* Memory NtAllocateVirtualMemory took from the guest heap. Under
      * RECOMP_HEAP_RECLAIM a release returns the block to the heap and a
      * decommit zeroes the pages it names, since heap memory stays committed. */
     if (xbox_HeapReclaimEnabled() && base_ptr && size_ptr) {
@@ -1786,6 +1893,7 @@ static void bridge_HalReturnToFirmware(void)
     /* The missing-file summary, for the same reason. On POSIX ExitProcess is
      * exit() and atexit runs after all; the summary prints once either way. */
     xbox_missing_summary("firmware");
+    xbox_kernel_summary_report("firmware");
 
     /* Let a host-played FMV finish before the process goes away.
      *
@@ -2238,7 +2346,13 @@ static void bridge_NtUserIoApcDispatcher(void)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = information;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = (status == 0) ? 0 : status;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    {
+        /* An APC runs in its thread's context: guest code on a guest thread,
+         * so it holds the guest CPU this call let go of. */
+        int took = xbox_GuestCpuEnterCallback();
+        fn();
+        xbox_GuestCpuLeaveCallback(took);
+    }
 
     g_eax = 0;
 }
@@ -2349,9 +2463,6 @@ static void bridge_AvSetDisplayMode(void)
         if (fb_va && fb_va < XBOX_CONTIG_SIZE)
             fb_va = XBOX_CONTIG_BASE + fb_va;
 
-        xbox_FramebufferWindowSet(fb_va, pitch);
-        xbox_FramebufferWindowStart();
-
         /* Record the resolved address, not the physical one the title passed.
          * Every reader of this wants to read guest memory with it, and the
          * physical form lands in the loaded image -- so the checksum probe
@@ -2359,7 +2470,13 @@ static void bridge_AvSetDisplayMode(void)
          * few megabytes away, and so did every dump that asked for "the"
          * framebuffer. Resolving once here is the fix; resolving in each
          * caller is how there came to be two of them disagreeing. */
-        xbox_SetDisplayFramebuffer(fb_va, pitch);
+        xbox_SetDisplayMode(fb_va, pitch, mode, format);
+        /* After the record: the window takes its size from it. */
+        xbox_FramebufferWindowSet(fb_va, pitch);
+        xbox_FramebufferWindowStart();
+        /* After the address, pitch and size, so a walker that sees the new
+         * generation also sees the new mode (present_pick, N8). */
+        xbox_DisplayModeBump();
     }
     xbox_AvSetDisplayMode(XBOX_TO_NATIVE(addr), step, mode, format, pitch, fb);
     g_eax = 0;
@@ -2449,7 +2566,8 @@ static void bridge_HalReadSMCTrayState(void)
  *
  * Returns 1 if the routine was found and called.
  */
-static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
+static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
+                          int prof_kind)
 {
     uint32_t routine, context;
     recomp_func_t fn;
@@ -2478,6 +2596,16 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    if (xbox_ProfOn()) {
+        /* Begin before the raise: the gate wait inside it is the routine's. */
+        void *prev = xbox_ProfBegin(prof_kind, routine);
+        int _irql = xbox_IrqlEnterInterrupt(2);
+        long long t0 = xbox_ProfNowUs();
+        fn();
+        xbox_ProfEnd(prev, xbox_ProfNowUs() - t0);
+        xbox_IrqlLeaveInterrupt(_irql);
+        return 1;
+    }
     { int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     return 1;
 }
@@ -2493,10 +2621,8 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
  * ran -- the same failure as an unqueued DPC, and just as quiet: the driver
  * asks for exclusive access, is told it did not get it, and skips the work.
  *
- * ponytail: no lock is taken. Nothing else here runs at ISR IRQL, and the one
- * caller that matters is a device model on its own thread; if two of those
- * ever contend, this wants the interrupt object's own lock rather than a
- * global one.
+ * The lock is the one-CPU gate the device models deliver ISRs under (one
+ * for all interrupts, not the interrupt object's own).
  */
 static void bridge_KeSynchronizeExecution(void)
 {
@@ -2518,7 +2644,35 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    /* The ISR's exclusion: the APU and OHCI models and the vblank deliver
+     * their ISRs holding the one-CPU gate when it is free and post them to
+     * its holder when it is not (xbox_IrqPost), so holding it here keeps the
+     * routine and those ISRs apart, as the interrupt's spinlock at DIRQL
+     * does. The leave is a safe point: what was posted meanwhile runs there,
+     * with the routine's result in g_eax saved around it. */
+    /* The routine is the title's code on its own thread, so it holds the
+     * guest CPU too (kernel_guest_cpu.c), taken after the gate: the order
+     * everywhere is gate, then CPU, never the reverse. */
+    if (xbox_ProfOn()) {
+        void *prev = xbox_ProfBegin(XBOX_PROF_SYNC, routine);
+        long long t0;
+        int took;
+        xbox_DispatchGateEnter();
+        took = xbox_GuestCpuEnterCallback();
+        t0 = xbox_ProfNowUs();
+        fn();
+        xbox_ProfEnd(prev, xbox_ProfNowUs() - t0);
+        xbox_GuestCpuLeaveCallback(took);
+        xbox_DispatchGateLeave();
+        return;
+    }
+    xbox_DispatchGateEnter();
+    {
+        int took = xbox_GuestCpuEnterCallback();
+        fn();
+        xbox_GuestCpuLeaveCallback(took);
+    }
+    xbox_DispatchGateLeave();
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
@@ -2581,20 +2735,17 @@ static void dpc_lock(void)
     EnterCriticalSection(&g_dpc_lock);
 }
 
-static void bridge_KeInsertQueueDpc(void)
+int xbox_DpcQueue(uint32_t dpc, uint32_t arg1, uint32_t arg2)
 {
-    uint32_t dpc  = STACK_ARG(0);
-    uint32_t arg1 = STACK_ARG(1);
-    uint32_t arg2 = STACK_ARG(2);
     LONG tail, next;
 
-    if (!dpc) { g_eax = 0; return; }
+    if (!dpc)
+        return 0;
 
     dpc_lock();
     if (BRIDGE_MEM8(dpc + 2)) {                 /* already queued */
         LeaveCriticalSection(&g_dpc_lock);
-        g_eax = 0;
-        return;
+        return 0;
     }
     tail = g_dpc_tail;
     next = (tail + 1) % XBOX_MAX_PENDING_DPC;
@@ -2602,8 +2753,7 @@ static void bridge_KeInsertQueueDpc(void)
         LeaveCriticalSection(&g_dpc_lock);
         fprintf(stderr, "  [KERNEL] DPC queue full, dropping 0x%08X\n", dpc);
         fflush(stderr);
-        g_eax = 0;
-        return;
+        return 0;
     }
     g_dpc_queue[tail].dpc  = dpc;
     g_dpc_queue[tail].arg1 = arg1;
@@ -2611,7 +2761,21 @@ static void bridge_KeInsertQueueDpc(void)
     BRIDGE_MEM8(dpc + 2) = 1;
     g_dpc_tail = next;
     LeaveCriticalSection(&g_dpc_lock);
-    g_eax = 1;
+    /* The timer thread may be asleep to its next vblank edge, 10 ms away:
+     * a DPC that no guest thread picks up at a raise would wait it out. */
+    if (xbox_DpcOnRaise())
+        xbox_HostTimerWake();
+    return 1;
+}
+
+int xbox_DpcPending(void)
+{
+    return g_dpc_head != g_dpc_tail;
+}
+
+static void bridge_KeInsertQueueDpc(void)
+{
+    g_eax = (uint32_t)xbox_DpcQueue(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2));
 }
 
 /* Cancel a queued DPC: take it out of the queue if it is still there. */
@@ -2646,7 +2810,7 @@ static void bridge_KeRemoveQueueDpc(void)
  */
 uint32_t xbox_GetConnectedInterrupt(uint32_t vector);   /* defined below */
 
-static int kernel_raise_interrupt(uint32_t vector)
+static int kernel_call_isr(uint32_t vector)
 {
     uint32_t kint = xbox_GetConnectedInterrupt(vector);
     uint32_t routine, context;
@@ -2666,7 +2830,18 @@ static int kernel_raise_interrupt(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    {
+        int _irql = xbox_IrqlEnterInterrupt(16);
+        if (xbox_ProfOn()) {
+            void *prev = xbox_ProfBegin(XBOX_PROF_ISR_VBLANK, routine);
+            long long t0 = xbox_ProfNowUs();
+            fn();
+            xbox_ProfEnd(prev, xbox_ProfNowUs() - t0);
+        } else {
+            fn();
+        }
+        xbox_IrqlLeaveInterrupt(_irql);
+    }
     return (int)(g_eax & 1u);
 }
 
@@ -2692,10 +2867,201 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define XBOX_NV2A_REG_BASE     0xFD000000u
 #define NV2A_PMC_INTR_0        0x00000100u
 #define NV2A_PMC_INTR_PCRTC    (1u << 24)
+#define NV2A_PMC_INTR_EN_0     0x00000140u
 #define NV2A_PCRTC_INTR_0      0x00600100u
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
+#define NV2A_PCRTC_INTR_EN_0   0x00600140u
 #define NV2A_VECTOR            3u
 
+/* Milliseconds on the performance counter, for the vblank schedule, the
+ * kernel timers and the vblank ack wait. GetTickCount64 is not good enough
+ * for those under Wine: it reads a tick the wineserver advances in steps of
+ * up to ~16 ms, so a schedule run on it fires vblanks 4-33 ms apart while
+ * still averaging 60 Hz, and a title that does its streaming work once per
+ * vblank misses its deadlines on the long gaps. */
+static long long kernel_clock_ms(void)
+{
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+
+    if (!freq.QuadPart && !QueryPerformanceFrequency(&freq))
+        return (long long)GetTickCount64();
+    QueryPerformanceCounter(&now);
+    return (long long)(now.QuadPart / freq.QuadPart) * 1000
+           + (long long)(now.QuadPart % freq.QuadPart) * 1000 / freq.QuadPart;
+}
+
+/* The vblank acknowledgement, done when the guest gives it.
+ *
+ * PMC_INTR_0 and PCRTC_INTR_0 are write-1-to-clear. An XDK vblank DPC reads
+ * PMC_INTR_0 to see what is pending, acks with PCRTC_INTR_0 = 1, and then
+ * spins until PMC_INTR_0 shows PCRTC clear. Against plain RAM
+ * only the nv2a-ack thread cleared that bit, once per pass. At Sleep(0) that
+ * was immediate. At Sleep(1), with the push-buffer executor making each pass
+ * take milliseconds, every vblank held the timer thread for the rest of a
+ * pass: 35-43% of a core under Proton, 6.5% on macOS.
+ *
+ * So after the ISR, PCRTC_INTR_0's vblank bit is taken down (the ISR
+ * has read it) and PMC's is left up for the DPC. This thread then waits for
+ * the DPC's ack write, the bit coming back, and clears both. It blocks on an
+ * event between vblanks.
+ *
+ * It used to give up after 2 ms. The DPC is queued, though, and the timer
+ * thread runs it only once the one-CPU gate is free, so whenever a title
+ * thread sat at DISPATCH across the vblank the DPC came late, acked into a
+ * window nobody watched any more, and spun at DISPATCH until the nv2a-ack
+ * pass came round. With a heavy push buffer a pass is hundreds of
+ * milliseconds: the D3D vblank DPC then held the timer thread for a quarter
+ * of the time, vblanks slowed to 45 Hz and audio streaming starved. So after
+ * the first 2 ms of yielding the watch goes on at 1 ms waits, and past a
+ * second at 16 ms ones, for as long as PMC_INTR_0's PCRTC bit is up: until
+ * the ack comes, the next vblank re-arms it, or the bit goes down some other
+ * way (the nv2a-ack backstop, xbox_VblankAckHeld).
+ *
+ * While the timer thread is between setting the two bits and the ISR's
+ * return (tick_busy), PCRTC_INTR_0's bit is the new vblank, not an ack:
+ * taking it then would ack the vblank before the ISR saw it. The bits are
+ * changed with interlocked operations, since the guest and the nv2a-ack
+ * thread write the same words. */
+enum { VBL_ACK_FAST_MS = 2, VBL_ACK_LATE_MS = 1000, VBL_ACK_SLOW_STEP_MS = 16 };
+
+int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_intr,
+                       volatile LONG *tick_busy, HANDLE rearm, long *late_ms)
+{
+    long long start = kernel_clock_ms(), now = start;
+
+    *late_ms = 0;
+    for (;;) {
+        DWORD step;
+
+        if (!*tick_busy && (*pcrtc_intr & NV2A_PCRTC_INTR_VBLANK)) {
+            InterlockedAnd((volatile LONG *)pcrtc_intr,
+                           (LONG)~NV2A_PCRTC_INTR_VBLANK);
+            InterlockedAnd((volatile LONG *)pmc_intr,
+                           (LONG)~NV2A_PMC_INTR_PCRTC);
+            if (now - start <= VBL_ACK_FAST_MS)
+                return XBOX_VBL_ACK_ON_TIME;
+            *late_ms = (long)(now - start);
+            return XBOX_VBL_ACK_LATE;
+        }
+        if (!*tick_busy && !(*pmc_intr & NV2A_PMC_INTR_PCRTC))
+            return XBOX_VBL_ACK_NONE;   /* nobody is waiting on it */
+        if (now - start <= VBL_ACK_FAST_MS) {
+            SwitchToThread();
+            now = kernel_clock_ms();
+            continue;
+        }
+        step = now - start <= VBL_ACK_LATE_MS ? 1 : VBL_ACK_SLOW_STEP_MS;
+        if (WaitForSingleObject(rearm, step) == WAIT_OBJECT_0) {
+            /* The next vblank: it is that one's ack now. */
+            return XBOX_VBL_ACK_REARMED;
+        }
+        now = kernel_clock_ms();
+    }
+}
+
+static HANDLE g_vbl_ack_event;
+/* Vblanks whose ack never came: the bit was left for the next one. Acks
+ * that came after the 2 ms yield, and the latest of them. Reported, and
+ * reset, on the 600-vblank line. */
+static volatile LONG g_vbl_ack_giveups;
+static volatile LONG g_vbl_ack_late, g_vbl_ack_late_max;
+/* Vblanks the ISR declined: with the XDK ISR, ones that came while its DPC
+ * had the interrupt masked. */
+static volatile LONG g_vbl_declined;
+/* Set by the timer thread from just before it raises the vblank bits until
+ * the ISR has returned and the watch is re-armed. */
+static volatile LONG g_vbl_tick_busy;
+/* When the vblank-ack thread last saw the PCRTC bit acked or down: the low
+ * 32 bits of kernel_clock_ms(), compared by unsigned difference. */
+static volatile LONG g_vbl_ack_seen_ms;
+
+static DWORD WINAPI kernel_vblank_ack_thread(LPVOID unused)
+{
+    int r = XBOX_VBL_ACK_ON_TIME;
+
+    (void)unused;
+    xbox_log_thread_role("vblank-ack", 0);
+    for (;;) {
+        long late_ms;
+
+        if (r != XBOX_VBL_ACK_REARMED)
+            WaitForSingleObject(g_vbl_ack_event, INFINITE);
+        r = xbox_VblankAckWait(
+            &BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0),
+            &BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+            &g_vbl_tick_busy, g_vbl_ack_event, &late_ms);
+        if (r != XBOX_VBL_ACK_REARMED)
+            InterlockedExchange(&g_vbl_ack_seen_ms, (LONG)(uint32_t)kernel_clock_ms());
+        if (r == XBOX_VBL_ACK_LATE) {
+            InterlockedIncrement(&g_vbl_ack_late);
+            if (late_ms > g_vbl_ack_late_max)
+                InterlockedExchange(&g_vbl_ack_late_max, late_ms);
+        } else if (r != XBOX_VBL_ACK_ON_TIME) {
+            InterlockedIncrement(&g_vbl_ack_giveups);
+        }
+    }
+    return 0;
+}
+
+static volatile LONG g_vbl_ack_owned;
+
+/* The nv2a-ack thread's backstop. While the vblank-ack thread runs it owns
+ * the two vblank bits, and nv2a-ack leaves them, unless no ack has come for
+ * VBL_ACK_LATE_MS with no vblank being raised: then the guest is not acking
+ * the XDK way (or its ack was lost), and nv2a-ack clears them each pass as it
+ * did before the watch, so a DPC spinning on PMC_INTR_0 is let go. */
+int xbox_VblankAckHeld(void)
+{
+    if (!g_vbl_ack_owned)
+        return 0;
+    if (g_vbl_tick_busy)
+        return 1;
+    return (uint32_t)kernel_clock_ms() - (uint32_t)g_vbl_ack_seen_ms
+           <= VBL_ACK_LATE_MS;
+}
+
+void xbox_VblankArmBits(volatile uint32_t *pcrtc_intr, volatile LONG *tick_busy,
+                        int raised)
+{
+    if (raised)
+        InterlockedAnd((volatile LONG *)pcrtc_intr, (LONG)~NV2A_PCRTC_INTR_VBLANK);
+    InterlockedExchange(tick_busy, 0);
+}
+
+/* Arm the ack watch for the next ack. raised: this tick set PCRTC_INTR_0's
+ * bit (the ISR ran, or declined), and the bit is taken down with tick_busy.
+ * A masked tick set no PCRTC bit, so one that is up is the DPC's ack and is
+ * left for the watch: an XDK DPC writes its ack once and then spins on
+ * PMC_INTR_0, and wiping that write left it spinning, every guest raise
+ * blocked behind it, until the nv2a-ack backstop a second later. */
+static void kernel_vblank_arm(int raised)
+{
+    if (!g_vbl_ack_event) {
+        HANDLE t;
+
+        g_vbl_ack_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!g_vbl_ack_event) {
+            InterlockedExchange(&g_vbl_tick_busy, 0);
+            return;
+        }
+        InterlockedExchange(&g_vbl_ack_seen_ms, (LONG)(uint32_t)kernel_clock_ms());
+        t = CreateThread(NULL, 0, kernel_vblank_ack_thread, NULL, 0, NULL);
+        if (!t) {
+            CloseHandle(g_vbl_ack_event);
+            g_vbl_ack_event = NULL;
+            InterlockedExchange(&g_vbl_tick_busy, 0);
+            return;
+        }
+        CloseHandle(t);
+        InterlockedExchange(&g_vbl_ack_owned, 1);
+    }
+    xbox_VblankArmBits(&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0),
+                       &g_vbl_tick_busy, raised);
+    SetEvent(g_vbl_ack_event);
+}
+
+/* Vblanks raised since start, for the field pin (xbox_PortIn, port 0x80C0). */
 static volatile LONG g_vblank_total;
 
 uint32_t xbox_VblankCount(void)
@@ -2703,61 +3069,337 @@ uint32_t xbox_VblankCount(void)
     return (uint32_t)g_vblank_total;
 }
 
-static void kernel_vblank_tick(void)
+/* RECOMP_DEBUG=vblank_clock=ms: the timer loop as it was before the
+ * nanosecond schedule (millisecond grid, Sleep(ms), 10 ms re-poll after a
+ * gate-busy drain), kept for A/B runs and bisecting. */
+static int kernel_vblank_clock_ms(void)
+{
+    static int v = -1;
+
+    if (v < 0) {
+        const char *c = recomp_env(RENV_VBLANK_CLOCK);
+        v = c && strcmp(c, "ms") == 0;
+        if (v) {
+            fprintf(stderr, "  [NV2A] vblank clock: millisecond schedule"
+                            " (vblank_clock=ms)\n");
+            fflush(stderr);
+        }
+    }
+    return v;
+}
+
+static int kernel_vblank_enabled(void)
 {
     static int enabled = -1;
-    static long long next_ms;
-    long long now;
 
     if (enabled < 0)
-        enabled = getenv("RECOMP_VBLANK") != NULL;
-    if (!enabled)
-        return;
+        enabled = recomp_env_on(RENV_VBLANK);
+    return enabled;
+}
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
-        return;
-    next_ms = now + 16;                       /* ~60 Hz */
+/* Count one vblank, and once per 600 print the line bench and golden read:
+ * should read ~10000 ms. Also the shortest and longest gap between two, by
+ * the performance counter rather than the clock the schedule runs on. */
+static void kernel_vblank_count(long long now)
+{
+    static unsigned long long total;
+    static long long last_ms;
+    static LARGE_INTEGER qf, qlast;
+    static double gap_min = 1e9, gap_max;
+    LARGE_INTEGER q;
+
     InterlockedIncrement(&g_vblank_total);
+    if (!qf.QuadPart)
+        QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&q);
+    if (qlast.QuadPart && qf.QuadPart) {
+        double g = (double)(q.QuadPart - qlast.QuadPart) * 1000.0
+                   / (double)qf.QuadPart;
+        if (g < gap_min) gap_min = g;
+        if (g > gap_max) gap_max = g;
+    }
+    qlast = q;
+    if (++total % 600 == 0) {
+        fprintf(stderr, "  [NV2A] vblank %llu: last 600 in %lld ms,"
+                " gap %.1f-%.1f ms, ack give-ups %ld, late acks %ld"
+                " (max %ld ms), declined %ld\n",
+                total, last_ms ? now - last_ms : 0, gap_min, gap_max,
+                (long)InterlockedExchange(&g_vbl_ack_giveups, 0),
+                (long)InterlockedExchange(&g_vbl_ack_late, 0),
+                (long)InterlockedExchange(&g_vbl_ack_late_max, 0),
+                (long)InterlockedExchange(&g_vbl_declined, 0));
+        fflush(stderr);
+        xbox_IrqReport();
+        if (xbox_ProfOn())
+            xbox_ProfReport();
+        gap_min = 1e9;
+        gap_max = 0;
+        last_ms = now;
+    } else if (total == 1) {
+        last_ms = now;
+    }
+}
 
-    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
-        return;
+/* The vblank ISR and what follows it, on whichever thread runs it: the
+ * timer thread with the gate, or the gate holder at a safe point. */
+static void kernel_vblank_deliver(void)
+{
+    static unsigned n;
+    int claimed = kernel_call_isr(NV2A_VECTOR);
 
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
-
-    {
-        static unsigned n;
-        int claimed = kernel_raise_interrupt(NV2A_VECTOR);
-        if (n++ < 3)
-            fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
-                    claimed < 0 ? "not callable" :
-                    claimed ? "claimed it" : "declined it");
+    /* Armed for a declined vblank too. The XDK ISR masks PMC_INTR_EN_0
+     * and queues its DPC, which unmasks when it is done; until then
+     * every vblank finds the mask down and is declined, but its status
+     * bit stays latched in PMC_INTR_0, as on hardware. The DPC, run late
+     * behind the one-CPU gate, then sees it, acks it and spins on it --
+     * and with the watch armed only on a claim, nothing cleared it
+     * until the nv2a-ack pass, hundreds of milliseconds under a heavy
+     * push buffer. */
+    if (claimed >= 0)
+        kernel_vblank_arm(1);
+    else
+        InterlockedExchange(&g_vbl_tick_busy, 0);
+    if (claimed == 0)
+        InterlockedIncrement(&g_vbl_declined);
+    if (n++ < 3) {
+        fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
+                claimed < 0 ? "not callable" :
+                claimed ? "claimed it" : "declined it");
         fflush(stderr);
     }
 }
 
-/* Run whatever is queued. Called from the timer thread, which has the guest
- * stack and TIB that a deferred routine needs. */
-static void kernel_drain_dpcs(void)
+/* The holder's run of a posted vblank: kernel_hal.c has put it on a worker
+ * stack at the device IRQL. */
+static void kernel_vblank_on_holder(void)
 {
+    kernel_vblank_deliver();
+}
+
+/* The NV2A asserts its interrupt line only while PMC_INTR_EN_0 is on. The
+ * XDK ISR clears it before it queues its DPC and the DPC sets it again
+ * last, so a vblank inside that window latches PMC_INTR_0's bit and calls
+ * no ISR. It used to be posted regardless. A vblank posted to a gate holder
+ * keeps tick_busy up until the holder's next safe point, and while it is up
+ * the DPC's ack is not taken. When the holder is itself running the D3D
+ * DPC (drained at a guest raise or lower, kernel_hal.c dpc_run_here) that
+ * DPC spins on PMC_INTR_0 with no safe point in the loop: the ISR never
+ * runs, tick_busy never drops, and the ack never comes. A title hung so
+ * within minutes of boot. */
+int xbox_VblankRaiseBits(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_intr,
+                         volatile uint32_t *pmc_intr_en, volatile LONG *tick_busy)
+{
+    /* Interlocked read: the enable is the holder's ISR and DPC writing. */
+    if (!InterlockedCompareExchange((volatile LONG *)pmc_intr_en, 0, 0)) {
+        InterlockedOr((volatile LONG *)pmc_intr, (LONG)NV2A_PMC_INTR_PCRTC);
+        return 0;
+    }
+    InterlockedExchange(tick_busy, 1);
+    InterlockedOr((volatile LONG *)pcrtc_intr, (LONG)NV2A_PCRTC_INTR_VBLANK);
+    InterlockedOr((volatile LONG *)pmc_intr, (LONG)NV2A_PMC_INTR_PCRTC);
+    return 1;
+}
+
+/* Raise one vblank: the PCRTC and PMC bits, then the ISR, then the ack
+ * watch. */
+static void kernel_vblank_raise(void)
+{
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
+        return;
+    xbox_IrqSetHandler(XBOX_IRQ_VBLANK, kernel_vblank_on_holder);
+
+    /* PCRTC_INTR_EN_0: D3D enables the vblank interrupt once it has
+     * connected its ISR. Until then the hardware raises nothing. */
+    if (!(BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_EN_0)
+          & NV2A_PCRTC_INTR_VBLANK)) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [NV2A] vblank held: PCRTC_INTR_EN_0 off\n");
+        return;
+    }
+
+    if (!xbox_VblankRaiseBits(
+            &BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0),
+            &BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+            &BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_EN_0),
+            &g_vbl_tick_busy)) {
+        /* Masked: what a declined delivery leaves, without the ISR, which
+         * would decline it, and without touching PCRTC_INTR_0, which this
+         * tick did not set. */
+        kernel_vblank_arm(0);
+        InterlockedIncrement(&g_vbl_declined);
+        return;
+    }
+
+    /* Under the one-CPU gate when it is free; never waits for it (this is
+     * the frame clock). Held, the ISR is posted to the holder and runs at
+     * its next safe point: tick_busy stays up until then, since until the
+     * ISR has run PCRTC_INTR_0's bit is this vblank, not an ack. A later
+     * tick while it is pending only advances the counter, as a latched
+     * line coalesces. */
+    switch (xbox_IrqSafePointsOn() ? xbox_IrqPost(XBOX_IRQ_VBLANK)
+                                   : XBOX_IRQ_UNGATED) {
+    case XBOX_IRQ_GATED:
+        kernel_vblank_deliver();
+        xbox_DispatchGateLeave();
+        break;
+    case XBOX_IRQ_UNGATED: {
+        /* irq_safe_points=0 (today's model: beside a holder, if any), or
+         * irq_safe_force past irq_safe_ms. */
+        int gated = xbox_DispatchGateTryEnter();
+        if (!gated)
+            xbox_IrqNoteUngated(XBOX_IRQ_VBLANK);
+        kernel_vblank_deliver();
+        if (gated)
+            xbox_DispatchGateLeave();
+        break;
+    }
+    default:
+        break;                          /* the holder runs it */
+    }
+}
+
+/* Vblank N is due at t0 + N * 1000 / 60 ms: an absolute schedule, so the
+ * rate is 60 Hz however coarse the caller's tick. It used to be "now + 16"
+ * checked on a 10 ms tick, which fired every 20 ms -- 50 Hz -- and the movie's
+ * frame limiter counts these. A host that falls more than 100 ms behind
+ * (a debugger stop, a stalled timer thread) restarts the schedule instead of
+ * firing a burst.
+ *
+ * Returns the milliseconds until the next one is due (10 when disabled), so
+ * the timer thread can sleep exactly that long. The vblank_clock=ms loop
+ * only; the default loop runs kernel_vblank_tick_ns. */
+static long kernel_vblank_tick(void)
+{
+    static long long t0;
+    static unsigned long long count;
+    long long now, due;
+    long wait;
+
+    if (!kernel_vblank_enabled())
+        return 10;
+
+    now = kernel_clock_ms();
+    if (!t0)
+        t0 = now;
+    due = t0 + (long long)(count * 1000ull / 60ull);
+    if (now < due)
+        return (long)(due - now);
+    if (now - due > 100) {
+        t0 = now;
+        count = 0;
+        if (xbox_ProfOn())
+            xbox_ProfCount(XBOX_PROF_SCHED_RESTART, now - due);
+    }
+    count++;
+    kernel_vblank_count(now);
+    xbox_PacingVblank(xbox_HostNowNs());
+    wait = (long)(t0 + (long long)(count * 1000ull / 60ull) - now);
+    if (wait < 1)
+        wait = 1;
+    kernel_vblank_raise();
+    return wait;
+}
+
+/* The same schedule on the nanosecond grid (kernel_pacing.c). Whole
+ * milliseconds put each vblank up to a millisecond off its edge, and the
+ * title counts vblanks from the top of each frame, so that error went
+ * straight into the flip interval (3D flips p5 26 / p95 41 ms around 33.3 on
+ * Metal). Returns 1 when it raised one; *next_due_ns is the next edge, 0
+ * when vblanks are off. */
+static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
+{
+    static XboxVblankSchedule sched;
+    uint64_t late;
+
+    *next_due_ns = 0;
+    if (!kernel_vblank_enabled())
+        return 0;
+    if (!xbox_VblankSchedule(&sched, now_ns, next_due_ns, &late))
+        return 0;
+    if (late && xbox_ProfOn())
+        xbox_ProfCount(XBOX_PROF_SCHED_RESTART, (long long)(late / 1000000u));
+    kernel_vblank_count(kernel_clock_ms());
+    xbox_PacingVblank(now_ns);
+    kernel_vblank_raise();
+    return 1;
+}
+
+/* Take the next DPC off the queue, 0 when it is empty. The Inserted byte is
+ * cleared before the routine runs, as the kernel does: the routine may queue
+ * itself again. */
+static int dpc_pop(PendingDpc *d)
+{
+    dpc_lock();
+    if (g_dpc_head == g_dpc_tail) {
+        LeaveCriticalSection(&g_dpc_lock);
+        return 0;
+    }
+    if (xbox_ProfOn())
+        xbox_ProfCount(XBOX_PROF_DPCQ_DEPTH,
+                       (g_dpc_tail - g_dpc_head + XBOX_MAX_PENDING_DPC)
+                       % XBOX_MAX_PENDING_DPC);
+    *d = g_dpc_queue[g_dpc_head];
+    g_dpc_head = (g_dpc_head + 1) % XBOX_MAX_PENDING_DPC;
+    if (d->dpc)
+        BRIDGE_MEM8(d->dpc + 2) = 0;
+    LeaveCriticalSection(&g_dpc_lock);
+    return 1;
+}
+
+/* Run whatever is queued. Called from the timer thread, which has the guest
+ * stack and TIB that a deferred routine needs. Returns 1 when it stopped on
+ * a busy gate with DPCs still queued; *ran counts the DPCs it ran. */
+static int kernel_drain_dpcs(int *ran)
+{
+    *ran = 0;
     for (;;) {
         PendingDpc d;
-        dpc_lock();
-        if (g_dpc_head == g_dpc_tail) {
-            LeaveCriticalSection(&g_dpc_lock);
-            break;
+        /* A DPC runs only while the one-CPU gate is free (no thread at
+         * DISPATCH_LEVEL, no ISR or KeSynchronizeExecution routine), and
+         * never waits for it: this thread is also the vblank and timer
+         * source, which a guest parked at DISPATCH must not stop. What is
+         * queued stays queued for the next tick, as DPCs wait on hardware
+         * until the processor drops below DISPATCH. */
+        if (!xbox_DispatchGateTryEnter()) {
+            if (xbox_ProfOn())
+                xbox_ProfCount(XBOX_PROF_DRAIN_BUSY, 1);
+            /* An unlocked look: a DPC queued just after is picked up by the
+             * next pass anyway. */
+            return g_dpc_head != g_dpc_tail;
         }
-        d = g_dpc_queue[g_dpc_head];
-        g_dpc_head = (g_dpc_head + 1) % XBOX_MAX_PENDING_DPC;
-        /* Cleared before the routine runs, as the kernel does: the routine
-         * may queue itself again. */
-        if (d.dpc)
-            BRIDGE_MEM8(d.dpc + 2) = 0;
-        LeaveCriticalSection(&g_dpc_lock);
-        if (d.dpc)
-            kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+        if (!dpc_pop(&d)) {
+            xbox_DispatchGateLeave();
+            return 0;
+        }
+        if (d.dpc && kernel_run_dpc(d.dpc, d.arg1, d.arg2, XBOX_PROF_DPC_QUEUE))
+            (*ran)++;
+        xbox_DispatchGateLeave();
     }
+}
+
+/* The timer thread's drain, for tests/irq_progress: the timer thread itself
+ * cannot start without a title's TLS image for its TIB. */
+int xbox_DpcDrainTimer(int *ran)
+{
+    return kernel_drain_dpcs(ran);
+}
+
+/* The queue, run on a guest thread that owns "the processor at DISPATCH":
+ * its raise, before its critical region, and its release point
+ * (kernel_hal.c, dpc_run_here). The caller holds the gate and is at or
+ * below DISPATCH; kernel_run_dpc raises for the routine where it is not
+ * there already. The routine runs on this thread's own guest stack, as the
+ * kernel runs a DPC on the interrupted thread's. */
+int xbox_DpcDrainHere(void)
+{
+    int ran = 0;
+    PendingDpc d;
+
+    while (dpc_pop(&d))
+        if (d.dpc && kernel_run_dpc(d.dpc, d.arg1, d.arg2, XBOX_PROF_DPC_QUEUE))
+            ran++;
+    return ran;
 }
 
 /* ── KeInitializeDpc (ordinal 107) ────────────────────────
@@ -2992,11 +3634,150 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
+/* Fire every kernel timer due at now_ms. Returns how many fired;
+ * *next_due_ms is the earliest still armed, -1 when none. */
+static int kernel_fire_timers(long long now, long long *next_due_ms)
+{
+    int i, fired = 0;
+
+    *next_due_ms = -1;
+    for (i = 0; i < XBOX_MAX_TIMERS; i++) {
+        uint32_t dpc, fired_va;
+
+        EnterCriticalSection(&g_timer_lock);
+        if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
+            if (g_timers[i].timer_va
+                && (*next_due_ms < 0 || g_timers[i].due_ms < *next_due_ms))
+                *next_due_ms = g_timers[i].due_ms;
+            LeaveCriticalSection(&g_timer_lock);
+            continue;
+        }
+        fired_va = g_timers[i].timer_va;
+        dpc = g_timers[i].dpc_va;
+        if (g_timers[i].period_ms > 0) {
+            g_timers[i].due_ms = now + g_timers[i].period_ms;
+            if (*next_due_ms < 0 || g_timers[i].due_ms < *next_due_ms)
+                *next_due_ms = g_timers[i].due_ms;
+        } else {
+            g_timers[i].timer_va = 0;      /* one-shot, done */
+        }
+        LeaveCriticalSection(&g_timer_lock);
+        fired++;
+
+        /* Outside the lock: the routine can set or cancel timers. */
+        if (dpc)
+            kernel_run_dpc(dpc, 0, 0, XBOX_PROF_DPC_TIMER);
+
+        /* Wake anyone parked on the timer's shadow event; a timer with no
+         * DPC is just a kernel sleep. */
+        {
+            HANDLE ev = ke_shadow_lookup(fired_va);
+            if (ev) {
+                SetEvent(ev);
+                BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
+            }
+        }
+    }
+    return fired;
+}
+
+/* The loop before the nanosecond schedule (vblank_clock=ms), unchanged. */
+static void kernel_timer_loop_ms(void)
+{
+    long wait = 10;
+
+    for (;;) {
+        long long now, next_due;
+        int ran;
+
+        /* Until the next vblank, at most the 10 ms timer tick. */
+        if (xbox_ProfOn()) {
+            long long t0 = xbox_ProfNowUs();
+            Sleep((DWORD)(wait < 1 ? 1 : wait));
+            xbox_ProfCount(XBOX_PROF_SLEEP_OVER, xbox_ProfNowUs() - t0
+                           - (long long)(wait < 1 ? 1 : wait) * 1000);
+            xbox_ProfCount(XBOX_PROF_N_LOOPS, 1);
+        } else {
+            Sleep((DWORD)(wait < 1 ? 1 : wait));
+        }
+        wait = kernel_vblank_tick();  /* the GPU's frame clock */
+        if (wait > 10)
+            wait = 10;
+        kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
+        now = kernel_clock_ms();
+        kernel_fire_timers(now, &next_due);
+        xbox_SpinWake();
+    }
+}
+
+/* The timer thread's loop: sleep to the earliest of the next vblank edge,
+ * the next kernel timer and a 10 ms cap, on the nanosecond clock, then
+ * raise what is due, drain DPCs and fire timers.
+ *
+ * A drain that finds the one-CPU gate busy leaves its DPCs queued (it never
+ * waits for the gate: this thread is the frame clock, and a guest parked at
+ * DISPATCH must not stop it). It used to find them again only at the next
+ * vblank or the 10 ms tick, and the title's vblank callback, which runs in
+ * such a DPC, came up to 10 ms late -- the flip landed late with it. Now the
+ * next pass comes within 1 ms while DPCs wait on the gate. */
+static void kernel_timer_loop_ns(void)
+{
+    const uint64_t ms = 1000000u;
+    uint64_t wait = 10 * ms;
+
+    xbox_HostTimerThreadInit();
+    for (;;) {
+        uint64_t now, vbl_next, target;
+        long long now_ms, timer_due;
+        int raised, ran, busy, fired;
+
+        /* Wakeable: KeInsertQueueDpc ends it, so a DPC that no guest thread
+         * drains at a raise runs now rather than at the next edge. */
+        if (xbox_ProfOn()) {
+            long long t0 = xbox_ProfNowUs();
+            xbox_HostTimerSleepNs(wait);
+            xbox_ProfCount(XBOX_PROF_SLEEP_OVER, xbox_ProfNowUs() - t0
+                           - (long long)(wait / 1000u));
+            xbox_ProfCount(XBOX_PROF_N_LOOPS, 1);
+        } else {
+            xbox_HostTimerSleepNs(wait);
+        }
+        raised = kernel_vblank_tick_ns(xbox_HostNowNs(), &vbl_next);
+        busy = kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
+        now_ms = kernel_clock_ms();
+        fired = kernel_fire_timers(now_ms, &timer_due);
+        /* A declined or not-callable vblank ran no DPC, but its PCRTC bits
+         * changed all the same. */
+        if (raised || ran || fired)
+            xbox_SpinWake();
+
+        now = xbox_HostNowNs();
+        target = now + 10 * ms;
+        if (vbl_next) {
+            /* Behind the grid (a late pass): catch up one vblank per
+             * millisecond, as the millisecond loop did, not in a burst. */
+            uint64_t v = vbl_next > now ? vbl_next : now + ms;
+            if (v < target)
+                target = v;
+        }
+        if (timer_due >= 0) {
+            uint64_t t = now + (timer_due > now_ms
+                                ? (uint64_t)(timer_due - now_ms) * ms : 0);
+            if (t < target)
+                target = t;
+        }
+        if (busy && now + ms < target)
+            target = now + ms;
+        wait = target > now ? target - now : 0;
+    }
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
 
     (void)unused;
+    xbox_log_thread_role("kernel-timer", 0);
     if (slot < 0) {
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
                         "timer DPCs will not run\n");
@@ -3019,46 +3800,52 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
-    for (;;) {
-        long long now;
-        int i;
-
-        Sleep(10);
-        kernel_vblank_tick();  /* the GPU's frame clock */
-        kernel_drain_dpcs();   /* deferred work, before due timers */
-        now = (long long)GetTickCount64();
-
-        for (i = 0; i < XBOX_MAX_TIMERS; i++) {
-            uint32_t dpc, fired_va;
-
-            EnterCriticalSection(&g_timer_lock);
-            if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
-                LeaveCriticalSection(&g_timer_lock);
-                continue;
-            }
-            fired_va = g_timers[i].timer_va;
-            dpc = g_timers[i].dpc_va;
-            if (g_timers[i].period_ms > 0)
-                g_timers[i].due_ms = now + g_timers[i].period_ms;
-            else
-                g_timers[i].timer_va = 0;      /* one-shot, done */
-            LeaveCriticalSection(&g_timer_lock);
-
-            /* Outside the lock: the routine can set or cancel timers. */
-            if (dpc)
-                kernel_run_dpc(dpc, 0, 0);
-
-            /* Wake anyone parked on the timer's shadow event; a timer with no
-             * DPC is just a kernel sleep. */
-            {
-                HANDLE ev = ke_shadow_lookup(fired_va);
-                if (ev) {
-                    SetEvent(ev);
-                    BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
-                }
-            }
-        }
+#ifdef _WIN32
+    /* Sleep(1) is 15.6 ms on native Windows without this, which would make
+     * the vblank_clock=ms schedule run at 32 Hz; the nanosecond loop sleeps
+     * on a high-resolution waitable timer, and also wants it for the
+     * fallback. Wine needs nothing. */
+    {
+        typedef unsigned (WINAPI *tbp_fn)(unsigned);
+        HMODULE winmm = LoadLibraryA("winmm.dll");
+        tbp_fn tbp = winmm ? (tbp_fn)(void *)GetProcAddress(winmm,
+                                                           "timeBeginPeriod")
+                           : NULL;
+        if (tbp)
+            tbp(1);
     }
+    /* Windows 11 may ignore that request while the window is occluded,
+     * minimised or otherwise not visible, which would put Sleep(1) and the
+     * ms vblank schedule back on the 15.6 ms tick whenever the game loses
+     * focus. Opting out of that throttling makes the system keep honouring
+     * the request. Windows 10 and Wine refuse or lack the class: ignored. */
+    {
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+        typedef struct {
+            ULONG Version, ControlMask, StateMask;
+        } power_throttling_state;
+        typedef BOOL (WINAPI *spi_fn)(HANDLE, int, LPVOID, DWORD);
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        spi_fn spi = k32 ? (spi_fn)(void *)GetProcAddress(k32,
+                                                         "SetProcessInformation")
+                         : NULL;
+        power_throttling_state st;
+        st.Version = 1;               /* PROCESS_POWER_THROTTLING_CURRENT_VERSION */
+        st.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        st.StateMask = 0;
+        if (spi)
+            spi(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &st,
+                sizeof st);
+    }
+#endif
+
+    if (kernel_vblank_clock_ms())
+        kernel_timer_loop_ms();
+    else
+        kernel_timer_loop_ns();
+    return 0;
 }
 
 /* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */
@@ -3083,7 +3870,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     if (free_slot >= 0) {
         g_timers[free_slot].timer_va  = timer_va;
         g_timers[free_slot].dpc_va    = dpc_va;
-        g_timers[free_slot].due_ms    = (long long)GetTickCount64() + delay_ms;
+        g_timers[free_slot].due_ms    = kernel_clock_ms() + delay_ms;
         g_timers[free_slot].period_ms = period_ms;
     }
     LeaveCriticalSection(&g_timer_lock);
@@ -3319,6 +4106,23 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h)
         BRIDGE_MEM32(handle_va) = bridge_handle_token(h);
 }
 
+/* An untagged token as a native HANDLE. The guest's pseudo-handles,
+ * NtCurrentProcess() (-1) and NtCurrentThread() (-2), are 32-bit negative
+ * values; zero-extending them gives 0x00000000FFFFFFFF / ...FFFE, which no
+ * 64-bit host treats as "the current process/thread". Windows fails
+ * DuplicateHandle on it (X-Men Legends' CRT duplicates NtCurrentThread() and
+ * spun forever on the STATUS_UNSUCCESSFUL that came back), and the POSIX shim
+ * dereferences it as an object. Sign-extend the pseudo-handle range so they
+ * reach the host as its own pseudo-handles. Every other untagged value is a
+ * synthetic/dummy handle and passes through unchanged. Used by both the
+ * by-value and the PHANDLE accessors. */
+static HANDLE bridge_untagged_handle(uint32_t token)
+{
+    if (token >= 0xFFFFFFF0u)
+        return (HANDLE)(intptr_t)(int32_t)token;
+    return (HANDLE)(uintptr_t)token;
+}
+
 /* Resolve a 32-bit Xbox handle slot back to a native HANDLE. */
 static HANDLE bridge_read_handle(uint32_t va)
 {
@@ -3327,8 +4131,7 @@ static HANDLE bridge_read_handle(uint32_t va)
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
     }
-    /* Untagged value: synthetic/dummy handle -- pass through unchanged. */
-    return (HANDLE)(uintptr_t)token;
+    return bridge_untagged_handle(token);
 }
 
 /* Resolve a token to a HANDLE and release its table slot (for NtClose). */
@@ -3350,14 +4153,7 @@ static HANDLE bridge_resolve_handle(uint32_t token)
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
     }
-    /* Pseudo-handles (NtCurrentProcess() = -1, NtCurrentThread() = -2) are
-     * negative. Zero-extending them on a 64-bit host yields 0x00000000FFFFFFFE,
-     * which Win32 rejects: X-Men Legends' CRT duplicates NtCurrentThread()
-     * and spun forever on the STATUS_UNSUCCESSFUL that came back. */
-    if (token >= 0xFFFFFFF0u)
-        return (HANDLE)(intptr_t)(int32_t)token;
-    /* Untagged: synthetic/dummy handle -- pass through unchanged. */
-    return (HANDLE)(uintptr_t)token;
+    return bridge_untagged_handle(token);
 }
 
 static HANDLE bridge_take_handle(uint32_t token)
@@ -3463,12 +4259,14 @@ static NTSTATUS bridge_create_file_open(
     return st;
 }
 
+void (*xbox_FileOpenHook)(const char *guest_path, uint32_t status);
+
 /* Every guest open -- NtCreateFile, NtOpenFile, IoCreateFile -- comes through
  * here, so this is where each attempt is logged and where the missing-file
  * report (kernel_missing.c) sees it. NtOpenFile and IoCreateFile used to
  * print nothing at all. Their failures print now, since the report needs
- * them; their successes only under RECOMP_MISSING_FILES=all, because a
- * title that streams through IoCreateFile would otherwise log
+ * them; their successes only under RECOMP_TRACE=missing=all, because a
+ * title that streams through IoCreateFile (Burnout 3) would otherwise log
  * every open by default. ntcreate: the caller is NtCreateFile, whose
  * success line has always printed. */
 static NTSTATUS bridge_create_file_impl(
@@ -3518,6 +4316,8 @@ static NTSTATUS bridge_create_file_impl(
             fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X\n",
                     gpath, (unsigned)disposition, (unsigned)options,
                     g_xbox_kernel_caller, status);
+        if (xbox_FileOpenHook)              /* e.g. a scripted pad waiting on a movie */
+            xbox_FileOpenHook(gpath, status);
     }
     fflush(stderr);
     return st;
@@ -3599,6 +4399,7 @@ static void bridge_RtlInitAnsiString(void)
 }
 
 /* ── NtCreateFile (ordinal 190, 9 args = 36 bytes) ─────── */
+
 static void bridge_NtCreateFile(void)
 {
     uint32_t handle_va   = STACK_ARG(0);  /* PHANDLE */
@@ -3635,7 +4436,7 @@ static void bridge_NtCreateFile(void)
      *
      * Off unless RECOMP_FMV_HOST is set: it is a substitute for the title's
      * own output, and that should be a decision rather than a default. */
-    if (g_eax == 0 && getenv("RECOMP_FMV_HOST")) {
+    if (g_eax == 0 && recomp_env(RENV_FMV_HOST)) {
         /* Declared here rather than included: the player lives in xbox_video,
          * which links xbox_d3d8, and having the kernel include its header
          * would make the dependency circular for no gain. Both land in the
@@ -3855,7 +4656,13 @@ static void bridge_RtlUnwind(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = reg;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = exc_record;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* return address */
-                fn();
+                {
+                    /* The handler is the title's code on its own thread:
+                     * it holds the guest CPU the unwind call let go of. */
+                    int took = xbox_GuestCpuEnterCallback();
+                    fn();
+                    xbox_GuestCpuLeaveCallback(took);
+                }
                 /* 16, not 20: the handler's own `ret` has already taken the
                  * return address off, leaving just the four arguments for the
                  * caller to drop. Cleaning 20 leaves esp four bytes high, and
@@ -3929,7 +4736,18 @@ static int bridge_async_io_enabled(void)
 {
     static int on = -1;
     if (on < 0)
-        on = getenv("RECOMP_ASYNC_IO") ? 1 : 0;
+        on = recomp_env(RENV_ASYNC_IO) ? 1 : 0;
+    return on;
+}
+
+/* The [READ]/[WRITE] records behind RECOMP_TRACE=file. They are bring-up
+ * evidence, one line per call on the guest thread, and a load or a save
+ * prints them by the thousand; nothing reads them in a default run. */
+static int bridge_file_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env(RENV_FILE_TRACE) ? 1 : 0;
     return on;
 }
 
@@ -3962,7 +4780,7 @@ static void bridge_NtReadFile(void)
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
      * identical from inside the title -- the first bytes settle it. */
-    {
+    if (bridge_file_trace()) {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
         /* The offset matters as much as the length. A title streaming a pack
@@ -3971,15 +4789,15 @@ static void bridge_NtReadFile(void)
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
-                    g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
+            fprintf(stderr, "  [READ] from=0x%08X buf=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller, buffer_va, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
-                    g_xbox_kernel_caller,
+            fprintf(stderr, "  [READ] from=0x%08X buf=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller, buffer_va,
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
@@ -4033,6 +4851,17 @@ static void bridge_NtWriteFile(void)
     }
     g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+    /* The same record as [READ]: where the bytes came from and the first of
+     * them. A cache copy that comes out all zeros is either a write from the
+     * wrong buffer or a right buffer that was cleared, and this tells which. */
+    if (length >= 4096 && bridge_file_trace()) {
+        const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
+        fprintf(stderr, "  [WRITE] from=0x%08X buf=0x%08X @%lld len=%u st=0x%08X  "
+                "%02X %02X %02X %02X\n", g_xbox_kernel_caller, buffer_va,
+                poff ? (long long)off.QuadPart : -1LL, length, g_eax,
+                p[0], p[1], p[2], p[3]);
+        fflush(stderr);
+    }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
@@ -4164,7 +4993,7 @@ static void bridge_NtQueryFullAttributesFile(void)
     g_eax = (uint32_t)xbox_NtQueryFullAttributesFile(&oa,
                 (PXBOX_FILE_NETWORK_OPEN_INFORMATION)XBOX_TO_NATIVE(info_va));
     /* Asking whether a file exists is not expecting it: a probe, listed only
-     * under RECOMP_MISSING_FILES=all. */
+     * under RECOMP_TRACE=missing=all. */
     if (g_eax)
         xbox_missing_note(name.Buffer, g_eax, 0, XBOX_FILE_OPEN, 0, 1);
 }
@@ -4784,8 +5613,10 @@ static void bridge_MmLockUnlockBufferPages(void)
  */
 static void bridge_MmQueryAllocationSize(void)
 {
+    /* Contiguous blocks live in their own arena now; ask it first. */
     uint32_t va = STACK_ARG(0);
-    uint32_t n = xbox_ContiguousBlockSize(va);   /* XPhysicalSize asks this too */
+    uint32_t n = xbox_ContiguousBlockSize(va);
+
     g_eax = n ? n : xbox_HeapBlockSize(va);
 }
 
@@ -6847,7 +7678,7 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
     HANDLE h = NULL;
 
     if (enabled < 0) {
-        const char *e = getenv("RECOMP_TITLE_KEVENTS");
+        const char *e = recomp_env(RENV_TITLE_KEVENTS);
         enabled = e && *e == '1';
     }
     if (!enabled)
@@ -7959,6 +8790,16 @@ static void bridge_KeSetEventBoostPriority(void)
 
     (void)increment;
 
+    {   /* An event the title built itself, as in KeSetEvent. */
+        int type;
+        HANDLE ge = ke_guest_event(guest_va, &type);
+        if (ge) {
+            BRIDGE_MEM32(guest_va + 4) = 1;
+            SetEvent(ge);
+            g_eax = 0;
+            return;
+        }
+    }
     h = ke_shadow_lookup(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
@@ -8430,13 +9271,18 @@ static void bridge_PsCreateSystemThread(void)
             fn = recomp_lookup_manual(start_routine);
         if (fn) {
             if (is_first_call) {
+                xbox_log_thread_role("guest-main", start_routine);
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                fn();
+                {   /* the main thread holds the guest CPU: see the ordinal 255 bridge */
+                    int took = xbox_GuestCpuEnterCallback();
+                    fn();
+                    xbox_GuestCpuLeaveCallback(took);
+                }
                 g_esp += 12;
             } else {
-                const char *inline_workers = getenv("RECOMP_WORKERS");
+                const char *inline_workers = recomp_env(RENV_WORKERS);
                 uint32_t stack_top;
 
                 if (inline_workers && !strcmp(inline_workers, "inline")) {
@@ -8449,7 +9295,8 @@ static void bridge_PsCreateSystemThread(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
-                                              stack_top, xbox_handle_ptr, 0);
+                                              stack_top, start_routine,
+                                              xbox_handle_ptr, 0);
                 }
             }
         } else {
@@ -9953,7 +10800,7 @@ static void kernel_watch_arm_once(void)
     if (done)
         return;
     done = 1;
-    env = getenv("RECOMP_KERNEL_WATCH");
+    env = recomp_env(RENV_KERNEL_WATCH);
     if (env)
         g_kernel_watch_va = (uint32_t)strtoul(env, NULL, 0);
 }
@@ -9977,68 +10824,108 @@ static void kernel_thunk_dispatch_body(void);
  * where the console's scheduler would switch threads anyway. Host threads
  * that only run a guest callback (vblank, interrupts) never take it.
  *
- * ponytail: a guest thread that spins in guest code on a flag another guest
- * thread sets, with no kernel call in the loop, deadlocks here. The console
- * would preempt it on its quantum; the upgrade is a periodic yield point in
- * the lifted code's backward branches. */
-static CRITICAL_SECTION g_guest_cpu;
-static int g_guest_cpu_on = -1;
-static RECOMP_TLS int t_guest_thread;     /* this host thread runs a guest thread */
-static RECOMP_TLS int t_guest_held;       /* and holds the guest CPU */
-static RECOMP_TLS int t_dispatch_depth;
-
-static int guest_cpu_enabled(void)
-{
-    if (g_guest_cpu_on < 0) {
-        const char *e = getenv("RECOMP_GUEST_LOCK");
-        InitializeCriticalSection(&g_guest_cpu);
-        g_guest_cpu_on = e && *e == '1';
-        if (g_guest_cpu_on)
-            fprintf(stderr, "  [KERNEL] guest CPU lock on: one guest thread runs at a time\n");
-    }
-    return g_guest_cpu_on;
-}
+ * The lock itself, its hand-off to a waiting thread and the yield a lowered
+ * spin-wait makes are kernel_guest_cpu.c; these are upstream's entry
+ * points. */
 
 /* Called once on each host thread that runs a guest thread, before its first
  * guest instruction. */
 void guest_cpu_join(void)
 {
-    t_guest_thread = 1;
-    if (guest_cpu_enabled() && !t_guest_held) {
-        EnterCriticalSection(&g_guest_cpu);
-        t_guest_held = 1;
-    }
+    xbox_GuestCpuJoin();
 }
 
 void guest_cpu_part(void)
 {
-    if (t_guest_held) {
-        t_guest_held = 0;
-        LeaveCriticalSection(&g_guest_cpu);
-    }
-    t_guest_thread = 0;
+    xbox_GuestCpuPart();
 }
 
 /* A guest thread lets go of the guest CPU for the length of every kernel
- * call. */
+ * call, and takes it back when it had it. A guest routine a bridge runs (an
+ * APC, an unwind handler) makes its own kernel calls through here too: they
+ * find the CPU as the bridge's callback entry left it and restore that, so
+ * the routine returns into the bridge holding what it held. */
 static void kernel_thunk_dispatch(void)
 {
-    int held = t_guest_held;
-    if (held) {                        /* let other guest threads run meanwhile */
-        t_guest_held = 0;
-        LeaveCriticalSection(&g_guest_cpu);
-    }
-    t_dispatch_depth++;
+    int slot = g_kernel_dispatch_slot;
+    int held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL,
+                                    slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE
+                                    ? g_slot_ordinals[slot] : 0);
     kernel_thunk_dispatch_body();
-    t_dispatch_depth--;
-    /* Back to guest code: take the CPU again. Only at the outermost call --
-     * a guest callback a bridge runs (an APC) returns into the bridge, not to
-     * the thread's own code -- and only if the thread still exists as one. */
-    if (t_guest_thread && t_dispatch_depth == 0 && guest_cpu_enabled()) {
-        EnterCriticalSection(&g_guest_cpu);
-        t_guest_held = 1;
+    if (held)
+        xbox_GuestCpuAcquire();
+}
+
+/* The [KERNEL] summary block: the cumulative call count, the call this one
+ * happened to be, and the six most-called ordinals since boot. */
+static void kernel_summary_print(const char *why, ULONG ordinal, int slot,
+                                 uint32_t esp)
+{
+    /* On the stack: the periodic block and an exit report can run at once,
+     * on different threads. */
+    unsigned char shown_ord[XBOX_KERNEL_THUNK_TABLE_SIZE];
+    int r, shown;
+
+    fprintf(stderr, "  [KERNEL] summary%s%s%s: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
+            why ? " (" : "", why ? why : "", why ? ")" : "",
+            g_kernel_call_count, (unsigned)ordinal, slot, esp);
+    /* And which ones, ranked. "Latest" names whatever the sample
+     * happened to land on; the question behind this line is what a
+     * title sitting still is actually asking the kernel for, and
+     * that wants counting rather than sampling. The counters are read
+     * unsynchronised, a deliberate snapshot: the watchdog calls this for
+     * a wedged thread that may hold any lock there could be. */
+    memset(shown_ord, 0, sizeof shown_ord);
+    for (shown = 0; shown < 6; shown++) {
+        int best = -1;
+        for (r = 0; r < XBOX_KERNEL_THUNK_TABLE_SIZE; r++)
+            if (g_ordinal_calls[r] && !shown_ord[r]
+                && (best < 0 || g_ordinal_calls[r] > g_ordinal_calls[best]))
+                best = r;
+        if (best < 0)
+            break;
+        shown_ord[best] = 1;
+        fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
+                (unsigned long long)g_ordinal_calls[best]);
     }
-    (void)held;
+    fflush(stderr);
+}
+
+/* Every 2 s the block repeated the same six ordinals for the whole run, on
+ * whichever guest thread's call landed on the tick; once at exit and in the
+ * watchdog's hang report says the same. RECOMP_TRACE=kernel_summary brings
+ * the periodic form back. */
+static int kernel_summary_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env(RENV_KERNEL_SUMMARY) ? 1 : 0;
+    return on;
+}
+
+/* The call the latest dispatch was, for the exit and watchdog reports, which
+ * run on threads that are not the caller's (g_esp is thread-local). */
+static ULONG    s_last_ordinal;
+static int      s_last_slot;
+static uint32_t s_last_esp;
+static int      s_summary_hooked;
+static int      s_summary_done;
+
+/* Once, by whichever exit gets there first: on POSIX a firmware exit also
+ * runs atexit, and a window close can race the main thread's exit. */
+void xbox_kernel_summary_report(const char *why)
+{
+    if (g_kernel_call_count == 0 || __atomic_exchange_n(&s_summary_done, 1, __ATOMIC_ACQ_REL) != 0)
+        return;
+    kernel_summary_print(why,
+                         __atomic_load_n(&s_last_ordinal, __ATOMIC_RELAXED),
+                         __atomic_load_n(&s_last_slot, __ATOMIC_RELAXED),
+                         __atomic_load_n(&s_last_esp, __ATOMIC_RELAXED));
+}
+
+static void kernel_summary_at_exit(void)
+{
+    xbox_kernel_summary_report("exit");
 }
 
 static void kernel_thunk_dispatch_body(void)
@@ -10046,6 +10933,12 @@ static void kernel_thunk_dispatch_body(void)
     int slot = g_kernel_dispatch_slot;
     bridge_func_t bridge;
     ULONG ordinal;
+
+    /* A kernel call is the gate holder's safe point: an interrupt posted
+     * while it held the gate runs here, before the bridge reads its
+     * arguments or takes any lock (xbox_IrqPost). After the slot is read,
+     * since a kernel call in the routine sets it again. */
+    xbox_IrqSafePoint();
 
     if (slot < 0 || slot >= XBOX_KERNEL_THUNK_TABLE_SIZE) {
         fprintf(stderr, "  [KERNEL] bad slot %d\n", slot);
@@ -10060,6 +10953,8 @@ static void kernel_thunk_dispatch_body(void)
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
+    if (xbox_ProfOn())
+        xbox_ProfKernelCall(ordinal);
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the
@@ -10073,36 +10968,21 @@ static void kernel_thunk_dispatch_body(void)
         fflush(stderr);
     }
 
-    {
+    __atomic_store_n(&s_last_ordinal, ordinal, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_last_slot, slot, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_last_esp, g_esp, __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&s_summary_hooked, __ATOMIC_RELAXED)
+        && !__atomic_exchange_n(&s_summary_hooked, 1, __ATOMIC_ACQ_REL)) {
+        atexit(kernel_summary_at_exit);
+        recomp_exit_hook_add(xbox_kernel_summary_report);  /* the windows' ExitProcess */
+    }
+
+    if (kernel_summary_trace()) {
         static DWORD last_summary_tick = 0;
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
-            fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
-                    g_kernel_call_count, ordinal, slot, g_esp);
-            /* And which ones, ranked. "Latest" names whatever the sample
-             * happened to land on; the question behind this line is what a
-             * title sitting still is actually asking the kernel for, and
-             * that wants counting rather than sampling. */
-            {
-                static unsigned char shown_ord[XBOX_KERNEL_THUNK_TABLE_SIZE];
-                int r, shown;
-
-                memset(shown_ord, 0, sizeof shown_ord);
-                for (shown = 0; shown < 6; shown++) {
-                    int best = -1;
-                    for (r = 0; r < XBOX_KERNEL_THUNK_TABLE_SIZE; r++)
-                        if (g_ordinal_calls[r] && !shown_ord[r]
-                            && (best < 0 || g_ordinal_calls[r] > g_ordinal_calls[best]))
-                            best = r;
-                    if (best < 0)
-                        break;
-                    shown_ord[best] = 1;
-                    fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
-                            (unsigned long long)g_ordinal_calls[best]);
-                }
-            }
-            fflush(stderr);
+            kernel_summary_print(NULL, ordinal, slot, g_esp);
             last_summary_tick = now;
         }
     }
@@ -10134,7 +11014,7 @@ static void kernel_thunk_dispatch_body(void)
          * that was already wrong before the first call sampled it. Printing
          * every sample under RECOMP_KERNEL_WATCH_ALL shows when it changed
          * even if no single bridge did it. */
-        if (getenv("RECOMP_KERNEL_WATCH_ALL")) {
+        if (recomp_env(RENV_KERNEL_WATCH_ALL)) {
             static uint32_t seen = 0xDEADBEEFu;
             if (_watch_before != seen) {
                 seen = _watch_before;

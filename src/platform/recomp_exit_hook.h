@@ -19,7 +19,12 @@ typedef void (*recomp_exit_hook_fn)(const char *why);
 /* One hook; a second call replaces the first. Any thread. */
 void recomp_exit_hook_set(recomp_exit_hook_fn fn);
 
-/* Calls the hook, if one is set, with why ("window"). */
+/* More hooks that run after it, for state outside the process that the OS
+ * may not undo on a Wine exit (the mouse's cursor clip). Up to four; adding
+ * one twice keeps one. Returns 0 when the table is full. Any thread. */
+int recomp_exit_hook_add(recomp_exit_hook_fn fn);
+
+/* Calls the hook, if one is set, then the added ones, with why ("window"). */
 void recomp_exit_hook_run(const char *why);
 
 #ifdef __cplusplus

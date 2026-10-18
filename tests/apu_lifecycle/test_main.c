@@ -1,12 +1,15 @@
 /* The APU brought up and torn down several times in one process.
  *
- * Two kinds of state outlived an instance. The DSP doorbell ack keeps its
- * configuration and the GPRST gate in file statics: a GP held in reset by
- * one instance left the ack paused in the next, and the RECOMP_APU_DSP_ACK
- * setting read by the first instance was never read again. And shutdown
- * never released the GP/EP state that init allocates.
+ * Three kinds of state outlived an instance. The =auto doorbell ack once
+ * cached the slot it derived from GPSADDR as a host pointer: a new instance
+ * whose title programmed the same GPSADDR acked a dword in the old RAM and
+ * never the new one. The ack keeps its configuration and the GPRST gate in
+ * file statics: a GP held in reset by one instance left the ack paused in
+ * the next, and the RECOMP_APU_DSP_ACK setting read by the first instance
+ * was never read again. And shutdown never released the GP/EP state that
+ * init allocates.
  *
- * A small zeroed buffer stands in for RAM, as in apu_dsp_ack: with no heap,
+ * Small zeroed buffers stand in for RAM, as in apu_dsp_ack: with no heap,
  * no image and no contiguous allocation above page 0, mcpx_apu_phys resolves
  * a low physical address to the buffer + address. The frame thread idles
  * after init (pause_requested) until something resumes it, so the test polls
@@ -15,6 +18,7 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "apu_regs.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,13 +60,11 @@ static void check(int ok, const char *what)
     if (!ok) failures++;
 }
 
+/* recomp_env reads the environment once per process; set the value it
+ * hands out instead, as a changed environment would after a reload. */
 static void set_ack_env(const char *v)
 {
-#ifdef _WIN32
-    _putenv_s("RECOMP_APU_DSP_ACK", v);
-#else
-    setenv("RECOMP_APU_DSP_ACK", v, 1);
-#endif
+    recomp_env_set(RENV_APU_DSP_ACK, v);
 }
 
 static uint32_t *dword(uint8_t *ram, uint32_t phys)
@@ -106,6 +108,32 @@ static long long heap_in_use(void)
 #else
     return -1;
 #endif
+}
+
+/* Same GPSADDR, new RAM: the new instance acks in its own RAM. Both buffers
+ * stay allocated, so the old behaviour writes a live buffer, not freed
+ * memory. */
+static void doorbell_case(uint8_t *ram_a, uint8_t *ram_b)
+{
+    MCPXAPUState *d;
+
+    set_ack_env("auto");
+    d = bring_up(ram_a);
+
+    if (!d) { failures++; return; }
+    *dword(ram_a, DOORBELL) = 0x11;
+    mcpx_apu_dsp_ack_poll(d);
+    check(*dword(ram_a, DOORBELL) == 0, "first instance: poll clears its doorbell");
+    mcpx_apu_shutdown(d);
+
+    d = bring_up(ram_b);
+    if (!d) { failures++; return; }
+    *dword(ram_a, DOORBELL) = 0x22;
+    *dword(ram_b, DOORBELL) = 0x33;
+    mcpx_apu_dsp_ack_poll(d);
+    check(*dword(ram_b, DOORBELL) == 0, "reinit, same GPSADDR: poll clears the new RAM's doorbell");
+    check(*dword(ram_a, DOORBELL) == 0x22, "reinit: the old RAM is left alone");
+    mcpx_apu_shutdown(d);
 }
 
 /* A GP held in reset when the instance went away: the next init must start
@@ -185,14 +213,17 @@ static void cycle_case(uint8_t *ram)
 
 int main(void)
 {
-    uint8_t *ram = (uint8_t *)calloc(1, FAKE_RAM);
+    uint8_t *ram_a = (uint8_t *)calloc(1, FAKE_RAM);
+    uint8_t *ram_b = (uint8_t *)calloc(1, FAKE_RAM);
 
-    if (!ram) { fprintf(stderr, "out of memory\n"); return 2; }
+    if (!ram_a || !ram_b) { fprintf(stderr, "out of memory\n"); return 2; }
     setvbuf(stdout, NULL, _IONBF, 0);
-    gate_case(ram);
-    config_case(ram);
-    cycle_case(ram);
+    doorbell_case(ram_a, ram_b);
+    gate_case(ram_b);
+    config_case(ram_b);
+    cycle_case(ram_b);
     printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
-    free(ram);
+    free(ram_a);
+    free(ram_b);
     return failures ? 1 : 0;
 }

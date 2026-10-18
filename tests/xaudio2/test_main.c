@@ -110,6 +110,14 @@ static HRESULT fake_submit(const XAUDIO2_BUFFER *buffer)
 #undef IXAudio2SourceVoice_SubmitSourceBuffer
 #define IXAudio2SourceVoice_SubmitSourceBuffer(source, buffer, ...) fake_submit(buffer)
 #include "../../src/apu/apu_xaudio2.c"
+#include "../../src/platform/recomp_env.c"
+
+/* The runtime reads the environment once; re-read it after each change. */
+static void put_env(const char *assignment)
+{
+    _putenv(assignment);
+    recomp_env_reload();
+}
 
 /* xa2_init reads the buffer variables on each call. */
 static void put_env(const char *assignment)

@@ -36,6 +36,52 @@
 #endif
 #endif
 
+/* 32-bit compare-and-swap: returns the value *p held, so the swap happened
+ * when that equals old. A function rather than a macro so the width is fixed
+ * by the prototype: long is 32 bits under MSVC but not on LP64 hosts. */
+static inline uint32_t qatomic_cmpxchg32(uint32_t *p, uint32_t old, uint32_t nv)
+{
+#ifdef _MSC_VER
+    return (uint32_t)_InterlockedCompareExchange((long volatile *)p, (long)nv,
+                                                 (long)old);
+#else
+    __atomic_compare_exchange_n(p, &old, nv, 0, __ATOMIC_SEQ_CST,
+                                __ATOMIC_SEQ_CST);
+    return old;
+#endif
+}
+
+/* 32-bit acquire load, for a value a compare-and-swap loop then trusts (a
+ * no-op write is skipped on it). _InterlockedOr with 0 is MSVC's full-barrier
+ * load. */
+static inline uint32_t qatomic_load32(uint32_t *p)
+{
+#ifdef _MSC_VER
+    return (uint32_t)_InterlockedOr((long volatile *)p, 0);
+#else
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#endif
+}
+
+/* 64-bit words (vp.voice_locked). qatomic_or/and above are _InterlockedOr on
+ * a 32-bit long under MSVC and would drop the high half of the word; and
+ * qemu_shim's qatomic_read is a plain dereference, which may tear or be
+ * cached. The load is sequentially consistent, not just acquire, because
+ * the hold and voice_lock each store one word and then load the other
+ * (hold_waiting, voice_locked): only a total order makes sure one of them
+ * sees the other's store. */
+#ifndef qatomic_or64
+#ifdef _MSC_VER
+#define qatomic_or64(p, v)  _InterlockedOr64((__int64 volatile *)(p), (__int64)(v))
+#define qatomic_and64(p, v) _InterlockedAnd64((__int64 volatile *)(p), (__int64)(v))
+#define qatomic_load64(p)   ((uint64_t)_InterlockedOr64((__int64 volatile *)(p), 0))
+#else
+#define qatomic_or64(p, v)  __atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
+#define qatomic_and64(p, v) __atomic_fetch_and((p), (v), __ATOMIC_SEQ_CST)
+#define qatomic_load64(p)   __atomic_load_n((p), __ATOMIC_SEQ_CST)
+#endif
+#endif
+
 /* ============================================================
  * QEMU clock helpers (beyond what NV2A shim provides)
  * ============================================================ */

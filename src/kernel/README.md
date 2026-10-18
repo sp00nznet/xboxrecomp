@@ -171,10 +171,21 @@ xbox_path_init("Burnout 3 Takedown", "saves");
 `save_dir` defaults to `$XDG_DATA_HOME/xboxrecomp` (POSIX) or
 `%LOCALAPPDATA%\xboxrecomp` (Windows). The title's own saves,
 `\Device\Harddisk0\Partition1\UDATA` and `...\TDATA` (where XAPI maps U: and T:),
-go to `<save_dir>/UDATA` and `<save_dir>/TDATA`. `RECOMP_SAVE_DIR=<dir>` moves
-just those two under `<dir>` (created if missing; absolute, and under Wine a
-DOS path such as `Z:\home\me\run\save`), so a scripted run can start from an
-empty save without touching the rest of the save dir.
+go to `<save_dir>/UDATA` and `<save_dir>/TDATA`, and its scratch, `...\CACHE`,
+to `<save_dir>/TitleCache`, which keeps the cache a title writes out of the
+game dir. It is not `CACHE`: Z: and Partition3-5 (the cache partitions
+behind X:, Y: and Z:) already use `<save_dir>/Cache`, which is the same
+folder on a case-insensitive host. `RECOMP_SAVE_DIR=<dir>` moves just those
+three under `<dir>` (created if missing; absolute, and under Wine a DOS path
+such as `Z:\home\me\run\save`), so a scripted run can start from an empty
+save without touching the rest of the save dir.
+
+Two toolkit config keys feed `xbox_path_init` from the game's `main.c` (the
+new-game template reads both): `RECOMP_GAME_FILES=<dir>` is the extracted
+game folder (`default.xbe` and the disc files; unset, the game's built-in
+default) and `RECOMP_HDD_DIR=<dir>` is the `save_dir` above (partition
+images, saves, caches; unset, the default place). A launcher sets them so an
+installed bundle finds the owner's files without a rebuild.
 
 ## Threading
 

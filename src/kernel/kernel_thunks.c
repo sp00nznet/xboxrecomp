@@ -18,6 +18,7 @@
  */
 
 #include "kernel.h"
+#include "recomp_env.h"
 #include "xbox_memory_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -406,7 +407,7 @@ void xbox_kernel_init(void)
     g_log_file = fopen("xbox_kernel.log", "w");
 
     /* Set log level from environment variable if present */
-    const char* log_env = getenv("XBOX_LOG_LEVEL");
+    const char* log_env = recomp_env(RENV_LOG_LEVEL);
     if (log_env) {
         g_log_level = atoi(log_env);
         if (g_log_level < XBOX_LOG_ERROR) g_log_level = XBOX_LOG_ERROR;
@@ -419,6 +420,21 @@ void xbox_kernel_init(void)
         "Kernel version: %u.%u.%u.%u (emulated)",
         xbox_KrnlVersion.Major, xbox_KrnlVersion.Minor,
         xbox_KrnlVersion.Build, xbox_KrnlVersion.Qfe);
+
+#if !defined(_WIN32)
+    /* Before the title opens anything: it may hold hundreds of files open
+     * at once (see w32_raise_fd_limit). */
+    {
+        unsigned long long was = 0, now = 0;
+        int rc = w32_raise_fd_limit(&was, &now);
+        if (rc > 0)
+            xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                "open-file limit raised from %llu to %llu", was, now);
+        else if (rc < 0)
+            xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
+                "open-file limit stays at %llu (could not raise it)", was);
+    }
+#endif
 
     /* Fill thunk table.
      *

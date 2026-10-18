@@ -28,6 +28,43 @@ static int call_irql(unsigned ordinal, uint32_t ecx, unsigned expected_old, unsi
     }
     return 0;
 }
+/* The level is per thread: another thread reads PASSIVE_LEVEL while this one
+ * is raised. Under the MinGW build XBOX_THREAD_LOCAL used to be ignored, and
+ * the level was one process-wide variable. */
+static DWORD WINAPI other_thread(LPVOID out) {
+    *(unsigned *)out = xbox_KfRaiseIrql(0);
+    return 0;
+}
+static int check(const char *name, int cond) {
+    if (!cond) fprintf(stderr, "FAIL %s (depth %d)\n", name, xbox_IrqlRaisedCount());
+    return !cond;
+}
+/* A lower that raises (KfLowerIrql to a level above the current one) sets
+ * the level but never counts as a raise: counted, it had no lower to undo it
+ * and the depth every device model reads stayed up for the rest of the run. */
+static int lower_raises_case(void) {
+    int failed = 0;
+    unsigned seen = 99;
+    HANDLE t;
+    failed |= check("starts passive and uncounted", xbox_KfRaiseIrql(0) == 0 && xbox_IrqlRaisedCount() == 0);
+    xbox_KfLowerIrql(16);
+    /* Read the level where the guest does, KPCR.Irql at fs:[0x24]: asking
+     * through KfRaiseIrql would itself count as a raise. */
+    failed |= check("lower-to-16 sets the level", memory[XBOX_TIB_MAIN + 0x24] == 16);
+    failed |= check("lower-to-16 is not counted", xbox_IrqlRaisedCount() == 0);
+    xbox_KfLowerIrql(0);
+    failed |= check("back to passive, still uncounted", xbox_IrqlRaisedCount() == 0);
+    (void)xbox_KfRaiseIrql(2);
+    failed |= check("a real raise counts once", xbox_IrqlRaisedCount() == 1);
+    xbox_KfLowerIrql(16);
+    failed |= check("lower-raises while counted stays at one", xbox_IrqlRaisedCount() == 1);
+    t = CreateThread(NULL, 0, other_thread, &seen, 0, NULL);
+    if (t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
+    failed |= check("another thread is at passive", seen == 0);
+    xbox_KfLowerIrql(0);
+    failed |= check("the real lower uncounts", xbox_IrqlRaisedCount() == 0 && !xbox_IrqlBlocksInterrupts());
+    return failed;
+}
 int main(void) {
     memory=VirtualAlloc(NULL,16*1024*1024,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
     if(!memory) return 10;
@@ -40,7 +77,8 @@ int main(void) {
     failed|=call_irql(160,0x12340003,2,3);
     failed|=call_irql(161,0xFACE0002,0,2);
     failed|=call_irql(161,0xABCD0000,0,0);
+    failed|=lower_raises_case();
     VirtualFree(memory,0,MEM_RELEASE);
-    if(!failed) puts("PASS fastcall IRQL: CL arguments, old levels, nesting and stack canary");
+    if(!failed) puts("PASS fastcall IRQL: CL arguments, old levels, nesting, stack canary, lower-raises not counted, per-thread level");
     return failed;
 }

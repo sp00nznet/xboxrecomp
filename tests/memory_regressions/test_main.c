@@ -23,7 +23,8 @@
  *   5. MEM_DECOMMIT then MEM_COMMIT on heap memory gives zeroed pages, as on
  *      the console. Both were no-ops, so the old contents came back.
  *   6. MmFreeContiguousMemory gives a contiguous block back and the next
- *      request of that size reuses it; the default never reuses one.
+ *      request of that size reuses it. In this fork that holds in every mode:
+ *      the contiguous arena is first-fit whatever the switch says.
  *   7. (default too) MmAllocateContiguousMemoryEx's physical range is
  *      honoured. A request limited to the low 16 MB still succeeds once
  *      unconstrained requests have filled up to it -- XDK D3D's visibility
@@ -311,12 +312,13 @@ int main(int argc, char **argv)
 
         snprintf(d, sizeof d, "free said %d", xbox_ContiguousFree(c1));
         c2 = xbox_ContiguousAlloc(0x20000, 4096);
-        if (reclaim) {
+        /* This fork's first-fit contiguous arena reuses freed blocks with or
+         * without the switch (it honours MmAllocateContiguousMemoryEx's
+         * physical range, which a title's visibility tests need). */
+        {
             char d2[160];
             snprintf(d2, sizeof d2, "%s, got 0x%08X, expected 0x%08X", d, c2, c1);
             check(c1 && c2 == c1, "a freed contiguous block is reused", d2);
-        } else {
-            check(c1 && c2 != c1, "default: contiguous memory is never reused", d);
         }
     }
 

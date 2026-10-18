@@ -17,6 +17,7 @@
  * the Win32 backend on Windows (and Proton) and the POSIX one elsewhere.
  */
 #include "kernel.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,15 +132,6 @@ static long host_file(const char *name, unsigned char *buf, size_t cap)
 }
 
 static unsigned char pattern(unsigned i) { return (unsigned char)(i * 7 + 1); }
-
-static void set_env(const char *k, const char *v)
-{
-#if defined(_WIN32)
-    _putenv_s(k, v ? v : "");
-#else
-    if (v) setenv(k, v, 1); else unsetenv(k);
-#endif
-}
 
 static void make_dir(const char *p)
 {
@@ -279,14 +271,14 @@ static void test_save_dir(const char *root)
     make_dir(game);
     make_dir(save);
 
-    set_env("RECOMP_SAVE_DIR", ov);
+    recomp_env_set(RENV_SAVE_DIR, ov);
     xbox_path_init(game, save);
     check(is_dir(ov), "RECOMP_SAVE_DIR is created", ov);
     snprintf(want, sizeof want, "%s" SEP_S "UDATA" SEP_S "x", ov);
     check_maps("\\Device\\Harddisk0\\Partition1\\UDATA\\x", want,
                "UDATA\\x goes under RECOMP_SAVE_DIR");
 
-    set_env("RECOMP_SAVE_DIR", NULL);
+    recomp_env_set(RENV_SAVE_DIR, NULL);
     snprintf(p, sizeof p, "%s" SEP_S "TDATA", game);
     make_dir(p);                   /* saves only in the game dir */
     xbox_path_init(game, save);

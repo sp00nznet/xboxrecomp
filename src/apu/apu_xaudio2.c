@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "apu_xaudio2.h"
+#include "recomp_env.h"
 
 /* The XAudio2 backend is Windows-only. On POSIX hosts apu_sdl2.c provides
  * the same xa2_* functions over SDL2. */
@@ -40,9 +41,9 @@ static int g_xa2_num_bufs    = XA2_NUM_BUFS_DEFAULT;
 #define XA2_BUF_SAMPLES g_xa2_buf_samples
 #define XA2_NUM_BUFS    g_xa2_num_bufs
 
-static int xa2_env_int(const char *name, int def, int lo, int hi)
+static int xa2_env_int(recomp_env_id id, int def, int lo, int hi)
 {
-    const char *e = getenv(name);
+    const char *e = recomp_env(id);
     int v;
     if (!e || !*e) return def;
     v = atoi(e);
@@ -76,10 +77,10 @@ int xa2_init(void)
 
     if (g_xa2_initialized) return 1;
 
-    g_xa2_buf_samples = xa2_env_int("RECOMP_AUDIO_BUF_SAMPLES",
+    g_xa2_buf_samples = xa2_env_int(RENV_AUDIO_BUF_SAMPLES,
                                     XA2_BUF_SAMPLES_DEFAULT,
                                     XA2_BUF_SAMPLES_MIN, XA2_BUF_SAMPLES_MAX);
-    g_xa2_num_bufs = xa2_env_int("RECOMP_AUDIO_BUF_COUNT", XA2_NUM_BUFS_DEFAULT,
+    g_xa2_num_bufs = xa2_env_int(RENV_AUDIO_BUF_COUNT, XA2_NUM_BUFS_DEFAULT,
                                  XA2_NUM_BUFS_MIN, XA2_NUM_BUFS_MAX);
 
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -226,6 +227,7 @@ int xa2_get_buffer_count(void)
  * the voice running dry after audio has started is one underrun, counted
  * once per dry spell and reported at most once a second. A drain announced
  * by xa2_expect_drain (the frame thread pausing) is not one. */
+
 int xa2_queued_samples(void)
 {
     XAUDIO2_VOICE_STATE state;

@@ -32,6 +32,8 @@ if(WIN32)
         ../../src/d3d/d3d8_resources.c
         ../../src/d3d/d3d8_shaders.c
         ../../src/d3d/d3d8_combiners.c
+        ../../src/d3d/d3d8_combiners_parse.c
+        ../../src/d3d/d3d8_combiners_hlsl.c
     )
     target_include_directories(d3d8_a8 PRIVATE ../../src/d3d)
     target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid d3dcompiler)

@@ -14,6 +14,9 @@ set(KERNEL_SOURCES
     kernel_thread.c
     kernel_sync.c
     kernel_hal.c
+    kernel_prof.c
+    kernel_pacing.c
+    kernel_guest_cpu.c
     kernel_xbox.c
     kernel_ob.c
     kernel_io.c
@@ -26,7 +29,12 @@ set(KERNEL_SOURCES
     recomp_trace.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
-    nv2a_vsh_interp.c
+    nv2a_flip_hold.c
+    nv2a_backend_common.c
+    nv2a_tex_pack.c
+    nv2a_vsh_cpu.c
+    nv2a_vsh_cdump.c
+    nv2a_fb_ring.c
     nv2a_combiner.c
 )
 
@@ -50,6 +58,13 @@ else()
     find_package(OpenSSL REQUIRED)
     target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
 endif()
+
+# The watchdog finalises the APU's WAV dump before _exit (apu_wav_close_nowait).
+# Link-only, so xbox_apu follows xbox_kernel on the link line.
+target_link_libraries(xbox_kernel PRIVATE xbox_apu)
+# The trapped-MMIO dispatch (xbox_PosixMmioFault, xbox_VehMmioFault) routes
+# to the APU and to the USB OHCI model.
+target_link_libraries(xbox_kernel PRIVATE xbox_usb)
 
 if(MSVC)
     target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
