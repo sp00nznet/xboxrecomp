@@ -6718,6 +6718,20 @@ static void bridge_RtlCaptureStackBackTrace(void)
 #define KE_SHADOW_SIZE 4096
 typedef struct { uint32_t guest_va; HANDLE host_handle; uint32_t in_use; } KE_SHADOW_SLOT;
 static KE_SHADOW_SLOT g_ke_shadow[KE_SHADOW_SIZE];
+
+/* A direct-mapped memo over the shadow table.
+ *
+ * The table itself is a linear scan under a lock, which was fine when waits
+ * were rare. Black's D3D worker parks on its vblank event tens of millions
+ * of times a run, and at 4096 slots that scan was a quarter of the process.
+ * A read of the memo costs one compare; insert and remove keep it coherent
+ * per slot, so a hit is authoritative (the handle value is pointer-sized and
+ * aligned -- a plain read, and the use-after-remove race is the one the
+ * locked lookup always had). KEVENTs are 16-byte aligned, so the low bits
+ * of the VA spread the slots. */
+#define KE_MEMO_SIZE 1024u
+static struct { uint32_t va; HANDLE h; } g_ke_memo[KE_MEMO_SIZE];
+
 static CRITICAL_SECTION g_ke_shadow_cs;
 static int g_ke_shadow_init;
 
@@ -6751,6 +6765,11 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
                 CloseHandle(g_ke_shadow[i].host_handle);
             g_ke_shadow[i].host_handle = host;
             LeaveCriticalSection(&g_ke_shadow_cs);
+            {
+                uint32_t slot = (guest_va >> 4) & (KE_MEMO_SIZE - 1u);
+                g_ke_memo[slot].va = guest_va;
+                g_ke_memo[slot].h  = host;
+            }
             return;
         }
     }
@@ -6762,6 +6781,11 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
             g_ke_shadow[i].guest_va    = guest_va;
             g_ke_shadow[i].host_handle = host;
             LeaveCriticalSection(&g_ke_shadow_cs);
+            {
+                uint32_t slot = (guest_va >> 4) & (KE_MEMO_SIZE - 1u);
+                g_ke_memo[slot].va = guest_va;
+                g_ke_memo[slot].h  = host;
+            }
             return;
         }
     }
@@ -6783,6 +6807,12 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va)
     if (!guest_va)
         return NULL;
 
+    {
+        uint32_t slot = (guest_va >> 4) & (KE_MEMO_SIZE - 1u);
+        if (g_ke_memo[slot].va == guest_va)
+            return g_ke_memo[slot].h;
+    }
+
     ke_shadow_init();
 
     EnterCriticalSection(&g_ke_shadow_cs);
@@ -6793,6 +6823,18 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va)
         }
     }
     LeaveCriticalSection(&g_ke_shadow_cs);
+    /* A miss is memoised too: most of a title's waits are on objects that
+     * never live in this table -- Black's D3D parks on its vblank event
+     * 165,000 times a second and that VA resolves by another path, so a
+     * memo that only remembered hits sent every one of those waits through
+     * the full scan. insert() overwrites the slot when a VA later joins
+     * the table, and remove() clears it, so a negative entry cannot
+     * outlive the truth. */
+    {
+        uint32_t slot = (guest_va >> 4) & (KE_MEMO_SIZE - 1u);
+        g_ke_memo[slot].va = guest_va;
+        g_ke_memo[slot].h  = h;
+    }
     return h;
 }
 
@@ -6818,6 +6860,13 @@ static void ke_shadow_remove(uint32_t guest_va)
         }
     }
     LeaveCriticalSection(&g_ke_shadow_cs);
+    {
+        uint32_t slot = (guest_va >> 4) & (KE_MEMO_SIZE - 1u);
+        if (g_ke_memo[slot].va == guest_va) {
+            g_ke_memo[slot].va = 0;
+            g_ke_memo[slot].h  = NULL;
+        }
+    }
 }
 
 /* Events a title initialises itself (RECOMP_TITLE_KEVENTS=1, off by default).

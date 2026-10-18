@@ -1047,12 +1047,42 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 
-        /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
-         * the driver has not started yet is not a test of anything. */
+        /* The frame clock runs from the first tick, and not only once the
+         * driver reaches USBOPERATIONAL: on hardware the 12 MHz clock keeps
+         * the frame counter moving through everything short of a host
+         * controller reset, and a driver that counts frames across
+         * SET_ADDRESS while still in reset -- Black's XPP does exactly that
+         * -- deadlocks against a clock that waits for operational. */
+        {
+            uint32_t hcca = hc->reg[HcHCCA / 4];
+
+            hc->reg[HcFmNumber / 4] =
+                (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
+            /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
+             * controller zeroes, so a dword write is what hardware does. */
+            if (hcca)
+                wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
+            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
+        }
+
+        /* Operational is HCFS == 10b in bits 7:6 -- for a driver that writes
+         * HcControl. Black's XPP never does: it drives the schedule through
+         * CommandStatus alone, filling the control and bulk lists (CLF/BLF)
+         * with the functional state left at USBRESET and the periodic list
+         * enabled in HcControl for the pad's interrupt endpoint. A driver
+         * that has filled a list has started the controller in every sense
+         * the schedule cares about, so a fill -- or a list enable -- counts
+         * as operational here. Interrupts still tick for the rest: the
+         * driver enables StartOfFrame and counts its interrupts while it
+         * waits. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
-                break;
-            continue;
+            if (!(hc->reg[HcCommandStatus / 4] & 0x06u)  /* no CLF, no BLF */
+             && !(control & 0x24u)) {                    /* no periodic, no bulk */
+                if (++waited > 1500)          /* 30 s and it never started */
+                    break;
+                goto deliver;                 /* frames and SF still tick */
+            }
+            control |= 0x80u;                 /* operational for this pass */
         }
         if (!(enable & INTR_MIE))
             continue;
@@ -1098,31 +1128,10 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             }
         }
 
-        /* The frame clock.
-         *
-         * INTR_SF was defined and never raised, and HcFmNumber only moved when
-         * something read it. That is enough for a driver that polls, and not
-         * enough for one that waits: USB enumeration is full of delays counted
-         * in frames -- the recovery time after SET_ADDRESS is the first -- and
-         * the Xbox stack enables StartOfFrame precisely to count them. Without
-         * a frame ever starting, enumeration stops one transfer past
-         * SET_ADDRESS with the driver waiting for time to pass.
-         *
-         * Twenty frames a tick because a frame is 1 ms and this loop sleeps
-         * 20. The count is what drivers compare; the rate is what they feel,
-         * and both are closer to right this way than a counter that never
-         * moves. */
-        {
-            uint32_t hcca = hc->reg[HcHCCA / 4];
-
-            hc->reg[HcFmNumber / 4] =
-                (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
-            /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
-             * controller zeroes, so a dword write is what hardware does. */
-            if (hcca)
-                wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
-            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
-        }
+        /* The frame clock moved to the top of the pass: it runs from the
+         * first tick, before the operational gate -- see the note there.
+         * Black's XPP counts frames across SET_ADDRESS while still in
+         * reset, and a clock gated on USBOPERATIONAL deadlocked it. */
 
         /* Be the bus master. ControlListEnable in HcControl says the driver
          * wants the list walked; ControlListFilled says it has put something
@@ -1159,14 +1168,17 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         /* BulkListEnable, bit 5. Nothing on this device uses bulk, but the
          * list is walked the same way and a driver that puts a transfer
          * there is owed the same service. */
-        if ((control & 0x20u)
+        if ((control & 0x20u || hc->reg[HcCommandStatus / 4] & 0x04u)
          && guest_ok(hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK, 16)) {
             if (ohci_walk_eds(hc, hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK,
                               &pass_done))
                 hc->reg[HcCommandStatus / 4] &= ~0x04u;   /* BLF consumed */
         }
 
-        if ((control & 0x10u)
+        /* ControlListEnable in HcControl, or CommandStatus CLF: Black's XPP
+         * fills the control list and never enables it in HcControl, so the
+         * fill is what the walk answers to. */
+        if ((control & 0x10u || hc->reg[HcCommandStatus / 4] & 0x02u)
          && guest_ok(hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, 16)) {
             if (ohci_run_control_list(hc, &pass_done))
                 hc->reg[HcCommandStatus / 4] &= ~0x02u;   /* CLF consumed */
