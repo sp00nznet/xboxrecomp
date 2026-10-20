@@ -1325,6 +1325,33 @@ def test_resync_recomputes_register_jump_edges():
     assert continuation in subject.lifter.imm_code_refs
 
 
+def test_direct_jump_past_inline_data_is_resynced():
+    # jmp +4; then data that decodes as mov eax, imm32 and swallows the ret
+    # the jump lands on (DOA3 JP 0x72FB8 -> 0x72FE0 past a jump table).
+    raw = bytes.fromhex("e904000000b8112233c3")
+    target = BASE + 9
+    subject = translator(raw, [])
+
+    instructions, blocks = subject.decode_function(BASE, BASE + len(raw))
+
+    assert [block.start for block in blocks] == [BASE, target]
+    assert instructions[-1].address == target
+    assert instructions[-1].mnemonic == "ret"
+
+
+def test_resync_evicts_stale_decode_inside_real_instruction():
+    # jmp to BASE+7; data c1 e0 decodes as shl eax,imm8 and swallows the a1
+    # of mov eax,[imm32] at BASE+7, leaving stale sbb/lds decodes inside it
+    # (DOA3 JP 0x18A210, where the leftover lds ran after the real mov).
+    raw = bytes.fromhex("e902000000c1e0a11c8ec500c3")
+    subject = translator(raw, [])
+
+    instructions, _ = subject.decode_function(BASE, BASE + len(raw))
+
+    assert [(insn.address, insn.mnemonic) for insn in instructions] == [
+        (BASE, "jmp"), (BASE + 7, "mov"), (BASE + 12, "ret")]
+
+
 @pytest.mark.parametrize("table_index", [0, 1])
 @pytest.mark.parametrize("extra_code", [b"", bytes.fromhex("31c0")])
 def test_embedded_jump_table_is_data_coverage(table_index, extra_code):
