@@ -399,10 +399,32 @@ See [docs/technical/candidate-games.md](docs/technical/candidate-games.md) for a
 
 ## Projects Using This Toolkit
 
-- **[Burnout 3: Takedown](https://github.com/sp00nznet/burnout3)** — The origin title and most mature target. 22,097 functions lifted. An earlier build was playable to the main menu at 60fps, but leaned on hand-written menu and render scaffolding; that is being replaced with genuinely recompiled code, and the honest bring-up currently reaches engine/RenderWare init. Treat the old "playable" claim as retired until the recompiled path gets back there.
-- **[Xbox Dashboard](https://github.com/sp00nznet/xboxdashboard)** — The original Xbox system shell (build 3944); the toolkit on system software rather than a game. Nothing renders yet: the earlier "green orb at 60fps" was the project's own scaffolding drawing a disc, and has been retired along with the fake scene root and hand-rolled asset loader around it. What runs is the dashboard's own code — full init chain, its own D3D8 sizing and allocating its own 640x480 surfaces, its own NV2A pushbuffer, its own `default.xip` read. Its UI is driven by a **VRML97 + JavaScript scene engine** (text→bytecode compiler + stack-machine VM + node-class reflection registry), which is the piece still to come online.
-- **[Wreckless: The Yakuza Missions](https://github.com/sp00nznet/wreckless)** — Xbox launch title (2002). Custom engine, 3,407 functions, boots through CRT init into game main. Debugging early gameplay crash.
-- **[Blood Wake](https://github.com/sp00nznet/bloodwake)** — First-party Microsoft naval combat (2001). Stormfront Studios custom engine. 4,608 functions, 367K lines of C generated (99.1% success). Project scaffolded, working toward first build.
+Ports built on xboxrecomp, by sp00nznet and the community. The version column is
+the xboxrecomp release each project's toolkit copy is based on; "fork" means the
+project carries its own patches on top. Status comes from each project's own
+README (October 2026): **Playable** means you can play the game; **Booting** means
+the game's own code runs but does not reach gameplay yet; **Early** means the code
+is lifted to C but does not run yet. Follow the link for the full picture.
+
+Missing a project, or is a row out of date? Open a pull request that edits this table.
+
+| Game | Creator | Repository | xboxrecomp version | Platforms | Status |
+|------|---------|------------|--------------------|-----------|--------|
+| 007: Nightfire | [@limeylicious](https://github.com/limeylicious) | [limeylicious/Nightfire-Windows-Port](https://github.com/limeylicious/Nightfire-Windows-Port) | v0.8 | Windows | Playable |
+| Amped 2 | [@bertibertig](https://github.com/bertibertig) | [bertibertig/Amped2-Recomp](https://github.com/bertibertig/Amped2-Recomp) | v0.14.0 (fork) | Linux; Windows experimental | Playable |
+| BLiNX 2: Masters of Time & Space | [@apexJCL](https://github.com/apexJCL) | [apexJCL/blinx2-recomp](https://github.com/apexJCL/blinx2-recomp) | v0.14.0 (fork) | macOS, Linux / Steam Deck (Proton), Windows (untested) | Playable |
+| Blood Wake | [@sp00nznet](https://github.com/sp00nznet) | [sp00nznet/bloodwake](https://github.com/sp00nznet/bloodwake) | main | Windows | Early |
+| Burnout 3: Takedown | [@sp00nznet](https://github.com/sp00nznet) | [sp00nznet/burnout3](https://github.com/sp00nznet/burnout3) | v0.12.0 | Windows | Playable |
+| Dead or Alive Xtreme Beach Volleyball | [@NoRain211](https://github.com/NoRain211) | [NoRain211/doaxvb-re](https://github.com/NoRain211/doaxvb-re) | v0.5 (fork) | Windows, macOS, Linux | Playable |
+| Def Jam: Fight for NY | [@vyanhursky](https://github.com/vyanhursky) | [vyanhursky/DefJamFFNY-recomp](https://github.com/vyanhursky/DefJamFFNY-recomp) | v0.13.0 (fork) | Windows, macOS, Linux / Steam Deck | Playable |
+| Jet Set Radio Future | [@andeecollard](https://github.com/andeecollard) | [andeecollard/jsrf-recomp](https://github.com/andeecollard/jsrf-recomp) | v0.8.0 (fork) | macOS (Apple Silicon); Windows experimental | Playable |
+| Mortal Kombat: Deadly Alliance | [@FOTLabs](https://github.com/FOTLabs) | [FOTLabs/mkda-nx](https://github.com/FOTLabs/mkda-nx) | v0.12.0 (fork) | Nintendo Switch | Playable |
+| SSX 3 | [@koenhendriks](https://github.com/koenhendriks) | [koenhendriks/SSX3-recomp](https://github.com/koenhendriks/SSX3-recomp) | v0.13.1 (fork) | Windows, Linux | Playable |
+| SSX 3 | [@bertibertig](https://github.com/bertibertig) | [bertibertig/SSX3-Recomp](https://github.com/bertibertig/SSX3-Recomp) | v0.14.0 (fork) | Linux; Windows experimental | Playable |
+| SSX Tricky | [@MatiasRiveraC](https://github.com/MatiasRiveraC) | [MatiasRiveraC/SSX-Tricky-PC](https://github.com/MatiasRiveraC/SSX-Tricky-PC) | v0.5 (fork) | Windows | Playable |
+| StarCraft: Ghost | [@aknavj](https://github.com/aknavj) | [aknavj/scghost-recomp](https://github.com/aknavj/scghost-recomp) | v0.12.0 (fork) | Windows | Playable |
+| Wreckless: The Yakuza Missions | [@sp00nznet](https://github.com/sp00nznet) | [sp00nznet/wreckless](https://github.com/sp00nznet/wreckless) | main | Windows | Booting |
+| Xbox Dashboard (build 3944) | [@sp00nznet](https://github.com/sp00nznet) | [sp00nznet/xboxdashboard](https://github.com/sp00nznet/xboxdashboard) | main | Windows | Booting |
 
 ## How You Can Help
 
