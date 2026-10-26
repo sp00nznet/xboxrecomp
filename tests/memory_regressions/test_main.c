@@ -9,7 +9,10 @@
  * One process per mode, because the switches are read once:
  *
  *   default       No switch set. Pins what every title gets today, so a change
- *                 that alters the default shows up here.
+ *                 that alters the default shows up here. A freed block with
+ *                 64 KB or more to spare is split on reuse (check 1).
+ *   heap-split-off RECOMP_HEAP_SPLIT=0: reuse hands a freed block over whole
+ *                 again, as before the split.
  *   heap-reclaim  RECOMP_HEAP_RECLAIM=1. Each check fails without the fix:
  *
  *   1. A small request after a large free takes only what it needs. Reuse used
@@ -187,13 +190,14 @@ int main(int argc, char **argv)
     int ext128 = !strcmp(mode, "ext-vma-128");
     int ext = ext128 || !strcmp(mode, "ext-vma");
     int avoid = !strcmp(mode, "contig-avoid-image");
+    int split_off = !strcmp(mode, "heap-split-off");
     size_t xbe_len = 0;
     unsigned char *xbe;
     char d[160];
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && !avoid && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !avoid && !split_off && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -203,6 +207,8 @@ int main(int argc, char **argv)
         set_env("RECOMP_EXT_VMA", "1");
     if (avoid)
         set_env("RECOMP_CONTIG_AVOID_IMAGE", "1");
+    if (split_off)
+        set_env("RECOMP_HEAP_SPLIT", "0");
     if (ext128)
         xbox_SetTotalRam(XBOX_DEVKIT_RAM);
 
@@ -257,7 +263,9 @@ int main(int argc, char **argv)
         s1 = xbox_HeapAlloc(16, 16);
         s2 = xbox_HeapAlloc(16, 16);
 
-        if (reclaim) {
+        if (reclaim || !split_off) {
+            /* RECOMP_HEAP_RECLAIM carves every reuse; by default a freed block
+             * with 64 KB or more to spare is split too. */
             snprintf(d, sizeof d, "block is %u bytes, expected 16", xbox_HeapBlockSize(s1));
             check(xbox_HeapBlockSize(s1) == 16, "16-byte request takes 16 bytes of a freed 2 MB", d);
             snprintf(d, sizeof d, "second request at 0x%08X, outside 0x%08X", s2, a);

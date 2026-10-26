@@ -3858,33 +3858,41 @@ static int heap_insert_free(int at, uint32_t addr, uint32_t size)
     return 1;
 }
 
-/* Take exactly `size` bytes, aligned, out of the first free block that has room
- * for them; what is left in front of and behind the piece stays free. Returns 0
- * when no free block fits. Caller holds g_heap_lock. */
+/* Take exactly `size` bytes, aligned, out of free block `i`; what is left in
+ * front of and behind the piece stays free. Returns 0 when the block has no
+ * room for them. Caller holds g_heap_lock. */
+static uint32_t heap_carve_block(int i, uint32_t size, uint32_t alignment)
+{
+    uint32_t a, start, end, front, back;
+    if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size)
+        return 0;
+    a = g_heap_blocks[i].addr;
+    start = (a + alignment - 1) & ~(alignment - 1);
+    end = a + g_heap_blocks[i].size;
+    if (start + size > end || start + size < start)
+        return 0;   /* not enough room once aligned */
+    front = start - a;
+    back = end - (start + size);
+    if (front && !heap_insert_free(i, a, front))
+        return 0;   /* table full: leave this block alone */
+    if (front)
+        i++;        /* the taken piece moved up one slot */
+    g_heap_blocks[i].addr = start;
+    g_heap_blocks[i].size = size;
+    g_heap_blocks[i].free = 0; g_heap_blocks[i].named = 0;
+    if (back && !heap_insert_free(i + 1, start + size, back))
+        g_heap_blocks[i].size += back;   /* table full: keep it attached */
+    memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
+    return start;
+}
+
+/* The same, out of the first free block that has room. */
 static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
 {
     for (int i = 0; i < g_heap_block_count; i++) {
-        uint32_t a, start, end, front, back;
-        if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size)
-            continue;
-        a = g_heap_blocks[i].addr;
-        start = (a + alignment - 1) & ~(alignment - 1);
-        end = a + g_heap_blocks[i].size;
-        if (start + size > end || start + size < start)
-            continue;   /* not enough room once aligned */
-        front = start - a;
-        back = end - (start + size);
-        if (front && !heap_insert_free(i, a, front))
-            continue;   /* table full: leave this block alone */
-        if (front)
-            i++;        /* the taken piece moved up one slot */
-        g_heap_blocks[i].addr = start;
-        g_heap_blocks[i].size = size;
-        g_heap_blocks[i].free = 0; g_heap_blocks[i].named = 0;
-        if (back && !heap_insert_free(i + 1, start + size, back))
-            g_heap_blocks[i].size += back;   /* table full: keep it attached */
-        memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
-        return start;
+        uint32_t r = heap_carve_block(i, size, alignment);
+        if (r)
+            return r;
     }
     return 0;
 }
@@ -4541,6 +4549,24 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
             }
             if (g_heap_blocks[i].addr & (alignment - 1)) {
                 continue;   /* wrong alignment for this request */
+            }
+            /* A freed block far bigger than the request is split, not handed
+             * out whole. Kung Fu Chaos frees a level's 6.8 MB buffers when it
+             * leaves a match load with B; the next small requests each took one
+             * of them whole (15 MB of slack in reused blocks), and reloading
+             * the menu then found no room for its own 6.8 MB buffer: malloc
+             * returned 0, the asset stayed empty and the game crashed. Small
+             * slack keeps the old behaviour, so most reuse is unchanged.
+             * RECOMP_HEAP_SPLIT=0 hands blocks out whole again. */
+            static int split = -1;
+            if (split < 0) {
+                const char *e = getenv("RECOMP_HEAP_SPLIT");
+                split = !(e && e[0] == '0');
+            }
+            if (split && g_heap_blocks[i].size - size >= 0x10000u) {
+                result = heap_carve_block(i, (size + 15) & ~15u, alignment);
+                if (result)
+                    return result;
             }
             g_heap_blocks[i].free = 0; g_heap_blocks[i].named = 0;
             result = g_heap_blocks[i].addr;
