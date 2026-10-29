@@ -774,10 +774,18 @@ static void surface_apply_clip(void)
 /* ---- Render back end (nv2a_backend.h) ------------------------------- */
 
 static const Nv2aBackend *s_backend;
+static void (*s_backend_present_sync)(void);
+
+void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
+                                             void (*present_sync)(void))
+{
+    s_backend = backend;
+    s_backend_present_sync = backend ? present_sync : NULL;
+}
 
 void nv2a_backend_register(const Nv2aBackend *backend)
 {
-    s_backend = backend;
+    nv2a_backend_register_with_present_sync(backend, NULL);
 }
 
 static int backend_draws(void)
@@ -4082,6 +4090,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
+        if (s_backend_present_sync)
+            s_backend_present_sync();
         /* Hand the window a copy of the frame just finished.
          *
          * The buffer the title has finished is the one the last batch drew

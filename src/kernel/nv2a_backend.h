@@ -102,6 +102,16 @@ typedef struct {
  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */
 void nv2a_backend_register(const Nv2aBackend *backend);
 
+/* Register a back end that must synchronize a surface into guest memory
+ * before the flip's window snapshot or framebuffer dump. present_sync runs
+ * synchronously on the executor thread and must complete pending GPU work and
+ * readback before returning; it must not present a window. flip still runs
+ * after the snapshot and dump. A NULL present_sync disables synchronization;
+ * a NULL backend removes both registrations. A later nv2a_backend_register
+ * call replaces both registrations. */
+void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
+                                             void (*present_sync)(void));
+
 /* Decode a whole texture to 0xAARRGGBB, row-major, width*height entries.
  * Handles every format the executor can sample (swizzled, linear, DXT).
  * Returns 0 if the format is not supported. */
