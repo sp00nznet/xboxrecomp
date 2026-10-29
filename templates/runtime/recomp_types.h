@@ -1524,8 +1524,8 @@ RECOMP_MMX_BINOP(MMX_PCMPGTD, 2, d, (int32_t)(a.d[i] > b.d[i] ? -1 : 0))
 /* pmaddwd: multiply signed words, add adjacent pairs into dwords. */
 static inline RecompMmx MMX_PMADDWD(RecompMmx a, RecompMmx b) {
     RecompMmx r;
-    r.d[0] = (int32_t)a.w[0] * b.w[0] + (int32_t)a.w[1] * b.w[1];
-    r.d[1] = (int32_t)a.w[2] * b.w[2] + (int32_t)a.w[3] * b.w[3];
+    r.ud[0] = (uint32_t)((int64_t)a.w[0] * b.w[0] + (int64_t)a.w[1] * b.w[1]);
+    r.ud[1] = (uint32_t)((int64_t)a.w[2] * b.w[2] + (int64_t)a.w[3] * b.w[3]);
     return r;
 }
 

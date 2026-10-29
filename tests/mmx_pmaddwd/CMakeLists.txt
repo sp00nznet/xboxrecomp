@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(mmx_pmaddwd_regression C)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+add_executable(mmx_pmaddwd_test test_main.c)
+enable_testing()
+add_test(NAME mmx_pmaddwd_test COMMAND mmx_pmaddwd_test)
