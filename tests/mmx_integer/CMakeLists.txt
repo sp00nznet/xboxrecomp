@@ -3,7 +3,7 @@ project(mmx_integer_test C)
 set(CMAKE_C_STANDARD 11)
 add_executable(mmx_integer_test test_main.c)
 # Shuffle and extract/insert need SSE. Preserve the existing flags for x86
-# targets, but omit them for other targets and mixed-architecture builds.
+# targets, but omit them when any target architecture is non-x86.
 if(NOT MSVC)
     include(CheckCSourceCompiles)
     check_c_source_compiles("
