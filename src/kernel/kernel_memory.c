@@ -169,7 +169,8 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
     /*
      * The contiguous arena is the virtual window onto physical RAM, so an
      * address inside it is its physical offset plus XBOX_CONTIG_BASE. Anything
-     * outside passes through unchanged.
+     * outside is the identity, except a heap page below 64 MB, which is named
+     * by its alias in the first RAM mirror (xbox_PhysRamName).
      *
      * The only implementation. bridge_MmGetPhysicalAddress calls this rather
      * than repeating the arithmetic: the two used to disagree, with the bridge
@@ -183,10 +184,10 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
     if (va >= XBOX_CONTIG_BASE &&
             (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
         return (ULONG_PTR)(va - XBOX_CONTIG_BASE);
-    /* The same number can be a window page; record that the title meant RAM
-     * (xbox_PhysNoteRamName says why the APU needs to know). */
-    xbox_PhysNoteRamName(va);
-    return (ULONG_PTR)va;
+    /* RAM gets a number no window page has, where it can (xbox_PhysRamName:
+     * a heap page's alias in the first mirror; otherwise the identity, with
+     * the RAM name recorded for the APU). */
+    return (ULONG_PTR)xbox_PhysRamName(va);
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

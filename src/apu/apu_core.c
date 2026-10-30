@@ -92,6 +92,13 @@ static inline uint32_t apu_mapped_ram(void)
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    uint32_t alias = xbox_PhysRamAlias();
+    /* A heap page's name: its alias in the first RAM mirror
+     * (xbox_PhysRamName), so it is RAM whatever the window holds at the same
+     * offset. Before the 64 MB case, which would read a 128 MB map's alias as
+     * plain RAM. */
+    if (alias && a >= alias && a - alias < (64u << 20))
+        return g_apu_ram_ptr + (a - alias);
     /* RAM above the window's 64 MB. On a 128 MB layout (a devkit) most of
      * the heap sits above 0x04000000, and so do the sound buffers a title
      * malloc()s and hands to DirectSound as plain pointers, which
@@ -133,7 +140,7 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
 
 /* Which of the cases above resolved an address, for the RECOMP_APU_TRACE
  * per-voice line and the doorbell line: "named" (a heap page
- * MmGetPhysicalAddress named), "win" (a page the contiguous allocator handed
+ * MmGetPhysicalAddress named: its mirror alias, or one the record holds), "win" (a page the contiguous allocator handed
  * out), "img" (inside the XBE image), "hiwin" (below the arena's high-water
  * mark but not a live page), "ram" (plain RAM: below 64 MB, or above it
  * where the host mapped RAM) or "wrap" (above the mapping, folded into the
@@ -142,6 +149,9 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
 const char *mcpx_apu_phys_class(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    uint32_t alias = xbox_PhysRamAlias();
+    if (alias && a >= alias && a - alias < (64u << 20))
+        return "named";
     if (a >= (64u << 20))
         return a < apu_mapped_ram() ? "ram" : "wrap";
     if (xbox_PhysRamNamedAt(a))
