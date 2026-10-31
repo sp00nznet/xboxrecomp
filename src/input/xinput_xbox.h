@@ -109,6 +109,13 @@ BOOL xbox_InputIsConnected(DWORD dwPort);
  */
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
 
+#if !defined(_WIN32)
+/* The POSIX SDL presenter owns event pumping while its main-thread window is
+ * active, and keeps SDL alive at shutdown while controller handles are open. */
+void xbox_InputSetMainPump(int on);
+int xbox_InputAnyOpen(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
