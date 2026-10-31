@@ -766,6 +766,8 @@ BOOLEAN __stdcall xbox_HalIsResetOrShutdownPending(void);
 KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
+KIRQL   xbox_EnterDispatchLevel(void);
+void    xbox_LeaveDispatchLevel(KIRQL old);
 
 VOID    __stdcall xbox_KeStallExecutionProcessor(ULONG MicroSeconds);
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void);

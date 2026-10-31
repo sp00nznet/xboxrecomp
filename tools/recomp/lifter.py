@@ -3376,15 +3376,17 @@ def lift_basic_block(lifter, bb, flag_state=None):
         elif curr.mnemonic.startswith("set"):
             pass  # SETcc doesn't set flags
         elif curr.mnemonic.startswith("rep"):
-            # rep movsb/movsd = data copy, preserves flags
-            # repe cmpsb/repne scasb = comparison, sets flags
+            # rep movs/stos = data copy, preserves flags
+            # repe/repne cmps/scas (byte, word and dword) = comparison, sets
+            # flags. Only the byte forms used to count, so after a
+            # `repe cmpsw` the jcc took its flags from whatever came before --
+            # usually an `xor reg, reg`, which made every comparison read as
+            # "equal". XNet's "is this address my own?" check is one of them:
+            # every System Link join resolved the host to loopback.
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
-            if "cmpsb" in raw_m or "scasb" in raw_m:
-                last_flag_setter = raw_m
-                last_flag_ops = list(curr.operands)
-            elif "cmpsb" in rest or "scasb" in rest:
-                last_flag_setter = raw_m
+            if any(k in raw_m or k in rest for k in ("cmps", "scas")):
+                last_flag_setter = raw_m if ("cmps" in raw_m or "scas" in raw_m)                     else (raw_m + " " + rest).strip()
                 last_flag_ops = list(curr.operands)
             else:
                 pass  # rep movs/stos = data movement, flags preserved

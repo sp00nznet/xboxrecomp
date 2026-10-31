@@ -32,6 +32,56 @@
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
 /*
+ * DISPATCH_LEVEL excludes DPCs.
+ *
+ * The Xbox has one CPU, so a thread that raises to DISPATCH_LEVEL knows no DPC
+ * can run until it lowers again, and drivers rely on exactly that instead of
+ * locks. XNet's packet pools and connection tables are guarded this way: its
+ * API raises, edits, lowers; its receive DPC edits the same structures. Here
+ * DPCs run on the kernel timer thread, alongside the game thread, so the
+ * guarantee has to be made real: one recursive lock, held by whichever thread
+ * is at DISPATCH_LEVEL or above, and taken around every DPC. Without it a
+ * System Link joiner's receive DPC tore through XNet state while the game
+ * thread was inside XNet, and the joiner froze partway into loading the map.
+ */
+static CRITICAL_SECTION g_dispatch_lock;
+static INIT_ONCE g_dispatch_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK dispatch_lock_init(PINIT_ONCE once, PVOID p, PVOID *c)
+{
+    (void)once; (void)p; (void)c;
+    InitializeCriticalSection(&g_dispatch_lock);
+    return TRUE;
+}
+
+static void irql_set(KIRQL new_irql)
+{
+    KIRQL old = g_current_irql;
+    InitOnceExecuteOnce(&g_dispatch_once, dispatch_lock_init, NULL, NULL);
+    if (old < DISPATCH_LEVEL && new_irql >= DISPATCH_LEVEL)
+        EnterCriticalSection(&g_dispatch_lock);
+    g_current_irql = new_irql;
+    if (old >= DISPATCH_LEVEL && new_irql < DISPATCH_LEVEL)
+        LeaveCriticalSection(&g_dispatch_lock);
+}
+
+/* Run a DPC (or an ISR) as the hardware would: at DISPATCH_LEVEL, never
+ * alongside a thread that has raised. Returns the level to restore. */
+KIRQL xbox_EnterDispatchLevel(void)
+{
+    KIRQL old = g_current_irql;
+    if (old < DISPATCH_LEVEL)
+        irql_set(DISPATCH_LEVEL);
+    return old;
+}
+
+void xbox_LeaveDispatchLevel(KIRQL old)
+{
+    if (old < DISPATCH_LEVEL)
+        irql_set(old);
+}
+
+/*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
  */
@@ -45,7 +95,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
             old, NewIrql);
     }
 
-    g_current_irql = NewIrql;
+    irql_set(NewIrql);
     return old;
 }
 
@@ -61,7 +111,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
             g_current_irql, NewIrql);
     }
 
-    g_current_irql = NewIrql;
+    irql_set(NewIrql);
 }
 
 /*
@@ -70,7 +120,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
-    g_current_irql = DISPATCH_LEVEL;
+    irql_set(DISPATCH_LEVEL);
     return old;
 }
 

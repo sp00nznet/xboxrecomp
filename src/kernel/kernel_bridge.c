@@ -1807,7 +1807,11 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    {
+        KIRQL old = xbox_EnterDispatchLevel();   /* see kernel_hal.c */
+        fn();
+        xbox_LeaveDispatchLevel(old);
+    }
     return 1;
 }
 

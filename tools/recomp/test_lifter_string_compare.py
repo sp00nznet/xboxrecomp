@@ -80,3 +80,31 @@ class StringCompareLifterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WideCompareAfterXorTest(unittest.TestCase):
+    def test_word_compare_overrides_an_earlier_xor(self):
+        # XNet's XNetXnAddrToInAddr: `xor edx, edx; repe cmpsw; jne`. The
+        # jne has to read the compare, not the zero the xor left in edx --
+        # reading edx made every address compare equal to this machine's.
+        clear = Instruction(0, 2, "xor", "edx, edx", "33d2")
+        clear.operands = [Operand(type="reg", reg="edx"),
+                          Operand(type="reg", reg="edx")]
+        compare = Instruction(
+            2, 3, "repe cmpsw", "word ptr [esi], word ptr es:[edi]",
+            "f366a7")
+        compare.operands = [
+            Operand(type="mem", mem_base="esi", mem_size=2),
+            Operand(type="mem", mem_base="edi", mem_size=2),
+        ]
+        jump = Instruction(5, 2, "jne", "0x10", "7509")
+        jump.jump_target = 0x10
+        lifter = Lifter()
+        lifter.func_start = 0
+        lifter.func_end = 0x20
+
+        lifted, _ = lift_basic_block(
+            lifter, BasicBlock(start=0, instructions=[clear, compare, jump]))
+        jcc = "\n".join(lifted).splitlines()[-1]
+        self.assertIn("_flags", jcc)
+        self.assertNotIn("edx", jcc)

@@ -182,8 +182,17 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
+        /* A read-only open always lets other readers in. Titles open disc
+         * files with no sharing at all -- harmless on a console, whose disc
+         * nobody else can open -- but here it locks the file against every
+         * other process: a second copy of the game (System Link testing on one
+         * PC) failed to open its level bundle (Bins\dm1fil.bin) with a
+         * sharing violation, then read from the missing stream and hung. */
+        DWORD share = xbox_share_to_win32(ShareAccess);
+        if (!(DesiredAccess & 0x50010116u))   /* GENERIC_WRITE|GENERIC_ALL|DELETE|write/append data|write attributes */
+            share |= FILE_SHARE_READ;
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
-            xbox_share_to_win32(ShareAccess), NULL,
+            share, NULL,
             xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
     }
 
