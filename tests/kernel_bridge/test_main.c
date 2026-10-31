@@ -72,8 +72,21 @@ int main(void)
     /* Two imports, in the form an XBE stores them: 0x80000000 | ordinal. */
     *(uint32_t *)(mem + THUNK_VA) = 0x80000000u | 173u;
     *(uint32_t *)(mem + THUNK_VA + 4) = 0x80000000u | 197u;
+    *(uint32_t *)(mem + THUNK_VA - 4) = 0x80000000u | 173u;
+    *(uint32_t *)(mem + THUNK_VA - 8) = 0xF2345678u;
+    *(uint32_t *)(mem + THUNK_VA - 12) = 0x80000000u;
+    *(uint32_t *)(mem + THUNK_VA - 16) = 0x80000000u | 379u;
     xbox_kernel_set_thunk_address(THUNK_VA, 2);
     xbox_kernel_bridge_init();
+
+    check(recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA - 4)) != NULL,
+          "a valid lookbehind ordinal still resolves", NULL);
+    check(*(uint32_t *)(mem + THUNK_VA - 8) == 0xF2345678u,
+          "lookbehind preserves unrelated high-bit data", NULL);
+    check(*(uint32_t *)(mem + THUNK_VA - 12) == 0x80000000u,
+          "lookbehind preserves ordinal zero", NULL);
+    check(*(uint32_t *)(mem + THUNK_VA - 16) == (0x80000000u | 379u),
+          "lookbehind preserves an out-of-range ordinal", NULL);
 
     /* bridge_init rewrites the entry in place to a synthetic VA. */
     recomp_func_t fn = recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA));
