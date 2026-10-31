@@ -59,10 +59,11 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  * finished frame once per flip means the window never reads memory the
  * rasteriser is writing, so what it shows cannot be half of anything.
  *
- * Two buffers and an index, swapped after the copy completes, so the window
- * thread is never reading the one being filled. */
+ * The lock also protects the window's copy: two flips can otherwise reuse
+ * the buffer the window is still reading. */
 static uint32_t     *s_present[2];
-static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+static LONG          s_present_idx = -1;   /* -1 until the first flip */
+static SRWLOCK       s_present_lock = SRWLOCK_INIT;
 
 /* The last PVIDEO frame shown. A frame stays on screen until the next one or
  * STOP, but once its bank is consumed the title may reuse the memory, so the
@@ -162,12 +163,16 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         return;
     if (getenv("RECOMP_FB_VA"))
         return;                       /* pinned: leave the old path alone */
+    AcquireSRWLockExclusive(&s_present_lock);
     next = (s_present_idx == 0) ? 1 : 0;
     if (!s_present[next]) {
         s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
                                              4);
-        if (!s_present[next])
+        if (!s_present[next]) {
+            ReleaseSRWLockExclusive(&s_present_lock);
+            fprintf(stderr, "  [FBWIN] cannot allocate a presentation frame\n");
             return;
+        }
     }
     bpp = pitch / s_fb_width;
     src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
@@ -196,8 +201,22 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
             memset(dst, 0, (size_t)s_fb_width * 4);
         }
     }
-    /* Published only once it is whole. */
-    InterlockedExchange(&s_present_idx, next);
+    s_present_idx = next;
+    ReleaseSRWLockExclusive(&s_present_lock);
+}
+
+static int fb_copy_presented_frame(uint32_t *dst)
+{
+    int copied = 0;
+
+    AcquireSRWLockShared(&s_present_lock);
+    if (s_present_idx >= 0) {
+        memcpy(dst, s_present[s_present_idx],
+               (size_t)s_fb_width * s_fb_height * 4);
+        copied = 1;
+    }
+    ReleaseSRWLockShared(&s_present_lock);
+    return copied;
 }
 
 /* Title bar, the way ps3recomp's window shows it. Written by the flip,
@@ -553,14 +572,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_present_idx >= 0 && s_rgb) {
+        if (s_rgb && fb_copy_presented_frame(s_rgb)) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
-            LONG idx = s_present_idx;
-            if (s_present[idx])
-                memcpy(s_rgb, s_present[idx],
-                       (size_t)s_fb_width * s_fb_height * 4);
             if (!fb_pinned)
                 fb_overlay();
             paced = fb_show(hwnd, hdc, &bi);
