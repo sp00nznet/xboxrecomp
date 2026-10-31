@@ -34,8 +34,18 @@ add_subdirectory(src/platform)
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
 
-# Graphics: D3D8 → D3D11 compatibility layer
-add_subdirectory(src/d3d)
+# Graphics: bundled D3D8 compatibility layer. Embedding projects that use the
+# pushbuffer executor directly may omit it, or define their own xbox_d3d8
+# target before adding xboxrecomp.
+option(XBOXRECOMP_BUILD_D3D8 "Build the bundled xbox_d3d8 compatibility layer" ON)
+if(NOT TARGET xbox_d3d8)
+    if(XBOXRECOMP_BUILD_D3D8)
+        add_subdirectory(src/d3d)
+    elseif(WIN32)
+        message(FATAL_ERROR
+            "XBOXRECOMP_BUILD_D3D8=OFF on Windows requires a replacement xbox_d3d8 target")
+    endif()
+endif()
 
 # Audio: DirectSound → software mixer compatibility
 add_subdirectory(src/audio)
@@ -59,9 +69,11 @@ add_subdirectory(src/video)
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
-set(XBOXRECOMP_LIBS
-    xbox_kernel
-    xbox_d3d8
+set(XBOXRECOMP_LIBS xbox_kernel)
+if(TARGET xbox_d3d8)
+    list(APPEND XBOXRECOMP_LIBS xbox_d3d8)
+endif()
+list(APPEND XBOXRECOMP_LIBS
     xbox_dsound
     xbox_input
     xbox_usb
@@ -79,4 +91,3 @@ if(UNIX AND NOT APPLE)
 else()
     target_link_libraries(xboxrecomp INTERFACE ${XBOXRECOMP_LIBS})
 endif()
-
