@@ -56,6 +56,9 @@ extern "C" {
  * model; a game that defined it as its own key keeps that row under
  * #ifndef RECOMP_ENV_HAVE_RUMBLE_ROW, as above. */
 #define RECOMP_ENV_HAVE_RUMBLE_ROW 1
+/* PAD_CLOCK and PAD_QUIT: a game that gives them defaults tests
+ * this first, since its public pin may predate them. */
+#define RECOMP_ENV_HAVE_PAD_CLOCK_ROW 1
 
 #ifdef RECOMP_ENV_HAVE_GAME_KEYS
 #include "recomp_env_game.h"
@@ -311,10 +314,12 @@ extern "C" {
     X(WATCHDOG_SECS,     DEBUG, "watchdog",        "RECOMP_WATCHDOG_SECS",     "=s: dump and exit after s seconds") \
     /* from upstream (merge of origin/main 1409a7d), appended */ \
     X(USB_PADS,          CONFIG, "RECOMP_USB_PADS",          NULL, "emulated USB pads plugged in, 1..4 (default 1)") \
-    X(PAD_SCRIPT,        DEBUG, "pad_script",      "RECOMP_PAD_SCRIPT",        "=ms:btn[+btn][:hold],... f<flip>:btn[:flips], f<flip>:@open:<name>[:btn/period] anchors, or =@file: timed pad presses") \
-    X(PAD_LIVE,          DEBUG, "pad_live",        "RECOMP_PAD_LIVE",          "=file: press each line appended to it (btn[+btn][:hold])") \
-    X(PAD_RECORD,        DEBUG, "pad_record",      "RECOMP_PAD_RECORD",        "=file: write the pads' presses as a flip-timed pad_script") \
-    X(PAD_ANCHOR,        DEBUG, "pad_anchor",      NULL,                       "=text[|text...]: pad_record writes an anchor (f<flip>:@open:<name>) for each open whose path holds one") \
+    X(PAD_SCRIPT,        DEBUG, "pad_script",      "RECOMP_PAD_SCRIPT",        "=ms:btn[+btn][:hold],... f<flip>:btn[:flips] or g<poll>:btn[:polls], <clock>:@open:<name>[:btn/period] anchors, <clock>:@end, or =@file: timed pad presses") \
+    X(PAD_LIVE,          DEBUG, "pad_live",        "RECOMP_PAD_LIVE",          "=file: press each line appended to it (btn[+btn][:hold], or f<flip>:/g<poll>: on the script's clock)") \
+    X(PAD_RECORD,        DEBUG, "pad_record",      "RECOMP_PAD_RECORD",        "=file: write the pads' presses as a pad_script timed by flip or poll (pad_clock), ending in @end") \
+    X(PAD_ANCHOR,        DEBUG, "pad_anchor",      NULL,                       "=text[|text...]: pad_record writes an anchor (f<flip>: or g<poll>:@open:<name>) for each open whose path holds one") \
+    X(PAD_CLOCK,         DEBUG, "pad_clock",       NULL,                       "=poll: pad_record times its steps by the title's pad polls (g<poll>), with exact stick and analog values; =flip (default) by the walker's flip") \
+    X(PAD_QUIT,          DEBUG, "pad_quit",        NULL,                       "once the pad script's last step (its @end, if it has one) has ended, close the window as its close button does (no window: exit hooks, then ExitProcess(0), on a thread of its own)") \
     X(KBM_SCRIPT,        DEBUG, "kbm_script",      NULL,                       "=file: inject key and mouse events on the pad poll (src/input/kbm_script.c); refused with RECOMP_INPUT_SCRIPT") \
     X(PB_REPORT_MS,      TRACE, "pb_report_ms",    "RECOMP_PB_REPORT_MS",      "=ms: [PB] report / fb_dump interval (10000, min 100)") \
     X(DPC_PROF,          TRACE, "dpc",             NULL,                       "[DPCPROF] time per host-run DPC/ISR routine and its waits, under the 600-vblank line") \

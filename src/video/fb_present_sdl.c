@@ -69,6 +69,7 @@
 
 #include <SDL3/SDL.h>
 #include "recomp_env.h"
+#include "recomp_exit_hook.h"
 #include "platform/sdl_env.h"
 #include <pthread.h>
 #include <stdint.h>
@@ -778,6 +779,17 @@ static void mac_fullscreen_level(SDL_Window *win, int full, int spaces_off)
 }
 #endif
 
+/* SDL_PushEvent may be called from any thread. */
+static void post_quit(const char *why)
+{
+    SDL_Event q;
+
+    (void)why;
+    memset(&q, 0, sizeof q);
+    q.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&q);
+}
+
 int xbox_HostWindowMain(int (*guest_main)(void))
 {
     SDL_Window *win;
@@ -939,6 +951,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     t_start = t_stat = now_ns(CLOCK_MONOTONIC);
     cpu_start = cpu_stat = now_ns(CLOCK_THREAD_CPUTIME_ID);
 
+    /* A quit asked for on another thread (RECOMP_DEBUG=pad_quit) comes as
+     * the close button's SDL_EVENT_QUIT, so the window ends the run here. */
+    recomp_quit_set(post_quit);
     while (!quit && !guest_done) {
         SDL_Event ev;
         uint64_t seq;
@@ -1197,6 +1212,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     }
 
     /* No present may be mid-publish (it pushes an SDL event) once SDL goes. */
+    recomp_quit_set(NULL);
     __atomic_store_n(&s_running, 0, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&s_in_present, __ATOMIC_SEQ_CST))
         sched_yield();

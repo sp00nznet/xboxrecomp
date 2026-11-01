@@ -75,8 +75,26 @@ static int button_bits(const char *name, size_t n, PadStep *st)
         }
     }
     for (i = 0; i < COUNT(s_buttons); i++) {
-        if (strlen(s_buttons[i].name) == n && same_word(s_buttons[i].name, name, n)) {
+        size_t k = strlen(s_buttons[i].name);
+        if (k == n && same_word(s_buttons[i].name, name, n)) {
             st->digital |= s_buttons[i].dig;
+            st->analog |= s_buttons[i].ana;
+            return 1;
+        }
+        /* "lt=97": an analog button at that depth. */
+        if (s_buttons[i].ana && n > k + 1 && n - k - 1 <= 3 && name[k] == '='
+            && same_word(s_buttons[i].name, name, k)) {
+            char num[4], *end;
+            unsigned long v;
+            int j;
+            memcpy(num, name + k + 1, n - k - 1);
+            num[n - k - 1] = 0;
+            v = strtoul(num, &end, 10);
+            if (*end || !isdigit((unsigned char)num[0]) || v < 1 || v > 255)
+                return 0;
+            for (j = 0; j < 8; j++)
+                if (s_buttons[i].ana == 1u << j)
+                    st->aval[j] = (uint8_t)(v == 255 ? 0 : v);
             st->analog |= s_buttons[i].ana;
             return 1;
         }
@@ -137,7 +155,7 @@ static const char *parse_anchor(const char *b, const PadStep *st, PadAnchors *a,
     }
     if (!st->by_flip) {
         /* An anchor ties flips to an event; a millisecond step has none. */
-        fprintf(stderr, "  PAD: anchor without f<flip>: at \"%.20s\"\n", b);
+        fprintf(stderr, "  PAD: anchor without f<flip> or g<poll>: at \"%.20s\"\n", b);
         return NULL;
     }
     memcpy(an.text, b, n);
@@ -178,7 +196,7 @@ static const char *parse_anchor(const char *b, const PadStep *st, PadAnchors *a,
                     PAD_RETRY_MAX_FLIPS, b);
             return NULL;
         }
-        an.retry.by_flip = 1;
+        an.retry.by_flip = st->by_flip;
         an.retry.hold = an.period / 2;
         b = end;
     }
@@ -239,13 +257,29 @@ int pad_script_parse_anchored(const char *text, PadStep *steps, int len,
         if (*p == 'f' || *p == 'F') {
             st.by_flip = 1;
             p++;
+        } else if (*p == 'g' || *p == 'G') {
+            st.by_flip = 2;
+            p++;
+        }
+        /* One clock a script: a poll and a flip are not the same count. */
+        if (st.by_flip && anchors) {
+            if (!anchors->clock) {
+                anchors->clock = st.by_flip;
+            } else if (anchors->clock != st.by_flip) {
+                fprintf(stderr, "  PAD: %s step in a script on the %s clock;"
+                        " skipped: at \"%.20s\"\n", st.by_flip == 2 ? "g<poll>" : "f<flip>",
+                        anchors->clock == 2 ? "poll" : "flip", p - 1);
+                p += strcspn(p, ", \t\r\n");
+                continue;
+            }
         }
         st.hold = st.by_flip ? PAD_HOLD_FLIPS_DEFAULT : 150;
         /* strtoul alone would take a sign or blanks, and "-1" would wrap
          * to a flip that never comes. */
         st.at = isdigit((unsigned char)*p) ? strtoul(p, &end, 10) : 0;
         if (!isdigit((unsigned char)*p) || *end != ':') {
-            fprintf(stderr, "  PAD: script entry without <ms> or f<flip>: at \"%.20s\"\n", p);
+            fprintf(stderr, "  PAD: script entry without <ms>, f<flip> or g<poll>:"
+                    " at \"%.20s\"\n", p);
             break;
         }
         b = end + 1;
@@ -254,6 +288,21 @@ int pad_script_parse_anchored(const char *text, PadStep *steps, int len,
             && b[2] == '-') {
             st.pad = (uint8_t)(b[1] - '1');
             b += 3;
+        }
+        if (*b == '@' && same_word(b, "@end", 4)
+            && (!b[4] || strchr(", \t\r\n#", b[4]))) {
+            /* The record's end: a step that presses nothing and ends on its
+             * own count, so pad_quit waits for it. */
+            if (!st.by_flip || st.pad) {
+                fprintf(stderr, "  PAD: @end needs f<flip> or g<poll> and no pad"
+                        " prefix: at \"%.20s\"\n", p);
+                break;
+            }
+            st.end = 1;
+            st.hold = 0;
+            steps[len++] = st;
+            p = b + 4;
+            continue;
         }
         if (*b == '@') {
             if (st.pad) {
@@ -629,7 +678,7 @@ void pad_step_press(const PadStep *st, uint8_t *out)
     out[2] |= st->digital;
     for (j = 0; j < 8; j++)
         if (st->analog & (1u << j))
-            out[4 + j] = 0xFF;
+            out[4 + j] = st->aval[j] ? st->aval[j] : 0xFF;
     if (st->stick) {
         /* Axes at 12..19: LX LY RX RY, signed 16-bit, up positive. */
         static const int16_t full = 32767;
@@ -671,7 +720,21 @@ PadBits pad_bits_from_report(const uint8_t *r)
     for (j = 0; j < 8; j++)
         if (r[4 + j] > ANALOG_PRESSED)
             b.analog |= (uint8_t)(1u << j);
+    memcpy(b.av, &r[4], sizeof b.av);
     memcpy(b.ax, &r[12], sizeof b.ax);
+    return b;
+}
+
+/* The poll clock's exact form: an analog byte is pressed from 1, at its
+ * depth. */
+static PadBits exact_bits(PadBits b)
+{
+    int j;
+
+    b.analog = 0;
+    for (j = 0; j < 8; j++)
+        if (b.av[j])
+            b.analog |= (uint8_t)(1u << j);
     return b;
 }
 
@@ -682,15 +745,35 @@ static void append(char *out, size_t n, size_t *used, const char *name)
         *used += (size_t)w;
 }
 
-void pad_bits_name(PadBits b, char *out, size_t n)
+/* With depth, an analog button short of full is written name=<depth>. */
+static void bits_name(PadBits b, int depth, char *out, size_t n)
 {
     size_t i, used = 0;
+    int j;
 
     if (n)
         out[0] = 0;
-    for (i = 0; i < COUNT(s_buttons); i++)
-        if ((s_buttons[i].dig & b.digital) || (s_buttons[i].ana & b.analog))
+    for (i = 0; i < COUNT(s_buttons); i++) {
+        if (s_buttons[i].dig & b.digital) {
             append(out, n, &used, s_buttons[i].name);
+        } else if (s_buttons[i].ana & b.analog) {
+            char one[16];
+            for (j = 0; j < 8; j++)
+                if (s_buttons[i].ana == 1u << j)
+                    break;
+            if (depth && j < 8 && b.av[j] && b.av[j] < 255) {
+                snprintf(one, sizeof one, "%s=%u", s_buttons[i].name, b.av[j]);
+                append(out, n, &used, one);
+            } else {
+                append(out, n, &used, s_buttons[i].name);
+            }
+        }
+    }
+}
+
+void pad_bits_name(PadBits b, char *out, size_t n)
+{
+    bits_name(b, 0, out, n);
 }
 
 static void axes_name(const int16_t *ax, char *out, size_t n)
@@ -722,29 +805,30 @@ static int axes_any(const int16_t *ax)
 /* A new stick step: past the band, or onto rest or full throw, which a
  * band would otherwise round away. Leaving rest takes the band too: a pad
  * at rest reads a few hundred off centre, inside any title's dead zone. */
-static int axes_moved(const int16_t *cur, const int16_t *now)
+static int axes_moved(const int16_t *cur, const int16_t *now, int exact)
 {
     int i;
     for (i = 0; i < 4; i++) {
         int d = (int)now[i] - (int)cur[i];
         if (!d)
             continue;
-        if (d >= PAD_AXIS_BAND || d <= -PAD_AXIS_BAND || !now[i]
+        if (exact || d >= PAD_AXIS_BAND || d <= -PAD_AXIS_BAND || !now[i]
             || now[i] >= 32767 || now[i] <= -32767)
             return 1;
     }
     return 0;
 }
 
-static int emit(char *out, size_t n, size_t *used, int pad, uint32_t at,
-                const char *names, uint32_t hold)
+static int emit(char *out, size_t n, size_t *used, int poll, int pad,
+                uint32_t at, const char *names, uint32_t hold)
 {
+    char c = poll ? 'g' : 'f';
     int w;
     if (pad > 0)
-        w = snprintf(out + *used, n - *used, "f%u:p%d-%s:%u\n", at, pad + 1,
+        w = snprintf(out + *used, n - *used, "%c%u:p%d-%s:%u\n", c, at, pad + 1,
                      names, hold);
     else
-        w = snprintf(out + *used, n - *used, "f%u:%s:%u\n", at, names, hold);
+        w = snprintf(out + *used, n - *used, "%c%u:%s:%u\n", c, at, names, hold);
     if (w > 0 && (size_t)w < n - *used) {
         *used += (size_t)w;
         return 1;
@@ -759,15 +843,22 @@ static int commit(PadRecorder *r, PadBits s, uint32_t flip, char *out, size_t n,
     char names[128];
     int lines = 0;
 
-    if (s.digital != r->cur.digital || s.analog != r->cur.analog) {
+    int bits = s.digital != r->cur.digital || s.analog != r->cur.analog;
+
+    if (bits || (r->poll && memcmp(s.av, r->cur.av, sizeof s.av))) {
         if (buttons_any(r->cur)) {
-            pad_bits_name(r->cur, names, sizeof names);
-            lines += emit(out, n, used, r->pad, r->since, names, flip - r->since);
+            bits_name(r->cur, r->poll, names, sizeof names);
+            lines += emit(out, n, used, r->poll, r->pad, r->since, names,
+                          flip - r->since);
         }
         r->cur.digital = s.digital;
         r->cur.analog = s.analog;
+        memcpy(r->cur.av, s.av, sizeof s.av);
         r->since = flip;
-        if (buttons_any(s)) {
+        /* A press is new buttons: a trigger's depth wavering under a held
+         * finger is not a tap, and would forge a retry and push real taps
+         * out of the history. */
+        if (bits && buttons_any(s)) {
             if (r->presses == PAD_RETRY_PRESSES) {
                 memmove(&r->press[0], &r->press[1], (PAD_RETRY_PRESSES - 1) * sizeof r->press[0]);
                 memmove(&r->press_at[0], &r->press_at[1],
@@ -779,10 +870,10 @@ static int commit(PadRecorder *r, PadBits s, uint32_t flip, char *out, size_t n,
             r->presses++;
         }
     }
-    if (axes_moved(r->cur.ax, s.ax)) {
+    if (axes_moved(r->cur.ax, s.ax, r->poll)) {
         if (axes_any(r->cur.ax)) {
             axes_name(r->cur.ax, names, sizeof names);
-            lines += emit(out, n, used, r->pad, r->ax_since, names,
+            lines += emit(out, n, used, r->poll, r->pad, r->ax_since, names,
                           flip - r->ax_since);
         }
         memcpy(r->cur.ax, s.ax, sizeof s.ax);
@@ -798,6 +889,8 @@ int pad_recorder_feed(PadRecorder *r, PadBits b, uint32_t flip, char *out, size_
 
     if (n)
         out[0] = 0;
+    if (r->poll)
+        b = exact_bits(b);
     if (!r->started) {
         r->started = 1;
         r->presses = 0;
@@ -807,8 +900,12 @@ int pad_recorder_feed(PadRecorder *r, PadBits b, uint32_t flip, char *out, size_
         return 0;
     }
     if (flip == r->pend_flip) {
+        int j;
         r->pend.digital |= b.digital;
         r->pend.analog |= b.analog;
+        for (j = 0; j < 8; j++)
+            if (b.av[j] > r->pend.av[j])
+                r->pend.av[j] = b.av[j];
         memcpy(r->pend.ax, b.ax, sizeof b.ax);
         return 0;
     }
@@ -835,6 +932,33 @@ int pad_recorder_end(PadRecorder *r, uint32_t flip, char *out, size_t n)
     lines += commit(r, none, flip, out, n, &used);
     r->started = 0;
     return lines;
+}
+
+int pad_recorder_end_line(const PadRecorder *recs, int n, uint32_t flip,
+                          char *out, size_t size)
+{
+    int i, any = 0, poll = 0, w;
+
+    if (size)
+        out[0] = 0;
+    for (i = 0; i < n; i++) {
+        if (!recs[i].started)
+            continue;
+        any = 1;
+        poll = recs[i].poll;
+        /* pad_recorder_end ends the held steps there at the earliest. */
+        if (flip <= recs[i].pend_flip)
+            flip = recs[i].pend_flip + 1;
+    }
+    if (!any)
+        return 0;
+    w = snprintf(out, size, "%c%u:@end\n", poll ? 'g' : 'f', (unsigned)flip);
+    if (w <= 0 || (size_t)w >= size) {
+        if (size)
+            out[0] = 0;
+        return 0;
+    }
+    return w;
 }
 
 const char *pad_path_name(const char *path)
@@ -935,7 +1059,8 @@ int pad_recorder_anchor(const PadRecorder *recs, int n, const char *path,
                      (unsigned)(flip - t[m - 1]));
         }
     }
-    w = snprintf(out, size, "%sf%u:@open:%s%s\n", why, (unsigned)a, name, retry);
+    w = snprintf(out, size, "%s%c%u:@open:%s%s\n", why,
+                 n > 0 && recs[0].poll ? 'g' : 'f', (unsigned)a, name, retry);
     if (w <= 0 || (size_t)w >= size) {
         if (size)
             out[0] = 0;

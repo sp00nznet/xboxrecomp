@@ -32,6 +32,27 @@
  * (a movie that takes A only a few seconds in, by its decoder's clock).
  * After PAD_ANCHOR_GIVE_UP_FLIPS late the replay gives the open up and goes
  * on as recorded.
+ *
+ * g<poll> times a step by the title's own polls of its pads instead: the
+ * number of port-0 reads so far (usb_gamepad.c counts each one
+ * usb_gamepad_report or usb_gamepad_game_record makes), holds in polls.
+ * The walker's flip runs beside the title's frame, not with it, so a poll
+ * near a flip's edge falls on either side of it from run to run, and a
+ * flip-timed replay hands some poll its neighbour's state; a frame-exact
+ * route (a wall clip) then misses. A poll-timed step lands on the
+ * same read of the pad in every run of a deterministic title. A script is
+ * on one clock: the first timed entry's (f or g) sets it, and an entry on
+ * the other is refused. Anchors count the same way, g<poll>:@open:<text>,
+ * and so do their counts below: a retry's period and the give-up are polls
+ * on the poll clock (about one a frame in BLiNX 2, so near the flips').
+ *
+ * An analog button may also carry its depth, a=<1..255> (lt=97: the
+ * trigger 97 of 255 down); a bare name presses it fully.
+ *
+ * f<flip>:@end or g<poll>:@end marks where a record stopped: it presses
+ * nothing and ends on its own count, so RECOMP_DEBUG=pad_quit waits for it
+ * and a replay runs on through the idle time after the last release. A
+ * record without one ends with its last step, as before.
  */
 #ifndef XBOX_USB_PAD_SCRIPT_H
 #define XBOX_USB_PAD_SCRIPT_H
@@ -41,8 +62,9 @@
 
 /* A recorded route of a few minutes is a few hundred button steps, but an
  * analog stick held by hand moves most flips: a long stroll can pass ten
- * thousand steps. */
-#define PAD_SCRIPT_MAX 32768
+ * thousand steps. On the poll clock every stick change is a step, up to 60 a
+ * second while the stick is off centre: room for about 18 minutes of it. */
+#define PAD_SCRIPT_MAX 65536
 
 /* An unheld flip-timed step lasts this many flips, the 150 ms default of the
  * millisecond form at 60 flips a second. */
@@ -57,8 +79,11 @@ typedef struct {
                                 8 L-down, then the same four for the right */
     uint8_t axis_set;        /* bit n: axis[n] (LX LY RX RY) is set */
     int16_t axis[4];
-    uint8_t by_flip;
+    uint8_t aval[8];         /* analog depth per bit of analog; 0 is full */
+    uint8_t by_flip;         /* 1 f<flip>, 2 g<poll>: at and hold are on that
+                                clock */
     uint16_t anchor;         /* 0, or 1 + the anchor it counts from */
+    uint8_t end;             /* the record's end (@end): hold 0, no buttons */
     int announced;
 } PadStep;
 
@@ -100,6 +125,7 @@ typedef struct {
     PadAnchor a[PAD_ANCHOR_MAX];
     int n, armed;
     int skip;                /* some anchor's skip is set */
+    uint8_t clock;           /* 0 none yet, else the script's by_flip */
 } PadAnchors;
 
 /* pad_script_parse, plus anchor entries into *anchors (kept sorted), and
@@ -178,6 +204,7 @@ void pad_step_press(const PadStep *st, uint8_t *report);
 typedef struct {
     uint8_t digital, analog;
     int16_t ax[4];           /* LX LY RX RY */
+    uint8_t av[8];           /* the analog bytes as read (report 4..11) */
 } PadBits;
 
 PadBits pad_bits_from_report(const uint8_t *report);
@@ -199,9 +226,13 @@ typedef struct {
     int presses;             /* how many of them there are */
     int pad;
     int started;
+    /* On the poll clock (g<poll> steps): every poll is its own step time,
+     * so the record is exact too: an analog button is pressed from 1 and
+     * written with its depth, and every stick change is a step. */
+    int poll;
 } PadRecorder;
 
-/* Feed one report's state at a flip. When a flip's state differs from the
+/* Feed one report's state at a flip (a poll on the poll clock). When a flip's state differs from the
  * one before, the steps it ends are written to out, one per line
  * ("f<flip>:<buttons>:<flips>", "f<flip>:lx=<v>+ly=<v>:<flips>", "p2-" for
  * pads past the first). Returns the number of lines. A stick change smaller
@@ -213,6 +244,13 @@ int pad_recorder_feed(PadRecorder *r, PadBits b, uint32_t flip, char *out, size_
 /* Write the steps still held at the end of a run, as if released at flip
  * (or the flip after the last report, if that is later). */
 int pad_recorder_end(PadRecorder *r, uint32_t flip, char *out, size_t n);
+
+/* The record's end line, "f<flip>:@end\n" (g<poll> on the poll clock), at
+ * flip or past every pad's last report, whichever is later; call it before
+ * pad_recorder_end, which forgets them. Returns the line's length, 0 when
+ * no pad reported (nothing was recorded) or out is too small. */
+int pad_recorder_end_line(const PadRecorder *recs, int n, uint32_t flip,
+                          char *out, size_t size);
 
 /* An anchor line for a file that opened at flip, after the anchor at
  * `since` (0 for none): "f<flip>:@open:<name>[:<buttons>/<period>]\n", the

@@ -634,6 +634,174 @@ static void test_recorder_anchor(void)
     CHECK(strcmp(pad_path_name("x.sfd"), "x.sfd") == 0);
 }
 
+/* The poll clock: g<poll> steps, one clock a script, analog
+ * depth, and a record that gives back every poll's state exactly. */
+static void test_poll_clock(void)
+{
+    static PadAnchors a;
+    PadStep s[8];
+    uint8_t r[20];
+    int n;
+
+    memset(&a, 0, sizeof a);
+    n = pad_script_parse_anchored("g10:a:3 g20:@open:stage g25:lt=97+rt:2 f30:b",
+                                  s, 0, 8, &a);
+    /* The f step is on the other clock: refused, the rest kept. */
+    CHECK(n == 2 && a.clock == 2 && a.n == 1);
+    CHECK(s[0].by_flip == 2 && s[0].at == 10 && s[0].hold == 3);
+    CHECK(s[1].analog == 0xC0 && s[1].aval[6] == 97 && s[1].aval[7] == 0);
+    CHECK(s[1].anchor == 1);
+    report(r, 0, 0, 0, 0);
+    pad_step_press(&s[1], r);
+    CHECK(r[4 + 6] == 97 && r[4 + 7] == 0xFF);
+    /* Depth out of range, or on a button with none, is not a button. */
+    memset(&a, 0, sizeof a);
+    CHECK(pad_script_parse("g1:lt=0", s, 0, 8) == 1 && !s[0].analog);
+    CHECK(pad_script_parse("g1:lt=256", s, 0, 8) == 1 && !s[0].analog);
+    CHECK(pad_script_parse("g1:start=9", s, 0, 8) == 1 && !s[0].digital);
+    CHECK(pad_script_parse("g1:a=255", s, 0, 8) == 1 && s[0].analog == 0x01
+          && s[0].aval[0] == 0);
+}
+
+static void test_poll_round_trip(void)
+{
+    /* What one jittery hand gives a title in successive polls: small stick
+     * moves inside the flip clock's band, a light trigger, a press under
+     * the trigger threshold. The flip record would round them away. */
+    static const struct { uint8_t a0, lt; int16_t lx, ly; } seq[] = {
+        {0, 0, 2330, -1568}, {0, 0, 2400, -1568}, {0, 0, 2410, -1500},
+        {0, 97, 2410, -1500}, {0, 158, 2410, -1500}, {0, 255, 15565, 31489},
+        {12, 255, 16367, 31151}, {200, 0, 16367, 31151}, {0, 0, 0, 0},
+        {0, 2, 0, 0}, {0, 0, -12402, -8703},
+    };
+    enum { N = sizeof seq / sizeof seq[0] };
+    PadRecorder rec;
+    static PadAnchors a;
+    PadStep steps[64];
+    char text[4096] = "", out[512];
+    int i, n;
+
+    memset(&rec, 0, sizeof rec);
+    rec.poll = 1;
+    for (i = 0; i < N; i++) {
+        uint8_t r[20];
+        report(r, 0, 0, seq[i].lx, seq[i].ly);
+        r[4] = seq[i].a0;
+        r[4 + 6] = seq[i].lt;
+        if (pad_recorder_feed(&rec, pad_bits_from_report(r), (uint32_t)(50 + i),
+                              out, sizeof out))
+            strcat(text, out);
+    }
+    if (pad_recorder_end(&rec, 50 + N, out, sizeof out))
+        strcat(text, out);
+    CHECK(text[0] == 'g' && !strchr(text, 'f'));
+    memset(&a, 0, sizeof a);
+    n = pad_script_parse_anchored(text, steps, 0, 64, &a);
+    CHECK(n > 0 && a.clock == 2);
+    for (i = 0; i < N; i++) {
+        uint8_t want[20], got[20];
+        int k;
+        report(want, 0, 0, seq[i].lx, seq[i].ly);
+        want[4] = seq[i].a0;
+        want[4 + 6] = seq[i].lt;
+        report(got, 0, 0, 0, 0);
+        for (k = 0; k < n; k++)
+            if (pad_step_active_at(&steps[k], &a, 0, (uint32_t)(50 + i)))
+                pad_step_press(&steps[k], got);
+        if (memcmp(want, got, 20) != 0) {
+            fails++;
+            fprintf(stderr, "FAIL poll round trip at poll %d\n%s", 50 + i, text);
+        }
+    }
+}
+
+/* An anchor on the poll clock is written g<poll>:@open. */
+static void test_poll_anchor(void)
+{
+    PadRecorder rec[1];
+    char line[512];
+    uint32_t at = 0;
+    uint8_t r[20];
+
+    memset(rec, 0, sizeof rec);
+    rec[0].poll = 1;
+    report(r, 0, 0, 0, 0);
+    pad_recorder_feed(&rec[0], pad_bits_from_report(r), 7, line, sizeof line);
+    CHECK(pad_recorder_anchor(rec, 1, "d:\\adx\\jingle_stagestart.adx", 8, 0,
+                              line, sizeof line, &at) > 0);
+    CHECK(at == 8 && strcmp(line, "g8:@open:jingle_stagestart.adx\n") == 0);
+}
+
+/* The record's end, @end: a step that presses nothing, done on its own
+ * count, written past every pad's last report. */
+static void test_end_marker(void)
+{
+    static PadAnchors a;
+    PadStep s[8];
+    PadRecorder rec[2];
+    char line[64], out[256];
+    uint8_t r[20];
+    int n;
+
+    memset(&a, 0, sizeof a);
+    n = pad_script_parse_anchored("g10:a:4,g40:@end", s, 0, 8, &a);
+    CHECK(n == 2 && a.clock == 2 && s[1].end && s[1].hold == 0 && s[1].at == 40);
+    CHECK(!pad_step_active(&s[1], 0, 40) && !pad_step_done(&s[1], 0, 39)
+          && pad_step_done(&s[1], 0, 40));
+    report(r, 0, 0, 0, 0);
+    pad_step_press(&s[1], r);
+    CHECK(r[2] == 0 && r[4] == 0);
+    /* One clock, as for any entry; no pad prefix; a word, not a prefix. */
+    memset(&a, 0, sizeof a);
+    CHECK(pad_script_parse_anchored("g10:a,f40:@end", s, 0, 8, &a) == 1);
+    CHECK(pad_script_parse("f40:p2-@end", s, 0, 8) == 0);
+    CHECK(pad_script_parse("40:@end", s, 0, 8) == 0);
+    memset(&a, 0, sizeof a);
+    CHECK(pad_script_parse_anchored("f40:@ending:x", s, 0, 8, &a) == 0);
+
+    /* Nothing reported: nothing recorded, no end. */
+    memset(rec, 0, sizeof rec);
+    rec[0].poll = rec[1].poll = 1;
+    rec[1].pad = 1;
+    CHECK(pad_recorder_end_line(rec, 2, 50, line, sizeof line) == 0 && !line[0]);
+    /* The end goes past the last report, or at the count given. */
+    pad_recorder_feed(&rec[0], bits(0, 1, 0, 0), 60, out, sizeof out);
+    CHECK(pad_recorder_end_line(rec, 2, 50, line, sizeof line) > 0
+          && strcmp(line, "g61:@end\n") == 0);
+    CHECK(pad_recorder_end_line(rec, 2, 90, line, sizeof line) > 0
+          && strcmp(line, "g90:@end\n") == 0);
+    CHECK(pad_recorder_end_line(rec, 2, 90, line, 5) == 0);
+    rec[0].poll = 0;
+    CHECK(pad_recorder_end_line(rec, 1, 90, line, sizeof line) > 0
+          && strcmp(line, "f90:@end\n") == 0);
+}
+
+/* On the poll clock a trigger's depth moving under a held finger is a new
+ * step but not a new press: it must not fill the retry's history. */
+static void test_poll_depth_not_a_press(void)
+{
+    PadRecorder rec;
+    char out[512];
+    uint8_t r[20];
+    uint32_t t = 10;
+    int i;
+
+    memset(&rec, 0, sizeof rec);
+    rec.poll = 1;
+    report(r, 0, 0, 0, 0);
+    pad_recorder_feed(&rec, pad_bits_from_report(r), t++, out, sizeof out);
+    r[4 + 6] = 90;                       /* lt pressed lightly: one press */
+    pad_recorder_feed(&rec, pad_bits_from_report(r), t++, out, sizeof out);
+    for (i = 0; i < 6; i++) {            /* its depth wavers */
+        r[4 + 6] = (uint8_t)(91 + i);
+        pad_recorder_feed(&rec, pad_bits_from_report(r), t++, out, sizeof out);
+    }
+    r[4 + 6] = 0;
+    pad_recorder_feed(&rec, pad_bits_from_report(r), t++, out, sizeof out);
+    pad_recorder_feed(&rec, pad_bits_from_report(r), t++, out, sizeof out);
+    CHECK(rec.presses == 1 && rec.press_at[0] == 11);
+}
+
 int main(void)
 {
     test_parse();
@@ -651,6 +819,11 @@ int main(void)
     test_anchor_early_limit();
     test_anchor_log();
     test_recorder_anchor();
+    test_poll_clock();
+    test_poll_round_trip();
+    test_poll_anchor();
+    test_end_marker();
+    test_poll_depth_not_a_press();
     if (fails) {
         fprintf(stderr, "pad_script: %d failure(s)\n", fails);
         return 1;

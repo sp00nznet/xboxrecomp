@@ -478,6 +478,44 @@ flip early against the open.
 `tests/pad_script` covers the grammar and the clock, `tests/usb_pad_anchor`
 the tap with opens.
 
+A flip-timed record is not exact. A title's pad polls do not keep step with
+the walker's flips: two polls can share a flip, and the next flip then gets
+none. The record keeps one of the two polls' sticks, and the replay gives
+both polls that value, so a stick that moves on every poll replays a poll
+off. The record also keeps a stick within 256 of the step's first value, and
+an analog button only as pressed or not. That is enough to navigate menus,
+but not for a frame-exact move (BLiNX 2's 2-1 wall clip missed).
+`RECOMP_DEBUG=pad_clock=poll` records on the title's port-0 polls instead:
+`g<poll>:<buttons>:<hold polls>`, every stick change a new step, and an
+analog button's depth as `lt=<1..255>` (any analog button takes `=<v>` in a
+script; 255 is a full press). Anchors on that clock are `g<poll>:@open:...`.
+A script uses one clock: an entry on the other one is refused with a log
+line. The poll clock counts the polls that pass through
+`usb_gamepad_report` or `usb_gamepad_game_record` for port 0, so a replay
+gives poll N what the record's poll N got, however the flips fall. On the
+OHCI path (a title that links its own XAPI) `usb_gamepad_report` answers the
+model's USB interrupt transfers, so the clock counts those reports, which
+come at the bus's pace, not the title's reads of the pad: there a poll step
+is only as exact as the reports are steady against the title's frame. A
+title that answers XInputGetState itself (BLiNX 2) counts its own reads.
+An anchor's retry period and its 1800-count give-up are polls on this clock.
+
+A record ends with `g<poll>:@end` (`f<flip>:@end` on the flip clock), the
+count at which it stopped. The step presses nothing.
+
+`RECOMP_DEBUG=pad_quit` ends a scripted run once every step of
+`RECOMP_PAD_SCRIPT` has ended, the `@end` included, so a replay runs through
+the idle time after the record's last release and stops where the record
+stopped (a record without `@end` stops at its last release). The quit is
+posted to the window, which closes as its close button closes it, on its
+own thread: the check runs on the title's pad thread, under the game's pad
+lock, where exit hooks and atexit work must not run. Without a window (a
+headless run) a thread of its own runs the exit hooks, then
+`ExitProcess(0)` (`exit(0)` on POSIX). It needs steps from
+`RECOMP_PAD_SCRIPT`; live lines added meanwhile must end too.
+`tests/usb_pad_poll` covers the poll clock end to end, a flip-clock control
+that misses, `@end` and both quits.
+
 ## Ports
 
 ```c

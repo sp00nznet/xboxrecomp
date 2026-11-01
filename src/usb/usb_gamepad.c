@@ -384,6 +384,26 @@ void usb_gamepad_flip(uint32_t flip)
 
 uint32_t usb_gamepad_flips(void) { return s_flip; }
 
+/* The title's port-0 polls so far: the poll clock (g<poll> steps,
+ * pad_script.h). Only the pad's thread moves it, after a poll's record, so
+ * a poll's press and its record read the same count; another thread (a file
+ * open) reads the next poll's. */
+static volatile uint32_t s_polls;
+/* The script's clock is the poll's (its steps are g<poll>), and the
+ * record's (RECOMP_DEBUG=pad_clock=poll). Each is read once. */
+static int s_script_poll;
+static int rec_poll(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *c = recomp_env(RENV_PAD_CLOCK);
+        v = c && !strcmp(c, "poll");
+    }
+    return v;
+}
+static uint32_t script_clock(void) { return s_script_poll ? s_polls : s_flip; }
+static uint32_t rec_clock(void) { return rec_poll() ? s_polls : s_flip; }
+
 static void pad_script_read(void)
 {
     const char *spec = recomp_env(RENV_PAD_SCRIPT);
@@ -419,6 +439,7 @@ static void pad_script_read(void)
         s_script_len = pad_script_parse_anchored(spec, s_script, 0, PAD_SCRIPT_MAX,
                                                  &s_anchors);
     }
+    s_script_poll = s_anchors.clock == 2;
     {
         int i;
         for (i = 0; i < s_anchors.n; i++)
@@ -455,7 +476,7 @@ static void pad_script_compact(unsigned long t)
 {
     int i, n = 0;
     for (i = 0; i < s_script_len; i++)
-        if (!pad_step_done_at(&s_script[i], &s_anchors, t, s_flip))
+        if (!pad_step_done_at(&s_script[i], &s_anchors, t, script_clock()))
             s_script[n++] = s_script[i];
     s_script_len = n;
     s_script_gen++;
@@ -508,11 +529,26 @@ static void pad_live_poll(unsigned long t)
                          && pending[1] >= '1' && pending[1] <= '4'
                          && pending[2] == '-' ? pending[1] - '1' : 0;
                 unsigned long at = t > next_free[pd] ? t : next_free[pd];
-                /* "f<flip>:..." carries its own time: the line is a step of
-                 * a flip-timed script, not a press for now. */
-                int timed = (pending[0] == 'f' || pending[0] == 'F')
-                            && isdigit((unsigned char)pending[1]);
+                /* "f<flip>:..." or "g<poll>:..." carries its own time: the
+                 * line is a step of a timed script, not a press for now. */
+                int timed = (pending[0] == 'f' || pending[0] == 'F') ? 1
+                            : (pending[0] == 'g' || pending[0] == 'G') ? 2 : 0;
+                if (timed && !isdigit((unsigned char)pending[1]))
+                    timed = 0;
                 pending[npending] = 0;
+                /* One clock a script, as in the file: the first timed entry
+                 * sets it when the script had none. */
+                if (timed && !s_anchors.clock) {
+                    s_anchors.clock = (uint8_t)timed;
+                    s_script_poll = timed == 2;
+                } else if (timed && s_anchors.clock != timed) {
+                    fprintf(stderr, "  PAD: live \"%s\": the script is on the %s"
+                            " clock; skipped\n", pending,
+                            s_anchors.clock == 2 ? "poll" : "flip");
+                    fflush(stderr);
+                    npending = 0;
+                    continue;
+                }
                 if (timed)
                     snprintf(line, sizeof line, "%s", pending);
                 else
@@ -527,13 +563,14 @@ static void pad_live_poll(unsigned long t)
                     s_script_len = pad_script_parse(line, s_script, s_script_len,
                                                     PAD_SCRIPT_MAX);
                     if (s_script_len > had)
-                        pad_step_not_before(&s_script[s_script_len - 1], s_flip);
+                        pad_step_not_before(&s_script[s_script_len - 1],
+                                            script_clock());
                 }
                 if (s_script_len > 0 && !timed)
                     next_free[pd] = at + s_script[s_script_len - 1].hold + 200;
                 if (timed)
-                    fprintf(stderr, "  PAD: live \"%s\" (flip %u)\n", pending,
-                            (unsigned)s_flip);
+                    fprintf(stderr, "  PAD: live \"%s\" (%s %u)\n", pending,
+                            timed == 2 ? "poll" : "flip", (unsigned)script_clock());
                 else
                     fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
                 fflush(stderr);
@@ -544,6 +581,56 @@ static void pad_live_poll(unsigned long t)
         }
     }
     fclose(f);
+}
+
+/* RECOMP_DEBUG=pad_quit: a replay ends where its record ended. A record
+ * ends with an @end step at the count it stopped on, so once every step of
+ * the script has ended, that one included, the run is over (a record from
+ * before @end ends with its last release). Only for a script from the
+ * start (RECOMP_PAD_SCRIPT); live lines added meanwhile must end too.
+ *
+ * This runs on the title's pad thread, inside its XInputGetState and under
+ * the game's pad lock (BLiNX 2: pad_input.c's g_lock). Exiting here would
+ * run the exit hooks and atexit work (SDL input, the mods) on that thread
+ * with the lock held. The quit is posted to the window instead, which
+ * closes as its close button does, on its own thread. Without a window (a
+ * headless run) a thread of its own ends the run, off the pad lock. */
+static DWORD WINAPI pad_quit_thread(LPVOID why)
+{
+    recomp_exit_hook_run((const char *)why);
+    fflush(stdout);
+    fflush(stderr);
+    /* exit() on POSIX, so a mod's trace buffered for atexit is written. */
+    ExitProcess(0);
+    return 0;
+}
+
+static void pad_script_quit(unsigned long t, uint32_t clock)
+{
+    static int on = -1, from;
+    int i, k;
+
+    if (on < 0)
+        on = recomp_env_on(RENV_PAD_QUIT) && s_script_len > 0;
+    if (!on)
+        return;
+    /* A step once ended stays ended, so the scan goes on from the last step
+     * still running: one check a poll while it runs, not the whole script. */
+    for (k = 0; k < s_script_len; k++) {
+        i = (from + k) % s_script_len;
+        if (!pad_step_done_at(&s_script[i], &s_anchors, t, clock)) {
+            from = i;
+            return;
+        }
+    }
+    on = 0;
+    fprintf(stderr, "  PAD: the script's last step has ended (%s %u): quitting"
+            " (pad_quit)\n", s_script_poll ? "poll" : "flip", (unsigned)clock);
+    fflush(stderr);
+    if (recomp_quit_post("pad_quit"))
+        return;
+    if (!CreateThread(NULL, 0, pad_quit_thread, (LPVOID)"pad_quit", 0, NULL))
+        pad_quit_thread((LPVOID)"pad_quit");   /* no thread: here, as before */
 }
 
 static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
@@ -560,10 +647,11 @@ static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
     t = now - t0;
     pad_live_poll(t);
     /* Only the LLE pushbuffer walker counts flips (usb_gamepad_flip); a
-     * title on the HLE D3D8 present path would get every f-step at boot. */
-    if (!warned && !flip && t > 20000) {
+     * title on the HLE D3D8 present path would get every f-step at boot.
+     * g<poll> steps count the title's polls and need no flips. */
+    if (!warned && !s_flip && t > 20000) {
         for (i = 0; i < s_script_len; i++)
-            if (s_script[i].by_flip)
+            if (s_script[i].by_flip == 1)
                 break;
         if (i < s_script_len) {
             fprintf(stderr, "  PAD: no flips counted after 20 s: f<flip> steps"
@@ -578,8 +666,8 @@ static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
             continue;
         if (!st->announced) {
             st->announced = 1;
-            fprintf(stderr, "  PAD: t=%lu ms flip %u step %d (digital 0x%02X analog 0x%02X)\n",
-                    t, (unsigned)flip, i, st->digital, st->analog);
+            fprintf(stderr, "  PAD: t=%lu ms %s %u step %d (digital 0x%02X analog 0x%02X)\n",
+                    t, s_script_poll ? "poll" : "flip", (unsigned)flip, i, st->digital, st->analog);
             fflush(stderr);
         }
         pad_step_press(st, out);
@@ -600,6 +688,8 @@ static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
         if (on)
             pad_step_press(&retry, out);
     }
+    if (pad == 0)
+        pad_script_quit(t, flip);
 }
 
 /* The pads the toolkit's own inputs drive: the script's (every pad a step
@@ -704,22 +794,29 @@ static void gamepad_from_report(const uint8_t *r, XBOX_GAMEPAD *g)
 }
 
 /* RECOMP_DEBUG=pad_record=<file>: the report as the title gets it, after the
- * script, as flip-timed steps. Each step is written when it ends and flushed,
- * and the steps still held are written at exit (atexit, or the window's exit
- * hook, since ExitProcess skips atexit). */
+ * script, as steps timed by flip or by poll (pad_clock). Each step is written
+ * when it ends and flushed; the steps still held and the @end line are
+ * written at exit (atexit, or the window's exit hook, since ExitProcess
+ * skips atexit). */
 static FILE *s_rec_file;
 static PadRecorder s_rec[USB_GAMEPAD_MAX];
 
 static void pad_record_end(void)
 {
-    char lines[512];
-    int i;
+    char lines[512], end[32];
+    int i, w;
 
     if (!s_rec_file)
         return;
+    /* Before pad_recorder_end, which forgets the pads' last reports; and
+     * only once, since atexit and the exit hook both come here (the second
+     * finds no pad started and writes nothing). */
+    w = pad_recorder_end_line(s_rec, USB_GAMEPAD_MAX, rec_clock(), end, sizeof end);
     for (i = 0; i < USB_GAMEPAD_MAX; i++)
-        if (pad_recorder_end(&s_rec[i], s_flip, lines, sizeof lines))
+        if (pad_recorder_end(&s_rec[i], rec_clock(), lines, sizeof lines))
             fputs(lines, s_rec_file);
+    if (w > 0)
+        fputs(end, s_rec_file);
     fflush(s_rec_file);
 }
 
@@ -744,14 +841,17 @@ static void pad_record_signal(int sig)
 {
     pad_sig_fn old = sig == SIGINT ? s_rec_old_int : s_rec_old_term;
 
-    char lines[512];
-    int i, fd;
+    char lines[512], end[32];
+    int i, fd, w;
 
     if (s_rec_file) {
         fd = fileno(s_rec_file);
+        w = pad_recorder_end_line(s_rec, USB_GAMEPAD_MAX, rec_clock(), end, sizeof end);
         for (i = 0; i < USB_GAMEPAD_MAX; i++)
-            if (pad_recorder_end(&s_rec[i], s_flip, lines, sizeof lines))
+            if (pad_recorder_end(&s_rec[i], rec_clock(), lines, sizeof lines))
                 (void)!pad_write(fd, lines, (unsigned)strlen(lines));
+        if (w > 0)
+            (void)!pad_write(fd, end, (unsigned)w);
         s_rec_file = NULL;
     }
     signal(sig, old == SIG_ERR ? SIG_DFL : old);
@@ -806,7 +906,7 @@ static void pad_record_open(const char *path, char *log, size_t logn)
     name = pad_path_name(path);
     if (s_rec_anchor_name[0] && !strcmp(name, s_rec_anchor_name))
         return;
-    w = pad_recorder_anchor(s_rec, USB_GAMEPAD_MAX, path, s_flip,
+    w = pad_recorder_anchor(s_rec, USB_GAMEPAD_MAX, path, rec_clock(),
                             s_rec_anchor_at, line, sizeof line, &at);
     if (w <= 0) {
         size_t used = strlen(log);
@@ -843,15 +943,22 @@ static void pad_record(int pad, const uint8_t *out, uint32_t flip)
                 recomp_exit_hook_add(pad_record_exit_hook);
                 s_rec_old_int = signal(SIGINT, pad_record_signal);
                 s_rec_old_term = signal(SIGTERM, pad_record_signal);
-                fprintf(f, "# pad_record: pad_script steps timed by flip"
-                        " (f<flip>:<buttons>:<hold flips>, sticks lx=<v>)\n");
+                if (rec_poll())
+                    fprintf(f, "# pad_record: pad_script steps timed by the title's"
+                            " pad polls (g<poll>:<buttons>:<hold polls>, sticks"
+                            " lx=<v>, analog depth lt=<v>)\n");
+                else
+                    fprintf(f, "# pad_record: pad_script steps timed by flip"
+                            " (f<flip>:<buttons>:<hold flips>, sticks lx=<v>)\n");
                 fflush(f);
                 fprintf(stderr, "  PAD: recording the pads to %s\n", path);
             }
             fflush(stderr);
         }
-        for (i = 0; i < USB_GAMEPAD_MAX; i++)
+        for (i = 0; i < USB_GAMEPAD_MAX; i++) {
             s_rec[i].pad = i;
+            s_rec[i].poll = rec_poll();
+        }
     }
     if (!state || pad < 0 || pad >= USB_GAMEPAD_MAX)
         return;
@@ -868,6 +975,21 @@ static void pad_record(int pad, const uint8_t *out, uint32_t flip)
     ReleaseSRWLockExclusive(&s_anchor_lock);
 }
 
+/* The clock a poll's press reads: the poll's count or the flip read
+ * with it. */
+static uint32_t script_at(uint32_t flip, uint32_t polls)
+{
+    pad_script_load();   /* s_script_poll comes with the script */
+    return s_script_poll ? polls : flip;
+}
+
+/* A port-0 poll is over: the poll clock moves on. */
+static void poll_done(int pad)
+{
+    if (pad == 0)
+        s_polls = s_polls + 1;
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -875,7 +997,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     uint8_t synth = synthetic_buttons();
     /* One flip for the script and the recorder: the walker may count one
      * between two reads, and the record would then lag the press by a flip. */
-    uint32_t flip = s_flip;
+    uint32_t flip = s_flip, polls = s_polls;
 
     if (max < 20)
         return 0;
@@ -928,16 +1050,18 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
             memset(&state, 0, sizeof state);
     } else if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
-        pad_script_apply(pad, out, flip);
-        pad_record(pad, out, flip);
+        pad_script_apply(pad, out, script_at(flip, polls));
+        pad_record(pad, out, rec_poll() ? polls : flip);
+        poll_done(pad);
         return 20;
     }
 
     g = &state.Gamepad;
     report_from_gamepad(g, out);
     out[2] |= synth;
-    pad_script_apply(pad, out, flip);
-    pad_record(pad, out, flip);
+    pad_script_apply(pad, out, script_at(flip, polls));
+    pad_record(pad, out, rec_poll() ? polls : flip);
+    poll_done(pad);
     return 20;
 }
 
@@ -962,7 +1086,7 @@ void usb_gamepad_game_press(int pad, struct XBOX_GAMEPAD *g)
     report_from_gamepad(g, r);
     if (pad == 0)
         r[2] |= synthetic_buttons();
-    pad_script_apply(pad, r, flip);
+    pad_script_apply(pad, r, script_at(flip, s_polls));
     gamepad_from_report(r, g);
 }
 
@@ -973,11 +1097,13 @@ void usb_gamepad_game_record(int pad, const struct XBOX_GAMEPAD *g)
 
     if (pad < 0 || pad >= USB_GAMEPAD_MAX)
         return;
-    /* The press's flip when this poll had one, else this one's own. */
+    /* The press's flip when this poll had one, else this one's own. The
+     * poll clock moves only below, so the press read this poll's count. */
     flip = s_game_pressed[pad] ? s_game_flip[pad] : s_flip;
     s_game_pressed[pad] = 0;
     report_from_gamepad(g, r);
-    pad_record(pad, r, flip);
+    pad_record(pad, r, rec_poll() ? s_polls : flip);
+    poll_done(pad);
 }
 
 uint32_t usb_gamepad_game_pads(void)
@@ -1004,7 +1130,7 @@ void usb_gamepad_file_open(const char *path, uint32_t status)
         return;
     pad_script_load();
     AcquireSRWLockExclusive(&s_anchor_lock);
-    pad_anchors_open(&s_anchors, path, s_flip, log, sizeof log);
+    pad_anchors_open(&s_anchors, path, script_clock(), log, sizeof log);
     pad_record_open(path, log, sizeof log);
     ReleaseSRWLockExclusive(&s_anchor_lock);
     /* Printed unlocked: a slow stderr must not hold the pad threads. */

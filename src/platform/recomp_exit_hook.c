@@ -47,3 +47,19 @@ void recomp_exit_hook_run(const char *why)
             fn(why);
     }
 }
+
+static recomp_quit_fn volatile s_quit;
+
+void recomp_quit_set(recomp_quit_fn fn)
+{
+    __atomic_store_n(&s_quit, fn, __ATOMIC_RELEASE);
+}
+
+int recomp_quit_post(const char *why)
+{
+    recomp_quit_fn fn = __atomic_load_n(&s_quit, __ATOMIC_ACQUIRE);
+    if (fn == NULL)
+        return 0;
+    fn(why);
+    return 1;
+}
