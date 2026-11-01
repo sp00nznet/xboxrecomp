@@ -2313,6 +2313,8 @@ class Lifter:
 
     def _lift_imul(self, insn, ops):
         nops = len(ops)
+        if nops == 1 and (_operand_width(ops[0]) or 4) < 4:
+            return self._lift_narrow_muldiv(ops, "imul")
         if nops == 1:
             # One operand: edx:eax = eax * ops[0]
             src = _fmt_operand_read(ops[0])
@@ -2332,9 +2334,54 @@ class Lifter:
             return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){src} * (int32_t){imm})")]
         return ["/* imul: unexpected form */"]
 
+    def _lift_narrow_muldiv(self, ops, m):
+        """The 8- and 16-bit one-operand MUL/IMUL/DIV/IDIV.
+
+        These do not touch EDX:EAX as a pair. The byte forms work on AX
+        alone: AX = AL * r/m8, or AL = AX / r/m8 with the remainder in AH, and
+        EDX is left as it was. The word forms use DX:AX and keep the upper
+        halves of both registers. Lifting them as the 32-bit form wrote the
+        high half of a 64-bit product over EDX, so code that loads DL before
+        an "imul bl" and reads it after lost the value. Auto Modellista's menu
+        auto-repeat (sub_00109670) computes "dl = delay - al * bl" that way;
+        the threshold came out as zero, and every unheld button fired a repeat
+        on every frame, so the menu scrolled and selected by itself.
+
+        The operand is read once, before any write, since it may be AL or AH.
+        """
+        src = _fmt_operand_read(ops[0])
+        signed = m in ("imul", "idiv")
+        if _operand_width(ops[0]) == 1:
+            if m in ("mul", "imul"):
+                cast = "(int32_t)(int8_t)" if signed else "(uint32_t)(uint8_t)"
+                return [f"{{ uint32_t _r = (uint32_t)({cast}LO8(eax) * {cast}({src}));",
+                        f"  SET_LO16(eax, _r); }}  /* {m} r/m8: ax = al * src */"]
+            if signed:
+                return [f"{{ int32_t _d = (int32_t)(int8_t)({src}), _n = (int32_t)(int16_t)LO16(eax);",
+                        "  int32_t _q = _n / _d, _m = _n % _d;",
+                        f"  SET_LO8(eax, (uint32_t)_q); SET_HI8(eax, (uint32_t)_m); }}  /* {m} r/m8 */"]
+            return [f"{{ uint32_t _d = (uint32_t)(uint8_t)({src}), _n = (uint32_t)LO16(eax);",
+                    "  uint32_t _q = _n / _d, _m = _n % _d;",
+                    f"  SET_LO8(eax, _q); SET_HI8(eax, _m); }}  /* {m} r/m8 */"]
+        if m in ("mul", "imul"):
+            cast = "(int32_t)(int16_t)" if signed else "(uint32_t)(uint16_t)"
+            return [f"{{ uint32_t _r = (uint32_t)({cast}LO16(eax) * {cast}({src}));",
+                    f"  SET_LO16(eax, _r); SET_LO16(edx, _r >> 16); }}  /* {m} r/m16: dx:ax = ax * src */"]
+        if signed:
+            return [f"{{ int32_t _d = (int32_t)(int16_t)({src});",
+                    "  int32_t _n = (int32_t)(((uint32_t)LO16(edx) << 16) | LO16(eax));",
+                    "  int32_t _q = _n / _d, _m = _n % _d;",
+                    f"  SET_LO16(eax, (uint32_t)_q); SET_LO16(edx, (uint32_t)_m); }}  /* {m} r/m16 */"]
+        return [f"{{ uint32_t _d = (uint32_t)(uint16_t)({src});",
+                "  uint32_t _n = ((uint32_t)LO16(edx) << 16) | LO16(eax);",
+                "  uint32_t _q = _n / _d, _m = _n % _d;",
+                f"  SET_LO16(eax, _q); SET_LO16(edx, _m); }}  /* {m} r/m16 */"]
+
     def _lift_muldiv(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
+        if (_operand_width(ops[0]) or 4) < 4:
+            return self._lift_narrow_muldiv(ops, m)
         src = _fmt_operand_read(ops[0])
         if m == "mul":
             return [
