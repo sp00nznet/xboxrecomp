@@ -309,6 +309,8 @@ extern void xbox_InputMouseWin32Msg(void *hwnd, unsigned msg, uintptr_t w, intpt
 extern void xbox_InputMouseWin32Sync(void *hwnd);
 extern void xbox_InputMouseWin32Release(void *hwnd);
 extern int xbox_InputKeyboardOn(void);
+extern int xbox_InputTextWin32Char(void *hwnd, uintptr_t w, intptr_t l);
+extern void xbox_InputTextFocusLost(void);
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -332,6 +334,13 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_SYSKEYUP:
         xbox_InputKeyEventWin32((int)w, (unsigned long)l, 0);
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
+    /* Typed text for a menu field (text_input.c), only while one has
+     * focus; otherwise WM_CHAR goes on to DefWindowProc. Same handling as
+     * the GDI window's (fb_present.c). */
+    case WM_CHAR:
+        if (xbox_InputTextWin32Char(h, (uintptr_t)w, (intptr_t)l))
+            return 0;
+        break;
     /* Alt (the walk key) or F10 alone would put the window in menu mode,
      * which takes the keyboard until the next key. There is no menu;
      * Alt+F4 is SC_CLOSE and still reaches Windows. With the keyboard off
@@ -343,6 +352,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
         xbox_InputKeysClear();
+        xbox_InputTextFocusLost();
         return 0;
     }
     if (m == WM_CLOSE) {

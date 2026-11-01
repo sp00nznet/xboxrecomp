@@ -19,6 +19,8 @@ Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGe
 | `kbm_script.c` | `RECOMP_DEBUG=kbm_script=<file>`: key and mouse events injected on the poll |
 | `keyboard_sdl.c` | The SDL window's key and focus events into that table (POSIX) |
 | `mouse_sdl.c` | The SDL window's mouse events, and the capture as relative mode (POSIX) |
+| `text_input.h`, `text_input.c` | Typed text for the menu's fields: the lock-free ring and the Begin/End request, every host; its `_WIN32` half reads `WM_CHAR` |
+| `text_input_sdl.c` | `SDL_EVENT_TEXT_INPUT` into the ring, and the request as SDL's text input and its area (POSIX) |
 
 ## Quick Start
 

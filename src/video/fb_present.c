@@ -35,6 +35,7 @@
 #include "../kernel/nv2a_stats.h"
 #include "keyboard.h"       /* src/input: the key table this window feeds */
 #include "mouse.h"
+#include "text_input.h"   /* src/input: WM_CHAR into the menu's text ring */
 #include "gpu_present.h"
 #include "recomp_exit_hook.h"   /* src/platform */
 #include <stdbool.h>
@@ -318,6 +319,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         xbox_InputKeyEventWin32((int)w, (unsigned long)l, 0);
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
 
+    /* Typed text for a menu field (text_input.c), only while one has
+     * focus; otherwise WM_CHAR goes on as before. The key edges above
+     * still arrive, so the menu's editing keys work as they do today. */
+    case WM_CHAR:
+        if (xbox_InputTextWin32Char(h, (uintptr_t)w, (intptr_t)l))
+            return 0;
+        break;
+
     /* Alt (the walk key) or F10 alone would put the window in menu mode,
      * which takes the keyboard until the next key. This window has no
      * menu; Alt+F4 is SC_CLOSE and still reaches Windows. With the keyboard
@@ -330,6 +339,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
         xbox_InputKeysClear();
+        xbox_InputTextFocusLost();
         return 0;
     }
     return DefWindowProcA(h, m, w, l);

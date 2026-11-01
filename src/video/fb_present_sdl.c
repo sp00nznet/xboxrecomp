@@ -88,6 +88,7 @@
 #endif
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 #include "mouse_sdl.h"        /* src/input: the mouse and its capture */
+#include "text_input_sdl.h"   /* src/input: typed text for the menu */
 #include "present_sdl_quit.h"
 #ifdef XBOXRECOMP_ENHANCE
 #include "kernel/nv2a_overlay.h"
@@ -951,6 +952,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                  * that release them; both only read the event. */
                 xbox_InputSdlEvent(&ev);
                 xbox_InputSdlMouseEvent(&ev);
+                xbox_InputSdlTextEvent(&ev);
                 if (ev.type == SDL_EVENT_QUIT)
                     quit = 1;
                 else if (ev.type == s_guest_done_event)
@@ -966,6 +968,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* The capture can change on the poll thread (the release key, a
          * script); relative mode has to be set here, on the window's. */
         xbox_InputSdlMouseSync(win);
+        /* Text input for a menu field, asked for on the guest's thread;
+         * SDL wants it started and stopped on this one. */
+        xbox_InputSdlTextSync(win);
 #if defined(__APPLE__)
         mac_fullscreen_level(win, full, spaces_off);
 #endif
