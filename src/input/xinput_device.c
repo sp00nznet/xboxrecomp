@@ -533,10 +533,13 @@ static int xbox_sdl_family_of(int type, uint16_t vid, uint16_t pid)
     case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
     case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
     case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
-#if SDL_VERSION_ATLEAST(3, 4, 0)
-    case SDL_GAMEPAD_TYPE_GAMECUBE:
-#endif
         return XBOX_PAD_FAMILY_NINTENDO;
+#if SDL_VERSION_ATLEAST(3, 4, 0)
+    /* Its own family: SDL places its A X B Y south, east, west, north,
+     * so the Switch's letters would name the wrong buttons. */
+    case SDL_GAMEPAD_TYPE_GAMECUBE:
+        return XBOX_PAD_FAMILY_GAMECUBE;
+#endif
 #if SDL_VERSION_ATLEAST(3, 4, 0)
     case SDL_GAMEPAD_TYPE_STEAM:
         return XBOX_PAD_FAMILY_STEAM;

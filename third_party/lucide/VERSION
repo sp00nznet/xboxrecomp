@@ -1,0 +1,26 @@
+Lucide 1.57.0, ISC licence and Feather's MIT notice (LICENSE)
+source: https://github.com/lucide-icons/lucide/releases/download/1.57.0/lucide-font-1.57.0.zip
+lucide-font/lucide.ttf sha256 321fa12a84fdb68e0d5aad772db62502f936fc40217d9a122b130b6c5d4dfc86
+made by: uv run tools/overlay/glyphs_to_ttf.py lucide --font <lucide.ttf> --codepoints <codepoints.json>, which is:
+  pyftsubset lucide.ttf --unicodes=U+E038,U+E06C,U+E06E,U+E06F,U+E082,U+E0B2,U+E0D7,U+E0DF,U+E113,U+E11B,U+E129,U+E144,U+E19E,U+E1B2,U+E20C,U+E284,U+E29A,U+E29C,U+E412 --layout-features='' --output-file=lucide-subset.ttf
+  then name IDs 0, 13 and 14 (copyright, licence, URL) and fsType 0
+icons:
+  U+E29A sliders-horizontal
+  U+E412 sparkles
+  U+E129 package
+  U+E0DF gamepad-2
+  U+E29C puzzle
+  U+E038 activity
+  U+E284 keyboard
+  U+E20C bug
+  U+E0D7 folder
+  U+E082 circle-help
+  U+E113 maximize-2
+  U+E11B minimize-2
+  U+E1B2 x
+  U+E06C check
+  U+E06E chevron-left
+  U+E06F chevron-right
+  U+E144 refresh-ccw
+  U+E19E upload
+  U+E0B2 download

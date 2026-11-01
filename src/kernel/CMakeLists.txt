@@ -51,13 +51,16 @@ set(KERNEL_SOURCES
 # The enhancements overlay (stats strip, toasts, the menu; enhance-menu-
 # preview R2, R7, R8): microui and stb_truetype vendored unmodified in
 # third_party/, built with their own warnings off, and the Atkinson
-# Hyperlegible Regular TTF embedded as C arrays at build time. Only
-# XBOXRECOMP_ENHANCE builds carry any of it.
+# Hyperlegible Regular TTF embedded as C arrays at build time, with the
+# Lucide icon subset and the input-glyph font beside it (overlay-revamp
+# D7, D8). Only XBOXRECOMP_ENHANCE builds carry any of it.
 if(XBOXRECOMP_ENHANCE)
     get_filename_component(_xr_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(_xr_tp "${_xr_root}/third_party")
     set(_ovl_fonts
-        "${_xr_tp}/fonts/atkinson-hyperlegible/AtkinsonHyperlegible-Regular.ttf")
+        "${_xr_tp}/fonts/atkinson-hyperlegible/AtkinsonHyperlegible-Regular.ttf"
+        "${_xr_tp}/lucide/lucide-subset.ttf"
+        "${_xr_tp}/kenney-input/xbr-input.ttf")
     # The size gate of 3B.1: the embedded faces stay under 0.7 MB.
     set(_ovl_font_bytes 0)
     foreach(_f IN LISTS _ovl_fonts)
@@ -73,7 +76,7 @@ if(XBOXRECOMP_ENHANCE)
     add_custom_command(
         OUTPUT "${_ovl_fonts_c}"
         COMMAND ${CMAKE_COMMAND} "-DOUT=${_ovl_fonts_c}"
-                "-DNAMES=nv2a_ovl_font_regular"
+                "-DNAMES=nv2a_ovl_font_regular|nv2a_ovl_font_icons|nv2a_ovl_font_input"
                 "-DFILES=${_ovl_fonts_arg}"
                 -P "${_xr_root}/cmake/embed_files.cmake"
         DEPENDS ${_ovl_fonts} "${_xr_root}/cmake/embed_files.cmake"
@@ -87,6 +90,7 @@ if(XBOXRECOMP_ENHANCE)
         nv2a_overlay.c
         nv2a_overlay_ui.c
         nv2a_overlay_font.c
+        nv2a_overlay_glyph.c
         nv2a_stats.c
         nv2a_present_chain.c
         ${_ovl_vendored}

@@ -17,13 +17,15 @@ find_package(Threads REQUIRED)
 set(XR_ROOT ${CMAKE_CURRENT_LIST_DIR}/../..)
 set(XR_SRC ${XR_ROOT}/src)
 set(XR_TP ${XR_ROOT}/third_party)
-set(_fonts "${XR_TP}/fonts/atkinson-hyperlegible/AtkinsonHyperlegible-Regular.ttf")
+set(_fonts "${XR_TP}/fonts/atkinson-hyperlegible/AtkinsonHyperlegible-Regular.ttf"
+           "${XR_TP}/lucide/lucide-subset.ttf" "${XR_TP}/kenney-input/xbr-input.ttf")
 string(REPLACE ";" "|" _fonts_arg "${_fonts}")
 set(_fonts_c "${CMAKE_CURRENT_BINARY_DIR}/nv2a_overlay_fonts.c")
 add_custom_command(
     OUTPUT "${_fonts_c}"
     COMMAND ${CMAKE_COMMAND} "-DOUT=${_fonts_c}"
-            "-DNAMES=nv2a_ovl_font_regular" "-DFILES=${_fonts_arg}"
+            "-DNAMES=nv2a_ovl_font_regular|nv2a_ovl_font_icons|nv2a_ovl_font_input"
+            "-DFILES=${_fonts_arg}"
             -P "${XR_ROOT}/cmake/embed_files.cmake"
     DEPENDS ${_fonts} "${XR_ROOT}/cmake/embed_files.cmake"
     VERBATIM)
@@ -34,11 +36,13 @@ add_executable(overlay_test test_main.c
     ${XR_SRC}/kernel/nv2a_overlay.c
     ${XR_SRC}/kernel/nv2a_overlay_ui.c
     ${XR_SRC}/kernel/nv2a_overlay_font.c
+    ${XR_SRC}/kernel/nv2a_overlay_glyph.c
     ${XR_SRC}/kernel/nv2a_overlay_ref.c
     ${XR_SRC}/kernel/nv2a_stats.c
     ${_vendored} "${_fonts_c}")
 target_include_directories(overlay_test PRIVATE ${XR_SRC}/kernel ${XR_TP}/microui ${XR_TP}/stb)
-target_compile_definitions(overlay_test PRIVATE XBOXRECOMP_ENHANCE)
+target_compile_definitions(overlay_test PRIVATE XBOXRECOMP_ENHANCE
+    "GLYPHS_TXT=\"${XR_TP}/kenney-input/glyphs.txt\"")
 if(NOT MSVC)
     # The pinned checksums hash float positions: no fused multiply-adds,
     # which arm64 clang makes by default and x86 compilers do not.

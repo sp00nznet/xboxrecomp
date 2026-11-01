@@ -336,6 +336,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         break;
 
+    /* The overlay names keys in the layout the player types in, which
+     * only this thread can read (layouts are per thread). */
+    case WM_INPUTLANGCHANGE:
+        xbox_InputKeyboardSetLayout((uintptr_t)l);
+        break;
+
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
         xbox_InputKeysClear();
@@ -567,6 +573,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
+    xbox_InputKeyboardSetLayout((uintptr_t)GetKeyboardLayout(0));
     hdc = GetDC(hwnd);
     {
         if (recomp_env_on(RENV_FB_FULLSCREEN))

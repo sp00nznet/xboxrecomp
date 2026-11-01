@@ -431,6 +431,18 @@ void xbox_InputKeyboardEnable(int on)
     __atomic_store_n(&s_kb_enable, on < 0 ? -1 : on != 0, __ATOMIC_RELEASE);
 }
 
+static uintptr_t s_layout;
+
+void xbox_InputKeyboardSetLayout(uintptr_t hkl)
+{
+    __atomic_store_n(&s_layout, hkl, __ATOMIC_RELEASE);
+}
+
+uintptr_t xbox_InputKeyboardLayout(void)
+{
+    return __atomic_load_n(&s_layout, __ATOMIC_ACQUIRE);
+}
+
 int xbox_InputKeyboardOn(void)
 {
     int e = __atomic_load_n(&s_kb_enable, __ATOMIC_ACQUIRE);

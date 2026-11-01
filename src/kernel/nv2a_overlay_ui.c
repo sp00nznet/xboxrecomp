@@ -5,7 +5,8 @@
  * toast stack.
  *
  * microui emits rects, text, clips and icons; the overlay adds rounded
- * rects, images and the cursor as its own commands. The converter turns
+ * rects, images, the cursor and atlas symbols (icons, input glyphs) as
+ * its own commands. The converter turns
  * all of them into triangles once, on the writer's thread, so every
  * presenter draws the same list and the backends agree by construction.
  */
@@ -62,6 +63,7 @@ int nv2a_ovl_px(float s, int token)
 struct ovl_rrect_cmd { mu_BaseCommand base; mu_Rect rect; int radius; float feather; mu_Color color; };
 struct ovl_image_cmd { mu_BaseCommand base; mu_Rect rect; int tex; mu_Color tint; };
 struct ovl_cursor_cmd { mu_BaseCommand base; int style, x, y, size; mu_Color fill, edge; };
+struct ovl_glyph_cmd { mu_BaseCommand base; mu_Rect rect; int face; uint32_t cp; mu_Color color; };
 
 static const mu_Rect s_unclipped = { 0, 0, 0x1000000, 0x1000000 };
 
@@ -141,6 +143,23 @@ void nv2a_ovl_ui_cursor(mu_Context *ctx, int style, int x, int y, int size,
     cmd->size = size;
     cmd->fill = fill;
     cmd->edge = edge;
+    pop_clipped(ctx, clipped);
+}
+
+void nv2a_ovl_ui_symbol(mu_Context *ctx, int face, uint32_t cp, mu_Rect r, mu_Color c)
+{
+    int clipped, box = r.w < r.h ? r.w : r.h;
+    struct ovl_glyph_cmd *cmd;
+    if (box <= 0)
+        return;
+    r = mu_rect(r.x + (r.w - box) / 2, r.y + (r.h - box) / 2, box, box);
+    cmd = push_clipped(ctx, OVL_CMD_GLYPH, (int)sizeof *cmd, r, &clipped);
+    if (!cmd)
+        return;
+    cmd->rect = r;
+    cmd->face = face;
+    cmd->cp = cp;
+    cmd->color = c;
     pop_clipped(ctx, clipped);
 }
 
@@ -400,6 +419,18 @@ int nv2a_ovl_convert(mu_Context *ctx, struct nv2a_ovl_build *b)
         case OVL_CMD_CURSOR:
             ok = conv_cursor(&c, (const struct ovl_cursor_cmd *)cmd);
             break;
+        case OVL_CMD_GLYPH: {
+            /* From the atlas like text, so the list needs no new texture
+             * and the backends draw it as they draw glyphs. */
+            const struct ovl_glyph_cmd *g = (const struct ovl_glyph_cmd *)cmd;
+            struct nv2a_ovl_quad q;
+            if (nv2a_ovl_font_symbol(g->face, g->cp, (float)g->rect.x, (float)g->rect.y,
+                                     (float)g->rect.h, &q)) {
+                set_tex(&c, 0);
+                ok = quad(&c, q.x0, q.y0, q.x1, q.y1, q.u0, q.v0, q.u1, q.v1, premul(g->color));
+            }
+            break;
+        }
         default:
             break;
         }

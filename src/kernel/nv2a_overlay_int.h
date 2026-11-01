@@ -52,9 +52,12 @@ enum { OVL_FONT_SMALL, OVL_FONT_BODY, OVL_FONT_TITLE, OVL_FONT_SLOTS };
 #define OVL_FONT_TAB(f)  (((uintptr_t)(f) & 0x8000u) != 0)
 
 /* Bakes Regular at the three text sizes for out_h lines into a coverage
- * atlas, expands it to premultiplied white, and logs the atlas line.
- * Init thread only. Returns 0 or -1. */
-int nv2a_ovl_font_bake(uint32_t out_h);
+ * atlas, with the symbol faces when symbols (the menu layer draws them),
+ * expands it to premultiplied white, and logs the atlas line. Init
+ * thread only, before any layer publishes. Returns 0 or -1. */
+int nv2a_ovl_font_bake(uint32_t out_h, int symbols);
+/* Whether the atlas holds the symbol faces. */
+int nv2a_ovl_font_symbols(void);
 void nv2a_ovl_font_free(void);
 const struct nv2a_ovl_atlas *nv2a_ovl_font_atlas(void);   /* NULL before a bake */
 
@@ -77,12 +80,27 @@ float nv2a_ovl_font_ascent(mu_Font font);
  * sequence. */
 uint32_t nv2a_ovl_utf8_next(const char **s, const char *end);
 
-/* ── Custom microui commands: rounded rects, images, cursors ── */
+/* The symbol faces baked beside the text (overlay-revamp D7, D8): the
+ * Lucide icon subset at the small, body and title sizes, and the input
+ * glyphs (third_party/kenney-input) at small, body and twice body. */
+enum { OVL_FACE_ICONS, OVL_FACE_INPUT, OVL_FACES };
+#define OVL_SYM_SIZES 3
+/* Whether face has a glyph for cp; needs no bake, and is 0 once a bake
+ * left the symbol faces out. */
+int nv2a_ovl_font_has_symbol(int face, uint32_t cp);
+/* The quad of cp in face centred in the box of box pixels at (x, y),
+ * from the nearest baked size. Returns 0 when the face lacks cp or no
+ * atlas is baked. */
+int nv2a_ovl_font_symbol(int face, uint32_t cp, float x, float y, float box,
+                         struct nv2a_ovl_quad *q);
+
+/* ── Custom microui commands: rounded rects, images, cursors, glyphs ── */
 
 enum {
     OVL_CMD_RRECT = MU_COMMAND_MAX,
     OVL_CMD_IMAGE,
     OVL_CMD_CURSOR,
+    OVL_CMD_GLYPH,      /* a symbol from a face of the atlas (nv2a_overlay_glyph.h) */
 };
 enum { OVL_CURSOR_ARROW, OVL_CURSOR_DOT };
 
@@ -98,6 +116,9 @@ void nv2a_ovl_ui_image(mu_Context *ctx, mu_Rect r, uint16_t tex, mu_Color tint);
 /* A cursor with its hotspot at (x, y), size pixels tall. */
 void nv2a_ovl_ui_cursor(mu_Context *ctx, int style, int x, int y, int size,
                         mu_Color fill, mu_Color edge);
+/* The symbol cp of face (OVL_FACE_*) centred in r, a square of the
+ * smaller side; nv2a_ovl_ui_glyph is the public way in. */
+void nv2a_ovl_ui_symbol(mu_Context *ctx, int face, uint32_t cp, mu_Rect r, mu_Color c);
 
 /* A finished microui frame into a draw list. Returns 1 when the list was
  * cut at a command boundary for want of room, else 0. */

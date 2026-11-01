@@ -17,13 +17,15 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(XR_ROOT ${CMAKE_CURRENT_LIST_DIR}/../..)
 set(XR_SRC ${XR_ROOT}/src)
 set(XR_TP ${XR_ROOT}/third_party)
-set(_fonts "${XR_TP}/fonts/atkinson-hyperlegible/AtkinsonHyperlegible-Regular.ttf")
+set(_fonts "${XR_TP}/fonts/atkinson-hyperlegible/AtkinsonHyperlegible-Regular.ttf"
+           "${XR_TP}/lucide/lucide-subset.ttf" "${XR_TP}/kenney-input/xbr-input.ttf")
 string(REPLACE ";" "|" _fonts_arg "${_fonts}")
 set(_fonts_c "${CMAKE_CURRENT_BINARY_DIR}/nv2a_overlay_fonts.c")
 add_custom_command(
     OUTPUT "${_fonts_c}"
     COMMAND ${CMAKE_COMMAND} "-DOUT=${_fonts_c}"
-            "-DNAMES=nv2a_ovl_font_regular" "-DFILES=${_fonts_arg}"
+            "-DNAMES=nv2a_ovl_font_regular|nv2a_ovl_font_icons|nv2a_ovl_font_input"
+            "-DFILES=${_fonts_arg}"
             -P "${XR_ROOT}/cmake/embed_files.cmake"
     DEPENDS ${_fonts} "${XR_ROOT}/cmake/embed_files.cmake"
     VERBATIM)

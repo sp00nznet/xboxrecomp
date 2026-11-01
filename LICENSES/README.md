@@ -23,13 +23,20 @@ The rest are for dsp56300, linked only in builds with
   file.
 
 The enhancements overlay, compiled only with `-DXBOXRECOMP_ENHANCE=ON`
-(see "the enhancements overlay" in the top-level NOTICE), vendors three
+(see "the enhancements overlay" in the top-level NOTICE), vendors these
 components under `third_party/`:
 
 - `MIT-microui.txt`: microui's licence, verbatim from its repository.
 - `MIT-stb.txt`: the stb licence file, verbatim (MIT or public domain).
 - `OFL-1.1-atkinson-hyperlegible.txt`: the Atkinson Hyperlegible font
   licence, verbatim from google/fonts (also beside the font as `OFL.txt`).
+- `ISC-MIT-lucide.txt`: Lucide's `LICENSE`, verbatim from its 1.57.0
+  release (ISC, with Feather's MIT notice for the icons Lucide took from
+  it); also beside the subset font as `third_party/lucide/LICENSE`.
+- `CC0-1.0-kenney-input.txt`: the Kenney Input Prompts `License.txt`,
+  verbatim (also `third_party/kenney-input/LICENSE`), followed by the CC0
+  1.0 legal code from creativecommons.org. CC0 asks for no credit; the
+  NOTICE gives it anyway.
 
 `present.shader` (also `-DXBOXRECOMP_ENHANCE=ON`; see "MPL-2.0 —
 librashader" in the top-level NOTICE) loads the prebuilt librashader at run

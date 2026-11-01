@@ -261,7 +261,7 @@ int xbox_InputSteamInput(DWORD slot)
 }
 
 static const char *const k_family[XBOX_PAD_FAMILY_COUNT] = {
-    "xbox", "playstation", "nintendo", "steam", "generic",
+    "xbox", "playstation", "nintendo", "steam", "generic", "gamecube",
 };
 
 const char *xbox_InputPadFamilyName(int family)

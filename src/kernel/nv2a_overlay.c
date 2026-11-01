@@ -55,6 +55,7 @@ static uint64_t s_place;            /* atomic: x, y, w, h as 16 bits each */
 static const char *s_presenter;     /* atomic */
 static int s_stats_on;              /* atomic */
 static int s_menu_lock;             /* atomic */
+static int s_published;             /* atomic: a layer published a list */
 static void (*s_wake)(void);        /* atomic: the presenter's wake */
 
 uint64_t nv2a_ovl_now_ns(void)
@@ -143,9 +144,21 @@ static void free_layer(struct layer *y)
 
 int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)
 {
-    int l, added = 0;
-    if (!__atomic_load_n(&s_armed, __ATOMIC_ACQUIRE) && nv2a_ovl_font_bake(out_h) < 0)
-        return -1;
+    int l, added = 0, menu = (layers & (1u << NV2A_OVL_MENU)) != 0;
+    if (!__atomic_load_n(&s_armed, __ATOMIC_ACQUIRE)) {
+        if (nv2a_ovl_font_bake(out_h, menu) < 0)
+            return -1;
+    } else if (menu && !nv2a_ovl_font_symbols()) {
+        /* enhance.c arms the strip and the toasts, then the menu, on the
+         * init thread: nothing has drawn from the text-only atlas yet, so
+         * it is baked again with the symbols. Once a list is out, a
+         * presenter or writer may hold the old one, and the menu's
+         * prompts write the controls' names instead. */
+        if (__atomic_load_n(&s_published, __ATOMIC_ACQUIRE))
+            fprintf(stderr, OVL_LOGP "menu: armed after a layer drew; prompts show names\n");
+        else if (nv2a_ovl_font_bake(out_h, 1) < 0 && nv2a_ovl_font_bake(out_h, 0) < 0)
+            return -1;
+    }
     for (l = 0; l < NV2A_OVL_COUNT; l++) {
         if (!(layers & (1u << l)) || layer_armed((enum nv2a_overlay_layer)l))
             continue;
@@ -270,6 +283,7 @@ void nv2a_overlay_build_publish(enum nv2a_overlay_layer l, uint32_t sum)
     s->list.gen = ++y->gen;
     s->list.atlas_gen = a ? a->gen : 0;
     s->list.sum = sum;
+    __atomic_store_n(&s_published, 1, __ATOMIC_RELEASE);
     if (y->build.cut && !y->cut_logged) {
         y->cut_logged = 1;
         fprintf(stderr, OVL_LOGP "%s: the page did not fit (%u vertices, %u commands);"
@@ -639,6 +653,7 @@ void nv2a_overlay_reset_for_test(void)
     s_presenter = NULL;
     s_stats_on = 0;
     s_menu_lock = 0;
+    s_published = 0;
     s_wake = NULL;
     s_toast_head = 0;
     s_toast_read = 0;

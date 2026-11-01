@@ -141,6 +141,13 @@ void xbox_InputKeyEvent(int code, int down);
 /* The same from a Win32 WM_KEY* message: wparam's VK and lparam, whose
  * scancode and extended bit say which Shift, Ctrl, Alt or Enter it was. */
 void xbox_InputKeyEventWin32(int vk, unsigned long lparam, int down);
+/* The Win32 window's keyboard layout (an HKL; 0 when no Win32 window
+ * posted one). Layouts are per thread: GetKeyboardLayout on the overlay's
+ * thread names keys in that thread's layout, not the one the player types
+ * in. So the window's thread posts its own at start and on each
+ * WM_INPUTLANGCHANGE, and key names read it here. */
+void      xbox_InputKeyboardSetLayout(uintptr_t hkl);
+uintptr_t xbox_InputKeyboardLayout(void);
 /* One line of the key trace: "[KEY] " + the text, the first 200 edges and
  * then one in 50, so a held key or a busy wheel cannot flood the log. */
 void xbox_InputTraceEdge(const char *fmt, ...);

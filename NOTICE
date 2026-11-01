@@ -132,6 +132,24 @@ MIT and permissive — the enhancements overlay (XBOXRECOMP_ENHANCE)
                         The OFL allows bundling them with software; they
                         are not sold on their own and are not renamed.
 
+  third_party/lucide/    Lucide 1.57.0 icon font, a 19-icon subset
+                        https://github.com/lucide-icons/lucide
+                        (c) 2026 Lucide Icons and Contributors. ISC; the
+                        icons Lucide took from Feather are (c) 2013-present
+                        Cole Bemis, MIT. Both texts are in LICENSE beside
+                        the font and in LICENSES/ISC-MIT-lucide.txt.
+                        Subset by tools/overlay/glyphs_to_ttf.py and
+                        embedded in the binary.
+
+  third_party/kenney-input/
+                        Kenney Input Prompts 1.3, 129 prompts converted to
+                        a font by tools/overlay/glyphs_to_ttf.py
+                        https://kenney.nl/assets/input-prompts
+                        Created and distributed by Kenney (www.kenney.nl).
+                        CC0 1.0: no credit is required; this one is given
+                        as the pack asks. The pack's licence and the CC0
+                        legal code are in LICENSES/CC0-1.0-kenney-input.txt.
+
   third_party/librashader/librashader.h
                         librashader v0.12.0 C header, unmodified
                         https://github.com/SnowflakePowered/librashader

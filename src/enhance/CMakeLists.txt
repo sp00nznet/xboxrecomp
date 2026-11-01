@@ -26,6 +26,8 @@
 #                  checks, import cap, atomic writes (file_browser.h)
 #   shader_param_kinds.c a parameter as a toggle, a choice or a slider: the
 #                  sidecar and a profile's [param_kinds] (shader_param_kinds.h)
+#   enhance_text.c menu text with input glyphs: {pad:} {key:} {mouse:}
+#                  {act:} tokens (enhance_text.h)
 # docs/runtime/config.md has the file format and the keys.
 #
 # The layer links the runtime (xbox_kernel, for nv2a_host_opts_set), never
@@ -37,6 +39,7 @@ add_library(xbox_enhance STATIC recomp_cfg.c enhance_cfg.c enhance.c enhance_inp
     shader_param_kinds.c)
 target_include_directories(xbox_enhance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_enhance PUBLIC recomp_env xbox_kernel xbox_input)
+target_sources(xbox_enhance PRIVATE enhance_text.c)
 if(NOT MSVC)
     target_compile_options(xbox_enhance PRIVATE -Wall -Wextra)
 endif()

@@ -810,7 +810,7 @@ table of `src/input/README.md` and no mouse.
 | `input.pad_threshold` | int | `1` .. `100`: percent a trigger or stick direction must reach to press a digital control it is mapped to | `50` | none |
 | `input.pad_invert_ly` | bool | the left stick's Y axis is inverted, before `left_stick`/`right_stick` swap | `false` | none |
 | `input.pad_invert_ry` | bool | the right stick's Y axis is inverted | `false` | none |
-| `input.glyphs` | string | `"auto"`, `"xbox"`, `"playstation"`, `"nintendo"`, `"steam"`: the button family the overlay names buttons by; `auto` asks the pad (below) | `"auto"` | none |
+| `input.glyphs` | string | `"auto"`, `"xbox"`, `"playstation"`, `"nintendo"`, `"steam"`, `"generic"`, `"gamecube"`: the button family the overlay draws button glyphs for (`generic` is lettered, for a pad of no known family); `auto` asks the pad (below), and stays `xbox` on Windows and under Proton, where XInput cannot tell | `"auto"` | none |
 
 These defaults are the layer's. The three stick knobs default to the
 legacy keyboard (no ramp, no walk key), so a title that ships no `[input]`
@@ -966,8 +966,9 @@ same per-file counts:
 
 **Pad family and Steam Input.** `xbox_InputPadFamily(slot)` says which
 button family a pad has, for the overlay's glyphs: `xbox`, `playstation`,
-`nintendo` (the GameCube adapter too) or `steam` (the Deck's own pad,
-28de:1205). SDL builds take it from SDL's pad type and the vendor and
+`nintendo`, `steam` (the Deck's own pad, 28de:1205), `gamecube` (SDL 3.4's
+GameCube type, whose A X B Y sit south, east, west, north) or `generic` (a
+pad SDL cannot name). SDL builds take it from SDL's pad type and the vendor and
 product; the XInput backend answers `xbox`. `input.glyphs` other than
 `auto` overrides it for every pad. `xbox_InputSteamInput(slot)` says
 whether Steam Input stands between the pad and the game: on SDL, `on` when

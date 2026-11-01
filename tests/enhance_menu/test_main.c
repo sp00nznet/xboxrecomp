@@ -2270,8 +2270,8 @@ static void test_pages(void)
 {
     /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Files. */
     static const uint32_t k_sum[9] = {
-        0x39322648u, 0x50367F1Eu, 0x3FC9A1FBu, 0x0F4B7064u, 0x64E35CB8u,
-        0xDE84570Bu, 0x8633F632u, 0xE72426AAu, 0xB2C4E2BAu };
+        0x9AD1EDFBu, 0x56FBA3A9u, 0xBD70CA3Fu, 0xB2801A34u, 0x17B2AA5Bu,
+        0x4AC9D35Bu, 0xF59BEA21u, 0x775CBD55u, 0x79909E2Du };
     start_with(ARMED, k_mods);
     open_menu();
     CHECK(enhance_menu_is_open());

@@ -56,7 +56,8 @@
 static const char *const s_look[]    = { "right_stick", "left_stick", "none", NULL };
 static const char *const s_capture[] = { "focus", "click", "never", NULL };
 /* input.glyphs: "auto", then the families in xbox_InputPadFamily order. */
-static const char *const s_glyphs[] = { "auto", "xbox", "playstation", "nintendo", "steam", NULL };
+static const char *const s_glyphs[] = { "auto", "xbox", "playstation", "nintendo", "steam",
+                                        "generic", "gamecube", NULL };
 
 static void say(const recomp_cfg *c, const char *key, const char *fmt, ...)
 {

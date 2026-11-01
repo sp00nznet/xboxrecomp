@@ -14,6 +14,11 @@
  *   lock      the menu-step try-lock between two threads
  *   cut       a page larger than the menu's room is cut at a command
  *   stats     every site inert with the flag clear
+ *   glyphs    the input glyph per family and source against glyphs.txt,
+ *             the mouse and key glyphs, every icon present; a page of pad
+ *             glyphs, icons and key caps through the reference raster
+ *   fit       the atlas at effective scale 3.0 (3240 lines) with the text
+ *             and both symbol faces fits 2048x2048
  *
  * A checksum of 0 below means "not pinned yet": the run prints the value.
  * A change to the converter, the font or the theme moves them: look at the
@@ -26,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "nv2a_overlay_glyph.h"
 #include "nv2a_overlay_int.h"
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
@@ -201,9 +207,9 @@ static const struct nv2a_ovl_list *frame_menu(uint32_t w, uint32_t h)
 static void test_frames(void)
 {
     static const struct { uint32_t w, h, stats, toasts, menu, r_stats, r_toasts, r_menu; } k[] = {
-        { 1280, 720, 0x606236B2, 0x4C0CBF51, 0xB39CFEBA, 0xB9132C4B, 0xFA0DCF41, 0x37B714FC },
-        { 1920, 1080, 0xD7FC2826, 0x7C13F9FE, 0x423268CE, 0x43F3F099, 0x95E89618, 0x7F614211 },
-        { 3840, 2160, 0x0C854DA4, 0x637C78CD, 0xB546DDBD, 0xBF6C09F6, 0xF1FFAF9E, 0xC011863F },
+        { 1280, 720, 0xFD8E9965, 0xC53253A5, 0x8D3BDF3E, 0x12641917, 0xEBC8FED3, 0xFCE76C3F },
+        { 1920, 1080, 0xDD4A23F1, 0xA0D4E102, 0xCB4EB246, 0x43F3F099, 0xFC74F6D4, 0xD50FC312 },
+        { 3840, 2160, 0x9D985883, 0x5F2183B5, 0x19B3A385, 0xA795B36D, 0x776C110B, 0xAC983065 },
     };
     const struct nv2a_ovl_atlas *a;
     unsigned i;
@@ -588,6 +594,241 @@ static void test_cut(void)
     CHECK(l && l->nvtx % 4 == 0, "a glyph cut in half");
 }
 
+/* glyphs.txt, the generator's own listing of the input font: U+XXXX,
+ * block, slot name, source. */
+#define MAX_ROWS 256
+static uint32_t s_rows[MAX_ROWS];
+static int s_nrows;
+
+static int load_glyphs_txt(void)
+{
+    FILE *f = fopen(GLYPHS_TXT, "r");
+    char line[256];
+    if (!f)
+        return 0;
+    s_nrows = 0;
+    while (fgets(line, sizeof line, f) && s_nrows < MAX_ROWS) {
+        unsigned cp;
+        if (sscanf(line, "U+%X", &cp) == 1)
+            s_rows[s_nrows++] = cp;
+    }
+    fclose(f);
+    return s_nrows;
+}
+
+static int listed(uint32_t cp)
+{
+    int i;
+    for (i = 0; i < s_nrows; i++)
+        if (s_rows[i] == cp)
+            return 1;
+    return 0;
+}
+
+static const char *test_namer(int vk, char *buf, int n)
+{
+    switch (vk) {
+    case 0x1B: snprintf(buf, (size_t)n, "Esc"); return buf;
+    case 0x20: snprintf(buf, (size_t)n, "Space"); return buf;
+    case 0x70: snprintf(buf, (size_t)n, "F1"); return buf;
+    }
+    return NULL;
+}
+
+/* The pad glyphs of every family, the mouse, the icons and three key
+ * caps (two named, one in hex) on one panel. */
+static const struct nv2a_ovl_list *frame_glyphs(uint32_t w, uint32_t h)
+{
+    static const int srcs[] = { 1, 2, 3, 4, 6, 7, 10, 22, NV2A_OVL_SRC_DPAD, NV2A_OVL_SRC_LSTICK };
+    static const uint32_t icons[] = { NV2A_OVL_ICON_SLIDERS, NV2A_OVL_ICON_GAMEPAD,
+                                      NV2A_OVL_ICON_KEYBOARD, NV2A_OVL_ICON_CHECK,
+                                      NV2A_OVL_ICON_CLOSE, NV2A_OVL_ICON_FOLDER };
+    static const int keys[] = { 0x1B, 0x20, 0x70, 0x41 };
+    const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+    float s = nv2a_ovl_ui_scale(h);
+    int pad = nv2a_ovl_px(s, t->pad), line = nv2a_ovl_px(s, t->font_body);
+    mu_Font body = OVL_FONT(OVL_FONT_BODY, line, 0);
+    mu_Rect panel = mu_rect(pad, pad, (int)w / 2, (int)h - 2 * pad);
+    mu_Context *ctx;
+    int fam, i, x, y = panel.y + pad;
+    nv2a_overlay_set_placement(0, 0, (int)w, (int)h);
+    ctx = nv2a_overlay_ui_begin(NV2A_OVL_MENU);
+    nv2a_ovl_ui_rrect(ctx, panel, nv2a_ovl_px(s, t->radius), 1.0f, t->bg);
+    for (fam = 0; fam < 5; fam++, y += line + pad / 2) {
+        x = panel.x + pad;
+        for (i = 0; i < (int)(sizeof srcs / sizeof srcs[0]); i++, x += line + pad / 2)
+            nv2a_ovl_ui_glyph(ctx, nv2a_ovl_glyph_src(fam, srcs[i]), mu_rect(x, y, line, line),
+                              t->text);
+    }
+    x = panel.x + pad;
+    for (i = 0; i < NV2A_OVL_MOUSE_COUNT; i++, x += line + pad / 2)
+        nv2a_ovl_ui_glyph(ctx, nv2a_ovl_glyph_mouse(i), mu_rect(x, y, line, line), t->text);
+    y += line + pad / 2;
+    x = panel.x + pad;
+    for (i = 0; i < (int)(sizeof icons / sizeof icons[0]); i++, x += line + pad / 2)
+        nv2a_ovl_ui_glyph(ctx, nv2a_ovl_glyph_icon(icons[i]), mu_rect(x, y, line, line), t->accent);
+    y += line + pad / 2;
+    x = panel.x + pad;
+    for (i = 0; i < (int)(sizeof keys / sizeof keys[0]); i++) {
+        nv2a_ovl_glyph g = nv2a_ovl_glyph_key(keys[i]);
+        int gw = nv2a_ovl_glyph_width(g, body);
+        nv2a_ovl_ui_glyph(ctx, g, mu_rect(x, y, gw, line), t->text);
+        x += gw + pad / 2;
+    }
+    y += line + pad / 2;
+    /* The rebinding prompt's size: twice body. */
+    nv2a_ovl_ui_glyph(ctx, nv2a_ovl_glyph_src(2, 1), mu_rect(panel.x + pad, y, 2 * line, 2 * line),
+                      t->text);
+    nv2a_overlay_ui_publish(NV2A_OVL_MENU);
+    return nv2a_overlay_acquire(NV2A_OVL_MENU);
+}
+
+static void test_glyphs(void)
+{
+    static const struct { uint32_t w, h, list, ref; } k[] = {
+        { 1920, 1080, 0xC52EFB2D, 0xB1EF752D },
+        { 3840, 2160, 0xE13B42EC, 0x661A4547 },
+    };
+    int fam, src, i;
+    unsigned j;
+    CHECK(load_glyphs_txt() > 100, "glyphs.txt at %s: %d rows", GLYPHS_TXT, s_nrows);
+    for (i = 0; i < s_nrows; i++)
+        CHECK(nv2a_ovl_font_has_symbol(OVL_FACE_INPUT, s_rows[i]), "U+%04X listed, not in the font",
+              s_rows[i]);
+    /* Per family and source: the family's own glyph, the home glyph for
+     * the guide, the Xbox glyph for what the generic family lacks and the
+     * Nintendo one for what the GameCube lacks, else none. Positional:
+     * Nintendo's south is its "B". The GameCube's block is 7. */
+    for (fam = 0; fam < 6; fam++)
+        for (src = 1; src <= NV2A_OVL_SRC_RSTICK; src++) {
+            uint32_t blk = fam == 5 ? 7u : (uint32_t)fam;
+            uint32_t own = 0xE000u + 0x40u * blk + (uint32_t)src, want = 0;
+            nv2a_ovl_glyph g = nv2a_ovl_glyph_src(fam, src);
+            if (src == 6)
+                want = 0xE180;
+            else if (listed(own))
+                want = own;
+            else if (fam == 4 && listed(0xE000u + (uint32_t)src))
+                want = 0xE000u + (uint32_t)src;
+            else if (fam == 5 && listed(0xE080u + (uint32_t)src))
+                want = 0xE080u + (uint32_t)src;
+            CHECK(want ? g == NV2A_OVL_GLYPH(NV2A_OVL_GLYPH_INPUT, want) : g == 0,
+                  "family %d source %d: 0x%08X, want U+%04X", fam, src, g, want);
+        }
+    CHECK(nv2a_ovl_glyph_src(2, 1) == NV2A_OVL_GLYPH(NV2A_OVL_GLYPH_INPUT, 0xE081),
+          "Switch south is not B");
+    CHECK(nv2a_ovl_glyph_src(5, 1) == NV2A_OVL_GLYPH(NV2A_OVL_GLYPH_INPUT, 0xE1C1)
+              && nv2a_ovl_glyph_src(5, 3) == NV2A_OVL_GLYPH(NV2A_OVL_GLYPH_INPUT, 0xE1C3)
+              && nv2a_ovl_glyph_src(5, 5) == nv2a_ovl_glyph_src(2, 5),
+          "GameCube: its own A south and B west, the Switch's minus for back");
+    CHECK(nv2a_ovl_glyph_src(4, 1) == nv2a_ovl_glyph_src(0, 1) && nv2a_ovl_glyph_src(4, 5)
+              == NV2A_OVL_GLYPH(NV2A_OVL_GLYPH_INPUT, 0xE105), "generic south and back");
+    CHECK(nv2a_ovl_glyph_src(0, 18) == 0 && nv2a_ovl_glyph_src(3, 18) != 0,
+          "paddle1: Xbox has none, the Deck has R4");
+    CHECK(nv2a_ovl_glyph_src(-1, 1) == nv2a_ovl_glyph_src(0, 1)
+              && nv2a_ovl_glyph_src(9, 1) == nv2a_ovl_glyph_src(0, 1), "out-of-range family");
+    CHECK(nv2a_ovl_glyph_src(0, 0) == 0 && nv2a_ovl_glyph_src(0, NV2A_OVL_SRC_RSTICK + 1) == 0,
+          "out-of-range source");
+    for (i = 0; i < NV2A_OVL_MOUSE_COUNT; i++)
+        CHECK(nv2a_ovl_glyph_mouse(i) == NV2A_OVL_GLYPH(NV2A_OVL_GLYPH_INPUT, 0xE140u + (uint32_t)i),
+              "mouse %d", i);
+    CHECK(nv2a_ovl_glyph_mouse(-1) == 0 && nv2a_ovl_glyph_mouse(NV2A_OVL_MOUSE_COUNT) == 0,
+          "out-of-range mouse");
+    CHECK(nv2a_ovl_glyph_key(0x01) == nv2a_ovl_glyph_mouse(NV2A_OVL_MOUSE_LEFT)
+              && nv2a_ovl_glyph_key(0x02) == nv2a_ovl_glyph_mouse(NV2A_OVL_MOUSE_RIGHT)
+              && nv2a_ovl_glyph_key(0x04) == nv2a_ovl_glyph_mouse(NV2A_OVL_MOUSE_MIDDLE),
+          "mouse button keys");
+    CHECK(nv2a_ovl_glyph_key(0x41) == NV2A_OVL_GLYPH(NV2A_OVL_GLYPH_KEY, 0x41)
+              && nv2a_ovl_glyph_key(0) == 0 && nv2a_ovl_glyph_key(0x100) == 0, "key glyphs");
+    {
+        static const uint32_t icons[] = {
+            NV2A_OVL_ICON_SLIDERS, NV2A_OVL_ICON_SPARKLES, NV2A_OVL_ICON_PACKAGE,
+            NV2A_OVL_ICON_GAMEPAD, NV2A_OVL_ICON_PUZZLE, NV2A_OVL_ICON_ACTIVITY,
+            NV2A_OVL_ICON_KEYBOARD, NV2A_OVL_ICON_BUG, NV2A_OVL_ICON_FOLDER,
+            NV2A_OVL_ICON_HELP, NV2A_OVL_ICON_MAXIMIZE, NV2A_OVL_ICON_MINIMIZE,
+            NV2A_OVL_ICON_CLOSE, NV2A_OVL_ICON_CHECK, NV2A_OVL_ICON_CHEVRON_LEFT,
+            NV2A_OVL_ICON_CHEVRON_RIGHT, NV2A_OVL_ICON_RESET, NV2A_OVL_ICON_UPLOAD,
+            NV2A_OVL_ICON_DOWNLOAD,
+        };
+        for (j = 0; j < sizeof icons / sizeof icons[0]; j++)
+            CHECK(nv2a_ovl_glyph_icon(icons[j]) == NV2A_OVL_GLYPH(NV2A_OVL_GLYPH_ICON, icons[j]),
+                  "icon U+%04X missing", icons[j]);
+        CHECK(nv2a_ovl_glyph_icon(0x41) == 0, "a letter is an icon");
+    }
+
+    nv2a_overlay_reset_for_test();
+    CHECK(nv2a_overlay_arm(0xF, 1080) == 0, "arm");
+    {
+        mu_Font f = OVL_FONT(OVL_FONT_BODY, 22, 0);
+        nv2a_ovl_glyph_set_key_namer(NULL);
+        CHECK(nv2a_ovl_glyph_width(nv2a_ovl_glyph_src(0, 1), f) == 22, "a symbol is a square");
+        CHECK(nv2a_ovl_glyph_width(nv2a_ovl_glyph_key(0x41), f) >= 22, "a cap narrower than tall");
+        nv2a_ovl_glyph_set_key_namer(test_namer);
+        CHECK(nv2a_ovl_glyph_width(nv2a_ovl_glyph_key(0x20), f)
+                  > nv2a_ovl_glyph_width(nv2a_ovl_glyph_key(0x70), f),
+              "Space is not wider than F1");
+    }
+    for (j = 0; j < sizeof k / sizeof k[0]; j++) {
+        char what[64];
+        const struct nv2a_ovl_list *l = frame_glyphs(k[j].w, k[j].h);
+        uint32_t c, glyph_tex = 0;
+        CHECK(l && well_formed(l), "glyphs at %u: malformed", k[j].h);
+        if (!l)
+            continue;
+        for (c = 0; c < l->ncmd; c++)
+            glyph_tex += l->cmd[c].tex == 0;
+        CHECK(glyph_tex >= 1, "glyphs at %u: nothing from the atlas", k[j].h);
+        snprintf(what, sizeof what, "glyph list at %u", k[j].h);
+        pin(what, l->sum, k[j].list);
+        snprintf(what, sizeof what, "glyphs-%u", k[j].h);
+        pin(what, raster(what, l, (int)k[j].w, (int)k[j].h), k[j].ref);
+    }
+    nv2a_ovl_glyph_set_key_namer(NULL);
+}
+
+/* The menu packs three text sizes, the icons at those and the input
+ * glyphs at small, body and twice body. At 3240 lines (effective scale
+ * 3.0: 1080 lines at render scale 3) it must fit 2048x2048, the twice-body
+ * input size left out if need be, and every glyph must have been packed. */
+static void test_fit(void)
+{
+    const struct nv2a_ovl_atlas *a;
+    struct nv2a_ovl_quad q;
+    int i;
+    nv2a_overlay_reset_for_test();
+    CHECK(nv2a_ovl_font_bake(3240, 1) == 0, "no atlas at 3240 lines");
+    a = nv2a_ovl_font_atlas();
+    CHECK(a && a->w <= 2048 && a->h <= 2048, "atlas %ux%u at 3240 lines", a ? a->w : 0,
+          a ? a->h : 0);
+    if (a)
+        printf("atlas at 3240 lines: %ux%u\n", a->w, a->h);
+    for (i = 0; i < s_nrows; i++)
+        CHECK(nv2a_ovl_font_symbol(OVL_FACE_INPUT, s_rows[i], 0, 0, 96, &q)
+                  && q.x1 > q.x0 && q.u1 > q.u0, "U+%04X not packed at 3240", s_rows[i]);
+    CHECK(nv2a_ovl_font_symbol(OVL_FACE_ICONS, NV2A_OVL_ICON_GAMEPAD, 0, 0, 96, &q),
+          "an icon not packed at 3240");
+    nv2a_ovl_font_free();
+
+    /* The strip and the toasts alone keep the text-only atlas of before
+     * the symbol faces, and draw no symbol. */
+    nv2a_overlay_reset_for_test();
+    CHECK(nv2a_overlay_arm(1u << NV2A_OVL_STATS | 1u << NV2A_OVL_TOAST, 1080) == 0, "arm");
+    a = nv2a_ovl_font_atlas();
+    CHECK(a && a->w == 512 && a->h == 1024, "stats-only atlas %ux%u", a ? a->w : 0,
+          a ? a->h : 0);
+    CHECK(!nv2a_ovl_font_symbols()
+              && !nv2a_ovl_font_has_symbol(OVL_FACE_ICONS, NV2A_OVL_ICON_GAMEPAD)
+              && !nv2a_ovl_font_symbol(OVL_FACE_ICONS, NV2A_OVL_ICON_GAMEPAD, 0, 0, 22, &q),
+          "symbols in a stats-only atlas");
+    /* The menu armed next, before anything drew, bakes them in. */
+    CHECK(nv2a_overlay_arm(1u << NV2A_OVL_MENU, 1080) == 0, "arm the menu");
+    CHECK(nv2a_ovl_font_symbols()
+              && nv2a_ovl_font_symbol(OVL_FACE_ICONS, NV2A_OVL_ICON_GAMEPAD, 0, 0, 22, &q),
+          "no symbols once the menu armed");
+    nv2a_overlay_reset_for_test();
+}
+
+
 static void test_stats(void)
 {
     struct nv2a_stats_snap s;
@@ -634,6 +875,8 @@ int main(void)
     test_lock();
     test_cut();
     test_stats();
+    test_glyphs();
+    test_fit();
     nv2a_overlay_reset_for_test();
     if (fails) {
         printf("overlay: %d failure(s)\n", fails);
