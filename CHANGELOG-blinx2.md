@@ -9,6 +9,61 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.12.0] - 2026-11-01
+
+### Added
+- The in-game menu marks each row whose value differs from the saved
+  config, saves from any page (Save, or Cmd/Ctrl+S) and reverts a row on
+  its own. Closing with unsaved changes asks *Exit without saving*,
+  *Exit and Save* or *Go Back*. The selected row's help shows in the
+  footer, and L3 toggles the hints. A Cmd+S pressed during a rename, a
+  capture or the close dialog is dropped, so it never saves a half edit.
+- Shader parameters on the Shaders page can be toggles and choices, not
+  only sliders, so on/off effects and modes no longer read as a 0..1
+  float. The kind comes from the shader's own annotations, with a
+  sidecar file for shaders that carry none.
+- A mod's captured controls read from one port-0 pad record and can be
+  rebound on the Mods page. Ports other than 0 are left to the game, so a
+  mod never takes a second player's pad.
+- Overlay text can name a pad button or a key by its glyph: Lucide icons
+  and Kenney Input Prompts baked into symbol faces (licences in
+  `LICENSES/`), key names in the window's keyboard layout, and a
+  GameCube family.
+- Groundwork for the menu's coming text fields and Files page: a text
+  input ring the host window feeds (SDL text input; Win32 `WM_CHAR` with
+  DBCS lead bytes) and the menu reads without racing the host thread, and
+  a UI-free file browser model for importing and exporting configs that
+  never overwrites a file, never follows a planted link and refuses
+  names Windows would refuse, on every host.
+- HUD tables take a `full` group key: full-width backings (a pause dim, a
+  dialogue gradient, a battle zoom) stretch to the wide frame instead of
+  staying boxed in 4:3.
+- `present.shader_lines` (`"auto"`, `"guest"`, `"host"`) picks whether a
+  shader chain gets the guest's line count or the scaled frame; `auto`
+  decides by the preset's name or a profile's `lines`.
+
+### Changed
+- The HUD layer's stretch moves only the edge still inside the 4:3 band,
+  and an already-wide batch counts as full width once it passes one band
+  edge. A batch with no triangle list keeps the two-edge rule. With the
+  layer on, BLiNX 2's locker-room backdrop now covers the frame, as it
+  does with the layer off.
+
+### Fixed
+- The shader chain draws into the stock picture's rect instead of over
+  the whole window, on Metal and D3D11.
+- CRT presets are fed the guest's 480 lines, so at render scale 2 or 3
+  their scanline mask no longer beats against the output in wide bands.
+  Other presets (`fsr`) still get the scaled frame.
+- Hor+: a post pass that reads the padded frame is no longer taken for a
+  movie and put back at 4:3, which left a seam and cut the lens flare in
+  BLiNX 1.
+- The lifter's 8- and 16-bit one-operand `mul`, `imul`, `div` and `idiv`
+  read and write AL, AX, AH and DX as the CPU does. They were lifted as
+  the 32-bit forms, so `imul cl` wrote the high half into EDX and
+  `div r/m8` divided EDX:EAX; BLiNX 1 had a function whose float came out
+  as 0 or NaN. Regenerate gen to pick it up.
+
 ## [blinx2-v0.11.0] - 2026-10-31
 
 ### Added
