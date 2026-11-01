@@ -2194,7 +2194,32 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
 }
 
 
+/* The heap is shared by every guest thread -- the title's own, and the kernel
+ * timer thread running DPCs (XNet allocates packet memory from its receive
+ * DPC) -- so the block table is locked like the contiguous arena above.
+ * Without it two allocations could be handed the same block: in System Link
+ * matches packet data landed in texture memory as green and purple noise. */
+static SRWLOCK g_heap_lock = SRWLOCK_INIT;
+static uint32_t heap_alloc_unlocked(uint32_t size, uint32_t alignment);
+static void heap_free_unlocked(uint32_t xbox_va);
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+    AcquireSRWLockExclusive(&g_heap_lock);
+    r = heap_alloc_unlocked(size, alignment);
+    ReleaseSRWLockExclusive(&g_heap_lock);
+    return r;
+}
+
+void xbox_HeapFree(uint32_t xbox_va)
+{
+    AcquireSRWLockExclusive(&g_heap_lock);
+    heap_free_unlocked(xbox_va);
+    ReleaseSRWLockExclusive(&g_heap_lock);
+}
+
+static uint32_t heap_alloc_unlocked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
@@ -2303,7 +2328,17 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
  * forward is asking about the block that contains it. Returns 0 for an address
  * this heap never handed out, which is what "not one of mine" has to look like.
  */
+static uint32_t heap_block_size_unlocked(uint32_t xbox_va);
 uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+{
+    uint32_t r;
+    AcquireSRWLockShared(&g_heap_lock);
+    r = heap_block_size_unlocked(xbox_va);
+    ReleaseSRWLockShared(&g_heap_lock);
+    return r;
+}
+
+static uint32_t heap_block_size_unlocked(uint32_t xbox_va)
 {
     int i;
 
@@ -2319,7 +2354,7 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
     return 0;
 }
 
-void xbox_HeapFree(uint32_t xbox_va)
+static void heap_free_unlocked(uint32_t xbox_va)
 {
     static int frees = 0, matched = 0;
 
