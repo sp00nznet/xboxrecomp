@@ -164,6 +164,47 @@ int enhance_action_check(const char *text, char *why, size_t n);
  * (menu.open's, else the written one over a default, else the first
  * registered). */
 int enhance_action_owner(const char *text, int except, char *bound, size_t n);
+/* ---- captured controls (mod.h XBOX_CTL_BUTTON and _STICK; mod-settings D3)
+ *
+ * A captured control's binding names a guest source, as the game sees it
+ * after [input.pad] and [input.bindings], by its lowercase control name
+ * ("rt", "x", "white", "left_stick"), or else a host key by its key name
+ * ("Space", "E", "up"), read from the framebuffer key state. The two sets
+ * share no name. Host-only buttons have no guest slot and are no source
+ * here. */
+enum {
+    ENHANCE_CTL_NONE,
+    ENHANCE_CTL_BUTTON,         /* idx: the wButtons bit (dpad, start, back, thumbs) */
+    ENHANCE_CTL_ANALOG,         /* idx: bAnalogButtons[] (a .. right trigger) */
+    ENHANCE_CTL_STICK,          /* idx: XBOX_CTL_SRC_LEFT or _RIGHT */
+    ENHANCE_CTL_KEY             /* key: the virtual-key code */
+};
+struct enhance_ctl_src {
+    int type, idx, key;
+};
+/* text into *out: 1, or 0 (out type NONE) when it names no source. */
+int enhance_control_parse(const char *text, struct enhance_ctl_src *out);
+int enhance_control_same(const struct enhance_ctl_src *a, const struct enhance_ctl_src *b);
+/* The menu's capture: the guest source host pad source src (input_map.h)
+ * feeds under the active pad setup, as a binding for a STICK row (stick
+ * 1: the whole stick a direction belongs to) or a BUTTON row (stick 0).
+ * 1 with the name in out, or 0 with the refusal in why ("fly controls
+ * take buttons the game sees" for a source with no guest slot). */
+int enhance_control_from_host(int src, int stick, char *out, size_t n, char *why, size_t wn);
+/* D3's conflict rules for text bound to mod m's control k: 0, or 1 with
+ * the owner in why ("F6 is Free camera: Toggle flight"). Rule 1: another
+ * captured control of m binds it (its index in *other, else -1). Rule 2: a
+ * key that an action has as its single key (a dormant one too). Controls
+ * of other mods may share a source (one mod captures at a time), and a
+ * button may sit in an action's chord (the consumed-chord mask takes it
+ * out before the record). */
+int enhance_control_conflict(int m, uint32_t k, const char *text, int *other,
+                             char *why, size_t n);
+/* Rule 2 the other way: an action bound to text, a key with no modifier,
+ * that a captured control names directly. 1 with the owner in why ("Free
+ * camera: Rise uses it"). */
+int enhance_action_control_clash(const char *text, char *why, size_t n);
+
 /* While on (the menu's capture), nothing fires: an input held meanwhile
  * fires only after its release. Turning it off takes effect one port-0
  * step later for keys and port 0 (at once for other ports), so a key that ended the capture before any step saw it held

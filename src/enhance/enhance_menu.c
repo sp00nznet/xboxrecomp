@@ -869,7 +869,7 @@ enum row_type {
     R_SLOT, R_INFO, R_HEADER, R_BIND, R_MOD, R_RESET,
     R_FILEIO,           /* Files: import (ref 0) or export (1), hidden for now */
     R_TEXT,             /* one wrapped line of a mod's Author, About or State */
-    R_CTL,              /* a mod's captured control: read only until phase D */
+    R_CTL,              /* a mod's captured control (BUTTON, STICK): rebound by capture */
     R_MODRESET,         /* "Reset this mod" */
     R_PARAM,            /* a shader parameter: ref indexes s_ptab */
     R_PRESET,           /* "Reset to preset" */
@@ -948,8 +948,11 @@ static int s_nrow;
 
 /* capture */
 enum { CAP_OFF, CAP_RELEASE, CAP_ARMED };
+/* What the capture binds: an action (id its id), or a mod's captured
+ * control (id the R_CTL ref), a BUTTON or a STICK row. */
+enum { CAP_ACTION, CAP_CTL_BUTTON, CAP_CTL_STICK };
 static struct {
-    int phase, id;
+    int phase, id, what;
     uint64_t t0, t_set;
     uint32_t max, last;
 } s_cap;
@@ -1392,11 +1395,10 @@ static void ctl_row(int m, uint32_t k, int ok)
         return;
     ctl_value(m, k, r->value, sizeof r->value);
     r->note = c->when;
-    /* Rebinding a captured control lands in phase D; until then the row
-     * says where its bindings come from. */
-    snprintf(r->help, sizeof r->help, "%s%s[input.controls] \"%s.%s\" and [input.bindings] set it",
-             c->help ? c->help : "", c->help && *c->help ? " \xC2\xB7 " : "", xbox_mod_name(m),
-             c->id);
+    snprintf(r->help, sizeof r->help, "%s%s%s",
+             c->help ? c->help : "", c->help && *c->help ? " \xC2\xB7 " : "",
+             c->kind == XBOX_CTL_STICK ? "A: push a stick to swap"
+                                       : "A: add a key or a game button \xC2\xB7 X: drop the last");
 }
 
 /* The keys under the mod's names no lookup read: typos the player can
@@ -2167,8 +2169,10 @@ static void build_rows(void)
  * under its current key, the alias removed (D4). */
 #define REWRITES_MAX 64
 /* + 2: the profile choice, present.profile and present.shader (D5). */
+/* + CTL_PENDING_MAX: the mods' captured controls ([input.controls]). */
+#define CTL_PENDING_MAX 64
 #define PENDING_MAX (SLOTS_MAX + ENHANCE_ACTIONS_MAX + MODS_MAX + 2 * REWRITES_MAX \
-                     + NV2A_PRESENT_OVERRIDES_MAX + 2)
+                     + NV2A_PRESENT_OVERRIDES_MAX + 2 + CTL_PENDING_MAX)
 static char s_pkey[PENDING_MAX][96];
 static char s_pval[PENDING_MAX][VAL_MAX * 4];
 static int s_pnull[PENDING_MAX];
@@ -2284,6 +2288,35 @@ static int rewrites(int n)
     return n;
 }
 
+/* Bindings as the TOML array a Save writes. */
+static void list_literal(bind_list l, int nl, char *out, size_t n)
+{
+    size_t at = (size_t)snprintf(out, n, "[");
+    for (int k = 0; k < nl && at < n; k++) {
+        char q[ENHANCE_ACTION_TEXT * 2 + 4];
+        recomp_cfg_quote(l[k], q, sizeof q);
+        at += (size_t)snprintf(out + at, n - at, "%s%s", k ? ", " : "", q);
+    }
+    if (at < n)
+        snprintf(out + at, n - at, "]");
+}
+
+/* Mod m's control count (the captured ones answer xbox_mod_control_key). */
+static uint32_t ctl_count(int m)
+{
+    const struct xbox_mod_desc *d = xbox_mod_desc_of(m);
+    return d ? d->n_controls : 0;
+}
+
+static int ctl_dirty(int only)
+{
+    int n = 0;
+    for (int m = 0; m < xbox_mod_count(); m++)
+        for (uint32_t k = 0; (only < 0 || only == m) && k < ctl_count(m); k++)
+            n += xbox_mod_control_dirty(m, k);
+    return n;
+}
+
 static int collect(void)
 {
     int n = 0;
@@ -2313,23 +2346,30 @@ static int collect(void)
     for (int id = 0; id < enhance_action_count() && id < ENHANCE_ACTIONS_MAX; id++) {
         bind_list cur, stock;
         int nc, ns;
-        size_t at;
         if (!binds_dirty(id))
             continue;
         nc = enhance_action_bindings(id, cur, ENHANCE_ACTION_BINDS);
         ns = action_stock(id, stock);
         snprintf(s_pkey[n], sizeof s_pkey[n], "input.actions.%s", enhance_action_name(id));
         s_pnull[n] = lists_equal(cur, nc, stock, ns);
-        at = (size_t)snprintf(s_pval[n], sizeof s_pval[n], "[");
-        for (int k = 0; k < nc; k++) {
-            char q[ENHANCE_ACTION_TEXT * 2 + 4];
-            recomp_cfg_quote(cur[k], q, sizeof q);
-            at += (size_t)snprintf(s_pval[n] + at, sizeof s_pval[n] - at, "%s%s",
-                                   k ? ", " : "", q);
-        }
-        snprintf(s_pval[n] + at, sizeof s_pval[n] - at, "]");
+        list_literal(cur, nc, s_pval[n], sizeof s_pval[n]);
         n++;
     }
+    /* A captured control back at its stock removes its key, as an action
+     * does. */
+    for (int m = 0, c = 0; m < xbox_mod_count(); m++)
+        for (uint32_t k = 0; k < ctl_count(m) && c < CTL_PENDING_MAX; k++) {
+            bind_list cur;
+            int nc;
+            if (!xbox_mod_control_dirty(m, k))
+                continue;
+            nc = xbox_mod_control_bindings(m, k, cur, ENHANCE_ACTION_BINDS, NULL);
+            snprintf(s_pkey[n], sizeof s_pkey[n], "%s", xbox_mod_control_key(m, k));
+            s_pnull[n] = xbox_mod_control_is_stock(m, k);
+            list_literal(cur, nc, s_pval[n], sizeof s_pval[n]);
+            n++;
+            c++;
+        }
     /* The shader parameters that moved: a removed override deletes its
      * key, so the file holds differences from the preset only. */
     for (int i = 0;; i++) {
@@ -2383,7 +2423,7 @@ int enhance_menu_unsaved(void)
             n++;
     for (int id = 0; id < ENHANCE_ACTIONS_MAX; id++)
         n += binds_dirty(id);
-    return n + nv2a_present_chain_overrides_dirty() + shader_edit_unsaved();
+    return n + ctl_dirty(-1) + nv2a_present_chain_overrides_dirty() + shader_edit_unsaved();
 }
 
 /* Every missing directory above `path`, outermost first: a user config
@@ -2463,6 +2503,9 @@ static int save(void)
         memcpy(s_slot[i].base, s_slot[i].cur, sizeof s_slot[i].base);
     for (int id = 0; id < enhance_action_count() && id < ENHANCE_ACTIONS_MAX; id++)
         abase_take(id);
+    for (int m = 0; m < xbox_mod_count(); m++)
+        for (uint32_t k = 0; k < ctl_count(m); k++)
+            xbox_mod_control_mark_saved(m, k);
     nv2a_present_chain_overrides_saved();
     shader_edit_config_saved();
     s_rw_done = 1;
@@ -2510,6 +2553,18 @@ static void reset_scope(int m)
         if (!lists_equal(cur, nc, stock, ns))
             action_set(id, stock, ns);
     }
+    for (int g = 0; g < xbox_mod_count(); g++)
+        for (uint32_t k = 0; (m < 0 || g == m) && k < ctl_count(g); k++) {
+            bind_list stock;
+            const char *t[ENHANCE_ACTION_BINDS];
+            int ns;
+            if (xbox_mod_control_forced(g, k) || xbox_mod_control_is_stock(g, k))
+                continue;
+            ns = xbox_mod_control_stock(g, k, stock, ENHANCE_ACTION_BINDS);
+            for (int b = 0; b < ns; b++)
+                t[b] = stock[b];
+            xbox_mod_control_set_bindings(g, k, t, ns);
+        }
 }
 
 static void reset_all(void)
@@ -2679,6 +2734,29 @@ static void change_slot(struct slot *s, int dir, int ok)
     }
     if (it->live == ENHANCE_LIVE_RESTART && it->kind != ENHANCE_ITEM_ACTION)
         status("%s applies at restart", it->label);
+}
+
+/* X on a captured control: its last binding goes, but one stays, or the
+ * control could never be moved again. */
+static void ctl_drop_last(const struct row *r)
+{
+    int m = r->ref >> 8, n;
+    uint32_t k = (uint32_t)(r->ref & 0xff);
+    bind_list l;
+    const char *t[ENHANCE_ACTION_BINDS];
+    if (xbox_mod_control_forced(m, k)) {
+        status("%s: set by its env row", r->label);
+        return;
+    }
+    n = xbox_mod_control_bindings(m, k, l, ENHANCE_ACTION_BINDS, NULL);
+    if (n <= 1) {
+        status("%s keeps one binding: bind another first", r->label);
+        return;
+    }
+    for (int b = 0; b < n - 1; b++)
+        t[b] = l[b];
+    xbox_mod_control_set_bindings(m, k, t, n - 1);
+    status("%s: %s dropped", r->label, l[n - 1]);
 }
 
 static void clear_binding(int id)
@@ -2897,6 +2975,9 @@ void enhance_menu_revert(void)
             t[k] = s_abase[id][k];
         enhance_action_set_bindings(id, t, s_abase_n[id]);
     }
+    for (int m = 0; m < xbox_mod_count(); m++)
+        for (uint32_t k = 0; k < ctl_count(m); k++)
+            xbox_mod_control_revert(m, k);
     nv2a_present_chain_override_revert();
     shader_edit_revert();
     sh_reset_state();
@@ -2941,6 +3022,17 @@ static int row_state(const struct row *r)
             st |= ENHANCE_ROW_NONDEFAULT;
         return st;
     }
+    case R_CTL: {
+        int m = r->ref >> 8;
+        uint32_t k = (uint32_t)(r->ref & 0xff);
+        if (xbox_mod_control_forced(m, k))
+            st |= ENHANCE_ROW_FORCED;
+        else if (xbox_mod_control_dirty(m, k))
+            st |= ENHANCE_ROW_UNSAVED;
+        if (xbox_mod_control_key(m, k) && !xbox_mod_control_is_stock(m, k))
+            st |= ENHANCE_ROW_NONDEFAULT;
+        return st;
+    }
     case R_PARAM: {
         const struct nv2a_present_param *p = &s_ptab[r->ref];
         float v = p->initial;
@@ -2976,6 +3068,8 @@ static int page_unsaved(int p)
         for (int id = 0; id < ENHANCE_ACTIONS_MAX; id++)
             if (binds_dirty(id))
                 return 1;
+    if (p == PAGE_MODS)
+        return ctl_dirty(-1) > 0;
     if (p == PAGE_SHADERS)
         return nv2a_present_chain_overrides_dirty() + shader_edit_unsaved() > 0;
     return 0;
@@ -3018,6 +3112,12 @@ static void dlg_compose(void)
     for (int id = 0; id < ENHANCE_ACTIONS_MAX; id++)
         if (binds_dirty(id))
             dlg_label(names, sizeof names, &k, enhance_action_label(id));
+    for (int m = 0; m < xbox_mod_count(); m++)
+        for (uint32_t c = 0; c < ctl_count(m); c++)
+            if (xbox_mod_control_dirty(m, c)) {
+                const struct xbox_mod_control *ct = &xbox_mod_desc_of(m)->controls[c];
+                dlg_label(names, sizeof names, &k, ct->label ? ct->label : ct->id);
+            }
     for (int i = 0;; i++) {
         char key[64], name[64];
         float v;
@@ -3200,6 +3300,8 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
     case ENHANCE_EV_CLEAR:
         if (r && r->type == R_BIND)
             clear_binding(r->ref);
+        if (r && r->type == R_CTL)
+            ctl_drop_last(r);
         if (r && r->type == R_SLOT)
             clear_slot(&s_slot[r->ref]);
         if (r && r->type == R_STAGE) {
@@ -3244,10 +3346,20 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
         }
         case R_CTL:
             if (ok) {
-                const struct xbox_mod_control *c =
-                    &xbox_mod_desc_shown(r->ref >> 8)->controls[r->ref & 0xff];
-                status("%s: read-only for now; set [input.controls] \"%s.%s\" in config.toml",
-                       r->label, xbox_mod_name(r->ref >> 8), c->id);
+                int m = r->ref >> 8;
+                uint32_t k = (uint32_t)(r->ref & 0xff);
+                const struct xbox_mod_control *c = &xbox_mod_desc_shown(m)->controls[k];
+                if (xbox_mod_control_forced(m, k)) {
+                    status("%s: set by %s", r->label, c->env ? c->env : "the environment");
+                    break;
+                }
+                cap_phase(CAP_RELEASE);
+                s_cap.id = r->ref;
+                s_cap.what = c->kind == XBOX_CTL_STICK ? CAP_CTL_STICK : CAP_CTL_BUTTON;
+                s_cap.t0 = now_ms;
+                s_cap.max = s_cap.last = 0;
+                status(s_cap.what == CAP_CTL_STICK ? "Push a stick (Esc cancels)"
+                                                   : "Press a key or a pad button (Esc cancels)");
             }
             break;
         case R_PARAM:
@@ -3263,6 +3375,7 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
             if (ok) {
                 cap_phase(CAP_RELEASE);
                 s_cap.id = r->ref;
+                s_cap.what = CAP_ACTION;
                 s_cap.t0 = now_ms;
                 s_cap.max = s_cap.last = 0;
                 status("Press a key or hold a pad chord (Esc cancels)");
@@ -3385,23 +3498,10 @@ static void capture_finish(const char *text)
     }
     /* A key a mod's captured control names directly is the mod's while it
      * captures (D3 conflict rule 2): an action there would fire mid-flight. */
-    for (int m = 0; m < xbox_mod_count(); m++) {
-        const struct xbox_mod_desc *d = xbox_mod_desc_of(m);
-        for (uint32_t k = 0; d && k < d->n_controls; k++) {
-            const struct xbox_mod_control *c = &d->controls[k];
-            bind_list cb;
-            int nb;
-            if (c->kind != XBOX_CTL_BUTTON && c->kind != XBOX_CTL_STICK)
-                continue;
-            nb = xbox_mod_control_bindings(m, k, cb, ENHANCE_ACTION_BINDS, NULL);
-            for (int i = 0; i < nb; i++)
-                if (chord_same(cb[i], text)) {
-                    const char *cl = c->label ? c->label : c->id;
-                    status("%s refused: %s: %s uses it", text, mod_title(m), cl);
-                    nv2a_overlay_toast("%s refused: %s: %s uses it", text, mod_title(m), cl);
-                    return;
-                }
-        }
+    if (enhance_action_control_clash(text, why, sizeof why)) {
+        status("%s refused: %s", text, why);
+        nv2a_overlay_toast("%s refused: %s", text, why);
+        return;
     }
     if (n >= ENHANCE_ACTION_BINDS) {
         status("%s refused: %d bindings at most", text, ENHANCE_ACTION_BINDS);
@@ -3430,6 +3530,127 @@ static void capture_pad_text(uint32_t set, char *out, size_t n)
         snprintf(out + at, n - at, "@%u", CHORD_MS);
 }
 
+static void ctl_refuse(const char *text, const char *why)
+{
+    status("%s refused: %s", text, why);
+    nv2a_overlay_toast("%s refused: %s", text, why);
+}
+
+/* A captured control's capture ends with text, a key name or a guest
+ * source (D3): a BUTTON row adds it, a STICK row replaces its stick and
+ * gives the old one to the row that had the new one. */
+static void ctl_finish(const char *text)
+{
+    int m = s_cap.id >> 8, other, n;
+    uint32_t k = (uint32_t)(s_cap.id & 0xff);
+    const struct xbox_mod_desc *d = xbox_mod_desc_of(m);
+    const struct xbox_mod_control *c;
+    const char *label, *t[ENHANCE_ACTION_BINDS];
+    struct enhance_ctl_src v, h;
+    bind_list l;
+    char why[128];
+
+    cap_phase(CAP_OFF);
+    if (!d || k >= d->n_controls)
+        return;
+    c = &d->controls[k];
+    label = c->label ? c->label : c->id;
+    if (!enhance_control_parse(text, &v)) {
+        ctl_refuse(text, "no key or game button has that name");
+        return;
+    }
+    if ((c->kind == XBOX_CTL_STICK) != (v.type == ENHANCE_CTL_STICK)) {
+        ctl_refuse(text, c->kind == XBOX_CTL_STICK ? "a stick row takes a stick"
+                                                   : "a stick goes on a stick row");
+        return;
+    }
+    n = xbox_mod_control_bindings(m, k, l, ENHANCE_ACTION_BINDS, NULL);
+    for (int b = 0; b < n; b++)
+        if (enhance_control_parse(l[b], &h) && enhance_control_same(&v, &h)) {
+            status("%s is bound already", text);
+            return;
+        }
+    if (enhance_control_conflict(m, k, text, &other, why, sizeof why)) {
+        /* Two STICK rows trade sticks: the swap the rule leaves them. */
+        if (c->kind == XBOX_CTL_STICK && other >= 0
+            && d->controls[other].kind == XBOX_CTL_STICK && n == 1) {
+            const struct xbox_mod_control *o = &d->controls[other];
+            const char *mine[1] = { l[0] }, *theirs[1] = { text };
+            if (xbox_mod_control_forced(m, (uint32_t)other)) {
+                ctl_refuse(text, why);
+                return;
+            }
+            xbox_mod_control_set_bindings(m, (uint32_t)other, mine, 1);
+            xbox_mod_control_set_bindings(m, k, theirs, 1);
+            status("%s: %s, %s: %s", label, text, o->label ? o->label : o->id, l[0]);
+            return;
+        }
+        ctl_refuse(text, why);
+        return;
+    }
+    if (c->kind == XBOX_CTL_STICK) {
+        t[0] = text;
+        xbox_mod_control_set_bindings(m, k, t, 1);
+        status("%s: %s", label, text);
+        return;
+    }
+    if (n >= ENHANCE_ACTION_BINDS) {
+        status("%s refused: %d bindings at most", text, ENHANCE_ACTION_BINDS);
+        return;
+    }
+    for (int b = 0; b < n; b++)
+        t[b] = l[b];
+    t[n] = text;
+    xbox_mod_control_set_bindings(m, k, t, n + 1);
+    status("%s: bound %s", label, text);
+}
+
+/* The pad sources a captured control's capture saw, as one guest name:
+ * every source must name the same one (a stick pushed on a diagonal),
+ * else the capture is refused. */
+static void ctl_finish_pad(uint32_t set)
+{
+    char name[ENHANCE_ACTION_TEXT] = "", one[ENHANCE_ACTION_TEXT], why[96];
+    int stick = s_cap.what == CAP_CTL_STICK;
+
+    for (int src = 1; src < INPUT_SRC_COUNT; src++) {
+        if (!(set & (1u << src)))
+            continue;
+        if (!enhance_control_from_host(src, stick, one, sizeof one, why, sizeof why)) {
+            cap_phase(CAP_OFF);
+            ctl_refuse(xbox_InputMap_SourceName(src), why);
+            return;
+        }
+        if (name[0] && strcmp(name, one)) {
+            cap_phase(CAP_OFF);
+            ctl_refuse(name, "a fly control takes one input at a time");
+            return;
+        }
+        snprintf(name, sizeof name, "%s", one);
+    }
+    if (name[0])
+        ctl_finish(name);
+}
+
+/* The stick directions in held come from a small threshold, which a
+ * resting stick on a worn pad can pass: a captured control's capture
+ * takes a direction only past 0.6 (D3), from the host pads themselves. */
+#define CTL_STICK_MIN 19661
+static uint32_t ctl_held(uint32_t held)
+{
+    uint32_t dirs = 0;
+    for (int src = INPUT_SRC_LSTICK_UP; src <= INPUT_SRC_RSTICK_RIGHT; src++)
+        held &= ~(1u << src);
+    for (DWORD slot = 0; slot < PORTS; slot++) {
+        InputRaw raw;
+        xbox_InputHostRaw(slot, &raw);
+        for (int src = INPUT_SRC_LSTICK_UP; src <= INPUT_SRC_RSTICK_RIGHT; src++)
+            if (raw.src[src] >= CTL_STICK_MIN)
+                dirs |= 1u << src;
+    }
+    return held | dirs;
+}
+
 /* One capture step: 1 when it used the input. */
 static int capture_step(uint32_t held, uint64_t now)
 {
@@ -3451,7 +3672,8 @@ static int capture_step(uint32_t held, uint64_t now)
         int down = xbox_FramebufferKeyDown(vk) != 0;
         size_t at = 0;
         const char *name;
-        if (!down || s_kprev[vk] || is_modifier(vk))
+        /* A fly control takes any key alone, Shift too (fast, slow). */
+        if (!down || s_kprev[vk] || (s_cap.what == CAP_ACTION && is_modifier(vk)))
             continue;
         if (vk == 0x1B) {   /* Esc */
             cap_phase(CAP_OFF);
@@ -3461,6 +3683,10 @@ static int capture_step(uint32_t held, uint64_t now)
         name = xbox_InputCodeName(vk, 0);
         if (!name)
             continue;
+        if (s_cap.what != CAP_ACTION) {
+            ctl_finish(name);
+            return 1;
+        }
         text[0] = 0;
         if (xbox_FramebufferKeyDown(XBOX_VK_CONTROL))
             at += (size_t)snprintf(text + at, sizeof text - at, "%s+", xbox_InputCodeName(XBOX_VK_CONTROL, 0));
@@ -3472,16 +3698,26 @@ static int capture_step(uint32_t held, uint64_t now)
         capture_finish(text);
         return 1;
     }
+    if (s_cap.what != CAP_ACTION)
+        held = ctl_held(held);
     if (held) {
         if ((held | s_cap.max) != s_cap.max || held != s_cap.last)
             s_cap.t_set = now;
         s_cap.max |= held;
         s_cap.last = held;
         if (held == s_cap.max && now - s_cap.t_set >= CHORD_MS) {
+            if (s_cap.what != CAP_ACTION) {
+                ctl_finish_pad(s_cap.max);
+                return 1;
+            }
             capture_pad_text(s_cap.max, text, sizeof text);
             capture_finish(text);
         }
     } else if (s_cap.max) {
+        if (s_cap.what != CAP_ACTION) {
+            ctl_finish_pad(s_cap.max);
+            return 1;
+        }
         capture_pad_text(s_cap.max, text, sizeof text);
         capture_finish(text);
     }
@@ -3911,7 +4147,7 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
     /* D10: a dot before the label while unsaved, and the value bright only
      * where it differs from stock, so a page shows what was changed. */
     int marked = rw->type == R_SLOT || rw->type == R_MOD || rw->type == R_BIND
-              || rw->type == R_PARAM || rw->type == R_PROFILE;
+              || rw->type == R_CTL || rw->type == R_PARAM || rw->type == R_PROFILE;
     int st = marked ? row_state(rw) : 0;
     mu_Color vcol = ro ? t->text_dim : !marked || (st & ENHANCE_ROW_NONDEFAULT) ? t->text
                                                                                 : t->text_dim;
@@ -4035,7 +4271,16 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
     }
     /* Text values (info, bindings, Save's path): right-aligned, cut to the
      * room the label left. */
-    if (rw->type == R_BIND && s_cap.phase != CAP_OFF && s_cap.id == rw->ref) {
+    if (rw->type == R_CTL && s_cap.phase != CAP_OFF && s_cap.what != CAP_ACTION
+        && s_cap.id == rw->ref) {
+        v = fit(fb, s_cap.what == CAP_CTL_STICK ? "push a stick\xE2\x80\xA6"
+                                               : "press a key or a button\xE2\x80\xA6",
+                right - x, cut, sizeof cut);
+        mu_draw_text(ctx, fb, v, -1, mu_vec2(right - text_w(fb, v), ty), t->warn);
+        return;
+    }
+    if (rw->type == R_BIND && s_cap.phase != CAP_OFF && s_cap.what == CAP_ACTION
+        && s_cap.id == rw->ref) {
         v = fit(fb, "press a key or a chord\xE2\x80\xA6", right - x, cut, sizeof cut);
         mu_draw_text(ctx, fb, v, -1, mu_vec2(right - text_w(fb, v), ty), t->warn);
         return;

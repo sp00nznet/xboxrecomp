@@ -6,8 +6,9 @@
  * chords and their consumption, guide+a (rule 7), chord_delay_ms, the flip
  * tick that reads a pad the title has stopped polling, arming by feature
  * keys only, the mod API v2 calls, the pad filter seam in input_core.c, and
- * bindings in host-source space under [input.pad] (gamepad-input-ux D4).
- * Runs in its working directory, where it writes config/config.toml.
+ * bindings in host-source space under [input.pad] (gamepad-input-ux D4),
+ * and the captured controls' port-0 record with D3's conflict rules
+ * (mod-settings D1, D3). Runs in its working directory, where it writes config/config.toml.
  */
 #include "enhance.h"
 #include "enhance_actions.h"
@@ -2115,6 +2116,232 @@ static void test_live_arm(void)
 }
 #endif
 
+/* ---- captured controls: the port-0 record (mod-settings D1, D3) -------- */
+
+static const char *const k_rec_fly[] = { "guide+y", NULL };
+static const char *const k_rec_sink[] = { "y", NULL };
+static const char *const k_rec_rise[] = { "rt", "R", NULL };
+static const char *const k_rec_move[] = { "left_stick", NULL };
+static const struct xbox_mod_control k_rec_ctl[] = {
+    { "fly", "Fly", NULL, NULL, XBOX_CTL_ACTION, k_rec_fly, NULL, NULL },
+    { "sink", "Sink", NULL, NULL, XBOX_CTL_BUTTON, k_rec_sink, NULL, NULL },
+    { "rise", "Rise", NULL, NULL, XBOX_CTL_BUTTON, k_rec_rise, NULL, NULL },
+    { "move", "Move", NULL, NULL, XBOX_CTL_STICK, k_rec_move, NULL, NULL },
+};
+static const struct xbox_mod_desc k_rec_desc = {
+    XBOX_MOD_DESC_VERSION, sizeof(struct xbox_mod_desc), "Rec", NULL, NULL, NULL,
+    NULL, 0, k_rec_ctl, 4
+};
+static const struct xbox_mod_api *s_rec;
+static int rec_init(const struct xbox_mod_api *api) { s_rec = api; return 0; }
+static const struct xbox_mod k_rec = { "rec", rec_init, NULL, &k_rec_desc };
+static const struct xbox_mod *const k_recs[] = { &k_rec, NULL };
+
+static int rec_value(uint32_t idx, struct xbox_ctl_value *v)
+{
+    memset(v, 0x55, sizeof *v);
+    return s_rec->control_value(&k_rec_desc, idx, v);
+}
+
+static void hold_rt(int on) { f_pad[0].Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = on ? 200 : 0; }
+
+/* With the hook disarmed: no record until a capture, then a neutral pad
+ * whose packet moves as capture starts and ends, the pad's own values to
+ * the mod, a pulled pad read as gone, a host key read with no pad. */
+static void test_record(void)
+{
+    struct xbox_ctl_value v;
+    XBOX_INPUT_STATE st;
+    DWORD pk;
+    const char *out = start_with("[input.controls]\n\"rec.rise\" = [\"rt\", \"R\"]\n", &k_fake,
+                                 k_recs);
+
+    CHECK(strstr(out, "hook=off") != NULL);
+    /* [input.controls] keys are no action names. */
+    CHECK(strstr(out, "no action named") == NULL);
+    poll0();
+    hold_y(1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_Y] == 255);
+    CHECK(rec_value(1, &v) == 0 && v.raw[0] == 0 && !v.connected);
+
+    pk = st.dwPacketNumber;
+    s_rec->input_capture(1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_Y] == 0 && st.Gamepad.wButtons == 0);
+    CHECK(st.dwPacketNumber != pk);
+    CHECK(rec_value(1, &v) == 1 && v.raw[0] == 255 && v.connected);
+    /* Another port is the game's: no neutral pad, the record untouched. */
+    CHECK(xbox_enhance_pad_seen(1, &st.Gamepad, 1) == 0);
+    CHECK(rec_value(1, &v) == 1 && v.raw[0] == 255);
+    /* The largest of rt (200) and R (down). */
+    hold_rt(1);
+    poll0();
+    CHECK(rec_value(2, &v) == 1 && v.raw[0] == 200);
+    xbox_InputKeyEvent('R', 1);
+    CHECK(rec_value(2, &v) == 1 && v.raw[0] == 255);
+    xbox_InputKeyEvent('R', 0);
+    hold_rt(0);
+    f_pad[0].Gamepad.sThumbLX = 20000;
+    f_pad[0].Gamepad.sThumbLY = -9000;
+    st = poll0();
+    CHECK(st.Gamepad.sThumbLX == 0 && st.Gamepad.sThumbLY == 0);
+    CHECK(rec_value(3, &v) == 1 && v.raw[0] == 20000 && v.raw[1] == -9000
+          && v.src == XBOX_CTL_SRC_LEFT);
+
+    /* Pulled: the title's poll fails as it would, the mod reads it gone;
+     * a host key still reads. */
+    f_conn[0] = 0;
+    CHECK(xbox_InputGetState(0, &st) != ERROR_SUCCESS);
+    CHECK(rec_value(1, &v) == 0 && v.raw[0] == 0 && !v.connected);
+    xbox_InputKeyEvent('R', 1);
+    CHECK(rec_value(2, &v) == 1 && v.raw[0] == 255 && !v.connected);
+    xbox_InputKeyEvent('R', 0);
+    f_conn[0] = 1;
+    advance(XBOX_INPUT_PROBE_MS + 1);
+
+    /* Capture ends: the pad is the title's again, on a new packet. */
+    st = poll0();
+    pk = st.dwPacketNumber;
+    s_rec->input_capture(0);
+    st = poll0();
+    CHECK(st.dwPacketNumber != pk);
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_Y] == 255 && st.Gamepad.sThumbLX == 20000);
+    /* An old record never reads after the capture that made it. */
+    CHECK(rec_value(1, &v) == 0 && v.raw[0] == 0);
+    s_rec->input_capture(1);
+    CHECK(rec_value(1, &v) == 0 && v.raw[0] == 0);
+    st = poll0();
+    CHECK(rec_value(1, &v) == 1 && v.raw[0] == 255);
+    s_rec->input_capture(0);
+    pad_clear();
+    poll0();
+}
+
+/* Guide+Y toggles flight without sinking: the chord's Y is masked before
+ * the record, until Y is let go; Y alone sinks. */
+static void test_record_chord(void)
+{
+    struct xbox_ctl_value v;
+    int fly;
+
+    start_with(ARMED, &k_fake, k_recs);
+    poll0();
+    fly = enhance_action_find("rec.fly");
+    CHECK(fly >= 0);
+    s_rec->input_capture(1);
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    advance(16);
+    hold_y(1);
+    poll0();
+    CHECK(enhance_action_pressed(fly) == 1);
+    CHECK(rec_value(1, &v) == 1 && v.raw[0] == 0);
+    hold_extra(XBOX_HOST_GUIDE, 0);
+    advance(16);
+    poll0();
+    CHECK(rec_value(1, &v) == 1 && v.raw[0] == 0);
+    hold_y(0);
+    advance(16);
+    poll0();
+    advance(16);
+    hold_y(1);
+    poll0();
+    CHECK(rec_value(1, &v) == 1 && v.raw[0] == 255);
+    CHECK(enhance_action_pressed(fly) == 0);
+    s_rec->input_capture(0);
+    pad_clear();
+    poll0();
+}
+
+/* The menu's capture, host source to guest name, under a remap. */
+static void test_record_from_host(void)
+{
+    xbox_pad_setup ps;
+    char name[ENHANCE_ACTION_TEXT], why[96];
+
+    start_with(ARMED, &k_fake, k_recs);
+    CHECK(enhance_control_from_host(INPUT_SRC_WEST, 0, name, sizeof name, why, sizeof why)
+          && !strcmp(name, "x"));
+    CHECK(enhance_control_from_host(INPUT_SRC_RIGHT_TRIGGER, 0, name, sizeof name, why,
+                                    sizeof why) && !strcmp(name, "rt"));
+    CHECK(!enhance_control_from_host(INPUT_SRC_PADDLE1, 0, name, sizeof name, why, sizeof why)
+          && strstr(why, "buttons the game sees"));
+    CHECK(enhance_control_from_host(INPUT_SRC_RSTICK_UP, 1, name, sizeof name, why, sizeof why)
+          && !strcmp(name, "right_stick"));
+    CHECK(!enhance_control_from_host(INPUT_SRC_LSTICK_UP, 0, name, sizeof name, why, sizeof why)
+          && strstr(why, "stick row"));
+    CHECK(!enhance_control_from_host(INPUT_SRC_WEST, 1, name, sizeof name, why, sizeof why)
+          && strstr(why, "takes a stick"));
+    xbox_PadSetupIdentity(&ps);
+    ps.map.source[INPUT_X] = INPUT_SRC_PADDLE1;
+    xbox_InputSetPadSetup(&ps);
+    CHECK(enhance_control_from_host(INPUT_SRC_PADDLE1, 0, name, sizeof name, why, sizeof why)
+          && !strcmp(name, "x"));
+    xbox_InputSetPadSetup(NULL);
+}
+
+/* D3's conflict rules, each way. */
+static void test_record_conflicts(void)
+{
+    char why[128];
+    int other;
+
+    start_with(ARMED "[input.actions]\nmenu.open = [\"F10\", \"F8\"]\n", &k_fake, k_recs);
+    /* 1: another control of the mod has it. */
+    CHECK(enhance_control_conflict(0, 1, "rt", &other, why, sizeof why) && other == 2);
+    CHECK(enhance_control_conflict(0, 1, "R", &other, why, sizeof why) && other == 2
+          && strstr(why, "Rec: Rise"));
+    /* 2: an action's single key, a captured key, either way. */
+    CHECK(enhance_control_conflict(0, 1, "F10", &other, why, sizeof why) && other < 0
+          && strstr(why, "F10 is"));
+    CHECK(enhance_action_control_clash("R", why, sizeof why) && strstr(why, "Rec: Rise"));
+    CHECK(!enhance_action_control_clash("Ctrl+R", why, sizeof why));
+    /* 3: a button in an action's chord (menu.open's guide+a) is fine. */
+    CHECK(!enhance_control_conflict(0, 2, "a", &other, why, sizeof why));
+    /* Every binding of an action counts, not only its first. */
+    CHECK(enhance_control_conflict(0, 2, "F8", &other, why, sizeof why) && strstr(why, "F8 is"));
+}
+
+#ifndef _WIN32
+static int s_rec_stop;
+static void *rec_poll_thread(void *u)
+{
+    (void)u;
+    for (int16_t i = 1; !__atomic_load_n(&s_rec_stop, __ATOMIC_ACQUIRE); i = (int16_t)(i % 30000 + 1)) {
+        XBOX_INPUT_STATE st;
+        f_pad[0].Gamepad.sThumbLX = i;
+        f_pad[0].Gamepad.sThumbLY = i;
+        xbox_InputGetState(0, &st);
+    }
+    return NULL;
+}
+
+/* No torn read: both axes come from one record. */
+static void test_record_torn(void)
+{
+    pthread_t t;
+    struct xbox_ctl_value v;
+    int torn = 0, reads = 0;
+
+    start_with(NULL, &k_fake, k_recs);
+    s_rec->input_capture(1);
+    __atomic_store_n(&s_rec_stop, 0, __ATOMIC_RELEASE);
+    pthread_create(&t, NULL, rec_poll_thread, NULL);
+    for (int i = 0; i < 200000; i++)
+        if (rec_value(3, &v)) {
+            reads++;
+            torn += v.raw[0] != v.raw[1];
+        }
+    __atomic_store_n(&s_rec_stop, 1, __ATOMIC_RELEASE);
+    pthread_join(t, NULL);
+    CHECK(reads > 0 && torn == 0);
+    s_rec->input_capture(0);
+    pad_clear();
+    poll0();
+}
+#endif
+
 int main(void)
 {
     MKDIR("config");
@@ -2149,6 +2376,13 @@ int main(void)
     test_dormant();
 #ifndef _WIN32
     test_live_arm();
+#endif
+    test_record();
+    test_record_chord();
+    test_record_from_host();
+    test_record_conflicts();
+#ifndef _WIN32
+    test_record_torn();
 #endif
     xbox_mod_shutdown();
     enhance_actions_reset();

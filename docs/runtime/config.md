@@ -1300,16 +1300,15 @@ The pages are Render, Shaders, Pack, Game (a title's own items, from
   - for a v3 mod, **Controls**: an action as on the Controls page (its
     help in the footer, "(mod off)" after its bindings while the mod is
     off); a BUTTON or STICK control with its bindings and the keys behind
-    them (`rt, R (keys R)`), its `when` note dimmed, read only for now
-    (the footer names the `[input.controls]` key to edit); an INFO
-    control as text;
+    them (`rt, R (keys R)`), its `when` note dimmed, rebound by capture
+    (below); an INFO control as text;
   - **Settings**, one row per descriptor setting: a toggle, a choice or a
     slider by `step`, with its `unit` after the value and its live class
     (below). A row an environment variable forces is dimmed with "set by
     `RECOMP_...`" and never saved;
   - the items the mod added with `menu_add` (a v2 mod has only these);
-  - **Reset this mod**: stages the mod's settings and action bindings
-    back to the stock: the defaults file's value, else the descriptor's
+  - **Reset this mod**: stages the mod's settings, action bindings and
+    captured controls back to the stock: the defaults file's value, else the descriptor's
     default (Save writes it, which removes the keys). Enabled is not
     reset, and other mods and unknown keys are left alone;
   - **Unknown keys**: the mod's keys nothing read, "not read; kept".
@@ -1516,7 +1515,7 @@ The title's glue calls two entries:
 | `setting(desc, idx)` | v3. A descriptor setting's value now (any thread; a relaxed atomic load). A bool is 0/1, an enum the choice's index. |
 | `on_setting(desc, fn, user)` | v3. `fn(idx, value, user)` after the menu changes a setting, from the next `xbox_mod_frame` on the guest's thread, as `on_enable`. A `restart` setting only records the value and never calls back. Init only. |
 | `control_action(desc, idx)` | v3. The action id of an ACTION control, for `action_pressed` and `action_down`; -1 for another kind. |
-| `control_value(desc, idx, out)` | v3. A captured control's value. Until the recorded pad state lands it reports not connected (0, `out` zeroed). |
+| `control_value(desc, idx, out)` | v3. A captured control's value while the mod captures port 0: a STICK's axes from the pad's record (the first binding's stick, `src` which one, so the mod picks its dead zone), a BUTTON's largest binding (0..255; a host key reads 255 while down, even with no pad). Returns 1 when it read a source. Without a capture, or with the pad pulled, the pad part reads 0 and `connected` 0. |
 | `hook(va, pre, post, flags, user)` | v4. Callbacks around each call of the guest function at `va` ([Hooks](#hooks-v4)). Init only. |
 | `active(mod, on)` | v4. The mod's own "doing something now" state, for the `mods=` line. Any thread. |
 | `hud_table(toml, len)` | v5. Registers the game's HUD table ([HUD table](#hud-table-v5)). Init only; one mod per run. |
@@ -2003,9 +2002,62 @@ moves no binding. When a dormant default wins a tie, one line says so:
 [MOD] F6: camera.toggle keeps it over probe.go (dormant)
 ```
 
-A BUTTON or STICK control is bound under `[input.controls]`, flat:
-`"<id>.<control id>" = ["w", "pad.ls"]`. An INFO control is shown and
-never bound.
+A BUTTON or STICK control is bound under `[input.controls]`, flat, as
+an array (the highest file that names the key decides all of it):
+
+```toml
+[input.controls]
+"camera.free.rise" = ["rt", "Space"]
+"camera.free.move" = ["right_stick"]
+```
+
+An INFO control is shown and never bound. A binding names:
+
+| Binding | Source | Reads |
+| --- | --- | --- |
+| `dpad_up` .. `dpad_right`, `start`, `back`, `left_thumb`, `right_thumb` | the guest's digital button | 255 or 0 |
+| `a`, `b`, `x`, `y`, `black`, `white`, `left_trigger` (`lt`), `right_trigger` (`rt`) | the guest's analog button | 0..255 |
+| `left_stick`, `right_stick` | the guest's stick (STICK controls only) | the two axes |
+| anything else: a key name (`Space`, `E`, `up`, `F6`, `Numpad0`) | the host key | 255 or 0 |
+
+The guest sources are the pad as the game would see it, after
+`[input.pad]` and the keyboard's `[input.bindings]`, so a remap moves
+them with the game's own controls. Host-only buttons (Guide, the paddles,
+the touchpad) have no guest slot and are no source; stick directions
+(`left_stick_up`) neither. A text that names nothing is left out with a
+line, `[MOD] input.controls.camera.free.rise: "pad.ls" is not a game
+button or a host key; left out`.
+
+While a mod captures port 0 (`input_capture`), the title reads a
+connected, released pad, with a packet number that moves as the capture
+starts and ends so the title drops what it held. The pad the title would
+have read is recorded for `control_value` after the host actions have
+taken out a consumed chord's buttons: `guide+y` toggling flight never
+also sinks on Y, and Y stays out until it is let go. A Y alone sinks.
+
+**Rebinding from the Mods page.** A on a BUTTON row captures one input,
+a key (a modifier alone too: Shift, Ctrl) or a game button, and adds it
+to the list, up to 8; X (Delete) drops the last, and the last binding
+stays. A on a STICK row captures a stick: it takes a direction only past
+0.6 of full travel, so a resting stick never binds. Esc cancels. The
+capture refuses, in the status line and a toast:
+
+1. a source another captured control of the same mod binds
+   (`R is Free camera: Rise`). Two STICK rows trade sticks instead: Move
+   on the right stick gives Look the left;
+2. a key an action has as a single key (`F6 is Free camera: Toggle
+   flight`), a dormant action's too; and the reverse, a key a captured
+   control names, on the Controls page (`R refused: Free camera: Rise
+   uses it`);
+3. a paddle or Guide (`fly controls take buttons the game sees`), a
+   stick on a BUTTON row or a button on a STICK row.
+
+A button inside an action's chord is fine (Y with `guide+y`): the chord
+is taken out before the record. Controls of different mods may share a
+source, since one mod captures at a time. A captured control set by its
+env row is read only. Save writes the changed keys, and a control back at
+its stock removes its key. Reset this mod and Revert cover them as they
+cover the settings.
 
 **Unknown keys.** A `mods."<id>..."` key a descriptor does not declare,
 a key of an id the build does not have, and an `[input.controls]` key no

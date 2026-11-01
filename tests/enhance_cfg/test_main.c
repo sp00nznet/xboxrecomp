@@ -1075,6 +1075,11 @@ void xbox_InputSetPadFilter(xbox_input_pad_filter_fn fn)
 {
     (void)fn;
 }
+/* The same for the port-0 record (mod.c installs it). */
+void xbox_InputSetPadSeen(xbox_input_seen_fn fn)
+{
+    (void)fn;
+}
 uint64_t xbox_InputNowMs(void)
 {
     return 0;

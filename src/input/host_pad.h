@@ -69,6 +69,17 @@ void xbox_InputSetPadFilter(xbox_input_pad_filter_fn fn);
  * way it did before them. */
 int xbox_InputPadFilterSet(void);
 
+/* The mod layer's record of port 0 (mod.h xbox_enhance_pad_seen). Called by
+ * xbox_InputGetState under XBOXRECOMP_ENHANCE after the filter, with the
+ * state the title is about to get (a failed poll: zeros, connected 0),
+ * whether or not a filter is set: a mod may hold capture with the hook
+ * disarmed. Nonzero while a mod holds port 0: the title then reads it
+ * connected and released (the neutral pad). The enhance library installs
+ * it, so xbox_input never links against it. */
+#define XBOX_HOST_PAD_SEEN 1
+typedef int (*xbox_input_seen_fn)(DWORD port, const XBOX_GAMEPAD *g, int connected);
+void xbox_InputSetPadSeen(xbox_input_seen_fn fn);
+
 /* The host-only buttons the last poll of slot saw (0 when none). */
 uint32_t xbox_InputHostExtra(DWORD slot);
 

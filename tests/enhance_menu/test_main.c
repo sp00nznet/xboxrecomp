@@ -1048,10 +1048,15 @@ static void test_detail_rows(void)
     CHECK(row_value("Move") && !strncmp(s_val, "left_stick", 10));
     CHECK(row_value("Mouse") && !strcmp(s_val, "Look"));
     i = row_index("Rise");
-    CHECK(i >= 0 && strstr(enhance_menu_row_help(i), "[input.controls] \"bmod.rise\"") != NULL);
+    CHECK(i >= 0 && strstr(enhance_menu_row_help(i), "A: add a key or a game button") != NULL);
+    /* A captured control's row is rebound by capture (test_ctl_capture);
+     * Esc leaves it as it was. */
     CHECK(enhance_menu_select_row("Rise"));
     tap(0x0D);
-    CHECK(strstr(enhance_menu_status(), "read-only for now") != NULL);
+    CHECK(enhance_menu_capturing());
+    tap(0x1B);
+    CHECK(!enhance_menu_capturing());
+    CHECK(row_value("Rise") && !strcmp(s_val, "rt, x, R (keys 3, C)"));
 
     /* Settings: each class as the descriptor gives it, the forced one
      * read-only with its env row named. */
@@ -1248,6 +1253,159 @@ static void test_detail_conflicts(void)
     CHECK(enhance_menu_capturing());
     tap('R');
     CHECK(strstr(enhance_menu_status(), "R refused: B mod: Rise uses it") != NULL);
+    CHECK(enhance_menu_unsaved() == 0);
+    open_menu();
+}
+
+/* A mod with two STICK rows, for the swap (D3). */
+static const char *const k_sm_move_def[] = { "left_stick", NULL };
+static const char *const k_sm_look_def[] = { "right_stick", NULL };
+static const char *const k_sm_sink_def[] = { "y", NULL };
+static const char *const k_sm_fly_def[] = { "guide+y", NULL };
+static const struct xbox_mod_control k_sm_ctl[] = {
+    { "fly", "Fly", NULL, NULL, XBOX_CTL_ACTION, k_sm_fly_def, NULL, NULL },
+    { "move", "Move", NULL, NULL, XBOX_CTL_STICK, k_sm_move_def, NULL, NULL },
+    { "look", "Look", NULL, NULL, XBOX_CTL_STICK, k_sm_look_def, NULL, NULL },
+    { "sink", "Sink", NULL, NULL, XBOX_CTL_BUTTON, k_sm_sink_def, NULL, NULL },
+};
+static const struct xbox_mod_desc k_sm_desc = {
+    XBOX_MOD_DESC_VERSION, sizeof(struct xbox_mod_desc),
+    "S mod", "Two sticks.", NULL, NULL, NULL, 0, k_sm_ctl, 4
+};
+static int sm_init(const struct xbox_mod_api *api) { (void)api; return 0; }
+static const struct xbox_mod k_sm = { "smod", sm_init, NULL, &k_sm_desc };
+static const struct xbox_mod *const k_smods[] = { &k_sm, NULL };
+
+static void ctl_capture_start(const char *label)
+{
+    CHECK(enhance_menu_select_row(label));
+    tap(0x0D);
+    CHECK(enhance_menu_capturing());
+}
+
+/* A pad input held for a few polls, then let go. */
+static void pad_hold_release(void (*set)(int on))
+{
+    set(1);
+    for (int i = 0; i < 3; i++) {
+        advance(16);
+        poll0();
+    }
+    set(0);
+    advance(16);
+    poll0();
+    flip();
+}
+static void set_y(int on) { f_pad[0].Gamepad.bAnalogButtons[XBOX_BUTTON_Y] = on ? 255 : 0; }
+static void set_paddle(int on) { f_extra[0] = on ? XBOX_HOST_PADDLE1 : 0; }
+static void set_rx_hard(int on) { f_pad[0].Gamepad.sThumbRX = on ? 30000 : 0; }
+static void set_rx_soft(int on) { f_pad[0].Gamepad.sThumbRX = on ? 12000 : 0; }
+
+/* A captured control rebound from the Mods page (mod-settings D3): a key
+ * or a game button joins its list, X drops the last, the conflicts are
+ * refused with their owner, and Save writes [input.controls]. */
+static void test_ctl_capture(void)
+{
+    char l[ENHANCE_ACTION_BINDS][ENHANCE_ACTION_TEXT];
+    const char *f;
+    start_with(ARMED, k_bmods);
+    open_menu();
+    open_detail("B mod");
+
+    /* A host key joins the list and reads at once. */
+    ctl_capture_start("Rise");
+    tap('E');
+    CHECK(!enhance_menu_capturing());
+    CHECK(xbox_mod_control_bindings(1, 1, l, ENHANCE_ACTION_BINDS, NULL) == 4
+          && !strcmp(l[3], "E"));
+    CHECK(xbox_mod_control_dirty(1, 1) && enhance_menu_unsaved() == 1);
+    CHECK(pending_has("input.controls.bmod.rise", "[\"rt\", \"x\", \"R\", \"E\"]"));
+
+    /* Already bound; an action's single key (rule 2); a paddle the game
+     * never sees; a stick on a button row. */
+    ctl_capture_start("Rise");
+    tap('R');
+    CHECK(strstr(enhance_menu_status(), "R is bound already") != NULL);
+    ctl_capture_start("Rise");
+    tap(VK_F7);
+    CHECK(strstr(enhance_menu_status(), "F7 refused: F7 is B mod: Toggle flight") != NULL);
+    ctl_capture_start("Rise");
+    pad_hold_release(set_paddle);
+    CHECK(strstr(enhance_menu_status(), "fly controls take buttons the game sees") != NULL);
+    ctl_capture_start("Rise");
+    pad_hold_release(set_rx_hard);
+    CHECK(strstr(enhance_menu_status(), "a stick goes on a stick row") != NULL);
+    CHECK(xbox_mod_control_bindings(1, 1, l, ENHANCE_ACTION_BINDS, NULL) == 4);
+
+    /* A game button, by its guest name. */
+    ctl_capture_start("Rise");
+    pad_hold_release(set_y);
+    CHECK(xbox_mod_control_bindings(1, 1, l, ENHANCE_ACTION_BINDS, NULL) == 5
+          && !strcmp(l[4], "y"));
+
+    /* X (Delete) drops the last; back at the stock nothing is staged. */
+    CHECK(enhance_menu_select_row("Rise"));
+    tap(0x2E);
+    tap(0x2E);
+    CHECK(xbox_mod_control_bindings(1, 1, l, ENHANCE_ACTION_BINDS, NULL) == 3);
+    CHECK(!xbox_mod_control_dirty(1, 1) && enhance_menu_unsaved() == 0);
+    CHECK(!pending_any("input.controls.bmod.rise"));
+
+    /* A stick row: a push under 0.6 is no capture, a full one is. */
+    ctl_capture_start("Move");
+    pad_hold_release(set_rx_soft);
+    CHECK(enhance_menu_capturing());
+    pad_hold_release(set_rx_hard);
+    CHECK(!enhance_menu_capturing());
+    CHECK(row_value("Move") && !strncmp(s_val, "right_stick", 11));
+
+    /* Save writes the table key; the row stays as saved. */
+    ctl_capture_start("Rise");
+    tap('E');
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "[input.controls]") != NULL);
+    CHECK(strstr(f, "\"bmod.rise\" = [\"rt\", \"x\", \"R\", \"E\"]") != NULL);
+    CHECK(strstr(f, "\"bmod.move\" = [\"right_stick\"]") != NULL);
+    CHECK(enhance_menu_unsaved() == 0 && !xbox_mod_control_dirty(1, 1));
+
+    /* Reset this mod stages the stock for each. */
+    CHECK(enhance_menu_select_row("Reset this mod"));
+    tap(0x0D);
+    CHECK(xbox_mod_control_is_stock(1, 1) && xbox_mod_control_is_stock(1, 2));
+    CHECK(pending_has("input.controls.bmod.rise", NULL));
+    open_menu();
+
+    /* The file's binding is the one in effect at the next start. */
+    start_with(ARMED "[input.controls]\n\"bmod.rise\" = [\"E\"]\n", k_bmods);
+    CHECK(xbox_mod_control_bindings(1, 1, l, ENHANCE_ACTION_BINDS, NULL) == 1
+          && !strcmp(l[0], "E"));
+    open_menu();
+}
+
+/* Two STICK rows trade sticks; a BUTTON row keeps one binding; Revert puts
+ * every control back. */
+static void test_ctl_swap(void)
+{
+    char l[ENHANCE_ACTION_BINDS][ENHANCE_ACTION_TEXT];
+    start_with(ARMED, k_smods);
+    open_menu();
+    open_detail("S mod");
+    ctl_capture_start("Move");
+    pad_hold_release(set_rx_hard);
+    CHECK(xbox_mod_control_bindings(0, 1, l, ENHANCE_ACTION_BINDS, NULL) == 1
+          && !strcmp(l[0], "right_stick"));
+    CHECK(xbox_mod_control_bindings(0, 2, l, ENHANCE_ACTION_BINDS, NULL) == 1
+          && !strcmp(l[0], "left_stick"));
+    CHECK(enhance_menu_unsaved() == 2);
+    CHECK(enhance_menu_select_row("Sink"));
+    tap(0x2E);
+    CHECK(strstr(enhance_menu_status(), "Sink keeps one binding") != NULL);
+    /* y sits in fly's chord: a button may (rule 3). */
+    CHECK(xbox_mod_control_bindings(0, 3, l, ENHANCE_ACTION_BINDS, NULL) == 1);
+    enhance_menu_revert();
+    CHECK(xbox_mod_control_bindings(0, 1, l, ENHANCE_ACTION_BINDS, NULL) == 1
+          && !strcmp(l[0], "left_stick"));
     CHECK(enhance_menu_unsaved() == 0);
     open_menu();
 }
@@ -2961,6 +3119,8 @@ int main(int argc, char **argv)
     test_detail_reset();
     test_detail_save();
     test_detail_conflicts();
+    test_ctl_capture();
+    test_ctl_swap();
     test_controls_groups();
     test_mouse();
     test_snapshot();

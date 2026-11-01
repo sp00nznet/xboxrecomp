@@ -1890,6 +1890,204 @@ int enhance_action_owner(const char *text, int except, char *bound, size_t n)
     return owner;
 }
 
+/* ---- captured controls (mod-settings D3) --------------------------------- */
+
+int enhance_control_parse(const char *text, struct enhance_ctl_src *out)
+{
+    char buf[TEXT_MAX];
+    int lower = 1, ctl, code, mouse;
+
+    memset(out, 0, sizeof *out);
+    if (!text || strlen(text) >= sizeof buf)
+        return 0;
+    snprintf(buf, sizeof buf, "%s", text);
+    trim(buf);
+    for (const char *p = buf; *p; p++)
+        if (isupper((unsigned char)*p))
+            lower = 0;
+    /* The action bindings' namespace (pad_name_src): a guest name in
+     * lowercase is the pad ("x" the button), anything else a key ("X",
+     * "space"). */
+    if (lower && (!strcmp(buf, "left_stick") || !strcmp(buf, "right_stick"))) {
+        out->type = ENHANCE_CTL_STICK;
+        out->idx = buf[0] == 'l' ? (int)XBOX_CTL_SRC_LEFT : (int)XBOX_CTL_SRC_RIGHT;
+        return 1;
+    }
+    ctl = !lower ? -1
+        : !strcmp(buf, "lt") ? INPUT_LEFT_TRIGGER
+        : !strcmp(buf, "rt") ? INPUT_RIGHT_TRIGGER : xbox_InputMap_ControlFromName(buf);
+    /* A stick direction is no source: a stick is bound whole. */
+    if (ctl >= INPUT_DPAD_UP && ctl < INPUT_A) {
+        out->type = ENHANCE_CTL_BUTTON;
+        out->idx = ctl;
+        return 1;
+    }
+    if (ctl >= INPUT_A && ctl <= INPUT_RIGHT_TRIGGER) {
+        out->type = ENHANCE_CTL_ANALOG;
+        out->idx = ctl - INPUT_A;
+        return 1;
+    }
+    if (ctl >= 0 || !xbox_InputNameToCode(buf, &code, &mouse) || mouse)
+        return 0;
+    out->type = ENHANCE_CTL_KEY;
+    out->key = code;
+    return 1;
+}
+
+int enhance_control_same(const struct enhance_ctl_src *a, const struct enhance_ctl_src *b)
+{
+    if (a->type != b->type || a->type == ENHANCE_CTL_NONE)
+        return 0;
+    return a->type == ENHANCE_CTL_KEY ? same_key(a->key, b->key) : a->idx == b->idx;
+}
+
+int enhance_control_from_host(int src, int stick, char *out, size_t n, char *why, size_t wn)
+{
+    xbox_pad_setup ps;
+    uint32_t feeds[SRC_BITS], f;
+    int c;
+
+    if (n)
+        out[0] = 0;
+    if (wn)
+        why[0] = 0;
+    if (src <= INPUT_SRC_NONE || src >= INPUT_SRC_COUNT)
+        return 0;
+    xbox_InputPadSetup(&ps);
+    map_feeds(&ps, feeds);
+    f = feeds[src] & GUEST_BITS;
+    /* The game's side of the map is what control_value reads, so a source
+     * that feeds nothing there (a paddle, Guide) could never move it. */
+    if (!f) {
+        snprintf(why, wn, "fly controls take buttons the game sees");
+        return 0;
+    }
+    if (f >> STICK_BIT0) {
+        if (!stick) {
+            snprintf(why, wn, "a stick goes on a stick row");
+            return 0;
+        }
+        /* Bits 16..19 are the guest's left stick, 20..23 its right. */
+        snprintf(out, n, "%s", (f >> STICK_BIT0) & 0xFu ? "left_stick" : "right_stick");
+        return 1;
+    }
+    if (stick) {
+        snprintf(why, wn, "a stick row takes a stick");
+        return 0;
+    }
+    for (c = 0; c < INPUT_PAD_CONTROL_COUNT && !(f & control_bit(c)); c++)
+        ;
+    /* The triggers as the defaults spell them. */
+    snprintf(out, n, "%s", c == INPUT_LEFT_TRIGGER ? "lt" : c == INPUT_RIGHT_TRIGGER ? "rt"
+                         : xbox_InputMap_ControlName(c));
+    return 1;
+}
+
+static void action_owner_text(int id, const char *input, char *why, size_t n)
+{
+    int g = enhance_action_mod(id);
+    const struct xbox_mod_desc *d = g >= 0 ? xbox_mod_desc_shown(g) : NULL;
+    const char *label = enhance_action_label(id);
+    if (g >= 0)
+        snprintf(why, n, "%s is %s: %s", input,
+                 d && d->title && *d->title ? d->title : xbox_mod_name(g), label ? label : "?");
+    else
+        snprintf(why, n, "%s is %s", input, label ? label : "another action's");
+}
+
+/* The action in the table whose binding is key alone, or -1. The built
+ * table holds dormant bindings too (rule 5). */
+static int single_key_owner(int key)
+{
+    int owner = -1;
+
+    spin_lock(&s_step_lock);
+    for (int i = 0; s_table && i < s_table->n && owner < 0; i++)
+        if (s_table->b[i].kind == B_KEY && !s_table->b[i].nmods
+            && same_key(s_table->b[i].key, key))
+            owner = s_table->b[i].action;
+    spin_unlock(&s_step_lock);
+    return owner;
+}
+
+int enhance_control_conflict(int m, uint32_t k, const char *text, int *other,
+                             char *why, size_t n)
+{
+    const struct xbox_mod_desc *d = xbox_mod_desc_of(m);
+    struct enhance_ctl_src want, have;
+    char l[ENHANCE_ACTION_BINDS][ENHANCE_ACTION_TEXT];
+    int owner;
+
+    if (other)
+        *other = -1;
+    if (n)
+        why[0] = 0;
+    if (!d || !enhance_control_parse(text, &want))
+        return 0;
+    /* Rule 1: two of one mod's fly controls on one source cannot both
+     * work. */
+    for (uint32_t c = 0; c < d->n_controls; c++) {
+        const struct xbox_mod_control *ct = &d->controls[c];
+        int nb;
+        if (c == k || (ct->kind != XBOX_CTL_BUTTON && ct->kind != XBOX_CTL_STICK))
+            continue;
+        nb = xbox_mod_control_bindings(m, c, l, ENHANCE_ACTION_BINDS, NULL);
+        for (int b = 0; b < nb; b++)
+            if (enhance_control_parse(l[b], &have) && enhance_control_same(&want, &have)) {
+                if (other)
+                    *other = (int)c;
+                snprintf(why, n, "%s is %s: %s", text,
+                         d->title && *d->title ? d->title : xbox_mod_name(m),
+                         ct->label ? ct->label : ct->id);
+                return 1;
+            }
+    }
+    /* Rule 2: the actions are consumed first, so the control would never
+     * see a key an action has. A guest button needs no check: no action
+     * is a single game button (R3). */
+    if (want.type == ENHANCE_CTL_KEY && (owner = single_key_owner(want.key)) >= 0) {
+        action_owner_text(owner, text, why, n);
+        return 1;
+    }
+    return 0;
+}
+
+int enhance_action_control_clash(const char *text, char *why, size_t n)
+{
+    struct binding b;
+    struct enhance_ctl_src have;
+    char l[ENHANCE_ACTION_BINDS][ENHANCE_ACTION_TEXT], quiet[8];
+
+    if (n)
+        why[0] = 0;
+    s_why = quiet;
+    s_why_n = sizeof quiet;
+    if (!parse_binding("check", text, &b) || b.kind != B_KEY || b.nmods) {
+        s_why = NULL;
+        return 0;
+    }
+    s_why = NULL;
+    for (int m = 0; m < xbox_mod_count(); m++) {
+        const struct xbox_mod_desc *d = xbox_mod_desc_of(m);
+        for (uint32_t c = 0; d && c < d->n_controls; c++) {
+            const struct xbox_mod_control *ct = &d->controls[c];
+            int nb;
+            if (ct->kind != XBOX_CTL_BUTTON && ct->kind != XBOX_CTL_STICK)
+                continue;
+            nb = xbox_mod_control_bindings(m, c, l, ENHANCE_ACTION_BINDS, NULL);
+            for (int i = 0; i < nb; i++)
+                if (enhance_control_parse(l[i], &have) && have.type == ENHANCE_CTL_KEY
+                    && same_key(have.key, b.key)) {
+                    snprintf(why, n, "%s: %s uses it",
+                             d->title && *d->title ? d->title : xbox_mod_name(m),
+                             ct->label ? ct->label : ct->id);
+                    return 1;
+                }
+        }
+    }
+    return 0;
+}
+
 void enhance_actions_quiet(int on)
 {
     /* Off drains through one more quiet step (2), see step(). */

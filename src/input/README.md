@@ -213,6 +213,19 @@ the host pad through `xbox_input_backend_read_host` so the actions still
 fire on a loading screen. `tests/input_actions` covers the filter seam
 and the actions.
 
+**The capture record.** `xbox_InputSetPadSeen(fn)` installs the
+enhancements layer's record of port 0 (`xbox_enhance_pad_seen`, `mod.h`),
+which `xbox_InputGetState` calls under `XBOXRECOMP_ENHANCE` after the
+filter, with the state the title is about to get (zeros and
+`connected` 0 for a failed poll), whether or not the filter is armed. It
+returns nonzero while a mod captures port 0: the title then reads the
+pad connected and released, with `dwPacketNumber` moved each time that
+starts or stops, and a failed poll is left as it is. The pointer keeps
+`xbox_input` from linking against the enhance library. A title that
+reads the pad through its own glue calls `xbox_enhance_pad_seen` itself
+after `xbox_enhance_pad_filter` (cat's `pad_input.c`,
+`XBOX_MOD_PAD_SEEN`). With no mod capturing it costs one load.
+
 ### Keyboard → Xbox mapping
 
 With `RECOMP_KEYBOARD=1` the keyboard is a pad on port 0, merged on top of

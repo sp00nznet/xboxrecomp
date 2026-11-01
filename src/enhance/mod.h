@@ -307,9 +307,15 @@ struct xbox_mod_api {
      * before init as "<id>.<control id>"), for action_pressed and
      * action_down; -1 for another kind or a bad idx. */
     int (*control_action)(const struct xbox_mod_desc *desc, uint32_t idx);
-    /* A captured control's value: fills *out, returns 1 when it reads a
-     * source. Until the recorded pad state lands (mod-settings phase D)
-     * it reports not connected: out zeroed, 0. */
+    /* A captured control's value, from port 0 as the title would have
+     * read it this poll (after [input.pad], [input.bindings] and the
+     * consumed-chord mask, before the neutral pad), on the guest's thread.
+     * BUTTON: raw[0] 0..255, the most of its bindings (a digital button or
+     * a host key reads 255). STICK: raw[0..1] the stick's x and y, src
+     * which stick (the caller picks the dead zone by it). connected is 0
+     * while no capture holds port 0, before its first poll, and with no
+     * pad (a host key still reads). Returns 1 when it read a source: a
+     * connected pad, or a host key binding. */
     int (*control_value)(const struct xbox_mod_desc *desc, uint32_t idx,
                          struct xbox_ctl_value *out);
 
@@ -428,6 +434,16 @@ void xbox_mod_debug_tick(void);
 /* The title's pad glue: whether a mod has port 0 (enhance_input_captured). */
 int xbox_mod_input_captured(void);
 
+/* The title's pad glue, once per port-0 poll after xbox_enhance_pad_filter,
+ * with the state it is about to use (connected 0: a failed poll): records
+ * it for control_value while a mod captures. Returns 1 then, and the glue
+ * gives the title a connected, released pad, with a packet number that
+ * moves when that starts and ends; 0 otherwise (any other port, or no
+ * capture), at the cost of one load. A
+ * title on xbox_InputGetState gets this from input_core.c. */
+#define XBOX_MOD_PAD_SEEN 1
+int xbox_enhance_pad_seen(DWORD port, const XBOX_GAMEPAD *g, int connected);
+
 /* The title's pad glue, after its own merge (keyboard, script): the host
  * pad behind port (host_pad.h; connected = 0 for a script or no pad) and
  * the state the title is about to use, from which a consumed chord's
@@ -507,6 +523,21 @@ const char *xbox_mod_setting_env(int i, uint32_t idx);
  * [input.controls] "<id>.<control id>" (D3). Returns the count. */
 int xbox_mod_control_bindings(int i, uint32_t idx, char out[][ENHANCE_ACTION_TEXT], int max,
                               const char **src);
+/* The menu's rebinding of a BUTTON or STICK control (the menu's thread):
+ * set_bindings stages n (1..ENHANCE_ACTION_BINDS) texts that control_value
+ * reads at once, refused (0) for an env-forced control. dirty: they differ
+ * from what was loaded or last saved; mark_saved after the Save wrote
+ * them; revert goes back. stock is what a reset stages (the defaults
+ * file's row, else the descriptor's defaults), is_stock whether the
+ * bindings are those, key the full [input.controls] key. */
+int xbox_mod_control_set_bindings(int i, uint32_t idx, const char *const *texts, int n);
+int xbox_mod_control_dirty(int i, uint32_t idx);
+void xbox_mod_control_mark_saved(int i, uint32_t idx);
+void xbox_mod_control_revert(int i, uint32_t idx);
+int xbox_mod_control_stock(int i, uint32_t idx, char out[][ENHANCE_ACTION_TEXT], int max);
+int xbox_mod_control_is_stock(int i, uint32_t idx);
+int xbox_mod_control_forced(int i, uint32_t idx);
+const char *xbox_mod_control_key(int i, uint32_t idx);
 
 /* User-file aliases waiting to be rewritten under the current key (D4):
  * the menu's Save writes key = value and removes old. Returns the count;

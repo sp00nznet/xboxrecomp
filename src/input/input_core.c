@@ -48,6 +48,8 @@ static int      g_rumbling[XBOX_MAX_CONTROLLERS];
 static uint32_t g_extra[XBOX_MAX_CONTROLLERS];
 /* The host actions' filter (host_pad.h); atomic, NULL when disarmed. */
 static xbox_input_pad_filter_fn g_filter;
+/* The mod layer's record (host_pad.h); atomic, NULL without one. */
+static xbox_input_seen_fn g_seen;
 /* input.glyphs (XBOX_PAD_FAMILY_*); atomic. */
 static int g_glyphs = XBOX_PAD_FAMILY_AUTO;
 
@@ -203,6 +205,11 @@ void xbox_InputSetBackend(const xbox_input_backend *b)
 void xbox_InputSetPadFilter(xbox_input_pad_filter_fn fn)
 {
     __atomic_store_n(&g_filter, fn, __ATOMIC_RELEASE);
+}
+
+void xbox_InputSetPadSeen(xbox_input_seen_fn fn)
+{
+    __atomic_store_n(&g_seen, fn, __ATOMIC_RELEASE);
 }
 
 int xbox_InputPadFilterSet(void)
@@ -375,7 +382,39 @@ DWORD xbox_InputLastState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     last_unlock();
     return rc;
 }
-#define KEEP(port, rc, st) ((port) == 0 ? keep_last((rc), (st)) : (rc))
+
+/* Port 0's neutral pad (host_pad.h, xbox_InputSetPadSeen): on while the
+ * record says a mod holds it. The title reads edges by packet number (see
+ * xbox_InputMergeKbm), so a state that turns to zero under the same number
+ * would read as still held: the number moves by one more each time the
+ * neutral pad starts or ends, and stays moved. The title's poll thread
+ * only. */
+static int g_neutral;
+static DWORD g_neutral_bump;
+
+static DWORD finish0(DWORD rc, XBOX_INPUT_STATE *st)
+{
+    static const XBOX_GAMEPAD none;
+    xbox_input_seen_fn seen = __atomic_load_n(&g_seen, __ATOMIC_ACQUIRE);
+    int held;
+
+    /* What the title would have read, for xbox_InputLastState and the
+     * record: the fly input stays readable while the title gets zeros. */
+    keep_last(rc, st);
+    held = seen && seen(0, rc == ERROR_SUCCESS ? &st->Gamepad : &none, rc == ERROR_SUCCESS);
+    /* A failed poll has no pad to neutralise and is left as it is. */
+    if (rc != ERROR_SUCCESS)
+        return rc;
+    if (held != g_neutral) {
+        g_neutral = held;
+        g_neutral_bump++;
+    }
+    if (held)
+        memset(&st->Gamepad, 0, sizeof st->Gamepad);
+    st->dwPacketNumber += g_neutral_bump;
+    return rc;
+}
+#define KEEP(port, rc, st) ((port) == 0 ? finish0((rc), (st)) : (rc))
 
 void xbox_InputKeepLastState(DWORD dwPort, DWORD rc, const XBOX_INPUT_STATE *pState)
 {

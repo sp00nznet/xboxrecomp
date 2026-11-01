@@ -1,7 +1,9 @@
 /*
  * mod.c - see mod.h. The tables are filled during init on the main thread,
  * before the guest and the render thread start, and only read after: the
- * frame and draw paths take no lock. Shutdown leaves them as they are: the
+ * frame and draw paths take no lock, but for control_value, which the menu
+ * can rebind under it (a short spin lock on the parsed bindings) and which
+ * reads the poll's record through a seqlock. Shutdown leaves them as they are: the
  * guest's thread or the render thread may be inside a callback then, and
  * the filter pointer (nv2a_batch_filter_set) is what stops new asks.
  */
@@ -28,6 +30,21 @@
 #include "recomp_guest_call.h"
 #include "recomp_hook_mod.h"
 #include "xbox_memory_layout.h"
+#include "keyboard.h"           /* xbox_FramebufferKeyDown: a host key binding */
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#define spin_wait() SwitchToThread()
+#else
+#include <sched.h>
+#define spin_wait() sched_yield()
+#endif
 
 #define LOGP "[MOD] "
 
@@ -99,6 +116,18 @@ struct ctl_rt {
     int n;
     char key[KEY_MAX];          /* "input.controls.<id>.<ctl>" */
     char bind[CTL_BINDS][ENHANCE_ACTION_TEXT];
+    /* The bindings as loaded or last saved: the menu's change is unsaved
+     * while bind differs from these. Both are the menu's thread's. */
+    char base[CTL_BINDS][ENHANCE_ACTION_TEXT];
+    int nbase, base_src;
+    /* What a reset stages: the defaults file's row, else the descriptor's
+     * defaults (a Save of it removes the user key). */
+    char stock[CTL_BINDS][ENHANCE_ACTION_TEXT];
+    int nstock;
+    /* bind parsed, what control_value reads on the guest's thread:
+     * s_code_lock's, since the menu rebinds from its own. */
+    struct enhance_ctl_src code[CTL_BINDS];
+    int ncode;
 };
 
 struct mod_rt {
@@ -981,10 +1010,32 @@ static void setting_resolve(int i, uint32_t k)
     st_val(&r->want, v);
 }
 
+/* A file's [input.controls] entry into out: a string or an array of
+ * strings, else 0. */
+static int hit_bindings(const recomp_cfg *f, const char *key,
+                        char out[][ENHANCE_ACTION_TEXT], int *n)
+{
+    recomp_cfg_type t = recomp_cfg_type_of(f, key);
+    size_t len;
+
+    *n = 0;
+    if (t == RCFG_STRING) {
+        snprintf(out[(*n)++], ENHANCE_ACTION_TEXT, "%s", recomp_cfg_string(f, key, ""));
+        return 1;
+    }
+    if (t != RCFG_ARRAY)
+        return 0;
+    len = recomp_cfg_array_len(f, key);
+    for (size_t e = 0; e < len && *n < CTL_BINDS; e++)
+        if (recomp_cfg_array_type(f, key, e) == RCFG_STRING)
+            snprintf(out[(*n)++], ENHANCE_ACTION_TEXT, "%s",
+                     recomp_cfg_array_string(f, key, e, ""));
+    return 1;
+}
+
 /* A captured control's bindings ([input.controls], D3): env row, the
- * user files' key then aliases, the defaults file's, the defaults. Read
- * for the menu and the dump; the per-frame reader lands in phase D. */
-static void control_resolve(int i, uint32_t k)
+ * user files' key then aliases, the defaults file's, the defaults. */
+static void control_load(int i, uint32_t k)
 {
     const struct xbox_mod_control *c = &s_mod[i].d.controls[k];
     struct ctl_rt *r = &s_mod[i].ctl[k];
@@ -1000,6 +1051,16 @@ static void control_resolve(int i, uint32_t k)
         fprintf(stderr, LOGP "%s: env row %s not bound (key too long / table full)\n",
                 r->key, c->env);
     nh = enhance_cfg_layered(r->key, c->aliases, hits, (int)(sizeof hits / sizeof hits[0]));
+    r->nstock = -1;
+    for (int h = 0; h < nh && r->nstock < 0; h++)
+        if ((hits[h].row == ENHANCE_ROW_DEFAULTS || hits[h].row == ENHANCE_ROW_DEFAULTS_ALIAS)
+            && !hit_bindings(hits[h].file, hits[h].key, r->stock, &r->nstock))
+            r->nstock = -1;
+    if (r->nstock < 0) {
+        r->nstock = 0;
+        for (int b = 0; c->defaults && c->defaults[b] && r->nstock < CTL_BINDS; b++)
+            snprintf(r->stock[r->nstock++], ENHANCE_ACTION_TEXT, "%s", c->defaults[b]);
+    }
     env = enhance_cfg_env(r->key);
     if (env) {
         const char *p = env;
@@ -1026,17 +1087,7 @@ static void control_resolve(int i, uint32_t k)
     for (int h = 0; h < nh; h++) {
         const recomp_cfg *f = hits[h].file;
         const char *key = hits[h].key;
-        recomp_cfg_type t = recomp_cfg_type_of(f, key);
-        size_t len;
-        if (t == RCFG_STRING) {
-            snprintf(r->bind[r->n++], ENHANCE_ACTION_TEXT, "%s", recomp_cfg_string(f, key, ""));
-        } else if (t == RCFG_ARRAY) {
-            len = recomp_cfg_array_len(f, key);
-            for (size_t e = 0; e < len && r->n < CTL_BINDS; e++)
-                if (recomp_cfg_array_type(f, key, e) == RCFG_STRING)
-                    snprintf(r->bind[r->n++], ENHANCE_ACTION_TEXT, "%s",
-                             recomp_cfg_array_string(f, key, e, ""));
-        } else {
+        if (!hit_bindings(f, key, r->bind, &r->n)) {
             fprintf(stderr, LOGP "%s.%s: %s:%d: %s should be a list of strings; ignored\n",
                     s_table[i]->name, c->id, recomp_cfg_name(f), recomp_cfg_line(f, key), key);
             continue;
@@ -1056,6 +1107,48 @@ static void control_resolve(int i, uint32_t k)
     }
     for (int b = 0; c->defaults && c->defaults[b] && r->n < CTL_BINDS; b++)
         snprintf(r->bind[r->n++], ENHANCE_ACTION_TEXT, "%s", c->defaults[b]);
+}
+
+static void code_lock(void);
+static void code_unlock(void);
+
+/* bind into code, under the lock: a text that names no source, or one
+ * the control's kind cannot read (a stick on a BUTTON, anything but a
+ * stick on a STICK), is left out with a line. */
+static void control_codes(int i, uint32_t k, int quiet)
+{
+    const struct xbox_mod_control *c = &s_mod[i].d.controls[k];
+    struct ctl_rt *r = &s_mod[i].ctl[k];
+    struct enhance_ctl_src code[CTL_BINDS];
+    int n = 0;
+
+    for (int b = 0; b < r->n; b++) {
+        struct enhance_ctl_src v;
+        int ok = enhance_control_parse(r->bind[b], &v);
+        if (ok && (c->kind == XBOX_CTL_STICK) != (v.type == ENHANCE_CTL_STICK))
+            ok = 0;
+        if (ok)
+            code[n++] = v;
+        else if (!quiet)
+            fprintf(stderr, LOGP "%s: \"%s\" is not %s; left out\n", r->key, r->bind[b],
+                    c->kind == XBOX_CTL_STICK ? "a stick (left_stick, right_stick)"
+                                              : "a game button or a host key");
+    }
+    code_lock();
+    memcpy(r->code, code, sizeof code);
+    r->ncode = n;
+    code_unlock();
+}
+
+static void control_resolve(int i, uint32_t k)
+{
+    struct ctl_rt *r = &s_mod[i].ctl[k];
+
+    control_load(i, k);
+    memcpy(r->base, r->bind, sizeof r->base);
+    r->nbase = r->n;
+    r->base_src = r->src;
+    control_codes(i, k, 0);
 }
 
 /* An ACTION control's user alias goes on the rewrite list like a
@@ -1161,15 +1254,158 @@ static int api_control_action(const struct xbox_mod_desc *desc, uint32_t idx)
     return xbox_mod_control_action(mod_of(desc), idx);
 }
 
-/* Until the recorded pad state lands (phase D) no source is read. */
+/* ---- the recorded port 0 (D3) -----------------------------------------
+ *
+ * Port 0's guest state as the title was about to get it, after the
+ * consumed-chord mask and before the neutral pad: the poll thread writes
+ * it (xbox_enhance_pad_seen) and a mod reads it on the guest's thread
+ * (control_value). A seqlock, so the poll never waits on the guest: the
+ * writer makes the sequence odd around the copy, a reader retries until
+ * it reads one even sequence on both sides. The words are atomics so the
+ * racing copy is defined; a torn one is never used. */
+#define REC_WORDS ((sizeof(XBOX_GAMEPAD) + 3) / 4)
+static struct {
+    unsigned seq;
+    unsigned epoch;             /* s_cap_epoch when written */
+    uint32_t connected;
+    uint32_t w[REC_WORDS];
+} s_rec;
+/* A second writer (two threads polling port 0) skips its copy instead of
+ * waiting: the one writing has a state as new. */
+static int s_rec_busy;
+/* Bumped as a capture starts: a record from before it (an earlier flight)
+ * reads as nothing until the first poll of this one. */
+static unsigned s_cap_epoch;
+
+int xbox_enhance_pad_seen(DWORD port, const XBOX_GAMEPAD *g, int connected)
+{
+    uint32_t w[REC_WORDS];
+    unsigned s;
+
+    /* The stock run's whole cost: one load. Only port 0 is the mod's: a
+     * glue that calls this for every port leaves the others to the game. */
+    if (port != 0 || !enhance_input_captured())
+        return 0;
+    if (__atomic_exchange_n(&s_rec_busy, 1, __ATOMIC_ACQUIRE))
+        return 1;
+    memset(w, 0, sizeof w);
+    if (connected && g)
+        memcpy(w, g, sizeof *g);
+    s = __atomic_load_n(&s_rec.seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_rec.seq, s + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    for (size_t i = 0; i < REC_WORDS; i++)
+        __atomic_store_n(&s_rec.w[i], w[i], __ATOMIC_RELAXED);
+    __atomic_store_n(&s_rec.connected, connected && g ? 1u : 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_rec.epoch, __atomic_load_n(&s_cap_epoch, __ATOMIC_ACQUIRE),
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&s_rec.seq, s + 2, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_rec_busy, 0, __ATOMIC_RELEASE);
+    return 1;
+}
+
+/* The record into *g: 1 when it holds a connected pad of this capture,
+ * else 0 with *g zeroed. */
+static int rec_read(XBOX_GAMEPAD *g)
+{
+    uint32_t w[REC_WORDS];
+    unsigned s0, s1, epoch, conn;
+
+    for (;;) {
+        s0 = __atomic_load_n(&s_rec.seq, __ATOMIC_ACQUIRE);
+        if (s0 & 1u) {
+            spin_wait();
+            continue;
+        }
+        for (size_t i = 0; i < REC_WORDS; i++)
+            w[i] = __atomic_load_n(&s_rec.w[i], __ATOMIC_RELAXED);
+        conn = __atomic_load_n(&s_rec.connected, __ATOMIC_RELAXED);
+        epoch = __atomic_load_n(&s_rec.epoch, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        s1 = __atomic_load_n(&s_rec.seq, __ATOMIC_RELAXED);
+        if (s0 == s1)
+            break;
+    }
+    memset(g, 0, sizeof *g);
+    if (!conn || epoch != __atomic_load_n(&s_cap_epoch, __ATOMIC_ACQUIRE)
+        || !enhance_input_captured())
+        return 0;
+    memcpy(g, w, sizeof *g);
+    return 1;
+}
+
+/* api->input_capture: a new capture starts a new record. */
+static void api_input_capture(int on)
+{
+    if (on && !enhance_input_captured())
+        __atomic_add_fetch(&s_cap_epoch, 1u, __ATOMIC_ACQ_REL);
+    enhance_input_capture(on);
+}
+
+static int s_code_lock;
+
+static void code_lock(void)
+{
+    while (__atomic_exchange_n(&s_code_lock, 1, __ATOMIC_ACQUIRE))
+        spin_wait();
+}
+
+static void code_unlock(void)
+{
+    __atomic_store_n(&s_code_lock, 0, __ATOMIC_RELEASE);
+}
+
 static int api_control_value(const struct xbox_mod_desc *desc, uint32_t idx,
                              struct xbox_ctl_value *out)
 {
-    (void)desc;
-    (void)idx;
+    struct enhance_ctl_src code[CTL_BINDS];
+    struct xbox_ctl_value v;
+    XBOX_GAMEPAD g;
+    int i = mod_of(desc), n, conn, keys = 0, kind;
+
+    memset(&v, 0, sizeof v);
     if (out)
-        memset(out, 0, sizeof *out);
-    return 0;
+        *out = v;
+    if (!out || i < 0 || idx >= s_mod[i].d.n_controls)
+        return 0;
+    kind = s_mod[i].d.controls[idx].kind;
+    if (kind != XBOX_CTL_BUTTON && kind != XBOX_CTL_STICK)
+        return 0;
+    code_lock();
+    n = s_mod[i].ctl[idx].ncode;
+    memcpy(code, s_mod[i].ctl[idx].code, sizeof code);
+    code_unlock();
+    conn = rec_read(&g);
+    if (kind == XBOX_CTL_STICK) {
+        /* A STICK has one source: the first that parsed. */
+        if (n > 0) {
+            int left = code[0].idx == (int)XBOX_CTL_SRC_LEFT;
+            v.src = (uint8_t)code[0].idx;
+            v.raw[0] = left ? g.sThumbLX : g.sThumbRX;
+            v.raw[1] = left ? g.sThumbLY : g.sThumbRY;
+        }
+        n = 0;
+    }
+    for (int b = 0; b < n; b++) {
+        int x = 0;
+        switch (code[b].type) {
+        case ENHANCE_CTL_BUTTON:
+            x = (g.wButtons >> code[b].idx) & 1u ? 255 : 0;
+            break;
+        case ENHANCE_CTL_ANALOG:
+            x = g.bAnalogButtons[code[b].idx];
+            break;
+        case ENHANCE_CTL_KEY:
+            keys = 1;
+            x = xbox_FramebufferKeyDown(code[b].key) ? 255 : 0;
+            break;
+        }
+        if (x > v.raw[0])
+            v.raw[0] = (int16_t)x;
+    }
+    v.connected = (uint8_t)conn;
+    *out = v;
+    return conn || keys;
 }
 
 void xbox_mod_register_table(const struct xbox_mod *const *mods)
@@ -1380,7 +1616,7 @@ static int mod_init(int describe)
     s_api.log = api_log;
     s_api.on_frame = api_on_frame;
     s_api.input_state = enhance_input_state;
-    s_api.input_capture = enhance_input_capture;
+    s_api.input_capture = api_input_capture;
     s_api.batch_filter = api_batch_filter;
     s_api.action_register = api_action_register;
     s_api.action_pressed = enhance_action_pressed;
@@ -1393,6 +1629,9 @@ static int mod_init(int describe)
     s_api.on_setting = api_on_setting;
     s_api.control_action = api_control_action;
     s_api.control_value = api_control_value;
+    /* The record and the neutral pad: input_core.c calls this on every
+     * port-0 poll, and it is one load while no mod captures. */
+    xbox_InputSetPadSeen(xbox_enhance_pad_seen);
     s_api.hook = api_hook;
     s_api.active = api_active;
     s_api.hud_table = api_hud_table;
@@ -1959,6 +2198,102 @@ int xbox_mod_control_bindings(int i, uint32_t idx, char out[][ENHANCE_ACTION_TEX
     for (; n < c->n && n < max; n++)
         snprintf(out[n], ENHANCE_ACTION_TEXT, "%s", c->bind[n]);
     return n;
+}
+
+/* A captured control of a valid mod, else NULL. */
+static struct ctl_rt *captured(int i, uint32_t idx)
+{
+    int kind;
+
+    if (i < 0 || i >= s_count || !s_mod[i].valid || idx >= s_mod[i].d.n_controls)
+        return NULL;
+    kind = s_mod[i].d.controls[idx].kind;
+    return kind == XBOX_CTL_BUTTON || kind == XBOX_CTL_STICK ? &s_mod[i].ctl[idx] : NULL;
+}
+
+int xbox_mod_control_set_bindings(int i, uint32_t idx, const char *const *texts, int n)
+{
+    struct ctl_rt *r = captured(i, idx);
+
+    if (!r || r->src == SRC_ENV || !texts || n < 1 || n > CTL_BINDS)
+        return 0;
+    for (int b = 0; b < n; b++)
+        snprintf(r->bind[b], ENHANCE_ACTION_TEXT, "%s", texts[b] ? texts[b] : "");
+    r->n = n;
+    r->src = SRC_MENU;
+    control_codes(i, idx, 1);
+    return 1;
+}
+
+static int same_list(char a[][ENHANCE_ACTION_TEXT], int na, char b[][ENHANCE_ACTION_TEXT], int nb)
+{
+    if (na != nb)
+        return 0;
+    for (int k = 0; k < na; k++)
+        if (strcmp(a[k], b[k]) != 0)
+            return 0;
+    return 1;
+}
+
+int xbox_mod_control_dirty(int i, uint32_t idx)
+{
+    struct ctl_rt *r = captured(i, idx);
+
+    return r && !same_list(r->bind, r->n, r->base, r->nbase);
+}
+
+void xbox_mod_control_mark_saved(int i, uint32_t idx)
+{
+    struct ctl_rt *r = captured(i, idx);
+
+    if (!r)
+        return;
+    memcpy(r->base, r->bind, sizeof r->base);
+    r->nbase = r->n;
+    r->base_src = r->src;
+}
+
+void xbox_mod_control_revert(int i, uint32_t idx)
+{
+    struct ctl_rt *r = captured(i, idx);
+
+    if (!r || same_list(r->bind, r->n, r->base, r->nbase))
+        return;
+    memcpy(r->bind, r->base, sizeof r->bind);
+    r->n = r->nbase;
+    r->src = r->base_src;
+    control_codes(i, idx, 1);
+}
+
+int xbox_mod_control_stock(int i, uint32_t idx, char out[][ENHANCE_ACTION_TEXT], int max)
+{
+    struct ctl_rt *r = captured(i, idx);
+    int n = 0;
+
+    for (; r && n < r->nstock && n < max; n++)
+        snprintf(out[n], ENHANCE_ACTION_TEXT, "%s", r->stock[n]);
+    return n;
+}
+
+int xbox_mod_control_is_stock(int i, uint32_t idx)
+{
+    struct ctl_rt *r = captured(i, idx);
+
+    return r && same_list(r->bind, r->n, r->stock, r->nstock);
+}
+
+int xbox_mod_control_forced(int i, uint32_t idx)
+{
+    struct ctl_rt *r = captured(i, idx);
+
+    return r && r->src == SRC_ENV;
+}
+
+const char *xbox_mod_control_key(int i, uint32_t idx)
+{
+    struct ctl_rt *r = captured(i, idx);
+
+    return r ? r->key : NULL;
 }
 
 int xbox_mod_pending_rewrites(const char **keys, const char **values,
