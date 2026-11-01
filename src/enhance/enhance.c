@@ -339,6 +339,16 @@ int xbox_enhance_init(const char *root, const char *title)
      * Armed but hidden, nothing is drawn; the cost is the font bake and
      * two layers' lists. overlay.stats is read once, by the hook's arming
      * (enhance_actions_start). */
+    /* overlay.ui_scale (D2) before any arm: the atlas is baked at the
+     * first, so the key is read once and a change waits for a restart. A
+     * line only when it is set, so the stock log stays as it was. */
+    {
+        double want = enhance_cfg_float("overlay.ui_scale", 1.0);
+        float got = nv2a_overlay_set_ui_scale((float)want);
+        if (enhance_cfg_source_of("overlay.ui_scale") != ENHANCE_SRC_DEFAULT)
+            fprintf(stderr, LOGP "overlay.ui_scale=%g%s\n", got,
+                    (float)want != got ? " (clamped to 0.75..2.0)" : "");
+    }
     {
         int stats = enhance_actions_keyed("overlay.stats");
         fprintf(stderr, LOGP "overlay.stats=%s\n", stats ? "on" : "off");

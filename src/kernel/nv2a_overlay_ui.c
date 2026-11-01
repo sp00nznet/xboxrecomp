@@ -42,6 +42,20 @@ const struct nv2a_ovl_theme nv2a_ovl_theme_default = {
     .shadow_alpha = 0.35f, .shadow = 12,
 };
 
+static float s_ui_mul = 1.0f;
+
+float nv2a_overlay_set_ui_scale(float mul)
+{
+    if (mul != mul)
+        mul = 1.0f;
+    if (mul < 0.75f)
+        mul = 0.75f;
+    if (mul > 2.0f)
+        mul = 2.0f;
+    s_ui_mul = mul;
+    return mul;
+}
+
 float nv2a_ovl_ui_scale(uint32_t out_h)
 {
     float s = (float)out_h / 1080.0f;
@@ -49,7 +63,14 @@ float nv2a_ovl_ui_scale(uint32_t out_h)
         s = 0.5f;
     if (s > 3.0f)
         s = 3.0f;
-    return s;   /* times overlay.ui_scale from phase 3E */
+    /* The outer clamp: 4K at 2.0 would ask for 4.0, past what the atlas
+     * holds; 480 lines at 0.75 for text under the smallest size it packs. */
+    s *= s_ui_mul;
+    if (s < 0.5f)
+        s = 0.5f;
+    if (s > 3.0f)
+        s = 3.0f;
+    return s;
 }
 
 int nv2a_ovl_px(float s, int token)

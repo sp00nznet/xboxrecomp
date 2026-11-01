@@ -9,6 +9,9 @@
 # pinned checksum. Pure C, no device:
 #   cmake -S tests/enhance_menu -B build/enhance_menu
 #   cmake --build build/enhance_menu && ctest --test-dir build/enhance_menu
+# MENU_REF_OUT=<dir> also writes the menu in both sizes, toolbar folded and
+# open, at 1080p, 720p and a narrow 600x800, as PPM from the CPU reference
+# raster: the pictures to review before pinning new sums.
 cmake_minimum_required(VERSION 3.20)
 project(enhance_menu_test C)
 set(CMAKE_C_STANDARD 11)
@@ -45,6 +48,8 @@ add_executable(enhance_menu_test
     ${XR_SRC}/enhance/enhance_input.c
     ${XR_SRC}/enhance/enhance_actions.c
     ${XR_SRC}/enhance/enhance_menu.c
+    ${XR_SRC}/enhance/enhance_menu_layout.c
+    ${XR_SRC}/enhance/enhance_text.c
     ${XR_SRC}/enhance/mod.c
     ${XR_SRC}/enhance/hud_anchor.c
     ${XR_SRC}/enhance/hud_capture.c
@@ -62,6 +67,8 @@ add_executable(enhance_menu_test
     ${XR_SRC}/kernel/nv2a_overlay.c
     ${XR_SRC}/kernel/nv2a_overlay_ui.c
     ${XR_SRC}/kernel/nv2a_overlay_font.c
+    ${XR_SRC}/kernel/nv2a_overlay_glyph.c
+    ${XR_SRC}/kernel/nv2a_overlay_ref.c
     ${XR_SRC}/kernel/nv2a_stats.c
     ${XR_SRC}/platform/recomp_env.c
     ${XR_SRC}/platform/recomp_exe_dir.c

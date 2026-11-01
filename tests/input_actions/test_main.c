@@ -102,6 +102,7 @@ int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)
     return 0;
 }
 void nv2a_overlay_set_stats(int on) { s_ovl_stats = on; }
+float nv2a_overlay_set_ui_scale(float mul) { return mul; }
 int nv2a_overlay_stats(void) { return s_ovl_stats; }
 static int s_toasts;
 static char s_toast[128];

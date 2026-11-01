@@ -175,6 +175,8 @@ the stock settings, `present.pacing = "spin"` included.
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
 | `overlay.stats` | bool | the stats strip in the window's top right corner: fps, frame ms (average and worst of the last second), pacing, scale and backend, at 2 Hz; never in a frame dump | `false` | `RECOMP_OVERLAY_STATS` |
+| `overlay.ui_scale` | number | the menu's and the overlays' size over the output-height scale, 0.75 to 2 in quarter steps: larger for a TV across the room. Read at start (the font atlas is baked then) | `1` | none |
+| `overlay.menu_size` | string | `"compact"` (a panel at the left, the game beside it) or `"expanded"` (the whole window over a dimmed game). R3 in the menu flips it and writes this key at once, alone; not with `RECOMP_CONFIG=none` | `"compact"` | none |
 | `menu.enabled` | bool | the in-game menu, opened by the `menu.open` action ([In-game menu](#in-game-menu-menuenabled)) | `false` | `RECOMP_MENU` |
 | `storage.ram_cache` | bool | the title's cache partition (`Z:`, `Partition3`-`5`) lives in memory: capped at the stock 750 MB (a full one answers `STATUS_DISK_FULL`, as FATX does), seeded read-only from `<hdd>/Cache` at the first file call, never written back. For a title that rewrites its cache all the time (BLiNX 1: about 7 GB an hour); the console clears these partitions anyway. On by default for every title; `false` puts the files in `<hdd>/Cache` as stock. Read before the guest starts | `true` | `RECOMP_STORAGE_RAM_CACHE` |
 | `mods.<name>` | bool | a mod ([Mods](#mods)) runs; `false` leaves its init out at start. The menu's Mods page writes it | `true` | none |
@@ -1297,6 +1299,19 @@ a second after the close.
 | LB, RB | Q, E, PgUp, PgDn | the previous or next page |
 | Y | F5 | Save |
 | X | Delete | clear an action's bindings |
+| R3 (on release) | | the size: compact or expanded (`overlay.menu_size`) |
+
+The menu comes in two sizes. Compact is a panel down the window's left,
+the game in view beside it; expanded fills the window over the game
+dimmed. The header names the game (the window title), and its buttons
+are the hints, the size and close. The sections sit in a toolbar down
+the panel's left: icons while the rows have the focus, unfolded with
+their names when the toolbar has it, drawn over the rows' left edge so
+the rows do not move. LB and RB unfold it for 1.5 s to show where they
+went. The footer holds the selected row's help, the unsaved count, and
+Cancel and Save with the input that fires them (View and Y on a pad,
+Shift+Esc and F5 on the keyboard). Everything scales with the output
+height times `overlay.ui_scale`.
 
 The pages are Render, Shaders, Pack, Game (a title's own items, from
 `enhance_menu_add`), Mods, Stats, Controls, Debug and Save.
@@ -1394,7 +1409,7 @@ points, its live class; the footer names the selected row's:
 | at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
-| at restart | at the next start; the change is saved, not applied | `display.aspect`, `present.surface`, a mod without `on_enable` |
+| at restart | at the next start; the change is saved, not applied | `display.aspect`, `present.surface`, `overlay.ui_scale`, a mod without `on_enable` |
 
 The `textures.pack` toggle turns the loaded pack off for this session only
 and is never saved (the key names the pack's file). A title's items and a

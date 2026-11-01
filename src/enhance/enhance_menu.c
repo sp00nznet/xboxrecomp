@@ -29,6 +29,9 @@
 #include "enhance.h"
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
+#include "enhance_menu_layout.h"
+#include "enhance_text.h"
+#include "host_pad.h"
 #include "hud_anchor.h"
 #include "input_map.h"
 #include "input_names.h"
@@ -38,6 +41,7 @@
 #include "mouse.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_overlay.h"
+#include "nv2a_overlay_glyph.h"
 #include "nv2a_overlay_int.h"
 #include "nv2a_present_chain.h"
 #include "nv2a_stats.h"
@@ -60,6 +64,7 @@
 #define CLOSE_MS     1000u  /* the neutral pad after closing, at most */
 #define LIVE_DRAW_MS 250u   /* a page of live numbers redraws this often */
 #define STATUS_MS    3000u  /* a message stays in the footer this long */
+#define PEEK_MS      1500u  /* Q10: LB/RB show the toolbar's labels this long */
 
 enum page {
     PAGE_RENDER, PAGE_SHADERS, PAGE_PACK, PAGE_GAME, PAGE_MODS, PAGE_STATS, PAGE_CONTROLS,
@@ -324,6 +329,11 @@ static const struct enhance_item k_items[] = {
     { ITEM("present.surface", "Present surface", "Render", ENHANCE_ITEM_CHOICE),
       .choices = k_surface, .live = ENHANCE_LIVE_RESTART, .def = "auto",
       .help = "The window surface the picture is shown on; auto picks the best one" },
+    /* The atlas is baked at the first overlay arm, so a new scale waits
+     * for the next run. */
+    { ITEM("overlay.ui_scale", "Overlay scale", "Render", ENHANCE_ITEM_RANGE), .lo = 0.75,
+      .hi = 2.0, .step = 0.25, .live = ENHANCE_LIVE_RESTART, .def = "1",
+      .help = "Sizes the menu and the overlays: larger for a TV across the room" },
     /* textures.pack names the file: the toggle is this session's only. */
     { ITEM("textures.pack", "Texture pack", "Pack", ENHANCE_ITEM_TOGGLE), .set = set_pack_bit,
       .get = get_pack_bit, .live = ENHANCE_LIVE_FLUSH, .flags = ENHANCE_ITEM_NOSAVE,
@@ -939,6 +949,10 @@ static struct {
 } s_dlg;
 
 static int s_hints_inline;          /* L3: hints under the rows, not as a tooltip */
+static int s_size;                  /* enum menu_size (D2), overlay.menu_size */
+static int s_bar_focus;             /* the toolbar has the focus (Q10) */
+static uint64_t s_peek_t;           /* the last section change, 0 for none */
+static int s_peek_drawn;            /* the draw after the peek ran out is done */
 static int s_need_draw;
 static char s_status[128];
 static uint64_t s_status_t, s_now;
@@ -1050,36 +1064,79 @@ static void slot_rows(int page, int mod)
     }
 }
 
-/* ---- the panel's geometry (the draw and the wrap share it) ---------------- */
+/* ---- the panel's geometry (the draw, the wrap and the hit test share it) - */
 
-struct geom {
-    float s;
-    int pad, gap, rowh, rgap, pw;
+/* The section toolbar's icon for each page (Q10). */
+static const uint32_t k_page_icon[PAGE_COUNT] = {
+    NV2A_OVL_ICON_SLIDERS, NV2A_OVL_ICON_SPARKLES, NV2A_OVL_ICON_PACKAGE, NV2A_OVL_ICON_GAMEPAD,
+    NV2A_OVL_ICON_PUZZLE, NV2A_OVL_ICON_ACTIVITY, NV2A_OVL_ICON_KEYBOARD, NV2A_OVL_ICON_BUG,
+    NV2A_OVL_ICON_FOLDER
 };
 
-/* R8: a panel on the left, 40% of the width up to 720 px at 1080; the
- * whole width on a narrow or portrait output. */
-static void geom_of(struct geom *g, int *w_out, int *h_out)
+/* Q11: the footer's buttons carry the shortcut that presses them. */
+static const char *const k_foot_pad[MENU_FB_COUNT] = {"{pad:view} Cancel", "{pad:north} Save"};
+static const char *const k_foot_key[MENU_FB_COUNT] = {"{key:shift+esc} Cancel", "{key:F5} Save"};
+/* A footer too small for the glyphs shows the bare words. */
+static const char *const k_foot_bare[MENU_FB_COUNT] = {"Cancel", "Save"};
+
+static int foot_device(void)
+{
+    return s_kbd ? ENHANCE_DEV_KEYBOARD : ENHANCE_DEV_PAD;
+}
+
+static const char *foot_label(int b)
+{
+    return (s_kbd ? k_foot_key : k_foot_pad)[b];
+}
+
+/* The layout's inputs that do not hang on the rows: the placement, the
+ * size mode, the text measured at this scale, the toolbar's entries (the
+ * pages shown, each one's page in pages[]) and the footer's buttons. The
+ * draw adds the rows, the summary and the dialog. */
+static void layout_base(struct menu_layout_in *in, int pages[PAGE_COUNT])
 {
     const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
     int px, py, w, h;
+    mu_Font ft, fb, fs;
+    memset(in, 0, sizeof *in);
     nv2a_overlay_placement(&px, &py, &w, &h);
     if (w <= 0 || h <= 0)
         w = 1920, h = 1080;
-    g->s = nv2a_ovl_ui_scale((uint32_t)h);
-    g->pad = nv2a_ovl_px(g->s, t->pad);
-    g->gap = nv2a_ovl_px(g->s, t->gap);
-    g->rowh = nv2a_ovl_px(g->s, t->row_h);
-    g->rgap = nv2a_ovl_px(g->s, 4);
-    g->pw = (int)(w * 0.40f);
-    if (g->pw > nv2a_ovl_px(g->s, 720))
-        g->pw = nv2a_ovl_px(g->s, 720);
-    if (w < 640 || h > w)
-        g->pw = w - 2 * g->pad;
-    if (w_out)
-        *w_out = w;
-    if (h_out)
-        *h_out = h;
+    in->w = w;
+    in->h = h;
+    in->s = nv2a_ovl_ui_scale((uint32_t)h);
+    in->tok.pad = t->pad;
+    in->tok.gap = t->gap;
+    in->tok.row_h = t->row_h;
+    in->tok.font_body = t->font_body;
+    in->size = s_size;
+    ft = OVL_FONT(OVL_FONT_TITLE, nv2a_ovl_px(in->s, t->font_title), 0);
+    fb = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(in->s, t->font_body), 0);
+    fs = OVL_FONT(OVL_FONT_SMALL, nv2a_ovl_px(in->s, t->font_small), 0);
+    in->title_h = nv2a_ovl_text_height(ft);
+    in->body_h = nv2a_ovl_text_height(fb);
+    in->small_h = nv2a_ovl_text_height(fs);
+    in->icon_w = nv2a_ovl_px(in->s, t->font_body);
+    in->arrow_w = nv2a_ovl_text_width(fb, "<", -1);
+    in->sec_sel = -1;
+    for (int p = 0; p < PAGE_COUNT; p++) {
+        int lw;
+        if (!page_shown(p))
+            continue;
+        lw = nv2a_ovl_text_width(fb, s_page_name[p], -1);
+        if (lw > in->label_w)
+            in->label_w = lw;
+        if (p == s_page)
+            in->sec_sel = in->nsec;
+        pages[in->nsec++] = p;
+    }
+    in->intro = enhance_menu_page_intro_text(s_page) != NULL;
+    in->cancel_w = enhance_text_width(fs, foot_label(MENU_FB_CANCEL), XBOX_PAD_FAMILY_AUTO,
+                                      foot_device());
+    in->save_w = enhance_text_width(fs, foot_label(MENU_FB_SAVE), XBOX_PAD_FAMILY_AUTO,
+                                    foot_device());
+    in->cancel_bare_w = nv2a_ovl_text_width(fs, k_foot_bare[MENU_FB_CANCEL], -1);
+    in->save_bare_w = nv2a_ovl_text_width(fs, k_foot_bare[MENU_FB_SAVE], -1);
 }
 
 /* An R_TEXT row's text starts here, past its label. */
@@ -1126,14 +1183,20 @@ static size_t wrap_take(mu_Font f, const char *p, int w, size_t max)
 static void text_rows(const char *label, const char *text, int tint)
 {
     const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
-    struct geom g;
+    static struct menu_layout l;    /* kilobytes: off the stack */
+    struct menu_layout_in in;
+    int pages[PAGE_COUNT];
     mu_Font fb;
     const char *p = text ? text : "";
     int w;
-    geom_of(&g, NULL, NULL);
-    fb = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(g.s, t->font_body), 0);
-    /* The row's room (draw_row: pad on each side, inside pw - pad). */
-    w = g.pw - 3 * g.pad - text_col(g.s);
+    /* The content's width does not hang on the rows, which are still
+     * being built. */
+    layout_base(&in, pages);
+    menu_layout_compute(&in, &l);
+    fb = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(l.s, t->font_body), 0);
+    /* The row's room (draw_row: a pad each side of the row, the label
+     * column first). */
+    w = l.content.w - 2 * l.pad - text_col(l.s);
     for (int first = 1;; first = 0) {
         size_t n = wrap_take(fb, p, w, VAL_MAX - 1);
         struct row *r = row_add(R_TEXT, -1, 0, first ? label : "");
@@ -2528,6 +2591,29 @@ static int save(void)
     return 0;
 }
 
+static const char *const k_menu_size[] = {"compact", "expanded", NULL};
+
+/* D2: the size is the player's layout, not a setting to review, so it is
+ * written at once, alone: the unsaved changes stay pending for Save. With
+ * RECOMP_CONFIG=none it holds for the session. */
+static void size_toggle(void)
+{
+    const char *path = enhance_cfg_user_path();
+    const char *key = "overlay.menu_size";
+    char q[32], err[512];
+    const char *val = q;
+    s_size = s_size == MENU_SIZE_EXPANDED ? MENU_SIZE_COMPACT : MENU_SIZE_EXPANDED;
+    s_need_draw = 1;
+    if (!path)
+        return;
+    recomp_cfg_quote(k_menu_size[s_size], q, sizeof q);
+    mkdir_parent(path);
+    if (recomp_cfg_patch(path, &key, &val, 1, err, sizeof err) != 0) {
+        fprintf(stderr, LOGP "menu: keeping overlay.menu_size in %s failed: %s\n", path, err);
+        status("Size not kept: %s", err);
+    }
+}
+
 /* Stage the stock of every slot and action (m -1), or of mod m's own
  * settings and actions but its Enabled row: Reset this mod keeps the mod
  * as it is and puts its options back. */
@@ -2620,6 +2706,7 @@ int enhance_menu_open(uint64_t now_ms)
     s_state = ST_OPEN;
     s_confirm = 0;
     s_dlg.on = 0;
+    s_peek_t = 0;
     s_rel_armed = s_rel_taint = 0;
     cap_phase(CAP_OFF);
     name_end();
@@ -3271,8 +3358,14 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
     switch (ev) {
     case ENHANCE_EV_UP: move_sel(-1); break;
     case ENHANCE_EV_DOWN: move_sel(1); break;
-    case ENHANCE_EV_PAGE_PREV: page_to(s_page - 1); break;
-    case ENHANCE_EV_PAGE_NEXT: page_to(s_page + 1); break;
+    case ENHANCE_EV_PAGE_PREV:
+    case ENHANCE_EV_PAGE_NEXT:
+        page_to(ev == ENHANCE_EV_PAGE_PREV ? s_page - 1 : s_page + 1);
+        /* Q10: the folded toolbar names where LB/RB went for a moment. */
+        s_peek_t = now_ms ? now_ms : 1;
+        s_peek_drawn = 0;
+        break;
+    case ENHANCE_EV_SIZE: size_toggle(); break;
     case ENHANCE_EV_SAVE: save(); break;
     case ENHANCE_EV_CLOSE:
     case ENHANCE_EV_CANCEL: leave_request(); break;
@@ -3748,12 +3841,13 @@ static void keys_latch(void)
 }
 
 /* ---- View and L3: on release, never as part of the menu's chord (A.6) ----
- * Cancel and the hints toggle sit on buttons a title may also use in its
+ * Cancel, the hints toggle and the size (R3) sit on buttons a title may use in its
  * menu.open chord (BLiNX 2: back+left_thumb@400). They fire when let go,
  * and not at all once a chord mate was held with them or the toggle fired
  * while they were down: that hold was the chord, not a press. */
 
-static const uint32_t k_rel_buttons = (1u << INPUT_SRC_BACK) | (1u << INPUT_SRC_LEFT_STICK_CLICK);
+static const uint32_t k_rel_buttons = (1u << INPUT_SRC_BACK) | (1u << INPUT_SRC_LEFT_STICK_CLICK)
+                                   | (1u << INPUT_SRC_RIGHT_STICK_CLICK);
 
 /* A binding's name as the pad source it means, 0 for a key or a mouse
  * button (enhance_actions.c reads names the same way). */
@@ -4017,6 +4111,7 @@ static void input_step(uint64_t now)
         uint32_t rel = release_step(held, press);
         if (rel & (1u << INPUT_SRC_BACK)) EV(ENHANCE_EV_CANCEL);
         if (rel & (1u << INPUT_SRC_LEFT_STICK_CLICK)) EV(ENHANCE_EV_HINTS);
+        if (rel & (1u << INPUT_SRC_RIGHT_STICK_CLICK)) EV(ENHANCE_EV_SIZE);
     }
     if (press & (1u << INPUT_SRC_SOUTH)) EV(ENHANCE_EV_OK);
     if (press & (1u << INPUT_SRC_EAST)) EV(ENHANCE_EV_BACK);
@@ -4128,22 +4223,74 @@ static void draw_pill(mu_Context *ctx, mu_Rect r, int on, int dim)
     nv2a_ovl_ui_rrect(ctx, mu_rect(kx, r.y + 3, k, k), k / 2, 1.0f, on ? t->text : t->text_dim);
 }
 
-static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selected, float s)
+static mu_Rect mr(struct menu_rect r)
+{
+    return mu_rect(r.x, r.y, r.w, r.h);
+}
+
+/* The item a row sets, NULL for none; *sl its slot or NULL. */
+static const struct enhance_item *row_item(const struct row *rw, const struct slot **sl)
+{
+    *sl = rw->type == R_SLOT ? &s_slot[rw->ref] : NULL;
+    return *sl ? (*sl)->it : rw->type == R_PARAM ? &s_pitem[rw->ref]
+         : rw->type == R_PROFILE ? &k_profile_item : NULL;
+}
+
+/* A row's value as drawn: with the setting's unit, a toggle's aside. */
+static void row_uv(const struct row *rw, char *uv, size_t n)
+{
+    const struct slot *sl;
+    const struct enhance_item *it = row_item(rw, &sl);
+    const char *unit = NULL;
+    if (sl && sl->dset >= 0) {
+        int m;
+        uint32_t k;
+        unit = dset_of(it, &m, &k)->unit;
+    }
+    if (unit && *unit && it->kind != ENHANCE_ITEM_TOGGLE)
+        snprintf(uv, n, "%s%s", rw->value, unit);
+    else
+        snprintf(uv, n, "%s", rw->value);
+}
+
+/* The row's control for the layout, and the value's width beside it. */
+static int row_kind(const struct row *rw, mu_Font fb, mu_Font fv, int *vw)
+{
+    const struct slot *sl;
+    const struct enhance_item *it = row_item(rw, &sl);
+    char uv[VAL_MAX + 32];
+    *vw = 0;
+    if (rw->type == R_HEADER)
+        return MENU_ROW_HEADER;
+    if (rw->type == R_TEXT)
+        return MENU_ROW_TEXT;
+    if (rw->type == R_MOD || (it && it->kind == ENHANCE_ITEM_TOGGLE))
+        return MENU_ROW_TOGGLE;
+    if (it && (it->kind == ENHANCE_ITEM_RANGE || it->kind == ENHANCE_ITEM_CHOICE)) {
+        row_uv(rw, uv, sizeof uv);
+        *vw = text_w(it->kind == ENHANCE_ITEM_RANGE ? fv : fb, uv);
+        return it->kind == ENHANCE_ITEM_RANGE ? MENU_ROW_RANGE : MENU_ROW_CHOICE;
+    }
+    return MENU_ROW_PLAIN;
+}
+
+static void draw_row(mu_Context *ctx, const struct row *rw, const struct menu_layout_row *vr,
+                     int selected, float s)
 {
     const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
     mu_Font fb = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(s, t->font_body), 0);
     mu_Font fs = OVL_FONT(OVL_FONT_SMALL, nv2a_ovl_px(s, t->font_small), 0);
     mu_Font fv = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(s, t->font_body), 1);
+    mu_Rect r = mr(vr->r);
     int pad = nv2a_ovl_px(s, t->pad), th = nv2a_ovl_text_height(fb);
     int ty = r.y + (r.h - th) / 2, x = r.x + pad, right = r.x + r.w - pad;
-    const struct slot *sl = rw->type == R_SLOT ? &s_slot[rw->ref] : NULL;
-    const struct enhance_item *it = sl ? sl->it : rw->type == R_PARAM ? &s_pitem[rw->ref]
-                                  : rw->type == R_PROFILE ? &k_profile_item : NULL;
+    const struct slot *sl;
+    const struct enhance_item *it = row_item(rw, &sl);
     const char *envname = sl ? sl->envname : rw->type == R_PROFILE ? shader_edit_forced() : NULL;
     int ro = (sl && sl->env) || (rw->type == R_PROFILE && envname);
     mu_Color tint = rw->tint == TINT_BAD ? t->bad : rw->tint == TINT_WARN ? t->warn : t->text_dim;
     char cut[VAL_MAX * 2], forced[96], uv[VAL_MAX + 32];
-    const char *v, *unit = NULL;
+    const char *v;
     /* D10: a dot before the label while unsaved, and the value bright only
      * where it differs from stock, so a page shows what was changed. */
     int marked = rw->type == R_SLOT || rw->type == R_MOD || rw->type == R_BIND
@@ -4152,11 +4299,6 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
     mu_Color vcol = ro ? t->text_dim : !marked || (st & ENHANCE_ROW_NONDEFAULT) ? t->text
                                                                                 : t->text_dim;
 
-    if (sl && sl->dset >= 0) {
-        int m;
-        uint32_t k;
-        unit = dset_of(it, &m, &k)->unit;
-    }
     if (rw->type == R_HEADER) {
         int hs = nv2a_ovl_text_height(fs), hy = r.y + r.h - hs - nv2a_ovl_px(s, 4);
         mu_draw_text(ctx, fs, rw->label, -1, mu_vec2(x, hy), t->accent);
@@ -4221,16 +4363,12 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
         mu_draw_text(ctx, fs, rw->note, -1, mu_vec2(x, fy), t->text_dim);
         x += text_w(fs, rw->note) + nv2a_ovl_px(s, 8);
     }
-    if (unit && *unit && it->kind != ENHANCE_ITEM_TOGGLE) {
-        snprintf(uv, sizeof uv, "%s%s", rw->value, unit);
-    } else {
-        snprintf(uv, sizeof uv, "%s", rw->value);
-    }
+    row_uv(rw, uv, sizeof uv);
 
     if (rw->type == R_MOD || (it && it->kind == ENHANCE_ITEM_TOGGLE)) {
         int on = rw->type == R_MOD ? xbox_mod_enabled(rw->ref) : on_text(rw->value);
-        int ph = nv2a_ovl_px(s, 24), pw = nv2a_ovl_px(s, 44);
-        draw_pill(ctx, mu_rect(right - pw, r.y + (r.h - ph) / 2, pw, ph), on, ro);
+        int pw = vr->pill.w;
+        draw_pill(ctx, mr(vr->pill), on, ro);
         if (rw->type == R_MOD) {
             enum xbox_mod_state st = xbox_mod_state(rw->ref);
             const char *w = st == XBOX_MOD_FAILED ? "failed"
@@ -4247,26 +4385,25 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
         return;
     }
     if (it && it->kind == ENHANCE_ITEM_RANGE) {
-        int tw = nv2a_ovl_px(s, 160), tk = nv2a_ovl_px(s, 4), kn = nv2a_ovl_px(s, 14);
-        int tx = right - tw, cy = r.y + r.h / 2;
+        struct menu_rect tr = vr->track;
+        int kn = nv2a_ovl_px(s, 14), cy = tr.y + tr.h / 2;
         double f = it->hi > it->lo ? (atof(rw->value) - it->lo) / (it->hi - it->lo) : 0;
         int fx;
         f = f < 0 ? 0 : f > 1 ? 1 : f;
-        fx = tx + (int)(f * tw + 0.5);
-        nv2a_ovl_ui_rrect(ctx, mu_rect(tx, cy - tk / 2, tw, tk), tk / 2, 1.0f, t->bg_row);
-        nv2a_ovl_ui_rrect(ctx, mu_rect(tx, cy - tk / 2, fx - tx, tk), tk / 2, 1.0f,
+        fx = tr.x + (int)(f * tr.w + 0.5);
+        nv2a_ovl_ui_rrect(ctx, mr(tr), tr.h / 2, 1.0f, t->bg_row);
+        nv2a_ovl_ui_rrect(ctx, mu_rect(tr.x, tr.y, fx - tr.x, tr.h), tr.h / 2, 1.0f,
                           ro ? t->text_dim : t->accent);
         nv2a_ovl_ui_rrect(ctx, mu_rect(fx - kn / 2, cy - kn / 2, kn, kn), kn / 2, 1.0f, t->text);
-        mu_draw_text(ctx, fv, uv, -1, mu_vec2(tx - nv2a_ovl_px(s, 12) - text_w(fv, uv), ty), vcol);
+        v = fit(fv, uv, vr->value.w, cut, sizeof cut);
+        mu_draw_text(ctx, fv, v, -1, mu_vec2(vr->value.x + vr->value.w - text_w(fv, v), ty), vcol);
         return;
     }
     if (it && it->kind == ENHANCE_ITEM_CHOICE) {
-        int aw = text_w(fb, "<"), sp = nv2a_ovl_px(s, 10);
-        int vw = text_w(fb, uv);
-        mu_draw_text(ctx, fb, ">", -1, mu_vec2(right - aw, ty), t->text_dim);
-        mu_draw_text(ctx, fb, uv, -1, mu_vec2(right - aw - sp - vw, ty),
+        mu_draw_text(ctx, fb, ">", -1, mu_vec2(vr->next.x, ty), t->text_dim);
+        mu_draw_text(ctx, fb, uv, -1, mu_vec2(vr->value.x, ty),
                      ro ? t->text_dim : rw->tint ? tint : vcol);
-        mu_draw_text(ctx, fb, "<", -1, mu_vec2(right - 2 * aw - 2 * sp - vw, ty), t->text_dim);
+        mu_draw_text(ctx, fb, "<", -1, mu_vec2(vr->prev.x, ty), t->text_dim);
         return;
     }
     /* Text values (info, bindings, Save's path): right-aligned, cut to the
@@ -4294,58 +4431,45 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
 
 /* D9a: the unsaved-changes dialog over a dimmed panel. Go Back has the
  * focus when it opens; the access letter of each button is underlined. */
-static void draw_dialog(mu_Context *ctx, int px, int py, int pw, int ph, float s)
+static void draw_dialog(mu_Context *ctx, const struct menu_layout *l)
 {
     const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+    float s = l->s;
     mu_Font ft = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(s, t->font_body), 1);
     mu_Font fs = OVL_FONT(OVL_FONT_SMALL, nv2a_ovl_px(s, t->font_small), 0);
-    int pad = nv2a_ovl_px(s, t->pad), gap = nv2a_ovl_px(s, t->gap);
-    int lh = nv2a_ovl_text_height(fs), bh = lh + nv2a_ovl_px(s, 14), nl = 1;
-    int w = pw * 3 / 4, h, x, y, bx, bw[DLG_BUTTONS], total = 0;
+    int pad = l->pad, lh = nv2a_ovl_text_height(fs), ly = l->dlg_line_y;
+    struct menu_rect d = l->dlg;
     static const char k_access[DLG_BUTTONS] = {'N', 'S', 'G'};
-    for (const char *c = s_dlg.body; *c; c++)
-        nl += *c == '\n';
-    h = pad + nv2a_ovl_text_height(ft) + gap + nl * (lh + nv2a_ovl_px(s, 4)) + gap + bh + pad;
-    x = px + (pw - w) / 2;
-    y = py + (ph - h) / 2;
-    nv2a_ovl_ui_rrect(ctx, mu_rect(px, py, pw, ph), nv2a_ovl_px(s, t->radius), 1.0f,
-                      with_alpha(t->bg, 170));
-    nv2a_ovl_ui_shadow(ctx, mu_rect(x, y, w, h), nv2a_ovl_px(s, t->radius),
-                       nv2a_ovl_px(s, t->shadow), t->shadow_alpha);
-    nv2a_ovl_ui_rrect(ctx, mu_rect(x, y, w, h), nv2a_ovl_px(s, t->radius), 1.0f, t->bg_row);
-    mu_draw_text(ctx, ft, "Unsaved changes", -1, mu_vec2(x + pad, y + pad), t->text);
-    {
-        int ly = y + pad + nv2a_ovl_text_height(ft) + gap;
-        const char *c = s_dlg.body;
-        while (*c) {
-            const char *e = strchr(c, '\n');
-            char line[256], cut[300];
-            size_t n = e ? (size_t)(e - c) : strlen(c);
-            if (n >= sizeof line)
-                n = sizeof line - 1;
-            memcpy(line, c, n);
-            line[n] = 0;
-            mu_draw_text(ctx, fs, fit(fs, line, w - 2 * pad, cut, sizeof cut), -1,
-                         mu_vec2(x + pad, ly),
-                         s_dlg.err[0] && !strcmp(line, s_dlg.err) ? t->bad : t->text_dim);
-            ly += lh + nv2a_ovl_px(s, 4);
-            c = e ? e + 1 : c + n;
-        }
+    const char *c = s_dlg.body;
+    nv2a_ovl_ui_rrect(ctx, mr(l->panel), nv2a_ovl_px(s, t->radius), 1.0f, with_alpha(t->bg, 170));
+    nv2a_ovl_ui_shadow(ctx, mr(d), nv2a_ovl_px(s, t->radius), nv2a_ovl_px(s, t->shadow),
+                       t->shadow_alpha);
+    nv2a_ovl_ui_rrect(ctx, mr(d), nv2a_ovl_px(s, t->radius), 1.0f, t->bg_row);
+    mu_draw_text(ctx, ft, "Unsaved changes", -1, mu_vec2(l->dlg_title.x, l->dlg_title.y), t->text);
+    while (*c) {
+        const char *e = strchr(c, '\n');
+        char line[256], cut[300];
+        size_t n = e ? (size_t)(e - c) : strlen(c);
+        if (n >= sizeof line)
+            n = sizeof line - 1;
+        memcpy(line, c, n);
+        line[n] = 0;
+        mu_draw_text(ctx, fs, fit(fs, line, d.w - 2 * pad, cut, sizeof cut), -1,
+                     mu_vec2(d.x + pad, ly),
+                     s_dlg.err[0] && !strcmp(line, s_dlg.err) ? t->bad : t->text_dim);
+        ly += l->dlg_line_h;
+        c = e ? e + 1 : c + n;
     }
     for (int b = 0; b < DLG_BUTTONS; b++) {
-        bw[b] = text_w(fs, k_dlg_button[b]) + 2 * pad;
-        total += bw[b] + (b ? gap : 0);
-    }
-    bx = x + w - pad - total;
-    for (int b = 0; b < DLG_BUTTONS; b++) {
-        int by = y + h - pad - bh, off = b == DLG_SAVE && dlg_save_dead(), foc = b == s_dlg.focus;
+        struct menu_rect br = l->dlg_btn[b];
+        int off = b == DLG_SAVE && dlg_save_dead(), foc = b == s_dlg.focus;
         const char *lab = k_dlg_button[b], *a = strchr(lab, k_access[b]);
         mu_Color tc = off ? t->text_dim : t->text;
-        int tx = bx + pad, ty = by + (bh - lh) / 2;
-        nv2a_ovl_ui_rrect(ctx, mu_rect(bx, by, bw[b], bh), nv2a_ovl_px(s, 6), 1.0f,
+        int tx = br.x + l->dlg_btn_pad, ty = br.y + (br.h - lh) / 2;
+        nv2a_ovl_ui_rrect(ctx, mr(br), nv2a_ovl_px(s, 6), 1.0f,
                           foc ? with_alpha(t->accent, off ? 60 : 110) : t->bg_hover);
         if (foc)
-            mu_draw_rect(ctx, mu_rect(bx, by + bh - nv2a_ovl_px(s, 3), bw[b], nv2a_ovl_px(s, 3)),
+            mu_draw_rect(ctx, mu_rect(br.x, br.y + br.h - nv2a_ovl_px(s, 3), br.w, nv2a_ovl_px(s, 3)),
                          t->accent);
         mu_draw_text(ctx, fs, lab, -1, mu_vec2(tx, ty), tc);
         if (a) {
@@ -4355,10 +4479,9 @@ static void draw_dialog(mu_Context *ctx, int px, int py, int pw, int ph, float s
             memcpy(pre, lab, n);
             pre[n] = 0;
             mu_draw_rect(ctx, mu_rect(tx + text_w(fs, pre), ty + lh - nv2a_ovl_px(s, 2),
-                                      text_w(fs, one), nv2a_ovl_px(s, 1) > 0 ? nv2a_ovl_px(s, 1) : 1),
+                                      text_w(fs, one), nv2a_ovl_px(s, 1)),
                          tc);
         }
-        bx += bw[b] + gap;
     }
 }
 
@@ -4384,167 +4507,233 @@ static void draw_graph(mu_Context *ctx, mu_Rect g, float s)
     }
 }
 
+/* Q10: the section toolbar, folded to icons or open with its labels over
+ * the content's left edge. A dot marks a section Save has not written
+ * (D10). */
+static void draw_toolbar(mu_Context *ctx, const struct menu_layout *l, const int *pages)
+{
+    const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+    float s = l->s;
+    mu_Font fb = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(s, t->font_body), 0);
+    int th = nv2a_ovl_text_height(fb), d = nv2a_ovl_px(s, 6), rad = nv2a_ovl_px(s, t->radius);
+    if (l->open) {
+        nv2a_ovl_ui_shadow(ctx, mr(l->bar), rad, nv2a_ovl_px(s, t->shadow), t->shadow_alpha);
+        /* Opaque: it lies over the rows, whose text must not show through
+         * the panel's translucent fill. */
+        nv2a_ovl_ui_rrect(ctx, mr(l->bar), rad, 1.0f, with_alpha(t->bg, 255));
+    }
+    /* The rule between the icons and the section. */
+    mu_draw_rect(ctx, mu_rect(l->bar.x + l->bar.w - 1, l->bar.y, 1, l->bar.h), t->bg_row);
+    for (int i = 0; i < l->nsec; i++) {
+        int p = pages[i], on = p == s_page;
+        struct menu_rect e = l->sec[i], ic = l->sec_icon[i];
+        if (e.h <= 0)
+            continue; /* scrolled out of a short bar */
+        if (on) {
+            nv2a_ovl_ui_rrect(ctx, mr(e), rad / 2, 1.0f, t->bg_hover);
+            mu_draw_rect(ctx, mu_rect(e.x, e.y + nv2a_ovl_px(s, 6), nv2a_ovl_px(s, 3),
+                                      e.h - 2 * nv2a_ovl_px(s, 6)), t->accent);
+        }
+        nv2a_ovl_ui_glyph(ctx, nv2a_ovl_glyph_icon(k_page_icon[p]), mr(ic),
+                          on ? t->text : t->text_dim);
+        if (page_unsaved(p))
+            nv2a_ovl_ui_rrect(ctx, mu_rect(ic.x + ic.w - d / 2, ic.y - d / 2, d, d), d / 2, 1.0f,
+                              t->accent);
+        if (l->sec_label[i].w > 0) {
+            char cut[64];
+            struct menu_rect lr = l->sec_label[i];
+            mu_draw_text(ctx, fb, fit(fb, s_page_name[p], lr.w, cut, sizeof cut), -1,
+                         mu_vec2(lr.x, lr.y + (lr.h - th) / 2), on ? t->text : t->text_dim);
+        }
+    }
+    /* No room for labels: the shown section's name beside its icon. */
+    if (l->tooltip.w > 0) {
+        struct menu_rect tr = l->tooltip;
+        int sec = -1;
+        for (int i = 0; i < l->nsec; i++)
+            if (pages[i] == s_page)
+                sec = i;
+        if (sec >= 0) {
+            if (tr.x + tr.w > l->panel.x + l->panel.w)
+                tr.w = l->panel.x + l->panel.w - tr.x;
+            nv2a_ovl_ui_shadow(ctx, mr(tr), rad / 2, nv2a_ovl_px(s, t->shadow), t->shadow_alpha);
+            nv2a_ovl_ui_rrect(ctx, mr(tr), rad / 2, 1.0f, with_alpha(t->bg_row, 255));
+            mu_draw_text(ctx, fb, s_page_name[s_page], -1,
+                         mu_vec2(tr.x + l->pad, tr.y + (tr.h - th) / 2), t->text);
+        }
+    }
+}
+
+/* The header (D1): the title and the game, then ? (hints), the size and
+ * close as icons. */
+static void draw_header(mu_Context *ctx, const struct menu_layout *l)
+{
+    const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+    mu_Font ft = OVL_FONT(OVL_FONT_TITLE, nv2a_ovl_px(l->s, t->font_title), 0);
+    char title[200], cut[260];
+    static const uint32_t k_hb[MENU_HB_COUNT] = {
+        NV2A_OVL_ICON_HELP, NV2A_OVL_ICON_MAXIMIZE, NV2A_OVL_ICON_CLOSE
+    };
+    const char *game = nv2a_overlay_game();
+    if (game[0])
+        snprintf(title, sizeof title, "Enhancements \xC2\xB7 %s", game);
+    else
+        snprintf(title, sizeof title, "Enhancements");
+    mu_draw_text(ctx, ft, fit(ft, title, l->title.w, cut, sizeof cut), -1,
+                 mu_vec2(l->title.x, l->title.y), t->text);
+    for (int b = 0; b < MENU_HB_COUNT; b++) {
+        uint32_t cp = b == MENU_HB_SIZE && s_size == MENU_SIZE_EXPANDED ? NV2A_OVL_ICON_MINIMIZE
+                                                                         : k_hb[b];
+        /* The hints button is lit while they show inline. */
+        mu_Color c = b == MENU_HB_HINTS && s_hints_inline ? t->accent : t->text_dim;
+        nv2a_ovl_ui_glyph(ctx, nv2a_ovl_glyph_icon(cp), mr(l->hbtn[b]), c);
+    }
+}
+
 void enhance_menu_draw(uint64_t now_ms)
 {
     const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+    static unsigned char kinds[ROWS_MAX];
+    static int vw[ROWS_MAX];
+    static struct menu_layout lay;
+    const struct menu_layout *l = &lay;
+    struct menu_layout_in in;
     mu_Context *ctx;
-    struct geom g;
-    int w, h, pad, gap, rowh, rgap, pw, ph, x0, y0, y, inner;
-    int area_y, area_h, foot_h, vis, *scroll, sel;
+    int pages[PAGE_COUNT], sel, un, news, nl = 1;
     float s;
-    mu_Font ft, fb, fs;
+    mu_Font fb, fs, fv;
+    char right[160];
 
     s_now = now_ms;
     if (s_state != ST_OPEN)
         return;
-    /* One geometry for the draw and the wrap (text_rows): two copies could
-     * drift and clip or overlap a wrapped row. */
-    geom_of(&g, &w, &h);
     ctx = nv2a_overlay_ui_begin(NV2A_OVL_MENU);
     if (!ctx)
         return;
     rates(now_ms);
     build_rows();
-    s_draw_w = w;
-    s_draw_h = h;
-    s = g.s;
-    ft = OVL_FONT(OVL_FONT_TITLE, nv2a_ovl_px(s, t->font_title), 0);
+    /* One layout for the draw, the wrap (text_rows) and the hit test: two
+     * copies could drift and clip or overlap a wrapped row. */
+    layout_base(&in, pages);
+    s = in.s;
     fb = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(s, t->font_body), 0);
     fs = OVL_FONT(OVL_FONT_SMALL, nv2a_ovl_px(s, t->font_small), 0);
-    pad = g.pad;
-    gap = g.gap;
-    rowh = g.rowh;
-    rgap = g.rgap;
-    pw = g.pw;
-    ph = h - 2 * pad;
-    x0 = pad;
-    y0 = pad;
-    nv2a_ovl_ui_shadow(ctx, mu_rect(x0, y0, pw, ph), nv2a_ovl_px(s, t->radius),
-                       nv2a_ovl_px(s, t->shadow), t->shadow_alpha);
-    nv2a_ovl_ui_rrect(ctx, mu_rect(x0, y0, pw, ph), nv2a_ovl_px(s, t->radius), 1.0f, t->bg);
-    inner = pw - 2 * pad;
-
-    y = y0 + pad;
-    mu_draw_text(ctx, ft, "Enhancements", -1, mu_vec2(x0 + pad, y), t->text);
-    y += nv2a_ovl_text_height(ft) + gap;
-
-    /* The tab strip, scrolled so the page shown is in view. */
-    {
-        int tx[PAGE_COUNT], tw[PAGE_COUNT], total = 0, off = 0, sp = nv2a_ovl_px(s, 20);
-        int tabh = nv2a_ovl_text_height(fb);
-        for (int p = 0; p < PAGE_COUNT; p++) {
-            tx[p] = total;
-            tw[p] = page_shown(p) ? text_w(fb, s_page_name[p]) : 0;
-            total += page_shown(p) ? tw[p] + sp : 0;
-        }
-        if (tx[s_page] + tw[s_page] > inner)
-            off = tx[s_page] + tw[s_page] - inner;
-        mu_push_clip_rect(ctx, mu_rect(x0 + pad, y, inner, tabh + nv2a_ovl_px(s, 8)));
-        for (int p = 0; p < PAGE_COUNT; p++) {
-            int xx = x0 + pad + tx[p] - off;
-            if (!page_shown(p))
-                continue;
-            mu_draw_text(ctx, fb, s_page_name[p], -1, mu_vec2(xx, y),
-                         p == s_page ? t->text : t->text_dim);
-            /* The section holds changes Save has not written (D10). */
-            if (page_unsaved(p)) {
-                int d = nv2a_ovl_px(s, 5);
-                nv2a_ovl_ui_rrect(ctx, mu_rect(xx + tw[p] + nv2a_ovl_px(s, 3), y, d, d), d / 2,
-                                  1.0f, t->accent);
-            }
-            if (p == s_page)
-                mu_draw_rect(ctx, mu_rect(xx, y + tabh + nv2a_ovl_px(s, 2), tw[p], nv2a_ovl_px(s, 3)),
-                             t->accent);
-        }
-        mu_pop_clip_rect(ctx);
-        y += tabh + nv2a_ovl_px(s, 8) + gap;
-    }
-
-    foot_h = nv2a_ovl_text_height(fs) + pad;
-    area_y = y;
-    area_h = y0 + ph - foot_h - gap - area_y;
-    if (s_page == PAGE_STATS)
-        area_h -= nv2a_ovl_px(s, 110) + gap;
-    vis = area_h / (rowh + rgap);
-    if (vis < 1)
-        vis = 1;
-    scroll = &s_scroll[s_page];
+    fv = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(s, t->font_body), 1);
+    for (int i = 0; i < s_nrow; i++)
+        kinds[i] = (unsigned char)row_kind(&s_row[i], fb, fv, &vw[i]);
+    in.toolbar_open = enhance_menu_toolbar_open(now_ms);
+    in.nrow = s_nrow;
+    in.scroll = s_scroll[s_page];
+    in.sel = s_sel[s_page];
+    in.row_kind = kinds;
+    in.row_value_w = vw;
+    in.extra_h = s_page == PAGE_STATS ? nv2a_ovl_px(s, 110) : 0;
+    un = enhance_menu_unsaved();
+    news = s_status[0] && s_status_t && now_ms - s_status_t < STATUS_MS;
+    if (news)
+        snprintf(right, sizeof right, "%s", s_status);
+    else if (un)
+        snprintf(right, sizeof right, "%d unsaved", un);
+    else
+        snprintf(right, sizeof right, "All saved");
+    in.summary_w = text_w(fs, right);
+    in.dlg_on = s_dlg.on;
+    for (const char *c = s_dlg.body; *c; c++)
+        nl += *c == '\n';
+    in.dlg_lines = nl;
+    for (int b = 0; b < DLG_BUTTONS; b++)
+        in.dlg_btn_w[b] = text_w(fs, k_dlg_button[b]);
+    menu_layout_compute(&in, &lay);
+    s_scroll[s_page] = l->scroll;
+    s_draw_w = in.w;
+    s_draw_h = in.h;
     sel = s_sel[s_page];
-    if (sel < *scroll)
-        *scroll = sel;
-    if (sel >= *scroll + vis)
-        *scroll = sel - vis + 1;
-    if (*scroll > s_nrow - vis)
-        *scroll = s_nrow - vis > 0 ? s_nrow - vis : 0;
-    mu_push_clip_rect(ctx, mu_rect(x0, area_y, pw, area_h));
-    for (int i = *scroll; i < s_nrow && i < *scroll + vis; i++) {
-        mu_Rect r = mu_rect(x0 + pad / 2, area_y + (i - *scroll) * (rowh + rgap), pw - pad, rowh);
-        draw_row(ctx, &s_row[i], r, i == sel && s_row[i].sel, s);
+
+    /* Expanded (D1) covers the game; compact leaves it beside the panel,
+     * so a live setting shows as it changes. */
+    if (l->backdrop)
+        mu_draw_rect(ctx, mr(l->place), with_alpha(t->bg, 217));
+    nv2a_ovl_ui_shadow(ctx, mr(l->panel), nv2a_ovl_px(s, t->radius), nv2a_ovl_px(s, t->shadow),
+                       t->shadow_alpha);
+    nv2a_ovl_ui_rrect(ctx, mr(l->panel), nv2a_ovl_px(s, t->radius), 1.0f, t->bg);
+    draw_header(ctx, l);
+
+    /* The section's intro (A.8), then its rows. */
+    if (l->intro.w > 0) {
+        const char *intro = enhance_menu_page_intro_text(s_page);
+        char cut[400];
+        mu_draw_text(ctx, fs, fit(fs, intro, l->intro.w, cut, sizeof cut), -1,
+                     mu_vec2(l->intro.x, l->intro.y), t->text_dim);
+    }
+    mu_push_clip_rect(ctx, mr(l->viewport));
+    for (int i = 0; i < l->nvrow; i++) {
+        int r = l->row[i].index;
+        draw_row(ctx, &s_row[r], &l->row[i], r == sel && s_row[r].sel, s);
     }
     mu_pop_clip_rect(ctx);
-    if (s_nrow > vis) {
-        int bh = area_h * vis / s_nrow, by = area_y + (area_h - bh) * *scroll / (s_nrow - vis);
-        int bw = nv2a_ovl_px(s, 4);
-        nv2a_ovl_ui_rrect(ctx, mu_rect(x0 + pw - bw - nv2a_ovl_px(s, 4), by, bw, bh), bw / 2, 1.0f,
-                          t->text_dim);
-    }
-    if (s_page == PAGE_STATS)
-        draw_graph(ctx, mu_rect(x0 + pad, area_y + area_h + gap, inner, nv2a_ovl_px(s, 110)), s);
+    if (l->scrollbar)
+        nv2a_ovl_ui_rrect(ctx, mr(l->sb_thumb), l->sb_thumb.w / 2, 1.0f, t->text_dim);
+    if (l->extra.h > 0)
+        draw_graph(ctx, mr(l->extra), s);
+    /* After the rows: open, the bar lies over their left edge. */
+    draw_toolbar(ctx, l, pages);
 
     /* The footer (D9): the device's controls on the left, then the unsaved
-     * count (or a status for STATUS_MS) and the Cancel and Save buttons. */
+     * count (or a status for STATUS_MS) and the Cancel and Save buttons
+     * with the shortcut that presses each (Q11). */
     {
-        int fy = y0 + ph - foot_h + (foot_h - nv2a_ovl_text_height(fs)) / 2 - pad / 4;
         const char *hint = s_kbd
             ? "Enter Select \xC2\xB7 Esc Back \xC2\xB7 Q E Section \xC2\xB7 F5 Save"
             : "A Select \xC2\xB7 B Back \xC2\xB7 LB RB Section \xC2\xB7 Y Save";
-        char right[160], cut[200], hcut[200];
+        char cut[200], hcut[200];
         const char *rt, *hv;
-        int un = enhance_menu_unsaved(), rw, bx, bpad = nv2a_ovl_px(s, 10);
-        int bh = nv2a_ovl_text_height(fs) + nv2a_ovl_px(s, 6), by = fy - nv2a_ovl_px(s, 3);
-        int news = s_status[0] && s_status_t && now_ms - s_status_t < STATUS_MS;
+        int lh = nv2a_ovl_text_height(fs), fy = l->hints.y + (l->hints.h - lh) / 2;
         int save_off = !un || dlg_save_off();
-        const char *bl[2] = {"Cancel", "Save"};
         const struct row *cur = s_nrow ? &s_row[sel] : NULL;
-        int bw[2];
         /* The selected row's help stands in for the controls while no
-         * status shows, until B or C draws hints at the rows. */
+         * status shows, until C draws hints at the rows. */
         if (cur && cur->sel && cur->help[0] && !news)
             hint = cur->help;
         if (s_name_on)
             hint = s_kbd ? "Type a name \xC2\xB7 Enter keep \xC2\xB7 Esc cancel"
                          : "Up/Down letter \xC2\xB7 Left/Right move \xC2\xB7 X delete \xC2\xB7 A keep \xC2\xB7 B cancel";
-        if (news)
-            snprintf(right, sizeof right, "%s", s_status);
-        else if (un)
-            snprintf(right, sizeof right, "%d unsaved", un);
-        else
-            snprintf(right, sizeof right, "All saved");
-        /* The buttons sit at the right edge, the news just before them. */
-        bx = x0 + pad + inner;
-        for (int b = 1; b >= 0; b--) {
-            bw[b] = text_w(fs, bl[b]) + 2 * bpad;
-            bx -= bw[b] + (b == 1 ? 0 : gap);
+        if (l->summary.w > 0) {
+            rt = fit(fs, right, l->summary.w, cut, sizeof cut);
+            mu_draw_text(ctx, fs, rt, -1,
+                         mu_vec2(l->summary.x + l->summary.w - text_w(fs, rt), fy),
+                         news ? t->text : un ? t->accent : t->text_dim);
         }
-        rt = fit(fs, right, inner / 2, cut, sizeof cut);
-        rw = text_w(fs, rt);
-        mu_draw_text(ctx, fs, rt, -1, mu_vec2(bx - gap - rw, fy),
-                     news ? t->text : un ? t->accent : t->text_dim);
-        hv = fit(fs, hint, bx - gap - rw - gap - (x0 + pad), hcut, sizeof hcut);
-        mu_draw_text(ctx, fs, hv, -1, mu_vec2(x0 + pad, fy), t->text_dim);
-        for (int b = 0; b < 2; b++) {
-            int off = b == 1 && save_off;
-            nv2a_ovl_ui_rrect(ctx, mu_rect(bx, by, bw[b], bh), nv2a_ovl_px(s, 6), 1.0f,
-                              b == 1 && !off ? with_alpha(t->accent, 60) : t->bg_row);
-            mu_draw_text(ctx, fs, bl[b], -1, mu_vec2(bx + bpad, fy), off ? t->text_dim : t->text);
-            bx += bw[b] + gap;
+        hv = fit(fs, hint, l->hints.w, hcut, sizeof hcut);
+        mu_draw_text(ctx, fs, hv, -1, mu_vec2(l->hints.x, fy), t->text_dim);
+        for (int b = 0; b < MENU_FB_COUNT; b++) {
+            struct menu_rect br = l->fbtn[b];
+            int off = b == MENU_FB_SAVE && save_off;
+            const char *lab = foot_label(b);
+            int lw;
+            if (br.w <= 0)
+                continue;
+            nv2a_ovl_ui_rrect(ctx, mr(br), nv2a_ovl_px(s, 6), 1.0f,
+                              b == MENU_FB_SAVE && !off ? with_alpha(t->accent, 60) : t->bg_row);
+            if (!l->foot_glyph) {
+                /* No room for the glyph: the bare word, cut to the button. */
+                lab = fit(fs, k_foot_bare[b], br.w - 2 * l->fbtn_pad, cut, sizeof cut);
+                lw = text_w(fs, lab);
+                mu_draw_text(ctx, fs, lab, -1, mu_vec2(br.x + (br.w - lw) / 2, br.y + (br.h - lh) / 2),
+                             off ? t->text_dim : t->text);
+                continue;
+            }
+            lw = enhance_text_width(fs, lab, XBOX_PAD_FAMILY_AUTO, foot_device());
+            enhance_text_draw(ctx, fs, lab, br.x + (br.w - lw) / 2, br.y + (br.h - lh) / 2,
+                              off ? t->text_dim : t->text, XBOX_PAD_FAMILY_AUTO, foot_device());
         }
     }
-    if (s_dlg.on)
-        draw_dialog(ctx, x0, y0, pw, ph, s);
+    if (l->dlg_on)
+        draw_dialog(ctx, l);
     nv2a_overlay_ui_publish(NV2A_OVL_MENU);
     s_draw_t = now_ms ? now_ms : 1;
     s_need_draw = 0;
+    if (s_peek_t && now_ms - s_peek_t >= PEEK_MS)
+        s_peek_drawn = 1;
 }
 
 /* ---- the hook --------------------------------------------------------------- */
@@ -4622,7 +4811,8 @@ void enhance_menu_hook(unsigned port, uint32_t held, XBOX_INPUT_STATE *st, uint6
             w = 1920, h = 1080;
         if (s_need_draw || w != s_draw_w || h != s_draw_h
             || (live && now_ms - s_draw_t >= LIVE_DRAW_MS)
-            || (s_status_t && now_ms - s_status_t >= STATUS_MS && now_ms - s_draw_t >= STATUS_MS))
+            || (s_status_t && now_ms - s_status_t >= STATUS_MS && now_ms - s_draw_t >= STATUS_MS)
+            || (s_peek_t && !s_peek_drawn && now_ms - s_peek_t >= PEEK_MS))
             enhance_menu_draw(now_ms);
     }
     if (s_state == ST_CLOSING) {
@@ -4653,6 +4843,9 @@ void enhance_menu_start(void)
     char binds[160], l[ENHANCE_ACTION_BINDS][ENHANCE_ACTION_TEXT];
     int id, n;
     size_t at = 0;
+    /* Read before the off return: a menu that is off still owns the key,
+     * so it is no "unused key". */
+    s_size = enhance_cfg_choice("overlay.menu_size", k_menu_size, MENU_SIZE_COMPACT);
     if (!enhance_actions_keyed("menu.enabled")) {
         fprintf(stderr, LOGP "menu.enabled=off\n");
         return;
@@ -4788,6 +4981,22 @@ int enhance_menu_hints_inline(void)
     return s_hints_inline;
 }
 
+int enhance_menu_size(void)
+{
+    return s_size;
+}
+
+void enhance_menu_set_toolbar_focus(int on)
+{
+    s_bar_focus = on != 0;
+    s_need_draw = 1;
+}
+
+int enhance_menu_toolbar_open(uint64_t now_ms)
+{
+    return s_bar_focus || (s_peek_t && now_ms - s_peek_t < PEEK_MS);
+}
+
 void enhance_menu_reset_for_test(void)
 {
     if (s_snap_on)
@@ -4829,6 +5038,10 @@ void enhance_menu_reset_for_test(void)
     memset(&s_dlg, 0, sizeof s_dlg);
     memset(s_page_intro, 0, sizeof s_page_intro);
     s_hints_inline = 0;
+    s_size = MENU_SIZE_COMPACT;
+    s_bar_focus = 0;
+    s_peek_t = 0;
+    s_peek_drawn = 0;
     s_rel_armed = s_rel_taint = 0;
     s_nslot = 0;
     s_nset = 0;

@@ -31,7 +31,8 @@ struct nv2a_ovl_theme {
 };
 extern const struct nv2a_ovl_theme nv2a_ovl_theme_default;
 
-/* clamp(out_h / 1080, 0.5, 3.0) * overlay.ui_scale (1.0 until 3E). */
+/* clamp(clamp(out_h / 1080, 0.5, 3.0) * overlay.ui_scale, 0.5, 3.0)
+ * (nv2a_overlay_set_ui_scale). */
 float nv2a_ovl_ui_scale(uint32_t out_h);
 /* A token scaled and rounded to whole pixels (at least 1 for a non-zero
  * token). */

@@ -125,7 +125,8 @@ enum enhance_menu_event {
     ENHANCE_EV_CLEAR,       /* X, Delete: clear an action's bindings */
     ENHANCE_EV_CLOSE,       /* the header's close: asks first when unsaved */
     ENHANCE_EV_CANCEL,      /* View (on release), Shift+Esc: leave, asking first */
-    ENHANCE_EV_HINTS        /* L3 (on release): hints inline or as a tooltip */
+    ENHANCE_EV_HINTS,       /* L3 (on release): hints inline or as a tooltip */
+    ENHANCE_EV_SIZE         /* R3 (on release), the header's size button: compact or expanded */
 };
 
 int  enhance_menu_open(uint64_t now_ms);
@@ -177,6 +178,16 @@ const char *enhance_menu_dialog_text(void);     /* its body, "" when closed */
 const char *enhance_menu_page_intro_text(int page);
 /* 1 when hints show inline under the rows, 0 as a tooltip (L3 flips it). */
 int  enhance_menu_hints_inline(void);
+/* The size mode (D2): 0 compact, 1 expanded. R3 and the header's button
+ * flip it; overlay.menu_size keeps it across runs. */
+int  enhance_menu_size(void);
+/* The section toolbar holds the focus (Q10): it unfolds with its labels.
+ * Phase C's focus model drives it; until then the ctest and the
+ * screenshots set it. */
+void enhance_menu_set_toolbar_focus(int on);
+/* 1 while the toolbar shows its labels: the focus, or the 1.5 s after a
+ * section change (the LB/RB peek). */
+int  enhance_menu_toolbar_open(uint64_t now_ms);
 /* The key and its TOML literal for each pending change, as Save would
  * write them (NULL value: the key is removed); returns the count. */
 int  enhance_menu_pending(const char **keys, const char **values, int max);

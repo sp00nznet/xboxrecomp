@@ -204,6 +204,30 @@ void nv2a_overlay_set_stats(int on)
         show(NV2A_OVL_STATS, 1);
 }
 
+/* Written by the window's title setters on the main thread before the
+ * guest starts (the XBE load, the game's own title), read by the menu's
+ * draw later: the last byte is never written, so the text always ends. */
+static char s_game[128];
+
+void nv2a_overlay_set_game(const char *utf8)
+{
+    size_t n = utf8 ? strlen(utf8) : 0;
+    if (n >= sizeof s_game) {
+        n = sizeof s_game - 1;
+        /* Not inside a UTF-8 sequence: back to its lead byte. */
+        while (n > 0 && ((unsigned char)utf8[n] & 0xC0) == 0x80)
+            n--;
+    }
+    if (n)
+        memcpy(s_game, utf8, n);
+    s_game[n] = 0;
+}
+
+const char *nv2a_overlay_game(void)
+{
+    return s_game;
+}
+
 int nv2a_overlay_stats(void)
 {
     return __atomic_load_n(&s_stats_on, __ATOMIC_RELAXED);
@@ -654,6 +678,8 @@ void nv2a_overlay_reset_for_test(void)
     s_stats_on = 0;
     s_menu_lock = 0;
     s_published = 0;
+    s_game[0] = 0;
+    nv2a_overlay_set_ui_scale(1.0f);
     s_wake = NULL;
     s_toast_head = 0;
     s_toast_read = 0;

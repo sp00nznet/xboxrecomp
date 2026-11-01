@@ -33,6 +33,9 @@
 #include "video_player.h"   /* the xbox_FramebufferWindow* prototypes */
 #include "window_title.h"
 #include "../kernel/nv2a_stats.h"
+#ifdef XBOXRECOMP_ENHANCE
+#include "../kernel/nv2a_overlay.h"
+#endif
 #include "keyboard.h"       /* src/input: the key table this window feeds */
 #include "mouse.h"
 #include "text_input.h"   /* src/input: WM_CHAR into the menu's text ring */
@@ -220,6 +223,7 @@ static char          s_xbe_title[128];
 static volatile LONG s_flips;
 static volatile LONG s_frame_draws;
 static volatile LONG s_name_gen;
+static volatile LONG s_host_title_set;  /* xbox_HostWindowSetTitle ran */
 
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
 {
@@ -227,6 +231,11 @@ void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
     if (xbox_title_utf16_to_utf8(buf, sizeof buf, name, max_chars)) {
         memcpy(s_xbe_title, buf, strlen(buf) + 1);
         InterlockedIncrement(&s_name_gen);
+#ifdef XBOXRECOMP_ENHANCE
+        /* The menu's header names the game too; a title's own name wins. */
+        if (!s_host_title_set)
+            nv2a_overlay_set_game(buf);
+#endif
     }
 }
 
@@ -437,7 +446,6 @@ extern void xbox_log_thread_role(const char *role, uint32_t routine);
 /* A title's own name for the window; once set it wins over the XBE
  * certificate's name in the title bar below. */
 static char          s_title[128] = "Xbox Recomp";
-static volatile LONG s_host_title_set;
 
 void xbox_HostWindowSetTitle(const char *title)
 {
@@ -445,6 +453,9 @@ void xbox_HostWindowSetTitle(const char *title)
         return;
     snprintf(s_title, sizeof(s_title), "%s", title);
     InterlockedExchange(&s_host_title_set, 1);
+#ifdef XBOXRECOMP_ENHANCE
+    nv2a_overlay_set_game(title);
+#endif
     /* The window threads pick the new name up on their next pass. */
     InterlockedIncrement(&s_name_gen);
 }

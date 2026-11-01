@@ -58,6 +58,7 @@ int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)
     return -1;
 }
 void nv2a_overlay_set_stats(int on) { (void)on; }
+float nv2a_overlay_set_ui_scale(float mul) { return mul; }
 int nv2a_overlay_stats(void) { return 0; }
 /* api_toast's overlay push: the last line, to check the mod's text. */
 static char s_toast_last[256];

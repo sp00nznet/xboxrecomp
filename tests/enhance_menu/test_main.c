@@ -79,6 +79,9 @@
 
 static int s_fail, s_checks;
 static int s_pin;   /* --pin: print the page sums instead of checking them */
+/* MENU_REF_OUT=<dir>: test_shots writes the menu, rasterised by the CPU
+ * reference over a stand-in frame, as PPM to look at before pinning. */
+static const char *s_ref_out;
 
 #define CHECK(c) do { s_checks++; if (!(c)) { s_fail++; \
     fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
@@ -456,7 +459,7 @@ static void test_navigate(void)
     /* Up from the first row wraps to the last. */
     CHECK(enhance_menu_select_row("Render scale"));
     tap(0x26);
-    CHECK(!strcmp(selected_label(), "Present surface"));
+    CHECK(!strcmp(selected_label(), "Overlay scale"));
 
     /* Right on Render scale: 1 -> 2, at the flip; unsaved. */
     CHECK(enhance_menu_select_row("Render scale"));
@@ -2270,8 +2273,8 @@ static void test_pages(void)
 {
     /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Files. */
     static const uint32_t k_sum[9] = {
-        0x9AD1EDFBu, 0x56FBA3A9u, 0xBD70CA3Fu, 0xB2801A34u, 0x17B2AA5Bu,
-        0x4AC9D35Bu, 0xF59BEA21u, 0x775CBD55u, 0x79909E2Du };
+        0x13527668u, 0x64F653C1u, 0x520072BFu, 0xFD1CB783u, 0x00BD4162u,
+        0xDE95928Fu, 0xAA60FECEu, 0xEFA7A61Au, 0x5446673Fu };
     start_with(ARMED, k_mods);
     open_menu();
     CHECK(enhance_menu_is_open());
@@ -3069,6 +3072,285 @@ static void test_footer_keys(void)
     CHECK(!enhance_menu_is_open());
 }
 
+/* D2: R3 on its release flips the size, written at once and alone; the
+ * start reads it back, and RECOMP_CONFIG=none keeps it to the session. */
+static void test_size(void)
+{
+    const struct nv2a_ovl_list *l;
+    uint32_t compact;
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_size() == 0);
+    enhance_menu_draw(100000);
+    l = nv2a_overlay_acquire(NV2A_OVL_MENU);
+    compact = l ? l->sum : 0;
+    change_scale();
+    pad_tap(XBOX_GAMEPAD_RIGHT_THUMB);
+    CHECK(enhance_menu_size() == 1);
+    CHECK(enhance_menu_unsaved() == 1);   /* the pending change stays pending */
+    read_file("config/config.toml");
+    CHECK(strstr(s_file, "menu_size = \"expanded\"") != NULL);
+    CHECK(strstr(s_file, "enabled = true") != NULL);
+    CHECK(strstr(s_file, "render") == NULL);   /* the pending scale is not written */
+    enhance_menu_draw(100000);
+    l = nv2a_overlay_acquire(NV2A_OVL_MENU);
+    CHECK(l && l->sum != compact);
+    tap(VK_F5);
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+
+    start_with(read_file("config/config.toml"), k_mods);
+    CHECK(enhance_menu_size() == 1);
+    open_menu();
+    pad_tap(XBOX_GAMEPAD_RIGHT_THUMB);
+    CHECK(enhance_menu_size() == 0);
+    read_file("config/config.toml");
+    CHECK(strstr(s_file, "menu_size = \"compact\"") != NULL);
+    open_menu();
+
+    set_env("RECOMP_CONFIG", "none");
+    set_env("RECOMP_MENU", "1");
+    start_with(ARMED "[overlay]\nmenu_size = \"expanded\"\n", k_mods);
+    open_menu();
+    CHECK(enhance_menu_is_open());
+    pad_tap(XBOX_GAMEPAD_RIGHT_THUMB);
+    CHECK(enhance_menu_size() == 1);
+    read_file("config/config.toml");
+    CHECK(strstr(s_file, "menu_size = \"expanded\"") != NULL);
+    pad_tap(XBOX_GAMEPAD_RIGHT_THUMB);
+    CHECK(enhance_menu_size() == 0);
+    read_file("config/config.toml");
+    CHECK(strstr(s_file, "menu_size = \"expanded\"") != NULL);   /* untouched */
+    open_menu();
+    set_env("RECOMP_MENU", NULL);
+    set_env("RECOMP_CONFIG", NULL);
+}
+
+/* R3 is no size toggle when it is part of the menu.open chord, under the
+ * leave dialog, or while a capture takes the next input. */
+static void test_size_guards(void)
+{
+    start_with(ARMED "[input.actions]\n\"menu.open\" = [\"F10\", \"back+right_stick_click@400\"]\n",
+               k_mods);
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_RIGHT_THUMB, 1);
+    for (int i = 0; i < 30 && !enhance_menu_is_open(); i++) {
+        advance(20);
+        poll0();
+    }
+    CHECK(enhance_menu_is_open());
+    hold_btn(XBOX_GAMEPAD_RIGHT_THUMB, 0);
+    advance(16);
+    poll0();
+    hold_btn(XBOX_GAMEPAD_BACK, 0);
+    advance(16);
+    poll0();
+    CHECK(enhance_menu_is_open() && enhance_menu_size() == 0);
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_RIGHT_THUMB, 1);
+    for (int i = 0; i < 30 && enhance_menu_is_open(); i++) {
+        advance(20);
+        poll0();
+    }
+    CHECK(!enhance_menu_is_open());
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_RIGHT_THUMB, 0);
+    for (int i = 0; i < 4; i++) {
+        advance(16);
+        poll0();
+    }
+    CHECK(!enhance_menu_is_open() && enhance_menu_size() == 0);
+
+    /* The leave dialog keeps the size. */
+    open_menu();
+    change_scale();
+    open_menu();
+    CHECK(enhance_menu_dialog() == 2);
+    advance(200);
+    poll0();
+    pad_tap(XBOX_GAMEPAD_RIGHT_THUMB);
+    CHECK(enhance_menu_dialog() == 2 && enhance_menu_size() == 0);
+    tap('G');
+    tap(VK_F5);
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+
+    /* A capture takes R3 as its input, never as the toggle. */
+    start_with(ARMED, k_bmods);
+    open_menu();
+    open_detail("B mod");
+    ctl_capture_start("Rise");
+    pad_tap(XBOX_GAMEPAD_RIGHT_THUMB);
+    CHECK(enhance_menu_size() == 0);
+    for (int i = 0; i < 4; i++) {
+        advance(16);
+        poll0();
+    }
+    CHECK(enhance_menu_size() == 0);
+}
+
+/* Q10: the toolbar unfolds while it has the focus, and for PEEK_MS after
+ * LB/RB; the hook draws once more when the peek runs out. */
+static void test_toolbar_fold(void)
+{
+    const struct nv2a_ovl_list *l;
+    uint32_t folded, open, peek;
+    uint64_t gen;
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(!enhance_menu_toolbar_open(f_clock()));
+    enhance_menu_draw(f_clock());
+    l = nv2a_overlay_acquire(NV2A_OVL_MENU);
+    folded = l ? l->sum : 0;
+    enhance_menu_set_toolbar_focus(1);
+    CHECK(enhance_menu_toolbar_open(f_clock()));
+    enhance_menu_draw(f_clock());
+    l = nv2a_overlay_acquire(NV2A_OVL_MENU);
+    open = l ? l->sum : 0;
+    CHECK(open != folded);
+    enhance_menu_set_toolbar_focus(0);
+    CHECK(!enhance_menu_toolbar_open(f_clock()));
+
+    tap(0x22);                                  /* PageDown: the next section */
+    tap(0x21);                                  /* and back */
+    CHECK(enhance_menu_toolbar_open(f_clock()));
+    l = nv2a_overlay_acquire(NV2A_OVL_MENU);
+    peek = l ? l->sum : 0;
+    advance(1400);
+    poll0();
+    CHECK(enhance_menu_toolbar_open(f_clock()));
+    advance(200);
+    CHECK(!enhance_menu_toolbar_open(f_clock()));
+    poll0();
+    l = nv2a_overlay_acquire(NV2A_OVL_MENU);
+    CHECK(l && l->sum != peek);                 /* the hook folded it */
+    gen = l ? l->gen : 0;
+    advance(100);
+    poll0();
+    l = nv2a_overlay_acquire(NV2A_OVL_MENU);
+    CHECK(l && l->gen == gen);                  /* once, not every poll */
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+    open_menu();
+    CHECK(!enhance_menu_toolbar_open(f_clock()));   /* a fresh open has no peek */
+    open_menu();
+}
+
+/* The header names the game the window title carries. */
+static void test_header_game(void)
+{
+    const struct nv2a_ovl_list *l;
+    uint32_t bare;
+    char longname[300];
+    start_with(ARMED, k_mods);
+    CHECK(!strcmp(nv2a_overlay_game(), ""));
+    open_menu();
+    enhance_menu_draw(100000);
+    l = nv2a_overlay_acquire(NV2A_OVL_MENU);
+    bare = l ? l->sum : 0;
+    nv2a_overlay_set_game("BLiNX 2: Masters of Time & Space");
+    CHECK(!strcmp(nv2a_overlay_game(), "BLiNX 2: Masters of Time & Space"));
+    enhance_menu_draw(100000);
+    l = nv2a_overlay_acquire(NV2A_OVL_MENU);
+    CHECK(l && l->sum != bare);
+    /* A long name is cut on a character's edge, never in a sequence. */
+    memset(longname, 'a', sizeof longname);
+    for (int i = 120; i < 140; i += 2) {
+        longname[i] = (char)0xC3;
+        longname[i + 1] = (char)0xA9;
+    }
+    longname[sizeof longname - 1] = 0;
+    nv2a_overlay_set_game(longname);
+    CHECK(strlen(nv2a_overlay_game()) <= 127);
+    CHECK(((unsigned char)nv2a_overlay_game()[strlen(nv2a_overlay_game()) - 1] & 0xC0) != 0xC0);
+    nv2a_overlay_set_game(NULL);
+    CHECK(!strcmp(nv2a_overlay_game(), ""));
+    open_menu();
+}
+
+/* The overlay scale row: restart class, quarter steps. */
+static void test_ui_scale_row(void)
+{
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Render"));
+    CHECK(row_value("Overlay scale") != NULL);
+    for (int i = 0; i < enhance_menu_rows(); i++) {
+        char lb[96];
+        enhance_menu_row(i, lb, sizeof lb, NULL, 0, NULL);
+        if (!strcmp(lb, "Overlay scale"))
+            CHECK(enhance_menu_row_live(i) == ENHANCE_LIVE_RESTART);
+    }
+    open_menu();
+}
+
+/* The menu's sizes and toolbar states as pictures (MENU_REF_OUT only):
+ * the review of a layout change, since a sum says only that it moved. */
+static void shot(const char *name, int w, int h)
+{
+    const struct nv2a_ovl_list *l;
+    uint32_t *px;
+    char path[1024];
+    FILE *f;
+    nv2a_overlay_set_placement(0, 0, w, h);
+    enhance_menu_draw(f_clock());
+    l = nv2a_overlay_acquire(NV2A_OVL_MENU);
+    CHECK(l != NULL);
+    if (!l)
+        return;
+    px = calloc((size_t)w * h, 4);
+    if (!px)
+        return;
+    nv2a_ovl_ref_draw(px, w, h, l, nv2a_overlay_atlas());
+    snprintf(path, sizeof path, "%s/%s.ppm", s_ref_out, name);
+    f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                const unsigned char *p = (const unsigned char *)&px[y * w + x];
+                /* A stand-in frame: a diagonal gradient, so the backdrop's
+                 * dimming and the panel's edges show. */
+                int bg[3] = { 40 + 120 * x / w, 70 + 90 * y / h, 150 - 80 * x / w };
+                unsigned char o[3];
+                for (int k = 0; k < 3; k++)
+                    o[k] = (unsigned char)(p[k] + bg[k] * (255 - p[3]) / 255);
+                fwrite(o, 1, 3, f);
+            }
+        fclose(f);
+    }
+    free(px);
+}
+
+static void test_shots(void)
+{
+    static const struct { const char *tag; int w, h; } k_out[] = {
+        { "1080p", 1920, 1080 }, { "720p", 1280, 720 }, { "narrow", 600, 800 } };
+    if (!s_ref_out)
+        return;
+    start_with(ARMED, k_mods);
+    nv2a_overlay_set_game("BLiNX 2: Masters of Time & Space");
+    open_menu();
+    for (unsigned o = 0; o < sizeof k_out / sizeof k_out[0]; o++)
+        for (int size = 0; size < 2; size++)
+            for (int bar = 0; bar < 2; bar++) {
+                char name[64];
+                if (enhance_menu_size() != size)
+                    pad_tap(XBOX_GAMEPAD_RIGHT_THUMB);
+                enhance_menu_set_toolbar_focus(bar);
+                snprintf(name, sizeof name, "%s-%s-%s", k_out[o].tag,
+                         size ? "expanded" : "compact", bar ? "open" : "folded");
+                shot(name, k_out[o].w, k_out[o].h);
+            }
+    enhance_menu_set_toolbar_focus(0);
+    if (enhance_menu_size() != 0)
+        pad_tap(XBOX_GAMEPAD_RIGHT_THUMB);
+    CHECK(enhance_menu_set_page("Controls"));
+    shot("1080p-compact-controls", 1920, 1080);
+    CHECK(enhance_menu_set_page("Stats"));
+    shot("1080p-compact-stats", 1920, 1080);
+    open_menu();
+    nv2a_overlay_set_game(NULL);
+    remove("config/config.toml");
+}
+
 /* A.8: every built-in row has its help, and each section its intro. */
 static void test_help(void)
 {
@@ -3100,6 +3382,7 @@ static void test_help(void)
 int main(int argc, char **argv)
 {
     s_pin = argc > 1 && !strcmp(argv[1], "--pin");
+    s_ref_out = getenv("MENU_REF_OUT");
     MKDIR("config");
     set_env("RECOMP_CONFIG", NULL);
     set_env("RECOMP_MENU", NULL);
@@ -3141,7 +3424,13 @@ int main(int argc, char **argv)
     test_revert_shaders();
     test_dialog();
     test_footer_keys();
+    test_size();
+    test_size_guards();
+    test_toolbar_fold();
+    test_header_game();
+    test_ui_scale_row();
     test_help();
+    test_shots();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();
     enhance_actions_reset();

@@ -388,6 +388,9 @@ void xbox_HostWindowSetTitle(const char *title)
         snprintf(s_title, sizeof s_title, "%s", title);
         __atomic_store_n(&s_host_title_set, 1, __ATOMIC_RELEASE);
         __atomic_add_fetch(&s_name_gen, 1, __ATOMIC_RELEASE);
+#ifdef XBOXRECOMP_ENHANCE
+        nv2a_overlay_set_game(title);   /* the menu's header names the game too */
+#endif
     }
 }
 
@@ -398,6 +401,10 @@ void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
     if (xbox_title_utf16_to_utf8(buf, sizeof buf, name, max_chars)) {
         memcpy(s_xbe_title, buf, strlen(buf) + 1);
         __atomic_add_fetch(&s_name_gen, 1, __ATOMIC_RELEASE);
+#ifdef XBOXRECOMP_ENHANCE
+        if (!__atomic_load_n(&s_host_title_set, __ATOMIC_ACQUIRE))
+            nv2a_overlay_set_game(buf);
+#endif
     }
 }
 

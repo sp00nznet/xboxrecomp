@@ -864,6 +864,24 @@ static void test_stats(void)
     CHECK(!nv2a_stats_enabled(), "flag left on");
 }
 
+/* overlay.ui_scale (D2): the multiplier over the output's factor, clamped
+ * twice; the outer clamp holds 4K at 2.0 to the atlas's 3.0 and 480 lines
+ * at 0.75 to 0.5. */
+static void test_ui_scale(void)
+{
+    CHECK(nv2a_ovl_ui_scale(1080) == 1.0f && nv2a_ovl_ui_scale(2160) == 2.0f, "stock scale");
+    CHECK(nv2a_overlay_set_ui_scale(2.0f) == 2.0f, "2.0 kept");
+    CHECK(nv2a_ovl_ui_scale(2160) == 3.0f, "3840x2160 at 2.0: %.3f", nv2a_ovl_ui_scale(2160));
+    CHECK(nv2a_ovl_ui_scale(1080) == 2.0f, "1080 at 2.0");
+    CHECK(nv2a_overlay_set_ui_scale(0.75f) == 0.75f, "0.75 kept");
+    CHECK(nv2a_ovl_ui_scale(480) == 0.5f, "640x480 at 0.75: %.3f", nv2a_ovl_ui_scale(480));
+    CHECK(nv2a_ovl_ui_scale(1080) == 0.75f, "1080 at 0.75");
+    CHECK(nv2a_overlay_set_ui_scale(5.0f) == 2.0f && nv2a_overlay_set_ui_scale(0.1f) == 0.75f,
+          "the key's range");
+    CHECK(nv2a_overlay_set_ui_scale(1.0f) == 1.0f && nv2a_ovl_ui_scale(1080) == 1.0f,
+          "back to stock");
+}
+
 int main(void)
 {
     s_ref_out = getenv("OVERLAY_REF_OUT");
@@ -877,6 +895,7 @@ int main(void)
     test_stats();
     test_glyphs();
     test_fit();
+    test_ui_scale();
     nv2a_overlay_reset_for_test();
     if (fails) {
         printf("overlay: %d failure(s)\n", fails);

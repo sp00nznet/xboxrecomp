@@ -85,6 +85,12 @@ struct nv2a_ovl_image { const uint32_t *px; uint32_t w, h; uint64_t gen; };
  * STATS and TOAST at init, hidden, when a feature key arms the actions
  * hook; stock leaves the overlay disarmed. */
 int nv2a_overlay_arm(uint32_t layers, uint32_t out_h);
+/* overlay.ui_scale (D2): the player's multiplier on the output's scale,
+ * clamped to 0.75..2.0 (returned). Set before the first arm: the atlas
+ * is baked once, at the scale of that moment, so a later value would
+ * draw glyphs at sizes the atlas does not hold. enhance.c sets it at
+ * init; unset it is 1.0. */
+float nv2a_overlay_set_ui_scale(float mul);
 int nv2a_overlay_armed(void);
 /* Whether layer l is armed (the menu: menu.enabled at enhance init). */
 int nv2a_overlay_layer_armed(enum nv2a_overlay_layer l);
@@ -93,6 +99,14 @@ int nv2a_overlay_layer_armed(enum nv2a_overlay_layer l);
  * name). Arms STATS first if needed; a no-op while disarmed. */
 void nv2a_overlay_set_stats(int on);
 int  nv2a_overlay_stats(void);
+
+/* The game's name for the menu's header ("Enhancements · <name>"), UTF-8,
+ * cut at 127 bytes: the window's title setters pass it on (a title's own
+ * xbox_HostWindowSetTitle, else the XBE certificate's name). The kernel
+ * holds it so the window code does not link the enhance layer. "" for
+ * none. */
+void nv2a_overlay_set_game(const char *utf8);
+const char *nv2a_overlay_game(void);
 
 /* ── Reader side (the presenting thread) ── */
 
