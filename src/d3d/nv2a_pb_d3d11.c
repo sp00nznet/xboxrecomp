@@ -2451,6 +2451,7 @@ struct aspect_batch {
     uint32_t lo, count, nidx;
     float lo_x, hi_x;
     int vary_z;         /* a program's 2D batch off one oPos.z (nv2a_aspect_gate) */
+    int post_tex;       /* a full-width 2D pass whose picture nv2a_aspect_place_tex dropped */
 };
 
 /* Whether hp's batch is a full-width screen quad (nv2a_aspect_screen_quad;
@@ -2587,6 +2588,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
         memcpy(lm.src, s_stage_src, sizeof lm.src);
     }
     hp->place = NV2A_PLACE_CENTRE;
+    hp->post_tex = 0;
     if (s_cur && s_cur->pad) {
         int guest_tex = 0, flat_rt = 0, padded_rt = 0;
         for (n = 0; n < 4; n++) {
@@ -2614,9 +2616,11 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
         }
         /* A square target is a reflection, glow or shadow map, never a
          * movie: display.movie applies to the frame only. */
-        hp->place = nv2a_aspect_place(hp->two_d, hp->full_w, guest_tex, flat_rt,
+        hp->place = nv2a_aspect_place(hp->two_d, hp->full_w,
+                                      nv2a_aspect_place_tex(guest_tex, padded_rt), flat_rt,
                                       s_cur->w == s_cur->h ? NV2A_MOVIE_BLACK
                                                            : nv2a_host_opts()->movie_mode);
+        hp->post_tex = hp->two_d && hp->full_w && guest_tex && padded_rt;
     }
     if (s_cur && nv2a_snap_2d_on(s_cur->n)) {
         /* render.snap_2d: a centred 2D batch samples guest textures at its
@@ -3328,6 +3332,29 @@ static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
             wide ? " wide" : "");
 }
 
+/* RECOMP_ASPECT_TRACE: each program and target size the first time
+ * nv2a_aspect_place_tex drops a guest picture: a full-width 2D pass that
+ * samples a padded target and a picture, placed as a post pass, not a
+ * movie (Metal's aspect_log_post, same line). */
+static void aspect_log_post(uint32_t hash, const RenderTarget *rt, int place)
+{
+    static const char *const names[] = { "centre", "stretch", "cover" };
+    enum { SET = 256 };
+    static uint64_t set[SET];
+    static unsigned used;
+    uint64_t key = ((uint64_t)hash << 32 | rt->w << 16 | rt->h) * 0x9E3779B97F4A7C15ull + 1u;
+    unsigned h = (unsigned)(key >> 56) & (SET - 1u);
+    while (set[h] && set[h] != key)
+        h = (h + 1u) & (SET - 1u);
+    if (set[h] || used >= SET / 2u)
+        return;
+    set[h] = key;
+    used++;
+    fprintf(stderr, "[aspect.post] %08X flip %llu: picture beside a padded target on %ux%u"
+            " pad %u at 0x%08X -> %s\n", hash, (unsigned long long)s_presents, rt->w, rt->h,
+            rt->pad, rt->addr, names[place]);
+}
+
 /* RECOMP_ASPECT_TRACE: each program and w the first time a flat near
  * layer of it is clipped to the guest columns (Metal's aspect_log_flat,
  * same line). */
@@ -3822,6 +3849,8 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                                                have_x ? hi_x : (float)rt->w);
         if (hp.two_d && rt->pad && aspect_trace())
             aspect_log(vs->hash, count, nidx / 3u, lo_x, hi_x, rt, hp.place, lift, wide);
+        if (hp.post_tex && aspect_trace())
+            aspect_log_post(vs->hash, rt, hp.place);
         set_vp(v, g, rt, hp.place, hp.two_d || flat, lift, cb);
         if (px_on()) {
             uint32_t before[4];

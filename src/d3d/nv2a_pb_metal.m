@@ -2115,6 +2115,29 @@ static void aspect_log_flat(uint32_t hash, uint32_t count, float w, const Render
             rt->addr);
 }
 
+/* RECOMP_ASPECT_TRACE: each program and target size the first time
+ * nv2a_aspect_place_tex drops a guest picture: a full-width 2D pass that
+ * samples a padded target and a picture, placed as a post pass, not a
+ * movie (D3D11's aspect_log_post, same line). */
+static void aspect_log_post(uint32_t hash, const RenderTarget *rt, int place)
+{
+    static const char *const names[] = { "centre", "stretch", "cover" };
+    enum { SET = 256 };
+    static uint64_t set[SET];
+    static unsigned used;
+    uint64_t key = ((uint64_t)hash << 32 | rt->w << 16 | rt->h) * 0x9E3779B97F4A7C15ull + 1u;
+    unsigned h = (unsigned)(key >> 56) & (SET - 1u);
+    while (set[h] && set[h] != key)
+        h = (h + 1u) & (SET - 1u);
+    if (set[h] || used >= SET / 2u)
+        return;
+    set[h] = key;
+    used++;
+    fprintf(stderr, "[aspect.post] %08X flip %llu: picture beside a padded target on %ux%u"
+            " pad %u at 0x%08X -> %s\n", hash, (unsigned long long)s_presents, rt->w, rt->h,
+            rt->pad, rt->addr, names[place]);
+}
+
 static void metal_on_draw(const struct nv2a_pb_draw *d)
 {
     /* The expanded list: at most three entries per index (a fan or a quad
@@ -2141,6 +2164,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     int cull = 0, cull_all = 0;
     unsigned bump_src;
     int full_w = 0, guest_tex = 0, flat_rt = 0, two_d = 0, have_x = 0, tris = 0, flat = 0;
+    int padded_rt = 0;
     int lift = 0, wide = 0;
     int vary_z = 0;     /* a program's 2D batch off one oPos.z (nv2a_aspect_gate) */
     int scan;
@@ -2353,6 +2377,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     srcs[k] = src;
                     if (!src->pad)
                         flat_rt = 1;
+                    else
+                        padded_rt = 1;
                     s_rtt_binds++;
                 } else {
                     stex[k] = tex_bind(t);
@@ -2403,7 +2429,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         /* A square target is a reflection, glow or shadow map, never a
          * movie: display.movie applies to the frame only. */
-        place = rt->pad ? nv2a_aspect_place(two_d, full_w, guest_tex, flat_rt,
+        place = rt->pad ? nv2a_aspect_place(two_d, full_w,
+                                            nv2a_aspect_place_tex(guest_tex, padded_rt), flat_rt,
                                             rt->w == rt->h ? NV2A_MOVIE_BLACK
                                                            : nv2a_host_opts()->movie_mode)
                         : NV2A_PLACE_CENTRE;
@@ -2426,6 +2453,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                                                have_x ? hi_x : (float)rt->w);
         if (two_d && rt->pad && aspect_trace())
             aspect_log(ve ? ve->hash : 0, count, nidx / 3u, lo_x, hi_x, rt, place, lift, wide);
+        if (rt->pad && two_d && full_w && guest_tex && padded_rt && aspect_trace())
+            aspect_log_post(ve ? ve->hash : 0, rt, place);
         /* A batch sampling a padded target the stock way reads it whole,
          * pads and all, which is what a stretched pass wants, short of a
          * square's overscan (nv2a_rt_stretch_read). Any other reads its

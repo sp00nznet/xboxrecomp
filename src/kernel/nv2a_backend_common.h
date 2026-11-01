@@ -1628,6 +1628,18 @@ static inline int nv2a_aspect_place(int two_d, int full_w, int guest_tex, int fl
          : movie_mode == NV2A_MOVIE_FILL ? NV2A_PLACE_COVER : NV2A_PLACE_CENTRE;
 }
 
+/* The guest_tex that nv2a_aspect_place takes: a guest picture counts only
+ * when the batch samples no padded render target (padded_rt). A pass that
+ * reads the padded frame is a post pass, whatever else it binds: BLiNX 1's
+ * glow downsamples the padded 640x480 frame into a padded 320x240 target
+ * with a 640x480 guest mask on stage 1. Centred as a "movie", it filled
+ * only the small target's guest columns, its pads stayed black, and the
+ * composite brightened the 4:3 centre alone, a step at the old edges. */
+static inline int nv2a_aspect_place_tex(int guest_tex, int padded_rt)
+{
+    return guest_tex && !padded_rt;
+}
+
 /* Whether a batch's stages take nv2a_uv_snap's 2D form: the batch is 2D
  * (pass-through, or a program on one screen layer, nv2a_aspect_scan), so
  * its mapping is affine and textured 3D is left alone, and it is centred,

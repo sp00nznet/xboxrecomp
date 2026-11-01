@@ -397,6 +397,15 @@ int main(void)
         CHECK(nv2a_aspect_place(1, 1, 1, 0, NV2A_MOVIE_BLACK) == NV2A_PLACE_CENTRE);  /* movie */
         CHECK(nv2a_aspect_place(1, 1, 1, 0, NV2A_MOVIE_FIT) == NV2A_PLACE_STRETCH);
         CHECK(nv2a_aspect_place(1, 1, 1, 0, NV2A_MOVIE_FILL) == NV2A_PLACE_COVER);
+        /* a guest picture beside a padded target is a post pass's mask
+         * (BLiNX 1's glow downsample), not a movie: stretched with the
+         * frame; a picture alone stays a movie */
+        CHECK(nv2a_aspect_place_tex(1, 0) && !nv2a_aspect_place_tex(1, 1));
+        CHECK(!nv2a_aspect_place_tex(0, 0) && !nv2a_aspect_place_tex(0, 1));
+        CHECK(nv2a_aspect_place(1, 1, nv2a_aspect_place_tex(1, 1), 0, NV2A_MOVIE_BLACK)
+              == NV2A_PLACE_STRETCH);
+        CHECK(nv2a_aspect_place(1, 1, nv2a_aspect_place_tex(1, 0), 0, NV2A_MOVIE_BLACK)
+              == NV2A_PLACE_CENTRE);
         /* a full-width composite of an unpadded target (a 256x256 blur)
          * keeps its 4:3 shape; a padded one is stretched over the pads */
         CHECK(nv2a_aspect_place(1, 1, 0, 1, NV2A_MOVIE_BLACK) == NV2A_PLACE_CENTRE);
