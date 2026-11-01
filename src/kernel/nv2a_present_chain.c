@@ -1240,3 +1240,41 @@ void nv2a_present_chain_params_reset_for_test(void)
     atomic_fetch_add(&s_pgen, 1);
     unlock();
 }
+
+static void ovr_revert(int scope, const char *key)
+{
+    int i;
+    lock();
+    for (i = 0; i < s_novr; i++) {
+        struct ovr *o = &s_ovr[i];
+        if (o->scope != scope || (key && strcmp(o->key, key)))
+            continue;
+        o->has = o->saved_has;
+        o->v = o->saved_v;
+    }
+    atomic_fetch_add(&s_pgen, 1);
+    unlock();
+}
+
+void nv2a_present_chain_override_revert(void)
+{
+    ovr_revert(SCOPE_PRESET, NULL);
+}
+
+void nv2a_present_chain_profile_revert(const char *slug)
+{
+    ovr_revert(SCOPE_PROFILE, slug);
+}
+
+int nv2a_present_chain_param_dirty(const char *name)
+{
+    const struct ovr *o;
+    int d;
+    if (!name)
+        return 0;
+    lock();
+    o = ovr_find(s_params_scope, s_params_key, name);
+    d = o && ovr_dirty(o);
+    unlock();
+    return d;
+}

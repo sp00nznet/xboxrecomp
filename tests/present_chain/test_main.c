@@ -576,6 +576,57 @@ static void case_params_cap(const char *dir)
     CHECK(!nv2a_present_chain_param_set("m128", 0.5f));
 }
 
+/* Exit without saving: the overrides go back to what was loaded or saved,
+ * one added since goes, a profile's values likewise, and the backend
+ * applies the values again. */
+static void case_revert(const char *dir)
+{
+    void *preset = NULL;
+    unsigned applied = 0, pg;
+    float v = 0;
+
+    load_params_lib(dir);
+    nv2a_present_chain_override_load("crt-lottes", "maskDark", 0.8f);
+    nv2a_present_chain_request("crt-lottes");
+    nv2a_present_chain_params_publish(&preset, nv2a_present_chain_gen());
+    nv2a_present_chain_params_apply(&applied, record_set, &s_nset);
+
+    /* A loaded one moved, a new one added, then a saved state. */
+    CHECK(nv2a_present_chain_param_set("maskDark", 0.3f));
+    CHECK(nv2a_present_chain_param_set("warpX", 0.05f));
+    CHECK(nv2a_present_chain_overrides_dirty() == 2);
+    pg = nv2a_present_chain_params_gen();
+    nv2a_present_chain_override_revert();
+    CHECK(nv2a_present_chain_params_gen() != pg);
+    CHECK(nv2a_present_chain_overrides_dirty() == 0);
+    CHECK(nv2a_present_chain_override_get("crt-lottes", "maskDark", &v) && near(v, 0.8f));
+    CHECK(!nv2a_present_chain_override_get("crt-lottes", "warpX", NULL));
+    s_nset = 0;
+    nv2a_present_chain_params_apply(&applied, record_set, &s_nset);
+    CHECK(s_nset == 2 && near(set_value("maskDark"), 0.8f) && near(set_value("warpX"), 0.01f));
+
+    /* After a Save the saved values are what Revert restores; a removal
+     * since then comes back. */
+    CHECK(nv2a_present_chain_param_set("warpX", 0.05f));
+    nv2a_present_chain_overrides_saved();
+    nv2a_present_chain_params_reset("crt-lottes");
+    CHECK(nv2a_present_chain_overrides_dirty() == 2);
+    nv2a_present_chain_override_revert();
+    CHECK(nv2a_present_chain_overrides_dirty() == 0);
+    CHECK(nv2a_present_chain_override_get("crt-lottes", "warpX", &v) && near(v, 0.05f));
+
+    /* The profile scope, by slug: another profile's edit stays. */
+    nv2a_present_chain_profile_value_load("mine", "warpX", 0.02f);
+    nv2a_present_chain_profile_reset("mine", NULL);
+    nv2a_present_chain_profile_reset("other", NULL);
+    CHECK(nv2a_present_chain_profile_dirty("mine") == 1);
+    nv2a_present_chain_profile_revert("mine");
+    CHECK(nv2a_present_chain_profile_dirty("mine") == 0);
+    CHECK(nv2a_present_chain_profile_value_get("mine", "warpX", &v) && near(v, 0.02f));
+    CHECK(nv2a_present_chain_overrides_dirty() == 0);
+    nv2a_present_chain_params_reset_for_test();
+}
+
 int main(int argc, char **argv)
 {
     const char *c = argc > 1 ? argv[1] : "";
@@ -595,6 +646,8 @@ int main(int argc, char **argv)
         refused(p);
     } else if (!strcmp(c, "params")) {
         case_params(dir);
+    } else if (!strcmp(c, "revert")) {
+        case_revert(dir);
     } else if (!strcmp(c, "profile")) {
         case_profile(dir);
     } else if (!strcmp(c, "params_cap")) {

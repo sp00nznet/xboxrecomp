@@ -15,6 +15,7 @@
  */
 #include "enhance_menu.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -41,6 +42,7 @@
 #include "nv2a_present_chain.h"
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
+#include "pad_map.h"
 #include "shader_profile_edit.h"
 #include "recomp_cfg.h"
 #include "recomp_env.h"
@@ -60,10 +62,24 @@
 
 enum page {
     PAGE_RENDER, PAGE_SHADERS, PAGE_PACK, PAGE_GAME, PAGE_MODS, PAGE_STATS, PAGE_CONTROLS,
-    PAGE_DEBUG, PAGE_SAVE, PAGE_COUNT
+    PAGE_DEBUG, PAGE_FILES, PAGE_COUNT
 };
 static const char *const s_page_name[PAGE_COUNT] = {
-    "Render", "Shaders", "Pack", "Game", "Mods", "Stats", "Controls", "Debug", "Save"
+    "Render", "Shaders", "Pack", "Game", "Mods", "Stats", "Controls", "Debug", "Files"
+};
+/* Each section's intro line (A.8): the toolkit's below, a title's through
+ * enhance_menu_page_intro. Held for the section header to draw. */
+static const char *s_page_intro[PAGE_COUNT];
+static const char *const k_page_intro[PAGE_COUNT] = {
+    "How the game is drawn and shown: resolution, filtering, aspect and pacing.",
+    "Post-processing shaders over the picture, saved as profiles.",
+    "The texture pack: replacement art, font and text.",
+    "Options this game adds.",
+    "Mods built into this game: turn them on or off and set their options.",
+    "Live numbers: frame rate, frame time and the draw counts.",
+    "What each action is bound to, on the pad and the keyboard, and the mouse.",
+    "The renderer's state and the trace channels, for bug reports.",
+    "Where the settings are saved, and the way back to the defaults.",
 };
 
 /* ---- the toolkit's items ------------------------------------------------ */
@@ -271,47 +287,61 @@ static const char *get_hud_margin(const struct enhance_item *it, char *b, size_t
 static const struct enhance_item k_hud_margin = {
     ITEM("display.hud_margin", "HUD margin", "Render", ENHANCE_ITEM_RANGE), .lo = 0, .hi = 64,
     .step = 4, .note = "wide aspect", .set = set_hud_margin, .get = get_hud_margin,
-    .live = ENHANCE_LIVE, .def = "0"
+    .live = ENHANCE_LIVE, .def = "0",
+    .help = "Pulls the HUD in from the screen edges on a wide picture"
 };
 
 static const struct enhance_item k_items[] = {
     { ITEM("render.scale", "Render scale", "Render", ENHANCE_ITEM_RANGE), .lo = 1, .hi = 4,
-      .step = 1, .set = set_scale, .get = get_scale, .live = ENHANCE_LIVE_FLUSH, .def = "1" },
+      .step = 1, .set = set_scale, .get = get_scale, .live = ENHANCE_LIVE_FLUSH, .def = "1",
+      .help = "Draws the 3D at a multiple of the Xbox resolution: sharper, slower" },
     { ITEM("render.snap_2d", "2D on guest grid", "Render", ENHANCE_ITEM_TOGGLE),
-      .note = "scale 2+", .set = set_snap, .get = get_snap, .def = "false" },
+      .note = "scale 2+", .set = set_snap, .get = get_snap, .def = "false",
+      .help = "Keeps 2D art on the Xbox pixel grid so scaled menus do not shimmer" },
     { ITEM("render.aniso", "Anisotropic filtering", "Render", ENHANCE_ITEM_CHOICE),
       .choices = k_aniso, .set = set_aniso, .get = get_aniso, .flags = ENHANCE_ITEM_NUMERIC,
-      .def = "0" },
+      .def = "0", .help = "Sharper textures on surfaces seen at an angle" },
     { ITEM("present.filter", "Scaling filter", "Render", ENHANCE_ITEM_CHOICE),
-      .choices = k_filter, .set = set_filter, .get = get_filter, .def = "nearest" },
+      .choices = k_filter, .set = set_filter, .get = get_filter, .def = "nearest",
+      .help = "How the picture is stretched to the window: nearest is crisp, linear smooth" },
     { ITEM("present.fullscreen", "Fullscreen", "Render", ENHANCE_ITEM_TOGGLE), .set = set_full,
-      .get = get_full, .live = ENHANCE_LIVE_FLUSH, .def = "false" },
+      .get = get_full, .live = ENHANCE_LIVE_FLUSH, .def = "false",
+      .help = "Fills the screen with a borderless window" },
     { ITEM("present.pacing", "Frame pacing", "Render", ENHANCE_ITEM_CHOICE),
-      .choices = k_pacing, .set = set_pacing, .get = get_pacing, .def = "sleep" },
+      .choices = k_pacing, .set = set_pacing, .get = get_pacing, .def = "sleep",
+      .help = "How the frame rate is held steady: sleep saves power, spin is tighter" },
     { ITEM("display.aspect", "Aspect ratio", "Render", ENHANCE_ITEM_CHOICE),
-      .choices = k_aspect, .live = ENHANCE_LIVE_RESTART, .def = "4:3" },
+      .choices = k_aspect, .live = ENHANCE_LIVE_RESTART, .def = "4:3",
+      .help = "The picture shape the game is told to draw for" },
     { ITEM("display.overscan", "Overscan crop", "Render", ENHANCE_ITEM_RANGE), .lo = 0,
       .hi = NV2A_OVERSCAN_MAX, .step = 4, .note = "4:3 only", .set = set_overscan,
-      .get = get_overscan, .def = "0" },
+      .get = get_overscan, .def = "0",
+      .help = "Crops the border a TV would hide, in pixels per side" },
     { ITEM("display.movie", "Movies", "Render", ENHANCE_ITEM_CHOICE), .choices = k_movie,
-      .set = set_movie, .get = get_movie, .def = "black" },
+      .set = set_movie, .get = get_movie, .def = "black",
+      .help = "What fills the screen around full-motion video" },
     { ITEM("present.surface", "Present surface", "Render", ENHANCE_ITEM_CHOICE),
-      .choices = k_surface, .live = ENHANCE_LIVE_RESTART, .def = "auto" },
+      .choices = k_surface, .live = ENHANCE_LIVE_RESTART, .def = "auto",
+      .help = "The window surface the picture is shown on; auto picks the best one" },
     /* textures.pack names the file: the toggle is this session's only. */
     { ITEM("textures.pack", "Texture pack", "Pack", ENHANCE_ITEM_TOGGLE), .set = set_pack_bit,
       .get = get_pack_bit, .live = ENHANCE_LIVE_FLUSH, .flags = ENHANCE_ITEM_NOSAVE,
-      .def = "true", .user = (void *)(uintptr_t)NV2A_PACK_OFF_ALL },
+      .def = "true", .user = (void *)(uintptr_t)NV2A_PACK_OFF_ALL,
+      .help = "Uses the replacement textures for this session" },
     { ITEM("textures.font", "Pack font", "Pack", ENHANCE_ITEM_CHOICE), .choices = k_onoff,
       .set = set_pack_bit, .get = get_pack_bit, .live = ENHANCE_LIVE_FLUSH, .def = "on",
-      .user = (void *)(uintptr_t)NV2A_PACK_OFF_FONT },
+      .user = (void *)(uintptr_t)NV2A_PACK_OFF_FONT,
+      .help = "Uses the pack's font in place of the game's" },
     { ITEM("textures.text", "Pack text", "Pack", ENHANCE_ITEM_CHOICE), .choices = k_onoff,
       .set = set_pack_bit, .get = get_pack_bit, .live = ENHANCE_LIVE_FLUSH, .def = "on",
-      .user = (void *)(uintptr_t)NV2A_PACK_OFF_TEXT },
+      .user = (void *)(uintptr_t)NV2A_PACK_OFF_TEXT,
+      .help = "Uses the pack's text images in place of the game's" },
     { ITEM("overlay.stats", "Stats strip", "Stats", ENHANCE_ITEM_TOGGLE), .set = set_stats,
-      .get = get_stats, .def = "false" },
+      .get = get_stats, .def = "false",
+      .help = "Shows frame time and rate in a strip over the game" },
     { ITEM("input.mouse_capture", "Capture", "Controls", ENHANCE_ITEM_CHOICE),
       .choices = k_capture, .set = set_capture, .get = get_capture,
-      .def = "focus" },
+      .def = "focus", .help = "When the game takes the mouse: on focus, on a click, or never" },
 };
 #define N_ITEMS ((int)(sizeof k_items / sizeof k_items[0]))
 
@@ -678,9 +708,14 @@ static void slot_set(struct slot *s, const char *v)
 
 /* ---- actions the Controls page changed ---------------------------------- */
 
-static unsigned char s_adirty[ENHANCE_ACTIONS_MAX];
-
 typedef char bind_list[ENHANCE_ACTION_BINDS][ENHANCE_ACTION_TEXT];
+
+/* Each action's bindings as loaded or last saved, as the slots keep base:
+ * an action is unsaved while its bindings differ from these, so binding a
+ * key and then binding it back leaves nothing to save (D10). */
+static bind_list s_abase[ENHANCE_ACTIONS_MAX];
+static int s_abase_n[ENHANCE_ACTIONS_MAX];
+static unsigned char s_abase_have[ENHANCE_ACTIONS_MAX];
 
 /* The stock bindings: the defaults file's [input.actions] entry, else the
  * code defaults. */
@@ -710,14 +745,74 @@ static int lists_equal(bind_list a, int na, bind_list b, int nb)
     return 1;
 }
 
+static int list_has(bind_list l, int n, const char *v)
+{
+    for (int i = 0; i < n; i++)
+        if (!strcmp(l[i], v))
+            return 1;
+    return 0;
+}
+
+/* The same set in any order: a capture appends, so clearing a key and
+ * binding it again puts it last, and that changes nothing the player sees. */
+static int same_binds(bind_list a, int na, bind_list b, int nb)
+{
+    if (na != nb)
+        return 0;
+    for (int i = 0; i < na; i++)
+        if (!list_has(b, nb, a[i]) || !list_has(a, na, b[i]))
+            return 0;
+    return 1;
+}
+
+static void abase_take(int id)
+{
+    s_abase_n[id] = enhance_action_bindings(id, s_abase[id], ENHANCE_ACTION_BINDS);
+    s_abase_have[id] = 1;
+}
+
+static int binds_dirty(int id)
+{
+    bind_list cur;
+    int n;
+    if (id < 0 || id >= ENHANCE_ACTIONS_MAX || !s_abase_have[id] || !enhance_action_name(id))
+        return 0;
+    n = enhance_action_bindings(id, cur, ENHANCE_ACTION_BINDS);
+    return !same_binds(cur, n, s_abase[id], s_abase_n[id]);
+}
+
 static void action_set(int id, bind_list l, int n)
 {
     const char *t[ENHANCE_ACTION_BINDS];
+    if (id >= 0 && id < ENHANCE_ACTIONS_MAX && !s_abase_have[id])
+        abase_take(id);
     for (int i = 0; i < n; i++)
         t[i] = l[i];
     enhance_action_set_bindings(id, t, n);
-    if (id >= 0 && id < ENHANCE_ACTIONS_MAX)
-        s_adirty[id] = 1;
+}
+
+/* Two values of one item as the player sees them: a range within half a
+ * step (0.5 and 0.50 or a snapped 0.4999), a number by value, a toggle as
+ * on or off, anything else as its text. */
+static int vals_same(const struct enhance_item *it, const char *a, const char *b)
+{
+    switch (it->kind) {
+    case ENHANCE_ITEM_TOGGLE:
+        return on_text(a) == on_text(b);
+    case ENHANCE_ITEM_RANGE:
+        return fabs(atof(a) - atof(b)) < (it->step > 0 ? it->step : 1e-6) / 2;
+    case ENHANCE_ITEM_CHOICE:
+        if (it->flags & ENHANCE_ITEM_NUMERIC)
+            return atoll(a) == atoll(b);
+        return !strcmp(a, b);
+    default:
+        return !strcmp(a, b);
+    }
+}
+
+static int slot_unsaved(const struct slot *s)
+{
+    return !vals_same(s->it, s->cur, s->base);
 }
 
 static const char *mod_title(int m);
@@ -770,7 +865,8 @@ static void join_bindings(int id, char *out, size_t n)
 
 enum { ST_CLOSED, ST_OPEN, ST_CLOSING };
 enum row_type {
-    R_SLOT, R_INFO, R_HEADER, R_BIND, R_MOD, R_SAVE, R_RESET,
+    R_SLOT, R_INFO, R_HEADER, R_BIND, R_MOD, R_RESET,
+    R_FILEIO,           /* Files: import (ref 0) or export (1), hidden for now */
     R_TEXT,             /* one wrapped line of a mod's Author, About or State */
     R_CTL,              /* a mod's captured control: read only until phase D */
     R_MODRESET,         /* "Reset this mod" */
@@ -784,6 +880,8 @@ enum row_type {
     R_NAME              /* "Rename": the text entry */
 };
 enum { TINT_NONE, TINT_BAD, TINT_WARN };
+/* The Files page's import and export rows wait for the file browser. */
+static const int k_files_io = 0;
 
 struct row {
     int type;
@@ -827,6 +925,20 @@ static void shaders_check(void)
 static int s_scroll[PAGE_COUNT];
 static int s_mod_sub = -1;          /* the mod whose items the Mods page lists */
 static int s_confirm;               /* the Reset row asks again */
+/* D9a: the unsaved-changes dialog; while on it takes every event. */
+enum { DLG_DISCARD, DLG_SAVE, DLG_BACK, DLG_BUTTONS };
+#define DLG_SWALLOW_MS 150u  /* = REPEAT_FIRST: the key that opened it waits */
+
+static struct {
+    int on, focus;
+    int failed;             /* Exit and Save failed: inert until reopened */
+    uint64_t t0;
+    char err[160];          /* a failed Exit and Save's reason */
+    char body[512];
+} s_dlg;
+
+static int s_hints_inline;          /* L3: hints under the rows, not as a tooltip */
+static int s_need_draw;
 static char s_status[128];
 static uint64_t s_status_t, s_now;
 
@@ -852,12 +964,13 @@ static void cap_phase(int phase)
 
 /* input */
 static uint32_t s_held[PORTS], s_prev_held;
+static uint32_t s_rel_armed, s_rel_taint;  /* View and L3 wait for release */
 static unsigned char s_kprev[256];
 static DWORD s_pkt[PORTS], s_fpkt[PORTS];
 static int s_dir, s_kbd;
 static uint64_t s_dir_next, s_close_t, s_draw_t;
 static uint64_t s_extra_t[INPUT_SRC_COUNT];
-static int s_need_draw, s_snap_on, s_stats_on;
+static int s_snap_on, s_stats_on;
 static int s_draw_w, s_draw_h;
 
 /* rates over one-second windows (Stats, Debug) */
@@ -925,8 +1038,11 @@ static void slot_rows(int page, int mod)
         r = row_add(R_SLOT, i, s->it->kind != ENHANCE_ITEM_INFO, s->it->label);
         if (r && s->it->kind == ENHANCE_ITEM_INFO)
             slot_read(s);
-        if (r)
-            snprintf(r->value, sizeof r->value, "%s", s->cur);
+        if (!r)
+            continue;
+        snprintf(r->value, sizeof r->value, "%s", s->cur);
+        if (s->help || s->it->help)
+            snprintf(r->help, sizeof r->help, "%s", s->help ? s->help : s->it->help);
     }
 }
 
@@ -1055,8 +1171,12 @@ static void slot_row(const char *key)
     if (i < 0)
         return;
     r = row_add(R_SLOT, i, 1, s_slot[i].it->label);
-    if (r)
-        snprintf(r->value, sizeof r->value, "%s", s_slot[i].cur);
+    if (!r)
+        return;
+    snprintf(r->value, sizeof r->value, "%s", s_slot[i].cur);
+    if (s_slot[i].help || s_slot[i].it->help)
+        snprintf(r->help, sizeof r->help, "%s",
+                 s_slot[i].help ? s_slot[i].help : s_slot[i].it->help);
 }
 
 static const char *miss_why(uint32_t w)
@@ -1344,7 +1464,8 @@ static void detail_rows(int m)
         if (!r)
             continue;
         snprintf(r->value, sizeof r->value, "%s", s_slot[i].cur);
-        snprintf(r->help, sizeof r->help, "%s", s_slot[i].help ? s_slot[i].help : "");
+        snprintf(r->help, sizeof r->help, "%s",
+                 s_slot[i].help ? s_slot[i].help : s_slot[i].it->help ? s_slot[i].it->help : "");
     }
     slot_rows(PAGE_MODS, m);
     if (ok)
@@ -1921,16 +2042,26 @@ static void build_rows(void)
 #undef TRACE_ROW_
         break;
     }
-    case PAGE_SAVE: {
+    case PAGE_FILES: {
+        /* Save lives in the footer (D9): this page is about the file. */
         const char *path = enhance_cfg_user_path();
-        int un = enhance_menu_unsaved();
-        struct row *r = row_add(R_SAVE, -1, 1, "Save");
-        if (r)
-            snprintf(r->value, sizeof r->value, "%s", path ? path : "off (RECOMP_CONFIG=none)");
-        info("Unsaved changes", "%d", un);
+        struct row *r;
+        info("Config file", "%s", path ? path : "off (RECOMP_CONFIG=none)");
+        if (s_nrow)
+            snprintf(s_row[s_nrow - 1].help, sizeof s_row[s_nrow - 1].help,
+                     "Save (the footer, Y or F5) writes the changes here");
         r = row_add(R_RESET, -1, 1, s_confirm ? "Reset everything? A / Enter: yes" : "Reset to defaults");
-        if (r)
+        if (r) {
             snprintf(r->value, sizeof r->value, "%s", s_confirm ? "B / Esc: no" : "");
+            snprintf(r->help, sizeof r->help,
+                     "Every setting, binding and shader back to stock; Save keeps it");
+        }
+        /* Import and export land with the file browser (phase FB): the
+         * rows are here, hidden, so the page keeps its order then. */
+        if (k_files_io) {
+            row_add(R_FILEIO, 0, 1, "Import settings");
+            row_add(R_FILEIO, 1, 1, "Export settings");
+        }
         break;
     }
     default:
@@ -2091,14 +2222,14 @@ static int collect(void)
     for (int i = 0; i < s_nslot; i++) {
         struct slot *s = &s_slot[i];
         char stock[VAL_MAX];
-        if (!slot_saveable(s) || !strcmp(s->cur, s->base))
+        if (!slot_saveable(s) || !slot_unsaved(s))
             continue;
         if (s->toggle && xbox_mod_enable_setting(s->mod) >= 0) {
             n += enable_save(s, n);
             continue;
         }
         snprintf(s_pkey[n], sizeof s_pkey[n], "%s", s->key);
-        s_pnull[n] = slot_stock(s, stock, sizeof stock) && !strcmp(stock, s->cur);
+        s_pnull[n] = slot_stock(s, stock, sizeof stock) && vals_same(s->it, stock, s->cur);
         if (s->dset >= 0) {
             /* The literal the toolkit writes for the setting's kind: a
              * float keeps its point ("1.0"), an enum is quoted. */
@@ -2115,7 +2246,7 @@ static int collect(void)
         bind_list cur, stock;
         int nc, ns;
         size_t at;
-        if (!s_adirty[id] || !enhance_action_name(id))
+        if (!binds_dirty(id))
             continue;
         nc = enhance_action_bindings(id, cur, ENHANCE_ACTION_BINDS);
         ns = action_stock(id, stock);
@@ -2180,10 +2311,10 @@ int enhance_menu_unsaved(void)
 {
     int n = 0;
     for (int i = 0; i < s_nslot; i++)
-        if (slot_saveable(&s_slot[i]) && strcmp(s_slot[i].cur, s_slot[i].base))
+        if (slot_saveable(&s_slot[i]) && slot_unsaved(&s_slot[i]))
             n++;
     for (int id = 0; id < ENHANCE_ACTIONS_MAX; id++)
-        n += s_adirty[id] != 0;
+        n += binds_dirty(id);
     return n + nv2a_present_chain_overrides_dirty() + shader_edit_unsaved();
 }
 
@@ -2215,7 +2346,10 @@ static void mkdir_parent(const char *path)
     }
 }
 
-static void save(void)
+/* 0 when everything is on disk (or there was nothing to write), -1 when
+ * it is not: the status says why, and the unsaved-changes dialog keeps
+ * itself open over a failure. */
+static int save(void)
 {
     const char *path = enhance_cfg_user_path();
     const char *keys[sizeof s_pkey / sizeof s_pkey[0]];
@@ -2229,14 +2363,14 @@ static void save(void)
     int edits = enhance_menu_unsaved(), n, rc, renamed, wrote;
     if (!path) {
         status("Save is off (RECOMP_CONFIG=none)");
-        return;
+        return -1;
     }
     /* The profiles first: the config may name one that has no file yet. */
     wrote = shader_edit_save(err, sizeof err);
     if (wrote < 0) {
         status("Save failed: %s", err);
         fprintf(stderr, LOGP "menu: saving a shader profile failed: %s\n", err);
-        return;
+        return -1;
     }
     n = enhance_menu_pending(keys, vals, (int)(sizeof keys / sizeof keys[0]));
     if (!n) {
@@ -2244,7 +2378,7 @@ static void save(void)
             status("Saved %d change%s", edits, edits == 1 ? "" : "s");
         else
             status("Nothing to save");
-        return;
+        return 0;
     }
     renamed = s_rw_staged;
     mkdir_parent(path);
@@ -2252,14 +2386,15 @@ static void save(void)
     if (rc < 0) {
         status("Save failed: %s", err);
         fprintf(stderr, LOGP "menu: save to %s failed: %s\n", path, err);
-        return;
+        return -1;
     }
     /* Keys left out for a [table] in the file (rc > 0) are named in the
      * log; the player fixes the file, so they are not kept pending to
      * fail again. */
     for (int i = 0; i < s_nslot; i++)
         memcpy(s_slot[i].base, s_slot[i].cur, sizeof s_slot[i].base);
-    memset(s_adirty, 0, sizeof s_adirty);
+    for (int id = 0; id < enhance_action_count() && id < ENHANCE_ACTIONS_MAX; id++)
+        abase_take(id);
     nv2a_present_chain_overrides_saved();
     shader_edit_config_saved();
     s_rw_done = 1;
@@ -2269,7 +2404,7 @@ static void save(void)
         /* The status line is short: the count, and the log has the rest. */
         status("Saved; %d key%s left out, a [table] in the file holds %s (see the log)", rc,
                rc == 1 ? "" : "s", rc == 1 ? "it" : "them");
-        return;
+        return 0;
     }
     fprintf(stderr, LOGP "menu: saved %d key%s to %s\n", n, n == 1 ? "" : "s", path);
     if (renamed && edits)
@@ -2279,6 +2414,7 @@ static void save(void)
         status("Saved %d renamed key%s", renamed, renamed == 1 ? "" : "s");
     else
         status("Saved %d change%s", edits, edits == 1 ? "" : "s");
+    return 0;
 }
 
 /* Stage the stock of every slot and action (m -1), or of mod m's own
@@ -2292,7 +2428,7 @@ static void reset_scope(int m)
         if (m >= 0 && (s->mod != m || s->toggle))
             continue;
         if (s->env || s->it->kind == ENHANCE_ITEM_INFO || s->it->kind == ENHANCE_ITEM_ACTION
-            || !slot_stock(s, stock, sizeof stock) || !strcmp(stock, s->cur))
+            || !slot_stock(s, stock, sizeof stock) || vals_same(s->it, stock, s->cur))
             continue;
         slot_set(s, stock);
     }
@@ -2348,13 +2484,20 @@ int enhance_menu_open(uint64_t now_ms)
      * shows as it is now; a change of the menu's own waits for Save. */
     for (int i = 0; i < s_nslot; i++) {
         struct slot *s = &s_slot[i];
-        if (!strcmp(s->cur, s->base)) {
+        if (!slot_unsaved(s)) {
             slot_read(s);
             memcpy(s->base, s->cur, sizeof s->base);
         }
     }
+    /* Bindings likewise: a mod registers its actions late, and another
+     * path (a title's rebind) may move one between two opens. */
+    for (int id = 0; id < enhance_action_count() && id < ENHANCE_ACTIONS_MAX; id++)
+        if (!binds_dirty(id))
+            abase_take(id);
     s_state = ST_OPEN;
     s_confirm = 0;
+    s_dlg.on = 0;
+    s_rel_armed = s_rel_taint = 0;
     cap_phase(CAP_OFF);
     name_end();
     sh_reset_state();
@@ -2379,6 +2522,7 @@ void enhance_menu_close(void)
         return;
     s_state = ST_CLOSING;
     s_close_t = s_now;
+    s_dlg.on = 0;
     cap_phase(CAP_OFF);
     name_end();
     s_confirm = 0;
@@ -2476,10 +2620,26 @@ static void clear_binding(int id)
         status("menu.open keeps a binding: the menu could not open again");
         return;
     }
+    if (id >= 0 && id < ENHANCE_ACTIONS_MAX && !s_abase_have[id])
+        abase_take(id);
     enhance_action_set_bindings(id, NULL, 0);
-    if (id >= 0 && id < ENHANCE_ACTIONS_MAX)
-        s_adirty[id] = 1;
     status("%s: unbound", enhance_action_label(id));
+}
+
+/* X or Delete on a setting: its stock value, staged as any change. */
+static void clear_slot(struct slot *s)
+{
+    char stock[VAL_MAX];
+    if (s->it->kind == ENHANCE_ITEM_INFO || s->it->kind == ENHANCE_ITEM_ACTION)
+        return;
+    if (s->env) {
+        status("Set by %s", s->envname ? s->envname : "the environment");
+        return;
+    }
+    if (!slot_stock(s, stock, sizeof stock) || vals_same(s->it, stock, s->cur))
+        return;
+    slot_set(s, stock);
+    status("%s: reset to default (%s)", s->it->label, stock);
 }
 
 /* After a chain edit: a bundled preset or a path forked into a profile
@@ -2647,12 +2807,284 @@ static int sh_event(const struct row *r, int dir, int ok)
     }
 }
 
+/* ---- revert, the row markers and the unsaved-changes dialog (D9, D10) --- */
+
+void enhance_menu_revert(void)
+{
+    for (int i = 0; i < s_nslot; i++) {
+        struct slot *s = &s_slot[i];
+        char v[VAL_MAX];
+        if (!slot_saveable(s) || !slot_unsaved(s))
+            continue;
+        /* Through set(), as a change in the menu: a live item shows the
+         * old value now, a RESTART one records it for the next start. */
+        memcpy(v, s->base, sizeof v);
+        slot_set(s, v);
+    }
+    for (int id = 0; id < enhance_action_count() && id < ENHANCE_ACTIONS_MAX; id++) {
+        const char *t[ENHANCE_ACTION_BINDS];
+        if (!binds_dirty(id))
+            continue;
+        for (int k = 0; k < s_abase_n[id]; k++)
+            t[k] = s_abase[id][k];
+        enhance_action_set_bindings(id, t, s_abase_n[id]);
+    }
+    nv2a_present_chain_override_revert();
+    shader_edit_revert();
+    sh_reset_state();
+    s_confirm = 0;
+    s_need_draw = 1;
+}
+
+static int slot_state(const struct slot *s)
+{
+    char stock[VAL_MAX];
+    int st = 0;
+    if (s->it->kind == ENHANCE_ITEM_INFO || s->it->kind == ENHANCE_ITEM_ACTION)
+        return 0;
+    if (s->env)
+        st |= ENHANCE_ROW_FORCED;
+    else if (slot_saveable(s) && slot_unsaved(s))
+        st |= ENHANCE_ROW_UNSAVED;
+    if (slot_stock(s, stock, sizeof stock) && !vals_same(s->it, stock, s->cur))
+        st |= ENHANCE_ROW_NONDEFAULT;
+    return st;
+}
+
+static int row_state(const struct row *r)
+{
+    int st = 0;
+    switch (r->type) {
+    case R_SLOT:
+        return slot_state(&s_slot[r->ref]);
+    case R_MOD: {
+        int t = toggle_slot(r->ref);
+        return t < 0 ? 0 : slot_state(&s_slot[t]);
+    }
+    case R_BIND: {
+        bind_list cur, stock;
+        int nc = enhance_action_bindings(r->ref, cur, ENHANCE_ACTION_BINDS);
+        int ns = action_stock(r->ref, stock);
+        if (enhance_action_source(r->ref, NULL, 0) == ENHANCE_ACT_SRC_ENV)
+            st |= ENHANCE_ROW_FORCED;
+        else if (binds_dirty(r->ref))
+            st |= ENHANCE_ROW_UNSAVED;
+        if (!same_binds(cur, nc, stock, ns))
+            st |= ENHANCE_ROW_NONDEFAULT;
+        return st;
+    }
+    case R_PARAM: {
+        const struct nv2a_present_param *p = &s_ptab[r->ref];
+        float v = p->initial;
+        nv2a_present_chain_param_get(p->name, &v);
+        if (nv2a_present_chain_param_dirty(p->name))
+            st |= ENHANCE_ROW_UNSAVED;
+        if (fabs((double)v - p->initial) >= param_step(p) / 2)
+            st |= ENHANCE_ROW_NONDEFAULT;
+        return st;
+    }
+    case R_PROFILE: {
+        const struct shader_edit_entry *e = shader_edit_entry(shader_edit_active());
+        if (shader_edit_forced())
+            st |= ENHANCE_ROW_FORCED;
+        else if (shader_edit_choice_dirty() || shader_edit_dirty(shader_edit_active()))
+            st |= ENHANCE_ROW_UNSAVED;
+        if (e && e->kind != SHADER_EDIT_OFF)
+            st |= ENHANCE_ROW_NONDEFAULT;
+        return st;
+    }
+    default:
+        return 0;
+    }
+}
+
+/* A section's tab carries the unsaved dot while anything on it is. */
+static int page_unsaved(int p)
+{
+    for (int i = 0; i < s_nslot; i++)
+        if (s_slot[i].page == p && slot_saveable(&s_slot[i]) && slot_unsaved(&s_slot[i]))
+            return 1;
+    if (p == PAGE_CONTROLS)
+        for (int id = 0; id < ENHANCE_ACTIONS_MAX; id++)
+            if (binds_dirty(id))
+                return 1;
+    if (p == PAGE_SHADERS)
+        return nv2a_present_chain_overrides_dirty() + shader_edit_unsaved() > 0;
+    return 0;
+}
+
+static const char *const k_dlg_button[DLG_BUTTONS] = {
+    "Exit without saving", "Exit and Save", "Go Back"
+};
+
+/* Exit and Save does nothing where nothing can be written. */
+static int dlg_save_off(void)
+{
+    return !enhance_cfg_user_path();
+}
+
+/* The dialog's Save: also off once it failed, so a second press cannot
+ * repeat the write that just failed and close nothing (D9a). */
+static int dlg_save_dead(void)
+{
+    return dlg_save_off() || s_dlg.failed;
+}
+
+static void dlg_label(char *out, size_t n, int *k, const char *label)
+{
+    size_t at = strlen(out);
+    if ((*k)++ < 3)
+        snprintf(out + at, n - at, "%s%s", at ? ", " : "", label ? label : "?");
+}
+
+/* "3 settings changed since the last save.", then up to three of them. */
+static void dlg_compose(void)
+{
+    char names[256] = "";
+    int un = enhance_menu_unsaved(), k = 0;
+    size_t at;
+    for (int i = 0; i < s_nslot; i++)
+        if (slot_saveable(&s_slot[i]) && slot_unsaved(&s_slot[i]))
+            dlg_label(names, sizeof names, &k, s_slot[i].toggle ? mod_title(s_slot[i].mod)
+                                                                : s_slot[i].it->label);
+    for (int id = 0; id < ENHANCE_ACTIONS_MAX; id++)
+        if (binds_dirty(id))
+            dlg_label(names, sizeof names, &k, enhance_action_label(id));
+    for (int i = 0;; i++) {
+        char key[64], name[64];
+        float v;
+        int has, dirty;
+        if (!nv2a_present_chain_override_at(i, key, sizeof key, name, sizeof name, &v, &has,
+                                            &dirty))
+            break;
+        if (dirty)
+            dlg_label(names, sizeof names, &k, name);
+    }
+    if (shader_edit_unsaved())
+        dlg_label(names, sizeof names, &k, "Shader profile");
+    at = (size_t)snprintf(s_dlg.body, sizeof s_dlg.body, "%d setting%s changed since the last save.",
+                          un, un == 1 ? "" : "s");
+    if (names[0] && at < sizeof s_dlg.body)
+        at += (size_t)snprintf(s_dlg.body + at, sizeof s_dlg.body - at, "\n%s%s", names,
+                               k > 3 ? ", \xE2\x80\xA6" : "");
+    if (s_dlg.err[0] && at < sizeof s_dlg.body)
+        at += (size_t)snprintf(s_dlg.body + at, sizeof s_dlg.body - at, "\n%s", s_dlg.err);
+    if (shader_edit_deleted() && at < sizeof s_dlg.body)
+        snprintf(s_dlg.body + at, sizeof s_dlg.body - at,
+                 "\nDeleted profiles are gone already; this does not bring them back.");
+}
+
+static void dlg_open(void)
+{
+    s_dlg.on = 1;
+    s_dlg.focus = DLG_BACK;
+    s_dlg.t0 = s_now;
+    s_dlg.failed = 0;
+    s_dlg.err[0] = 0;
+    s_confirm = 0;
+    dlg_compose();
+    s_need_draw = 1;
+}
+
+/* Every way out of the menu but a host quit: ask while anything is
+ * unsaved, so the menu never closes over silent pending changes. */
+static void leave_request(void)
+{
+    if (enhance_menu_unsaved() > 0)
+        dlg_open();
+    else
+        enhance_menu_close();
+}
+
+static void dlg_activate(int b)
+{
+    switch (b) {
+    case DLG_DISCARD:
+        enhance_menu_revert();
+        s_dlg.on = 0;
+        enhance_menu_close();
+        break;
+    case DLG_SAVE:
+        if (dlg_save_dead())
+            break;
+        if (save() < 0) {
+            s_dlg.failed = 1;
+            snprintf(s_dlg.err, sizeof s_dlg.err, "%s", s_status);
+            s_dlg.focus = DLG_BACK;
+            dlg_compose();
+            break;
+        }
+        s_dlg.on = 0;
+        enhance_menu_close();
+        break;
+    default:
+        s_dlg.on = 0;
+        break;
+    }
+    s_need_draw = 1;
+}
+
+/* The dialog takes every event while it is up (D9a). */
+static int dlg_event(enum enhance_menu_event ev)
+{
+    if (s_now - s_dlg.t0 < DLG_SWALLOW_MS)
+        return 1;
+    switch (ev) {
+    case ENHANCE_EV_LEFT:
+    case ENHANCE_EV_UP:
+        if (s_dlg.focus > 0)
+            s_dlg.focus--;
+        break;
+    case ENHANCE_EV_RIGHT:
+    case ENHANCE_EV_DOWN:
+        if (s_dlg.focus < DLG_BUTTONS - 1)
+            s_dlg.focus++;
+        break;
+    case ENHANCE_EV_OK:
+        dlg_activate(s_dlg.focus);
+        break;
+    case ENHANCE_EV_BACK:
+    case ENHANCE_EV_CANCEL:
+    case ENHANCE_EV_CLOSE:
+        /* Asking to leave again never picks for the player. */
+        dlg_activate(DLG_BACK);
+        break;
+    default:
+        /* Y (Save) is no shortcut here: a reflex Y never closes the menu. */
+        break;
+    }
+    s_need_draw = 1;
+    return 1;
+}
+
+/* The keyboard's own dialog keys: Tab and Shift+Tab move focus, N, S and
+ * G are the buttons' access keys. 1 when the key was the dialog's. */
+static int dlg_key(int vk, int shift)
+{
+    if (!s_dlg.on || s_now - s_dlg.t0 < DLG_SWALLOW_MS)
+        return 0;
+    switch (vk) {
+    case 0x09:
+        if (shift ? s_dlg.focus > 0 : s_dlg.focus < DLG_BUTTONS - 1)
+            s_dlg.focus += shift ? -1 : 1;
+        break;
+    case 'N': dlg_activate(DLG_DISCARD); break;
+    case 'S': dlg_activate(DLG_SAVE); break;
+    case 'G': dlg_activate(DLG_BACK); break;
+    default: return 0;
+    }
+    s_need_draw = 1;
+    return 1;
+}
+
 int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
 {
     struct row *r;
     s_now = now_ms;
     if (s_state != ST_OPEN || ev == ENHANCE_EV_NONE)
         return 0;
+    if (s_dlg.on)
+        return dlg_event(ev);
     build_rows();
     r = s_nrow ? &s_row[s_sel[s_page]] : NULL;
     if (r && !r->sel)
@@ -2674,7 +3106,14 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
     case ENHANCE_EV_PAGE_PREV: page_to(s_page - 1); break;
     case ENHANCE_EV_PAGE_NEXT: page_to(s_page + 1); break;
     case ENHANCE_EV_SAVE: save(); break;
-    case ENHANCE_EV_CLOSE: enhance_menu_close(); break;
+    case ENHANCE_EV_CLOSE:
+    case ENHANCE_EV_CANCEL: leave_request(); break;
+    case ENHANCE_EV_HINTS:
+        /* No status yet: nothing draws hints under the rows until B or C,
+         * so the footer help stays the one place they show. */
+        s_hints_inline = !s_hints_inline;
+        s_need_draw = 1;
+        break;
     case ENHANCE_EV_BACK:
         if (s_page == PAGE_SHADERS && s_sh_sub != SH_MAIN) {
             /* Back to the row the sub-list opened from. */
@@ -2687,12 +3126,14 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
             s_sel[PAGE_MODS] = s_mod_sub;
             s_mod_sub = -1;
         } else {
-            enhance_menu_close();
+            leave_request();
         }
         break;
     case ENHANCE_EV_CLEAR:
         if (r && r->type == R_BIND)
             clear_binding(r->ref);
+        if (r && r->type == R_SLOT)
+            clear_slot(&s_slot[r->ref]);
         if (r && r->type == R_STAGE) {
             const struct shader_edit_entry *e = shader_edit_entry(shader_edit_active());
             if (shader_edit_forced()) {
@@ -2758,10 +3199,6 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
                 s_cap.max = s_cap.last = 0;
                 status("Press a key or hold a pad chord (Esc cancels)");
             }
-            break;
-        case R_SAVE:
-            if (ok)
-                save();
             break;
         case R_RESET:
             if (!ok)
@@ -3006,6 +3443,91 @@ static void keys_latch(void)
         s_kprev[vk] = xbox_FramebufferKeyDown(vk) != 0;
 }
 
+/* ---- View and L3: on release, never as part of the menu's chord (A.6) ----
+ * Cancel and the hints toggle sit on buttons a title may also use in its
+ * menu.open chord (BLiNX 2: back+left_thumb@400). They fire when let go,
+ * and not at all once a chord mate was held with them or the toggle fired
+ * while they were down: that hold was the chord, not a press. */
+
+static const uint32_t k_rel_buttons = (1u << INPUT_SRC_BACK) | (1u << INPUT_SRC_LEFT_STICK_CLICK);
+
+/* A binding's name as the pad source it means, 0 for a key or a mouse
+ * button (enhance_actions.c reads names the same way). */
+static int pad_src_of(const char *name)
+{
+    xbox_pad_setup id;
+    int src, ctl;
+    for (const char *p = name; *p; p++)
+        if (isupper((unsigned char)*p))
+            return 0;   /* "A" is a key, "a" the pad's south button */
+    src = xbox_InputMap_SourceFromName(name);
+    if (src > INPUT_SRC_NONE)
+        return src;
+    ctl = xbox_InputMap_ControlFromName(name);
+    if (ctl < 0 || ctl >= INPUT_PAD_CONTROL_COUNT)
+        return 0;
+    xbox_PadSetupIdentity(&id);
+    return id.map.source[ctl];
+}
+
+/* The pad buttons held with src in one of menu.open's pad chords. */
+static uint32_t menu_chord_mates(int src)
+{
+    bind_list l;
+    uint32_t mates = 0;
+    int id = -1, n;
+    for (int i = 0; i < enhance_action_count() && id < 0; i++)
+        if (enhance_action_name(i) && !strcmp(enhance_action_name(i), "menu.open"))
+            id = i;
+    if (id < 0)
+        return 0;
+    n = enhance_action_bindings(id, l, ENHANCE_ACTION_BINDS);
+    for (int b = 0; b < n; b++) {
+        char tok[ENHANCE_ACTION_TEXT];
+        uint32_t bits = 0;
+        int pad = 1;
+        const char *p = l[b];
+        while (*p && *p != '@' && pad) {
+            size_t k = 0;
+            while (*p && *p != '+' && *p != '@' && k + 1 < sizeof tok)
+                tok[k++] = *p++;
+            tok[k] = 0;
+            if (*p == '+')
+                p++;
+            k = (size_t)pad_src_of(tok);
+            if (k)
+                bits |= 1u << k;
+            else
+                pad = 0;
+        }
+        if (pad && (bits & (1u << src)) && (bits & ~(1u << src)))
+            mates |= bits & ~(1u << src);
+    }
+    return mates;
+}
+
+/* The release events of this step, as ENHANCE_EV_* bits by source. */
+static uint32_t release_step(uint32_t held, uint32_t press)
+{
+    uint32_t fired = 0;
+    s_rel_armed |= press & k_rel_buttons;
+    for (int src = 0; src < INPUT_SRC_COUNT; src++) {
+        uint32_t b = 1u << src;
+        if (!(s_rel_armed & b))
+            continue;
+        if (held & b) {
+            if (held & menu_chord_mates(src))
+                s_rel_taint |= b;
+            continue;
+        }
+        if (!(s_rel_taint & b))
+            fired |= b;
+        s_rel_armed &= ~b;
+        s_rel_taint &= ~b;
+    }
+    return fired;
+}
+
 /* ---- the name editor -------------------------------------------------------
  * Rename types into s_name: the keyboard as a US layout (the menu reads
  * virtual keys, not text), the pad by cycling the character under the
@@ -3174,6 +3696,10 @@ static void input_step(uint64_t now)
     press = held & ~s_prev_held;
 
     if (capture_step(held, now) || name_step(held, press, now)) {
+        /* A button that started there is no press of the menu's, and a
+         * Cmd+S typed into a name or a capture is no later Save. */
+        xbox_InputShortcutTake('S');
+        s_rel_armed = s_rel_taint = 0;
         s_need_draw = 1;
         s_prev_held = held;
         keys_latch();
@@ -3183,6 +3709,11 @@ static void input_step(uint64_t now)
     if (press)
         s_kbd = 0;
 #define EV(e) do { redraw |= enhance_menu_event((e), now); } while (0)
+    {
+        uint32_t rel = release_step(held, press);
+        if (rel & (1u << INPUT_SRC_BACK)) EV(ENHANCE_EV_CANCEL);
+        if (rel & (1u << INPUT_SRC_LEFT_STICK_CLICK)) EV(ENHANCE_EV_HINTS);
+    }
     if (press & (1u << INPUT_SRC_SOUTH)) EV(ENHANCE_EV_OK);
     if (press & (1u << INPUT_SRC_EAST)) EV(ENHANCE_EV_BACK);
     if (press & (1u << INPUT_SRC_WEST)) EV(ENHANCE_EV_CLEAR);
@@ -3197,12 +3728,31 @@ static void input_step(uint64_t now)
             { 'E', ENHANCE_EV_PAGE_NEXT }, { 0x22, ENHANCE_EV_PAGE_NEXT },
             { 0x74, ENHANCE_EV_SAVE }, { 0x2E, ENHANCE_EV_CLEAR },
         };
+        int shift = xbox_FramebufferKeyDown(XBOX_VK_SHIFT) != 0;
+        int ctrl = xbox_FramebufferKeyDown(XBOX_VK_CONTROL) != 0;
+        /* The dialog's Tab and access keys first: N, S and G are its own. */
+        static const int k_dlg_keys[] = { 0x09, 'N', 'S', 'G' };
+        int cmd_s = xbox_InputShortcutTake('S');
+        for (unsigned i = 0; i < sizeof k_dlg_keys / sizeof k_dlg_keys[0]; i++)
+            if (key_edge(k_dlg_keys[i]) && !(ctrl && k_dlg_keys[i] == 'S')
+                && dlg_key(k_dlg_keys[i], shift)) {
+                s_kbd = 1;
+                redraw = 1;
+            }
         for (unsigned i = 0; i < sizeof k_keys / sizeof k_keys[0]; i++)
             if (key_edge(k_keys[i].vk)) {
                 s_kbd = 1;
                 if (s_state == ST_OPEN)
-                    EV(k_keys[i].ev);
+                    /* Shift+Esc is Cancel: leave, asking first. */
+                    EV(k_keys[i].vk == 0x1B && shift ? ENHANCE_EV_CANCEL : k_keys[i].ev);
             }
+        /* Ctrl+S, and Cmd+S on macOS (posted by the host: the key table
+         * never sees a Cmd key). In the dialog both are swallowed: the
+         * save reflex is no answer to "leave?", only a bare S is. */
+        if (s_state == ST_OPEN && !s_dlg.on && ((ctrl && key_edge('S')) || cmd_s)) {
+            s_kbd = 1;
+            EV(ENHANCE_EV_SAVE);
+        }
     }
     /* Directions repeat while held. */
     if ((held & k_up) || xbox_FramebufferKeyDown(0x26))
@@ -3266,17 +3816,6 @@ static const char *fit(mu_Font f, const char *s, int w, char *out, size_t n)
     return out;
 }
 
-static const char *live_tag(int live)
-{
-    switch (live) {
-    case ENHANCE_LIVE_FLUSH: return "at the flip";
-    case ENHANCE_LIVE_STAGE: return "next stage";
-    case ENHANCE_LIVE_ACTIVATE: return "next activation";
-    case ENHANCE_LIVE_RESTART: return "at restart";
-    default: return "live";
-    }
-}
-
 static void draw_pill(mu_Context *ctx, mu_Rect r, int on, int dim)
 {
     const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
@@ -3301,6 +3840,13 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
     mu_Color tint = rw->tint == TINT_BAD ? t->bad : rw->tint == TINT_WARN ? t->warn : t->text_dim;
     char cut[VAL_MAX * 2], forced[96], uv[VAL_MAX + 32];
     const char *v, *unit = NULL;
+    /* D10: a dot before the label while unsaved, and the value bright only
+     * where it differs from stock, so a page shows what was changed. */
+    int marked = rw->type == R_SLOT || rw->type == R_MOD || rw->type == R_BIND
+              || rw->type == R_PARAM || rw->type == R_PROFILE;
+    int st = marked ? row_state(rw) : 0;
+    mu_Color vcol = ro ? t->text_dim : !marked || (st & ENHANCE_ROW_NONDEFAULT) ? t->text
+                                                                                : t->text_dim;
 
     if (sl && sl->dset >= 0) {
         int m;
@@ -3332,8 +3878,14 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
         mu_draw_rect(ctx, mu_rect(r.x, r.y + nv2a_ovl_px(s, 6), nv2a_ovl_px(s, 3),
                                   r.h - 2 * nv2a_ovl_px(s, 6)), t->accent);
     }
-    /* The label, then its class: a dot for a change that shows now, words
-     * for one that waits. */
+    if (st & ENHANCE_ROW_UNSAVED) {
+        /* In the row's left pad, between the selection bar and the label. */
+        int d = nv2a_ovl_px(s, 6);
+        nv2a_ovl_ui_rrect(ctx, mu_rect(x - d - nv2a_ovl_px(s, 4), r.y + (r.h - d) / 2, d, d), d / 2,
+                          1.0f, t->accent);
+    }
+    /* The label, then its class: nothing for a change that shows now (the
+     * common case), words for one that waits. */
     mu_draw_text(ctx, fb, rw->label, -1, mu_vec2(x, ty), ro || rw->dim ? t->text_dim : t->text);
     x += text_w(fb, rw->label) + nv2a_ovl_px(s, 8);
     if (it && it->kind != ENHANCE_ITEM_INFO) {
@@ -3346,10 +3898,7 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
             mu_draw_text(ctx, fs, forced, -1, mu_vec2(x, fy), t->text_dim);
             x += text_w(fs, forced) + nv2a_ovl_px(s, 8);
         } else if (it->live == ENHANCE_LIVE || it->live == ENHANCE_LIVE_FLUSH) {
-            int d = nv2a_ovl_px(s, 6);
-            nv2a_ovl_ui_rrect(ctx, mu_rect(x, r.y + (r.h - d) / 2, d, d), d / 2, 1.0f,
-                              with_alpha(t->accent, 200));
-            x += d + nv2a_ovl_px(s, 8);
+            /* Applies now: no mark (D10 keeps the dot for "unsaved"). */
         } else {
             const char *w = it->live == ENHANCE_LIVE_RESTART ? "applies at restart"
                           : it->live == ENHANCE_LIVE_ACTIVATE ? "next activation"
@@ -3404,8 +3953,7 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
         nv2a_ovl_ui_rrect(ctx, mu_rect(tx, cy - tk / 2, fx - tx, tk), tk / 2, 1.0f,
                           ro ? t->text_dim : t->accent);
         nv2a_ovl_ui_rrect(ctx, mu_rect(fx - kn / 2, cy - kn / 2, kn, kn), kn / 2, 1.0f, t->text);
-        mu_draw_text(ctx, fv, uv, -1, mu_vec2(tx - nv2a_ovl_px(s, 12) - text_w(fv, uv), ty),
-                     ro ? t->text_dim : t->text);
+        mu_draw_text(ctx, fv, uv, -1, mu_vec2(tx - nv2a_ovl_px(s, 12) - text_w(fv, uv), ty), vcol);
         return;
     }
     if (it && it->kind == ENHANCE_ITEM_CHOICE) {
@@ -3413,7 +3961,7 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
         int vw = text_w(fb, uv);
         mu_draw_text(ctx, fb, ">", -1, mu_vec2(right - aw, ty), t->text_dim);
         mu_draw_text(ctx, fb, uv, -1, mu_vec2(right - aw - sp - vw, ty),
-                     ro ? t->text_dim : rw->tint ? tint : t->text);
+                     ro ? t->text_dim : rw->tint ? tint : vcol);
         mu_draw_text(ctx, fb, "<", -1, mu_vec2(right - 2 * aw - 2 * sp - vw, ty), t->text_dim);
         return;
     }
@@ -3427,7 +3975,78 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
     if (!rw->value[0])
         return;
     v = fit(fb, rw->value, right - x, cut, sizeof cut);
-    mu_draw_text(ctx, fb, v, -1, mu_vec2(right - text_w(fb, v), ty), tint);
+    mu_draw_text(ctx, fb, v, -1, mu_vec2(right - text_w(fb, v), ty),
+                 marked && !rw->tint ? vcol : tint);
+}
+
+/* D9a: the unsaved-changes dialog over a dimmed panel. Go Back has the
+ * focus when it opens; the access letter of each button is underlined. */
+static void draw_dialog(mu_Context *ctx, int px, int py, int pw, int ph, float s)
+{
+    const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+    mu_Font ft = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(s, t->font_body), 1);
+    mu_Font fs = OVL_FONT(OVL_FONT_SMALL, nv2a_ovl_px(s, t->font_small), 0);
+    int pad = nv2a_ovl_px(s, t->pad), gap = nv2a_ovl_px(s, t->gap);
+    int lh = nv2a_ovl_text_height(fs), bh = lh + nv2a_ovl_px(s, 14), nl = 1;
+    int w = pw * 3 / 4, h, x, y, bx, bw[DLG_BUTTONS], total = 0;
+    static const char k_access[DLG_BUTTONS] = {'N', 'S', 'G'};
+    for (const char *c = s_dlg.body; *c; c++)
+        nl += *c == '\n';
+    h = pad + nv2a_ovl_text_height(ft) + gap + nl * (lh + nv2a_ovl_px(s, 4)) + gap + bh + pad;
+    x = px + (pw - w) / 2;
+    y = py + (ph - h) / 2;
+    nv2a_ovl_ui_rrect(ctx, mu_rect(px, py, pw, ph), nv2a_ovl_px(s, t->radius), 1.0f,
+                      with_alpha(t->bg, 170));
+    nv2a_ovl_ui_shadow(ctx, mu_rect(x, y, w, h), nv2a_ovl_px(s, t->radius),
+                       nv2a_ovl_px(s, t->shadow), t->shadow_alpha);
+    nv2a_ovl_ui_rrect(ctx, mu_rect(x, y, w, h), nv2a_ovl_px(s, t->radius), 1.0f, t->bg_row);
+    mu_draw_text(ctx, ft, "Unsaved changes", -1, mu_vec2(x + pad, y + pad), t->text);
+    {
+        int ly = y + pad + nv2a_ovl_text_height(ft) + gap;
+        const char *c = s_dlg.body;
+        while (*c) {
+            const char *e = strchr(c, '\n');
+            char line[256], cut[300];
+            size_t n = e ? (size_t)(e - c) : strlen(c);
+            if (n >= sizeof line)
+                n = sizeof line - 1;
+            memcpy(line, c, n);
+            line[n] = 0;
+            mu_draw_text(ctx, fs, fit(fs, line, w - 2 * pad, cut, sizeof cut), -1,
+                         mu_vec2(x + pad, ly),
+                         s_dlg.err[0] && !strcmp(line, s_dlg.err) ? t->bad : t->text_dim);
+            ly += lh + nv2a_ovl_px(s, 4);
+            c = e ? e + 1 : c + n;
+        }
+    }
+    for (int b = 0; b < DLG_BUTTONS; b++) {
+        bw[b] = text_w(fs, k_dlg_button[b]) + 2 * pad;
+        total += bw[b] + (b ? gap : 0);
+    }
+    bx = x + w - pad - total;
+    for (int b = 0; b < DLG_BUTTONS; b++) {
+        int by = y + h - pad - bh, off = b == DLG_SAVE && dlg_save_dead(), foc = b == s_dlg.focus;
+        const char *lab = k_dlg_button[b], *a = strchr(lab, k_access[b]);
+        mu_Color tc = off ? t->text_dim : t->text;
+        int tx = bx + pad, ty = by + (bh - lh) / 2;
+        nv2a_ovl_ui_rrect(ctx, mu_rect(bx, by, bw[b], bh), nv2a_ovl_px(s, 6), 1.0f,
+                          foc ? with_alpha(t->accent, off ? 60 : 110) : t->bg_hover);
+        if (foc)
+            mu_draw_rect(ctx, mu_rect(bx, by + bh - nv2a_ovl_px(s, 3), bw[b], nv2a_ovl_px(s, 3)),
+                         t->accent);
+        mu_draw_text(ctx, fs, lab, -1, mu_vec2(tx, ty), tc);
+        if (a) {
+            /* Underline the access key: the width of the text before it. */
+            char pre[64], one[2] = {*a, 0};
+            size_t n = (size_t)(a - lab) < sizeof pre ? (size_t)(a - lab) : sizeof pre - 1;
+            memcpy(pre, lab, n);
+            pre[n] = 0;
+            mu_draw_rect(ctx, mu_rect(tx + text_w(fs, pre), ty + lh - nv2a_ovl_px(s, 2),
+                                      text_w(fs, one), nv2a_ovl_px(s, 1) > 0 ? nv2a_ovl_px(s, 1) : 1),
+                         tc);
+        }
+        bx += bw[b] + gap;
+    }
 }
 
 static void draw_graph(mu_Context *ctx, mu_Rect g, float s)
@@ -3514,11 +4133,11 @@ void enhance_menu_draw(uint64_t now_ms)
                 continue;
             mu_draw_text(ctx, fb, s_page_name[p], -1, mu_vec2(xx, y),
                          p == s_page ? t->text : t->text_dim);
-            /* The chosen profile has edits Save has not written. */
-            if (p == PAGE_SHADERS && shader_edit_dirty(shader_edit_active())) {
+            /* The section holds changes Save has not written (D10). */
+            if (page_unsaved(p)) {
                 int d = nv2a_ovl_px(s, 5);
                 nv2a_ovl_ui_rrect(ctx, mu_rect(xx + tw[p] + nv2a_ovl_px(s, 3), y, d, d), d / 2,
-                                  1.0f, t->warn);
+                                  1.0f, t->accent);
             }
             if (p == s_page)
                 mu_draw_rect(ctx, mu_rect(xx, y + tabh + nv2a_ovl_px(s, 2), tw[p], nv2a_ovl_px(s, 3)),
@@ -3559,25 +4178,24 @@ void enhance_menu_draw(uint64_t now_ms)
     if (s_page == PAGE_STATS)
         draw_graph(ctx, mu_rect(x0 + pad, area_y + area_h + gap, inner, nv2a_ovl_px(s, 110)), s);
 
-    /* The footer: the controls on the left, the news on the right. */
+    /* The footer (D9): the device's controls on the left, then the unsaved
+     * count (or a status for STATUS_MS) and the Cancel and Save buttons. */
     {
         int fy = y0 + ph - foot_h + (foot_h - nv2a_ovl_text_height(fs)) / 2 - pad / 4;
         const char *hint = s_kbd
-            ? "Arrows move \xC2\xB7 Enter select \xC2\xB7 Esc back \xC2\xB7 Q/E page \xC2\xB7 F5 save"
-            : "A select \xC2\xB7 B back \xC2\xB7 X clear \xC2\xB7 Y save \xC2\xB7 LB/RB page";
-        char right[160], cut[200];
-        const char *rt;
-        int un = enhance_menu_unsaved(), rw;
-        const struct row *cur = s_nrow ? &s_row[sel] : NULL;
-        const char *tag = cur && cur->type == R_SLOT ? live_tag(s_slot[cur->ref].it->live)
-                        : cur && cur->type == R_MOD
-                            ? live_tag(xbox_mod_has_on_enable(cur->ref) ? ENHANCE_LIVE
-                                                                       : ENHANCE_LIVE_RESTART)
-                        : cur && (cur->type == R_BIND || cur->type == R_PARAM
-                                  || cur->type == R_PROFILE || cur->type == R_STAGE) ? "live" : "";
-        /* The selected row's help stands in for the controls while no
-         * status shows (D5): the status line still wins. */
+            ? "Enter Select \xC2\xB7 Esc Back \xC2\xB7 Q E Section \xC2\xB7 F5 Save"
+            : "A Select \xC2\xB7 B Back \xC2\xB7 LB RB Section \xC2\xB7 Y Save";
+        char right[160], cut[200], hcut[200];
+        const char *rt, *hv;
+        int un = enhance_menu_unsaved(), rw, bx, bpad = nv2a_ovl_px(s, 10);
+        int bh = nv2a_ovl_text_height(fs) + nv2a_ovl_px(s, 6), by = fy - nv2a_ovl_px(s, 3);
         int news = s_status[0] && s_status_t && now_ms - s_status_t < STATUS_MS;
+        int save_off = !un || dlg_save_off();
+        const char *bl[2] = {"Cancel", "Save"};
+        const struct row *cur = s_nrow ? &s_row[sel] : NULL;
+        int bw[2];
+        /* The selected row's help stands in for the controls while no
+         * status shows, until B or C draws hints at the rows. */
         if (cur && cur->sel && cur->help[0] && !news)
             hint = cur->help;
         if (s_name_on)
@@ -3586,19 +4204,31 @@ void enhance_menu_draw(uint64_t now_ms)
         if (news)
             snprintf(right, sizeof right, "%s", s_status);
         else if (un)
-            snprintf(right, sizeof right, "%d unsaved%s%s", un, *tag ? " \xC2\xB7 " : "", tag);
+            snprintf(right, sizeof right, "%d unsaved", un);
         else
-            snprintf(right, sizeof right, "%s", tag);
+            snprintf(right, sizeof right, "All saved");
+        /* The buttons sit at the right edge, the news just before them. */
+        bx = x0 + pad + inner;
+        for (int b = 1; b >= 0; b--) {
+            bw[b] = text_w(fs, bl[b]) + 2 * bpad;
+            bx -= bw[b] + (b == 1 ? 0 : gap);
+        }
         rt = fit(fs, right, inner / 2, cut, sizeof cut);
         rw = text_w(fs, rt);
-        {
-            char hcut[200];
-            const char *hv = fit(fs, hint, inner - rw - gap, hcut, sizeof hcut);
-            mu_draw_text(ctx, fs, hv, -1, mu_vec2(x0 + pad, fy), t->text_dim);
+        mu_draw_text(ctx, fs, rt, -1, mu_vec2(bx - gap - rw, fy),
+                     news ? t->text : un ? t->accent : t->text_dim);
+        hv = fit(fs, hint, bx - gap - rw - gap - (x0 + pad), hcut, sizeof hcut);
+        mu_draw_text(ctx, fs, hv, -1, mu_vec2(x0 + pad, fy), t->text_dim);
+        for (int b = 0; b < 2; b++) {
+            int off = b == 1 && save_off;
+            nv2a_ovl_ui_rrect(ctx, mu_rect(bx, by, bw[b], bh), nv2a_ovl_px(s, 6), 1.0f,
+                              b == 1 && !off ? with_alpha(t->accent, 60) : t->bg_row);
+            mu_draw_text(ctx, fs, bl[b], -1, mu_vec2(bx + bpad, fy), off ? t->text_dim : t->text);
+            bx += bw[b] + gap;
         }
-        mu_draw_text(ctx, fs, rt, -1, mu_vec2(x0 + pad + inner - rw, fy),
-                     s_status[0] && now_ms - s_status_t < STATUS_MS ? t->text : t->text_dim);
     }
+    if (s_dlg.on)
+        draw_dialog(ctx, x0, y0, pw, ph, s);
     nv2a_overlay_ui_publish(NV2A_OVL_MENU);
     s_draw_t = now_ms ? now_ms : 1;
     s_need_draw = 0;
@@ -3629,6 +4259,8 @@ void enhance_menu_hook(unsigned port, uint32_t held, XBOX_INPUT_STATE *st, uint6
     case ST_CLOSED:
         if (st)
             s_pkt[port] = st->dwPacketNumber;
+        /* A Cmd+S while the menu is shut is the host's, not a later Save. */
+        xbox_InputShortcutTake('S');
         if (enhance_actions_menu_request()) {
             uint32_t all = 0;
             for (int p = 0; p < PORTS; p++)
@@ -3644,12 +4276,21 @@ void enhance_menu_hook(unsigned port, uint32_t held, XBOX_INPUT_STATE *st, uint6
     case ST_OPEN:
         /* Quiet keeps menu.open from firing during a capture; the phase
          * test stays in case a request was queued before it began. */
-        if (enhance_actions_menu_request() && s_cap.phase == CAP_OFF)
-            enhance_menu_close();
-        else
+        if (enhance_actions_menu_request() && s_cap.phase == CAP_OFF) {
+            /* The toggle asks first, as B does; in the dialog it is Go
+             * Back. What it held is spent: no Cancel when it lets go. */
+            s_rel_taint |= s_rel_armed;
+            if (s_dlg.on)
+                dlg_event(ENHANCE_EV_CLOSE);
+            else
+                leave_request();
+        } else {
             input_step(now_ms);
+        }
         break;
     case ST_CLOSING:
+        /* A Cmd+S as the menu shuts is spent, not a Save when it reopens. */
+        xbox_InputShortcutTake('S');
         if (enhance_actions_menu_request()) {
             enhance_menu_open(now_ms);
             keys_latch();
@@ -3798,6 +4439,42 @@ int enhance_menu_select_row(const char *label)
 
 const char *enhance_menu_status(void) { return s_status; }
 
+int enhance_menu_row_state(int i)
+{
+    return i >= 0 && i < s_nrow ? row_state(&s_row[i]) : 0;
+}
+
+int enhance_menu_dialog(void)
+{
+    return s_dlg.on ? s_dlg.focus : -1;
+}
+
+const char *enhance_menu_dialog_text(void)
+{
+    return s_dlg.on ? s_dlg.body : "";
+}
+
+int enhance_menu_page_intro(const char *page, const char *text)
+{
+    int p = page_by_name(page, -1);
+    if (p < 0)
+        return 0;
+    s_page_intro[p] = text;
+    return 1;
+}
+
+const char *enhance_menu_page_intro_text(int page)
+{
+    if (page < 0 || page >= PAGE_COUNT)
+        return NULL;
+    return s_page_intro[page] ? s_page_intro[page] : k_page_intro[page];
+}
+
+int enhance_menu_hints_inline(void)
+{
+    return s_hints_inline;
+}
+
 void enhance_menu_reset_for_test(void)
 {
     if (s_snap_on)
@@ -3834,7 +4511,12 @@ void enhance_menu_reset_for_test(void)
     s_draw_w = s_draw_h = 0;
     s_rate_t0 = 0;
     memset(s_rate, 0, sizeof s_rate);
-    memset(s_adirty, 0, sizeof s_adirty);
+    memset(s_abase_have, 0, sizeof s_abase_have);
+    memset(s_abase_n, 0, sizeof s_abase_n);
+    memset(&s_dlg, 0, sizeof s_dlg);
+    memset(s_page_intro, 0, sizeof s_page_intro);
+    s_hints_inline = 0;
+    s_rel_armed = s_rel_taint = 0;
     s_nslot = 0;
     s_nset = 0;
     s_nptab = 0;

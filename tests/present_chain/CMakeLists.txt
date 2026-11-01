@@ -51,7 +51,7 @@ if(NOT MSVC)
 endif()
 enable_testing()
 foreach(c request rate preset missing bad_abi old_api no_exports good params params_key
-        describe describe_nolib profile params_cap)
+        describe describe_nolib profile params_cap revert)
     add_test(NAME present_chain_${c} COMMAND present_chain_test ${c}
              $<TARGET_FILE_DIR:fake_lrs_good>
              WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})

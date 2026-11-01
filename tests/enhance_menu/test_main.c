@@ -428,7 +428,7 @@ static void test_navigate(void)
 
     /* Q from Render wraps to Save, E back. */
     tap('Q');
-    CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Save"));
+    CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Files"));
     tap('E');
     CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
     CHECK(!strcmp(selected_label(), "Render scale"));
@@ -477,17 +477,29 @@ static void test_navigate(void)
     tap(0x27);
     CHECK(!strcmp(row_value("Scaling filter"), "nearest"));
 
-    /* Esc closes; the title gets nothing while Esc is down, and the pad
-     * button held through the close stays the host's to its release. */
+    /* Esc asks first (D9a): the A held here stepped the filter, so the
+     * dialog comes up and N leaves without saving. The title gets nothing
+     * while the keys are down, and the pad button held through the close
+     * stays the host's to its release. */
     hold_a(1);
     advance(16);
     poll0();
     xbox_InputKeyEvent(0x1B, 1);
     advance(16);
     st = poll0();
-    CHECK(!enhance_menu_is_open());
+    CHECK(enhance_menu_is_open());
+    CHECK(enhance_menu_dialog() == 2);
     CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
     xbox_InputKeyEvent(0x1B, 0);
+    advance(160);
+    poll0();
+    xbox_InputKeyEvent('N', 1);
+    advance(16);
+    st = poll0();
+    CHECK(!enhance_menu_is_open());
+    CHECK(!strcmp(row_value("Scaling filter"), "nearest"));
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
+    xbox_InputKeyEvent('N', 0);
     advance(16);
     st = poll0();
     advance(1100);
@@ -810,7 +822,7 @@ static void test_capture_and_save(void)
     CHECK(strstr(f, "testmod.poke") != NULL);
 
     /* Reset asks first, then puts the binding back to its defaults. */
-    CHECK(enhance_menu_set_page("Save"));
+    CHECK(enhance_menu_set_page("Files"));
     CHECK(enhance_menu_select_row("Reset to defaults"));
     tap(0x0D);
     CHECK(enhance_menu_select_row("Reset everything? A / Enter: yes"));
@@ -1386,7 +1398,7 @@ static void test_shaders(void)
     CHECK(strstr(f, "FSR_SHARPENING = 0.1") != NULL);
 
     /* The Save page's Reset to defaults clears every preset's. */
-    CHECK(enhance_menu_set_page("Save"));
+    CHECK(enhance_menu_set_page("Files"));
     CHECK(enhance_menu_select_row("Reset to defaults"));
     tap(0x0D);
     CHECK(enhance_menu_select_row("Reset everything? A / Enter: yes"));
@@ -1709,19 +1721,24 @@ static void test_profiles(void)
     CHECK(row_value("Profile") && !strcmp(s_val, "fsr custom"));
     CHECK(strstr(enhance_menu_status(), "Now editing fsr custom") != NULL);
     CHECK(row_value("1  fsr") && row_value("2  user:stage_a"));
+    /* F10 with the fork unsaved asks (D9a); Go Back keeps the menu. */
     open_menu();
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 2);
+    advance(160);
+    tap(0x1B);
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0);
 
     /* The folder is read when the page opens: a file added meanwhile shows
-     * at the next open, and the unsaved profiles stay. */
+     * at the next visit, and the unsaved profiles stay. */
     write_file(PROFILES "/later.toml", "version = 1\nname = \"Later\"\nstages = [\"fsr\"]\n");
     n0 = shader_edit_count();
-    open_menu();
+    CHECK(enhance_menu_set_page("Render"));
     CHECK(enhance_menu_set_page("Shaders"));
     CHECK(shader_edit_count() == n0 + 1);
     CHECK(!strcmp(row_value("Profile"), "fsr custom"));
 
     /* Reset to defaults: the picker to Off, the files stay. */
-    CHECK(enhance_menu_set_page("Save"));
+    CHECK(enhance_menu_set_page("Files"));
     CHECK(enhance_menu_select_row("Reset to defaults"));
     tap(0x0D);
     CHECK(enhance_menu_select_row("Reset everything? A / Enter: yes"));
@@ -2040,10 +2057,10 @@ static uint32_t sum_of(const struct nv2a_ovl_list *l)
 
 static void test_pages(void)
 {
-    /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Save. */
+    /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Files. */
     static const uint32_t k_sum[9] = {
-        0xC7247387u, 0x39B5FB95u, 0x14C4B84Eu, 0x9990C101u, 0x677BFFE6u,
-        0xE26B4D93u, 0xAE5AA710u, 0x301034FDu, 0x37C23792u };
+        0x39322648u, 0x50367F1Eu, 0x3FC9A1FBu, 0x0F4B7064u, 0x64E35CB8u,
+        0xDE84570Bu, 0x8633F632u, 0xE72426AAu, 0xB2C4E2BAu };
     start_with(ARMED, k_mods);
     open_menu();
     CHECK(enhance_menu_is_open());
@@ -2124,7 +2141,7 @@ static void test_shaders_hidden(void)
     tap('Q');
     CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
     tap('Q');
-    CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Save"));
+    CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Files"));
     tap('E');
     CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
     /* Said once: a second open is quiet. */
@@ -2237,7 +2254,7 @@ static void test_save_tables(void)
 static const char *const k_gm_lv[] = { "near", "far", NULL };
 static const struct enhance_item k_gm_stage = {
     "fx.lod", "Draw distance", "Game", ENHANCE_ITEM_CHOICE, k_gm_lv, 0, 0, 0, NULL,
-    NULL, NULL, ENHANCE_LIVE_STAGE, 0, "near", NULL
+    NULL, NULL, ENHANCE_LIVE_STAGE, 0, "near", NULL, NULL
 };
 static void test_stage_row(void)
 {
@@ -2255,6 +2272,618 @@ static void test_stage_row(void)
     CHECK(pending_has("fx.lod", "\"far\""));
     CHECK(enhance_menu_row_live(-1) == -1);
     open_menu();
+}
+
+/* ---- D10 badges, revert, the D9a dialog, the footer keys -------------- */
+
+static int row_at(const char *label)
+{
+    char l[96];
+    int n = enhance_menu_rows();
+    for (int i = 0; i < n; i++) {
+        enhance_menu_row(i, l, sizeof l, NULL, 0, NULL);
+        if (!strcmp(l, label))
+            return i;
+    }
+    return -1;
+}
+
+#define ST_U ENHANCE_ROW_UNSAVED
+#define ST_N ENHANCE_ROW_NONDEFAULT
+#define ST_F ENHANCE_ROW_FORCED
+static int state_of(const char *label) { return enhance_menu_row_state(row_at(label)); }
+
+/* D10 cases 1-7: "unsaved" is against the saved value, "non-default"
+ * against stock, and an env-forced row is neither changeable nor unsaved. */
+static void test_badges(void)
+{
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_select_row("Render scale"));
+    CHECK(state_of("Render scale") == 0);                       /* 1 fresh */
+    tap(0x27);
+    CHECK(state_of("Render scale") == (ST_U | ST_N));           /* 2 set */
+    tap(VK_F5);
+    CHECK(state_of("Render scale") == ST_N);                    /* 3 saved */
+    CHECK(enhance_menu_unsaved() == 0);
+    tap(0x27);
+    CHECK(state_of("Render scale") == (ST_U | ST_N));
+    tap(0x25);
+    CHECK(!strcmp(row_value("Render scale"), "2"));
+    CHECK(state_of("Render scale") == ST_N);                    /* 4 back */
+    CHECK(enhance_menu_unsaved() == 0);
+    tap(0x2E);                                                  /* Delete: clear */
+    CHECK(!strcmp(row_value("Render scale"), "1"));
+    CHECK(state_of("Render scale") == ST_U);                    /* 5 cleared */
+    CHECK(strstr(enhance_menu_status(), "reset to default (1)") != NULL);
+    enhance_menu_revert();
+    CHECK(!strcmp(row_value("Render scale"), "2"));
+    CHECK(state_of("Render scale") == ST_N);                    /* 6 revert */
+    CHECK(enhance_menu_unsaved() == 0);
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+
+    /* 7: forced by the environment. */
+    set_env("RECOMP_PRESENT_FILTER", "linear");
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_select_row("Scaling filter"));
+    CHECK(state_of("Scaling filter") == (ST_F | ST_N));
+    tap(0x27);
+    tap(0x2E);
+    CHECK(!(state_of("Scaling filter") & ST_U));
+    CHECK(strstr(enhance_menu_status(), "Set by") != NULL);
+    CHECK(enhance_menu_unsaved() == 0);
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+    set_env("RECOMP_PRESENT_FILTER", NULL);
+}
+
+/* Revert per kind: a value, a mod toggle and a binding go back to the
+ * saved state through set(), and each leaves unsaved at 0. */
+static void test_revert(void)
+{
+    const char *t[2] = { "F6", "F7" };
+    const char *back[1] = { "F6" };
+    int poke;
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_select_row("Scaling filter"));
+    tap(0x27);
+    CHECK(!strcmp(row_value("Scaling filter"), "linear"));
+    flip();
+    CHECK(nv2a_host_opts()->present_filter == 1);
+    CHECK(enhance_menu_unsaved() == 1);
+    enhance_menu_revert();
+    flip();
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(!strcmp(row_value("Scaling filter"), "nearest"));
+    CHECK(nv2a_host_opts()->present_filter == 0);   /* set() saw the saved value */
+
+    /* A mod toggle. */
+    CHECK(enhance_menu_set_page("Mods"));
+    CHECK(enhance_menu_select_row("testmod"));
+    tap(0x25);
+    CHECK(!xbox_mod_enabled(0));
+    CHECK(enhance_menu_unsaved() == 1);
+    CHECK(state_of("testmod") & ST_U);
+    enhance_menu_revert();
+    CHECK(xbox_mod_enabled(0));
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(!(state_of("testmod") & ST_U));
+
+    /* A binding: changed, reverted; changed and put back by hand is clean. */
+    CHECK(enhance_menu_set_page("Controls"));
+    poke = enhance_action_find("testmod.poke");
+    CHECK(poke >= 0);
+    enhance_action_set_bindings(poke, t, 2);
+    CHECK(enhance_menu_unsaved() == 1);
+    CHECK(state_of("Poke") == (ST_U | ST_N));
+    enhance_menu_revert();
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(!strcmp(row_value("Poke"), "F6"));
+    CHECK(state_of("Poke") == 0);
+    enhance_action_set_bindings(poke, t, 2);
+    enhance_action_set_bindings(poke, back, 1);
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(state_of("Poke") == 0);
+
+    /* The same through the menu's capture (action_set): F7 added, all
+     * cleared, F6 captured again leaves the row clean. */
+    CHECK(enhance_menu_select_row("Poke"));
+    tap(0x0D);
+    CHECK(enhance_menu_capturing());
+    tap(VK_F7);
+    CHECK(!strcmp(row_value("Poke"), "F6, F7"));
+    CHECK(enhance_menu_unsaved() == 1);
+    tap(0x2E);
+    CHECK(!strcmp(row_value("Poke"), "none"));
+    CHECK(enhance_menu_unsaved() == 1);
+    tap(0x0D);
+    CHECK(enhance_menu_capturing());
+    tap(0x75);  /* F6 */
+    CHECK(!enhance_menu_capturing());
+    CHECK(!strcmp(row_value("Poke"), "F6"));
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(state_of("Poke") == 0);
+    advance(16);
+    poll0();
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+
+    /* An off-grid value as loaded: within half a step of what the item
+     * shows, so it is clean, and a step there and back stays clean. */
+    start_with(ARMED "[render]\nscale = 2.4\n", k_mods);
+    open_menu();
+    CHECK(enhance_menu_select_row("Render scale"));
+    CHECK(!(state_of("Render scale") & ST_U));
+    CHECK(enhance_menu_unsaved() == 0);
+    tap(0x27);
+    CHECK(enhance_menu_unsaved() == 1);
+    tap(0x25);
+    CHECK(enhance_menu_unsaved() == 0);
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+}
+
+static void change_scale_at(int line)
+{
+    int ok = enhance_menu_set_page("Render") && enhance_menu_select_row("Render scale");
+    tap(0x27);
+    ok = ok && enhance_menu_unsaved() == 1;
+    if (!ok)
+        fprintf(stderr, "change_scale failed from line %d\n", line);
+    CHECK(ok);
+}
+#define change_scale() change_scale_at(__LINE__)
+
+static void shift_esc(void)
+{
+    xbox_InputKeyEvent(0x10, 1);
+    tap(0x1B);
+    xbox_InputKeyEvent(0x10, 0);
+}
+
+static void pad_tap(WORD w)
+{
+    hold_btn(w, 1);
+    advance(16);
+    poll0();
+    hold_btn(w, 0);
+    advance(16);
+    poll0();
+}
+
+static void hold_b(int on) { f_pad[0].Gamepad.bAnalogButtons[XBOX_BUTTON_B] = on ? 255 : 0; }
+
+static void pad_b(void)
+{
+    hold_b(1);
+    advance(16);
+    poll0();
+    hold_b(0);
+    advance(16);
+    poll0();
+}
+
+/* Revert on the Shaders page: a preset override, and through
+ * shader_edit_revert() a rename, an unsaved New, a fork and the choice.
+ * Then the dialog's deleted-profile line, and a Cmd+S typed into a name. */
+static void test_revert_shaders(void)
+{
+    int n0;
+    float v = 0;
+
+    /* A preset override goes back to the saved value. */
+    start_with(ARMED "[present]\nshader = \"crt-lottes\"\nshader_lib = \"" FAKE_LRS_PARAMS "\"\n"
+               "[present.shader_params.crt-lottes]\nwarpX = 0.03\n", NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    chain_built();
+    flip();
+    CHECK(row_value("warpX") && !strcmp(s_val, "0.03"));
+    CHECK(enhance_menu_select_row("warpX"));
+    tap(0x27);
+    CHECK(!strcmp(row_value("warpX"), "0.04"));
+    CHECK(enhance_menu_unsaved() == 1);
+    enhance_menu_revert();
+    flip();
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(row_value("warpX") && !strcmp(s_val, "0.03"));
+    CHECK(nv2a_present_chain_param_get("warpX", &v) && v > 0.0299f && v < 0.0301f);
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+    nv2a_present_chain_params_clear();
+
+    MKDIR(PROFILES);
+    MKDIR(CACHE);
+    MKDIR(CACHE "/slangp");
+    s_cache_root = CACHE;
+    write_file(PROFILES "/mine.toml", "version = 1\nname = \"Mine\"\n"
+                                      "stages = [\"user:stage_a\", \"user:stage_b\"]\n");
+    start_with(CFG_PROF "profile = \"mine\"\n", NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(row_value("Profile") && !strcmp(s_val, "Mine"));
+    chain_up();
+    n0 = shader_edit_count();
+    CHECK(enhance_menu_unsaved() == 0);
+
+    /* The choice. */
+    CHECK(enhance_menu_select_row("Profile"));
+    tap(0x27);
+    CHECK(strcmp(row_value("Profile"), "Mine"));
+    CHECK(enhance_menu_unsaved() > 0);
+    enhance_menu_revert();
+    CHECK(row_value("Profile") && !strcmp(s_val, "Mine"));
+    CHECK(enhance_menu_unsaved() == 0);
+
+    /* A rename, with a Cmd+S typed while the name is open: it is spent
+     * there, not a Save once the name ends. */
+    CHECK(enhance_menu_select_row("Rename"));
+    tap(0x0D);
+    for (int i = 0; i < 4; i++)
+        tap(0x08);
+    shift_tap('Z');
+    xbox_InputShortcutPost('S');
+    advance(16);
+    poll0();
+    tap(0x0D);
+    advance(16);
+    poll0();
+    CHECK(row_value("Profile") && !strcmp(s_val, "Z"));
+    CHECK(enhance_menu_unsaved() > 0);
+    CHECK(read_file(PROFILES "/z.toml")[0] == 0);
+    enhance_menu_revert();
+    CHECK(row_value("Profile") && !strcmp(s_val, "Mine"));
+    CHECK(row_value("Rename") && !strcmp(s_val, "Mine"));
+    CHECK(enhance_menu_unsaved() == 0);
+
+    /* An unsaved New goes. */
+    CHECK(enhance_menu_select_row("Save as new"));
+    tap(0x0D);
+    CHECK(row_value("Profile") && !strcmp(s_val, "Profile 1"));
+    CHECK(shader_edit_count() == n0 + 1);
+    enhance_menu_revert();
+    CHECK(shader_edit_count() == n0);
+    CHECK(row_value("Profile") && !strcmp(s_val, "Mine"));
+    CHECK(enhance_menu_unsaved() == 0);
+
+    /* A fork of a bundled preset goes, and the choice comes back. */
+    CHECK(enhance_menu_select_row("Profile"));
+    for (int i = 0; i < 12 && strcmp(row_value("Profile"), "fsr"); i++)
+        tap(0x27);
+    CHECK(enhance_menu_select_row("Add shader"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("user:stage_a"));
+    tap(0x0D);
+    CHECK(row_value("Profile") && !strcmp(s_val, "fsr custom"));
+    enhance_menu_revert();
+    CHECK(shader_edit_count() == n0);
+    CHECK(row_value("Profile") && !strcmp(s_val, "Mine"));
+    CHECK(enhance_menu_unsaved() == 0);
+
+    /* The deleted-profile line: a Delete is written at once, so the
+     * dialog says Exit without saving does not bring it back. */
+    CHECK(enhance_menu_select_row("Delete"));
+    tap(0x0D);
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "Deleted Mine") != NULL);
+    CHECK(shader_edit_deleted());
+    change_scale();
+    CHECK(enhance_menu_set_page("Shaders"));
+    tap(0x1B);
+    CHECK(enhance_menu_dialog() == 2);
+    CHECK(strstr(enhance_menu_dialog_text(), "Deleted profiles are gone already") != NULL);
+    advance(160);
+    tap('G');
+    /* A save is the new base: the line goes with it. */
+    tap(VK_F5);
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(!shader_edit_deleted());
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+
+    remove(PROFILES "/mine.toml");
+    rmdir(PROFILES);
+    remove(CACHE "/slangp/mine.slangp");
+    remove(CACHE "/slangp/~unsaved.slangp");
+    rmdir(CACHE "/slangp");
+    rmdir(CACHE);
+    s_cache_root = NULL;
+    nv2a_present_chain_params_clear();
+}
+
+/* D9a: every way out asks while something is unsaved; Go Back has the
+ * focus, the opening key is swallowed for 150 ms, and the dialog's
+ * buttons and access keys do what they say. */
+static void test_dialog(void)
+{
+    const char *f;
+    int sel;
+    start_with(ARMED, k_mods);
+    open_menu();
+
+    /* Nothing unsaved: each trigger just closes. */
+    tap(0x1B);
+    CHECK(!enhance_menu_is_open());
+    open_menu();
+    shift_esc();
+    CHECK(!enhance_menu_is_open());
+    open_menu();
+    pad_b();
+    CHECK(!enhance_menu_is_open());
+    open_menu();
+    pad_tap(XBOX_GAMEPAD_BACK);                 /* View, on its release */
+    CHECK(!enhance_menu_is_open());
+
+    /* With a change: each asks, and B, Esc and View are Go Back. */
+    open_menu();
+    change_scale();
+    sel = enhance_menu_selected();
+    tap(0x1B);
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 2);
+    CHECK(strstr(enhance_menu_dialog_text(), "1 setting changed since the last save.") != NULL);
+    CHECK(strstr(enhance_menu_dialog_text(), "Render scale") != NULL);
+    /* The swallow: a key within 150 ms of the opening does nothing. */
+    tap(0x25);
+    CHECK(enhance_menu_dialog() == 2);
+    advance(160);
+    tap(0x25);
+    CHECK(enhance_menu_dialog() == 1);
+    tap(0x1B);                                  /* Esc: Go Back */
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0);
+    CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
+    CHECK(enhance_menu_selected() == sel);
+    CHECK(enhance_menu_unsaved() == 1);
+
+    pad_b();
+    CHECK(enhance_menu_dialog() == 2);
+    advance(160);
+    pad_b();
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0);
+
+    pad_tap(XBOX_GAMEPAD_BACK);
+    CHECK(enhance_menu_dialog() == 2);
+    advance(160);
+    pad_tap(XBOX_GAMEPAD_BACK);
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0);
+
+    shift_esc();
+    CHECK(enhance_menu_dialog() == 2);
+    advance(160);
+    tap('G');
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0);
+
+    /* F10 asks too, and a second F10 is Go Back. */
+    open_menu();
+    CHECK(enhance_menu_dialog() == 2);
+    advance(160);
+    open_menu();
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0);
+
+    /* Y (Save) is not a dialog shortcut; Enter on the focus is. */
+    open_menu();
+    advance(160);
+    f_pad[0].Gamepad.bAnalogButtons[XBOX_BUTTON_Y] = 255;
+    advance(16);
+    poll0();
+    f_pad[0].Gamepad.bAnalogButtons[XBOX_BUTTON_Y] = 0;
+    advance(16);
+    poll0();
+    CHECK(enhance_menu_dialog() == 2);
+    tap(0x0D);
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0);
+
+    /* N: exit without saving, the change reverted. */
+    tap(0x1B);
+    advance(160);
+    tap('N');
+    CHECK(!enhance_menu_is_open());
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(!strcmp(row_value("Render scale"), "1"));
+
+    /* S: exit and save. */
+    open_menu();
+    change_scale();
+    tap(0x1B);
+    advance(160);
+    tap('S');
+    CHECK(!enhance_menu_is_open());
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "scale = 2") != NULL);
+
+    /* A save that fails keeps the dialog up with the reason. */
+    open_menu();
+    change_scale();
+    remove("config/config.toml");
+    MKDIR("config/config.toml");
+    tap(0x1B);
+    advance(160);
+    tap('S');
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 2);
+    CHECK(strstr(enhance_menu_dialog_text(), "Save failed") != NULL);
+    rmdir("config/config.toml");
+    /* The failed Exit and Save is inert until the dialog opens again,
+     * even with the folder fixed. */
+    tap('S');
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 2);
+    tap(0x25);
+    tap(0x0D);
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 1);
+    CHECK(enhance_menu_unsaved() == 1);
+    tap('G');
+    CHECK(enhance_menu_dialog() < 0);
+    tap(VK_F5);
+    CHECK(enhance_menu_unsaved() == 0);
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+
+    /* Ctrl+S and Cmd+S in the dialog are swallowed: no save, no exit. */
+    open_menu();
+    change_scale();
+    tap(0x1B);
+    advance(160);
+    xbox_InputKeyEvent(0x11, 1);
+    tap('S');
+    xbox_InputKeyEvent(0x11, 0);
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 2);
+    CHECK(enhance_menu_unsaved() == 1);
+    xbox_InputShortcutPost('S');
+    advance(16);
+    poll0();
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 2);
+    CHECK(enhance_menu_unsaved() == 1);
+    tap('N');
+    CHECK(!enhance_menu_is_open());
+
+    /* RECOMP_CONFIG=none: Exit and Save is off, the dialog stays. */
+    set_env("RECOMP_CONFIG", "none");
+    set_env("RECOMP_MENU", "1");
+    start_with(ARMED, k_mods);
+    open_menu();
+    change_scale();
+    tap(0x1B);
+    advance(160);
+    tap('S');
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 2);
+    tap(0x25);
+    tap(0x0D);                                  /* Enter on the dimmed Save */
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 1);
+    tap('N');
+    CHECK(!enhance_menu_is_open());
+    set_env("RECOMP_MENU", NULL);
+    set_env("RECOMP_CONFIG", NULL);
+
+    /* The deleted-profile line shows only after a delete; covered by the
+     * profile tests' delete path through shader_edit_deleted(). */
+}
+
+/* The footer's keys: Ctrl+S and the host's Cmd+S save, L3 on its release
+ * moves the hints, and the chord that opened the menu fires neither. */
+static void test_footer_keys(void)
+{
+    start_with(ARMED "[input.actions]\n\"menu.open\" = [\"F10\", \"back+left_stick_click@400\"]\n",
+               k_mods);
+    open_menu();
+    change_scale();
+    xbox_InputKeyEvent(0x11, 1);
+    tap('S');
+    xbox_InputKeyEvent(0x11, 0);
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(strstr(enhance_menu_status(), "Saved") != NULL);
+    change_scale();
+    xbox_InputShortcutPost('S');
+    advance(16);
+    poll0();
+    CHECK(enhance_menu_unsaved() == 0);
+
+    CHECK(enhance_menu_hints_inline() == 0);
+    pad_tap(XBOX_GAMEPAD_LEFT_THUMB);
+    CHECK(enhance_menu_hints_inline() == 1);
+    /* No status until hints draw at the rows (B or C). */
+    CHECK(strstr(enhance_menu_status(), "Hints") == NULL);
+    pad_tap(XBOX_GAMEPAD_LEFT_THUMB);
+    CHECK(enhance_menu_hints_inline() == 0);
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+
+    /* A Cmd+S while shut is the host's: it never saves at the next open. */
+    xbox_InputShortcutPost('S');
+    advance(16);
+    poll0();
+
+    /* Open on the chord: letting go of View and L3 is neither Cancel nor
+     * the hints toggle. */
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB, 1);
+    for (int i = 0; i < 30 && !enhance_menu_is_open(); i++) {
+        advance(20);
+        poll0();
+    }
+    CHECK(enhance_menu_is_open());
+    change_scale();
+    advance(16);
+    poll0();
+    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 0);
+    advance(16);
+    poll0();
+    hold_btn(XBOX_GAMEPAD_BACK, 0);
+    advance(16);
+    poll0();
+    CHECK(enhance_menu_is_open());
+    CHECK(enhance_menu_dialog() < 0);
+    CHECK(enhance_menu_hints_inline() == 0);
+    CHECK(enhance_menu_unsaved() == 1);   /* no stray Cmd+S saved it */
+
+    /* View and L3 pressed while open, the toggle held: with a change the
+     * toggle asks, and letting go is neither Cancel nor the hints. */
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB, 1);
+    for (int i = 0; i < 30 && enhance_menu_dialog() < 0; i++) {
+        advance(20);
+        poll0();
+    }
+    CHECK(enhance_menu_dialog() == 2);
+    advance(200);
+    poll0();
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB, 0);
+    advance(16);
+    poll0();
+    advance(16);
+    poll0();
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 2);
+    CHECK(enhance_menu_hints_inline() == 0);
+    tap('G');
+    tap(VK_F5);
+    CHECK(enhance_menu_unsaved() == 0);
+
+    /* The same with nothing unsaved: the toggle closes, the release
+     * neither reopens, asks nor toggles the hints. */
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB, 1);
+    for (int i = 0; i < 30 && enhance_menu_is_open(); i++) {
+        advance(20);
+        poll0();
+    }
+    CHECK(!enhance_menu_is_open());
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB, 0);
+    for (int i = 0; i < 4; i++) {
+        advance(16);
+        poll0();
+    }
+    CHECK(!enhance_menu_is_open());
+    CHECK(enhance_menu_hints_inline() == 0);
+    open_menu();
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0);
+    CHECK(enhance_menu_hints_inline() == 0);
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+}
+
+/* A.8: every built-in row has its help, and each section its intro. */
+static void test_help(void)
+{
+    static const char *const pages[] = { "Render", "Pack", "Stats", "Controls" };
+    start_with(ARMED, k_mods);
+    open_menu();
+    for (unsigned p = 0; p < sizeof pages / sizeof pages[0]; p++) {
+        CHECK(enhance_menu_set_page(pages[p]));
+        for (int i = 0; i < enhance_menu_rows(); i++) {
+            char l[96];
+            if (enhance_menu_row_live(i) < 0)
+                continue;
+            enhance_menu_row(i, l, sizeof l, NULL, 0, NULL);
+            if (!enhance_menu_row_help(i) || !enhance_menu_row_help(i)[0]) {
+                fprintf(stderr, "no help: %s/%s\n", pages[p], l);
+                CHECK(0);
+            }
+        }
+    }
+    for (int p = 0; p < enhance_menu_page_count(); p++)
+        CHECK(enhance_menu_page_intro_text(p) && enhance_menu_page_intro_text(p)[0]);
+    CHECK(enhance_menu_page_intro("Game", "Options this title adds."));
+    CHECK(!enhance_menu_page_intro("Nope", "x"));
+    CHECK(!strcmp(enhance_menu_page_intro_text(3), "Options this title adds."));
+    open_menu();
+    CHECK(!enhance_menu_is_open());
 }
 
 int main(int argc, char **argv)
@@ -2293,6 +2922,12 @@ int main(int argc, char **argv)
     test_save_tables();
     test_stage_row();
     test_shaders_hidden();
+    test_badges();
+    test_revert();
+    test_revert_shaders();
+    test_dialog();
+    test_footer_keys();
+    test_help();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();
     enhance_actions_reset();

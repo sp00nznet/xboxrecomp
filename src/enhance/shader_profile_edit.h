@@ -124,6 +124,17 @@ int shader_edit_save(char *msg, size_t n);
 /* The Save page's Reset to defaults: the picker to Off. Files stay. */
 void shader_edit_reset_defaults(void);
 
+/* The menu's "Exit without saving" (overlay-revamp D9a): the entries, their
+ * chains, names and values, and the choice back to what the files and the
+ * config hold. An unsaved profile goes; a deleted one stays deleted. Then
+ * the list is read again and the choice requested, as a reload does.
+ * 1 when the session had deleted a profile (Revert cannot bring it back). */
+int shader_edit_revert(void);
+int shader_edit_deleted(void);
+/* 1 when the picker's choice differs from the config's (the Profile row's
+ * unsaved mark), 0 under an environment override. */
+int shader_edit_choice_dirty(void);
+
 void shader_edit_reset_for_test(void);
 
 #ifdef __cplusplus

@@ -88,6 +88,12 @@ void xbox_InputKeySet(int vk, int down);
 /* Release every key (focus lost). */
 void xbox_InputKeysClear(void);
 
+/* App shortcuts that never reach the key table (macOS Cmd+S, which the SDL
+ * path keeps from the game): the host posts the key, the menu takes it
+ * once. Lock-free; a second post before the take is one press. */
+void xbox_InputShortcutPost(int vk);
+int  xbox_InputShortcutTake(int vk);
+
 /* For the Win32 window (fb_present.c), here so every host tests them.
  *
  * WM_KEYDOWN reports both Shifts as VK_SHIFT, both Ctrls as VK_CONTROL and

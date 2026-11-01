@@ -139,8 +139,12 @@ void xbox_InputSdlEvent(const SDL_Event *ev)
             xbox_InputKeysClear();
             return;
         }
-        if (ev->key.mod & SDL_KMOD_GUI)
+        if (ev->key.mod & SDL_KMOD_GUI) {
+            /* Cmd+S is the menu's Save on macOS; the game never sees it. */
+            if (ev->key.key == SDLK_S)
+                xbox_InputShortcutPost('S');
             return;
+        }
         /* The sided code: xbox_InputKeyEvent keeps the either-side
          * entries and traces the edge by name. */
         vk = xbox_InputSdlKeyToCode((int)ev->key.key);

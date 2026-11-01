@@ -48,6 +48,21 @@ void xbox_InputKeysClear(void)
     s_return_main = s_return_kp = 0;
 }
 
+static volatile unsigned char s_shortcut[256];
+
+void xbox_InputShortcutPost(int vk)
+{
+    if (vk > 0 && vk < 256)
+        __atomic_store_n(&s_shortcut[vk], 1, __ATOMIC_RELEASE);
+}
+
+int xbox_InputShortcutTake(int vk)
+{
+    if (vk <= 0 || vk >= 256)
+        return 0;
+    return __atomic_exchange_n(&s_shortcut[vk], 0, __ATOMIC_ACQ_REL);
+}
+
 int xbox_InputWin32SideVk(int vk, uint32_t lparam)
 {
     unsigned scan = (lparam >> 16) & 0xFF;

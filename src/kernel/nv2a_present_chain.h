@@ -292,6 +292,18 @@ void nv2a_present_chain_lib_reset_for_test(void);
  * when the library or the preset is missing or does not parse. */
 int nv2a_present_chain_describe(const char *request, struct nv2a_present_param *out, int cap);
 
+/* The menu's "Exit without saving" (overlay-revamp D9a): every preset-scope
+ * override back to what was loaded or saved last; one added since goes.
+ * Moves the params generation, so the backend applies the values again. */
+void nv2a_present_chain_override_revert(void);
+
+/* The same for profile slug's values (NULL: every profile's). */
+void nv2a_present_chain_profile_revert(const char *slug);
+
+/* 1 when the active table's parameter name differs from its saved value:
+ * the menu's unsaved mark on that row (D10). */
+int nv2a_present_chain_param_dirty(const char *name);
+
 #ifdef __cplusplus
 }
 #endif

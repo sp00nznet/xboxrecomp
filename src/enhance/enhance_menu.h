@@ -44,10 +44,9 @@ enum enhance_item_kind {
     ENHANCE_ITEM_ACTION     /* set(it, NULL) on A / Enter */
 };
 
-/* When a change takes effect (design R1): the menu shows a dot for LIVE
- * and FLUSH, "next stage" for STAGE, "next activation" for ACTIVATE and
- * "applies at restart" for RESTART, and the footer names the selected
- * row's class. */
+/* When a change takes effect (design R1): the menu shows no mark for LIVE
+ * and FLUSH (the common "applies now"), "next stage" for STAGE, "next
+ * activation" for ACTIVATE and "applies at restart" for RESTART. */
 enum enhance_item_live {
     ENHANCE_LIVE = 0,       /* L: at the next flip */
     ENHANCE_LIVE_FLUSH,     /* F: at the flip, rebuilding a cache or a target */
@@ -80,14 +79,26 @@ struct enhance_item {
     unsigned flags;                 /* ENHANCE_ITEM_* */
     const char *def;                /* the code default as text ("false") */
     void *user;
+    /* What the setting does, as the row's hint shows it; NULL: none.
+     * Appended, so a table written before it keeps its meaning. */
+    const char *help;
 };
 
 #define ENHANCE_MENU_MAX_ITEMS 128
+
+/* Set where struct enhance_item has .help and enhance_menu_page_intro()
+ * exists, so a game can use them and still build on an older toolkit. */
+#define ENHANCE_MENU_HELP 1
 
 /* A title's item, from its init (before the first step): kept, not copied,
  * so it must be static. Returns 0 when the table is full or the item has
  * no key or label. */
 int enhance_menu_add(const struct enhance_item *it);
+
+/* The intro line shown under a section's tabs ("Game": what the title's
+ * options are about). A title calls it from its init, as for its items;
+ * text is kept, not copied. Returns 0 for an unknown section. */
+int enhance_menu_page_intro(const char *page, const char *text);
 
 /* From xbox_enhance_init, after the overlay arm: when menu.enabled is on,
  * arms the MENU layer, sets the actions hook and logs
@@ -112,10 +123,14 @@ enum enhance_menu_event {
     ENHANCE_EV_PAGE_NEXT,   /* RB, E, PgDn */
     ENHANCE_EV_SAVE,        /* Y, F5 */
     ENHANCE_EV_CLEAR,       /* X, Delete: clear an action's bindings */
-    ENHANCE_EV_CLOSE
+    ENHANCE_EV_CLOSE,       /* the header's close: asks first when unsaved */
+    ENHANCE_EV_CANCEL,      /* View (on release), Shift+Esc: leave, asking first */
+    ENHANCE_EV_HINTS        /* L3 (on release): hints inline or as a tooltip */
 };
 
 int  enhance_menu_open(uint64_t now_ms);
+/* Closes at once, with no question: the leave requests (B at the top, the
+ * close, Cancel, the toggle) go through the unsaved-changes dialog. */
 void enhance_menu_close(void);
 int  enhance_menu_is_open(void);
 /* One event; returns 1 when the page must be drawn again. */
@@ -145,6 +160,23 @@ int  enhance_menu_select_row(const char *label);  /* 1 when found */
 int  enhance_menu_capturing(void);
 const char *enhance_menu_status(void);           /* the last message */
 int  enhance_menu_unsaved(void);
+/* Every unsaved change back to what was loaded or saved last: slots (live
+ * ones through set()), bindings, the shader overrides and the shader
+ * profiles' edits. A deleted profile stays deleted. */
+void enhance_menu_revert(void);
+/* Row i's markers (design D10), 0 when i is out of range. */
+#define ENHANCE_ROW_UNSAVED    0x1  /* changed since the last load or save */
+#define ENHANCE_ROW_NONDEFAULT 0x2  /* differs from the stock value */
+#define ENHANCE_ROW_FORCED     0x4  /* the environment sets it: read only */
+int  enhance_menu_row_state(int i);
+/* The unsaved-changes dialog: -1 when closed, else the focused button
+ * (0 Exit without saving, 1 Exit and Save, 2 Go Back). */
+int  enhance_menu_dialog(void);
+const char *enhance_menu_dialog_text(void);     /* its body, "" when closed */
+/* A section's intro, NULL for none. */
+const char *enhance_menu_page_intro_text(int page);
+/* 1 when hints show inline under the rows, 0 as a tooltip (L3 flips it). */
+int  enhance_menu_hints_inline(void);
 /* The key and its TOML literal for each pending change, as Save would
  * write them (NULL value: the key is removed); returns the count. */
 int  enhance_menu_pending(const char **keys, const char **values, int max);

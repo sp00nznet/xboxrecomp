@@ -25,6 +25,8 @@ static int s_n, s_active, s_init;
 #define SAVED_UNKNOWN (-1)
 static int s_saved_kind;
 static char s_saved_slug[SHADER_PROFILE_REF_MAX];
+/* A profile file was deleted this session (the exit dialog says so). */
+static int s_deleted;
 
 /* The chosen chain as analyse() last found it. */
 static struct shader_profile_compose s_info;
@@ -829,6 +831,7 @@ int shader_edit_delete(char *msg, size_t n)
             s_saved_slug[0] = 0;
         }
         fprintf(stderr, LOGP "menu: deleted profile %s (%s.toml)\n", name, e->file);
+        s_deleted = 1;
     }
     nv2a_present_chain_profile_forget(e->slug);
     nv2a_present_chain_request("none");
@@ -968,6 +971,8 @@ int shader_edit_config(const char **keys, const char **vals, int max)
 
 void shader_edit_config_saved(void)
 {
+    /* The save is the new base: a Delete before it is no longer news. */
+    s_deleted = 0;
     if (!s_init || shader_edit_forced())
         return;
     s_saved_kind = act()->kind;
@@ -1078,8 +1083,71 @@ void shader_edit_reset_defaults(void)
     request(NULL, 0);
 }
 
+int shader_edit_choice_dirty(void)
+{
+    return s_init && !shader_edit_forced() && !same_choice();
+}
+
+int shader_edit_deleted(void)
+{
+    return s_deleted;
+}
+
+int shader_edit_revert(void)
+{
+    int n = 0, active = 0;
+
+    if (!s_init) {
+        nv2a_present_chain_profile_revert(NULL);
+        return s_deleted;
+    }
+    if (!shader_edit_unsaved()) {
+        /* Nothing to undo: no new request, so the chain is not rebuilt. */
+        return s_deleted;
+    }
+    for (int i = 0; i < s_n; i++) {
+        struct shader_edit_entry *e = &s_e[i];
+        if (e->kind == SHADER_EDIT_USER && !e->file[0]) {
+            /* Never written: an unsaved New, Copy or fork. */
+            nv2a_present_chain_profile_forget(e->slug);
+            shader_profile_cache_forget(e->slug);
+            continue;
+        }
+        if (e->kind == SHADER_EDIT_USER && e->state == SHADER_PROFILE_OK) {
+            if (strcmp(e->slug, e->file)) {
+                /* A rename not yet saved: the values go back to the file's
+                 * slug with the name. */
+                nv2a_present_chain_profile_rekey(e->slug, e->file);
+                shader_profile_cache_renamed(e->slug, e->file);
+                snprintf(e->slug, sizeof e->slug, "%s", e->file);
+            }
+            snprintf(e->name, sizeof e->name, "%s", e->fname);
+            e->nstages = e->fnstages;
+            memcpy(e->stage, e->fstage, sizeof e->stage);
+        }
+        if (i != n)
+            s_e[n] = *e;
+        n++;
+    }
+    s_n = n;
+    nv2a_present_chain_profile_revert(NULL);
+    /* The choice the config holds; one a Delete left to a lower layer is
+     * unknown here, so Off stays, as the Delete left it. */
+    for (int i = 0; i < s_n && s_saved_kind != SAVED_UNKNOWN; i++) {
+        const struct shader_edit_entry *e = &s_e[i];
+        if (e->kind == s_saved_kind
+            && (e->kind == SHADER_EDIT_OFF || !strcmp(e->slug, s_saved_slug)))
+            active = i;
+    }
+    s_active = active;
+    shader_edit_refresh();
+    request(NULL, 0);
+    return s_deleted;
+}
+
 void shader_edit_reset_for_test(void)
 {
+    s_deleted = 0;
     s_n = s_active = s_init = 0;
     s_saved_kind = SHADER_EDIT_OFF;
     s_saved_slug[0] = 0;
