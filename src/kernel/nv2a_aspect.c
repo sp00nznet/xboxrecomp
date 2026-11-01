@@ -120,7 +120,7 @@ int nv2a_aspect_full_tris_in(const float (*xy)[2], const uint32_t *idx, uint32_t
     for (t = 0; t < ntri; t++) {
         float a = xy[idx[3 * t]][0], b = xy[idx[3 * t + 1]][0], c = xy[idx[3 * t + 2]][0];
         float mn = fminf(a, fminf(b, c)), mx = fmaxf(a, fmaxf(b, c));
-        if (nv2a_aspect_full_width(mn, mx, w) && mn >= lo && mx <= hi)
+        if (nv2a_aspect_full_width(mn, mx, w) && (mn >= lo || mx <= hi))
             return 1;
     }
     return 0;
@@ -142,6 +142,8 @@ int nv2a_aspect_full(float lo_x, float hi_x, const float (*xy)[2], const uint32_
         bound = nv2a_aspect_full_tris_in(xy, idx, ntri, w, -NV2A_HUD_WIDE_BAND,
                                          (float)w + NV2A_HUD_WIDE_BAND);
     else
+        /* No triangles to look at: a bound past one edge says nothing of a
+         * mixed batch, so the whole batch must sit inside the band. */
         bound = lo_x >= -NV2A_HUD_WIDE_BAND && hi_x <= (float)w + NV2A_HUD_WIDE_BAND;
     if (wide)
         *wide = !bound;

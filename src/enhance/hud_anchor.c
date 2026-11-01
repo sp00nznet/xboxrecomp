@@ -42,6 +42,7 @@ struct hud_group {
     int kind;
     int implicit;               /* a site's own group: no shared reference */
     int has_ref, has_park;
+    int full_stretch;           /* full = "stretch": full-width primitives mapped wide */
     float ref_x, park;          /* canvas units */
     uint64_t ref;               /* proportional: epoch << 32 | float bits */
 };
@@ -611,20 +612,29 @@ static void prim_stretch(struct prim *p, uint32_t n, uint32_t tw, uint32_t pad)
     for (uint32_t k = 0; k < n; k++)
         p->gx[k] = cx + (p->gx[k] - cx) * f;
     prim_bounds(p, n);
-    /* Covering the 4:3 columns yet within the already-wide band: H5 would
-     * take it as full width and stretch it again. Its outer x goes just
-     * past the band, u kept (at most 9 px of stretch, no texel outside its
-     * own u range). */
-    if (nv2a_aspect_full_width(p->lo, p->hi, tw) && p->lo >= -NV2A_HUD_WIDE_BAND
-        && p->hi <= (float)tw + NV2A_HUD_WIDE_BAND) {
+    /* Covering the 4:3 columns with an edge inside the already-wide band:
+     * H5 takes a triangle past one edge only as full width (nv2a_aspect_full)
+     * and would stretch it again. Each edge inside the band goes just past
+     * it, u kept (at most 9 px of stretch, no texel outside its own u
+     * range); an edge already past stays. With a small pad a one-sided
+     * overhang (KUF's right fade, 0..680, at pad 4: -4..684.5) moves its
+     * left edge only.
+     * Not covered: a strip's degenerate triangles can bridge two sprites
+     * into one that spans the columns while neither sprite does (a review
+     * finding; no case seen yet). */
+    if (nv2a_aspect_full_width(p->lo, p->hi, tw)) {
+        int mlo = p->lo >= -NV2A_HUD_WIDE_BAND, mhi = p->hi <= (float)tw + NV2A_HUD_WIDE_BAND;
         float nlo = -NV2A_HUD_WIDE_BAND - 1.0f, nhi = (float)tw + NV2A_HUD_WIDE_BAND + 1.0f;
-        for (uint32_t k = 0; k < n; k++) {
-            if (fabsf(p->gx[k] - p->lo) <= 1e-3f)
-                p->gx[k] = nlo;
-            else if (fabsf(p->gx[k] - p->hi) <= 1e-3f)
-                p->gx[k] = nhi;
+        if (mlo || mhi) {
+            float olo = p->lo, ohi = p->hi;
+            for (uint32_t k = 0; k < n; k++) {
+                if (mlo && fabsf(p->gx[k] - olo) <= 1e-3f)
+                    p->gx[k] = nlo;
+                else if (mhi && fabsf(p->gx[k] - ohi) <= 1e-3f)
+                    p->gx[k] = nhi;
+            }
+            prim_bounds(p, n);
         }
-        prim_bounds(p, n);
     }
 }
 
@@ -880,7 +890,12 @@ int hud_layer_apply(const struct xbox_mod_call *c, const struct xbox_hud_call *d
         prim_bounds(&p, s_prim);
         if (!isfinite(p.lo) || !isfinite(p.hi))
             continue;
-        if (kind == XBOX_HUD_STRETCH) {
+        if (kind == XBOX_HUD_STRETCH
+            || (grp && grp->full_stretch && nv2a_aspect_full_width(p.lo, p.hi, sn.tw))) {
+            /* A group's full-width primitive under full = "stretch": a dim
+             * or backing the game draws with a picture texture, which H5
+             * would centre as a movie, while the same call's smaller
+             * panels keep the group's kind. */
             prim_stretch(&p, s_prim, sn.tw, sn.pad);
         } else if (kind == XBOX_HUD_WORLD) {
             /* Projected by the game: left alone, but a piece parked past
@@ -1038,7 +1053,7 @@ static int check_keys(const recomp_cfg *cfg)
                                           "w_va", "h_va", "view_va", "type", "mem_scale", NULL };
     static const char *const layout[] = { "stride", "x_off", "u_off", "prim", NULL };
     static const char *const wrapper[] = { "va", "name", NULL };
-    static const char *const group[] = { "name", "kind", "ref_x", "park", NULL };
+    static const char *const group[] = { "name", "kind", "ref_x", "park", "full", NULL };
     static const char *const site[] = { "ret_va", "element", "group", "kind", "note", NULL };
     size_t i, n = recomp_cfg_count(cfg);
 
@@ -1416,6 +1431,15 @@ static int parse_table(const recomp_cfg *cfg, hud_hook_fn hook)
             if (!num(cfg, key, &g->park) || !isfinite(g->park) || g->park <= 0.0f)
                 return fail("group %s: park is not a positive number", name);
             g->has_park = 1;
+        }
+        snprintf(key, sizeof key, "group.%zu.full", i);
+        if (recomp_cfg_find(cfg, key) >= 0) {
+            const char *full = recomp_cfg_string(cfg, key, NULL);
+            if (g->kind == XBOX_HUD_STRETCH || g->kind == XBOX_HUD_WORLD)
+                return fail("group %s: full is for groups that move or keep", name);
+            if (!full || (strcmp(full, "stretch") && strcmp(full, "keep")))
+                return fail("group %s: full must be \"stretch\" or \"keep\"", name);
+            g->full_stretch = !strcmp(full, "stretch");
         }
         s_ngroups++;
     }

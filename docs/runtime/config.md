@@ -1699,6 +1699,7 @@ name = "panel"
 kind = "left"
 # ref_x = -200               # proportional: the reference x, canvas units
 # park = 360                 # world: primitives beyond it are parked
+# full = "stretch"           # full-width primitives stretched (default "keep")
 
 [[site]]                     # one call site, by return address
 ret_va = 0x0006B25A
@@ -1744,16 +1745,24 @@ Each non-stretch primitive is clipped to the 4:3 columns moved by its
 offset, with `u` clipped in step when `u_off` is set. A primitive wholly
 outside them, one the game parked off-screen, is moved past the wide
 frame's edge so it stays hidden. A full-width primitive (a fade) is left
-for Hor+. A call whose vertex count is not a multiple of `prim`, or that
+for Hor+, which centres one that samples a picture texture as a movie. A
+group with `full = "stretch"` maps its full-width primitives as `stretch`
+does instead, for a dim or backing drawn with a picture texture by the
+same call as smaller panels, which keep the group's kind. It is not
+allowed on `stretch` and `world` groups. A call whose vertex count is not a multiple of `prim`, or that
 has more than 1024 vertices under `XBOX_HUD_RESTORE`, is left untouched,
 with one `[hud.skip]` trace line per site.
 
 **The backends.** While the layer is active, Metal and D3D11 give a 2D
 batch drawn on the canvas's target the 3D box (the lift), so moved sprites
 show in the pads. Full-width batches (movies, fades) keep their box. On that
-target, a batch whose triangles reach past `[-8, w + 8]` is not counted as
-full width (`nv2a_aspect_full_tris_in`), so stretched sprites are not
-stretched a second time. The CPU rasteriser has no lift: moved elements are
+target, a batch whose triangles reach past both `-8` and `w + 8` is not
+counted as full width (`nv2a_aspect_full_tris_in`), so stretched sprites are
+not stretched a second time. An oversized full-screen triangle (0..2w)
+passes one edge only and stays full width; a symmetric overscan draw still
+passes both and is cleared. A batch without a triangle list must lie inside
+both bounds. The layer pushes a stretched sprite's edges that stay inside
+the band just past it. The CPU rasteriser has no lift: moved elements are
 clipped there.
 
 **Logs.**

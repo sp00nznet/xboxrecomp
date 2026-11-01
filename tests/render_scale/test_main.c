@@ -530,6 +530,20 @@ int main(void)
                   && wide == 0);
             CHECK(nv2a_aspect_full(-8, 648, NULL, NULL, 0, 640, 480, &wide));
             CHECK(!nv2a_aspect_full(3, 640, NULL, NULL, 0, 640, 480, &wide) && wide == 0);
+            /* Past one edge only: an oversized full-screen triangle
+             * (0..2w, KUF's menu resolve) stays full width, so H5 still stretches
+             * it over the pads (hand check finding 2). */
+            wx[0][0] = wx[2][0] = 0;
+            wx[1][0] = 1280;
+            wx[2][1] = 960;
+            CHECK(nv2a_aspect_full(0, 1280, (const float (*)[2])wx, wi, 1, 640, 480, &wide)
+                  && wide == 0);
+            /* without a list one edge proves nothing: the batch is cleared */
+            CHECK(!nv2a_aspect_full(0, 1280, NULL, NULL, 0, 640, 480, &wide) && wide == 1);
+            wx[0][0] = wx[2][0] = -640;
+            wx[1][0] = 640;
+            CHECK(nv2a_aspect_full(-640, 640, (const float (*)[2])wx, wi, 1, 640, 480, &wide)
+                  && wide == 0);
             nv2a_aspect_hud_set(0, 0, 0);
         }
         /* so it is a centred 2D batch: the HUD keeps its 4:3 layout */

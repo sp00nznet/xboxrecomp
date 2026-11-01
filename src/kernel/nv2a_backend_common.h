@@ -1937,15 +1937,20 @@ int nv2a_aspect_hud_lift(uint32_t rt_w, uint32_t rt_h, int two_d, int flat, int 
  * bounds lo_x..hi_x span the w-wide frame (nv2a_aspect_full_width) and,
  * for a triangle list (xy and idx not NULL, ntri triangles), one triangle
  * does (nv2a_aspect_full_tris). While the layer is on this w x h target a
- * triangle, or the batch without a list, counts only within
- * [-NV2A_HUD_WIDE_BAND, w + NV2A_HUD_WIDE_BAND] guest pixels: the layer's
- * stretch map puts its sprites past that on purpose, and H5 must not
- * stretch them again. *wide (may be NULL) is 1 when that bound alone
- * cleared the batch's full width. */
+ * triangle counts only when it is not past both -NV2A_HUD_WIDE_BAND and
+ * w + NV2A_HUD_WIDE_BAND guest pixels: the layer's stretch map is
+ * symmetric and puts its sprites past both on purpose, and H5 must not
+ * stretch them again. An oversized full-screen triangle (0..2w, KUF's
+ * menu resolve) passes one edge only and stays full width; a symmetric
+ * overscan draw still passes both and is cleared. Without a list the
+ * whole batch must lie inside both bounds (one edge proves nothing of a
+ * mixed batch). *wide (may be NULL) is 1 when that bound alone cleared
+ * the batch's full width. */
 #define NV2A_HUD_WIDE_BAND 8.0f
 int nv2a_aspect_full(float lo_x, float hi_x, const float (*xy)[2], const uint32_t *idx,
                      uint32_t ntri, uint32_t w, uint32_t h, int *wide);
-/* nv2a_aspect_full_tris with each triangle also within [lo, hi]. */
+/* nv2a_aspect_full_tris counting only a triangle not past both lo and hi
+ * (its min x >= lo or its max x <= hi). */
 int nv2a_aspect_full_tris_in(const float (*xy)[2], const uint32_t *idx, uint32_t ntri,
                              uint32_t w, float lo, float hi);
 /* The presented frame's guest size: a backend publishes it at each flip,

@@ -172,6 +172,7 @@ static const char k_table[] = HEAD
     "[[group]]\nname = \"bg\"\nkind = \"stretch\"\n"
     "[[group]]\nname = \"marks\"\nkind = \"world\"\npark = 200\n"
     "[[group]]\nname = \"title\"\nkind = \"centre\"\n"
+    "[[group]]\nname = \"dim\"\nkind = \"centre\"\nfull = \"stretch\"\n"
     "[[site]]\nret_va = 0x2000\nelement = \"score\"\ngroup = \"score\"\n"
     "[[site]]\nret_va = 0x2010\nelement = \"timer\"\ngroup = \"timer\"\n"
     "[[site]]\nret_va = 0x2020\nelement = \"meter a\"\ngroup = \"meter\"\n"
@@ -179,7 +180,8 @@ static const char k_table[] = HEAD
     "[[site]]\nret_va = 0x2030\nelement = \"bg\"\ngroup = \"bg\"\n"
     "[[site]]\nret_va = 0x2040\nelement = \"marker\"\ngroup = \"marks\"\n"
     "[[site]]\nret_va = 0x2050\nelement = \"title\"\ngroup = \"title\"\n"
-    "[[site]]\nret_va = 0x2060\nelement = \"gauge\"\nkind = \"proportional\"\n";
+    "[[site]]\nret_va = 0x2060\nelement = \"gauge\"\nkind = \"proportional\"\n"
+    "[[site]]\nret_va = 0x2070\nelement = \"dim\"\ngroup = \"dim\"\n";
 
 static void test_errors(void)
 {
@@ -202,6 +204,11 @@ static void test_errors(void)
         HEAD "[[group]]\nname = \"g\"\nkind = \"left\"\n[[group]]\nname = \"g\"\nkind = \"right\"\n",
         /* park off a world group */
         HEAD "[[group]]\nname = \"g\"\nkind = \"left\"\npark = 10\n",
+        /* full on a stretch or world group, or not stretch or keep */
+        HEAD "[[group]]\nname = \"g\"\nkind = \"stretch\"\nfull = \"stretch\"\n",
+        HEAD "[[group]]\nname = \"g\"\nkind = \"world\"\nfull = \"keep\"\n",
+        HEAD "[[group]]\nname = \"g\"\nkind = \"centre\"\nfull = \"wide\"\n",
+        HEAD "[[group]]\nname = \"g\"\nkind = \"centre\"\nfull = 1\n",
         /* bad canvas and layout */
         "version = 1\n[canvas]\nw = 0\nh = 480\n[layout]\nstride = 16\nx_off = 0\n",
         "version = 1\n[canvas]\nw = 640\nh = 480\nview = [0, 0, 640]\n[layout]\nstride = 16\n"
@@ -226,7 +233,7 @@ static void test_errors(void)
     s_hook_refuse = 0;
     /* One table per run; [capture] takes only its reserved draws (2.1),
      * unused, and refuses any other key. */
-    CHECK(load(k_table) == 8);
+    CHECK(load(k_table) == 9);
     CHECK(hud_layer_has_table() && s_nhooks == 1 && s_hooks[0].va == 0x1000);
     CHECK(hud_layer_table(k_table, strlen(k_table), fake_hook) < 0);
     CHECK(load(HEAD "[capture]\ndraws = [1, 2]\n") == 0);
@@ -247,7 +254,7 @@ static void test_offsets(void)
         { 16, 9, 4, 3, 0, 107, 0 },    { 16, 9, 0, 0, 200, 107, 43 },
         { 4, 3, 0, 0, 0, 0, 0 },
     };
-    CHECK(load(k_table) == 8);
+    CHECK(load(k_table) == 9);
     for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
         set_aspect(t[i].w == 4 ? 0 : t[i].w, t[i].w == 4 ? 0 : t[i].h);
         hud_layer_set_keys(t[i].aw, t[i].ah, t[i].margin);
@@ -271,7 +278,7 @@ static void test_offsets(void)
 
 static void test_kinds(void)
 {
-    CHECK(load(k_table) == 8);
+    CHECK(load(k_table) == 9);
     set_aspect(16, 9);
     hud_layer_set_keys(0, 0, 0);
     CHECK(hud_layer_frame(1) == 1);
@@ -313,6 +320,19 @@ static void test_kinds(void)
     apply(0x2060);
     CHECK(NEAR(vx(0), 100 - 67));
 
+    /* full = "stretch": the full-width primitive is stretched (0..640 ->
+     * -107..747), a smaller one of the same group keeps its kind, and a
+     * full-width one of a plain centre group is left for Hor+. */
+    quad(0, 640);
+    CHECK(apply(0x2070) == XBOX_HUD_CENTRE);
+    CHECK(NEAR(vx(0), -107) && NEAR(vx(1), 747) && NEAR(vu(0), 0) && NEAR(vu(1), 1));
+    quad(110, 530);
+    apply(0x2070);
+    CHECK(NEAR(vx(0), 110) && NEAR(vx(1), 530));
+    quad(0, 640);
+    apply(0x2050);
+    CHECK(NEAR(vx(0), 0) && NEAR(vx(1), 640));
+
     /* stretch: 0..320 -> -107..320 */
     quad(0, 320);
     CHECK(apply(0x2030) == XBOX_HUD_STRETCH);
@@ -324,6 +344,16 @@ static void test_kinds(void)
     quad(50, 590);
     apply(0x2030);
     CHECK(NEAR(vx(0), -9) && NEAR(vx(1), 649) && NEAR(vu(0), 0) && NEAR(vu(1), 1));
+    /* One edge inside the band only: at pad 4 (648/480 = 81:60) a quad of
+     * 0..680 stretches to -4..684.5, past the right edge alone. H5 would
+     * take it as full width, so its left edge goes past the band too and
+     * the right one stays. */
+    set_aspect(81, 60);
+    hud_layer_frame(1);
+    quad(0, 680);
+    apply(0x2030);
+    CHECK(vx(0) < -8.0f && vx(1) > 648.0f && NEAR(vx(1), 684.5f) && NEAR(vu(0), 0)
+          && NEAR(vu(1), 1));
     set_aspect(16, 9);
     hud_layer_frame(1);
 
@@ -342,7 +372,7 @@ static void test_kinds(void)
 
 static void test_clip(void)
 {
-    CHECK(load(k_table) == 8);
+    CHECK(load(k_table) == 9);
     set_aspect(16, 9);
     hud_layer_set_keys(0, 0, 0);
     hud_layer_frame(1);
@@ -398,7 +428,7 @@ static void test_clip(void)
 static void test_chain(void)
 {
     struct xbox_mod_call w, w2;
-    CHECK(load(k_table) == 8);
+    CHECK(load(k_table) == 9);
     set_aspect(16, 9);
     hud_layer_frame(1);
 
@@ -526,7 +556,7 @@ static void test_canvas(void)
 
 static void test_restore_and_state(void)
 {
-    CHECK(load(k_table) == 8);
+    CHECK(load(k_table) == 9);
     set_aspect(16, 9);
     hud_layer_set_keys(0, 0, 0);
     hud_layer_frame(1);
@@ -579,7 +609,7 @@ static void test_restore_exact(void)
     uint8_t want[LEN], mid[LEN];
     const char *out;
 
-    CHECK(load(k_table) == 8);
+    CHECK(load(k_table) == 9);
     set_aspect(16, 9);
     hud_layer_set_keys(0, 0, 0);
     hud_layer_frame(1);
@@ -702,7 +732,7 @@ static void test_threads_group(void)
     pthread_t th[2];
     int same = 1, left = 0, right = 0;
 
-    CHECK(load(k_table) == 8);
+    CHECK(load(k_table) == 9);
     set_aspect(16, 9);
     hud_layer_set_keys(0, 0, 0);
     hud_layer_frame(1);
@@ -756,7 +786,7 @@ static void test_threads_chain(void)
 {
     pthread_t th;
 
-    CHECK(load(k_table) == 8);
+    CHECK(load(k_table) == 9);
     set_aspect(16, 9);
     hud_layer_frame(1);
     s_main_w = at(0x7000, 0x2010);          /* the text wrapper from timer */
