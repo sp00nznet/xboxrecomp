@@ -180,6 +180,11 @@ struct nv2a_present_param {
      * when a later stage declares it too: one value drives both. */
     int stage;
     int shared;
+    /* The basename of the pass shader that declares it ("crt-lottes.slang",
+     * an #include counting as its pass's), the first pass's for a name
+     * several declare; "" when no pass file could be read. The menu keys
+     * its parameter kinds on it (shader_param_kinds.h). */
+    char file[64];
 };
 
 /* The preset key of a request ("crt-lottes", or a path's sanitised stem)

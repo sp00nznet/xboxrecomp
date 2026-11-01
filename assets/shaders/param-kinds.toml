@@ -1,0 +1,45 @@
+# How the in-game Shaders page shows the bundled shaders' parameters
+# (src/enhance/shader_param_kinds.h). Ours, not an upstream file.
+#
+# A slang preset declares each parameter as a number; this file says which
+# ones are a list of named modes. One [[param]] per parameter, keyed by the
+# shader file that declares it (#pragma parameter) and the name:
+#   kind    = "toggle" | "choice" | "slider"
+#   choices = a choice's names, one per value from the minimum
+#   help    = the row's help line
+# Values stay numbers: a choice writes min + its index, so profile files
+# and the config hold what they always did. Parameters with a 0..1 range of
+# step 1 are toggles without an entry here.
+#
+# The names come from the shaders' own source, never invented.
+
+# crt/shaders/crt-lottes-fast.slang (libretro/slang-shaders 2b0530ba):
+# "MASK" 0..3 step 1. CrtsTone (MASK == 0.0: mask = 1.0) and CrtsMask's
+# branches, named by the source's CRTS_MASK_* list:
+#   0  CrtsMask's last branch returns 1.0     CRTS_MASK_NONE "No mask"
+#   1  {1,1,1} with the dark channel           CRTS_MASK_GRILLE_LITE
+#      ("The LITE version of the Aperture Grille is brighter")
+#   2  {dark,dark,dark} with the lit channel   CRTS_MASK_GRILLE
+#      ("Aperture grille (aka Trinitron)")
+#   3  pos.x += pos.y * 3, a 6-pixel triad     CRTS_MASK_SHADOW
+#      ("Horizontally stretched shadow mask")
+[[param]]
+file = "crt-lottes-fast.slang"
+name = "MASK"
+kind = "choice"
+choices = ["None", "Aperture grille lite", "Aperture grille", "Shadow mask"]
+help = "The phosphor pattern drawn over the picture"
+
+# crt/shaders/crt-lottes.slang (libretro/slang-shaders 2b0530ba):
+# "shadowMask" 0..4 step 1. Mask() draws it only when shadowMask > 0.0; its
+# branches carry these comments:
+#   1  "Very compressed TV style shadow mask."
+#   2  "Aperture-grille."
+#   3  "Stretched VGA style shadow mask (same as prior shaders)."
+#   4  "VGA style shadow mask."
+[[param]]
+file = "crt-lottes.slang"
+name = "shadowMask"
+kind = "choice"
+choices = ["None", "Compressed TV", "Aperture grille", "Stretched VGA", "VGA"]
+help = "The phosphor pattern drawn over the picture"

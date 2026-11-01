@@ -22,6 +22,7 @@
 
 #include "enhance_cfg.h"
 #include "nv2a_present_chain.h"
+#include "recomp_cfg.h"
 #include "recomp_env.h"
 #include "recomp_exe_dir.h"
 #include "shader_profile.h"
@@ -264,6 +265,36 @@ static void case_save(void)
     t = read_file(path);
     CHECK(!has(t, "hardScan") && has(t, "FSR_SHARPENING = 0.25\n") && has(t, "mine = 7\n"));
     free(t);
+
+    /* [param_kinds.X] as the last table: Save keeps it whole, and new
+     * values land under their own [params] tables, not inside it. */
+    write_file(path, "version = 1\nname = \"Soft CRT\"\nstages = [\"fsr\", \"crt-lottes\"]\n\n"
+                     "[params.fsr]\nFSR_SHARPENING = 0.5\n\n"
+                     "[param_kinds.MASK]\nkind = \"toggle\"\nhelp = \"Mine\"\n");
+    CHECK(shader_profile_load(path, &p, err, sizeof err) == 0 && p.nvalues == 1);
+    shader_profile_value_set(&p, "fsr", "FSR_GRAIN", 1.0f);
+    shader_profile_value_set(&p, "crt-lottes", "hardScan", -8.0f);
+    CHECK(shader_profile_save(path, &p, err, sizeof err) == 0);
+    t = read_file(path);
+    CHECK(has(t, "[param_kinds.MASK]\nkind = \"toggle\"\nhelp = \"Mine\"\n"));
+    free(t);
+    CHECK(shader_profile_load(path, &q, err, sizeof err) == 0 && q.nvalues == 3);
+    {
+        int seen = 0;
+        for (int i = 0; i < q.nvalues; i++)
+            seen += (!strcmp(q.value[i].key, "fsr") && !strcmp(q.value[i].name, "FSR_GRAIN")
+                     && q.value[i].v == 1.0f)
+                    + (!strcmp(q.value[i].key, "crt-lottes")
+                       && !strcmp(q.value[i].name, "hardScan") && q.value[i].v == -8.0f);
+        CHECK(seen == 2);
+    }
+    {
+        recomp_cfg *c = recomp_cfg_load_file(path, err, sizeof err);
+        CHECK(c && !strcmp(recomp_cfg_string(c, "param_kinds.MASK.kind", ""), "toggle"));
+        CHECK(c && recomp_cfg_type_of(c, "param_kinds.MASK.FSR_GRAIN") == RCFG_NONE
+              && recomp_cfg_type_of(c, "param_kinds.MASK.hardScan") == RCFG_NONE);
+        recomp_cfg_free(c);
+    }
 
     /* never written: a file that does not parse, a newer one */
     write_file(path, "version = = 1\n");

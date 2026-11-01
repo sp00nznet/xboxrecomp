@@ -50,6 +50,7 @@
 #include "nv2a_tex_pack.h"
 #include "pad_map.h"
 #include "recomp_env.h"
+#include "shader_param_kinds.h"
 #include "shader_profile_edit.h"
 
 #include <fcntl.h>
@@ -1418,6 +1419,58 @@ static void test_shaders(void)
         CHECK(!nv2a_present_chain_override_get("x", "y", NULL));
     }
     nv2a_present_chain_params_clear();
+}
+
+/* ---- 7b'. parameter kinds (overlay-revamp D5) ------------------------- */
+
+/* A parameter the sidecar beside the exe declares a toggle: a pill, the
+ * help first in the footer, and the store and Save keep the preset's
+ * numbers (maskDark is 0..2, so off is 0 and on is 2). The sidecar keys it
+ * on the pass file that declares it, which the chain reads from the
+ * preset beside the exe. */
+static void test_param_kinds(void)
+{
+    const char *f;
+    float v = 0;
+    int i;
+
+    MKDIR("shaders");
+    write_file("shaders/crt-lottes.slangp", "shaders = 1\nshader0 = \"kinds.slang\"\n");
+    write_file("shaders/kinds.slang",
+               "#pragma parameter maskDark \"Lottes maskDark\" 0.5 0.0 2.0 0.05\n");
+    write_file("shaders/param-kinds.toml",
+               "[[param]]\nfile = \"kinds.slang\"\nname = \"maskDark\"\nkind = \"toggle\"\n"
+               "choices = [\"Soft\", \"Hard\"]\nhelp = \"How dark the mask gets\"\n");
+    shader_param_kinds_builtin_reset(NULL);
+    start_with(ARMED "[present]\nshader = \"crt-lottes\"\nshader_lib = \"" FAKE_LRS_PARAMS "\"\n",
+               NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    chain_built();
+    flip();
+    CHECK(row_value("warpX") && !strcmp(row_value("warpX"), "0.01"));
+    CHECK(row_value("Lottes maskDark") && !strcmp(row_value("Lottes maskDark"), "false"));
+    CHECK(enhance_menu_select_row("Lottes maskDark"));
+    i = enhance_menu_selected();
+    CHECK(strstr(enhance_menu_row_help(i), "How dark the mask gets \xC2\xB7 maskDark \xC2\xB7 0..2")
+          == enhance_menu_row_help(i));
+    CHECK(strstr(enhance_menu_row_help(i), "on: Hard") != NULL);
+    tap(0x27);
+    CHECK(!strcmp(row_value("Lottes maskDark"), "true"));
+    CHECK(nv2a_present_chain_param_get("maskDark", &v) && v == 2.0f);
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "maskDark = 2.0") != NULL);
+    tap(0x0D);
+    CHECK(!strcmp(row_value("Lottes maskDark"), "false"));
+    CHECK(nv2a_present_chain_param_get("maskDark", &v) && v == 0.0f);
+    open_menu();
+    nv2a_present_chain_params_clear();
+    remove("shaders/crt-lottes.slangp");
+    remove("shaders/kinds.slang");
+    remove("shaders/param-kinds.toml");
+    rmdir("shaders");
+    shader_param_kinds_builtin_reset(NULL);
 }
 
 /* ---- 7c. shader profiles (design D5, D10) ------------------------------ */
@@ -2912,6 +2965,7 @@ int main(int argc, char **argv)
     test_mouse();
     test_snapshot();
     test_shaders();
+    test_param_kinds();
     test_profiles();
     test_profiles_forced();
     test_profiles_delete_layers();

@@ -5,6 +5,7 @@
 
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
@@ -647,6 +648,254 @@ int nv2a_present_chain_preset(char *out, size_t cap, unsigned *gen_out)
     return preset_path(req, out, cap, 1);
 }
 
+/* ---- Which pass file declares a parameter ----
+ *
+ * librashader lists a preset's parameters with no file, but the menu keys
+ * its parameter kinds on the shader that declares each one (two presets
+ * can both name a MASK). So the preset is read here as far as that needs:
+ * shaderN through #reference (each path relative to the file that set it),
+ * then each pass's source and its #include files for #pragma parameter.
+ * Every file is read at most once per call: guarded headers that include
+ * each other would otherwise be read again at every level. */
+#define DECL_PASSES_MAX 64
+#define DECL_DEPTH_MAX 8
+#define DECL_SEEN_MAX 256
+#define DECL_PATH 1024
+#define DECL_TEXT_MAX (4 << 20)
+
+/* One call's state, on the heap: the pass table and the files read are
+ * too big for a present thread's stack, and a call shares nothing, so the
+ * menu's describe and a backend's publish never wait on each other. */
+struct decl_ctx {
+    char pass[DECL_PASSES_MAX][DECL_PATH];
+    int npass;
+    char seen[DECL_SEEN_MAX][DECL_PATH];
+    int nseen;
+};
+
+/* The scratch paths of one level of the walk. */
+struct decl_paths {
+    char dir[DECL_PATH], rel[DECL_PATH], full[DECL_PATH];
+};
+
+/* 1 the first time path comes up in this call (and remembered), 0 after,
+ * or when the list is full. */
+static int decl_first(struct decl_ctx *cx, const char *path)
+{
+    for (int i = 0; i < cx->nseen; i++)
+        if (!strcmp(cx->seen[i], path))
+            return 0;
+    if (cx->nseen >= DECL_SEEN_MAX)
+        return 0;
+    snprintf(cx->seen[cx->nseen++], DECL_PATH, "%s", path);
+    return 1;
+}
+
+static char *decl_read(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    char *buf = NULL;
+    long n;
+    if (!f)
+        return NULL;
+    if (!fseek(f, 0, SEEK_END) && (n = ftell(f)) >= 0 && n <= DECL_TEXT_MAX
+        && !fseek(f, 0, SEEK_SET) && (buf = malloc((size_t)n + 1))) {
+        if (fread(buf, 1, (size_t)n, f) == (size_t)n) {
+            buf[n] = 0;
+        } else {
+            free(buf);
+            buf = NULL;
+        }
+    }
+    fclose(f);
+    return buf;
+}
+
+static void decl_dir(const char *path, char *out, size_t cap)
+{
+    const char *s, *cut = NULL;
+    for (s = path; *s; s++)
+        if (*s == '/' || *s == '\\')
+            cut = s;
+    if (cut)
+        snprintf(out, cap, "%.*s", (int)(cut - path), path);
+    else
+        snprintf(out, cap, ".");
+}
+
+/* rel against dir. A Windows preset's "inc\x.h" names the same file on a
+ * POSIX host, where a backslash is no separator. */
+static void decl_join(const char *dir, const char *rel, char *out, size_t cap)
+{
+    if (path_is_absolute(rel))
+        snprintf(out, cap, "%s", rel);
+    else
+        snprintf(out, cap, "%s/%s", dir, rel);
+#ifndef _WIN32
+    for (char *c = out; *c; c++)
+        if (*c == '\\')
+            *c = '/';
+#endif
+}
+
+static int decl_space(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+/* A line's value after '=' or a directive: "quoted" whole, else to a
+ * comment, trimmed. */
+static void decl_value(const char *v, const char *end, char *out, size_t cap)
+{
+    const char *e;
+    while (v < end && decl_space(*v))
+        v++;
+    if (v < end && *v == '"') {
+        const char *q = memchr(v + 1, '"', (size_t)(end - v - 1));
+        e = q ? q : end;
+        v++;
+    } else {
+        for (e = v; e < end && *e != '#' && !(e[0] == '/' && e + 1 < end && e[1] == '/'); e++)
+            ;
+        while (e > v && decl_space(e[-1]))
+            e--;
+    }
+    snprintf(out, cap, "%.*s", (int)(e - v), v);
+}
+
+/* shaderN = path of path's preset and its #reference files, into the pass
+ * table (absolute or relative to the working directory). The referenced
+ * file first, so the preset's own lines override it, as librashader reads
+ * it. */
+static void decl_preset(struct decl_ctx *cx, const char *path, int depth)
+{
+    struct decl_paths *ps;
+    char *text;
+    const char *l;
+    int round;
+
+    if (depth > DECL_DEPTH_MAX || !decl_first(cx, path))
+        return;
+    if (!(ps = malloc(sizeof *ps)))
+        return;
+    if (!(text = decl_read(path))) {
+        free(ps);
+        return;
+    }
+    decl_dir(path, ps->dir, sizeof ps->dir);
+    for (round = 0; round < 2; round++) {
+        for (l = text; *l;) {
+            const char *e = strchr(l, '\n'), *b = l;
+            if (!e)
+                e = l + strlen(l);
+            while (b < e && decl_space(*b))
+                b++;
+            if (round == 0 && !strncmp(b, "#reference", 10)) {
+                decl_value(b + 10, e, ps->rel, sizeof ps->rel);
+                decl_join(ps->dir, ps->rel, ps->full, sizeof ps->full);
+                decl_preset(cx, ps->full, depth + 1);
+            } else if (round == 1 && !strncmp(b, "shader", 6) && b[6] >= '0' && b[6] <= '9') {
+                const char *d = b + 6;
+                int idx = 0;
+                while (d < e && *d >= '0' && *d <= '9' && idx < 1000)
+                    idx = idx * 10 + (*d++ - '0');
+                while (d < e && decl_space(*d))
+                    d++;
+                if (d < e && *d == '=' && idx < DECL_PASSES_MAX) {
+                    decl_value(d + 1, e, ps->rel, sizeof ps->rel);
+                    if (ps->rel[0]) {
+                        decl_join(ps->dir, ps->rel, cx->pass[idx], DECL_PATH);
+                        if (idx + 1 > cx->npass)
+                            cx->npass = idx + 1;
+                    }
+                }
+            }
+            l = *e ? e + 1 : e;
+        }
+    }
+    free(text);
+    free(ps);
+}
+
+/* The rows path's source (and its #include files) declares get file. */
+static void decl_source(struct decl_ctx *cx, const char *path, const char *file, int depth,
+                        struct nv2a_present_param *t, int n)
+{
+    struct decl_paths *ps;
+    char *text;
+    const char *l;
+
+    if (depth > DECL_DEPTH_MAX || !decl_first(cx, path))
+        return;
+    if (!(ps = malloc(sizeof *ps)))
+        return;
+    if (!(text = decl_read(path))) {
+        free(ps);
+        return;
+    }
+    decl_dir(path, ps->dir, sizeof ps->dir);
+    for (l = text; *l;) {
+        const char *e = strchr(l, '\n'), *b = l;
+        if (!e)
+            e = l + strlen(l);
+        while (b < e && decl_space(*b))
+            b++;
+        if (!strncmp(b, "#pragma", 7) && decl_space(b[7])) {
+            const char *w = b + 7, *nb;
+            while (w < e && decl_space(*w))
+                w++;
+            if (!strncmp(w, "parameter", 9) && decl_space(w[9])) {
+                w += 9;
+                while (w < e && decl_space(*w))
+                    w++;
+                nb = w;
+                while (w < e && !decl_space(*w))
+                    w++;
+                for (int i = 0; i < n; i++)
+                    if (!t[i].file[0] && strlen(t[i].name) == (size_t)(w - nb)
+                        && !memcmp(t[i].name, nb, (size_t)(w - nb)))
+                        snprintf(t[i].file, sizeof t[i].file, "%s", file);
+            }
+        } else if (!strncmp(b, "#include", 8)) {
+            const char *q = memchr(b, '"', (size_t)(e - b)), *q2;
+            if (q && (q2 = memchr(q + 1, '"', (size_t)(e - q - 1)))) {
+                snprintf(ps->rel, sizeof ps->rel, "%.*s", (int)(q2 - q - 1), q + 1);
+                decl_join(ps->dir, ps->rel, ps->full, sizeof ps->full);
+                decl_source(cx, ps->full, file, depth + 1, t, n);
+            }
+        }
+        l = *e ? e + 1 : e;
+    }
+    free(text);
+    free(ps);
+}
+
+/* Set each row's file from the preset at path: passes in order, so a name
+ * two passes declare takes the first one's. Rows no pass declares keep "". */
+static void tag_files(const char *path, struct nv2a_present_param *t, int n)
+{
+    struct decl_ctx *cx;
+    int i;
+
+    for (i = 0; i < n; i++)
+        t[i].file[0] = 0;
+    if (!path || !*path || n <= 0 || !(cx = calloc(1, sizeof *cx)))
+        return;
+    decl_preset(cx, path, 0);
+    /* The preset files read so far are no sources; a pass may still be
+     * one of them only by mistake, and then it declares nothing. */
+    for (i = 0; i < cx->npass; i++) {
+        const char *b = cx->pass[i], *s;
+        if (!cx->pass[i][0])
+            continue;
+        for (s = cx->pass[i]; *s; s++)
+            if (*s == '/' || *s == '\\')
+                b = s + 1;
+        decl_source(cx, cx->pass[i], b, 0, t, n);
+    }
+    free(cx);
+}
+
 int nv2a_present_chain_describe(const char *request, struct nv2a_present_param *out, int cap)
 {
     PFN_libra_preset_create pc;
@@ -672,6 +921,7 @@ int nv2a_present_chain_describe(const char *request, struct nv2a_present_param *
     }
     n = nv2a_present_chain_params_read(&preset, out, cap);
     pf(&preset);
+    tag_files(path, out, n);
     return n;
 }
 
@@ -782,6 +1032,7 @@ int nv2a_present_chain_params_read(void *preset, struct nv2a_present_param *out,
         d->step = p->step > 0 ? p->step : 0;
         d->stage = 0;
         d->shared = 0;
+        d->file[0] = 0;
         n++;
     }
     fr(list);
@@ -889,8 +1140,18 @@ static void tag_rows(struct nv2a_present_param *t, int n)
 void nv2a_present_chain_params_publish(void *preset, unsigned gen)
 {
     struct nv2a_present_param t[NV2A_PRESENT_PARAMS_MAX];
-    char req[512], key[64];
+    char req[512], key[64], path[1024];
     int n = nv2a_present_chain_params_read(preset, t, NV2A_PRESENT_PARAMS_MAX);
+
+    /* The files before the lock: reading them must not hold the menu. A
+     * request that moved meanwhile drops the table below anyway, so its
+     * files are not read at all. */
+    lock();
+    snprintf(req, sizeof req, "%s", s_req);
+    unlock();
+    if (gen == atomic_load(&s_gen) && !is_none(req)
+        && preset_path(req, path, sizeof path, 0) > 0)
+        tag_files(path, t, n);
 
     lock();
     if (gen == atomic_load(&s_gen)) {

@@ -39,6 +39,7 @@ add_executable(enhance_menu_test
     ${XR_SRC}/enhance/shader_profile.c
     ${XR_SRC}/enhance/shader_profile_req.c
     ${XR_SRC}/enhance/shader_profile_edit.c
+    ${XR_SRC}/enhance/shader_param_kinds.c
     ${XR_SRC}/enhance/enhance_input.c
     ${XR_SRC}/enhance/enhance_actions.c
     ${XR_SRC}/enhance/enhance_menu.c

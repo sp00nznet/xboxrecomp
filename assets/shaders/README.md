@@ -18,6 +18,11 @@ lot on a small screen. The in-game Shaders page resets to these values, and
 | `crt-lottes` | `warpY` | 0.02 | 0.041 |
 | `crt-lottes-fast` | `CURVATURE` | 0.01 | 0.02 |
 
+`param-kinds.toml` is ours too: it tells the in-game Shaders page which
+parameters are a list of named modes (crt-lottes-fast's `MASK`,
+crt-lottes's `shadowMask`), with the names taken from the shaders' own
+source comments (`docs/runtime/config.md`, "Parameter kinds").
+
 Only public-domain, MIT and Unlicense files are bundled; each file keeps its
 licence header.
 

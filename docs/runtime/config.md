@@ -602,6 +602,35 @@ maskDark = 0.6
   found under another stage's table is read and moved there at the next
   save.
 
+- `[param_kinds.<param>]` (optional): how the Shaders page shows a
+  parameter of this profile, over the bundled table and the rules below.
+  `kind` is `"toggle"`, `"choice"` or `"slider"`; `choices` are a choice's
+  names, one per value from the minimum (2 to 8, each under 32 bytes), or a
+  toggle's off and on words; `help` (under 100 bytes) leads the row's help
+  line. Keyed by the name alone, as a profile has one row per name. The
+  page reads this table, the loader skips it and a save keeps it.
+
+**Parameter kinds.** A preset declares each parameter as a number, so the
+Shaders page decides how a row shows by the first rule that matches
+(`src/enhance/shader_param_kinds.h`):
+
+1. declared: the profile's `[param_kinds]`, then the bundled
+   `shaders/param-kinds.toml` beside the executable, keyed by the pass
+   shader that declares it (`crt-lottes.slang`) and the name. A declared
+   choice whose names are not one per value of an integer range does not
+   match: the bundled file's declaration is tried next, then rule 2;
+2. a range of 0 to 1 by 1: a toggle;
+3. an integer range of 3 to 8 values by 1 whose description ends in
+   `: name | name ...` with one name per value: a choice;
+4. a slider.
+
+A toggle or a choice drops a trailing `: a | b` list from its label
+(`FSR LFGA Film Grain Color: Gray | RGB` reads `FSR LFGA Film Grain
+Color`). Values stay numbers whatever the kind: a toggle stores the minimum
+(off) or the maximum (on) and reads on from the middle of its range up, a
+choice the minimum plus its index, so
+`[params]` and `present.shader_params` hold what they always did.
+
 Unknown keys and tables are reported (`[SHADER] <file>:<line>: unknown key
 <key>`) and kept: a save changes only `version`, `name`, `stages` and the
 `[params]` values, through `recomp_cfg_patch`, so comments and other lines

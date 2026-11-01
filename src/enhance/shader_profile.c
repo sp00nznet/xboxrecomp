@@ -504,6 +504,11 @@ int shader_profile_parse(const char *text, const char *file, const char *slug,
                         recomp_cfg_line(c, k), SHADER_PROFILE_VALUES_MAX, k);
             continue;
         }
+        /* [param_kinds] belongs to the Shaders page, which reads the file
+         * again (shader_param_kinds_parse_profile); Save keeps it like any
+         * key it does not own. */
+        if (!strncmp(k, "param_kinds.", 12))
+            continue;
         /* Kept: Save patches only the keys it owns. */
         fprintf(stderr, LOGP "%s:%d: unknown key %s\n", file, recomp_cfg_line(c, k), k);
     }

@@ -43,6 +43,7 @@
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
 #include "pad_map.h"
+#include "shader_param_kinds.h"
 #include "shader_profile_edit.h"
 #include "recomp_cfg.h"
 #include "recomp_env.h"
@@ -1553,6 +1554,10 @@ static int s_sh_want, s_sh_want_type, s_sh_want_ref;
 static char s_pick[SHADER_PROFILE_STAGES_MAX + 64][SHADER_PROFILE_REF_MAX];
 static int s_npick;
 static char s_pnote[NV2A_PRESENT_PARAMS_MAX][32];
+/* Each row's kind (shader_param_kinds.h): its label and names live here, as
+ * the item points at them. */
+static struct shader_param_kind_info s_pkind[NV2A_PRESENT_PARAMS_MAX];
+static const char *s_pchoice[NV2A_PRESENT_PARAMS_MAX][SHADER_PARAM_CHOICES_MAX + 1];
 
 /* Rename's text entry: the name being edited and the cursor, in bytes. */
 static int s_name_on;
@@ -1607,10 +1612,26 @@ static void name_end(void)
 /* only: a stage's own names, -1 every row, PARAMS_CHAIN the rows no stage
  * lists (a chain's main page shows them, as no stage's list does). */
 #define PARAMS_CHAIN (-2)
+
+/* A saved profile's [param_kinds], when the table is that profile's. */
+static const struct shader_param_kinds *param_profile_kinds(void)
+{
+    const struct shader_edit_entry *e;
+    char dir[1024], path[1200];
+    if (!nv2a_present_chain_params_profile())
+        return NULL;
+    e = shader_edit_entry(shader_edit_active());
+    if (!e || !e->file[0] || !shader_profile_dir(dir, sizeof dir))
+        return NULL;
+    shader_profile_path(dir, e->file, path, sizeof path);
+    return shader_param_kinds_profile_file(path);
+}
+
 static void param_list(int only)
 {
     int nn = 0;
     const char (*names)[64] = only >= 0 ? shader_edit_stage_names(only, &nn) : NULL;
+    const struct shader_param_kinds *pk = param_profile_kinds();
     int any = 0;
     for (int i = 0; i < s_nptab; i++) {
         const struct nv2a_present_param *p = &s_ptab[i];
@@ -1626,8 +1647,19 @@ static void param_list(int only)
             header("Parameters");
         memset(it, 0, sizeof *it);
         it->key = p->name;
-        it->label = p->desc[0] ? p->desc : p->name;
-        it->kind = ENHANCE_ITEM_RANGE;
+        /* A toggle or a list of modes where the preset meant one (design
+         * D5); the value stays the preset's number either way. */
+        shader_param_kind_resolve(p, pk, shader_param_kinds_builtin(), &s_pkind[i]);
+        it->label = s_pkind[i].label;
+        it->kind = s_pkind[i].kind == SHADER_PARAM_TOGGLE   ? ENHANCE_ITEM_TOGGLE
+                 : s_pkind[i].kind == SHADER_PARAM_CHOICE ? ENHANCE_ITEM_CHOICE
+                                                          : ENHANCE_ITEM_RANGE;
+        if (it->kind == ENHANCE_ITEM_CHOICE) {
+            for (int k = 0; k < s_pkind[i].nnames; k++)
+                s_pchoice[i][k] = s_pkind[i].name[k];
+            s_pchoice[i][s_pkind[i].nnames] = NULL;
+            it->choices = s_pchoice[i];
+        }
         it->lo = p->min;
         it->hi = p->max;
         it->step = param_step(p);
@@ -1653,11 +1685,35 @@ static void param_list(int only)
         if (!r)
             break;
         nv2a_present_chain_param_get(p->name, &v);
-        snprintf(r->value, sizeof r->value, "%.*f", param_decimals(p), v);
-        /* The bounds and the preset's value as the preset wrote them: they
-         * need not sit on the step grid (warpX ends at 0.125, step 0.01). */
-        snprintf(r->help, sizeof r->help, "%s \xC2\xB7 %g..%g \xC2\xB7 preset %g", p->name,
-                 p->min, p->max, p->initial);
+        if (it->kind == ENHANCE_ITEM_TOGGLE)
+            snprintf(r->value, sizeof r->value, "%s",
+                     shader_param_toggle_on(p, v) ? "true" : "false");
+        else if (it->kind == ENHANCE_ITEM_CHOICE)
+            snprintf(r->value, sizeof r->value, "%s",
+                     s_pkind[i].name[shader_param_kind_index(p, v)]);
+        else
+            snprintf(r->value, sizeof r->value, "%.*f", param_decimals(p), v);
+        /* The declared help first, then the bounds and the preset's value
+         * as the preset wrote them: they need not sit on the step grid
+         * (warpX ends at 0.125, step 0.01). A toggle names its on state. */
+        {
+            char on[48] = "", tail[sizeof r->help];
+            size_t room, n = strlen(s_pkind[i].help);
+            if (it->kind == ENHANCE_ITEM_TOGGLE && s_pkind[i].nnames == 2)
+                snprintf(on, sizeof on, " \xC2\xB7 on: %s", s_pkind[i].name[1]);
+            snprintf(tail, sizeof tail, "%s \xC2\xB7 %g..%g \xC2\xB7 preset %g%s", p->name, p->min,
+                     p->max, p->initial, on);
+            /* The help gives way, at a character, so the bounds stay whole. */
+            room = sizeof r->help - 1 - strlen(tail);
+            room = room > 4 ? room - 4 : 0;
+            if (n > room) {
+                n = room;
+                while (n && ((unsigned char)s_pkind[i].help[n] & 0xC0) == 0x80)
+                    n--;
+            }
+            snprintf(r->help, sizeof r->help, "%.*s%s%s", (int)n, s_pkind[i].help,
+                     n ? " \xC2\xB7 " : "", tail);
+        }
     }
     if (!any && s_pkey_active[0] && only != PARAMS_CHAIN)
         info("Parameters", "none in this %s", only >= 0 ? "stage" : "preset");
@@ -1892,6 +1948,18 @@ static void change_param(int i, int dir, int ok)
     step = param_step(p);
     v = p->initial;
     nv2a_present_chain_param_get(p->name, &v);
+    /* A toggle flips and a choice wraps both ways, as their slots do; the
+     * store gets the number the preset declares for the state. */
+    if (s_pitem[i].kind == ENHANCE_ITEM_TOGGLE) {
+        nv2a_present_chain_param_set(p->name,
+                                     shader_param_toggle_value(p, !shader_param_toggle_on(p, v)));
+        return;
+    }
+    if (s_pitem[i].kind == ENHANCE_ITEM_CHOICE) {
+        nv2a_present_chain_param_set(p->name,
+                                     shader_param_choice_next(p, s_pkind[i].nnames, v, dir));
+        return;
+    }
     x = v + (dir < 0 ? -step : step);
     x = p->min + floor((x - p->min) / step + 0.5) * step;
     if (x > p->max + step * 1e-3)
