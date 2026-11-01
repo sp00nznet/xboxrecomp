@@ -492,6 +492,20 @@ int shader_profile_parse(const char *text, const char *file, const char *slug,
         recomp_cfg_type t;
         if (!strcmp(k, "version") || !strcmp(k, "name") || !strcmp(k, "stages"))
             continue;
+        if (!strcmp(k, "lines")) {
+            const char *v = recomp_cfg_type_of(c, k) == RCFG_STRING
+                ? recomp_cfg_string(c, k, "") : "";
+            if (!strcmp(v, "auto"))
+                p->lines = NV2A_PRESENT_LINES_AUTO;
+            else if (!strcmp(v, "guest"))
+                p->lines = NV2A_PRESENT_LINES_GUEST;
+            else if (!strcmp(v, "host"))
+                p->lines = NV2A_PRESENT_LINES_HOST;
+            else
+                fprintf(stderr, LOGP "%s:%d: lines is not \"auto\", \"guest\" or \"host\";"
+                        " auto\n", file, recomp_cfg_line(c, k));
+            continue;
+        }
         if (!strncmp(k, PARAMS_PREFIX, sizeof PARAMS_PREFIX - 1)) {
             t = recomp_cfg_type_of(c, k);
             if (!params_key(k, key, sizeof key, &name) || (t != RCFG_FLOAT && t != RCFG_INT)) {

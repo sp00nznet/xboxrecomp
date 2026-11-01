@@ -1401,6 +1401,23 @@ int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t d
     return 0;
 }
 
+int nv2a_present_chain_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
+                            int filter, int surface_internal, struct nv2a_rect *r)
+{
+    if (surface_internal && filter == NV2A_PRESENT_INTEGER)
+        filter = NV2A_PRESENT_LINEAR;
+    return nv2a_present_rect(src_w, src_h, dst_w, dst_h, filter, r);
+}
+
+void nv2a_present_chain_source(uint32_t hw, uint32_t hh, unsigned n, int lines,
+                               uint32_t *sw, uint32_t *sh)
+{
+    *sw = hw;
+    *sh = hh;
+    if (lines && n > 1 && hh >= n && hh % n == 0)
+        *sh = hh / n;
+}
+
 void nv2a_present_crop(uint32_t fw, uint32_t fh, uint32_t tw, uint32_t th, unsigned n,
                        unsigned pad, unsigned ov, int filter, struct nv2a_crop *c)
 {

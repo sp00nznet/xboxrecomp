@@ -1976,6 +1976,28 @@ struct nv2a_rect { int32_t x, y, w, h; };
 int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
                       int filter, struct nv2a_rect *r);
 
+/* present.shader: the rectangle the chain fills, the one the stock present
+ * shows on the screen. Under present.surface=window that is
+ * nv2a_present_rect's; under internal the stock frame goes whole to the
+ * compositor (gamescope, or the Metal layer), which fits it to the output,
+ * so INTEGER fits there too instead of leaving a 1x frame in a corner of
+ * the output-sized surface the chain draws to. surface_internal:
+ * the surface the config asked for, not the one the chain switched to. */
+int nv2a_present_chain_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
+                            int filter, int surface_internal, struct nv2a_rect *r);
+
+/* present.shader: the chain's input for a frame of host size hw x hh at
+ * render scale n. A preset that draws one scanline per source line (lines:
+ * a CRT) gets the guest's line count, hh / n rows of the whole host width,
+ * each the mean of its n host rows: fed the host rows it drew 2 or 3
+ * scanlines per guest line, finer than the output's rows at 800 or 1080,
+ * and they beat into bands. Anything else (fsr), scale 1, and a
+ * height that is not a multiple of n (no whole guest line per n rows) get
+ * the host frame as it is. The one owner of that rule: a backend resolves
+ * exactly when *sh < hh. */
+void nv2a_present_chain_source(uint32_t hw, uint32_t hh, unsigned n, int lines,
+                               uint32_t *sw, uint32_t *sh);
+
 /* display.overscan: the part of a frame of host size fw x fh (render scale
  * n, hor+ pad guest px) that a crop of ov guest px a side shows, in a
  * texture of tw x th. The top and bottom lose ov * fh / fw so the picture

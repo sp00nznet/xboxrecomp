@@ -28,6 +28,7 @@ static char s_req[512] = "none";
 static char s_lib_path[512];
 static atomic_uint s_gen;
 static atomic_int s_wanted;
+static atomic_int s_lines_mode;     /* present.shader_lines, NV2A_PRESENT_LINES_* */
 /* A profile request: its slug ("" for a present.shader request) and the
  * stages' parameter names publish tags rows by. Under s_lock. */
 static char s_req_slug[64];
@@ -632,20 +633,31 @@ static int preset_path(const char *req, char *out, size_t cap, int say)
     return -1;
 }
 
-int nv2a_present_chain_preset(char *out, size_t cap, unsigned *gen_out)
+static int lines_locked(void);
+
+int nv2a_present_chain_preset_lines(char *out, size_t cap, unsigned *gen_out, int *lines_out)
 {
     char req[512];
     unsigned gen;
+    int on;
 
     lock();
     snprintf(req, sizeof req, "%s", s_req);
     gen = atomic_load(&s_gen);
+    on = lines_locked();
     unlock();
     if (gen_out)
         *gen_out = gen;
+    if (lines_out)
+        *lines_out = on;
     if (is_none(req))
         return 0;
     return preset_path(req, out, cap, 1);
+}
+
+int nv2a_present_chain_preset(char *out, size_t cap, unsigned *gen_out)
+{
+    return nv2a_present_chain_preset_lines(out, cap, gen_out, NULL);
 }
 
 /* ---- Which pass file declares a parameter ----
@@ -993,6 +1005,98 @@ void nv2a_present_chain_preset_key(const char *request, char *out, size_t cap)
                     || c == '-' || c == '_') ? c : '_';
     }
     out[o] = 0;
+}
+
+static int lower(int c)
+{
+    return c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c;
+}
+
+/* 1 when s[0..n) starts with the lower-case word w. */
+static int starts(const char *s, size_t n, const char *w)
+{
+    size_t i;
+    for (i = 0; w[i]; i++)
+        if (i >= n || lower((unsigned char)s[i]) != w[i])
+            return 0;
+    return 1;
+}
+
+int nv2a_present_chain_key_lines(const char *key)
+{
+    const char *t;
+
+    if (!key)
+        return 0;
+    /* RetroArch names its CRT presets crt-*, crt_* and crtsomething; the
+     * rest put crt or scanline(s) somewhere in the stem. */
+    if (starts(key, strlen(key), "crt"))
+        return 1;
+    for (t = key; *t;) {
+        size_t n = strcspn(t, "-_.");
+        if ((n == 3 && starts(t, n, "crt")) || starts(t, n, "scanline"))
+            return 1;
+        t += n;
+        if (*t)
+            t++;
+    }
+    return 0;
+}
+
+int nv2a_present_chain_ref_lines(const char *ref)
+{
+    char key[64];
+    const char *end, *dir;
+
+    if (is_none(ref))
+        return 0;
+    nv2a_present_chain_preset_key(ref, key, sizeof key);
+    if (nv2a_present_chain_key_lines(key))
+        return 1;
+    /* The parent directory: the last component before the file name. */
+    end = ref + strlen(ref);
+    while (end > ref && end[-1] != '/' && end[-1] != '\\')
+        end--;
+    if (end == ref)
+        return 0;
+    end--;
+    dir = end;
+    while (dir > ref && dir[-1] != '/' && dir[-1] != '\\')
+        dir--;
+    return end - dir == 3 && starts(dir, 3, "crt");
+}
+
+void nv2a_present_chain_set_lines(int mode)
+{
+    atomic_store(&s_lines_mode, mode == NV2A_PRESENT_LINES_GUEST || mode == NV2A_PRESENT_LINES_HOST
+                                    ? mode : NV2A_PRESENT_LINES_AUTO);
+}
+
+/* The line choice for the request as it stands; under s_lock. */
+static int lines_locked(void)
+{
+    int mode = atomic_load(&s_lines_mode);
+
+    if (is_none(s_req))
+        return 0;
+    if (mode != NV2A_PRESENT_LINES_AUTO)
+        return mode == NV2A_PRESENT_LINES_GUEST;
+    if (s_nstages > 0) {
+        if (s_stages[0].lines != NV2A_PRESENT_LINES_AUTO)
+            return s_stages[0].lines == NV2A_PRESENT_LINES_GUEST;
+        return nv2a_present_chain_key_lines(s_stages[0].key);
+    }
+    return nv2a_present_chain_ref_lines(s_req);
+}
+
+int nv2a_present_chain_lines(void)
+{
+    int on;
+
+    lock();
+    on = lines_locked();
+    unlock();
+    return on;
 }
 
 int nv2a_present_chain_params_read(void *preset, struct nv2a_present_param *out, int cap)

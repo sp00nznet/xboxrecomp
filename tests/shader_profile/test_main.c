@@ -206,6 +206,21 @@ static void case_parse(void)
     CHECK(r == SHADER_PROFILE_OK && p.nvalues == 1);
     CHECK(shader_profile_value_get(&p, "fsr", "FSR_FILMGRAIN", &v));
     CHECK(!shader_profile_value_get(&p, "fsr", "FSR_SHARPENING", &v));
+    /* lines: how the chain is fed (present.shader_lines); auto when absent
+     * or not one of the three */
+    CHECK(p.lines == NV2A_PRESENT_LINES_AUTO);
+    CHECK(shader_profile_parse("version = 1\nstages = [\"fsr\"]\nlines = \"guest\"\n", "a",
+                               NULL, &p, err, sizeof err) == SHADER_PROFILE_OK
+          && p.lines == NV2A_PRESENT_LINES_GUEST);
+    CHECK(shader_profile_parse("version = 1\nstages = [\"crt-lottes\"]\nlines = \"host\"\n",
+                               "a", NULL, &p, err, sizeof err) == SHADER_PROFILE_OK
+          && p.lines == NV2A_PRESENT_LINES_HOST);
+    CHECK(shader_profile_parse("version = 1\nstages = [\"fsr\"]\nlines = \"both\"\n", "a",
+                               NULL, &p, err, sizeof err) == SHADER_PROFILE_OK
+          && p.lines == NV2A_PRESENT_LINES_AUTO);
+    CHECK(shader_profile_parse("version = 1\nstages = [\"fsr\"]\nlines = 1\n", "a", NULL, &p,
+                               err, sizeof err) == SHADER_PROFILE_OK
+          && p.lines == NV2A_PRESENT_LINES_AUTO);
     /* no name: the slug */
     CHECK(shader_profile_parse("version = 1\nstages = [\"fsr\"]\n", "a", "my-fsr", &p, err,
                                sizeof err) == SHADER_PROFILE_OK && !strcmp(p.name, "my-fsr"));

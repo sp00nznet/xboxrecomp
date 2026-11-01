@@ -90,6 +90,7 @@ static size_t                      s_conv_cap;
 static int                         s_internal;  /* present.surface=internal */
 static int                         s_layer_filter = -1;
 #ifdef XBOXRECOMP_ENHANCE
+static id<MTLRenderPipelineState>  s_pso_lines; /* present.shader: guest-line resolve */
 static id<MTLRenderPipelineState>  s_pso_ovl;  /* the overlay, premultiplied */
 static id<MTLTexture>              s_ovl_tex[1 + NV2A_OVL_IMAGES];
 static uint64_t                    s_ovl_tex_gen[1 + NV2A_OVL_IMAGES];
@@ -126,6 +127,16 @@ static const char s_blit_msl[] =
     "fragment float4 fs_blit(VO i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
     "                        sampler s [[sampler(0)]]) {\n"
     "    return float4(t.sample(s, i.t).rgb, 1);\n"
+    "}\n"
+    /* present.shader's resolve to the guest's lines: each row the mean of
+     * its n host rows, at the whole host width (D3D11's s_lrs_res_src). */
+    "fragment float4 fs_lines(VO i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+    "                         constant uint &n [[buffer(0)]]) {\n"
+    "    uint2 q = uint2(i.p.xy);\n"
+    "    float3 c = 0;\n"
+    "    for (uint k = 0; k < n; k++)\n"
+    "        c += t.read(uint2(q.x, q.y * n + k)).rgb;\n"
+    "    return float4(c / float(n), 1);\n"
     "}\n"
     /* The overlay: a list's vertices and indices as they are (20-byte
      * vertices, uint16 indices), each index read by vertex_id, so a command
@@ -185,6 +196,11 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         pd.vertexFunction = [[lib newFunctionWithName:@"vs_crop"] autorelease];
         s_pso_crop = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
 #ifdef XBOXRECOMP_ENHANCE
+        pd.vertexFunction = [[lib newFunctionWithName:@"vs_blit"] autorelease];
+        pd.fragmentFunction = [[lib newFunctionWithName:@"fs_lines"] autorelease];
+        s_pso_lines = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!s_pso_lines)
+            fprintf(stderr, "[SHADER] the guest-line resolve failed; the chain reads the host rows\n");
         pd.vertexFunction = [[lib newFunctionWithName:@"vs_ovl"] autorelease];
         pd.fragmentFunction = [[lib newFunctionWithName:@"fs_ovl"] autorelease];
         pd.colorAttachments[0].blendingEnabled = YES;
@@ -290,6 +306,8 @@ void fbm_destroy(void)
         s_pso_crop = nil;
 #ifdef XBOXRECOMP_ENHANCE
         chain_free();
+        [s_pso_lines release];
+        s_pso_lines = nil;
         [s_pso_ovl release];
         s_pso_ovl = nil;
         for (k = 0; k <= NV2A_OVL_IMAGES; k++) {
@@ -554,6 +572,32 @@ static PFN_libra_mtl_filter_chain_frame s_chain_ff;   /* with the chain */
 static PFN_libra_mtl_filter_chain_set_param s_chain_sp;
 static unsigned s_chain_pgen;       /* the parameter generation applied */
 static int s_chain_ov_said;
+static int s_chain_lines;           /* the preset draws per source line */
+static int s_chain_said;            /* the chain's first frame said how it was fed */
+/* The chain's input resolved to the guest's lines (nv2a_present_chain_source),
+ * and its output at the rectangle's size, drawn 1:1 into the drawable after:
+ * librashader gives the last pass the whole texture's size as OutputSize
+ * and FinalViewportSize, not the viewport's, so drawn straight into a
+ * letterboxed rectangle the mask was laid out for the whole drawable and
+ * squeezed into it (D3D11's s_lrs_out). */
+static id<MTLTexture> s_chain_src, s_chain_out;
+
+/* *t at w x h (BGRA8, private, a render target that is read after), made
+ * again when the size changed. A command buffer still in flight keeps the
+ * old one. */
+static id<MTLTexture> chain_tex(id<MTLTexture> *t, uint32_t w, uint32_t h)
+{
+    if (!*t || [*t width] != w || [*t height] != h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                         width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        td.storageMode = MTLStorageModePrivate;
+        [*t release];
+        *t = [s_dev newTextureWithDescriptor:td];
+    }
+    return *t;
+}
 
 static void chain_free(void)
 {
@@ -568,6 +612,9 @@ static void chain_free(void)
     s_chain = NULL;
     s_chain_ff = NULL;
     s_chain_sp = NULL;
+    [s_chain_src release];
+    [s_chain_out release];
+    s_chain_src = s_chain_out = nil;
     nv2a_present_chain_params_clear();
 }
 
@@ -609,7 +656,8 @@ static libra_mtl_filter_chain_t chain_get(void)
     s_chain_frames = 0;
     if (!nv2a_present_chain_wanted())
         return NULL;
-    found = nv2a_present_chain_preset(path, sizeof path, NULL);
+    found = nv2a_present_chain_preset_lines(path, sizeof path, NULL, &s_chain_lines);
+    s_chain_said = 0;
     l = found > 0 ? nv2a_present_chain_lib() : NULL;
     if (!l) {
         nv2a_present_chain_failed(gen);
@@ -726,6 +774,13 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 nv2a_present_crop(fw, fh, fw, fh, n, pad, ov, filter, &c);
             whole = nv2a_present_rect(ov ? c.fit_w : fw, ov ? c.fit_h : fh, (uint32_t)dw,
                                       (uint32_t)dh, filter, &r);
+#ifdef XBOXRECOMP_ENHANCE
+            /* The chain fills what the stock present shows: under
+             * internal the layer's fit, not an integer multiple. */
+            if (chain)
+                whole = nv2a_present_chain_rect(fw, fh, (uint32_t)dw, (uint32_t)dh, filter,
+                                                s_internal, &r);
+#endif
             if (internal) {
                 /* 1:1: the layer does the scaling. A crop is zoomed into the
                  * whole drawable with the present filter's sampler, except
@@ -738,13 +793,18 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                     filter = NV2A_PRESENT_NEAREST;
             }
 #ifdef XBOXRECOMP_ENHANCE
-            if (chain && r.w > 0 && r.h > 0) {
-                /* This pass only clears; the chain draws after it, into
-                 * the same rectangle, then the overlay's pass loads. */
-                libra_viewport_t lv = { (float)r.x, (float)r.y, (uint32_t)r.w, (uint32_t)r.h };
+            if (chain && r.w > 0 && r.h > 0
+                && chain_tex(&s_chain_out, (uint32_t)r.w, (uint32_t)r.h)) {
+                /* This pass only clears; the chain draws after it into
+                 * s_chain_out, which the next pass draws 1:1 into the
+                 * rectangle before the overlay. */
+                libra_viewport_t lv = { 0.0f, 0.0f, (uint32_t)r.w, (uint32_t)r.h };
                 frame_mtl_opt_t fo;
                 libra_error_t e;
                 char msg[512];
+                id<MTLTexture> src = s_slot[k];
+                uint32_t sw, sh;
+                int resolved = 0;
 
                 memset(&fo, 0, sizeof fo);
                 fo.version = LIBRASHADER_CURRENT_VERSION;
@@ -754,16 +814,53 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                     nv2a_present_chain_rate(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
                 [enc endEncoding];
                 enc = nil;
-                e = s_chain_ff(&chain, cb, s_chain_frames++, s_slot[k], d.texture, &lv, NULL,
-                               &fo);
+                nv2a_present_chain_source(fw, fh, n, s_chain_lines, &sw, &sh);
+                if (sh < fh && s_pso_lines && chain_tex(&s_chain_src, sw, sh)) {
+                    MTLRenderPassDescriptor *lp = [MTLRenderPassDescriptor renderPassDescriptor];
+                    id<MTLRenderCommandEncoder> le;
+                    uint32_t rows = fh / sh;
+                    lp.colorAttachments[0].texture = s_chain_src;
+                    lp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+                    lp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    le = [cb renderCommandEncoderWithDescriptor:lp];
+                    [le setRenderPipelineState:s_pso_lines];
+                    [le setFragmentTexture:s_slot[k] atIndex:0];
+                    [le setFragmentBytes:&rows length:sizeof rows atIndex:0];
+                    [le drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                    [le endEncoding];
+                    src = s_chain_src;
+                    resolved = 1;
+                }
+                /* Said at the first frame, once the source is known: a
+                 * height that is no multiple of the scale, or a resolve
+                 * that did not build, feeds the host rows even to a CRT. */
+                if (s_chain_lines && !s_chain_said) {
+                    s_chain_said = 1;
+                    if (resolved || n <= 1)
+                        fprintf(stderr, "[SHADER] present.shader: fed the guest's lines"
+                                " (%u of %u rows)\n", resolved ? sh : fh, fh);
+                    else
+                        fprintf(stderr, "[SHADER] present.shader: fed the host's %u rows (%s)\n",
+                                fh, sh < fh ? "the guest-line resolve failed"
+                                            : "not a multiple of render.scale");
+                }
+                e = s_chain_ff(&chain, cb, s_chain_frames++, src, s_chain_out, &lv, NULL, &fo);
+                rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+                enc = [cb renderCommandEncoderWithDescriptor:rp];
                 if (e) {
                     nv2a_present_chain_error(e, msg, sizeof msg);
                     fprintf(stderr, "[SHADER] present.shader off: frame: %s\n", msg);
                     nv2a_present_chain_failed(s_chain_gen);
                     chain_free();   /* the command buffer keeps what it uses */
+                } else {
+                    /* Same size, so nearest copies it texel for texel. */
+                    MTLViewport vp = { r.x, r.y, r.w, r.h, 0.0, 1.0 };
+                    [enc setRenderPipelineState:s_pso];
+                    [enc setViewport:vp];
+                    [enc setFragmentTexture:s_chain_out atIndex:0];
+                    [enc setFragmentSamplerState:s_smp[0] atIndex:0];
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
                 }
-                rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
-                enc = [cb renderCommandEncoderWithDescriptor:rp];
                 chained = 1;
             }
             if (!chained && r.w > 0 && r.h > 0) {

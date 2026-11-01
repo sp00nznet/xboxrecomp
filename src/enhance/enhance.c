@@ -140,6 +140,8 @@ static void load_tex_pack(const struct nv2a_host_opts *o)
 static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };
 /* Indexes match XBOX_PACING_SPIN / XBOX_PACING_SLEEP. */
 static const char *const s_pacing[] = { "spin", "sleep", NULL };
+/* present.shader_lines, in NV2A_PRESENT_LINES_* order. */
+static const char *const s_shader_lines[] = { "auto", "guest", "host", NULL };
 /* present.surface: "auto" (index 0) is resolved here, never stored. */
 static const char *const s_surface[] = { "auto", "window", "internal", NULL };
 /* textures.font / textures.text: words, as the menu shows them. */
@@ -152,7 +154,7 @@ int xbox_enhance_init(const char *root, const char *title)
     struct nv2a_host_opts o;
     const char *aspect, *shader_lib;
     long long scale, aniso, overscan;
-    int rc, pacing, surface;
+    int rc, pacing, surface, shader_lines;
     char surface_txt[48], overscan_txt[64] = "", hud_txt[96] = "", shader[512];
 
     rc = enhance_cfg_init(root, title) < 0 ? -1 : 0;
@@ -281,6 +283,14 @@ int xbox_enhance_init(const char *root, const char *title)
      * stock start never touches it, nor any profile file. */
     shader_lib = enhance_cfg_string("present.shader_lib", "");
     nv2a_present_chain_set_lib(shader_lib);
+    /* A config key only, no env row: it matters only with a shader on,
+     * and a preset the name test misses is a config fix, not a debug one.
+     * Said only when set, so the stock start line stays as it was. */
+    shader_lines = enhance_cfg_choice("present.shader_lines", s_shader_lines,
+                                      NV2A_PRESENT_LINES_AUTO);
+    nv2a_present_chain_set_lines(shader_lines);
+    if (shader_lines != NV2A_PRESENT_LINES_AUTO)
+        fprintf(stderr, LOGP "present.shader_lines=%s\n", s_shader_lines[shader_lines]);
     load_shader_params();
     switch (shader_profile_start(root, shader, sizeof shader)) {
     case 1:

@@ -57,8 +57,18 @@ void nv2a_present_chain_requested(char *out, size_t cap);
 /* Rows in the active parameter table (below), and names per stage. */
 #define NV2A_PRESENT_PARAMS_MAX 128
 
+/* How a chain is fed (present.shader_lines, a profile's `lines`): auto
+ * (the preset's name says whether it draws per source line), the guest's
+ * line count, or the host frame's rows. */
+#define NV2A_PRESENT_LINES_AUTO 0
+#define NV2A_PRESENT_LINES_GUEST 1
+#define NV2A_PRESENT_LINES_HOST 2
+
 struct nv2a_present_stage {
     char key[64];                     /* the stage's preset key */
+    /* NV2A_PRESENT_LINES_*: the profile's choice, read off the first stage
+     * only; auto (0, a zeroed stage) leaves it to the key. */
+    int lines;
     int nnames;
     char name[NV2A_PRESENT_PARAMS_MAX][64];   /* the parameters it declares */
 };
@@ -190,6 +200,35 @@ struct nv2a_present_param {
 /* The preset key of a request ("crt-lottes", or a path's sanitised stem)
  * into out; "" for "none". */
 void nv2a_present_chain_preset_key(const char *request, char *out, size_t cap);
+
+/* 1 when preset key names a preset that draws one scanline per source row,
+ * so it is fed the guest's line count (nv2a_present_chain_source): "crt"
+ * as a '-', '_' or '.' separated token anywhere (crt-lottes, zfast-crt,
+ * newpixie-crt) or leading the key (crtglow_gauss), or a token starting
+ * with "scanline". Case-insensitive. */
+int nv2a_present_chain_key_lines(const char *key);
+
+/* nv2a_present_chain_key_lines for a request or a stage reference (a
+ * bundled name or a .slangp path): its key, or a parent directory named
+ * "crt" (RetroArch's shaders_slang/crt/...). */
+int nv2a_present_chain_ref_lines(const char *ref);
+
+/* present.shader_lines, NV2A_PRESENT_LINES_*: guest or host wins over a
+ * profile's `lines` and the name; auto (the default) leaves them to it.
+ * Out of range is auto. Any thread. */
+void nv2a_present_chain_set_lines(int mode);
+
+/* 1 when the current request's chain is fed the guest's lines: the
+ * present.shader_lines choice, else a profile's first stage's `lines`,
+ * else that stage's key (nv2a_present_chain_key_lines), or for a
+ * present.shader request nv2a_present_chain_ref_lines on it. 0 for
+ * "none". Any thread. */
+int nv2a_present_chain_lines(void);
+
+/* nv2a_present_chain_preset with *lines_out set as nv2a_present_chain_lines,
+ * from the same snapshot of the request: a backend building a chain cannot
+ * pair one request's preset with the next one's line choice. */
+int nv2a_present_chain_preset_lines(char *out, size_t cap, unsigned *gen_out, int *lines_out);
 
 /* Read a parsed preset's parameters (preset: a libra_shader_preset_t *)
  * into out. Returns the count (0 when the library lacks the call). */

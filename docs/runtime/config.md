@@ -169,6 +169,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `present.shader` | string | `"none"`, `"crt-lottes"`, `"crt-lottes-fast"`, `"crt-hyllian"`, `"fsr"`, or a `.slangp` path: a RetroArch slang preset run by librashader in place of the final present, on Metal and D3D11 ([present.shader](#presentshader)) | `"none"` | `RECOMP_PRESENT_SHADER` |
 | `present.shader_params.<preset>.<param>` | number | a slang preset's runtime parameter, per preset: `<preset>` is the bundled name or a path's file stem, `<param>` a `#pragma parameter` name. Clamped to the parameter's range ([shader parameters](#shaderparams)) | the preset's own value | none |
 | `present.shader_lib` | string | the librashader library; relative to the executable's directory. Loaded as given, with no hash check (the sha256 pin covers only the build's own copy) | `librashader.dll` beside the executable; macOS `librashader.dylib` beside it, then `../Frameworks/librashader.dylib` | `RECOMP_PRESENT_SHADER_LIB` |
+| `present.shader_lines` | string | `"auto"`, `"guest"`, `"host"`: whether the shader chain gets the guest's line count or the frame at `render.scale` ([pass order](#presentshader)); `auto` decides by the preset's name. Over a profile's `lines` | `"auto"` | none |
 | `present.surface` | string | `"auto"`, `"window"`, `"internal"`: who scales the frame to the screen, the game or the compositor | `"auto"` | `RECOMP_PRESENT_SURFACE` |
 | `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
@@ -448,11 +449,12 @@ same requests at given flips, to check a switch without the menu.
 - **`present.shader`.** <a id="presentshader"></a>A RetroArch slang
   preset, run by [librashader](https://github.com/SnowflakePowered/librashader)
   0.12, replaces the draw that puts the frame on the screen. Its input is
-  the frame at `render.scale` (the whole frame, its guard band included),
-  and its output fills the same letterboxed rectangle the stock present
-  would, so the aspect, `present.surface` and the window size behave as
-  before; `present.filter` and `display.overscan` do not apply while a
-  shader runs (overscan says so once). The bundled presets sit in
+  the frame at `render.scale` (the whole frame, its guard band included;
+  a CRT preset gets it at the guest's line count, see the pass order
+  below), and its output fills the same letterboxed rectangle the stock
+  present would, so the aspect, `present.surface` and the window size
+  behave as before; `present.filter` and `display.overscan` do not apply
+  while a shader runs (overscan says so once). The bundled presets sit in
   `shaders/` beside the executable (`assets/shaders`, public domain, MIT
   and Unlicense only, listed in its README): `crt-lottes` and
   `crt-lottes-fast` (shadow mask, scanlines, curvature), `crt-hyllian`
@@ -493,9 +495,47 @@ same requests at given flips, to check a switch without the menu.
   at that size; otherwise the swap chain follows the window's client
   area. Metal's drawable follows the window. With the shader set back to
   `none` the frame-sized surface comes back at the next present.
-  `render.scale` above the output's height still gives more source lines
-  than output lines, which aliases the scanlines; pick a lower scale with
-  a CRT preset.
+
+  The pass order, the same on D3D11 and Metal:
+  1. The game draws its frame at `render.scale` (1280x960 at 2x).
+  2. When the chain is fed the guest's lines (below), the frame is
+     resolved to the guest's line count at full host width
+     (1280x480 at 2x, 1920x480 at 3x), each row the mean of its
+     `render.scale` host rows. A CRT preset draws one scanline per
+     source row, so a scaled frame gave it 960 or 1440 lines for an
+     output of 800 rows, under one pixel per scanline, and the beat
+     between the two showed as wide horizontal bands. Fed the guest's
+     480 lines the scanlines match scale 1, and the extra width keeps
+     the sharper picture across each line. Any other preset (`fsr`, a
+     path named otherwise) gets the scaled frame as it is, as does a
+     frame whose height is no multiple of `render.scale`. The first frame
+     logs which it got (`fed the guest's lines (480 of 960 rows)` or `fed
+     the host's 961 rows (not a multiple of render.scale)`).
+
+     Which presets get the guest's lines: `present.shader_lines = "guest"`
+     or `"host"` decides for every preset. Under `"auto"` (the default) a
+     profile's `lines` decides, and failing that the name of the preset
+     (a profile's first stage):
+     - `crt` leading the file stem (`crt-lottes`, `crtglow_gauss`) or as a
+       `-`, `_` or `.` separated word anywhere in it (`zfast-crt`,
+       `newpixie-crt`);
+     - a word starting with `scanline`;
+     - a parent folder named `crt`, as in RetroArch's `shaders_slang/crt/`.
+
+     A CRT preset named otherwise and kept outside a `crt` folder, such as
+     `megatron`, `gtu` or `mame_hlsl`, needs `"guest"` (or a profile with
+     `lines = "guest"`).
+  3. The chain runs into an intermediate the size of the letterboxed
+     rectangle, so each pass's `OutputSize` and `FinalViewportSize` are
+     the picture's, not the whole window's (librashader gives the final
+     pass its target's size, and a mask or curvature laid out for the
+     window was cut by the rectangle).
+  4. The intermediate is copied 1:1 into the rectangle; the bars stay
+     black. Under `present.surface = internal` the rectangle is the
+     letterboxed fit the compositor would have given the stock frame,
+     even with `present.filter = integer`, whose largest whole multiple
+     (1x at scale 1 on an 800-row screen) showed the picture smaller
+     with the shader on than off.
 - **Shader parameters.** <a id="shaderparams"></a>A slang preset declares
   runtime parameters (`#pragma parameter`: a name, a label, a range and a
   step). librashader reads them when the chain is built, and the menu's
@@ -593,6 +633,10 @@ maskDark = 0.6
   relative one, looked up in `<root>/shaders/` and then beside the
   executable. A file in `<root>/shaders/` named like a bundled preset is
   refused, so `fsr` always means the bundled one.
+- `lines` (string, optional): `"auto"`, `"guest"` or `"host"`, as
+  `present.shader_lines` for this profile, which a `"guest"` or `"host"`
+  there overrides. Only the first stage sees the frame, so it is read
+  for that stage. Another value is logged and taken as `"auto"`.
 - `[params.<preset key>]`: parameter values, keyed by the stage's preset
   key (the bundled name, or the file stem as for
   `present.shader_params`), so a reorder changes only `stages`. A value
@@ -633,7 +677,7 @@ choice the minimum plus its index, so
 
 Unknown keys and tables are reported (`[SHADER] <file>:<line>: unknown key
 <key>`) and kept: a save changes only `version`, `name`, `stages` and the
-`[params]` values, through `recomp_cfg_patch`, so comments and other lines
+`[params]` values (it keeps `lines` as it is), through `recomp_cfg_patch`, so comments and other lines
 stay. A file that does not parse is listed broken, with its error, and is
 never written.
 

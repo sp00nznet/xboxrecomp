@@ -50,6 +50,10 @@ struct shader_profile {
     int version;
     int nstages;
     char stage[SHADER_PROFILE_STAGES_MAX][SHADER_PROFILE_REF_MAX];
+    /* `lines = "auto" | "guest" | "host"`: how the chain is fed
+     * (NV2A_PRESENT_LINES_*, present.shader_lines); auto (0) when absent.
+     * Read, never written: Save keeps the line as any key it does not own. */
+    int lines;
     /* Differences from the composed preset's values, one per (key, name). */
     int nvalues;
     struct shader_profile_value value[SHADER_PROFILE_VALUES_MAX];

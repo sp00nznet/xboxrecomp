@@ -4426,34 +4426,60 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
 #ifdef XBOXRECOMP_ENHANCE
 /* ── present.shader (nv2a_present_chain.h) ──────────────────────────────
  *
- * librashader's D3D11 filter chain draws the frame into the scaling blit's
- * rectangle of the cleared back buffer, in place of the blit's triangle. Its
- * input is the frame at render.scale's host size, pads included: the whole
- * target when the frame fills it, else a copy of the frame's part (a grown
- * target holds more). Built on this thread when the request's generation
- * moves; "none" never loads the library. */
+ * librashader's D3D11 filter chain draws the frame into a texture the size
+ * of the scaling blit's rectangle, which is then copied into that rectangle
+ * of the cleared back buffer, in place of the blit's triangle. Its input is
+ * the frame at render.scale's host size, pads included: the whole target
+ * when the frame fills it, else a copy of the frame's part (a grown target
+ * holds more); for a CRT preset at render.scale > 1, the frame resolved to
+ * the guest's lines (nv2a_present_chain_source). Built on this thread when
+ * the request's generation moves; "none" never loads the library. */
 static libra_d3d11_filter_chain_t s_lrs_chain;
 static unsigned s_lrs_gen;
 static size_t s_lrs_frames;
+static int s_lrs_lines;             /* the chain's preset draws per source line */
+static int s_lrs_said;              /* the chain's first frame said how it was fed */
 static ID3D11Texture2D *s_lrs_src;
 static ID3D11ShaderResourceView *s_lrs_srv;
+static ID3D11RenderTargetView *s_lrs_src_rtv;   /* when s_lrs_src is a resolve */
+/* The chain's output, the rectangle's size: librashader gives the last pass
+ * the whole render target's size as OutputSize and FinalViewportSize, not
+ * the viewport's, so drawn straight into a letterboxed rectangle of the back
+ * buffer the mask (crt-lottes: vTexCoord / OutputSize.zw) was laid out for
+ * the whole back buffer and squeezed into the rectangle, and a
+ * viewport-scaled pass came out at the back buffer's size. */
+static ID3D11Texture2D *s_lrs_out;
+static ID3D11RenderTargetView *s_lrs_out_rtv;
+static ID3D11PixelShader *s_lrs_res_ps;
+static ID3D11Buffer *s_lrs_res_cb;
+static int s_lrs_res_failed;
 static PFN_libra_d3d11_filter_chain_frame s_lrs_ff;   /* with the chain */
 static PFN_libra_d3d11_filter_chain_set_param s_lrs_sp;
 static unsigned s_lrs_pgen;         /* the parameter generation applied */
 static int s_lrs_ov_said;
 
-/* The chain and its input copy: after a switch to none or a failure the
- * copy (host size, tens of MB at scale 4) is not kept for the session. */
+/* The chain, its input copy and its output: after a switch to none or a
+ * failure the copy (host size, tens of MB at scale 4) is not kept for the
+ * session. */
 static void lrs_free(void)
 {
     const struct nv2a_lrs *l;
     PFN_libra_d3d11_filter_chain_free fr;
     if (s_lrs_srv)
         ID3D11ShaderResourceView_Release(s_lrs_srv);
+    if (s_lrs_src_rtv)
+        ID3D11RenderTargetView_Release(s_lrs_src_rtv);
     if (s_lrs_src)
         ID3D11Texture2D_Release(s_lrs_src);
+    if (s_lrs_out_rtv)
+        ID3D11RenderTargetView_Release(s_lrs_out_rtv);
+    if (s_lrs_out)
+        ID3D11Texture2D_Release(s_lrs_out);
     s_lrs_srv = NULL;
+    s_lrs_src_rtv = NULL;
     s_lrs_src = NULL;
+    s_lrs_out_rtv = NULL;
+    s_lrs_out = NULL;
     s_lrs_ff = NULL;
     s_lrs_sp = NULL;
     if (!s_lrs_chain)
@@ -4488,7 +4514,8 @@ static libra_d3d11_filter_chain_t lrs_chain(void)
     s_lrs_frames = 0;
     if (!nv2a_present_chain_wanted())
         return NULL;
-    found = nv2a_present_chain_preset(path, sizeof path, NULL);
+    found = nv2a_present_chain_preset_lines(path, sizeof path, NULL, &s_lrs_lines);
+    s_lrs_said = 0;
     l = found > 0 ? nv2a_present_chain_lib() : NULL;
     if (!l) {
         nv2a_present_chain_failed(gen);
@@ -4592,52 +4619,156 @@ static int chain_surface(int on, int internal)
         }
     }
     if (w && h && (w != s_back_w || h != s_back_h)) {
+        RECT cr = {0, 0, 0, 0};
         swap_resize(w, h);
-        fprintf(stderr, "[SHADER] present.shader: back buffer %ux%u (the output's size)\n",
-                s_back_w, s_back_h);
+        /* The client area beside it: a window the compositor sees at
+         * another size than the swap chain is scaled by it. */
+        GetClientRect(s_hwnd, &cr);
+        fprintf(stderr, "[SHADER] present.shader: back buffer %ux%u (the output's size),"
+                " client %ldx%ld\n", s_back_w, s_back_h, (long)(cr.right - cr.left),
+                (long)(cr.bottom - cr.top));
     }
     return 1;
 }
 
-/* The chain's input: rt's w x h corner at host size. */
-static ID3D11ShaderResourceView *lrs_source(RenderTarget *rt, UINT w, UINT h)
+/* The resolve to the guest's lines: each output row the mean of its n host
+ * rows, at the whole host width (the extra sharpness stays across). */
+static const char s_lrs_res_src[] =
+    "Texture2D t0 : register(t0);\n"
+    "cbuffer C : register(b0) { int4 k; };\n"   /* k.x: host rows per guest line */
+    "float4 main(float4 p : SV_Position, float2 t : TEXCOORD0) : SV_Target {\n"
+    "    int2 q = int2(p.xy);\n"
+    "    float3 c = 0;\n"
+    "    for (int i = 0; i < k.x; i++)\n"
+    "        c += t0.Load(int3(q.x, q.y * k.x + i, 0)).rgb;\n"
+    "    return float4(c / k.x, 1);\n"
+    "}\n";
+
+static int lrs_res_init(void)
 {
+    ID3DBlob *code = NULL;
+
+    if (s_lrs_res_ps || s_lrs_res_failed)
+        return s_lrs_res_ps != NULL;
+    s_lrs_res_failed = 1;
+    if (!blit_init() || !compile("nv2a_present_lines_ps", s_lrs_res_src, "ps_5_0", &code))
+        return 0;
+    ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                   ID3D10Blob_GetBufferSize(code), NULL, &s_lrs_res_ps);
+    ID3D10Blob_Release(code);
+    s_lrs_res_cb = make_buffer(16, D3D11_BIND_CONSTANT_BUFFER);
+    if (!s_lrs_res_ps || !s_lrs_res_cb) {
+        fprintf(stderr, "[SHADER] the guest-line resolve failed; the chain reads the host rows\n");
+        return 0;
+    }
+    s_lrs_res_failed = 0;
+    return 1;
+}
+
+/* s_lrs_src at w x h of format f, made again when any of them changed.
+ * rtv: bindable as a render target (the resolve draws into it). */
+static int lrs_src_make(UINT w, UINT h, DXGI_FORMAT f, int rtv)
+{
+    D3D11_TEXTURE2D_DESC td;
+
+    if (s_lrs_src) {
+        ID3D11Texture2D_GetDesc(s_lrs_src, &td);
+        if (td.Width == w && td.Height == h && td.Format == f && !rtv == !s_lrs_src_rtv)
+            return 1;
+        ID3D11ShaderResourceView_Release(s_lrs_srv);
+        if (s_lrs_src_rtv)
+            ID3D11RenderTargetView_Release(s_lrs_src_rtv);
+        ID3D11Texture2D_Release(s_lrs_src);
+        s_lrs_srv = NULL;
+        s_lrs_src_rtv = NULL;
+        s_lrs_src = NULL;
+    }
+    memset(&td, 0, sizeof td);
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = f;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (rtv ? D3D11_BIND_RENDER_TARGET : 0);
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_lrs_src)))
+        return 0;
+    if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_lrs_src,
+                                                     NULL, &s_lrs_srv))
+        || (rtv && FAILED(ID3D11Device_CreateRenderTargetView(
+                s_dev, (ID3D11Resource *)s_lrs_src, NULL, &s_lrs_src_rtv)))) {
+        if (s_lrs_srv)
+            ID3D11ShaderResourceView_Release(s_lrs_srv);
+        ID3D11Texture2D_Release(s_lrs_src);
+        s_lrs_srv = NULL;
+        s_lrs_src_rtv = NULL;
+        s_lrs_src = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+/* The chain's input: rt's w x h corner at host size, or with sh < h that
+ * corner resolved to sh rows (sh = h / n, nv2a_present_chain_source).
+ * *resolved: 1 when it was, 0 when it is the host rows (sh == h, or the
+ * resolve shader failed to build). */
+static ID3D11ShaderResourceView *lrs_source(RenderTarget *rt, UINT w, UINT h, UINT sh,
+                                            int *resolved)
+{
+    static ID3D11ShaderResourceView *const none = NULL;
     D3D11_TEXTURE2D_DESC td;
     D3D11_BOX b;
 
     ID3D11Texture2D_GetDesc(rt->tex, &td);
+    *resolved = 0;
+    if (sh < h && lrs_res_init()) {
+        D3D11_MAPPED_SUBRESOURCE m;
+        D3D11_VIEWPORT vp;
+        int k[4] = { (int)(h / sh), 0, 0, 0 };
+        float uv[4] = { 1, 1, 0, 0 };
+
+        if (!lrs_src_make(w, sh, td.Format, 1))
+            return NULL;
+        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_lrs_res_cb, 0,
+                                           D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            return NULL;
+        memcpy(m.pData, k, sizeof k);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_lrs_res_cb, 0);
+        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
+                                           D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            return NULL;
+        memcpy(m.pData, uv, sizeof uv);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_lrs_src_rtv, NULL);
+        vp.TopLeftX = vp.TopLeftY = 0.0f;
+        vp.Width = (float)w;
+        vp.Height = (float)sh;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+        ID3D11DeviceContext_RSSetState(s_ctx, s_rs[0][0]);
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFF);
+        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
+        ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_lrs_res_ps, NULL, 0);
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_lrs_res_cb);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
+        ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+        /* Every binding above went behind the draw path's state shadow. */
+        s_sc_init = 0;
+        *resolved = 1;
+        return s_lrs_srv;
+    }
     if (td.Width == w && td.Height == h)
         return rt->srv;
-    if (s_lrs_src) {
-        D3D11_TEXTURE2D_DESC sd;
-        ID3D11Texture2D_GetDesc(s_lrs_src, &sd);
-        if (sd.Width != w || sd.Height != h || sd.Format != td.Format) {
-            ID3D11ShaderResourceView_Release(s_lrs_srv);
-            ID3D11Texture2D_Release(s_lrs_src);
-            s_lrs_srv = NULL;
-            s_lrs_src = NULL;
-        }
-    }
-    if (!s_lrs_src) {
-        td.Width = w;
-        td.Height = h;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.SampleDesc.Count = 1;
-        td.SampleDesc.Quality = 0;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        td.CPUAccessFlags = 0;
-        td.MiscFlags = 0;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_lrs_src)))
-            return NULL;
-        if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_lrs_src,
-                                                         NULL, &s_lrs_srv))) {
-            ID3D11Texture2D_Release(s_lrs_src);
-            s_lrs_src = NULL;
-            return NULL;
-        }
-    }
+    if (!lrs_src_make(w, h, td.Format, 0))
+        return NULL;
     b.left = b.top = b.front = 0;
     b.right = w;
     b.bottom = h;
@@ -4647,10 +4778,47 @@ static ID3D11ShaderResourceView *lrs_source(RenderTarget *rt, UINT w, UINT h)
     return s_lrs_srv;
 }
 
-/* rt through the chain into the back buffer at nv2a_present_rect's place
- * (the filter only sizes the rectangle: the chain samples). 0 when it did
- * not draw, and the caller presents as without a shader. */
-static int present_chain(RenderTarget *rt, int filter, int internal)
+/* s_lrs_out at w x h, the back buffer's format. */
+static int lrs_out_make(UINT w, UINT h)
+{
+    D3D11_TEXTURE2D_DESC td;
+
+    if (s_lrs_out) {
+        ID3D11Texture2D_GetDesc(s_lrs_out, &td);
+        if (td.Width == w && td.Height == h)
+            return 1;
+        ID3D11RenderTargetView_Release(s_lrs_out_rtv);
+        ID3D11Texture2D_Release(s_lrs_out);
+        s_lrs_out_rtv = NULL;
+        s_lrs_out = NULL;
+    }
+    memset(&td, 0, sizeof td);
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_lrs_out)))
+        return 0;
+    if (FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_lrs_out, NULL,
+                                                   &s_lrs_out_rtv))) {
+        ID3D11Texture2D_Release(s_lrs_out);
+        s_lrs_out = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+/* rt through the chain into the back buffer at the stock present's place
+ * (nv2a_present_chain_rect; the filter only sizes the rectangle: the chain
+ * samples). internal: the back buffer is the frame's size (no chain
+ * surface), so the chain fills it; surface_internal: the config asked for
+ * present.surface=internal. 0 when it did not draw, and the caller presents
+ * as without a shader. */
+static int present_chain(RenderTarget *rt, int filter, int internal, int surface_internal)
 {
     static const float black[4] = {0, 0, 0, 1};
     libra_d3d11_filter_chain_t chain;
@@ -4659,7 +4827,8 @@ static int present_chain(RenderTarget *rt, int filter, int internal)
     libra_viewport_t lv;
     libra_error_t e;
     struct nv2a_rect r;
-    UINT cw, ch, hcw, hch;
+    UINT cw, ch, hcw, hch, sw, sh;
+    int resolved;
     char msg[512];
 
     chain = lrs_chain();
@@ -4679,20 +4848,35 @@ static int present_chain(RenderTarget *rt, int filter, int internal)
         hcw = rt->hw;
     if (hch > rt->hh)
         hch = rt->hh;
-    src = lrs_source(rt, hcw, hch);
+    nv2a_present_chain_source(hcw, hch, rt->n, s_lrs_lines, &sw, &sh);
+    src = lrs_source(rt, hcw, hch, sh, &resolved);
     if (!src)
         return 0;
-    nv2a_present_rect(hcw, hch, s_back_w, s_back_h, filter, &r);
+    /* Said at the first frame, once the source is known: a height that is
+     * no multiple of the scale, or a resolve that did not build, feeds the
+     * host rows even to a CRT preset. */
+    if (s_lrs_lines && !s_lrs_said) {
+        s_lrs_said = 1;
+        if (resolved || rt->n <= 1)
+            fprintf(stderr, "[SHADER] present.shader: fed the guest's lines (%u of %u rows)\n",
+                    resolved ? sh : hch, hch);
+        else
+            fprintf(stderr, "[SHADER] present.shader: fed the host's %u rows (%s)\n", hch,
+                    sh < hch ? "the guest-line resolve failed" : "not a multiple of render.scale");
+    }
+    /* The rectangle keeps the host frame's shape: a resolved source is
+     * hcw wide and only ch high. */
+    nv2a_present_chain_rect(hcw, hch, s_back_w, s_back_h, filter, surface_internal, &r);
     if (internal) {
         r.x = r.y = 0;
         r.w = (int32_t)s_back_w;
         r.h = (int32_t)s_back_h;
     }
-    if (r.w <= 0 || r.h <= 0)
+    if (r.w <= 0 || r.h <= 0 || !lrs_out_make((UINT)r.w, (UINT)r.h))
         return 0;
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
-    lv.x = (float)r.x;
-    lv.y = (float)r.y;
+    lv.x = 0.0f;
+    lv.y = 0.0f;
     lv.width = (uint32_t)r.w;
     lv.height = (uint32_t)r.h;
     memset(&fo, 0, sizeof fo);
@@ -4700,7 +4884,7 @@ static int present_chain(RenderTarget *rt, int filter, int internal)
     fo.total_subframes = 1;
     fo.current_subframe = 1;
     fo.frames_per_second = nv2a_present_chain_rate((uint64_t)(sh_now_ms() * 1e6));
-    e = s_lrs_ff(&s_lrs_chain, s_ctx, s_lrs_frames++, src, s_back_rtv, &lv, NULL, &fo);
+    e = s_lrs_ff(&s_lrs_chain, s_ctx, s_lrs_frames++, src, s_lrs_out_rtv, &lv, NULL, &fo);
     /* Every binding the chain made went behind the draw path's state shadow. */
     s_sc_init = 0;
     if (e) {
@@ -4710,6 +4894,10 @@ static int present_chain(RenderTarget *rt, int filter, int internal)
         lrs_free();
         return 0;
     }
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_back, 0, (UINT)r.x,
+                                              (UINT)r.y, 0, (ID3D11Resource *)s_lrs_out, 0,
+                                              NULL);
     s_ovl_place = r;
     return 1;
 }
@@ -5063,7 +5251,8 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
          * crop has no place in it. */
         s_chained = 0;
         if (s_back && (nv2a_present_chain_wanted() || s_lrs_chain)) {
-            s_chained = present_chain(s_drawn, eo->present_filter, internal);
+            s_chained = present_chain(s_drawn, eo->present_filter, internal,
+                                      eo->present_surface == NV2A_PRESENT_SURFACE_INTERNAL);
             if (s_chained && eo->overscan && !s_lrs_ov_said++)
                 fprintf(stderr, "[SHADER] display.overscan=%u ignored while"
                         " present.shader runs\n", eo->overscan);

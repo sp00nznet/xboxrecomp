@@ -1,5 +1,6 @@
 /* display.overscan: the crop each GPU presenter samples (nv2a_present_crop)
- * and the destination nv2a_present_rect gives it. The whole frame at 0 is
+ * and the destination nv2a_present_rect gives it; present.shader's rect and
+ * source size (nv2a_present_chain_rect, nv2a_present_chain_source). The whole frame at 0 is
  * compared exactly, since the presenters run it at stock. */
 #include <math.h>
 #include <stdio.h>
@@ -114,6 +115,71 @@ int main(void)
     /* a zero size: the whole (empty) frame, no division by zero */
     nv2a_present_crop(0, 0, 0, 0, 1, 0, 9, NV2A_PRESENT_LINEAR, &c);
     CHECK(c.w == 0.0f && c.fit_w == 0);
+
+    /* present.shader's rect: with the chain on, the picture
+     * fills what the stock present shows. Under present.surface=internal
+     * the compositor fits the frame, so integer turns into the fit. */
+    whole = nv2a_present_chain_rect(1280, 960, 1280, 800, NV2A_PRESENT_INTEGER, 1, &r);
+    CHECK(whole == 0 && rect_is(&r, 106, 0, 1067, 800));
+    nv2a_present_rect(1280, 960, 1280, 800, NV2A_PRESENT_LINEAR, &r);
+    CHECK(rect_is(&r, 106, 0, 1067, 800));
+    /* elsewhere it is the stock rect, integer included */
+    nv2a_present_chain_rect(1280, 960, 2560, 1600, NV2A_PRESENT_INTEGER, 0, &r);
+    CHECK(rect_is(&r, 640, 320, 1280, 960));
+    nv2a_present_chain_rect(1280, 960, 1280, 800, NV2A_PRESENT_INTEGER, 0, &r);
+    {
+        struct nv2a_rect s;
+        nv2a_present_rect(1280, 960, 1280, 800, NV2A_PRESENT_INTEGER, &s);
+        CHECK(rect_is(&r, s.x, s.y, s.w, s.h));
+    }
+    nv2a_present_chain_rect(1536, 960, 1280, 800, NV2A_PRESENT_NEAREST, 1, &r);
+    CHECK(rect_is(&r, 0, 0, 1280, 800));
+    /* hor+ 16:9 (854 x 480 padded, 1708 x 960 at 2x) on the Deck under
+     * internal: integer is the fit, the 1/256 snap leaving it 720 high
+     * would need a 799-row output, so it keeps its 719 rows. */
+    nv2a_present_chain_rect(1708, 960, 1280, 800, NV2A_PRESENT_INTEGER, 1, &r);
+    {
+        struct nv2a_rect s;
+        nv2a_present_rect(1708, 960, 1280, 800, NV2A_PRESENT_LINEAR, &s);
+        CHECK(rect_is(&r, s.x, s.y, s.w, s.h));
+        CHECK(rect_is(&r, 0, 40, 1280, 719));
+    }
+    /* 1366 x 768 under internal, 4:3 at 2x: pillarboxed to 1024 wide */
+    nv2a_present_chain_rect(1280, 960, 1366, 768, NV2A_PRESENT_INTEGER, 1, &r);
+    CHECK(rect_is(&r, 171, 0, 1024, 768));
+    /* render.scale 3 under window keeps integer: 1x of 1920 x 1440 in
+     * 4K, centred; in 1280 x 800 no whole multiple fits, so the fit. */
+    nv2a_present_chain_rect(1920, 1440, 3840, 2160, NV2A_PRESENT_INTEGER, 0, &r);
+    CHECK(rect_is(&r, 960, 360, 1920, 1440));
+    nv2a_present_chain_rect(1920, 1440, 1280, 800, NV2A_PRESENT_INTEGER, 0, &r);
+    CHECK(rect_is(&r, 106, 0, 1067, 800));
+
+    /* present.shader's source: a crt* chain gets the guest's
+     * line count at full host width; anything else the scaled frame. */
+    {
+        uint32_t sw, sh;
+        nv2a_present_chain_source(1280, 960, 2, 1, &sw, &sh);
+        CHECK(sw == 1280 && sh == 480);
+        nv2a_present_chain_source(1920, 1440, 3, 1, &sw, &sh);
+        CHECK(sw == 1920 && sh == 480);
+        nv2a_present_chain_source(640, 480, 1, 1, &sw, &sh);
+        CHECK(sw == 640 && sh == 480);
+        nv2a_present_chain_source(1920, 1440, 3, 0, &sw, &sh);
+        CHECK(sw == 1920 && sh == 1440);
+        nv2a_present_chain_source(2, 1, 2, 1, &sw, &sh);
+        CHECK(sh == 1);
+        /* PAL at 3x: 576 lines */
+        nv2a_present_chain_source(2160, 1728, 3, 1, &sw, &sh);
+        CHECK(sw == 2160 && sh == 576);
+        nv2a_present_chain_source(1280, 962, 2, 1, &sw, &sh);
+        CHECK(sh == 481);
+        /* no whole guest line per 2 rows: the host rows, which a backend
+         * reads as no resolve (sh == hh) */
+        nv2a_present_chain_source(1280, 961, 2, 1, &sw, &sh);
+        CHECK(sw == 1280 && sh == 961);
+        nv2a_present_chain_source(1920, 1441, 3, 1, &sw, &sh);
+        CHECK(sh == 1441);
+    }
 
     printf("present_crop: ok\n");
     return 0;

@@ -350,6 +350,88 @@ static void case_params_key(void)
     key_is("C:\\mods\\My Shader.slangp", "My_Shader");
     key_is("/home/deck/shaders/crt-royale.v2.slangp", "crt-royale_v2");
     key_is("shaders/x.slangp", "x");
+
+    /* A CRT preset draws one scanline per source row, so it is fed the
+     * guest's lines; anything else keeps the scaled frame. */
+    CHECK(nv2a_present_chain_key_lines("crt-lottes"));
+    CHECK(nv2a_present_chain_key_lines("CRT-Royale_v2"));
+    CHECK(nv2a_present_chain_key_lines("crtglow_gauss"));
+    CHECK(nv2a_present_chain_key_lines("zfast-crt"));
+    CHECK(nv2a_present_chain_key_lines("newpixie-crt"));
+    CHECK(nv2a_present_chain_key_lines("my_CRT_v2"));
+    CHECK(nv2a_present_chain_key_lines("scanlines-sine-abs"));
+    CHECK(nv2a_present_chain_key_lines("fake_scanline"));
+    CHECK(!nv2a_present_chain_key_lines("fsr"));
+    CHECK(!nv2a_present_chain_key_lines("cr"));
+    CHECK(!nv2a_present_chain_key_lines("acrtx"));
+    CHECK(!nv2a_present_chain_key_lines("megatron"));
+    CHECK(!nv2a_present_chain_key_lines("scan"));
+    CHECK(!nv2a_present_chain_key_lines(""));
+    CHECK(!nv2a_present_chain_key_lines(NULL));
+    /* RetroArch's layout: the folder says it */
+    CHECK(nv2a_present_chain_ref_lines("/rs/shaders_slang/crt/gtu-v050.slangp"));
+    CHECK(nv2a_present_chain_ref_lines("C:\\rs\\CRT\\megatron.slangp"));
+    CHECK(!nv2a_present_chain_ref_lines("/rs/shaders_slang/crtx/gtu-v050.slangp"));
+    CHECK(!nv2a_present_chain_ref_lines("/rs/crt-stuff/edge/fsr.slangp"));
+    CHECK(!nv2a_present_chain_ref_lines("fsr"));
+    CHECK(!nv2a_present_chain_ref_lines("none"));
+    CHECK(nv2a_present_chain_ref_lines("crt-lottes"));
+    nv2a_present_chain_request("crt-hyllian");
+    CHECK(nv2a_present_chain_lines());
+    nv2a_present_chain_request("/home/deck/shaders/crt-royale.v2.slangp");
+    CHECK(nv2a_present_chain_lines());
+    nv2a_present_chain_request("/rs/shaders_slang/crt/mame_hlsl.slangp");
+    CHECK(nv2a_present_chain_lines());
+    nv2a_present_chain_request("/rs/shaders_slang/presets/mame_hlsl.slangp");
+    CHECK(!nv2a_present_chain_lines());
+    nv2a_present_chain_request("fsr");
+    CHECK(!nv2a_present_chain_lines());
+    nv2a_present_chain_request("none");
+    CHECK(!nv2a_present_chain_lines());
+
+    /* A profile: its first stage decides, not the composed file's name. */
+    {
+        static struct nv2a_present_stage st[2];
+        char out[1024];
+        int on = -1;
+
+        memset(st, 0, sizeof st);
+        snprintf(st[0].key, sizeof st[0].key, "crt-lottes");
+        snprintf(st[1].key, sizeof st[1].key, "fsr");
+        nv2a_present_chain_request_profile("soft", "/cache/soft.slangp", st, 2);
+        CHECK(nv2a_present_chain_lines());
+        snprintf(st[0].key, sizeof st[0].key, "fsr");
+        snprintf(st[1].key, sizeof st[1].key, "crt-lottes");
+        nv2a_present_chain_request_profile("up", "/cache/crt/up.slangp", st, 2);
+        CHECK(!nv2a_present_chain_lines());
+        /* the profile's own lines over the key */
+        st[0].lines = NV2A_PRESENT_LINES_GUEST;
+        nv2a_present_chain_request_profile("up", "/cache/up.slangp", st, 2);
+        CHECK(nv2a_present_chain_lines());
+        snprintf(st[0].key, sizeof st[0].key, "crt-lottes");
+        st[0].lines = NV2A_PRESENT_LINES_HOST;
+        nv2a_present_chain_request_profile("soft", "/cache/soft.slangp", st, 2);
+        CHECK(!nv2a_present_chain_lines());
+        /* present.shader_lines over both */
+        nv2a_present_chain_set_lines(NV2A_PRESENT_LINES_GUEST);
+        CHECK(nv2a_present_chain_lines());
+        nv2a_present_chain_request("fsr");
+        CHECK(nv2a_present_chain_lines());
+        /* the path and the choice come from one snapshot */
+        nv2a_present_chain_preset_lines(out, sizeof out, NULL, &on);
+        CHECK(on == 1);
+        nv2a_present_chain_set_lines(NV2A_PRESENT_LINES_HOST);
+        nv2a_present_chain_request("crt-lottes");
+        CHECK(!nv2a_present_chain_lines());
+        nv2a_present_chain_request("none");
+        on = -1;
+        CHECK(nv2a_present_chain_preset_lines(out, sizeof out, NULL, &on) == 0 && on == 0);
+        nv2a_present_chain_set_lines(99);
+        nv2a_present_chain_request("crt-lottes");
+        CHECK(nv2a_present_chain_lines());
+        nv2a_present_chain_set_lines(NV2A_PRESENT_LINES_AUTO);
+        nv2a_present_chain_request("none");
+    }
 }
 
 /* The dump's parse: no GPU and no chain, and the active table untouched.

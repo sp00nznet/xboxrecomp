@@ -236,6 +236,13 @@ static int request_locked(const struct shader_profile *p, unsigned flags, char *
          * without the library there is no chain to tag, so none. */
         k = nv2a_present_chain_describe(path[s], rows, NV2A_PRESENT_PARAMS_MAX);
         shader_profile_stage_key(p->stage[s], s_stage[s].key, sizeof s_stage[s].key);
+        /* The first stage sees the frame: the profile's choice, else a
+         * preset under a crt folder, which its key alone cannot show. */
+        s_stage[s].lines = NV2A_PRESENT_LINES_AUTO;
+        if (s == 0)
+            s_stage[s].lines = p->lines != NV2A_PRESENT_LINES_AUTO ? p->lines
+                : nv2a_present_chain_ref_lines(path[s]) ? NV2A_PRESENT_LINES_GUEST
+                : NV2A_PRESENT_LINES_AUTO;
         s_stage[s].nnames = k > 0 ? k : 0;
         for (int i = 0; i < s_stage[s].nnames; i++) {
             snprintf(s_stage[s].name[i], sizeof s_stage[s].name[i], "%s", rows[i].name);
