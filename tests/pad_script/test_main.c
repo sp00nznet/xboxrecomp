@@ -396,6 +396,14 @@ static void test_anchor_give_up(void)
           && a.armed == 2);
     CHECK(strstr(log, ", and 1 later anchor(s) it passed; 2 step(s) skipped"));
     CHECK(a.a[1].seen_flip == 200);
+
+    /* A record's @end under a given-up anchor presses nothing: not a
+     * skipped step. */
+    memset(&a, 0, sizeof a);
+    CHECK(pad_script_parse_anchored("f100:@open:movie f110:b:4 f120:@end",
+                                    s, 0, 4, &a) == 2 && s[1].end && s[1].anchor);
+    CHECK(pad_anchors_tick(&a, s, 2, 100 + PAD_ANCHOR_GIVE_UP_FLIPS, log, sizeof log) == 1
+          && strstr(log, "; 1 step(s) skipped"));
     CHECK(!pad_anchor_retry(&a, 0, 100 + PAD_ANCHOR_GIVE_UP_FLIPS + 10, &r, NULL, 0));
 
     /* Several overdue at once all go, each read on the give-up's clock. */
@@ -770,7 +778,38 @@ static void test_end_marker(void)
           && strcmp(line, "g61:@end\n") == 0);
     CHECK(pad_recorder_end_line(rec, 2, 90, line, sizeof line) > 0
           && strcmp(line, "g90:@end\n") == 0);
-    CHECK(pad_recorder_end_line(rec, 2, 90, line, 5) == 0);
+    CHECK(pad_recorder_end_line(rec, 2, 90, line, 5) == 0 && !line[0]);
+    /* A step that does not fit leaves no cut line behind: the recorder
+     * formats without snprintf (signal-safe) and writes a line whole. */
+    {
+        PadRecorder one;
+        memset(&one, 0, sizeof one);
+        one.poll = 1;
+        pad_recorder_feed(&one, bits(1, 0, 0, 0), 10, out, sizeof out);
+        pad_recorder_feed(&one, bits(0, 0, 0, 0), 14, out, sizeof out);
+        CHECK(pad_recorder_feed(&one, bits(0, 0, 0, 0), 15, line, 6) == 0
+              && !line[0]);
+        memset(&one, 0, sizeof one);
+        one.poll = 1;
+        one.pad = 2;
+        pad_recorder_feed(&one, bits(1, 0, 0, 0), 4000000000u, out, sizeof out);
+        CHECK(pad_recorder_end(&one, 4000000007u, out, sizeof out) == 1
+              && strcmp(out, "g4000000000:p3-up:7\n") == 0);
+        /* A negative axis, and a poll-clock depth, exactly. */
+        memset(&one, 0, sizeof one);
+        pad_recorder_feed(&one, bits(0, 0, -32768, 0), 10, out, sizeof out);
+        CHECK(pad_recorder_end(&one, 12, out, sizeof out) == 1
+              && strcmp(out, "f10:lx=-32768:2\n") == 0);
+        {
+            PadBits lt = bits(0, 0, 0, 0);
+            lt.av[6] = 97;   /* lt, a light press */
+            memset(&one, 0, sizeof one);
+            one.poll = 1;
+            pad_recorder_feed(&one, lt, 10, out, sizeof out);
+            CHECK(pad_recorder_end(&one, 13, out, sizeof out) == 1
+                  && strcmp(out, "g10:lt=97:3\n") == 0);
+        }
+    }
     rec[0].poll = 0;
     CHECK(pad_recorder_end_line(rec, 1, 90, line, sizeof line) > 0
           && strcmp(line, "f90:@end\n") == 0);

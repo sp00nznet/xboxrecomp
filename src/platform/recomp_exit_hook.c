@@ -60,6 +60,5 @@ int recomp_quit_post(const char *why)
     recomp_quit_fn fn = __atomic_load_n(&s_quit, __ATOMIC_ACQUIRE);
     if (fn == NULL)
         return 0;
-    fn(why);
-    return 1;
+    return fn(why) ? 1 : 0;
 }

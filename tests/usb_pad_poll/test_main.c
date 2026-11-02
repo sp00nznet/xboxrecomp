@@ -20,7 +20,12 @@
  *    must miss some poll, or the poll run proves nothing;
  *  - the headless quit: no window to post to and a script without @end
  *    (a record from before it): pad_quit ends the run on a thread of its
- *    own, with 0, once the last step has ended.
+ *    own, with 0, once the last step has ended. The title keeps polling
+ *    while that thread runs the exit hooks: a test hook holds the thread
+ *    until three more polls have gone by, and the record must still end
+ *    with one @end, written by the hook, not a second one from atexit;
+ *  - the refused post: a window whose poster fails (SDL's full queue) must
+ *    not lose the quit; the quit thread ends the run as without a window.
  */
 #include "pad_script.h"
 #include "recomp_exit_hook.h"
@@ -46,6 +51,8 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define POLLS 120     /* the child's polls */
 #define LAST  60      /* the script's last step ends here */
 #define END   64      /* and its @end here */
+#define SLACK 8       /* the headless quit comes this many polls past LAST */
+#define AFTER 3       /* polls the title makes while the quit's hooks run */
 
 static int failures;
 
@@ -74,49 +81,106 @@ static uint32_t flip_of(uint32_t p)
     return p - p / 3;
 }
 
-static volatile int s_quit_posted;
+static volatile int s_quit_posted, s_refused;
 
-static void window_close(const char *why)
+static int window_close(const char *why)
 {
     (void)why;
     s_quit_posted = 1;
+    return 1;
+}
+
+/* A window that cannot take the close. */
+static int window_refuses(const char *why)
+{
+    (void)why;
+    s_refused++;
+    return 0;
+}
+
+static volatile int s_hooked, s_polled_after;
+static int s_mode;
+
+/* Runs on the quit thread after the recorder's hook has ended the record:
+ * hold it there until the title has polled AFTER more times. */
+static void quit_hook(const char *why)
+{
+    int i;
+
+    (void)why;
+    if (s_mode == 3 && s_refused != 1)
+        _exit(4);           /* the quit did not go through the poster */
+    __atomic_store_n(&s_hooked, 1, __ATOMIC_RELEASE);
+    for (i = 0; i < 4000 && !__atomic_load_n(&s_polled_after, __ATOMIC_ACQUIRE); i++)
+        usleep(1000);
+}
+
+static void poll_once(uint32_t p, FILE *seen)
+{
+    XBOX_GAMEPAD g;
+    uint32_t f = flip_of(p);
+
+    if (!p || f != flip_of(p - 1))
+        usb_gamepad_flip(f);
+    game_sources(p, &g);
+    usb_gamepad_game_press(0, &g);
+    /* The window's loop: the close comes before the title sees more. */
+    if (s_quit_posted) {
+        if (seen)
+            fclose(seen);
+        exit(0);
+    }
+    usb_gamepad_game_record(0, &g);
+    if (seen) {
+        fwrite(&g, sizeof g, 1, seen);
+        fflush(seen);
+    }
 }
 
 /* mode 0: the poll run, a window taking the quit; 1: the flip control,
- * which ends on its own; 2: the headless quit. */
+ * which ends on its own; 2: the headless quit; 3: a window refusing it. */
 static void child(int mode)
 {
     FILE *seen = mode == 0 ? fopen(SEEN_PATH, "wb") : NULL;
-    XBOX_GAMEPAD g;
-    uint32_t p, polls = mode == 2 ? 4000 : POLLS;
+    uint32_t p;
+    int i, after = 0;
 
+    s_mode = mode;
     if (mode == 0 && !seen)
         _exit(2);
     if (mode == 0)
         recomp_quit_set(window_close);
-    for (p = 0; p < polls; p++) {
-        uint32_t f = flip_of(p);
-        if (!p || f != flip_of(p - 1))
-            usb_gamepad_flip(f);
-        game_sources(p, &g);
-        usb_gamepad_game_press(0, &g);
-        /* The window's loop: the close comes before the title sees more. */
-        if (s_quit_posted) {
-            if (seen)
-                fclose(seen);
-            exit(0);
-        }
-        usb_gamepad_game_record(0, &g);
-        if (seen) {
-            fwrite(&g, sizeof g, 1, seen);
-            fflush(seen);
-        }
-        if (mode == 2)
-            usleep(1000);   /* the quit's own thread gets 4 s */
+    if (mode == 3)
+        recomp_quit_set(window_refuses);
+    if (mode < 2) {
+        for (p = 0; p < POLLS; p++)
+            poll_once(p, seen);
+        if (mode == 1)
+            exit(0);        /* atexit writes the held steps */
+        _exit(3);           /* pad_quit never came */
     }
-    if (mode == 1)
-        exit(0);            /* atexit writes the held steps */
-    _exit(3);               /* pad_quit never came */
+    for (p = 0;; p++) {
+        if (__atomic_load_n(&s_hooked, __ATOMIC_ACQUIRE)) {
+            if (after++ == AFTER) {
+                /* Let the quit thread exit; this thread stops polling. */
+                __atomic_store_n(&s_polled_after, 1, __ATOMIC_RELEASE);
+                for (;;)
+                    usleep(1000);
+            }
+        } else if (p >= LAST + SLACK) {
+            /* pad_quit is decided in the poll that ends the last step, so
+             * by now its thread is on its way: wait for it, up to 4 s. */
+            for (i = 0; i < 4000 && !__atomic_load_n(&s_hooked, __ATOMIC_ACQUIRE); i++)
+                usleep(1000);
+            if (!__atomic_load_n(&s_hooked, __ATOMIC_ACQUIRE))
+                _exit(3);   /* pad_quit never came */
+            continue;
+        }
+        poll_once(p, NULL);
+        /* The recorder's hook goes in at the first poll; this one after it. */
+        if (p == 0)
+            recomp_exit_hook_add(quit_hook);
+    }
 }
 
 static int run(int mode, const char *debug)
@@ -249,21 +313,38 @@ int main(void)
             printf("  the flip record's first miss: poll %ld\n", miss);
     }
 
-    /* The headless quit, for a script with no @end. */
-    rc = run(2, "pad_clock=poll,pad_quit,pad_record=" HEAD_PATH
-                ",pad_script=g10:a:4,g55:rt=97:5");
-    check(rc == 0, "without a window pad_quit ends the run itself, with 0");
-    slurp(HEAD_PATH, text, sizeof text);
+    /* The headless quit, for a script with no @end, and the same with a
+     * window that refuses the post. */
     {
-        const char *e = strstr(text, ":@end\n");
-        unsigned long at = 0;
-        if (e) {
-            while (e > text && e[-1] != '\n')
-                e--;
-            at = strtoul(e + 1, NULL, 10);
+        int mode;
+        for (mode = 2; mode <= 3; mode++) {
+            const char *e, *last;
+            unsigned long at = 0;
+            int ends = 0;
+
+            remove(HEAD_PATH);
+            rc = run(mode, "pad_clock=poll,pad_quit,pad_record=" HEAD_PATH
+                           ",pad_script=g10:a:4,g55:rt=97:5");
+            check(rc == 0, mode == 2
+                  ? "without a window pad_quit ends the run itself, with 0"
+                  : "a refused post falls back to the quit thread, with 0");
+            slurp(HEAD_PATH, text, sizeof text);
+            for (e = text; (e = strstr(e, ":@end\n")) != NULL; e++)
+                ends++;
+            if (ends != 1)
+                printf("%s", text);
+            check(ends == 1, "one @end, though the title polled during the quit");
+            last = strstr(text, ":@end\n");
+            if (last) {
+                e = last;
+                while (e > text && e[-1] != '\n')
+                    e--;
+                at = strtoul(e + 1, NULL, 10);
+            }
+            check(last && e[0] == 'g' && at >= LAST && at <= LAST + SLACK + 1,
+                  "a script without @end quits a few polls past its last release");
+            check(last && last[6] == 0, "nothing is recorded after the @end");
         }
-        check(e && e[0] == 'g' && at >= LAST,
-              "a script without @end quits after its last release");
     }
 
     remove(REC_PATH);

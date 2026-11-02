@@ -373,10 +373,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 
 /* A quit asked for off this thread (RECOMP_DEBUG=pad_quit): closed as the
  * close button closes it, by WM_CLOSE on the thread that pumps the window. */
-static void post_close(const char *why)
+static int post_close(const char *why)
 {
     (void)why;
-    PostMessageA(s_hwnd, WM_CLOSE, 0, 0);
+    return PostMessageA(s_hwnd, WM_CLOSE, 0, 0) ? 1 : 0;
 }
 
 static void pump(void)
@@ -632,7 +632,6 @@ static int init(void)
         fprintf(stderr, LOGP "CreateWindow failed (%lu)\n", GetLastError());
         return 0;
     }
-    recomp_quit_set(post_close);
     s_sync_interval = recomp_env_on(RENV_PRESENT_VSYNC) ? 1 : 0;
     if (recomp_env(RENV_PRESENT_VSYNC))
         fprintf(stderr, LOGP "present vsync %s (RECOMP_PRESENT_VSYNC=%s)\n",
@@ -739,6 +738,10 @@ static int init(void)
 #ifdef XBOXRECOMP_ENHANCE
     nv2a_present_chain_host("D3D11");
 #endif
+    /* Only once the device is up: a failed init returns before any frame
+     * is pumped, and a poster left behind would take pad_quit's close for
+     * a window that never closes, and the quit would be lost. */
+    recomp_quit_set(post_close);
     s_failed = 0;
     return 1;
 }

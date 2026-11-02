@@ -787,14 +787,14 @@ static void mac_fullscreen_level(SDL_Window *win, int full, int spaces_off)
 #endif
 
 /* SDL_PushEvent may be called from any thread. */
-static void post_quit(const char *why)
+static int post_quit(const char *why)
 {
     SDL_Event q;
 
     (void)why;
     memset(&q, 0, sizeof q);
     q.type = SDL_EVENT_QUIT;
-    SDL_PushEvent(&q);
+    return SDL_PushEvent(&q) ? 1 : 0;
 }
 
 int xbox_HostWindowMain(int (*guest_main)(void))

@@ -627,6 +627,9 @@ static void pad_script_quit(unsigned long t, uint32_t clock)
     fprintf(stderr, "  PAD: the script's last step has ended (%s %u): quitting"
             " (pad_quit)\n", s_script_poll ? "poll" : "flip", (unsigned)clock);
     fflush(stderr);
+    /* A post the window refused (a full SDL queue, a window already gone)
+     * would lose the quit, which is asked only once: the quit thread ends
+     * the run then, as without a window. */
     if (recomp_quit_post("pad_quit"))
         return;
     if (!CreateThread(NULL, 0, pad_quit_thread, (LPVOID)"pad_quit", 0, NULL))
@@ -804,20 +807,37 @@ static PadRecorder s_rec[USB_GAMEPAD_MAX];
 static void pad_record_end(void)
 {
     char lines[512], end[32];
+    FILE *f;
     int i, w;
 
-    if (!s_rec_file)
+    /* Under the lock the pad thread feeds the recorders under, and only
+     * once: atexit and the exit hook both come here, and the hook may run
+     * on another thread (pad_quit's, the window's) while the title still
+     * polls. A pad poll after the end would start its recorder again, and
+     * the second pass would write a step and a second, later @end. With
+     * s_rec_file gone pad_record writes nothing more.
+     *
+     * The unlocked check first: once the record has ended, a second pass
+     * must not take the lock. A signal handler chained after ours may call
+     * exit() on a thread that holds it (inside pad_record), and the rwlock
+     * is not recursive, so atexit would deadlock there. */
+    if (!__atomic_load_n(&s_rec_file, __ATOMIC_ACQUIRE))
         return;
-    /* Before pad_recorder_end, which forgets the pads' last reports; and
-     * only once, since atexit and the exit hook both come here (the second
-     * finds no pad started and writes nothing). */
-    w = pad_recorder_end_line(s_rec, USB_GAMEPAD_MAX, rec_clock(), end, sizeof end);
-    for (i = 0; i < USB_GAMEPAD_MAX; i++)
-        if (pad_recorder_end(&s_rec[i], rec_clock(), lines, sizeof lines))
-            fputs(lines, s_rec_file);
-    if (w > 0)
-        fputs(end, s_rec_file);
-    fflush(s_rec_file);
+    AcquireSRWLockExclusive(&s_anchor_lock);
+    f = __atomic_load_n(&s_rec_file, __ATOMIC_ACQUIRE);
+    if (f) {
+        /* Before pad_recorder_end, which forgets the pads' last reports. */
+        w = pad_recorder_end_line(s_rec, USB_GAMEPAD_MAX, rec_clock(), end,
+                                  sizeof end);
+        for (i = 0; i < USB_GAMEPAD_MAX; i++)
+            if (pad_recorder_end(&s_rec[i], rec_clock(), lines, sizeof lines))
+                fputs(lines, f);
+        if (w > 0)
+            fputs(end, f);
+        fflush(f);
+        __atomic_store_n(&s_rec_file, NULL, __ATOMIC_RELEASE);
+    }
+    ReleaseSRWLockExclusive(&s_anchor_lock);
 }
 
 static void pad_record_exit_hook(const char *why)
@@ -831,9 +851,12 @@ static void pad_record_exit_hook(const char *why)
  * that last step. The handler writes the held steps with write(2), not
  * stdio: every fputs to the record is flushed at once, so its buffer is
  * empty unless the signal lands mid-fputs, and write cannot deadlock on the
- * FILE's lock. Then the handler that was there before runs (the [MEM]
- * exit line's, or the default), so the stop still means what it did and
- * the bench keeps its memory line. Only installed while recording. */
+ * FILE's lock. The lines are formatted without stdio too (pad_script.h).
+ * It takes no lock, which a signal cannot; a signal landing inside
+ * pad_record_end may write the end twice, and nothing worse. Then the
+ * handler that was there before runs (the [MEM] exit line's, or the
+ * default), so the stop still means what it did and the bench keeps its
+ * memory line. Only installed while recording. */
 typedef void (*pad_sig_fn)(int);
 static pad_sig_fn s_rec_old_int = SIG_DFL, s_rec_old_term = SIG_DFL;
 
@@ -842,17 +865,17 @@ static void pad_record_signal(int sig)
     pad_sig_fn old = sig == SIGINT ? s_rec_old_int : s_rec_old_term;
 
     char lines[512], end[32];
+    FILE *f = __atomic_exchange_n(&s_rec_file, NULL, __ATOMIC_ACQ_REL);
     int i, fd, w;
 
-    if (s_rec_file) {
-        fd = fileno(s_rec_file);
+    if (f) {
+        fd = fileno(f);
         w = pad_recorder_end_line(s_rec, USB_GAMEPAD_MAX, rec_clock(), end, sizeof end);
         for (i = 0; i < USB_GAMEPAD_MAX; i++)
             if (pad_recorder_end(&s_rec[i], rec_clock(), lines, sizeof lines))
                 (void)!pad_write(fd, lines, (unsigned)strlen(lines));
         if (w > 0)
             (void)!pad_write(fd, end, (unsigned)w);
-        s_rec_file = NULL;
     }
     signal(sig, old == SIG_ERR ? SIG_DFL : old);
     raise(sig);
@@ -895,7 +918,7 @@ static int anchor_wanted(const char *path)
 /* Under s_anchor_lock: a refusal goes to log[0..logn), printed after it. */
 static void pad_record_open(const char *path, char *log, size_t logn)
 {
-    FILE *f = s_rec_file;
+    FILE *f = __atomic_load_n(&s_rec_file, __ATOMIC_ACQUIRE);
     char line[512];
     uint32_t at;
     const char *name;
@@ -938,7 +961,7 @@ static void pad_record(int pad, const uint8_t *out, uint32_t flip)
                 fprintf(stderr, "  PAD: cannot write the pad record %s\n", path);
             } else {
                 state = 1;
-                s_rec_file = f;
+                __atomic_store_n(&s_rec_file, f, __ATOMIC_RELEASE);
                 atexit(pad_record_end);
                 recomp_exit_hook_add(pad_record_exit_hook);
                 s_rec_old_int = signal(SIGINT, pad_record_signal);
@@ -962,13 +985,14 @@ static void pad_record(int pad, const uint8_t *out, uint32_t flip)
     }
     if (!state || pad < 0 || pad >= USB_GAMEPAD_MAX)
         return;
-    f = s_rec_file;
-    if (!f)   /* the signal path has written the record's end */
+    if (!__atomic_load_n(&s_rec_file, __ATOMIC_ACQUIRE))   /* the end is written */
         return;
-    /* One uncontended lock per pad poll, only while recording. */
+    /* One uncontended lock per pad poll, only while recording. The file is
+     * read again under it: pad_record_end may have ended the record since. */
     AcquireSRWLockExclusive(&s_anchor_lock);
-    if (pad_recorder_feed(&s_rec[pad], pad_bits_from_report(out), flip, lines,
-                          sizeof lines)) {
+    f = __atomic_load_n(&s_rec_file, __ATOMIC_ACQUIRE);
+    if (f && pad_recorder_feed(&s_rec[pad], pad_bits_from_report(out), flip,
+                               lines, sizeof lines)) {
         fputs(lines, f);
         fflush(f);
     }

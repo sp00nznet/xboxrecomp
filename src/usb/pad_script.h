@@ -248,7 +248,10 @@ int pad_recorder_end(PadRecorder *r, uint32_t flip, char *out, size_t n);
 /* The record's end line, "f<flip>:@end\n" (g<poll> on the poll clock), at
  * flip or past every pad's last report, whichever is later; call it before
  * pad_recorder_end, which forgets them. Returns the line's length, 0 when
- * no pad reported (nothing was recorded) or out is too small. */
+ * no pad reported (nothing was recorded) or out is too small.
+ *
+ * pad_recorder_end and pad_recorder_end_line are async-signal-safe: they
+ * format without stdio, so a signal handler may end a record with them. */
 int pad_recorder_end_line(const PadRecorder *recs, int n, uint32_t flip,
                           char *out, size_t size);
 

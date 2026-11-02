@@ -429,7 +429,8 @@ static int count_skipped(PadAnchors *a, const PadStep *steps, int nsteps)
     for (i = 0; i < nsteps; i++) {
         const PadStep *st = &steps[i];
         const PadAnchor *an;
-        if (!st->anchor || st->anchor > a->n || !st->by_flip)
+        /* @end presses nothing: passing it skips no input. */
+        if (st->end || !st->anchor || st->anchor > a->n || !st->by_flip)
             continue;
         an = &a->a[st->anchor - 1];
         if (an->skip && st->at + st->hold <= an->skip_clock)
@@ -710,6 +711,71 @@ void pad_step_press(const PadStep *st, uint8_t *out)
  * resting under a finger, not pressed. */
 #define ANALOG_PRESSED 30
 
+/* The recorder's lines are built without snprintf: pad_record's SIGINT and
+ * SIGTERM handler ends the record through pad_recorder_end and
+ * pad_recorder_end_line, and POSIX does not list snprintf as
+ * async-signal-safe (a C library may take the locale's lock or allocate in
+ * it). strlen and memcpy it does list. A piece is built whole, then goes
+ * into the line all or nothing, so a line that does not fit leaves no cut
+ * text behind. */
+typedef struct {
+    char s[192];             /* a step's line: "g<u32>:p4-" + 127 + ":<u32>\n" */
+    size_t len;
+    int over;
+} Piece;
+
+static void pc_str(Piece *p, const char *s)
+{
+    size_t k = strlen(s);
+    if (p->over || k >= sizeof p->s - p->len) {
+        p->over = 1;
+        return;
+    }
+    memcpy(p->s + p->len, s, k);
+    p->len += k;
+    p->s[p->len] = 0;
+}
+
+static void pc_char(Piece *p, char c)
+{
+    char one[2];
+    one[0] = c;
+    one[1] = 0;
+    pc_str(p, one);
+}
+
+static void pc_uint(Piece *p, unsigned long v)
+{
+    char d[24];
+    size_t i = sizeof d - 1;
+    d[i] = 0;
+    do {
+        d[--i] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v && i);
+    pc_str(p, d + i);
+}
+
+static void pc_int(Piece *p, long v)
+{
+    if (v < 0) {
+        pc_char(p, '-');
+        pc_uint(p, 0ul - (unsigned long)v);
+    } else {
+        pc_uint(p, (unsigned long)v);
+    }
+}
+
+/* The piece onto out at *used, whole or not at all: 1 when it went. */
+static int pc_put(const Piece *p, char *out, size_t n, size_t *used)
+{
+    if (p->over || *used >= n || p->len >= n - *used)
+        return 0;
+    memcpy(out + *used, p->s, p->len + 1);
+    *used += p->len;
+    return 1;
+}
+
 PadBits pad_bits_from_report(const uint8_t *r)
 {
     PadBits b;
@@ -740,9 +806,11 @@ static PadBits exact_bits(PadBits b)
 
 static void append(char *out, size_t n, size_t *used, const char *name)
 {
-    int w = snprintf(out + *used, n - *used, "%s%s", *used ? "+" : "", name);
-    if (w > 0 && (size_t)w < n - *used)
-        *used += (size_t)w;
+    Piece p = {{0}, 0, 0};
+    if (*used)
+        pc_char(&p, '+');
+    pc_str(&p, name);
+    (void)pc_put(&p, out, n, used);
 }
 
 /* With depth, an analog button short of full is written name=<depth>. */
@@ -757,13 +825,15 @@ static void bits_name(PadBits b, int depth, char *out, size_t n)
         if (s_buttons[i].dig & b.digital) {
             append(out, n, &used, s_buttons[i].name);
         } else if (s_buttons[i].ana & b.analog) {
-            char one[16];
             for (j = 0; j < 8; j++)
                 if (s_buttons[i].ana == 1u << j)
                     break;
             if (depth && j < 8 && b.av[j] && b.av[j] < 255) {
-                snprintf(one, sizeof one, "%s=%u", s_buttons[i].name, b.av[j]);
-                append(out, n, &used, one);
+                Piece p = {{0}, 0, 0};
+                pc_str(&p, s_buttons[i].name);
+                pc_char(&p, '=');
+                pc_uint(&p, b.av[j]);
+                append(out, n, &used, p.s);
             } else {
                 append(out, n, &used, s_buttons[i].name);
             }
@@ -784,11 +854,13 @@ static void axes_name(const int16_t *ax, char *out, size_t n)
     if (n)
         out[0] = 0;
     for (i = 0; i < 4; i++) {
-        char one[16];
+        Piece p = {{0}, 0, 0};
         if (!ax[i])
             continue;
-        snprintf(one, sizeof one, "%s=%d", s_axes[i], ax[i]);
-        append(out, n, &used, one);
+        pc_str(&p, s_axes[i]);
+        pc_char(&p, '=');
+        pc_int(&p, ax[i]);
+        append(out, n, &used, p.s);
     }
 }
 
@@ -822,18 +894,21 @@ static int axes_moved(const int16_t *cur, const int16_t *now, int exact)
 static int emit(char *out, size_t n, size_t *used, int poll, int pad,
                 uint32_t at, const char *names, uint32_t hold)
 {
-    char c = poll ? 'g' : 'f';
-    int w;
-    if (pad > 0)
-        w = snprintf(out + *used, n - *used, "%c%u:p%d-%s:%u\n", c, at, pad + 1,
-                     names, hold);
-    else
-        w = snprintf(out + *used, n - *used, "%c%u:%s:%u\n", c, at, names, hold);
-    if (w > 0 && (size_t)w < n - *used) {
-        *used += (size_t)w;
-        return 1;
+    Piece p = {{0}, 0, 0};
+
+    pc_char(&p, poll ? 'g' : 'f');
+    pc_uint(&p, at);
+    pc_char(&p, ':');
+    if (pad > 0) {
+        pc_char(&p, 'p');
+        pc_uint(&p, (unsigned long)pad + 1);
+        pc_char(&p, '-');
     }
-    return 0;
+    pc_str(&p, names);
+    pc_char(&p, ':');
+    pc_uint(&p, hold);
+    pc_char(&p, '\n');
+    return pc_put(&p, out, n, used);
 }
 
 /* The state s holds from flip on: end what changed. */
@@ -937,7 +1012,9 @@ int pad_recorder_end(PadRecorder *r, uint32_t flip, char *out, size_t n)
 int pad_recorder_end_line(const PadRecorder *recs, int n, uint32_t flip,
                           char *out, size_t size)
 {
-    int i, any = 0, poll = 0, w;
+    int i, any = 0, poll = 0;
+    size_t used = 0;
+    Piece p = {{0}, 0, 0};
 
     if (size)
         out[0] = 0;
@@ -952,13 +1029,12 @@ int pad_recorder_end_line(const PadRecorder *recs, int n, uint32_t flip,
     }
     if (!any)
         return 0;
-    w = snprintf(out, size, "%c%u:@end\n", poll ? 'g' : 'f', (unsigned)flip);
-    if (w <= 0 || (size_t)w >= size) {
-        if (size)
-            out[0] = 0;
+    pc_char(&p, poll ? 'g' : 'f');
+    pc_uint(&p, flip);
+    pc_str(&p, ":@end\n");
+    if (!pc_put(&p, out, size, &used))
         return 0;
-    }
-    return w;
+    return (int)used;
 }
 
 const char *pad_path_name(const char *path)
