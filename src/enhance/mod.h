@@ -56,7 +56,7 @@
 extern "C" {
 #endif
 
-#define XBOX_MOD_API_VERSION 6u
+#define XBOX_MOD_API_VERSION 7u
 
 struct xbox_mod_api;
 
@@ -402,7 +402,47 @@ struct xbox_mod_api {
      * that stays off leaves the guest's memory map stock. Its guest VA, or
      * 0 with a line. */
     uint32_t (*guest_alloc)(const struct xbox_mod *m, uint32_t size, uint32_t align);
+
+    /* ---- version 7 (check size before using these) ---------------------
+     * Input glyphs and the status panel (overlay-revamp D12a). */
+
+    /* The binding of ref on the device the player used last, into out (cap
+     * bytes, always ended). ref is a source ("pad:south", "key:F5",
+     * "mouse:left"), an action ("act:camera.free.toggle") or one of m's own
+     * controls by id ("ctl:move"). flags XBOX_GLYPH_TOKENS writes tokens
+     * ("{pad:ls}"), which draw as glyphs in any text the overlay draws;
+     * XBOX_GLYPH_TEXT writes names ("Left stick", "F5") for a log line. A
+     * chord's members are joined by "+". Off the pad, a captured control
+     * bound only on the pad names the keys that drive it, a stick's joined
+     * by "/" ("W/A/S/D"; the right stick also "Mouse move"). Returns the
+     * length written, or -1: when ref is unbound or names nothing, out
+     * holds ref itself, cut to cap; when cap is too short for the whole
+     * name, out holds the members that fit whole (maybe none, ""), never
+     * part of one. Works once the mods' inits are done: called from init
+     * it answers -1 with ref (the device tracking and [input] bindings are
+     * not up yet); a status text set from init still expands its tokens
+     * at every draw. Any thread; the binding tables are read under their
+     * lock. */
+    int (*glyph_name)(const struct xbox_mod *m, const char *ref, char *out, size_t cap,
+                      uint32_t flags);
+    /* m's status panel: a small card at the top left of the screen. text
+     * is up to XBOX_MOD_STATUS_LINES lines ('\n') of XBOX_MOD_STATUS_LINE
+     * bytes, the first the panel's title; NULL or "" removes it. Tokens
+     * ({pad:} {key:} {mouse:} {act:} {ctl:}) are kept as written and
+     * expanded at every draw, so the panel follows the device in use and a
+     * rebinding without another call. Hidden while the menu is open, and
+     * dropped when m is turned off or fails. Any thread; the text is
+     * copied. Returns 0, or -1 when it was cut to fit (what fits is set). */
+    int (*status)(const struct xbox_mod *m, const char *text);
 };
+
+/* glyph_name's flags: one of the two. */
+#define XBOX_GLYPH_TOKENS 1u
+#define XBOX_GLYPH_TEXT   2u
+
+/* status's limits. */
+#define XBOX_MOD_STATUS_LINES 6
+#define XBOX_MOD_STATUS_LINE  120
 
 /* Stack argument n (0-based) of a hooked call, in a pre or a post. */
 #define XBOX_MOD_ARG32(api, c, n) XBOX_MOD_MEM32(api, (c)->esp + 4 + 4 * (n))
@@ -538,6 +578,28 @@ int xbox_mod_control_stock(int i, uint32_t idx, char out[][ENHANCE_ACTION_TEXT],
 int xbox_mod_control_is_stock(int i, uint32_t idx);
 int xbox_mod_control_forced(int i, uint32_t idx);
 const char *xbox_mod_control_key(int i, uint32_t idx);
+/* Control id's index in mod i's descriptor, or -1. */
+int xbox_mod_control_find(int i, const char *id);
+
+/* ---- the status panels and glyph names (version 7) --------------------- */
+
+/* Mod i's status text as set (at most XBOX_MOD_STATUS_LINES lines), into
+ * out; "" when none, or while i is not on. Any thread. */
+void xbox_mod_status_text(int i, char *out, size_t cap);
+/* Moves whenever a status text is set, cleared or dropped. */
+uint32_t xbox_mod_status_serial(void);
+/* glyph_name's resolver (enhance_mod_status.c installs enhance_text's, with
+ * the device in use, after the mods' inits): mod is the caller's table
+ * index. It returns the length, -1 for an unbound ref, or
+ * XBOX_MOD_GLYPH_CUT for a name cut to whole members. Without one,
+ * glyph_name answers -1 with ref's own text. */
+#define XBOX_MOD_GLYPH_CUT (-2)
+typedef int (*xbox_mod_glyph_namer)(int mod, const char *ref, char *out, size_t cap,
+                                    uint32_t flags);
+void xbox_mod_set_glyph_namer(xbox_mod_glyph_namer fn);
+/* 1 once a mod has called glyph_name or set a status: the device tracking
+ * starts then, so a run without either stays stock. */
+int xbox_mod_glyphs_used(void);
 
 /* User-file aliases waiting to be rewritten under the current key (D4):
  * the menu's Save writes key = value and removes old. Returns the count;

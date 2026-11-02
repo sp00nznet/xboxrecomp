@@ -1,4 +1,4 @@
-{"schema": 1, "api": 6, "mods": [
+{"schema": 1, "api": 7, "mods": [
   {"id": "fly", "title": "Free camera", "summary": "Fly the camera", "author": "tests", "version": "1.0", "descriptor": true, "init": "no", "enable": "fly.enabled", "settings": [
       {"name": "enabled", "key": "fly.enabled", "kind": "enum", "label": "Free camera", "enable": true, "default": "off", "choices": ["off", "on"], "live": "restart", "value": "off", "source": "default"},
       {"name": "speed", "key": "mods.fly.speed", "kind": "float", "label": "Speed", "help": "Fly speed", "unit": "x", "default": 1, "lo": 0.05, "hi": 20, "step": 0.05, "live": "live", "env": "RECOMP_APU_HRTF", "aliases": ["fly.old_speed"], "value": 1, "source": "default"},

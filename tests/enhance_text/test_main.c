@@ -7,6 +7,10 @@
  *             its "B"); a chord's members joined by "+"
  *   act       an action's binding for the device in use, its padN: and
  *             @ms dropped, else any binding
+ *   ctl       a control of the owning mod (a stubbed table), the same pick;
+ *             off the pad, a captured control bound on the pad only names
+ *             its keys (a stubbed keyboard map), an action control its
+ *             chord; no owner, or another mod's, names nothing
  *   text      a token that names nothing draws as its own text; a member
  *             with no glyph draws its name
  *   widths    what enhance_text_width says is what enhance_text_draw draws
@@ -23,6 +27,7 @@
 #include "host_pad.h"
 #include "input_map.h"
 #include "input_names.h"
+#include "mod.h"
 #include "nv2a_overlay_glyph.h"
 #include "nv2a_overlay_int.h"
 
@@ -70,6 +75,74 @@ int enhance_action_bindings(int id, char out[][ENHANCE_ACTION_TEXT], int max)
         snprintf(out[n], ENHANCE_ACTION_TEXT, "%s", k_actions[id].binds[n]);
         n++;
     }
+    return n;
+}
+
+/* A stub of mod 1's controls: captured ones with keys of their own,
+ * captured ones bound on the pad only, and an action control. */
+static const struct { const char *id; const char *binds[2]; } k_controls[] = {
+    { "move", { "left_stick", "w" } },
+    { "rise", { "rt", "space" } },
+    { "look", { "right_stick" } },
+    { "jump", { "x" } },
+    { "boost", { "lb" } },
+};
+#define NCTL ((int)(sizeof k_controls / sizeof k_controls[0]))
+#define CTL_BOOST 4
+
+int xbox_mod_control_action(int i, uint32_t idx)
+{
+    return i == 1 && idx == CTL_BOOST ? 3 : -1;
+}
+
+/* enhance_actions.c's parse, for the sources the stub controls bind. */
+int enhance_control_parse(const char *text, struct enhance_ctl_src *out)
+{
+    memset(out, 0, sizeof *out);
+    if (!strcmp(text, "left_stick") || !strcmp(text, "right_stick")) {
+        out->type = ENHANCE_CTL_STICK;
+        out->idx = text[0] == 'l' ? (int)XBOX_CTL_SRC_LEFT : (int)XBOX_CTL_SRC_RIGHT;
+    } else if (!strcmp(text, "x")) {
+        out->type = ENHANCE_CTL_ANALOG;
+        out->idx = INPUT_X - INPUT_A;
+    } else if (!strcmp(text, "lb")) {
+        out->type = ENHANCE_CTL_ANALOG;
+        out->idx = INPUT_WHITE - INPUT_A;
+    }
+    return out->type != ENHANCE_CTL_NONE;
+}
+
+/* A stub keyboard map: x on Q, white on E, the right stick on I J K L,
+ * and no key for the left stick. */
+int xbox_InputBindingsOf(int control, int *codes, int *is_mouse, int max)
+{
+    int code = control == INPUT_X ? 'Q' : control == INPUT_WHITE ? 'E'
+             : control == INPUT_RSTICK_UP ? 'I' : control == INPUT_RSTICK_LEFT ? 'J'
+             : control == INPUT_RSTICK_DOWN ? 'K' : control == INPUT_RSTICK_RIGHT ? 'L' : 0;
+    if (!code || max < 1)
+        return 0;
+    codes[0] = code;
+    is_mouse[0] = 0;
+    return 1;
+}
+
+int xbox_mod_control_find(int i, const char *id)
+{
+    for (int k = 0; i == 1 && k < NCTL; k++)
+        if (!strcmp(id, k_controls[k].id))
+            return k;
+    return -1;
+}
+
+int xbox_mod_control_bindings(int i, uint32_t idx, char out[][ENHANCE_ACTION_TEXT], int max,
+                              const char **src)
+{
+    int n = 0;
+    (void)src;
+    if (i != 1 || idx >= (uint32_t)NCTL)
+        return 0;
+    for (; n < 2 && n < max && k_controls[idx].binds[n]; n++)
+        snprintf(out[n], ENHANCE_ACTION_TEXT, "%s", k_controls[idx].binds[n]);
     return n;
 }
 
@@ -197,6 +270,52 @@ static void test_act(void)
               == sum_glyph(nv2a_ovl_glyph_mouse(NV2A_OVL_MOUSE_LEFT)), "a mouse binding");
 }
 
+static uint32_t sum_owned(const char *text, int device, int mod)
+{
+    mu_Context *ctx = nv2a_overlay_ui_begin(NV2A_OVL_MENU);
+    int w = enhance_text_draw_owned(ctx, s_font, text, 10, 10, k_ink, 0, device, mod);
+    CHECK(w == enhance_text_width_owned(s_font, text, 0, device, mod), "%s: widths", text);
+    return sum_published();
+}
+
+static void test_ctl(void)
+{
+    const int P = ENHANCE_DEV_PAD, K = ENHANCE_DEV_KEYBOARD;
+    CHECK(sum_owned("{ctl:move}", P, 1) == sum_text("{pad:ls}", 0, P), "ctl move on pad");
+    CHECK(sum_owned("{ctl:move}", P, 1) == sum_text("{pad:left_stick}", 0, P), "left_stick");
+    CHECK(sum_owned("{ctl:move}", K, 1) == sum_text("{key:w}", 0, K), "ctl move on keys");
+    CHECK(sum_owned("{ctl:rise}", P, 1) == sum_text("{pad:rt}", 0, P), "ctl rise");
+    /* Bound on the pad only: off the pad, the keys the keyboard map gives
+     * its guest control; a stick its direction keys, the right one the
+     * mouse too, joined by "/". An action control keeps its pad chord. */
+    CHECK(sum_owned("{ctl:jump}", P, 1) == sum_text("{pad:x}", 0, P), "jump on pad");
+    CHECK(sum_owned("{ctl:jump}", K, 1) == sum_text("{key:Q}", 0, K), "jump on keys");
+    CHECK(sum_owned("{ctl:jump}", ENHANCE_DEV_MOUSE, 1) == sum_text("{key:Q}", 0, K),
+          "jump with the mouse");
+    CHECK(sum_owned("{ctl:boost}", K, 1) == sum_text("{pad:lb}", 0, K), "action control");
+    {
+        int kw = 0, sep = text_w("/") + 2 * s_gap;
+        const char *keys[] = { "I", "J", "K", "L" };
+        for (int i = 0; i < 4; i++) {
+            int code, mouse;
+            CHECK(xbox_InputNameToCode(keys[i], &code, &mouse), "%s", keys[i]);
+            kw += nv2a_ovl_glyph_width(nv2a_ovl_glyph_key(code), s_font) + sep;
+        }
+        kw += nv2a_ovl_glyph_width(nv2a_ovl_glyph_mouse(NV2A_OVL_MOUSE_MOVE), s_font);
+        CHECK(enhance_text_width_owned(s_font, "{ctl:look}", 0, K, 1) == kw,
+              "look on keys: %d, want %d",
+              enhance_text_width_owned(s_font, "{ctl:look}", 0, K, 1), kw);
+        CHECK(sum_owned("{ctl:look}", K, 1) != sum_owned("{ctl:look}", P, 1), "look differs");
+    }
+    /* Only the owner's controls: the menu's own text and another mod's
+     * name nothing, and draw as text. */
+    CHECK(enhance_text_width(s_font, "{ctl:move}", 0, P) == text_w("{ctl:move}"), "no owner");
+    CHECK(enhance_text_width_owned(s_font, "{ctl:move}", 0, P, 0) == text_w("{ctl:move}"),
+          "another mod");
+    CHECK(enhance_text_width_owned(s_font, "{ctl:nope}", 0, P, 1) == text_w("{ctl:nope}"),
+          "unknown control");
+}
+
 static void test_text(void)
 {
     static const char *const literal[] = {
@@ -242,6 +361,7 @@ int main(void)
     enhance_text_init();
     test_tokens();
     test_act();
+    test_ctl();
     test_text();
     nv2a_overlay_reset_for_test();
     if (fails) {

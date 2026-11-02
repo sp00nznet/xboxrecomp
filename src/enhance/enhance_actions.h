@@ -222,6 +222,13 @@ typedef void (*enhance_menu_hook_fn)(unsigned port, uint32_t held,
 void enhance_actions_set_menu_hook(enhance_menu_hook_fn fn);
 int enhance_actions_menu_request(void);
 
+/* The mods' status panels (enhance_mod_status.h): fn(0) first on every
+ * flip tick, on the overlay's thread. The tick runs only while the hook
+ * is armed (a feature key on, rule 6), so no panel shows without one.
+ * fn(1) when the tick stops (a disarm, a reset) or fn is replaced, from
+ * the caller's thread: hide what is shown. NULL removes it. */
+void enhance_actions_set_panel_hook(void (*fn)(int stop));
+
 /* Disarm, clear the registry, the bindings and the per-port state (tests). */
 void enhance_actions_reset(void);
 

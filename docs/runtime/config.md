@@ -1558,7 +1558,7 @@ The title's glue calls two entries:
 - `xbox_mod_input_captured()` from its pad read. While it returns true, the
   title must see a released pad.
 
-`struct xbox_mod_api` (version 6, `XBOX_MOD_API_VERSION`) holds:
+`struct xbox_mod_api` (version 7, `XBOX_MOD_API_VERSION`) holds:
 
 | Member | What it gives |
 | --- | --- |
@@ -1584,6 +1584,8 @@ The title's glue calls two entries:
 | `hud_capturing(mod)` | v5. Non-zero when the mod's hooks run only for a mapping capture (it owns the HUD table and is off or dormant): a hook then does only `hud_apply` and `hud_restore`. Any thread. |
 | `guest_call(va, args, eax_out)` | v6. Runs the lifted guest function at `va` ([Guest calls](#guest-calls-v6)). Only from a hook's pre or post, or an `on_frame` callback. |
 | `guest_alloc(mod, size, align)` | v6. A zeroed block of guest memory the title's heap never hands out ([Guest calls](#guest-calls-v6)). Same threads as `guest_call`. |
+| `glyph_name(mod, ref, out, cap, flags)` | v7. The binding of a source, an action or one of the mod's controls, named for the device in use ([Glyphs and the status panel](#glyphs-and-the-status-panel-v7)). Any thread. |
+| `status(mod, text)` | v7. The mod's status panel at the top left of the screen ([Glyphs and the status panel](#glyphs-and-the-status-panel-v7)). Any thread. |
 
 `struct xbox_mod` gained two fields in v4, after `desc`:
 
@@ -1685,6 +1687,85 @@ larger one is refused. Two guest threads asking at once still get one
 block. Nothing frees it. Use it for data the guest must
 reach by address (a record a guest function reads), never for the mod's
 own state.
+
+### Glyphs and the status panel (v7)
+
+A mod built against v7 checks `api->size` before it calls either member:
+on an older runtime the fields are past the end, and the mod then shows
+nothing. A mod that never calls them changes nothing. The device tracking
+below starts at the first call, so a run without one stays stock.
+
+**The device in use.** The toolkit takes the device that saw the last new
+press: a pad button or trigger past half travel, or a stick pushed past
+8000 of 32767, makes it the pad; a key, the keyboard; a mouse button, the
+mouse. Only new presses count, so a key held down does not keep winning
+over a pad in use. The pad's family (Xbox, PlayStation, ...) comes from
+port 0.
+
+**`api->glyph_name(mod, ref, out, cap, flags)`** names the binding of `ref`:
+
+- `ref` is a source (`pad:south`, `key:F5`, `mouse:left`), an action
+  (`act:camera.free.toggle`) or one of the mod's own controls by id
+  (`ctl:move`). It may be written in braces (`{ctl:move}`).
+- An action or a control names the first binding on the device in use,
+  or the first binding at all when that device has none.
+- Off the pad, a captured control (a `BUTTON` or `STICK` control) bound
+  only on the pad names the keys that drive it. Such a control reads the
+  guest's pad with the keyboard merged in, so the key the keyboard map
+  binds to its guest control drives it: `rt` names that key, and a stick
+  names its four direction keys, up, left, down, right, joined by `/`
+  (`W/A/S/D` on the default map). The right stick also names the mouse
+  (`Mouse move`), since the guest's mouse look drives that stick and a
+  capture hands the motion to the mod. An action control keeps its pad
+  chord: actions read the host pad, which no key presses.
+- `XBOX_GLYPH_TOKENS` writes tokens (`{pad:guide}+{pad:y}`), which draw as
+  glyphs in any text the overlay draws. `XBOX_GLYPH_TEXT` writes names
+  (`Guide+Y`, `Cross` on a PlayStation pad, `F6`, `Mouse left`) for a log
+  line. A chord's members are joined by `+`.
+- It returns the length written. When `ref` is unbound or names nothing,
+  it returns -1 and `out` holds `ref` itself, cut to `cap`. When the name
+  does not fit in `cap`, it returns -1 and `out` holds only the members
+  that fit whole (maybe none, `""`), never part of one: a cut member
+  would name another input (`F1` out of `F10`). `out` is always ended.
+- It works once the mods' inits are done. Called from `init`, it
+  returns -1 with `ref` in `out`: the toolkit installs the names after
+  the inits, since `[input.actions]` applies the user's bindings only
+  then. A status text set from `init` is not affected, since its tokens
+  expand at every draw.
+
+**`api->status(mod, text)`** sets the mod's panel:
+
+- `text` holds up to `XBOX_MOD_STATUS_LINES` (6) lines split by `'\n'`,
+  each up to `XBOX_MOD_STATUS_LINE` (120) bytes. The first line is the
+  panel's title, drawn with an accent dot; the others are drawn smaller
+  under it. NULL or `""` removes the panel.
+- A text over either limit is cut, never at a UTF-8 sequence's middle.
+  What fits is set and the call returns -1; otherwise 0.
+- The text is copied under a lock. Tokens (`{pad:}`, `{key:}`, `{mouse:}`,
+  `{act:}`, `{ctl:}`) are kept as written and expanded at every draw, so
+  the panel follows the device in use and a rebinding in the menu without
+  another call. Set the text when it changes, not every frame: a call
+  with the same text does nothing.
+- The panel is dropped when the mod is turned off (live or for the next
+  start) or its init fails. A late call from it is ignored, except a
+  clear (NULL or `""`), which is always taken.
+
+**Placement.** The panels stack down from the top left corner, inside a
+5% title-safe inset, in the mods' table order, one card each. They are
+drawn at the overlay's UI scale on the `STATUS` layer, above the stats
+and under the toasts, the menu and the cursor. A card that would cross
+the bottom inset is not drawn, nor any after it: the stack is cut, never
+squeezed. The panels are hidden while the menu is open. The toolkit draws
+them again when a text, the device, the pad family or the window changes,
+and every 250 ms, so a rebinding shows.
+
+**The hook must be armed.** The panels are drawn from the host actions'
+flip tick, which runs only while that hook is armed: a feature key on
+(rule 6 of [Host actions](#host-actions-inputactions)), `menu.enabled`,
+`overlay.stats` or a mod's enable key. With every feature key off, no
+panel shows, and `status` still stores the text for when one is armed.
+When the hook disarms, the toolkit hides the panels at once, so none
+stays on the screen.
 
 ### HUD table (v5)
 
@@ -2153,7 +2234,7 @@ Schema 1. Fields are only added; one removed or changed in meaning bumps
 `schema`. A field that does not apply is left out.
 
 ```json
-{"schema": 1, "api": 6, "mods": [
+{"schema": 1, "api": 7, "mods": [
   {"id": "fly", "title": "Free camera", "descriptor": true, "init": "no", "enable": "fly.enabled",
    "settings": [
       {"name": "speed", "key": "mods.fly.speed", "kind": "float", "label": "Speed",

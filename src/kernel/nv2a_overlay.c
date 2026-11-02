@@ -23,9 +23,18 @@
  * spare; the strip and the toasts are a few dozen quads. Three indices a
  * vertex: a rounded rect's fan and feather ring take about 4.5, a glyph
  * quad 1.5. */
-static const uint32_t s_cap_vtx[NV2A_OVL_COUNT] = { 2048, 2048, 16384, 64 };
-static const uint32_t s_cap_cmd[NV2A_OVL_COUNT] = { 16, 16, 256, 2 };
-static const char *const s_layer_name[NV2A_OVL_COUNT] = { "stats", "toast", "menu", "cursor" };
+static const uint32_t s_cap_vtx[NV2A_OVL_COUNT] = {
+    [NV2A_OVL_STATS] = 2048, [NV2A_OVL_STATUS] = 4096, [NV2A_OVL_TOAST] = 2048,
+    [NV2A_OVL_MENU] = 16384, [NV2A_OVL_CURSOR] = 64,
+};
+static const uint32_t s_cap_cmd[NV2A_OVL_COUNT] = {
+    [NV2A_OVL_STATS] = 16, [NV2A_OVL_STATUS] = 32, [NV2A_OVL_TOAST] = 16,
+    [NV2A_OVL_MENU] = 256, [NV2A_OVL_CURSOR] = 2,
+};
+static const char *const s_layer_name[NV2A_OVL_COUNT] = {
+    [NV2A_OVL_STATS] = "stats", [NV2A_OVL_STATUS] = "status", [NV2A_OVL_TOAST] = "toast",
+    [NV2A_OVL_MENU] = "menu", [NV2A_OVL_CURSOR] = "cursor",
+};
 
 struct slot {
     struct nv2a_ovl_vtx *vtx;
@@ -172,10 +181,15 @@ int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)
         }
         added++;
     }
-    if (!__atomic_load_n(&s_armed, __ATOMIC_ACQUIRE))
-        fprintf(stderr, OVL_LOGP "armed:%s%s%s%s\n", s_layer[0].armed ? " stats" : "",
-                s_layer[1].armed ? " toast" : "", s_layer[2].armed ? " menu" : "",
-                s_layer[3].armed ? " cursor" : "");
+    if (!__atomic_load_n(&s_armed, __ATOMIC_ACQUIRE)) {
+        char names[64] = "";
+        for (l = 0; l < NV2A_OVL_COUNT; l++)
+            if (s_layer[l].armed) {
+                strcat(names, " ");
+                strcat(names, s_layer_name[l]);
+            }
+        fprintf(stderr, OVL_LOGP "armed:%s\n", names);
+    }
     __atomic_store_n(&s_armed, 1, __ATOMIC_RELEASE);
     return 0;
 }

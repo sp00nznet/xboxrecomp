@@ -16,13 +16,26 @@
  *                           (a pad binding for the pad, a key for the
  *                           keyboard and the mouse), so a hint follows
  *                           rebinding; a chord's members are joined by +
+ *   {ctl:move}              a control of the mod that owns the string, as
+ *                           bound now (a mod's labels, help and status
+ *                           panel); names nothing in the menu's own text.
+ *                           Off the pad, a captured control bound only on
+ *                           the pad shows the keys that drive it, a stick
+ *                           its direction keys joined by / (the right
+ *                           stick also the mouse)
  *
  * A token that names nothing draws as its own text, braces included, and
  * a member with no glyph (the Xbox family's paddles) draws its name. Mods
- * get glyphs by writing tokens in their strings: no API call (Q5 open).
+ * get glyphs by writing tokens in their strings, and outside the overlay
+ * through mod API version 7 (Q5, D12a): glyph_name writes a ref's binding
+ * as tokens or plain names (enhance_text_glyph_name), and the status
+ * panel expands its tokens at every draw.
  */
 #ifndef ENHANCE_TEXT_H
 #define ENHANCE_TEXT_H
+
+#include <stddef.h>
+#include <stdint.h>
 
 #include "microui.h"
 
@@ -41,6 +54,23 @@ int enhance_text_draw(mu_Context *ctx, mu_Font font, const char *text, int x, in
                       mu_Color color, int family, int device);
 /* The width enhance_text_draw would draw. */
 int enhance_text_width(mu_Font font, const char *text, int family, int device);
+
+/* The same, with {ctl:} read against mod (an xbox_mod_count index; -1
+ * for none). */
+int enhance_text_draw_owned(mu_Context *ctx, mu_Font font, const char *text, int x, int y,
+                            mu_Color color, int family, int device, int mod);
+int enhance_text_width_owned(mu_Font font, const char *text, int family, int device, int mod);
+
+/* glyph_name (mod.h, version 7) for mod: ref ("pad:south", "act:x",
+ * "ctl:move", braces allowed) as its binding for device, written into out
+ * as tokens, or with XBOX_GLYPH_TEXT as plain names ("Left stick",
+ * "Guide+Y"; a stick's keys "W/A/S/D"). Returns the length; -1 when ref
+ * names nothing (out is then untouched); XBOX_MOD_GLYPH_CUT when cap is
+ * short, with out holding the whole members that fit, never part of one.
+ * Any thread: the tables are read under their locks and the names are
+ * the canonical ones, not the layout cache's. */
+int enhance_text_glyph_name(int mod, const char *ref, char *out, size_t cap, uint32_t flags,
+                            int family, int device);
 
 /* Install the host's key namer for key caps (nv2a_ovl_glyph_set_key_namer).
  * enhance_text_draw does it on first use; a page that draws key caps

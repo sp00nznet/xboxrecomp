@@ -14,6 +14,7 @@
  * the flip tick may both call the hook, and only one of them may step.
  */
 #include "enhance_menu.h"
+#include "enhance_mod_status.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -4846,6 +4847,8 @@ void enhance_menu_start(void)
     /* Read before the off return: a menu that is off still owns the key,
      * so it is no "unused key". */
     s_size = enhance_cfg_choice("overlay.menu_size", k_menu_size, MENU_SIZE_COMPACT);
+    /* The mods' panels and glyph names work with the menu off too. */
+    enhance_mod_status_start();
     if (!enhance_actions_keyed("menu.enabled")) {
         fprintf(stderr, LOGP "menu.enabled=off\n");
         return;

@@ -50,6 +50,7 @@ add_executable(enhance_menu_test
     ${XR_SRC}/enhance/enhance_menu.c
     ${XR_SRC}/enhance/enhance_menu_layout.c
     ${XR_SRC}/enhance/enhance_text.c
+    ${XR_SRC}/enhance/enhance_mod_status.c
     ${XR_SRC}/enhance/mod.c
     ${XR_SRC}/enhance/hud_anchor.c
     ${XR_SRC}/enhance/hud_capture.c

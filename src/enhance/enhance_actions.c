@@ -254,6 +254,16 @@ static int s_menu_act = -1;
 /* The menu (enhance_menu.c): its hook runs after each step, outside the
  * step lock, and a menu.open fire is a request it takes there. */
 static enhance_menu_hook_fn s_menu_hook;
+static void (*s_panel_hook)(int stop);
+
+/* The flip tick stopped (disarmed): a panel shown must not stay on the
+ * screen with nothing left to hide it. */
+static void panel_stop(void)
+{
+    void (*panel)(int) = __atomic_load_n(&s_panel_hook, __ATOMIC_ACQUIRE);
+    if (panel)
+        panel(1);
+}
 static int s_menu_req;
 /* The menu's capture: what is pressed meanwhile is the capture's, and
  * fires nothing (enhance_actions_quiet). */
@@ -856,6 +866,14 @@ void enhance_actions_tick(void)
 
     /* A debug key's live mod switches, from the thread the menu steps on. */
     xbox_mod_debug_tick();
+    /* The mods' status panels, on the overlay's thread. This tick only
+     * runs while the hook is armed (a feature key on, rule 6), so the
+     * panels show only then; the disarm below stops them. */
+    {
+        void (*panel)(int) = __atomic_load_n(&s_panel_hook, __ATOMIC_ACQUIRE);
+        if (panel)
+            panel(0);
+    }
     if (!__atomic_load_n(&s_armed, __ATOMIC_ACQUIRE))
         return;
     /* Which ports to read, and their slots. The clock is read under the
@@ -1655,6 +1673,7 @@ static void disarm_match(int all_mods, int owner, const char *key)
 #ifdef XBOXRECOMP_ENHANCE
         nv2a_flip_hook_set(NULL);
 #endif
+        panel_stop();
         hook_line();
     }
 }
@@ -2101,6 +2120,13 @@ void enhance_actions_set_menu_hook(enhance_menu_hook_fn fn)
     __atomic_store_n(&s_menu_hook, fn, __ATOMIC_RELEASE);
 }
 
+void enhance_actions_set_panel_hook(void (*fn)(int stop))
+{
+    void (*old)(int) = __atomic_exchange_n(&s_panel_hook, fn, __ATOMIC_ACQ_REL);
+    if (old && old != fn)
+        old(1);
+}
+
 int enhance_actions_menu_request(void)
 {
     return __atomic_exchange_n(&s_menu_req, 0, __ATOMIC_ACQ_REL);
@@ -2155,7 +2181,9 @@ void enhance_actions_reset(void)
 #ifdef XBOXRECOMP_ENHANCE
     nv2a_flip_hook_set(NULL);
 #endif
+    panel_stop();
     enhance_actions_set_menu_hook(NULL);
+    enhance_actions_set_panel_hook(NULL);
     spin_lock(&s_reg_lock);
     s_nact = 0;
     s_ntoolkit = 0;

@@ -548,6 +548,174 @@ static void api_active(const struct xbox_mod *m, int on)
         }
 }
 
+/* m's table index, or -1. */
+static int table_of(const struct xbox_mod *m)
+{
+    for (int i = 0; m && s_table && i < s_count; i++)
+        if (s_table[i] == m)
+            return i;
+    return -1;
+}
+
+/* ---- the status panels and glyph names (version 7) ---------------------
+ *
+ * The texts are a mod's to set from any thread and the panel's to read
+ * from the flip tick, so each is copied in and out under one short spin
+ * lock; the serial tells the panel to look again. */
+
+#define STATUS_MAX (XBOX_MOD_STATUS_LINES * (XBOX_MOD_STATUS_LINE + 1))
+static char s_status[MOD_MAX][STATUS_MAX];
+static int s_status_lock;
+static uint32_t s_status_serial;
+static int s_glyphs_used;
+static xbox_mod_glyph_namer s_namer;
+
+static void status_lock(void)
+{
+    while (__atomic_exchange_n(&s_status_lock, 1, __ATOMIC_ACQUIRE))
+        spin_wait();
+}
+
+static void status_unlock(void)
+{
+    __atomic_store_n(&s_status_lock, 0, __ATOMIC_RELEASE);
+}
+
+/* text cut to the panel's lines: XBOX_MOD_STATUS_LINES of at most
+ * XBOX_MOD_STATUS_LINE bytes, a line cut back to a UTF-8 lead byte so a
+ * cut never draws half a character. Returns 1 when anything was cut. */
+static int status_fit(const char *text, char out[STATUS_MAX])
+{
+    size_t at = 0;
+    int lines = 0, cut = 0;
+
+    while (*text && lines < XBOX_MOD_STATUS_LINES) {
+        const char *nl = strchr(text, '\n');
+        size_t n = nl ? (size_t)(nl - text) : strlen(text), k = n;
+
+        if (k > XBOX_MOD_STATUS_LINE) {
+            k = XBOX_MOD_STATUS_LINE;
+            while (k > 0 && ((unsigned char)text[k] & 0xC0) == 0x80)
+                k--;
+            cut = 1;
+        }
+        if (lines)
+            out[at++] = '\n';
+        memcpy(out + at, text, k);
+        at += k;
+        lines++;
+        text += n;
+        if (*text == '\n')
+            text++;
+    }
+    out[at] = 0;
+    return cut || *text;
+}
+
+static void status_drop(int i)
+{
+    if (i < 0 || i >= MOD_MAX)
+        return;
+    status_lock();
+    if (s_status[i][0]) {
+        s_status[i][0] = 0;
+        __atomic_add_fetch(&s_status_serial, 1, __ATOMIC_RELEASE);
+    }
+    status_unlock();
+}
+
+/* A switch's new state, stored under the panels' lock with the drop: a
+ * status call checks the state under the same lock, so one racing the
+ * switch from the mod's own thread either lands before the drop (and is
+ * dropped) or sees the new state (and is refused). Never a card left
+ * behind to come back on the next switch on. */
+static void state_store(int i, enum xbox_mod_state st)
+{
+    status_lock();
+    __atomic_store_n(&s_state[i], st, __ATOMIC_RELAXED);
+    if (st != XBOX_MOD_ON && s_status[i][0]) {
+        s_status[i][0] = 0;
+        __atomic_add_fetch(&s_status_serial, 1, __ATOMIC_RELEASE);
+    }
+    status_unlock();
+}
+
+static int api_status(const struct xbox_mod *m, const char *text)
+{
+    char buf[STATUS_MAX];
+    int i = table_of(m), cut;
+
+    if (i < 0)
+        return -1;
+    cut = text ? status_fit(text, buf) : (buf[0] = 0, 0);
+    if (buf[0])
+        __atomic_store_n(&s_glyphs_used, 1, __ATOMIC_RELAXED);
+    status_lock();
+    /* Off or failed, a mod has no panel (D12a): a late call from its own
+     * thread cannot bring back what the switch dropped (state_store). Its
+     * init may set one, before its state is decided. A clear is always
+     * taken. */
+    if (buf[0] && s_init_owner != i
+        && __atomic_load_n(&s_state[i], __ATOMIC_RELAXED) != XBOX_MOD_ON) {
+        status_unlock();
+        return 0;
+    }
+    if (strcmp(s_status[i], buf)) {
+        memcpy(s_status[i], buf, strlen(buf) + 1);
+        __atomic_add_fetch(&s_status_serial, 1, __ATOMIC_RELEASE);
+    }
+    status_unlock();
+    return cut ? -1 : 0;
+}
+
+void xbox_mod_status_text(int i, char *out, size_t cap)
+{
+    if (!out || !cap)
+        return;
+    out[0] = 0;
+    if (i < 0 || i >= s_count)
+        return;
+    status_lock();
+    if (__atomic_load_n(&s_state[i], __ATOMIC_RELAXED) == XBOX_MOD_ON)
+        snprintf(out, cap, "%s", s_status[i]);
+    status_unlock();
+}
+
+uint32_t xbox_mod_status_serial(void)
+{
+    return __atomic_load_n(&s_status_serial, __ATOMIC_ACQUIRE);
+}
+
+void xbox_mod_set_glyph_namer(xbox_mod_glyph_namer fn)
+{
+    __atomic_store_n(&s_namer, fn, __ATOMIC_RELEASE);
+}
+
+int xbox_mod_glyphs_used(void)
+{
+    return __atomic_load_n(&s_glyphs_used, __ATOMIC_RELAXED);
+}
+
+static int api_glyph_name(const struct xbox_mod *m, const char *ref, char *out, size_t cap,
+                          uint32_t flags)
+{
+    xbox_mod_glyph_namer fn = __atomic_load_n(&s_namer, __ATOMIC_ACQUIRE);
+    int n = -1;
+
+    __atomic_store_n(&s_glyphs_used, 1, __ATOMIC_RELAXED);
+    if (!out || !cap)
+        return -1;
+    if (fn && ref)
+        n = fn(table_of(m), ref, out, cap, flags);
+    /* A cut keeps the whole members that fit; only an unbound ref (or no
+     * namer yet, during init) writes the ref itself. */
+    if (n == XBOX_MOD_GLYPH_CUT)
+        return -1;
+    if (n < 0)
+        snprintf(out, cap, "%s", ref ? ref : "");
+    return n;
+}
+
 /* api.mem, once the guest has mapped its memory (after xbox_enhance_init,
  * before its first frame or draw). Either the guest's thread (frames) or
  * the render thread (filters) may get there first; both store the same
@@ -596,6 +764,7 @@ static void drop_owner(int owner)
     enhance_actions_drop_owner(owner);
     if (owner >= 0 && owner < MOD_MAX)
         recomp_hook_drop_owner(&s_mod[owner]);
+    status_drop(owner);
 }
 
 static void exit_hook(const char *why)
@@ -1584,6 +1753,12 @@ static int mod_init(int describe)
     s_ncap_hooks = 0;
     s_hud_owner = -1;
     s_hud_owner_on = 0;
+    /* A re-init (tests) starts with no panels and no version 7 use. */
+    status_lock();
+    memset(s_status, 0, sizeof s_status);
+    status_unlock();
+    __atomic_add_fetch(&s_status_serial, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_glyphs_used, 0, __ATOMIC_RELAXED);
     s_nset_at = -1;
     s_frames = 0;
     hud_layer_reset();
@@ -1640,6 +1815,8 @@ static int mod_init(int describe)
     s_api.hud_capturing = api_hud_capturing;
     s_api.guest_call = api_guest_call;
     s_api.guest_alloc = api_guest_alloc;
+    s_api.glyph_name = api_glyph_name;
+    s_api.status = api_status;
     hud_layer_set_mem(&s_api.mem);
     s_menu_on = enhance_cfg_bool("menu.enabled", 0);
 
@@ -2012,7 +2189,7 @@ enum xbox_mod_state xbox_mod_set_enabled(int i, int on)
         st = on ? XBOX_MOD_ON : XBOX_MOD_OFF;
     else
         st = XBOX_MOD_RESTART;
-    __atomic_store_n(&s_state[i], st, __ATOMIC_RELAXED);
+    state_store(i, st);
     return st;
 }
 
@@ -2149,7 +2326,9 @@ double xbox_mod_setting_set(int i, uint32_t idx, double v)
         } else {
             st = XBOX_MOD_RESTART;
         }
-        __atomic_store_n(&s_state[i], st, __ATOMIC_RELAXED);
+        /* Not running now: its panel goes, and stays gone on a switch back
+         * before the restart. */
+        state_store(i, st);
         return v;
     }
     if (s->live == ENHANCE_LIVE_RESTART)
@@ -2195,9 +2374,23 @@ int xbox_mod_control_bindings(int i, uint32_t idx, char out[][ENHANCE_ACTION_TEX
     }
     if (src)
         *src = s_src_name[c->src];
+    /* Under the parsed codes' lock: glyph_name reads these from any
+     * thread while the menu rebinds. */
+    code_lock();
     for (; n < c->n && n < max; n++)
         snprintf(out[n], ENHANCE_ACTION_TEXT, "%s", c->bind[n]);
+    code_unlock();
     return n;
+}
+
+int xbox_mod_control_find(int i, const char *id)
+{
+    if (!id || i < 0 || i >= s_count || !s_mod[i].valid)
+        return -1;
+    for (uint32_t k = 0; k < s_mod[i].d.n_controls; k++)
+        if (s_mod[i].d.controls[k].id && !strcmp(s_mod[i].d.controls[k].id, id))
+            return (int)k;
+    return -1;
 }
 
 /* A captured control of a valid mod, else NULL. */
@@ -2217,9 +2410,11 @@ int xbox_mod_control_set_bindings(int i, uint32_t idx, const char *const *texts,
 
     if (!r || r->src == SRC_ENV || !texts || n < 1 || n > CTL_BINDS)
         return 0;
+    code_lock();
     for (int b = 0; b < n; b++)
         snprintf(r->bind[b], ENHANCE_ACTION_TEXT, "%s", texts[b] ? texts[b] : "");
     r->n = n;
+    code_unlock();
     r->src = SRC_MENU;
     control_codes(i, idx, 1);
     return 1;
@@ -2259,8 +2454,10 @@ void xbox_mod_control_revert(int i, uint32_t idx)
 
     if (!r || same_list(r->bind, r->n, r->base, r->nbase))
         return;
+    code_lock();
     memcpy(r->bind, r->base, sizeof r->bind);
     r->n = r->nbase;
+    code_unlock();
     r->src = r->base_src;
     control_codes(i, idx, 1);
 }
