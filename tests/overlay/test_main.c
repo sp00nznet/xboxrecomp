@@ -882,6 +882,83 @@ static void test_ui_scale(void)
           "back to stock");
 }
 
+/* The window-to-output view (present.surface = internal): the identity by
+ * default, Metal's aspect fit (letterboxed or pillarboxed), D3D11's
+ * stretch of the back buffer to the client area. A window pixel maps to
+ * the output pixel under its centre; one past an edge lands outside. */
+static void test_view(void)
+{
+    int x, y, r[4];
+    x = 1234, y = -5;
+    nv2a_overlay_to_output(&x, &y);
+    CHECK(x == 1234 && y == -5, "identity moved to %d,%d", x, y);
+    nv2a_overlay_to_window(&x, &y);
+    CHECK(x == 1234 && y == -5, "identity back to %d,%d", x, y);
+
+    /* 640x480 in a 1920x1200 window: bars left and right. */
+    nv2a_overlay_view_fit(1920, 1200, 640, 480, r);
+    CHECK(r[0] == 160 && r[1] == 0 && r[2] == 1600 && r[3] == 1200, "fit %d,%d %dx%d", r[0],
+          r[1], r[2], r[3]);
+    nv2a_overlay_set_view(r[0], r[1], r[2], r[3], 640, 480);
+    {
+        static const int k[][4] = {
+            { 160, 0, 0, 0 },       { 159, -1, -1, -1 },     { 960, 600, 320, 240 },
+            { 1759, 1199, 639, 479 }, { 1760, 1200, 640, 480 }, { 0, 0, -64, 0 },
+        };
+        for (int i = 0; i < 6; i++) {
+            x = k[i][0], y = k[i][1];
+            nv2a_overlay_to_output(&x, &y);
+            CHECK(x == k[i][2] && y == k[i][3], "letterbox %d,%d -> %d,%d", k[i][0], k[i][1], x,
+                  y);
+        }
+    }
+    x = 320, y = 240;
+    nv2a_overlay_to_window(&x, &y);
+    CHECK(x == 960 && y == 600, "letterbox back %d,%d", x, y);
+    x = 0, y = 0;
+    nv2a_overlay_to_window(&x, &y);
+    CHECK(x == 160 && y == 0, "letterbox origin %d,%d", x, y);
+
+    /* The other way: bars top and bottom, the height rounded. */
+    nv2a_overlay_view_fit(1000, 1000, 640, 480, r);
+    CHECK(r[0] == 0 && r[1] == 125 && r[2] == 1000 && r[3] == 750, "pillar fit %d,%d %dx%d", r[0],
+          r[1], r[2], r[3]);
+    nv2a_overlay_view_fit(1001, 1000, 640, 480, r);
+    CHECK(r[2] == 1001 && r[3] == 751 && r[1] == 124, "rounded fit %d,%d %dx%d", r[0], r[1],
+          r[2], r[3]);
+    nv2a_overlay_view_fit(0, 1000, 640, 480, r);
+    CHECK(r[0] == 0 && r[1] == 0 && r[2] == 0 && r[3] == 1000, "no window");
+
+    /* Stretched: 640x480 over a 1280x720 client, 2x across, 1.5x down. */
+    nv2a_overlay_set_view(0, 0, 1280, 720, 640, 480);
+    x = 640, y = 360;
+    nv2a_overlay_to_output(&x, &y);
+    CHECK(x == 320 && y == 240, "stretch centre %d,%d", x, y);
+    x = 1279, y = 719;
+    nv2a_overlay_to_output(&x, &y);
+    CHECK(x == 639 && y == 479, "stretch corner %d,%d", x, y);
+    x = 1, y = 1;
+    nv2a_overlay_to_output(&x, &y);
+    CHECK(x == 0 && y == 1, "stretch 1,1 -> %d,%d", x, y);   /* centres 0.75 and 1.0 */
+    x = 2, y = 2;
+    nv2a_overlay_to_output(&x, &y);
+    CHECK(x == 1 && y == 1, "stretch 2,2 -> %d,%d", x, y);
+    x = 320, y = 240;
+    nv2a_overlay_to_window(&x, &y);
+    CHECK(x == 640 && y == 360, "stretch back %d,%d", x, y);
+
+    /* A size of 0 is the identity again (a minimised window). */
+    nv2a_overlay_set_view(0, 0, 0, 720, 640, 480);
+    x = 77, y = 88;
+    nv2a_overlay_to_output(&x, &y);
+    CHECK(x == 77 && y == 88, "zero view moved to %d,%d", x, y);
+    nv2a_overlay_set_view(0, 0, 1280, 720, 640, 480);
+    nv2a_overlay_reset_for_test();
+    x = 77, y = 88;
+    nv2a_overlay_to_output(&x, &y);
+    CHECK(x == 77 && y == 88, "reset kept the view: %d,%d", x, y);
+}
+
 int main(void)
 {
     s_ref_out = getenv("OVERLAY_REF_OUT");
@@ -896,6 +973,7 @@ int main(void)
     test_glyphs();
     test_fit();
     test_ui_scale();
+    test_view();
     nv2a_overlay_reset_for_test();
     if (fails) {
         printf("overlay: %d failure(s)\n", fails);

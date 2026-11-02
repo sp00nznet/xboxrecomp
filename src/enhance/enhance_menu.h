@@ -118,14 +118,15 @@ enum enhance_menu_event {
     ENHANCE_EV_NONE = 0,
     ENHANCE_EV_UP, ENHANCE_EV_DOWN, ENHANCE_EV_LEFT, ENHANCE_EV_RIGHT,
     ENHANCE_EV_OK,          /* A, Enter, Space: toggle, enter, run */
-    ENHANCE_EV_BACK,        /* B, Esc, Backspace: leave a sub-list, else close */
+    ENHANCE_EV_BACK,        /* B, Esc, Backspace, right-click: leave a sub-list; at the
+                             * top B goes to the toolbar (a second B leaves), Esc leaves */
     ENHANCE_EV_PAGE_PREV,   /* LB, Q, PgUp */
     ENHANCE_EV_PAGE_NEXT,   /* RB, E, PgDn */
     ENHANCE_EV_SAVE,        /* Y, F5 */
     ENHANCE_EV_CLEAR,       /* X, Delete: clear an action's bindings */
     ENHANCE_EV_CLOSE,       /* the header's close: asks first when unsaved */
     ENHANCE_EV_CANCEL,      /* View (on release), Shift+Esc: leave, asking first */
-    ENHANCE_EV_HINTS,       /* L3 (on release): hints inline or as a tooltip */
+    ENHANCE_EV_HINTS,       /* L3 (on release), F1, the header's ?: hints inline or as a tooltip */
     ENHANCE_EV_SIZE         /* R3 (on release), the header's size button: compact or expanded */
 };
 
@@ -176,14 +177,30 @@ int  enhance_menu_dialog(void);
 const char *enhance_menu_dialog_text(void);     /* its body, "" when closed */
 /* A section's intro, NULL for none. */
 const char *enhance_menu_page_intro_text(int page);
-/* 1 when hints show inline under the rows, 0 as a tooltip (L3 flips it). */
+/* 1 when hints show inline under the rows (L3, F1 and the header's ?
+ * flip tooltip or off to inline and back to tooltip). */
 int  enhance_menu_hints_inline(void);
+/* overlay.menu_hints (D11): 0 tooltip, 1 inline, 2 off (enum menu_hints). */
+int  enhance_menu_hints(void);
+/* The focused region (D3, enum menu_focus): 0 content, 1 toolbar, 2 footer. */
+int  enhance_menu_focus(void);
+/* The footer button with the focus (MENU_FB_*), -1 when the footer has none. */
+int  enhance_menu_footer_selected(void);
+/* The latest device (ENHANCE_DEV_*): the footer's glyphs and hints follow it. */
+int  enhance_menu_device(void);
+/* 1 when the selected row's tooltip card shows at now_ms (D11). */
+int  enhance_menu_tooltip(uint64_t now_ms);
+/* 1 while the on-screen keyboard is up over the name field (D4). */
+int  enhance_menu_osk(void);
+/* The geometry of the last draw (enhance_menu_layout.h), NULL before one:
+ * the ctest aims the pointer with it. */
+struct menu_layout;
+const struct menu_layout *enhance_menu_last_layout(void);
 /* The size mode (D2): 0 compact, 1 expanded. R3 and the header's button
  * flip it; overlay.menu_size keeps it across runs. */
 int  enhance_menu_size(void);
 /* The section toolbar holds the focus (Q10): it unfolds with its labels.
- * Phase C's focus model drives it; until then the ctest and the
- * screenshots set it. */
+ * B at a section's top level puts it there; the screenshots set it. */
 void enhance_menu_set_toolbar_focus(int on);
 /* 1 while the toolbar shows its labels: the focus, or the 1.5 s after a
  * section change (the LB/RB peek). */

@@ -13,6 +13,8 @@
 #   text_input.c    typed text for the menu's fields: the ring and the
 #                   request (every host; its Win32 half reads WM_CHAR)
 #   text_input_sdl.c SDL_EVENT_TEXT_INPUT and SDL's text input (POSIX)
+#   pointer.c       the absolute pointer for the menu's mouse: a seqlocked
+#                   snapshot, Win32 and SDL formats (every host)
 
 add_library(xbox_input STATIC
     pad_map.c
@@ -23,6 +25,7 @@ add_library(xbox_input STATIC
     input_names.c
     kbm_script.c
     text_input.c
+    pointer.c
 )
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -81,6 +84,10 @@ endif()
 # the request and two threads (every host, no SDL, no window).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_text
                  ${CMAKE_CURRENT_BINARY_DIR}/input_text)
+# The pointer snapshot: both writers' formats, the wheel's rest, the
+# seqlock against a writer thread (every host, no SDL, no window).
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_pointer
+                 ${CMAKE_CURRENT_BINARY_DIR}/input_pointer)
 # The XInput DLL a game's exe imports must ship with Windows (Windows builds
 # with an objdump to read the import table).
 if(WIN32 AND CMAKE_OBJDUMP)

@@ -892,6 +892,17 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
             r.h = dh;
         }
         nv2a_overlay_set_placement(r.x, r.y, r.w, r.h);
+        /* Under internal the layer fits the drawable into the window after
+         * this pass, so the pointer's window pixels map through that fit
+         * (D3D11's stretch is the same call); else the two are one. */
+        if (internal) {
+            int ww = 0, wh = 0, v[4];
+            SDL_GetWindowSizeInPixels(win, &ww, &wh);
+            nv2a_overlay_view_fit(ww, wh, dw, dh, v);
+            nv2a_overlay_set_view(v[0], v[1], v[2], v[3], dw, dh);
+        } else {
+            nv2a_overlay_set_view(0, 0, 0, 0, 0, 0);
+        }
         if (nlayers && s_pso_ovl)
             ovl_draw(enc, cb, layers, nlayers, r, dw, dh);
 #else

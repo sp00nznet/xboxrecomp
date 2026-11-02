@@ -11,6 +11,7 @@ add_executable(input_keyboard_test
     test_main.c
     ${INPUT_SRC}/keyboard.c
     ${INPUT_SRC}/mouse.c
+    ${INPUT_SRC}/pointer.c
     ${INPUT_SRC}/input_names.c
     ${INPUT_SRC}/input_map.c
     ${INPUT_SRC}/kbm_script.c)

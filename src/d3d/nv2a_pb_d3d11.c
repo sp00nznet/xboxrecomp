@@ -5088,6 +5088,19 @@ static void ovl_present(void)
         r.h = (int32_t)s_back_h;
     }
     nv2a_overlay_set_placement(r.x, r.y, r.w, r.h);
+    /* A back buffer of another size than the client area is stretched into
+     * it by DXGI (the legacy description's scaling): under
+     * present.surface=internal whenever the window is resized, and for the
+     * one flip between a WM_SIZE and present_resize otherwise. The pointer's
+     * client pixels map through that stretch (Metal's fit is the same
+     * call); the same sizes publish none. */
+    {
+        UINT vw = s_client_w, vh = s_client_h;
+        if (vw && vh && (vw != s_back_w || vh != s_back_h))
+            nv2a_overlay_set_view(0, 0, (int)vw, (int)vh, (int)s_back_w, (int)s_back_h);
+        else
+            nv2a_overlay_set_view(0, 0, 0, 0, 0, 0);
+    }
     nv2a_overlay_poll(GetTickCount64());
     if (!nv2a_overlay_visible() || !(n = nv2a_overlay_lists(ls)) || !ovl_init())
         return;

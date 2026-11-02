@@ -81,6 +81,11 @@ struct menu_layout_in {
     /* Rows: kinds and (for range and choice) the value's width, nrow each;
      * NULL kinds lay every row out plain. */
     int nrow, scroll, sel;
+    /* The wheel scrolled (D3): scroll stands as given, even with sel out of
+     * view; a pad or key move clears it. */
+    int free_scroll;
+    /* Inline hints (D11): a line this tall under every row, 0 for none. */
+    int hint_h;
     const unsigned char *row_kind;
     const int *row_value_w;
     int extra_h;           /* a block under the rows (the Stats graph), or 0 */
@@ -98,7 +103,8 @@ struct menu_layout_in {
 struct menu_layout_row {
     int index;             /* the row */
     int clipped;           /* past the viewport's foot: drawn cut, never hit */
-    struct menu_rect r;
+    struct menu_rect r;    /* the row's band: label and value */
+    struct menu_rect hint; /* the inline hint's line under r, zero without */
     /* Value controls, zero when the kind has none. */
     struct menu_rect pill, track, prev, next, value;
 };

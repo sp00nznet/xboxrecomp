@@ -13,8 +13,10 @@
 #include "mouse_sdl.h"
 #include "mouse.h"
 #include "input_names.h"
+#include "pointer.h"
 
 static int s_relative = -1;     /* the mode last applied; -1 none yet */
+static int s_hidden;            /* SDL_HideCursor applied for the menu */
 /* SDL3 reports motion and the wheel in fractions (high-resolution mice,
  * trackpads); mouse.c counts whole steps. The part
  * left over carries into the next event, so slow motion still adds up. */
@@ -38,10 +40,51 @@ static int whole(float *acc, float d)
     return n;
 }
 
+/* The window's pixels per SDL coordinate: the overlay's placement is in
+ * pixels, SDL's mouse in points (2 per point on a Retina display). */
+static float density_of(SDL_WindowID id)
+{
+    SDL_Window *w = SDL_GetWindowFromID(id);
+    float d = w ? SDL_GetWindowPixelDensity(w) : 0.0f;
+    return d > 0.0f ? d : 1.0f;
+}
+
+static unsigned pointer_button(Uint8 b)
+{
+    return b == SDL_BUTTON_LEFT ? XBOX_POINTER_LEFT : b == SDL_BUTTON_RIGHT ? XBOX_POINTER_RIGHT
+         : b == SDL_BUTTON_MIDDLE ? XBOX_POINTER_MIDDLE : 0u;
+}
+
+/* The menu's absolute pointer (pointer.h). A touch counts here, unlike for
+ * the game's mouse: a tap on the Deck's screen is a click on the menu. */
+static void pointer_event(const SDL_Event *ev)
+{
+    switch (ev->type) {
+    case SDL_EVENT_MOUSE_MOTION:
+        xbox_InputPointerSdlMove(ev->motion.x, ev->motion.y, density_of(ev->motion.windowID));
+        return;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+        if (pointer_button(ev->button.button))
+            xbox_InputPointerSdlButton(pointer_button(ev->button.button), ev->button.down,
+                                       ev->button.x, ev->button.y,
+                                       density_of(ev->button.windowID));
+        return;
+    case SDL_EVENT_MOUSE_WHEEL:
+        xbox_InputPointerSdlWheel(ev->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -ev->wheel.y
+                                                                                : ev->wheel.y);
+        return;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        xbox_InputPointerFocusLost();
+        return;
+    }
+}
+
 void xbox_InputSdlMouseEvent(const SDL_Event *ev)
 {
     int n;
 
+    pointer_event(ev);
     switch (ev->type) {
     case SDL_EVENT_MOUSE_MOTION: {
         int dx, dy;
@@ -102,7 +145,17 @@ void xbox_InputSdlMouseEvent(const SDL_Event *ev)
 int xbox_InputSdlMouseSync(SDL_Window *win)
 {
     int want = xbox_InputMouseCaptured();
+    /* The menu's hide (a pad or key press while the cursor is free); in
+     * relative mode SDL hides it anyway, so it counts only outside. */
+    int hide = !want && xbox_InputMouseCursorHidden();
 
+    if (hide != s_hidden) {
+        if (hide)
+            SDL_HideCursor();
+        else
+            SDL_ShowCursor();
+        s_hidden = hide;
+    }
     if (want == s_relative)
         return 0;
     /* Relative mode hides the cursor, confines it and reports motion past

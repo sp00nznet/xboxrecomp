@@ -82,6 +82,12 @@ int  xbox_InputMouseKey(int vk, int down);
 /* 1 while something (the enhancements menu) needs the cursor free; 0 gives
  * it back, captured again if the window still has focus. */
 void xbox_InputMouseSuspend(int on);
+/* While the cursor is free (suspended for the menu), 1 hides it and 0
+ * shows it: the menu hides it on a pad or key press and shows it again on
+ * mouse motion (overlay-revamp D3). A captured cursor is hidden anyway.
+ * Any thread; the window's sync applies it. */
+void xbox_InputMouseCursorHide(int on);
+int  xbox_InputMouseCursorHidden(void);
 /* Whether the cursor is captured now: the window mirrors this. */
 int  xbox_InputMouseCaptured(void);
 /* The injector (kbm_script) captures without a window; with one, the

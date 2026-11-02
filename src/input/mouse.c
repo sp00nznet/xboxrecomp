@@ -18,6 +18,7 @@
 #include "mouse.h"
 #include "keyboard.h"
 #include "input_names.h"
+#include "pointer.h"
 #include "recomp_env.h"
 #include "recomp_exit_hook.h"
 
@@ -252,6 +253,18 @@ void xbox_InputMouseSuspend(int on)
     update("menu");
 }
 
+static int s_cursor_hide;
+
+void xbox_InputMouseCursorHide(int on)
+{
+    STORE(&s_cursor_hide, on != 0);
+}
+
+int xbox_InputMouseCursorHidden(void)
+{
+    return LOAD(&s_cursor_hide);
+}
+
 void xbox_InputMouseForceCapture(int on)
 {
     STORE(&s_forced, on != 0);
@@ -433,6 +446,7 @@ void xbox_InputMouseReset(void)
 {
     STORE(&s_focus, 0);
     STORE(&s_suspend, 0);
+    STORE(&s_cursor_hide, 0);
     STORE(&s_key_free, 0);
     STORE(&s_clicked, 0);
     STORE(&s_forced, 0);
@@ -464,6 +478,7 @@ static int  s_path_logged;
 static LONG s_abs_x, s_abs_y;
 static int  s_have_abs;
 static int  s_wheel_rem;
+static int  s_cur_hidden;       /* window thread: hidden for the menu, uncaptured */
 
 static void log_path(const char *path)
 {
@@ -554,6 +569,9 @@ void xbox_InputMouseWin32Msg(void *hwnd, unsigned msg, uintptr_t w, intptr_t l)
     POINT c, at;
     uint32_t now;
 
+    /* The menu's absolute pointer (pointer.h) as well: both game windows
+     * pass every message here, so this one call feeds it from either. */
+    xbox_InputPointerWin32Msg(msg, w, l);
     switch (msg) {
     case WM_MOUSEACTIVATE:
         /* Sent before the button message of a click on an inactive
@@ -722,8 +740,21 @@ void xbox_InputMouseWin32Sync(void *hwnd)
         }
     } else if (!want && s_applied) {
         unapply();
+        s_cur_hidden = 0;   /* unapply showed it */
         return;
     }
+    if (!want) {
+        /* Free for the menu: hidden while a pad or the keys lead. The count
+         * is per thread, so this runs only here, on the window's. */
+        int hide = LOAD(&s_cursor_hide);
+        if (hide != s_cur_hidden) {
+            for (int i = 0; i < 8 && (hide ? ShowCursor(FALSE) >= 0 : ShowCursor(TRUE) < 0); i++)
+                ;
+            s_cur_hidden = hide;
+        }
+        return;
+    }
+    s_cur_hidden = 0;   /* the capture hides it on its own count */
     /* Every pump: the window may have moved, and a cursor at the centre
      * cannot leave through an edge before the next one. */
     if (!clip_client(h))

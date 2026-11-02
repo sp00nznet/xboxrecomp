@@ -177,6 +177,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `overlay.stats` | bool | the stats strip in the window's top right corner: fps, frame ms (average and worst of the last second), pacing, scale and backend, at 2 Hz; never in a frame dump | `false` | `RECOMP_OVERLAY_STATS` |
 | `overlay.ui_scale` | number | the menu's and the overlays' size over the output-height scale, 0.75 to 2 in quarter steps: larger for a TV across the room. Read at start (the font atlas is baked then) | `1` | none |
 | `overlay.menu_size` | string | `"compact"` (a panel at the left, the game beside it) or `"expanded"` (the whole window over a dimmed game). R3 in the menu flips it and writes this key at once, alone; not with `RECOMP_CONFIG=none` | `"compact"` | none |
+| `overlay.menu_hints` | string | where the menu shows the selected row's help: `"tooltip"` (a card beside the row, 350 ms after a pad or key selection settles, 500 ms after the mouse rests), `"inline"` (a line under every row) or `"off"`. L3 (on release), F1 and the header's `?` flip between tooltip and inline (from off: inline) and write this key at once, alone; not with `RECOMP_CONFIG=none` | `"tooltip"` | none |
 | `menu.enabled` | bool | the in-game menu, opened by the `menu.open` action ([In-game menu](#in-game-menu-menuenabled)) | `false` | `RECOMP_MENU` |
 | `storage.ram_cache` | bool | the title's cache partition (`Z:`, `Partition3`-`5`) lives in memory: capped at the stock 750 MB (a full one answers `STATUS_DISK_FULL`, as FATX does), seeded read-only from `<hdd>/Cache` at the first file call, never written back. For a title that rewrites its cache all the time (BLiNX 1: about 7 GB an hour); the console clears these partitions anyway. On by default for every title; `false` puts the files in `<hdd>/Cache` as stock. Read before the guest starts | `true` | `RECOMP_STORAGE_RAM_CACHE` |
 | `mods.<name>` | bool | a mod ([Mods](#mods)) runs; `false` leaves its init out at start. The menu's Mods page writes it | `true` | none |
@@ -1293,13 +1294,53 @@ a second after the close.
 
 | Pad | Keyboard | Does |
 |---|---|---|
-| D-pad, left stick | arrows | move; left and right change the value. Held: a repeat after 150 ms, then every 60 ms |
-| A | Enter, Space | toggle, enter a list, start a capture, run an action |
-| B | Esc, Backspace | leave a list or a capture, else close |
+| D-pad, left stick | arrows | move; left and right change the value. Held: a repeat after 150 ms, then every 60 ms. Down past the last row moves to the footer's buttons (on Save when something is unsaved, else Cancel); Up from the first row stays |
+| A | Enter, Space | toggle, enter a list, start a capture, run an action, press the focused footer button |
+| B | Esc, Backspace | leave a list or a capture. At a section's top it moves to the section's entry in the toolbar and a second press closes (asking first when something is unsaved) |
+| | Tab, Shift+Tab | the focus round the toolbar, the rows and the footer |
 | LB, RB | Q, E, PgUp, PgDn | the previous or next page |
-| Y | F5 | Save |
+| Y | F5, Ctrl+S, Cmd+S | Save |
 | X | Delete | clear an action's bindings |
+| View (on release) | Shift+Esc | Cancel: close, asking first when something is unsaved |
+| L3 (on release) | F1 | the hints: tooltip or inline (`overlay.menu_hints`) |
 | R3 (on release) | | the size: compact or expanded (`overlay.menu_size`) |
+
+In the toolbar, Up and Down (or LB and RB) walk the sections and A or
+Right enters one; in the footer, Left and Right pick Cancel or Save and
+Up or B goes back to the row. The global buttons (Y, View, L3, R3, LB,
+RB) do the same everywhere; no page binds them.
+
+The mouse works the menu while it is open: the cursor is freed for it
+(a mod holding the mouse gets no motion until the menu closes) and hides
+on a pad or key press until the mouse moves again. Moving the pointer
+over a row selects it, but only real motion does: a mouse resting on the
+panel never takes the selection from the pad or the keys. A click acts
+on what it hits: a switch flips, the arrows step a choice, a slider
+jumps to the point and follows a drag, a row's label is its A, and the
+header buttons, the footer buttons, the toolbar's entries and the
+dialog's buttons press. The wheel over a slider or a choice steps its
+value, one step a notch, applied as the arrows apply it; anywhere else
+it scrolls the rows without moving the selection, and the next key or
+pad press brings the selection back into view. The right button is B
+(Go Back in the dialog). Clicks on the dimmed game or outside the panel
+do nothing. Under `present.surface = internal` the pointer maps through
+the presenter's scaling (Metal's letterbox, D3D11's stretch to the
+window), so a click lands on what is drawn under it.
+
+Renaming a shader profile edits the name in place: a keyboard types in
+its own layout (the window's text input, so dead keys and IMEs work),
+with Left, Right, Home, End, Backspace and Delete, Enter to keep it and
+Esc to cancel. When the pad was the last input, or the mouse or a
+touch started the rename and no key has been pressed this session, an
+on-screen keyboard opens under the field: the d-pad moves, A types the focused key, X
+deletes, Start or Done keeps the name, B cancels, and LB and RB move
+the text cursor. Shift gives one capital. Under Steam (`SteamGameId`, or
+`SteamDeck=1`) the footer also names Steam + X, Steam's own keyboard. The mouse clicks
+its keys, and the right button cancels.
+
+`RECOMP_TRACE=menu_input` prints the menu's input as it happens: the
+device each event came from, focus moves, pointer hits and clicks, the
+tooltip's shows and the text field's input.
 
 The menu comes in two sizes. Compact is a panel down the window's left,
 the game in view beside it; expanded fills the window over the game

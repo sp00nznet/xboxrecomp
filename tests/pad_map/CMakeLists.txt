@@ -14,6 +14,7 @@ add_executable(pad_map_test
     ${INPUT_SRC}/input_core.c
     ${INPUT_SRC}/keyboard.c
     ${INPUT_SRC}/mouse.c
+    ${INPUT_SRC}/pointer.c
     ${INPUT_SRC}/input_names.c
     ${INPUT_SRC}/input_map.c
     ${INPUT_SRC}/kbm_script.c)

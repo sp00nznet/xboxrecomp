@@ -36,9 +36,9 @@ extern "C" {
 
 /* ---- the consumer: the guest's thread (the menu) ----------------------- */
 
-/* Text input on, for a field at x, y, w, h in placement pixels (the frame's
- * rect in the window's pixels, nv2a_overlay_set_placement). Empties the
- * ring. A second Begin moves the field. */
+/* Text input on, for a field at x, y, w, h in the window's pixels (the
+ * menu maps its placement rect back through nv2a_overlay_to_window).
+ * Empties the ring. A second Begin moves the field. */
 void xbox_InputTextBegin(int x, int y, int w, int h);
 /* Text input off; empties the ring. */
 void xbox_InputTextEnd(void);

@@ -2,7 +2,8 @@
 # font, the CPU reference raster, nv2a_stats): draw-list and raster
 # checksums of fixed frames, layout at 720 and 2160 lines, the layers'
 # publish, hide and visible mask, toast expiry, two writers and a reader,
-# the menu try-lock, the overflow cut, inert stats and the disarmed state.
+# the menu try-lock, the overflow cut, inert stats, the disarmed state and
+# the window-to-output view the pointer maps through.
 # POSIX (pthreads):
 #   cmake -S tests/overlay -B build/overlay
 #   cmake --build build/overlay && ctest --test-dir build/overlay

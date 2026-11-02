@@ -35,7 +35,12 @@
 #include "enhance.h"
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
+#include "enhance_input.h"
 #include "enhance_menu.h"
+#include "enhance_menu_input.h"
+#include "enhance_menu_layout.h"
+#include "enhance_osk.h"
+#include "enhance_text.h"
 #include "host_pad.h"
 #include "input_backend.h"
 #include "input_names.h"
@@ -49,9 +54,11 @@
 #include "nv2a_present_chain.h"
 #include "nv2a_tex_pack.h"
 #include "pad_map.h"
+#include "pointer.h"
 #include "recomp_env.h"
 #include "shader_param_kinds.h"
 #include "shader_profile_edit.h"
+#include "text_input.h"
 
 #include <fcntl.h>
 #include <stdarg.h>
@@ -220,6 +227,15 @@ static void tap(int vk)
     flip();
 }
 
+/* Esc as the pad's B (D9a): from a section's top level the first goes to
+ * the toolbar, and the one there leaves, asking first when unsaved. */
+static void esc_leave(void)
+{
+    if (enhance_menu_focus() != MENU_FOCUS_TOOLBAR)
+        tap(0x1B);
+    tap(0x1B);
+}
+
 /* ---- stderr capture ---------------------------------------------------- */
 
 static int s_saved_fd = -1;
@@ -309,6 +325,7 @@ static const char *start_with(const char *toml, const struct xbox_mod *const *mo
     nv2a_overlay_reset_for_test();
     xbox_InputSetBackend(&k_fake);
     xbox_InputKeysClear();
+    xbox_InputPointerReset();
     pad_clear();
     if (toml)
         write_file("config/config.toml", toml);
@@ -456,9 +473,18 @@ static void test_navigate(void)
     xbox_InputKeyEvent(0x28, 0);
     advance(16);
     poll0();
-    /* Up from the first row wraps to the last. */
+    /* Q11: no wrap. Up from the first row stays; Down past the last goes
+     * to the footer, on Cancel with nothing to save, and Up comes back. */
     CHECK(enhance_menu_select_row("Render scale"));
     tap(0x26);
+    CHECK(!strcmp(selected_label(), "Render scale"));
+    CHECK(enhance_menu_focus() == 0);
+    CHECK(enhance_menu_select_row("Overlay scale"));
+    tap(0x28);
+    CHECK(enhance_menu_focus() == 2 && enhance_menu_footer_selected() == 0);
+    CHECK(!strcmp(selected_label(), "Overlay scale"));
+    tap(0x26);
+    CHECK(enhance_menu_focus() == 0 && enhance_menu_footer_selected() == -1);
     CHECK(!strcmp(selected_label(), "Overlay scale"));
 
     /* Right on Render scale: 1 -> 2, at the flip; unsaved. */
@@ -481,13 +507,17 @@ static void test_navigate(void)
     tap(0x27);
     CHECK(!strcmp(row_value("Scaling filter"), "nearest"));
 
-    /* Esc asks first (D9a): the A held here stepped the filter, so the
-     * dialog comes up and N leaves without saving. The title gets nothing
-     * while the keys are down, and the pad button held through the close
-     * stays the host's to its release. */
+    /* Esc is B (D9a): the first goes to the toolbar, the one there asks
+     * first. The A held here stepped the filter, so the dialog comes up
+     * and N leaves without saving. The title gets nothing while the keys
+     * are down, and the pad button held through the close stays the
+     * host's to its release. */
     hold_a(1);
     advance(16);
     poll0();
+    tap(0x1B);
+    CHECK(enhance_menu_is_open() && enhance_menu_focus() == MENU_FOCUS_TOOLBAR);
+    CHECK(enhance_menu_dialog() < 0);
     xbox_InputKeyEvent(0x1B, 1);
     advance(16);
     st = poll0();
@@ -1708,11 +1738,33 @@ static void press_a(void)
     flip();
 }
 
-static void shift_tap(int vk)
+static void shift_tap_vk(int vk)
 {
     xbox_InputKeyEvent(0x10, 1);
     tap(vk);
     xbox_InputKeyEvent(0x10, 0);
+}
+
+/* Text as the host's window types it (SDL_EVENT_TEXT_INPUT, WM_CHAR): into
+ * the ring while a field wants text. */
+static void type_text(const char *t)
+{
+    xbox_InputTextPushUtf8(t);
+    advance(16);
+    poll0();
+    flip();
+}
+
+static void press_analog(int b)
+{
+    f_pad[0].Gamepad.bAnalogButtons[b] = 255;
+    advance(16);
+    poll0();
+    flip();
+    f_pad[0].Gamepad.bAnalogButtons[b] = 0;
+    advance(16);
+    poll0();
+    flip();
 }
 
 #define CFG_PROF ARMED "[present]\nshader_lib = \"" FAKE_LRS_PARAMS "\"\n"
@@ -1837,17 +1889,19 @@ static void test_profiles(void)
     CHECK(enhance_menu_unsaved() == 0);
     CHECK(read_file(CACHE "/slangp/mine.slangp")[0] != 0);
 
-    /* Rename on the keyboard: letters, Q and E, F5 type or are swallowed;
-     * Enter keeps it. */
+    /* Rename on the keyboard (D4): the host's text, in the player's
+     * layout, types; Q and E and F5 are swallowed as keys (their text is
+     * the ring's); Enter keeps it. No on-screen keys for a keyboard. */
     CHECK(enhance_menu_select_row("Rename"));
     tap(0x0D);
+    CHECK(xbox_InputTextActive());
+    CHECK(!enhance_menu_osk());
     for (int i = 0; i < 4; i++)
         tap(0x08);
-    shift_tap('M');
-    tap('Y');
-    tap(0x20);
+    type_text("My ");
     tap('Q');
     tap('E');
+    type_text("qe");
     tap(VK_F5);
     CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Shaders"));
     CHECK(row_value("Rename") && !strcmp(s_val, "My qe|"));
@@ -1855,6 +1909,7 @@ static void test_profiles(void)
     tap(0x2E);
     CHECK(row_value("Rename") && !strcmp(s_val, "My q|"));
     tap(0x0D);
+    CHECK(!xbox_InputTextActive());
     CHECK(strstr(enhance_menu_status(), "Renamed to My q") != NULL);
     CHECK(row_value("Profile") && !strcmp(s_val, "My q"));
     /* The chain may still read the old composed file until a request
@@ -1875,14 +1930,50 @@ static void test_profiles(void)
     f = read_file("config/config.toml");
     CHECK(strstr(f, "profile = \"my-q\"") != NULL);
 
-    /* Rename on the pad: Up past the end adds a letter under the cursor
-     * and cycles it; B cancels. */
+    /* Rename on the pad: the on-screen keyboard (D4) opens on q; A
+     * types the focused key, the d-pad moves, X deletes; Shift gives one
+     * capital; B cancels. */
     CHECK(enhance_menu_select_row("Rename"));
     press_a();
+    CHECK(enhance_menu_osk());
+    press_a();
+    CHECK(row_value("Rename") && !strcmp(s_val, "My qq|"));
+    /* The menu's global buttons are the editor's or nothing while it is
+     * up: Y does not save, View does not ask to leave, L3 keeps the hints,
+     * R3 is nothing; LB and RB move the text cursor, not the section. */
+    {
+        int pg = enhance_menu_page(), hints = enhance_menu_hints_inline();
+        press_analog(XBOX_BUTTON_Y);
+        press(XBOX_GAMEPAD_BACK);
+        press(XBOX_GAMEPAD_LEFT_THUMB);
+        press(XBOX_GAMEPAD_RIGHT_THUMB);
+        CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0 && enhance_menu_osk());
+        CHECK(enhance_menu_hints_inline() == hints);
+        CHECK(row_value("Rename") && !strcmp(s_val, "My qq|"));
+        press_analog(XBOX_BUTTON_WHITE);
+        CHECK(row_value("Rename") && !strcmp(s_val, "My q|q"));
+        press_analog(XBOX_BUTTON_BLACK);
+        CHECK(row_value("Rename") && !strcmp(s_val, "My qq|"));
+        CHECK(enhance_menu_page() == pg && enhance_menu_osk());
+    }
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    press_a();
+    CHECK(row_value("Rename") && !strcmp(s_val, "My qqw|"));
+    press_analog(XBOX_BUTTON_X);
+    CHECK(row_value("Rename") && !strcmp(s_val, "My qq|"));
+    /* Down three rows: from w to the bottom row's Shift, then a capital
+     * z. */
+    press(XBOX_GAMEPAD_DPAD_DOWN);
+    press(XBOX_GAMEPAD_DPAD_DOWN);
+    press(XBOX_GAMEPAD_DPAD_DOWN);
+    press_a();
     press(XBOX_GAMEPAD_DPAD_UP);
-    CHECK(row_value("Rename") && !strcmp(s_val, "My q|A"));
-    press(XBOX_GAMEPAD_DPAD_UP);
-    CHECK(row_value("Rename") && !strcmp(s_val, "My q|B"));
+    press_a();
+    CHECK(row_value("Rename") && !strcmp(s_val, "My qqZ|"));
+    /* Typed text from a keyboard puts the on-screen keys away. */
+    type_text("y");
+    CHECK(!enhance_menu_osk());
+    CHECK(row_value("Rename") && !strcmp(s_val, "My qqZy|"));
     f_pad[0].Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
     advance(16);
     poll0();
@@ -2273,8 +2364,8 @@ static void test_pages(void)
 {
     /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Files. */
     static const uint32_t k_sum[9] = {
-        0x13527668u, 0x64F653C1u, 0x520072BFu, 0xFD1CB783u, 0x00BD4162u,
-        0xDE95928Fu, 0xAA60FECEu, 0xEFA7A61Au, 0x5446673Fu };
+        0x65348BABu, 0xBECB3B03u, 0x0439BB8Du, 0x125C08E1u, 0x4677E872u,
+        0x778983B3u, 0x7B63D4BDu, 0xDFA436B9u, 0x1CED9BD4u };
     start_with(ARMED, k_mods);
     open_menu();
     CHECK(enhance_menu_is_open());
@@ -2738,7 +2829,7 @@ static void test_revert_shaders(void)
     tap(0x0D);
     for (int i = 0; i < 4; i++)
         tap(0x08);
-    shift_tap('Z');
+    type_text("Z");
     xbox_InputShortcutPost('S');
     advance(16);
     poll0();
@@ -2786,7 +2877,7 @@ static void test_revert_shaders(void)
     CHECK(shader_edit_deleted());
     change_scale();
     CHECK(enhance_menu_set_page("Shaders"));
-    tap(0x1B);
+    esc_leave();
     CHECK(enhance_menu_dialog() == 2);
     CHECK(strstr(enhance_menu_dialog_text(), "Deleted profiles are gone already") != NULL);
     advance(160);
@@ -2819,13 +2910,15 @@ static void test_dialog(void)
     open_menu();
 
     /* Nothing unsaved: each trigger just closes. */
-    tap(0x1B);
+    esc_leave();
     CHECK(!enhance_menu_is_open());
     open_menu();
     shift_esc();
     CHECK(!enhance_menu_is_open());
     open_menu();
-    pad_b();
+    pad_b();                                    /* to the toolbar (C.2b) */
+    CHECK(enhance_menu_is_open() && enhance_menu_focus() == MENU_FOCUS_TOOLBAR);
+    pad_b();                                    /* there: the leave */
     CHECK(!enhance_menu_is_open());
     open_menu();
     pad_tap(XBOX_GAMEPAD_BACK);                 /* View, on its release */
@@ -2835,7 +2928,7 @@ static void test_dialog(void)
     open_menu();
     change_scale();
     sel = enhance_menu_selected();
-    tap(0x1B);
+    esc_leave();
     CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 2);
     CHECK(strstr(enhance_menu_dialog_text(), "1 setting changed since the last save.") != NULL);
     CHECK(strstr(enhance_menu_dialog_text(), "Render scale") != NULL);
@@ -2850,7 +2943,13 @@ static void test_dialog(void)
     CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
     CHECK(enhance_menu_selected() == sel);
     CHECK(enhance_menu_unsaved() == 1);
+    /* Go Back leaves the focus where the leave came from: the toolbar. */
+    CHECK(enhance_menu_focus() == MENU_FOCUS_TOOLBAR);
+    tap(0x27);
+    CHECK(enhance_menu_focus() == MENU_FOCUS_CONTENT);
 
+    pad_b();
+    CHECK(enhance_menu_dialog() < 0 && enhance_menu_focus() == MENU_FOCUS_TOOLBAR);
     pad_b();
     CHECK(enhance_menu_dialog() == 2);
     advance(160);
@@ -2890,7 +2989,7 @@ static void test_dialog(void)
     CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0);
 
     /* N: exit without saving, the change reverted. */
-    tap(0x1B);
+    esc_leave();
     advance(160);
     tap('N');
     CHECK(!enhance_menu_is_open());
@@ -2900,7 +2999,7 @@ static void test_dialog(void)
     /* S: exit and save. */
     open_menu();
     change_scale();
-    tap(0x1B);
+    esc_leave();
     advance(160);
     tap('S');
     CHECK(!enhance_menu_is_open());
@@ -2912,7 +3011,7 @@ static void test_dialog(void)
     change_scale();
     remove("config/config.toml");
     MKDIR("config/config.toml");
-    tap(0x1B);
+    esc_leave();
     advance(160);
     tap('S');
     CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 2);
@@ -2936,7 +3035,7 @@ static void test_dialog(void)
     /* Ctrl+S and Cmd+S in the dialog are swallowed: no save, no exit. */
     open_menu();
     change_scale();
-    tap(0x1B);
+    esc_leave();
     advance(160);
     xbox_InputKeyEvent(0x11, 1);
     tap('S');
@@ -2957,7 +3056,7 @@ static void test_dialog(void)
     start_with(ARMED, k_mods);
     open_menu();
     change_scale();
-    tap(0x1B);
+    esc_leave();
     advance(160);
     tap('S');
     CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 2);
@@ -3379,6 +3478,952 @@ static void test_help(void)
     CHECK(!enhance_menu_is_open());
 }
 
+/* ---- overlay-revamp C: the pad's regions, the mouse, hints, the OSK ----- */
+
+/* D3's owner table: the global buttons and the section buttons are two
+ * sets, and every event sits on the set its kind belongs to, so no section
+ * binds a global button. */
+static void test_owner_table(void)
+{
+    int n;
+    const struct menu_pad_event *ev = menu_pad_events(&n);
+    uint32_t g = menu_owner_mask(MENU_OWN_GLOBAL), sec = menu_owner_mask(MENU_OWN_SECTION);
+    CHECK(g && sec && !(g & sec));
+    for (int i = 0; i < n; i++) {
+        int global = ev[i].ev == ENHANCE_EV_SAVE || ev[i].ev == ENHANCE_EV_CANCEL
+                     || ev[i].ev == ENHANCE_EV_HINTS || ev[i].ev == ENHANCE_EV_SIZE
+                     || ev[i].ev == ENHANCE_EV_PAGE_PREV || ev[i].ev == ENHANCE_EV_PAGE_NEXT;
+        int own = menu_button_owner(ev[i].src);
+        if (own != (global ? MENU_OWN_GLOBAL : MENU_OWN_SECTION)) {
+            fprintf(stderr, "pad event %d on src %d: owner %d\n", ev[i].ev, ev[i].src, own);
+            CHECK(0);
+        }
+        /* Only a global button acts on its release (a game's chord). */
+        CHECK(!ev[i].on_release || own == MENU_OWN_GLOBAL);
+        for (int j = 0; j < i; j++)
+            CHECK(ev[j].src != ev[i].src);
+    }
+    CHECK(menu_focus_cycle(MENU_FOCUS_CONTENT, 1) == MENU_FOCUS_FOOTER);
+    CHECK(menu_focus_cycle(MENU_FOCUS_FOOTER, 1) == MENU_FOCUS_TOOLBAR);
+    CHECK(menu_focus_cycle(MENU_FOCUS_TOOLBAR, -1) == MENU_FOCUS_FOOTER);
+    CHECK(menu_focus_cycle(MENU_FOCUS_HEADER, 1) == MENU_FOCUS_FOOTER);
+}
+
+/* Q11 and Q12 on the pad: Down past the last row is the footer, B at the
+ * top is the toolbar, and a B there leaves. */
+static void test_pad_regions(void)
+{
+    int last;
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Render"));
+    for (int i = 0; i < 60 && enhance_menu_focus() == MENU_FOCUS_CONTENT; i++)
+        press(XBOX_GAMEPAD_DPAD_DOWN);
+    CHECK(enhance_menu_focus() == MENU_FOCUS_FOOTER);
+    CHECK(enhance_menu_footer_selected() == MENU_FB_CANCEL);   /* nothing to save */
+    last = enhance_menu_selected();
+    press(XBOX_GAMEPAD_DPAD_DOWN);                             /* no wrap */
+    CHECK(enhance_menu_focus() == MENU_FOCUS_FOOTER);
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    CHECK(enhance_menu_footer_selected() == MENU_FB_SAVE);
+    press(XBOX_GAMEPAD_DPAD_LEFT);
+    CHECK(enhance_menu_footer_selected() == MENU_FB_CANCEL);
+    press(XBOX_GAMEPAD_DPAD_UP);
+    CHECK(enhance_menu_focus() == MENU_FOCUS_CONTENT && enhance_menu_selected() == last);
+    press(XBOX_GAMEPAD_DPAD_DOWN);
+    CHECK(enhance_menu_focus() == MENU_FOCUS_FOOTER);
+    pad_b();                                                   /* B: back to the row */
+    CHECK(enhance_menu_focus() == MENU_FOCUS_CONTENT && enhance_menu_selected() == last);
+
+    /* With a change the footer opens on Save, and A there saves. */
+    change_scale();
+    for (int i = 0; i < 60 && enhance_menu_focus() == MENU_FOCUS_CONTENT; i++)
+        press(XBOX_GAMEPAD_DPAD_DOWN);
+    CHECK(enhance_menu_footer_selected() == MENU_FB_SAVE);
+    press_a();
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(enhance_menu_is_open());
+
+    /* The toolbar: B at the top, Up and Down walk the sections, A or Right
+     * enters. */
+    press(XBOX_GAMEPAD_DPAD_UP);
+    CHECK(enhance_menu_set_page("Render"));
+    pad_b();
+    CHECK(enhance_menu_focus() == MENU_FOCUS_TOOLBAR);
+    CHECK(enhance_menu_toolbar_open(f_clock()));
+    press(XBOX_GAMEPAD_DPAD_DOWN);
+    CHECK(enhance_menu_page() == 1 && enhance_menu_focus() == MENU_FOCUS_TOOLBAR);
+    press(XBOX_GAMEPAD_DPAD_UP);
+    CHECK(enhance_menu_page() == 0);
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    CHECK(enhance_menu_focus() == MENU_FOCUS_CONTENT);
+    pad_b();
+    press_a();
+    CHECK(enhance_menu_focus() == MENU_FOCUS_CONTENT && enhance_menu_page() == 0);
+    /* Tab from the content goes to the footer, Shift+Tab back. */
+    tap(0x09);
+    CHECK(enhance_menu_focus() == MENU_FOCUS_FOOTER);
+    shift_tap_vk(0x09);
+    CHECK(enhance_menu_focus() == MENU_FOCUS_CONTENT);
+    pad_b();
+    pad_b();
+    CHECK(!enhance_menu_is_open());
+
+    /* B, B with a change: the dialog, and its B is Go Back to the toolbar. */
+    open_menu();
+    change_scale();
+    pad_b();
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0);
+    pad_b();
+    CHECK(enhance_menu_dialog() == 2);
+    advance(160);
+    pad_b();
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0);
+    CHECK(enhance_menu_focus() == MENU_FOCUS_TOOLBAR);
+    CHECK(enhance_menu_unsaved() == 1);
+    enhance_menu_revert();
+    pad_b();
+    CHECK(!enhance_menu_is_open());
+}
+
+/* ---- the pointer ---- */
+
+static const struct menu_layout *lay_now(void)
+{
+    enhance_menu_draw(f_clock());
+    return enhance_menu_last_layout();
+}
+
+#define CX(r) ((r).x + (r).w / 2)
+#define CY(r) ((r).y + (r).h / 2)
+
+static void ptr_step(void)
+{
+    advance(16);
+    poll0();
+    flip();
+}
+
+static void ptr_move(int x, int y)
+{
+    xbox_InputPointerMove(x, y);
+    ptr_step();
+}
+
+static void ptr_click(unsigned b, int x, int y)
+{
+    xbox_InputPointerButton(b, 1, x, y);
+    ptr_step();
+    xbox_InputPointerButton(b, 0, x, y);
+    ptr_step();
+}
+
+static const struct menu_layout_row *vrow(const struct menu_layout *l, int index)
+{
+    for (int i = 0; l && i < l->nvrow; i++)
+        if (l->row[i].index == index && !l->row[i].clipped)
+            return &l->row[i];
+    return NULL;
+}
+
+/* The first row in view with this control: 0 a pill, 1 a track, 2 arrows. */
+static const struct menu_layout_row *vrow_with(const struct menu_layout *l, int what)
+{
+    for (int i = 0; l && i < l->nvrow; i++) {
+        const struct menu_layout_row *r = &l->row[i];
+        if (r->clipped)
+            continue;
+        if ((what == 0 && r->pill.w > 0) || (what == 1 && r->track.w > 0)
+            || (what == 2 && r->next.w > 0 && r->prev.w > 0))
+            return r;
+    }
+    return NULL;
+}
+
+static const char *row_val(int index)
+{
+    enhance_menu_row(index, NULL, 0, s_val, sizeof s_val, NULL);
+    return s_val;
+}
+
+/* A resting mouse never takes the selection: only motion past 2 px at the
+ * ui scale does. The cursor hides on a pad or key press. The menu holds
+ * the mouse: a mod's divert is off while it is open. */
+static void test_pointer_motion(void)
+{
+    const struct menu_layout *l;
+    const struct menu_layout_row *r3;
+    int thr, x, y, dx, dy;
+    start_with(ARMED, k_mods);
+    enhance_input_capture(1);
+    CHECK(xbox_InputMouseTakeCounts(&dx, &dy) == 1);
+    open_menu();
+    CHECK(xbox_InputMouseTakeCounts(&dx, &dy) == 0);   /* held: no divert */
+    CHECK(xbox_InputMouseCursorHidden());
+    CHECK(enhance_menu_set_page("Render"));
+    l = lay_now();
+    CHECK(l != NULL);
+    r3 = vrow(l, 3);
+    CHECK(r3 != NULL);
+    if (!l || !r3)
+        return;
+    thr = menu_pointer_threshold(l->s);
+    x = CX(r3->r);
+    y = CY(r3->r);
+    ptr_move(x, y);
+    CHECK(enhance_menu_selected() == 3);
+    CHECK(enhance_menu_device() == ENHANCE_DEV_MOUSE);
+    CHECK(!xbox_InputMouseCursorHidden());
+    tap(0x26);
+    CHECK(enhance_menu_selected() == 2);
+    CHECK(enhance_menu_device() == ENHANCE_DEV_KEYBOARD);
+    CHECK(xbox_InputMouseCursorHidden());
+    ptr_step();                                 /* a still mouse */
+    CHECK(enhance_menu_selected() == 2);
+    ptr_move(x + thr - 1, y);                   /* under the threshold */
+    CHECK(enhance_menu_selected() == 2);
+    CHECK(enhance_menu_device() == ENHANCE_DEV_KEYBOARD);
+    ptr_move(x + thr, y);
+    CHECK(enhance_menu_selected() == 3);
+    CHECK(enhance_menu_device() == ENHANCE_DEV_MOUSE);
+    press(XBOX_GAMEPAD_DPAD_DOWN);
+    CHECK(enhance_menu_selected() == 4);
+    CHECK(enhance_menu_device() == ENHANCE_DEV_PAD);
+    CHECK(xbox_InputMouseCursorHidden());
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+    CHECK(!xbox_InputMouseCursorHidden());
+    CHECK(xbox_InputMouseTakeCounts(&dx, &dy) == 1);   /* the divert is back */
+    /* A capture given back while the menu holds the mouse stays given back. */
+    open_menu();
+    enhance_input_capture(0);
+    open_menu();
+    CHECK(xbox_InputMouseTakeCounts(&dx, &dy) == 0);
+    /* And one taken meanwhile waits for the close. */
+    open_menu();
+    enhance_input_capture(1);
+    CHECK(xbox_InputMouseTakeCounts(&dx, &dy) == 0);
+    open_menu();
+    CHECK(xbox_InputMouseTakeCounts(&dx, &dy) == 1);
+    enhance_input_capture(0);
+}
+
+static void test_pointer_clicks(void)
+{
+    const struct menu_layout *l;
+    const struct menu_layout_row *r;
+    char v0[128];
+    int i, page, sel;
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Render"));
+    l = lay_now();
+    if (!l) {
+        CHECK(0);
+        return;
+    }
+
+    /* The pill, and the label: the row's A. */
+    r = vrow_with(l, 0);
+    CHECK(r != NULL);
+    if (r) {
+        i = r->index;
+        snprintf(v0, sizeof v0, "%s", row_val(i));
+        ptr_click(XBOX_POINTER_LEFT, CX(r->pill), CY(r->pill));
+        CHECK(enhance_menu_selected() == i);
+        CHECK(strcmp(row_val(i), v0) != 0);
+        CHECK(enhance_menu_unsaved() == 1);
+        ptr_click(XBOX_POINTER_LEFT, r->r.x + 4, CY(r->r));
+        CHECK(!strcmp(row_val(i), v0));
+        CHECK(enhance_menu_unsaved() == 0);
+    }
+
+    /* The arrows. */
+    l = lay_now();
+    r = vrow_with(l, 2);
+    CHECK(r != NULL);
+    if (r) {
+        i = r->index;
+        snprintf(v0, sizeof v0, "%s", row_val(i));
+        ptr_click(XBOX_POINTER_LEFT, CX(r->next), CY(r->next));
+        CHECK(strcmp(row_val(i), v0) != 0);
+        ptr_click(XBOX_POINTER_LEFT, CX(r->prev), CY(r->prev));
+        CHECK(!strcmp(row_val(i), v0));
+    }
+
+    /* The slider: a press at a point snaps there, a drag follows, a move
+     * with no button held does not. */
+    l = lay_now();
+    r = vrow_with(l, 1);
+    CHECK(r != NULL);
+    if (r) {
+        int lx = r->track.x, rx = r->track.x + r->track.w - 1, ty = CY(r->track);
+        char hi[128], lo[128];
+        i = r->index;
+        xbox_InputPointerButton(XBOX_POINTER_LEFT, 1, lx, ty);
+        ptr_step();
+        snprintf(lo, sizeof lo, "%s", row_val(i));
+        xbox_InputPointerMove(rx, ty);
+        ptr_step();
+        snprintf(hi, sizeof hi, "%s", row_val(i));
+        CHECK(strcmp(hi, lo) != 0);
+        xbox_InputPointerMove(lx, ty);
+        ptr_step();
+        CHECK(!strcmp(row_val(i), lo));
+        xbox_InputPointerMove(rx, ty);
+        ptr_step();
+        CHECK(!strcmp(row_val(i), hi));
+        xbox_InputPointerButton(XBOX_POINTER_LEFT, 0, rx, ty);
+        ptr_step();
+        ptr_move(lx, ty);
+        CHECK(!strcmp(row_val(i), hi));
+        enhance_menu_revert();
+    }
+
+    /* The header's hints and size buttons. */
+    l = lay_now();
+    ptr_click(XBOX_POINTER_LEFT, CX(l->hbtn[MENU_HB_HINTS]), CY(l->hbtn[MENU_HB_HINTS]));
+    CHECK(enhance_menu_hints_inline());
+    l = lay_now();
+    ptr_click(XBOX_POINTER_LEFT, CX(l->hbtn[MENU_HB_HINTS]), CY(l->hbtn[MENU_HB_HINTS]));
+    CHECK(!enhance_menu_hints_inline());
+    l = lay_now();
+    ptr_click(XBOX_POINTER_LEFT, CX(l->hbtn[MENU_HB_SIZE]), CY(l->hbtn[MENU_HB_SIZE]));
+    CHECK(enhance_menu_size() == 1);
+    l = lay_now();
+    ptr_click(XBOX_POINTER_LEFT, CX(l->hbtn[MENU_HB_SIZE]), CY(l->hbtn[MENU_HB_SIZE]));
+    CHECK(enhance_menu_size() == 0);
+
+    /* A toolbar entry: that section, the content focused. */
+    l = lay_now();
+    CHECK(l->nsec > 2);
+    ptr_click(XBOX_POINTER_LEFT, CX(l->sec[2]), CY(l->sec[2]));
+    CHECK(enhance_menu_page() != 0);
+    CHECK(enhance_menu_focus() == MENU_FOCUS_CONTENT);
+    l = lay_now();
+    ptr_click(XBOX_POINTER_LEFT, CX(l->sec[0]), CY(l->sec[0]));
+    CHECK(enhance_menu_page() == 0);
+
+    /* Outside the panel: nothing. */
+    l = lay_now();
+    CHECK(l->panel.x + l->panel.w < l->place.w - 20);
+    page = enhance_menu_page();
+    sel = enhance_menu_selected();
+    ptr_click(XBOX_POINTER_LEFT, l->place.w - 10, l->place.h / 2);
+    CHECK(enhance_menu_is_open() && enhance_menu_page() == page && enhance_menu_selected() == sel);
+    CHECK(enhance_menu_unsaved() == 0);
+    xbox_InputPointerWheel(-3);
+    ptr_step();
+    CHECK(enhance_menu_is_open() && enhance_menu_selected() == sel);
+
+    /* The footer's Save, then its Cancel leaves. */
+    change_scale();
+    l = lay_now();
+    ptr_click(XBOX_POINTER_LEFT, CX(l->fbtn[MENU_FB_SAVE]), CY(l->fbtn[MENU_FB_SAVE]));
+    CHECK(enhance_menu_unsaved() == 0);
+    l = lay_now();
+    ptr_click(XBOX_POINTER_LEFT, CX(l->fbtn[MENU_FB_CANCEL]), CY(l->fbtn[MENU_FB_CANCEL]));
+    CHECK(!enhance_menu_is_open());
+
+    /* The close button asks; the dialog's buttons and the right button. */
+    open_menu();
+    change_scale();
+    l = lay_now();
+    ptr_click(XBOX_POINTER_LEFT, CX(l->hbtn[MENU_HB_CLOSE]), CY(l->hbtn[MENU_HB_CLOSE]));
+    CHECK(enhance_menu_dialog() >= 0);
+    advance(160);
+    l = lay_now();
+    CHECK(l->dlg_on);
+    ptr_click(XBOX_POINTER_LEFT, CX(l->dlg_btn[2]), CY(l->dlg_btn[2]));   /* Go Back */
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0 && enhance_menu_unsaved() == 1);
+    l = lay_now();
+    ptr_click(XBOX_POINTER_LEFT, CX(l->hbtn[MENU_HB_CLOSE]), CY(l->hbtn[MENU_HB_CLOSE]));
+    advance(160);
+    ptr_click(XBOX_POINTER_RIGHT, 10, 10);                               /* Go Back */
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0);
+    l = lay_now();
+    ptr_click(XBOX_POINTER_LEFT, CX(l->hbtn[MENU_HB_CLOSE]), CY(l->hbtn[MENU_HB_CLOSE]));
+    advance(160);
+    l = lay_now();
+    ptr_click(XBOX_POINTER_LEFT, CX(l->dlg_btn[0]), CY(l->dlg_btn[0]));   /* Exit without saving */
+    CHECK(!enhance_menu_is_open());
+
+    /* The right button is the pad's B: the toolbar, then out. */
+    open_menu();
+    l = lay_now();
+    r = vrow(l, 1);
+    CHECK(r != NULL);
+    if (r) {
+        ptr_click(XBOX_POINTER_RIGHT, CX(r->r), CY(r->r));
+        CHECK(enhance_menu_focus() == MENU_FOCUS_TOOLBAR);
+        ptr_click(XBOX_POINTER_RIGHT, CX(r->r), CY(r->r));
+    }
+    CHECK(!enhance_menu_is_open());
+}
+
+/* The wheel scrolls the rows and leaves the selection; the next key brings
+ * it back into view. */
+static void test_pointer_wheel(void)
+{
+    const struct menu_layout *l = NULL;
+    int found = 0, sel, max;
+    start_with(ARMED, k_mods);
+    open_menu();
+    for (int p = 0; p < enhance_menu_page_count() && !found; p++) {
+        if (!enhance_menu_set_page(enhance_menu_page_name(p)))
+            continue;
+        l = lay_now();
+        found = l && l->scrollbar;
+    }
+    CHECK(found);
+    if (!found)
+        return;
+    l = lay_now();
+    ptr_move(l->row[0].r.x + 4, CY(l->row[0].r));     /* over the label */
+    sel = enhance_menu_selected();
+    max = enhance_menu_rows() - l->vis;
+    xbox_InputPointerWheel(-2);                 /* toward the player: down */
+    ptr_step();
+    l = lay_now();
+    CHECK(l->scroll == (max < 2 ? max : 2));
+    CHECK(enhance_menu_selected() == sel);
+    xbox_InputPointerWheel(5);
+    ptr_step();
+    CHECK(lay_now()->scroll == 0);
+    xbox_InputPointerWheel(-100);
+    ptr_step();
+    l = lay_now();
+    CHECK(l->scroll == max);
+    CHECK(enhance_menu_selected() == sel);
+    if (sel < l->scroll)
+        CHECK(!enhance_menu_tooltip(f_clock() + 10000));   /* no card for a row out of view */
+    tap(0x28);                                  /* re-anchors */
+    l = lay_now();
+    CHECK(enhance_menu_selected() >= l->scroll && enhance_menu_selected() < l->scroll + l->vis);
+    open_menu();
+}
+
+/* A tap: the press and its release both between two menu steps (a
+ * trackpad's tap, a touch, a window pumped at flips) still clicks, where it
+ * was pressed. */
+static void ptr_tap(unsigned b, int x, int y)
+{
+    xbox_InputPointerButton(b, 1, x, y);
+    xbox_InputPointerButton(b, 0, x, y);
+    ptr_step();
+}
+
+/* The review's cases: taps between steps, the dialog's swallow for the
+ * pointer, a press after a wheel scroll spent on the re-anchor, a drag set
+ * once on the item's grid. */
+#define AN_ROWS 40
+static struct enhance_item s_an[AN_ROWS];
+static char s_an_key[AN_ROWS][16], s_an_label[AN_ROWS][16];
+
+static void test_pointer_taps(void)
+{
+    const struct menu_layout *l;
+    const struct menu_layout_row *r;
+    char v0[128];
+    int i, found = 0, sel;
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Render"));
+    l = lay_now();
+    r = vrow_with(l, 0);
+    CHECK(r != NULL);
+    if (r) {
+        i = r->index;
+        snprintf(v0, sizeof v0, "%s", row_val(i));
+        ptr_tap(XBOX_POINTER_LEFT, CX(r->pill), CY(r->pill));
+        CHECK(enhance_menu_selected() == i);
+        CHECK(strcmp(row_val(i), v0) != 0);
+        /* Tapped on the pill, then moved away before the step: the press's
+         * place is the one that counts. */
+        xbox_InputPointerButton(XBOX_POINTER_LEFT, 1, CX(r->pill), CY(r->pill));
+        xbox_InputPointerButton(XBOX_POINTER_LEFT, 0, CX(r->pill), CY(r->pill));
+        xbox_InputPointerMove(l->place.w - 10, l->place.h / 2);
+        ptr_step();
+        CHECK(!strcmp(row_val(i), v0));
+        CHECK(enhance_menu_unsaved() == 0);
+    }
+    /* A right tap is the pad's B. */
+    ptr_tap(XBOX_POINTER_RIGHT, 10, 10);
+    CHECK(enhance_menu_focus() == MENU_FOCUS_TOOLBAR);
+    press_a();
+    CHECK(enhance_menu_focus() == MENU_FOCUS_CONTENT);
+
+    /* The slider: a tap at its right end is its top, set once; Right adds
+     * nothing past it. */
+    l = lay_now();
+    r = vrow_with(l, 1);
+    CHECK(r != NULL);
+    if (r) {
+        char hi[128];
+        i = r->index;
+        ptr_tap(XBOX_POINTER_LEFT, r->track.x + r->track.w - 1, CY(r->track));
+        snprintf(hi, sizeof hi, "%s", row_val(i));
+        CHECK(enhance_menu_selected() == i);
+        tap(0x27);
+        CHECK(!strcmp(row_val(i), hi));
+        ptr_tap(XBOX_POINTER_LEFT, r->track.x, CY(r->track));
+        snprintf(v0, sizeof v0, "%s", row_val(i));
+        CHECK(strcmp(v0, hi) != 0);
+        tap(0x25);
+        CHECK(!strcmp(row_val(i), v0));       /* the bottom */
+        enhance_menu_revert();
+    }
+
+    /* The dialog's buttons and the right button wait out its swallow, as
+     * the pad's do: a double click on the close button does not answer it. */
+    change_scale();
+    l = lay_now();
+    ptr_tap(XBOX_POINTER_LEFT, CX(l->hbtn[MENU_HB_CLOSE]), CY(l->hbtn[MENU_HB_CLOSE]));
+    CHECK(enhance_menu_dialog() >= 0);
+    l = lay_now();
+    CHECK(l->dlg_on);
+    ptr_tap(XBOX_POINTER_LEFT, CX(l->dlg_btn[0]), CY(l->dlg_btn[0]));   /* Exit without saving */
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() >= 0);
+    ptr_tap(XBOX_POINTER_RIGHT, 10, 10);
+    CHECK(enhance_menu_dialog() >= 0);
+    advance(160);
+    ptr_tap(XBOX_POINTER_RIGHT, 10, 10);                               /* Go Back */
+    CHECK(enhance_menu_is_open() && enhance_menu_dialog() < 0 && enhance_menu_unsaved() == 1);
+    enhance_menu_revert();
+
+    /* After a wheel scroll, the next press only brings the selection back
+     * into view: Right on a row the player has not seen yet sets nothing.
+     * A Game section long enough to scroll, every row a choice. */
+    start_with(ARMED, NULL);
+    for (i = 0; i < AN_ROWS; i++) {
+        snprintf(s_an_key[i], sizeof s_an_key[i], "fx.an%d", i);
+        snprintf(s_an_label[i], sizeof s_an_label[i], "Anchor %d", i);
+        s_an[i] = k_gm_stage;
+        s_an[i].key = s_an_key[i];
+        s_an[i].label = s_an_label[i];
+        CHECK(enhance_menu_add(&s_an[i]));
+    }
+    open_menu();
+    CHECK(enhance_menu_set_page("Game"));
+    l = lay_now();
+    found = l && l->scrollbar;
+    CHECK(found);
+    if (found) {
+        ptr_move(CX(l->row[0].r), CY(l->row[0].r));          /* the wheel goes where it points */
+        CHECK(enhance_menu_select_row("Anchor 0"));
+        sel = enhance_menu_selected();
+        xbox_InputPointerWheel(-100);
+        ptr_step();
+        l = lay_now();
+        CHECK(sel < l->scroll);
+        tap(0x27);
+        l = lay_now();
+        CHECK(enhance_menu_selected() >= l->scroll && enhance_menu_selected() < l->scroll + l->vis);
+        CHECK(enhance_menu_unsaved() == 0);
+        tap(0x27);                                                   /* now it sets */
+        CHECK(enhance_menu_unsaved() == 1);
+        enhance_menu_revert();
+    }
+    open_menu();
+}
+
+/* D11's card: 350 ms after a key or pad selection settles, 500 ms after the
+ * pointer rests; none while hints are inline or off, or the toolbar holds
+ * the focus. */
+static void test_tooltip(void)
+{
+    const struct menu_layout *l;
+    const struct menu_layout_row *r;
+    uint64_t t;
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Render"));
+    tap(0x28);
+    t = f_clock() - 16;                         /* the press's poll */
+    CHECK(!enhance_menu_tooltip(t + MENU_TIP_SETTLE_MS - 1));
+    CHECK(enhance_menu_tooltip(t + MENU_TIP_SETTLE_MS));
+    l = lay_now();
+    r = vrow(l, 3);
+    CHECK(r != NULL);
+    if (r) {
+        ptr_move(CX(r->r), CY(r->r));
+        t = f_clock();
+        CHECK(enhance_menu_selected() == 3);
+        CHECK(!enhance_menu_tooltip(t + MENU_TIP_SETTLE_MS));
+        CHECK(!enhance_menu_tooltip(t + MENU_TIP_HOVER_MS - 1));
+        CHECK(enhance_menu_tooltip(t + MENU_TIP_HOVER_MS));
+    }
+    pad_b();
+    CHECK(!enhance_menu_tooltip(f_clock() + 10000));
+    press_a();
+    tap(0x70);                                  /* F1: inline */
+    CHECK(enhance_menu_hints_inline());
+    CHECK(!enhance_menu_tooltip(f_clock() + 10000));
+    tap(0x70);
+    open_menu();
+
+    start_with(ARMED "[overlay]\nmenu_hints = \"off\"\n", k_mods);
+    CHECK(enhance_menu_hints() == MENU_HINTS_OFF);
+    open_menu();
+    tap(0x28);
+    CHECK(!enhance_menu_tooltip(f_clock() + 10000));
+    open_menu();
+}
+
+/* overlay.menu_hints: F1, L3 on its release and the header's ? flip it, it
+ * is written alone at once, and RECOMP_CONFIG=none writes nothing. */
+static void test_hints_key(void)
+{
+    start_with(ARMED, k_mods);
+    CHECK(enhance_menu_hints() == MENU_HINTS_TOOLTIP);
+    open_menu();
+    change_scale();
+    tap(0x70);
+    CHECK(enhance_menu_hints() == MENU_HINTS_INLINE);
+    read_file("config/config.toml");
+    CHECK(strstr(s_file, "menu_hints = \"inline\"") != NULL);
+    CHECK(strstr(s_file, "render") == NULL);    /* the pending scale stays pending */
+    CHECK(enhance_menu_unsaved() == 1);
+    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 1);
+    advance(16);
+    poll0();
+    CHECK(enhance_menu_hints() == MENU_HINTS_INLINE);   /* not on the press */
+    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 0);
+    advance(16);
+    poll0();
+    CHECK(enhance_menu_hints() == MENU_HINTS_TOOLTIP);
+    read_file("config/config.toml");
+    CHECK(strstr(s_file, "menu_hints = \"tooltip\"") != NULL);
+    tap(0x70);
+    enhance_menu_revert();
+    open_menu();
+    start_with(read_file("config/config.toml"), k_mods);
+    CHECK(enhance_menu_hints() == MENU_HINTS_INLINE);
+
+    set_env("RECOMP_CONFIG", "none");
+    set_env("RECOMP_MENU", "1");
+    start_with(ARMED "[overlay]\nmenu_hints = \"off\"\n", k_mods);
+    open_menu();
+    CHECK(enhance_menu_hints() == MENU_HINTS_TOOLTIP);   /* the file is not read */
+    tap(0x70);
+    CHECK(enhance_menu_hints() == MENU_HINTS_INLINE);
+    read_file("config/config.toml");
+    CHECK(strstr(s_file, "menu_hints = \"off\"") != NULL);   /* untouched */
+    open_menu();
+    set_env("RECOMP_MENU", NULL);
+    set_env("RECOMP_CONFIG", NULL);
+}
+
+/* The on-screen keyboard's model, geometry and hit test (D4). */
+/* Esc and Backspace are B (D9a): from a section's rows they go up to the
+ * toolbar; on the toolbar they leave, through the dialog when a change is
+ * unsaved. */
+static void test_back_keys(void)
+{
+    static const unsigned keys[] = { 0x1B, 0x08 };
+    for (int k = 0; k < 2; k++) {
+        start_with(ARMED, k_mods);
+        open_menu();
+        CHECK(enhance_menu_set_page("Render"));
+        CHECK(enhance_menu_select_row("Scaling filter"));
+        if (enhance_menu_focus() != MENU_FOCUS_CONTENT)
+            tap(0x28);
+        CHECK(enhance_menu_focus() == MENU_FOCUS_CONTENT);
+        tap(keys[k]);
+        CHECK(enhance_menu_is_open() && enhance_menu_focus() == MENU_FOCUS_TOOLBAR);
+        tap(keys[k]);
+        CHECK(!enhance_menu_is_open());
+
+        open_menu();
+        CHECK(enhance_menu_set_page("Render"));
+        CHECK(enhance_menu_select_row("Scaling filter"));
+        if (enhance_menu_focus() != MENU_FOCUS_CONTENT)
+            tap(0x28);
+        tap(0x27);
+        CHECK(enhance_menu_unsaved() == 1);
+        tap(keys[k]);
+        CHECK(enhance_menu_focus() == MENU_FOCUS_TOOLBAR && enhance_menu_dialog() < 0);
+        tap(keys[k]);
+        CHECK(enhance_menu_is_open() && enhance_menu_dialog() == 2);
+        advance(160);
+        tap('N');
+        CHECK(!enhance_menu_is_open());
+    }
+}
+
+/* The page shown with a row whose control is this (vrow_with's what), or
+ * NULL; the layout is the page's. */
+static const struct menu_layout_row *page_with(int what, const struct menu_layout **lp)
+{
+    for (int p = 0; p < enhance_menu_page_count(); p++) {
+        const struct menu_layout *l;
+        const struct menu_layout_row *r;
+        if (!enhance_menu_set_page(enhance_menu_page_name(p)))
+            continue;
+        l = lay_now();
+        r = vrow_with(l, what);
+        if (r) {
+            *lp = l;
+            return r;
+        }
+    }
+    return NULL;
+}
+
+/* One notch over a control: the value one step along, as the pad's Right
+ * (or Left) gives it, live and unsaved; the rows stay where they are. */
+static void wheel_check(int x, int y, int index)
+{
+    char v0[128], v1[128];
+    int scroll = lay_now()->scroll, unsaved = enhance_menu_unsaved();
+    snprintf(v0, sizeof v0, "%s", row_val(index));
+    ptr_move(x, y);
+    xbox_InputPointerWheel(1);
+    ptr_step();
+    snprintf(v1, sizeof v1, "%s", row_val(index));
+    CHECK(strcmp(v1, v0) != 0);
+    CHECK(enhance_menu_unsaved() == unsaved + 1);
+    CHECK(enhance_menu_selected() == index && enhance_menu_focus() == MENU_FOCUS_CONTENT);
+    CHECK(lay_now()->scroll == scroll);
+    xbox_InputPointerWheel(-1);
+    ptr_step();
+    CHECK(!strcmp(row_val(index), v0));
+    CHECK(enhance_menu_unsaved() == unsaved);
+    /* The pad's step from the same value lands where the notch did. */
+    tap(0x27);
+    CHECK(!strcmp(row_val(index), v1));
+    tap(0x25);
+    CHECK(!strcmp(row_val(index), v0));
+}
+
+/* The wheel over a slider or a choice steps it, one step a notch; over a
+ * label it scrolls (test_pointer_wheel). */
+static void test_pointer_wheel_steps(void)
+{
+    const struct menu_layout *l = NULL;
+    const struct menu_layout_row *r;
+    int index;
+    start_with(ARMED, k_mods);
+    open_menu();
+    r = page_with(1, &l);
+    CHECK(r != NULL);
+    if (r) {
+        index = r->index;
+        wheel_check(CX(r->track), CY(r->track), index);
+    }
+    r = page_with(2, &l);
+    CHECK(r != NULL);
+    if (r) {
+        index = r->index;
+        wheel_check(CX(r->next), CY(r->next), index);
+        r = vrow(lay_now(), index);
+        CHECK(r != NULL);
+        if (r)
+            wheel_check((r->prev.x + r->prev.w + r->next.x) / 2, CY(r->next), index);
+    }
+    open_menu();
+}
+
+/* The on-screen keys come up for a rename started by the mouse or a touch
+ * while no key has been used; once one has, the host's text is enough. */
+static void test_osk_pointer(void)
+{
+    const struct menu_layout *l;
+    const struct menu_layout_row *r;
+    int i;
+    MKDIR(PROFILES);
+    write_file(PROFILES "/mine.toml", "version = 1\nname = \"Mine\"\n"
+                                      "stages = [\"user:stage_a\"]\n");
+    start_with(CFG_PROF "profile = \"mine\"\n", NULL);
+    enhance_menu_open(f_clock());       /* no key: the pad chord or a host call */
+    CHECK(enhance_menu_is_open());
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(row_value("Profile") && !strcmp(s_val, "Mine"));
+    i = row_index("Rename");
+    CHECK(i >= 0);
+    l = lay_now();
+    r = vrow(l, i);
+    CHECK(r != NULL);
+    if (r) {
+        ptr_move(CX(r->r) + 3, CY(r->r));
+        ptr_click(XBOX_POINTER_LEFT, CX(r->r), CY(r->r));
+        CHECK(xbox_InputTextActive() && enhance_menu_osk());
+        tap(0x1B);                      /* a key: from here the keyboard is known */
+        CHECK(!xbox_InputTextActive());
+        ptr_click(XBOX_POINTER_LEFT, CX(r->r), CY(r->r));
+        CHECK(xbox_InputTextActive() && !enhance_menu_osk());
+        tap(0x1B);
+    }
+    CHECK(row_value("Rename") && !strcmp(s_val, "Mine"));
+    esc_leave();
+    CHECK(!enhance_menu_is_open());
+    remove(PROFILES "/mine.toml");
+    rmdir(PROFILES);
+}
+
+/* Under present.surface = internal the pointer is in the window's pixels
+ * and the placement in the output's: the menu maps through the view the
+ * presenter publishes. Here the output is stretched 2x into the window. */
+static void test_pointer_view(void)
+{
+    const struct menu_layout *l;
+    const struct menu_layout_row *r = NULL;
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Render"));
+    l = lay_now();
+    for (int i = l ? l->nvrow - 1 : -1; i >= 0 && !r; i--) {
+        int sel;
+        enhance_menu_row(l->row[i].index, NULL, 0, NULL, 0, &sel);
+        if (sel && !l->row[i].clipped && l->row[i].index != enhance_menu_selected())
+            r = &l->row[i];
+    }
+    CHECK(r != NULL);
+    if (r) {
+        int index = r->index, x = r->r.x + 4, y = CY(r->r);
+        nv2a_overlay_set_view(0, 0, 3840, 2160, 1920, 1080);
+        ptr_move(2 * x + 9, 2 * y);
+        ptr_move(2 * x, 2 * y);
+        CHECK(enhance_menu_selected() == index);
+        /* A click lands on the arrow drawn under it, at its window pixel. */
+        r = vrow_with(lay_now(), 2);
+        CHECK(r != NULL);
+        if (r) {
+            char v0[128];
+            int ci = r->index, cx = CX(r->next), cy = CY(r->next);
+            snprintf(v0, sizeof v0, "%s", row_val(ci));
+            ptr_move(2 * cx, 2 * cy);
+            ptr_click(XBOX_POINTER_LEFT, 2 * cx, 2 * cy);
+            CHECK(enhance_menu_selected() == ci && strcmp(row_val(ci), v0) != 0);
+            CHECK(enhance_menu_unsaved() == 1);
+        }
+        nv2a_overlay_set_view(0, 0, 0, 0, 0, 0);
+    }
+    esc_leave();
+    if (enhance_menu_dialog() >= 0) {
+        advance(160);
+        tap('N');
+    }
+    CHECK(!enhance_menu_is_open());
+}
+
+/* A slider drag answers a pending ask with no, as the pad's step does. */
+static void test_drag_cancels_ask(void)
+{
+    const struct menu_layout_row *r;
+    MKDIR(PROFILES);
+    write_file(PROFILES "/mine.toml", "version = 1\nname = \"Mine\"\n"
+                                      "stages = [\"user:stage_a\", \"user:stage_b\"]\n");
+    start_with(CFG_PROF "profile = \"mine\"\n", NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    chain_up();
+    CHECK(enhance_menu_select_row("1  user:stage_a"));
+    tap(0x2E);
+    CHECK(enhance_menu_select_row("Remove user:stage_a? A / Enter: yes"));
+    r = vrow_with(lay_now(), 1);
+    CHECK(r != NULL);
+    if (r) {
+        int x = r->track.x + 1, y = CY(r->track);
+        char v0[128];
+        snprintf(v0, sizeof v0, "%s", row_val(r->index));
+        ptr_move(x + 5, y);
+        ptr_click(XBOX_POINTER_LEFT, x, y);
+        CHECK(strcmp(row_val(r->index), v0) != 0);
+        CHECK(!enhance_menu_select_row("Remove user:stage_a? A / Enter: yes"));
+        CHECK(row_value("1  user:stage_a") && row_value("2  user:stage_b"));
+    }
+    esc_leave();
+    if (enhance_menu_dialog() >= 0) {
+        advance(160);
+        tap('N');
+    }
+    CHECK(!enhance_menu_is_open());
+    remove(PROFILES "/mine.toml");
+    rmdir(PROFILES);
+}
+
+static void test_osk(void)
+{
+    struct osk k;
+    struct osk_layout ly;
+    char out[8];
+    int first, row, col;
+    const char *label;
+    enhance_osk_open(&k);
+    CHECK(k.on && k.row == 1 && k.col == 0);
+    CHECK(enhance_osk_press(&k, out, sizeof out) == OSK_ACT_TEXT && !strcmp(out, "q"));
+    enhance_osk_move(&k, 0, -1);
+    CHECK(k.row == 0 && k.col == 0);
+    enhance_osk_move(&k, 0, -1);                /* rows wrap: the bottom row */
+    CHECK(k.row == OSK_ROWS - 1 && k.col == 0);
+    CHECK(enhance_osk_key(k.row, k.col, 0, &first, &label) == OSK_KEY_SHIFT);
+    enhance_osk_move(&k, 1, 0);                 /* a wide key is one stop */
+    CHECK(k.col == 2);
+    CHECK(enhance_osk_press(&k, out, sizeof out) == OSK_ACT_TEXT && !strcmp(out, " "));
+    enhance_osk_move(&k, 1, 0);
+    CHECK(k.col == 8);
+    CHECK(enhance_osk_press(&k, out, sizeof out) == OSK_ACT_DONE);
+    enhance_osk_move(&k, 1, 0);
+    CHECK(k.col == 0);
+    enhance_osk_move(&k, -1, 0);
+    CHECK(k.col == 8);
+    enhance_osk_move(&k, -1, 0);
+    CHECK(k.col == 2);
+    enhance_osk_move(&k, 0, -1);                /* up from Space: its column */
+    CHECK(k.row == 3 && k.col == 2);
+    enhance_osk_move(&k, 0, 1);
+    enhance_osk_move(&k, -1, 0);
+    CHECK(enhance_osk_press(&k, out, sizeof out) == OSK_ACT_NONE && k.shift);
+    k.row = 2;
+    k.col = 0;
+    CHECK(enhance_osk_press(&k, out, sizeof out) == OSK_ACT_TEXT && !strcmp(out, "A"));
+    CHECK(!k.shift);                            /* one capital */
+    CHECK(enhance_osk_press(&k, out, sizeof out) == OSK_ACT_TEXT && !strcmp(out, "a"));
+    k.row = 3;
+    k.col = 9;
+    CHECK(enhance_osk_press(&k, out, sizeof out) == OSK_ACT_BACKSPACE);
+    CHECK(enhance_osk_key(3, 9, 0, &first, &label) == OSK_KEY_BACKSPACE && !strcmp(label, "Del"));
+    CHECK(enhance_osk_key(OSK_ROWS, 0, 0, &first, &label) < 0 && !label);
+    enhance_osk_close(&k);
+    CHECK(!k.on);
+
+    /* Under the field when it fits, else above; inside the area. */
+    enhance_osk_layout(100, 100, 300, 40, 1920, 1080, 40, 4, &ly);
+    CHECK(ly.panel.y == 100 + 40 + 4 && ly.panel.x == 100);
+    CHECK(ly.cell[4][2].w == 6 * 40 + 5 * 4 && ly.span[4][2] == 6 && ly.span[4][3] == 0);
+    CHECK(enhance_osk_hit(&ly, CX(ly.cell[1][3]), CY(ly.cell[1][3]), &row, &col) && row == 1 && col == 3);
+    CHECK(enhance_osk_hit(&ly, ly.cell[4][2].x + ly.cell[4][2].w - 2, CY(ly.cell[4][2]), &row, &col)
+          && row == 4 && col == 2);
+    CHECK(!enhance_osk_hit(&ly, ly.panel.x - 5, ly.panel.y, &row, &col));
+    enhance_osk_layout(1900, 1000, 300, 40, 1920, 1080, 40, 4, &ly);
+    CHECK(ly.panel.y + ly.panel.h <= 1000);
+    CHECK(ly.panel.x + ly.panel.w <= 1920);
+
+    CHECK(strstr(enhance_osk_hint(1), "Steam + X") != NULL);
+    CHECK(strstr(enhance_osk_hint(0), "Steam") == NULL);
+}
+
+static void test_input_rules(void)
+{
+    static const int w[] = { 10, 20, 30 };
+    CHECK(menu_hints_fit(w, 3, 5, 70) == 3);
+    CHECK(menu_hints_fit(w, 3, 5, 69) == 2);
+    CHECK(menu_hints_fit(w, 3, 5, 35) == 2);
+    CHECK(menu_hints_fit(w, 3, 5, 34) == 1);
+    CHECK(menu_hints_fit(w, 3, 5, 9) == 0);
+    CHECK(menu_pointer_threshold(1.0f) == 2);
+    CHECK(menu_pointer_threshold(2.0f) == 4);
+    CHECK(menu_pointer_threshold(0.2f) == 1);
+    CHECK(!menu_pointer_moved(10, 10, 11, 9, 1.0f));
+    CHECK(menu_pointer_moved(10, 10, 12, 10, 1.0f));
+    CHECK(menu_pointer_moved(10, 10, 10, 8, 1.0f));
+    CHECK(!menu_tip_due(ENHANCE_DEV_PAD, 0, 5000));
+    CHECK(menu_tip_due(ENHANCE_DEV_PAD, 1000, 1350));
+    CHECK(!menu_tip_due(ENHANCE_DEV_MOUSE, 1000, 1350));
+    CHECK(menu_tip_due(ENHANCE_DEV_MOUSE, 1000, 1500));
+}
+
 int main(int argc, char **argv)
 {
     s_pin = argc > 1 && !strcmp(argv[1], "--pin");
@@ -3430,6 +4475,21 @@ int main(int argc, char **argv)
     test_header_game();
     test_ui_scale_row();
     test_help();
+    test_owner_table();
+    test_pad_regions();
+    test_pointer_motion();
+    test_pointer_clicks();
+    test_pointer_wheel();
+    test_pointer_taps();
+    test_pointer_wheel_steps();
+    test_back_keys();
+    test_osk_pointer();
+    test_pointer_view();
+    test_drag_cancels_ask();
+    test_tooltip();
+    test_hints_key();
+    test_osk();
+    test_input_rules();
     test_shots();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();

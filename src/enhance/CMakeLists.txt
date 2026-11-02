@@ -32,6 +32,11 @@
 #                  hit test, pure (enhance_menu_layout.h)
 #   enhance_mod_status.c the mods' status panels and the latest device for
 #                  glyph_name (mod API version 7, enhance_mod_status.h)
+#   enhance_menu_input.c the menu's input rules: focus regions, button
+#                  owners, the pad's events, pointer and tooltip thresholds,
+#                  pure (enhance_menu_input.h)
+#   enhance_osk.c  the on-screen keyboard for a text field on a pad: grid,
+#                  model, draw and hit test (enhance_osk.h)
 # docs/runtime/config.md has the file format and the keys.
 #
 # The layer links the runtime (xbox_kernel, for nv2a_host_opts_set), never
@@ -44,7 +49,7 @@ add_library(xbox_enhance STATIC recomp_cfg.c enhance_cfg.c enhance.c enhance_inp
 target_include_directories(xbox_enhance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_enhance PUBLIC recomp_env xbox_kernel xbox_input)
 target_sources(xbox_enhance PRIVATE enhance_text.c enhance_menu_layout.c)
-target_sources(xbox_enhance PRIVATE enhance_mod_status.c)
+target_sources(xbox_enhance PRIVATE enhance_mod_status.c enhance_menu_input.c enhance_osk.c)
 if(NOT MSVC)
     target_compile_options(xbox_enhance PRIVATE -Wall -Wextra)
 endif()

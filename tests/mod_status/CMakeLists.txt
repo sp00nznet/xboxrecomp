@@ -44,6 +44,8 @@ add_executable(mod_status_test
     ${XR_SRC}/enhance/enhance_actions.c
     ${XR_SRC}/enhance/enhance_menu.c
     ${XR_SRC}/enhance/enhance_menu_layout.c
+    ${XR_SRC}/enhance/enhance_menu_input.c
+    ${XR_SRC}/enhance/enhance_osk.c
     ${XR_SRC}/enhance/enhance_text.c
     ${XR_SRC}/enhance/enhance_mod_status.c
     ${XR_SRC}/enhance/mod.c
@@ -55,6 +57,8 @@ add_executable(mod_status_test
     ${XR_SRC}/input/pad_map.c
     ${XR_SRC}/input/keyboard.c
     ${XR_SRC}/input/mouse.c
+    ${XR_SRC}/input/pointer.c
+    ${XR_SRC}/input/text_input.c
     ${XR_SRC}/input/input_names.c
     ${XR_SRC}/input/input_map.c
     ${XR_SRC}/input/kbm_script.c

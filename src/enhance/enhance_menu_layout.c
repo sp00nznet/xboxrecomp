@@ -91,7 +91,7 @@ void menu_layout_compute(const struct menu_layout_in *in, struct menu_layout *l)
 {
     float s = in->s;
     struct menu_rect P;
-    int bsz, bx, body_y, body_b, tbf, tbo, eh, em, bpad, btn_h, vy, vh, step;
+    int bsz, bx, body_y, body_b, tbf, tbo, eh, em, bpad, btn_h, vy, vh, step, hh;
 
     memset(l, 0, sizeof *l);
     l->s = s;
@@ -223,14 +223,15 @@ void menu_layout_compute(const struct menu_layout_in *in, struct menu_layout *l)
     }
     l->viewport = rect(l->content.x, vy, l->content.w, vh);
     vh = l->viewport.h;
-    step = l->rowh + l->rgap;
+    hh = in->hint_h > 0 ? in->hint_h : 0;
+    step = l->rowh + hh + l->rgap;
     l->vis = vh / step;
     if (l->vis < 1)
         l->vis = 1;
     l->scroll = in->scroll;
-    if (in->sel < l->scroll)
+    if (!in->free_scroll && in->sel < l->scroll)
         l->scroll = in->sel;
-    if (in->sel >= l->scroll + l->vis)
+    if (!in->free_scroll && in->sel >= l->scroll + l->vis)
         l->scroll = in->sel - l->vis + 1;
     if (l->scroll > in->nrow - l->vis)
         l->scroll = in->nrow - l->vis > 0 ? in->nrow - l->vis : 0;
@@ -243,8 +244,10 @@ void menu_layout_compute(const struct menu_layout_in *in, struct menu_layout *l)
             break;
         vr->index = i;
         vr->r = rect(l->content.x, y, l->content.w, l->rowh);
-        vr->clipped = y + l->rowh > vy + vh;
+        vr->clipped = y + l->rowh + hh > vy + vh;
         row_controls(in, l, vr);
+        if (hh)
+            vr->hint = rect(l->content.x + l->pad, y + l->rowh, l->content.w - 2 * l->pad, hh);
         l->nvrow++;
     }
     if (in->nrow > l->vis) {
@@ -348,7 +351,7 @@ struct menu_hit menu_hit(const struct menu_layout *l, int x, int y)
         for (int i = 0; i < l->nvrow; i++) {
             const struct menu_layout_row *vr = &l->row[i];
             struct menu_rect band;
-            if (vr->clipped || !inside(vr->r, x, y))
+            if (vr->clipped || (!inside(vr->r, x, y) && !inside(vr->hint, x, y)))
                 continue;
             h.region = MENU_HIT_ROW;
             h.index = vr->index;

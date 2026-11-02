@@ -736,12 +736,49 @@ int enhance_input_reload(void)
 /* ---- a mod's input ---------------------------------------------------- */
 
 static int s_mod_capture;
+/* While the menu holds the mouse (enhance_input_menu_hold) a mod's capture is
+ * recorded but the divert stays off. The two run on different threads (a
+ * mod's call on the guest's or a hook's, the menu on the guest's), so one
+ * short lock keeps the record and the divert in step: without it a capture
+ * released between the menu's read and its divert would leave the divert on. */
+static int s_menu_hold;
+static int s_div_lock;
+
+static void div_lock(void)
+{
+    while (__atomic_exchange_n(&s_div_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+}
+
+static void div_unlock(void)
+{
+    __atomic_store_n(&s_div_lock, 0, __ATOMIC_RELEASE);
+}
 
 void enhance_input_capture(int on)
 {
     on = on != 0;
-    if (__atomic_exchange_n(&s_mod_capture, on, __ATOMIC_ACQ_REL) != on)
+    div_lock();
+    if (__atomic_exchange_n(&s_mod_capture, on, __ATOMIC_ACQ_REL) != on && !s_menu_hold)
         xbox_InputMouseDivert(on);
+    div_unlock();
+}
+
+void enhance_input_menu_hold(int on)
+{
+    on = on != 0;
+    div_lock();
+    if (on != s_menu_hold) {
+        s_menu_hold = on;
+        /* The cursor is freed for the menu's pointer; the mod in flight (the
+         * free camera) gets no motion while the menu is open. On close the
+         * divert follows the capture as it is now, so a capture the mod
+         * took or gave back meanwhile counts; the divert's edge drops the
+         * counts gathered so far, so the camera does not jump. */
+        xbox_InputMouseSuspend(on);
+        xbox_InputMouseDivert(on ? 0 : __atomic_load_n(&s_mod_capture, __ATOMIC_ACQUIRE));
+    }
+    div_unlock();
 }
 
 int enhance_input_captured(void)

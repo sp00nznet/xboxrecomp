@@ -47,6 +47,7 @@ add_executable(input_actions_test
     ${XR_SRC}/input/pad_map.c
     ${XR_SRC}/input/keyboard.c
     ${XR_SRC}/input/mouse.c
+    ${XR_SRC}/input/pointer.c
     ${XR_SRC}/input/input_names.c
     ${XR_SRC}/input/input_map.c
     ${XR_SRC}/input/kbm_script.c

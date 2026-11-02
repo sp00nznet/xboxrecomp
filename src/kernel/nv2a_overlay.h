@@ -135,6 +135,22 @@ const struct nv2a_ovl_image *nv2a_overlay_image(uint16_t tex);
 void nv2a_overlay_set_placement(int x, int y, int w, int h);
 void nv2a_overlay_placement(int *x, int *y, int *w, int *h);
 
+/* present.surface=internal: the output is drawn at the frame's size and
+ * scaled into the window after the present (the layer's aspect fit on
+ * Metal, DXGI's stretch on D3D11), so a window pixel is no output pixel.
+ * Each present publishes where the output lands in the window (vx, vy, vw,
+ * vh, window pixels) and the output's size (ow, oh); any size 0 means the
+ * window and the output are one, the default. to_output maps a window
+ * pixel (the pointer's) into the output's pixels, the placement's space;
+ * to_window maps back (the IME's rect). Neither touches a point while the
+ * window and the output are one. view_fit is the aspect fit (centred,
+ * rounded) of an ow x oh output in a ww x wh window, Metal's
+ * kCAGravityResizeAspect. */
+void nv2a_overlay_set_view(int vx, int vy, int vw, int vh, int ow, int oh);
+void nv2a_overlay_to_output(int *x, int *y);
+void nv2a_overlay_to_window(int *x, int *y);
+void nv2a_overlay_view_fit(int ww, int wh, int ow, int oh, int r[4]);
+
 /* The presenter's name for the strip ("Metal", "D3D11", "SDL"). */
 void nv2a_overlay_set_presenter(const char *name);
 const char *nv2a_overlay_presenter(void);   /* NULL before the first present */

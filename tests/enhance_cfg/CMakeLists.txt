@@ -28,6 +28,7 @@ add_executable(enhance_cfg_test
     ${XR_SRC}/enhance/mod_describe.c
     ${XR_SRC}/input/keyboard.c
     ${XR_SRC}/input/mouse.c
+    ${XR_SRC}/input/pointer.c
     ${XR_SRC}/input/input_names.c
     ${XR_SRC}/input/input_map.c
     ${XR_SRC}/input/pad_map.c

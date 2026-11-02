@@ -47,6 +47,11 @@ struct enhance_input_state {
  * here, so the pad's state stays readable for the mod. Any thread. */
 void enhance_input_capture(int on);
 int  enhance_input_captured(void);
+/* The enhancements menu holds the mouse while it is open: the cursor is
+ * freed (xbox_InputMouseSuspend) and a mod's divert is off; a mod's capture
+ * meanwhile is only recorded. 0 gives it back: the divert follows
+ * enhance_input_captured() as it is then. */
+void enhance_input_menu_hold(int on);
 void enhance_input_state(struct enhance_input_state *out);
 
 #ifdef __cplusplus

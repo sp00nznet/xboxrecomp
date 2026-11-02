@@ -61,6 +61,11 @@ static int s_armed;                 /* atomic */
 static uint32_t s_visible;          /* atomic */
 static uint64_t s_epoch;            /* atomic: moves at publishes and visibility */
 static uint64_t s_place;            /* atomic: x, y, w, h as 16 bits each */
+/* The view (nv2a_overlay_set_view): the output's rect in the window as 16
+ * bits each, and the output's size as 32 bits each, under a seqlock so a
+ * reader never pairs one resize's rect with another's size. */
+static uint32_t s_view_seq;
+static uint64_t s_view_rect, s_view_out;
 static const char *s_presenter;     /* atomic */
 static int s_stats_on;              /* atomic */
 static int s_menu_lock;             /* atomic */
@@ -268,6 +273,92 @@ void nv2a_overlay_placement(int *x, int *y, int *w, int *h)
     *y = (int16_t)((v >> 16) & 0xffff);
     *w = (int)((v >> 32) & 0xffff);
     *h = (int)((v >> 48) & 0xffff);
+}
+
+void nv2a_overlay_set_view(int vx, int vy, int vw, int vh, int ow, int oh)
+{
+    uint64_t r, o;
+    uint32_t q;
+    if (vw <= 0 || vh <= 0 || ow <= 0 || oh <= 0)
+        vx = vy = vw = vh = ow = oh = 0;
+    r = (uint64_t)(uint16_t)vx | (uint64_t)(uint16_t)vy << 16
+      | (uint64_t)(uint16_t)vw << 32 | (uint64_t)(uint16_t)vh << 48;
+    o = (uint64_t)(uint32_t)ow | (uint64_t)(uint32_t)oh << 32;
+    /* Every present calls this: the common case stores nothing. */
+    if (__atomic_load_n(&s_view_rect, __ATOMIC_RELAXED) == r
+        && __atomic_load_n(&s_view_out, __ATOMIC_RELAXED) == o)
+        return;
+    q = __atomic_load_n(&s_view_seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_view_seq, q + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&s_view_rect, r, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_view_out, o, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_view_seq, q + 2, __ATOMIC_RELEASE);
+}
+
+/* 0 when the window and the output are one (no view published). */
+static int view_get(int v[6])
+{
+    uint64_t r, o;
+    uint32_t a, b;
+    do {
+        a = __atomic_load_n(&s_view_seq, __ATOMIC_ACQUIRE);
+        r = __atomic_load_n(&s_view_rect, __ATOMIC_RELAXED);
+        o = __atomic_load_n(&s_view_out, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        b = __atomic_load_n(&s_view_seq, __ATOMIC_RELAXED);
+    } while ((a & 1u) || a != b);
+    v[0] = (int16_t)(r & 0xffff);
+    v[1] = (int16_t)((r >> 16) & 0xffff);
+    v[2] = (int)((r >> 32) & 0xffff);
+    v[3] = (int)((r >> 48) & 0xffff);
+    v[4] = (int)(uint32_t)o;
+    v[5] = (int)(uint32_t)(o >> 32);
+    return v[2] > 0 && v[3] > 0 && v[4] > 0 && v[5] > 0;
+}
+
+/* Rounds toward minus infinity, so a pixel just outside the view's left
+ * or top edge lands outside the output too (C's division would give 0). */
+static int floor_div(int64_t a, int64_t b)
+{
+    int64_t q = a / b;
+    return (int)(q - ((a % b) != 0 && ((a < 0) != (b < 0))));
+}
+
+void nv2a_overlay_to_output(int *x, int *y)
+{
+    int v[6];
+    if (!view_get(v))
+        return;
+    /* The output pixel whose square holds the window pixel's centre. */
+    *x = floor_div(((int64_t)(*x - v[0]) * 2 + 1) * v[4], (int64_t)v[2] * 2);
+    *y = floor_div(((int64_t)(*y - v[1]) * 2 + 1) * v[5], (int64_t)v[3] * 2);
+}
+
+void nv2a_overlay_to_window(int *x, int *y)
+{
+    int v[6];
+    if (!view_get(v))
+        return;
+    *x = v[0] + floor_div((int64_t)*x * v[2], v[4]);
+    *y = v[1] + floor_div((int64_t)*y * v[3], v[5]);
+}
+
+void nv2a_overlay_view_fit(int ww, int wh, int ow, int oh, int r[4])
+{
+    r[0] = r[1] = 0;
+    r[2] = ww;
+    r[3] = wh;
+    if (ww <= 0 || wh <= 0 || ow <= 0 || oh <= 0)
+        return;
+    /* Compared as ww/ow against wh/oh without a division. */
+    if ((int64_t)ww * oh > (int64_t)wh * ow) {
+        r[2] = (int)(((int64_t)ow * wh * 2 + oh) / ((int64_t)oh * 2));
+        r[0] = (ww - r[2]) / 2;
+    } else {
+        r[3] = (int)(((int64_t)oh * ww * 2 + ow) / ((int64_t)ow * 2));
+        r[1] = (wh - r[3]) / 2;
+    }
 }
 
 void nv2a_overlay_set_presenter(const char *name)
@@ -703,6 +794,7 @@ void nv2a_overlay_reset_for_test(void)
     memset(s_toast, 0, sizeof s_toast);
     s_stats_t = 0;
     s_stats_w = s_stats_h = s_toast_w = s_toast_h = 0;
+    nv2a_overlay_set_view(0, 0, 0, 0, 0, 0);
 }
 
 void nv2a_overlay_toast_hook_for_test(void (*seen)(const char *line), void (*mid_push)(void))

@@ -288,7 +288,14 @@ static const char *start_with(const char *toml, const struct xbox_mod *const *mo
 #define ARMED "[menu]\nenabled = true\n"
 
 static void open_menu(void) { tap(VK_F10); }
-static void close_menu(void) { tap(0x1B); }
+/* Esc is B: from a section's rows it goes up to the toolbar, and the
+ * second one there leaves. */
+static void close_menu(void)
+{
+    tap(0x1B);
+    if (enhance_menu_is_open())
+        tap(0x1B);
+}
 
 /* ---- the mods ------------------------------------------------------------ */
 

@@ -30,7 +30,9 @@
 #include "enhance.h"
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
+#include "enhance_menu_input.h"
 #include "enhance_menu_layout.h"
+#include "enhance_osk.h"
 #include "enhance_text.h"
 #include "host_pad.h"
 #include "hud_anchor.h"
@@ -48,10 +50,12 @@
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
 #include "pad_map.h"
+#include "pointer.h"
 #include "shader_param_kinds.h"
 #include "shader_profile_edit.h"
 #include "recomp_cfg.h"
 #include "recomp_env.h"
+#include "text_input.h"
 
 #define LOGP "[ENHANCE] "
 
@@ -949,9 +953,10 @@ static struct {
     char body[512];
 } s_dlg;
 
-static int s_hints_inline;          /* L3: hints under the rows, not as a tooltip */
+static int s_hints;                 /* enum menu_hints (D11), overlay.menu_hints */
 static int s_size;                  /* enum menu_size (D2), overlay.menu_size */
-static int s_bar_focus;             /* the toolbar has the focus (Q10) */
+static int s_focus;                 /* enum menu_focus (D3): where the pad and keys act */
+static int s_foot_sel;              /* MENU_FB_* while the footer has the focus */
 static uint64_t s_peek_t;           /* the last section change, 0 for none */
 static int s_peek_drawn;            /* the draw after the peek ran out is done */
 static int s_need_draw;
@@ -987,6 +992,83 @@ static uint32_t s_rel_armed, s_rel_taint;  /* View and L3 wait for release */
 static unsigned char s_kprev[256];
 static DWORD s_pkt[PORTS], s_fpkt[PORTS];
 static int s_dir, s_kbd;
+/* The mouse leads (D3): set by real motion, a click or the wheel, cleared
+ * by the first pad or key event; the latest device is MOUSE while set, else
+ * KEYBOARD when s_kbd, else PAD. */
+static int s_mouse;
+/* A key has reached the menu since the game started: the player has a
+ * physical keyboard, so a rename types there and the OSK stays shut. */
+static int s_kbd_seen;
+/* The pointer (D3): the last snapshot's sequence, where real motion was
+ * last measured from, the held buttons, a drag on a slider row, and the
+ * wheel's own scroll (the selection stays; the next key re-anchors it). */
+static uint32_t s_ptr_seq;
+static int s_ptr_ax, s_ptr_ay, s_ptr_x = -1, s_ptr_y = -1;
+static unsigned s_ptr_btn;
+static int s_drag_row = -1;
+static int s_free_scroll;
+static int s_hover_row = -1;
+/* D11's tooltip: when the selection or the hover last settled. */
+static uint64_t s_tip_t;
+static int s_tip_sel = -1, s_tip_page = -1;
+/* The layout the last draw used, for the hit test and a text field's rect. */
+static struct menu_layout s_lay;
+static int s_lay_ok;
+static int s_tip_drawn;             /* the last draw showed the card */
+
+/* RECOMP_TRACE=menu_input (C.9). */
+#define MTRACE(...) \
+    do { \
+        if (recomp_env(RENV_MENU_INPUT_TRACE)) { \
+            fprintf(stderr, LOGP "menu_input: " __VA_ARGS__); \
+            fflush(stderr); \
+        } \
+    } while (0)
+
+static const char *const k_dev_name[] = {"pad", "keyboard", "mouse"};
+static const char *const k_focus_name[] = {"content", "toolbar", "footer", "header"};
+
+static int menu_device(void)
+{
+    return s_mouse ? ENHANCE_DEV_MOUSE : s_kbd ? ENHANCE_DEV_KEYBOARD : ENHANCE_DEV_PAD;
+}
+
+/* A pad (kbd 0) or key (1) event: that device leads, and the cursor hides
+ * until the mouse moves again (C.6). */
+static void dev_set(int kbd)
+{
+    int was = menu_device();
+    s_mouse = 0;
+    s_kbd = kbd != 0;
+    if (kbd)
+        s_kbd_seen = 1;
+    xbox_InputMouseCursorHide(1);
+    if (menu_device() != was) {
+        MTRACE("device %s\n", k_dev_name[menu_device()]);
+        s_need_draw = 1;
+    }
+}
+
+static void dev_mouse(void)
+{
+    if (!s_mouse) {
+        MTRACE("device mouse\n");
+        s_need_draw = 1;
+    }
+    s_mouse = 1;
+    xbox_InputMouseCursorHide(0);
+}
+
+static int any_key_down(void);
+
+static void focus_to(int f)
+{
+    if (f == s_focus)
+        return;
+    MTRACE("focus %s -> %s\n", k_focus_name[s_focus], k_focus_name[f]);
+    s_focus = f;
+    s_need_draw = 1;
+}
 static uint64_t s_dir_next, s_close_t, s_draw_t;
 static uint64_t s_extra_t[INPUT_SRC_COUNT];
 static int s_snap_on, s_stats_on;
@@ -1080,14 +1162,16 @@ static const char *const k_foot_key[MENU_FB_COUNT] = {"{key:shift+esc} Cancel", 
 /* A footer too small for the glyphs shows the bare words. */
 static const char *const k_foot_bare[MENU_FB_COUNT] = {"Cancel", "Save"};
 
+/* The glyph family follows the latest device (D8); the mouse's player has
+ * the keys at hand, so the mouse shows the keys' shortcuts. */
 static int foot_device(void)
 {
-    return s_kbd ? ENHANCE_DEV_KEYBOARD : ENHANCE_DEV_PAD;
+    return menu_device();
 }
 
 static const char *foot_label(int b)
 {
-    return (s_kbd ? k_foot_key : k_foot_pad)[b];
+    return (menu_device() == ENHANCE_DEV_PAD ? k_foot_pad : k_foot_key)[b];
 }
 
 /* The layout's inputs that do not hang on the rows: the placement, the
@@ -1630,6 +1714,11 @@ static int s_name_on;
 static char s_name[SHADER_PROFILE_NAME_MAX + 1];
 static int s_name_cur, s_name_dir;
 static uint64_t s_name_next;
+/* The on-screen keyboard over the name field (D4), and where the last draw
+ * put its keys, for a click. */
+static struct osk s_osk;
+static struct osk_layout s_osk_lay;
+static int s_osk_lay_ok;
 
 static const struct enhance_item k_profile_item = {
     .label = "Profile", .kind = ENHANCE_ITEM_CHOICE, .live = ENHANCE_LIVE
@@ -1656,13 +1745,58 @@ static void sh_reset_state(void)
 
 /* The edit is modal, as a capture is: the actions fire nothing meanwhile,
  * so a typed letter never also does what it is bound to. */
+/* The selected row's band in the last draw's layout, in the menu's pixels;
+ * the panel when it was not drawn. */
+static struct menu_rect sel_row_rect(void)
+{
+    struct menu_rect r = {0, 0, 0, 0};
+    if (!s_lay_ok)
+        return r;
+    r = s_lay.panel;
+    for (int i = 0; i < s_lay.nvrow; i++)
+        if (s_lay.row[i].index == s_sel[s_page])
+            r = s_lay.row[i].r;
+    return r;
+}
+
+static void name_osk(int on)
+{
+    if (on && !s_osk.on) {
+        enhance_osk_open(&s_osk);
+        MTRACE("osk open\n");
+    } else if (!on && s_osk.on) {
+        enhance_osk_close(&s_osk);
+        MTRACE("osk close\n");
+    }
+    s_need_draw = 1;
+}
+
+/* The edit is modal, as a capture is: the actions fire nothing meanwhile,
+ * so a typed letter never also does what it is bound to. Text arrives as
+ * the host typed it, in the player's layout (D4, text_input.h); a pad
+ * player gets the on-screen keyboard. */
 static void name_begin(const char *name)
 {
+    struct menu_rect f = sel_row_rect();
+    int px, py, w, h;
     snprintf(s_name, sizeof s_name, "%s", name);
     s_name_cur = (int)strlen(s_name);
     s_name_on = 1;
     s_name_dir = 0;
     enhance_actions_quiet(1);
+    nv2a_overlay_placement(&px, &py, &w, &h);
+    /* The host places its IME and the system keyboard by this rect, in the
+     * window's pixels. */
+    {
+        int x0 = px + f.x, y0 = py + f.y, x1 = x0 + f.w, y1 = y0 + f.h;
+        nv2a_overlay_to_window(&x0, &y0);
+        nv2a_overlay_to_window(&x1, &y1);
+        xbox_InputTextBegin(x0, y0, x1 - x0, y1 - y0);
+    }
+    /* The pad has no other way to type; a rename by mouse or touch gets it
+     * too, unless a keyboard has been used (a touch screen, a Deck in
+     * desktop mode, a mouse-only player). */
+    name_osk(menu_device() == ENHANCE_DEV_PAD || !s_kbd_seen);
 }
 
 static void name_end(void)
@@ -1670,6 +1804,9 @@ static void name_end(void)
     if (!s_name_on)
         return;
     s_name_on = 0;
+    xbox_InputTextEnd();
+    enhance_osk_close(&s_osk);
+    s_osk_lay_ok = 0;
     enhance_actions_quiet(0);
 }
 
@@ -2597,22 +2734,37 @@ static const char *const k_menu_size[] = {"compact", "expanded", NULL};
 /* D2: the size is the player's layout, not a setting to review, so it is
  * written at once, alone: the unsaved changes stay pending for Save. With
  * RECOMP_CONFIG=none it holds for the session. */
-static void size_toggle(void)
+static void layout_key_write(const char *key, const char *value, const char *what)
 {
     const char *path = enhance_cfg_user_path();
-    const char *key = "overlay.menu_size";
     char q[32], err[512];
     const char *val = q;
-    s_size = s_size == MENU_SIZE_EXPANDED ? MENU_SIZE_COMPACT : MENU_SIZE_EXPANDED;
     s_need_draw = 1;
     if (!path)
         return;
-    recomp_cfg_quote(k_menu_size[s_size], q, sizeof q);
+    recomp_cfg_quote(value, q, sizeof q);
     mkdir_parent(path);
     if (recomp_cfg_patch(path, &key, &val, 1, err, sizeof err) != 0) {
-        fprintf(stderr, LOGP "menu: keeping overlay.menu_size in %s failed: %s\n", path, err);
-        status("Size not kept: %s", err);
+        fprintf(stderr, LOGP "menu: keeping %s in %s failed: %s\n", key, path, err);
+        status("%s not kept: %s", what, err);
     }
+}
+
+static void size_toggle(void)
+{
+    s_size = s_size == MENU_SIZE_EXPANDED ? MENU_SIZE_COMPACT : MENU_SIZE_EXPANDED;
+    layout_key_write("overlay.menu_size", k_menu_size[s_size], "Size");
+}
+
+/* D11: the header's ?, L3 and F1 flip between the tooltip and inline
+ * hints (off comes back on inline: the player asked to see them), written
+ * at once and alone, as the size is. */
+static const char *const k_menu_hints[] = {"tooltip", "inline", "off", NULL};
+
+static void hints_toggle(void)
+{
+    s_hints = s_hints == MENU_HINTS_INLINE ? MENU_HINTS_TOOLTIP : MENU_HINTS_INLINE;
+    layout_key_write("overlay.menu_hints", k_menu_hints[s_hints], "Hints");
 }
 
 /* Stage the stock of every slot and action (m -1), or of mod m's own
@@ -2705,6 +2857,36 @@ int enhance_menu_open(uint64_t now_ms)
         if (!binds_dirty(id))
             abase_take(id);
     s_state = ST_OPEN;
+    enhance_input_menu_hold(1);
+    /* D3: the focus starts in the content, as before; the pointer's place
+     * now is no motion, so a resting mouse takes nothing. */
+    focus_to(MENU_FOCUS_CONTENT);
+    s_free_scroll = 0;
+    s_drag_row = -1;
+    s_hover_row = -1;
+    {
+        struct xbox_pointer pt;
+        xbox_InputPointerTake(&pt);
+        s_ptr_seq = pt.seq;
+        s_ptr_ax = s_ptr_x = pt.x;
+        s_ptr_ay = s_ptr_y = pt.y;
+        s_ptr_btn = pt.buttons;
+    }
+    {
+        /* The device that opened it leads: a pad held (the chord), a key
+         * down (F10), else the pad when one is connected. */
+        uint32_t all = 0;
+        for (int p = 0; p < PORTS; p++)
+            all |= s_held[p];
+        s_mouse = 0;
+        s_kbd = all ? 0 : any_key_down() ? 1 : !xbox_InputIsConnected(0);
+        if (!all && any_key_down())
+            s_kbd_seen = 1;
+        MTRACE("open device %s\n", k_dev_name[menu_device()]);
+    }
+    xbox_InputMouseCursorHide(1);
+    s_tip_t = now_ms ? now_ms : 1;
+    s_tip_sel = s_tip_page = -1;
     s_confirm = 0;
     s_dlg.on = 0;
     s_peek_t = 0;
@@ -2732,6 +2914,8 @@ void enhance_menu_close(void)
     if (s_state != ST_OPEN)
         return;
     s_state = ST_CLOSING;
+    xbox_InputMouseCursorHide(0);
+    enhance_input_menu_hold(0);
     s_close_t = s_now;
     s_dlg.on = 0;
     cap_phase(CAP_OFF);
@@ -2757,6 +2941,7 @@ static void page_to(int p)
     s_page = p;
     s_mod_sub = -1;
     s_confirm = 0;
+    s_free_scroll = 0;
     name_end();
     sh_reset_state();
     if (p == PAGE_SHADERS)
@@ -2764,16 +2949,17 @@ static void page_to(int p)
     stats_page_use();
 }
 
-static void move_sel(int d)
+/* The next selectable row in direction d; 0 at either end (Q11: no wrap,
+ * Down past the last row goes to the footer instead). */
+static int move_sel(int d)
 {
     int *sel = &s_sel[s_page];
-    if (!s_nrow)
-        return;
-    for (int k = 0; k < s_nrow; k++) {
-        *sel = (*sel + d + s_nrow) % s_nrow;
-        if (s_row[*sel].sel)
-            return;
-    }
+    for (int i = *sel + d; i >= 0 && i < s_nrow; i += d)
+        if (s_row[i].sel) {
+            *sel = i;
+            return 1;
+        }
+    return 0;
 }
 
 static void change_slot(struct slot *s, int dir, int ok)
@@ -3280,10 +3466,17 @@ static void dlg_activate(int b)
     s_need_draw = 1;
 }
 
+/* The dialog is up and past the swallow, so a press that opened it (a
+ * reflex second B, a double click) cannot answer it. */
+static int dlg_ready(void)
+{
+    return s_dlg.on && s_now - s_dlg.t0 >= DLG_SWALLOW_MS;
+}
+
 /* The dialog takes every event while it is up (D9a). */
 static int dlg_event(enum enhance_menu_event ev)
 {
-    if (s_now - s_dlg.t0 < DLG_SWALLOW_MS)
+    if (!dlg_ready())
         return 1;
     switch (ev) {
     case ENHANCE_EV_LEFT:
@@ -3317,7 +3510,7 @@ static int dlg_event(enum enhance_menu_event ev)
  * G are the buttons' access keys. 1 when the key was the dialog's. */
 static int dlg_key(int vk, int shift)
 {
-    if (!s_dlg.on || s_now - s_dlg.t0 < DLG_SWALLOW_MS)
+    if (!dlg_ready())
         return 0;
     switch (vk) {
     case 0x09:
@@ -3333,6 +3526,42 @@ static int dlg_key(int vk, int shift)
     return 1;
 }
 
+/* A footer button (D9, Q11), by the pad's A, Enter or a click. */
+static void foot_press(int b)
+{
+    MTRACE("footer %s\n", b == MENU_FB_SAVE ? "save" : "cancel");
+    if (b == MENU_FB_CANCEL) {
+        leave_request();
+        return;
+    }
+    if (enhance_menu_unsaved() > 0 && !dlg_save_off())
+        save();
+}
+
+/* The wheel scrolled the rows away from the selection: the next key or pad
+ * press brings it back to the first row in view (D3) before it acts.
+ * Returns 1 when the press was spent on that. */
+static int re_anchor(void)
+{
+    int *sel = &s_sel[s_page], sc = s_scroll[s_page], away;
+    if (!s_free_scroll)
+        return 0;
+    s_free_scroll = 0;
+    away = s_lay_ok && (*sel < sc || *sel >= sc + s_lay.vis);
+    if (!away)
+        return 0;
+    for (int i = sc; i < s_nrow && i < sc + s_lay.vis; i++)
+        if (s_row[i].sel) {
+            *sel = i;
+            break;
+        }
+    /* No selectable row in view: the selection stays and the rows scroll
+     * back to it. Either way the press is spent, since any press (OK, Left)
+     * on a row the player cannot see yet would act on it unseen. */
+    MTRACE("re-anchor row %d\n", *sel);
+    return 1;
+}
+
 int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
 {
     struct row *r;
@@ -3342,6 +3571,59 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
     if (s_dlg.on)
         return dlg_event(ev);
     build_rows();
+    /* D3's regions: the toolbar and the footer take the section buttons;
+     * the global ones (Save, Cancel, the size and hints, LB/RB) fall
+     * through to the switch below, the same on every region. */
+    if (s_focus == MENU_FOCUS_TOOLBAR) {
+        switch (ev) {
+        case ENHANCE_EV_UP:
+        case ENHANCE_EV_PAGE_PREV:
+            page_to(s_page - 1);
+            return 1;
+        case ENHANCE_EV_DOWN:
+        case ENHANCE_EV_PAGE_NEXT:
+            page_to(s_page + 1);
+            return 1;
+        case ENHANCE_EV_OK:
+        case ENHANCE_EV_RIGHT:
+            /* Into the section on the row it remembers. */
+            focus_to(MENU_FOCUS_CONTENT);
+            return 1;
+        case ENHANCE_EV_BACK:
+            leave_request();
+            return 1;
+        case ENHANCE_EV_LEFT:
+        case ENHANCE_EV_CLEAR:
+            return 1;
+        default:
+            break;
+        }
+    } else if (s_focus == MENU_FOCUS_FOOTER) {
+        switch (ev) {
+        case ENHANCE_EV_LEFT:
+            s_foot_sel = MENU_FB_CANCEL;
+            return 1;
+        case ENHANCE_EV_RIGHT:
+            s_foot_sel = MENU_FB_SAVE;
+            return 1;
+        case ENHANCE_EV_OK:
+            foot_press(s_foot_sel);
+            return 1;
+        case ENHANCE_EV_UP:
+        case ENHANCE_EV_BACK:
+            focus_to(MENU_FOCUS_CONTENT);
+            return 1;
+        case ENHANCE_EV_DOWN:
+        case ENHANCE_EV_CLEAR:
+            return 1;
+        default:
+            break;
+        }
+    } else if (ev == ENHANCE_EV_UP || ev == ENHANCE_EV_DOWN || ev == ENHANCE_EV_LEFT
+               || ev == ENHANCE_EV_RIGHT || ev == ENHANCE_EV_OK || ev == ENHANCE_EV_CLEAR) {
+        if (re_anchor())
+            return 1;
+    }
     r = s_nrow ? &s_row[s_sel[s_page]] : NULL;
     if (r && !r->sel)
         r = NULL;
@@ -3358,7 +3640,14 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
     }
     switch (ev) {
     case ENHANCE_EV_UP: move_sel(-1); break;
-    case ENHANCE_EV_DOWN: move_sel(1); break;
+    case ENHANCE_EV_DOWN:
+        if (!move_sel(1)) {
+            /* Q11: past the last row, the footer, on Save when there is
+             * something to save. */
+            s_foot_sel = enhance_menu_unsaved() > 0 ? MENU_FB_SAVE : MENU_FB_CANCEL;
+            focus_to(MENU_FOCUS_FOOTER);
+        }
+        break;
     case ENHANCE_EV_PAGE_PREV:
     case ENHANCE_EV_PAGE_NEXT:
         page_to(ev == ENHANCE_EV_PAGE_PREV ? s_page - 1 : s_page + 1);
@@ -3371,10 +3660,7 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
     case ENHANCE_EV_CLOSE:
     case ENHANCE_EV_CANCEL: leave_request(); break;
     case ENHANCE_EV_HINTS:
-        /* No status yet: nothing draws hints under the rows until B or C,
-         * so the footer help stays the one place they show. */
-        s_hints_inline = !s_hints_inline;
-        s_need_draw = 1;
+        hints_toggle();
         break;
     case ENHANCE_EV_BACK:
         if (s_page == PAGE_SHADERS && s_sh_sub != SH_MAIN) {
@@ -3388,7 +3674,10 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
             s_sel[PAGE_MODS] = s_mod_sub;
             s_mod_sub = -1;
         } else {
-            leave_request();
+            /* Q12: B, Esc, Backspace and the right button go up a level,
+             * to the section's entry in the toolbar; a second one there
+             * leaves (the toolbar's BACK, asking first when unsaved). */
+            focus_to(MENU_FOCUS_TOOLBAR);
         }
         break;
     case ENHANCE_EV_CLEAR:
@@ -3928,20 +4217,20 @@ static uint32_t release_step(uint32_t held, uint32_t press)
 }
 
 /* ---- the name editor -------------------------------------------------------
- * Rename types into s_name: the keyboard as a US layout (the menu reads
- * virtual keys, not text), the pad by cycling the character under the
- * cursor. Enter or A keeps it, Esc or B drops it. */
+ * Rename types into s_name. The keyboard's text comes from the host's
+ * ring (text_input.h) in the player's layout, IME included; the editing
+ * keys (Backspace, Delete, the arrows, Home, End) stay key edges. A pad
+ * types on the on-screen keyboard (D4). Enter, A on Done or a pad's Start
+ * keeps the name; Esc or B drops it. */
 
-static const char k_name_cycle[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -_";
-
-static void name_insert(char c)
+static void name_insert_utf8(const char *u)
 {
-    size_t len = strlen(s_name);
-    if (len >= SHADER_PROFILE_NAME_MAX)
+    size_t len = strlen(s_name), n = strlen(u);
+    if (!n || len + n > SHADER_PROFILE_NAME_MAX)
         return;
-    memmove(s_name + s_name_cur + 1, s_name + s_name_cur, len - (size_t)s_name_cur + 1);
-    s_name[s_name_cur++] = c;
+    memmove(s_name + s_name_cur + n, s_name + s_name_cur, len - (size_t)s_name_cur + 1);
+    memcpy(s_name + s_name_cur, u, n);
+    s_name_cur += (int)n;
 }
 
 /* The UTF-8 character before or at the cursor: its start and length. */
@@ -3974,26 +4263,6 @@ static void name_cut(int from, int to)
     s_name_cur = from;
 }
 
-static void name_cycle(int dir)
-{
-    const int n = (int)sizeof k_name_cycle - 1;
-    char c = s_name[s_name_cur];
-    const char *p = c ? strchr(k_name_cycle, c) : NULL;
-    if (!c) {
-        name_insert(dir > 0 ? 'A' : '_');
-        s_name_cur--;
-        return;
-    }
-    if (!p || ((unsigned char)c & 0x80)) {
-        /* Not in the cycle (a non-ASCII character): it becomes the first. */
-        name_cut(s_name_cur, name_next(s_name_cur));
-        name_insert(k_name_cycle[0]);
-        s_name_cur--;
-        return;
-    }
-    s_name[s_name_cur] = k_name_cycle[((int)(p - k_name_cycle) + dir + n) % n];
-}
-
 static void name_keep(void)
 {
     char msg[SHADER_PROFILE_ERR_MAX * 2];
@@ -4006,87 +4275,477 @@ static void name_keep(void)
     status("Renamed to %s; Save writes it", s_name);
 }
 
+static void name_cancel(void)
+{
+    name_end();
+    status("Rename cancelled");
+}
+
+/* The focused key of the on-screen keyboard, pressed. */
+static void osk_press(void)
+{
+    char t[8];
+    switch (enhance_osk_press(&s_osk, t, sizeof t)) {
+    case OSK_ACT_TEXT: name_insert_utf8(t); break;
+    case OSK_ACT_BACKSPACE: name_cut(name_prev(s_name_cur), s_name_cur); break;
+    case OSK_ACT_DONE: name_keep(); break;
+    default: break;
+    }
+    s_need_draw = 1;
+}
+
 /* One step of the name editor: 1 while it owns the input. */
 static int name_step(uint32_t held, uint32_t press, uint64_t now)
 {
-    int shift = xbox_FramebufferKeyDown(XBOX_VK_SHIFT) != 0, dir = 0;
+    int dir = 0, pad_dir = 0;
+    char u[8];
     if (!s_name_on)
         return 0;
-    if (key_edge(0x1B) || (press & (1u << INPUT_SRC_EAST))) {
-        s_kbd = key_edge(0x1B);
-        name_end();
-        status("Rename cancelled");
+    /* The host's typed text first: what came before an Enter is the
+     * name's. A keyboard player typing puts the on-screen keys away. */
+    for (int k = 0; k < 64 && xbox_InputTextPop(u, sizeof u) > 0; k++) {
+        name_insert_utf8(u);
+        dev_set(1);
+        if (s_osk.on)
+            name_osk(0);
+    }
+    if (key_edge(0x1B)) {
+        dev_set(1);
+        name_cancel();
         return 1;
     }
-    if (key_edge(0x0D) || (press & (1u << INPUT_SRC_SOUTH))) {
-        s_kbd = key_edge(0x0D);
+    if (key_edge(0x0D)) {
+        dev_set(1);
         name_keep();
         return 1;
     }
     if (key_edge(0x08)) {
         name_cut(name_prev(s_name_cur), s_name_cur);
-        s_kbd = 1;
+        dev_set(1);
     }
-    if (key_edge(0x2E) || (press & (1u << INPUT_SRC_WEST))) {
-        s_kbd = key_edge(0x2E);
+    if (key_edge(0x2E)) {
         name_cut(s_name_cur, name_next(s_name_cur));
+        dev_set(1);
     }
-    for (int vk = 'A'; vk <= 'Z'; vk++)
-        if (key_edge(vk)) {
-            name_insert((char)(shift ? vk : vk - 'A' + 'a'));
-            s_kbd = 1;
-        }
-    for (int vk = '0'; vk <= '9'; vk++)
-        if (key_edge(vk)) {
-            name_insert(shift && vk == '9' ? '(' : shift && vk == '0' ? ')' : (char)vk);
-            s_kbd = 1;
-        }
-    for (int vk = 0x60; vk <= 0x69; vk++)   /* the numpad digits */
-        if (key_edge(vk)) {
-            name_insert((char)('0' + vk - 0x60));
-            s_kbd = 1;
-        }
-    {
-        static const struct { int vk; char c, sc; } k_punct[] = {
-            { 0x20, ' ', ' ' }, { 0xBD, '-', '_' }, { 0xBE, '.', '.' },
-            { 0x6D, '-', '-' }, { 0x6E, '.', '.' },
-        };
-        for (unsigned i = 0; i < sizeof k_punct / sizeof k_punct[0]; i++)
-            if (key_edge(k_punct[i].vk)) {
-                name_insert(shift ? k_punct[i].sc : k_punct[i].c);
-                s_kbd = 1;
+    if (key_edge(0x24)) {   /* Home */
+        s_name_cur = 0;
+        dev_set(1);
+    }
+    if (key_edge(0x23)) {   /* End */
+        s_name_cur = (int)strlen(s_name);
+        dev_set(1);
+    }
+    if (press) {
+        dev_set(0);
+        if (!s_osk.on) {
+            /* A pad picked up mid-edit: its keyboard, the press spent on
+             * showing it (B still cancels). */
+            if (press & (1u << INPUT_SRC_EAST)) {
+                name_cancel();
+                return 1;
             }
+            name_osk(1);
+            s_name_dir = (held & (k_up | k_down | k_left | k_right)) ? -1 : 0;
+        } else {
+            if (press & (1u << INPUT_SRC_EAST)) {
+                name_cancel();
+                return 1;
+            }
+            if (press & (1u << INPUT_SRC_START)) {
+                name_keep();
+                return 1;
+            }
+            if (press & (1u << INPUT_SRC_WEST))
+                name_cut(name_prev(s_name_cur), s_name_cur);
+            if (press & (1u << INPUT_SRC_SOUTH)) {
+                osk_press();
+                if (!s_name_on)
+                    return 1;
+            }
+            /* LB and RB move the text cursor, the d-pad the keys. */
+            if (press & (1u << INPUT_SRC_LEFT_SHOULDER))
+                s_name_cur = name_prev(s_name_cur);
+            if (press & (1u << INPUT_SRC_RIGHT_SHOULDER))
+                s_name_cur = name_next(s_name_cur);
+        }
     }
     /* Directions repeat as on the rows; the menu's own s_dir follows them
-     * so nothing fires when the editor lets go. */
-    if ((held & k_up) || xbox_FramebufferKeyDown(0x26))
-        dir = ENHANCE_EV_UP;
-    else if ((held & k_down) || xbox_FramebufferKeyDown(0x28))
-        dir = ENHANCE_EV_DOWN;
-    else if ((held & k_left) || xbox_FramebufferKeyDown(0x25))
+     * so nothing fires when the editor lets go. The pad's move the
+     * on-screen keys, the arrow keys the text cursor. */
+    if (s_osk.on && (held & k_up))
+        dir = ENHANCE_EV_UP, pad_dir = 1;
+    else if (s_osk.on && (held & k_down))
+        dir = ENHANCE_EV_DOWN, pad_dir = 1;
+    else if (s_osk.on && (held & k_left))
+        dir = ENHANCE_EV_LEFT, pad_dir = 1;
+    else if (s_osk.on && (held & k_right))
+        dir = ENHANCE_EV_RIGHT, pad_dir = 1;
+    else if (xbox_FramebufferKeyDown(0x25))
         dir = ENHANCE_EV_LEFT;
-    else if ((held & k_right) || xbox_FramebufferKeyDown(0x27))
+    else if (xbox_FramebufferKeyDown(0x27))
         dir = ENHANCE_EV_RIGHT;
-    if (dir != s_name_dir || (dir && now >= s_name_next)) {
+    if (s_name_dir < 0) {
+        /* The direction that showed the keyboard is spent until let go. */
+        if (dir)
+            dir = -1;
+        else
+            s_name_dir = 0;
+    }
+    if (dir >= 0 && (dir != s_name_dir || (dir && now >= s_name_next))) {
         s_name_next = now + (dir != s_name_dir ? REPEAT_FIRST : REPEAT_NEXT);
         s_name_dir = dir;
-        switch (dir) {
-        case ENHANCE_EV_UP: name_cycle(1); break;
-        case ENHANCE_EV_DOWN: name_cycle(-1); break;
-        case ENHANCE_EV_LEFT: s_name_cur = name_prev(s_name_cur); break;
-        case ENHANCE_EV_RIGHT: s_name_cur = name_next(s_name_cur); break;
-        default: break;
+        if (pad_dir) {
+            enhance_osk_move(&s_osk, dir == ENHANCE_EV_LEFT ? -1 : dir == ENHANCE_EV_RIGHT ? 1 : 0,
+                             dir == ENHANCE_EV_UP ? -1 : dir == ENHANCE_EV_DOWN ? 1 : 0);
+        } else if (dir == ENHANCE_EV_LEFT) {
+            s_name_cur = name_prev(s_name_cur);
+            dev_set(1);
+        } else if (dir == ENHANCE_EV_RIGHT) {
+            s_name_cur = name_next(s_name_cur);
+            dev_set(1);
         }
     }
-    s_dir = dir;
+    s_dir = dir > 0 ? dir : 0;
     s_dir_next = now + REPEAT_FIRST;
     return 1;
+}
+
+/* ---- the tooltip (D11) ------------------------------------------------------ */
+
+/* The selection's settle time: a new row or section starts the wait. */
+static void tip_track(uint64_t now)
+{
+    if (s_sel[s_page] != s_tip_sel || s_page != s_tip_page) {
+        s_tip_sel = s_sel[s_page];
+        s_tip_page = s_page;
+        s_tip_t = now ? now : 1;
+    }
+}
+
+/* The selected row's help shows as a card: hints on tooltip, the content
+ * focused with nothing modal over it, and the selection settled. */
+static int tip_shown(uint64_t now)
+{
+    const struct row *r;
+    if (s_state != ST_OPEN || s_hints != MENU_HINTS_TOOLTIP || s_focus != MENU_FOCUS_CONTENT
+        || s_dlg.on || s_name_on || s_cap.phase != CAP_OFF || !s_nrow
+        || s_tip_sel != s_sel[s_page] || s_tip_page != s_page)
+        return 0;
+    r = &s_row[s_sel[s_page]];
+    if (!r->sel || !r->help[0])
+        return 0;
+    /* The mouse's wait counts from the hover; a wheel scroll that moved the
+     * row out of view shows no card for it. */
+    if (s_free_scroll && s_lay_ok
+        && (s_sel[s_page] < s_lay.scroll || s_sel[s_page] >= s_lay.scroll + s_lay.vis))
+        return 0;
+    return menu_tip_due(menu_device(), s_tip_t, now);
+}
+
+/* ---- the pointer (D3) ------------------------------------------------------- */
+
+static const struct enhance_item *row_item(const struct row *rw, const struct slot **sl);
+
+/* The layout's section entries as pages, from the last draw. */
+static int s_lay_pages[PAGE_COUNT];
+
+/* A range row's value dragged to x: set once, snapped to the item's step
+ * from its low end and clamped to its ends, as Left and Right would leave
+ * it; a value the environment holds stays, with the reason in the status. */
+static void drag_to(int ri, int x)
+{
+    const struct menu_layout_row *vr = NULL;
+    const struct slot *csl;
+    const struct enhance_item *it;
+    const struct row *r;
+    double f, want, step;
+    char v[VAL_MAX];
+    if (ri < 0 || ri >= s_nrow)
+        return;
+    r = &s_row[ri];
+    it = row_item(r, &csl);
+    if (!it || it->kind != ENHANCE_ITEM_RANGE || it->hi <= it->lo)
+        return;
+    for (int i = 0; i < s_lay.nvrow; i++)
+        if (s_lay.row[i].index == ri)
+            vr = &s_lay.row[i];
+    if (!vr || vr->track.w <= 0)
+        return;
+    f = (double)(x - vr->track.x) / (double)vr->track.w;
+    f = f < 0 ? 0 : f > 1 ? 1 : f;
+    step = it->step > 0 ? it->step : 1;
+    want = it->lo + floor(f * (it->hi - it->lo) / step + 0.5) * step;
+    if (want > it->hi)
+        want = it->hi;
+    if (fabs(want - atof(r->value)) < step * 1e-3)
+        return;
+    /* A value change answers a pending Reset or remove ask with "no", as
+     * the pad's step does in enhance_menu_event. */
+    s_confirm = 0;
+    s_sh_conf = 0;
+    s_sel[s_page] = ri;
+    if (r->type == R_PARAM) {
+        nv2a_present_chain_param_set(s_ptab[r->ref].name, (float)want);
+    } else if (r->type == R_SLOT) {
+        struct slot *sl = &s_slot[r->ref];
+        if (sl->env) {
+            if (sl->envname)
+                status("Set by %s", sl->envname);
+            else
+                status("Set by the environment");
+            return;
+        }
+        snprintf(v, sizeof v, "%g", want);
+        slot_set(sl, v);
+        if (it->live == ENHANCE_LIVE_RESTART)
+            status("%s applies at restart", it->label);
+    } else {
+        return;
+    }
+    build_rows();
+}
+
+/* A left click at a hit. */
+static void click(struct menu_hit h, int x)
+{
+    MTRACE("click region %d index %d part %d\n", h.region, h.index, h.part);
+    switch (h.region) {
+    case MENU_HIT_DIALOG:
+        if (h.index >= 0 && dlg_ready()) {
+            s_dlg.focus = h.index;
+            dlg_activate(h.index);
+        }
+        break;
+    case MENU_HIT_HEADER:
+        if (h.index == MENU_HB_HINTS)
+            hints_toggle();
+        else if (h.index == MENU_HB_SIZE)
+            size_toggle();
+        else if (h.index == MENU_HB_CLOSE)
+            leave_request();
+        break;
+    case MENU_HIT_FOOTER:
+        if (h.index >= 0) {
+            s_foot_sel = h.index;
+            foot_press(h.index);
+        }
+        break;
+    case MENU_HIT_TOOLBAR:
+        if (h.index >= 0 && h.index < s_lay.nsec) {
+            int p = s_lay_pages[h.index];
+            if (p != s_page) {
+                page_to(p);
+                s_peek_t = 0;
+            }
+            focus_to(MENU_FOCUS_CONTENT);
+        }
+        break;
+    case MENU_HIT_ROW:
+        if (h.index < 0 || h.index >= s_nrow || !s_row[h.index].sel)
+            break;
+        focus_to(MENU_FOCUS_CONTENT);
+        s_sel[s_page] = h.index;
+        switch (h.part) {
+        case MENU_PART_PREV: enhance_menu_event(ENHANCE_EV_LEFT, s_now); break;
+        case MENU_PART_NEXT: enhance_menu_event(ENHANCE_EV_RIGHT, s_now); break;
+        case MENU_PART_TRACK:
+            s_drag_row = h.index;
+            drag_to(h.index, x);
+            break;
+        default:
+            /* The pill, the label, the value: the row's A. */
+            enhance_menu_event(ENHANCE_EV_OK, s_now);
+            break;
+        }
+        break;
+    default:
+        /* The backdrop, the panel's bare parts, outside: nothing (D3). */
+        break;
+    }
+    s_need_draw = 1;
+}
+
+/* Real motion over a hit: the pointer selects what it rests on. */
+static void hover(struct menu_hit h)
+{
+    switch (h.region) {
+    case MENU_HIT_DIALOG:
+        if (h.index >= 0 && h.index != s_dlg.focus) {
+            s_dlg.focus = h.index;
+            s_need_draw = 1;
+        }
+        break;
+    case MENU_HIT_ROW:
+        s_hover_row = h.index;
+        if (h.index >= 0 && h.index < s_nrow && s_row[h.index].sel
+            && (h.index != s_sel[s_page] || s_focus != MENU_FOCUS_CONTENT)) {
+            s_sel[s_page] = h.index;
+            s_confirm = 0;
+            focus_to(MENU_FOCUS_CONTENT);
+            s_need_draw = 1;
+        }
+        break;
+    case MENU_HIT_FOOTER:
+        if (h.index >= 0 && (s_focus != MENU_FOCUS_FOOTER || s_foot_sel != h.index)) {
+            s_foot_sel = h.index;
+            focus_to(MENU_FOCUS_FOOTER);
+            s_need_draw = 1;
+        }
+        break;
+    default:
+        s_hover_row = -1;
+        break;
+    }
+}
+
+/* The wheel over a slider's or a choice's control (the track, the arrows,
+ * the value) steps it; anywhere else, the label included, it scrolls, so
+ * a page of sliders still scrolls under the pointer. */
+static int wheel_steps(struct menu_hit h)
+{
+    const struct slot *sl;
+    const struct enhance_item *it;
+    if (h.region != MENU_HIT_ROW || h.index < 0 || h.index >= s_nrow || !s_row[h.index].sel)
+        return 0;
+    if (h.part != MENU_PART_TRACK && h.part != MENU_PART_PREV && h.part != MENU_PART_NEXT
+        && h.part != MENU_PART_VALUE)
+        return 0;
+    it = row_item(&s_row[h.index], &sl);
+    return it && (it->kind == ENHANCE_ITEM_RANGE || it->kind == ENHANCE_ITEM_CHOICE);
+}
+
+/* One pointer snapshot: motion past the threshold, the buttons' edges and
+ * the wheel. modal: a capture or the name editor owns the input, so only
+ * the on-screen keys take a click. */
+static void pointer_step(int modal)
+{
+    struct xbox_pointer p;
+    unsigned down, up;
+    int x, y, lx, ly, px, py, w, h, moved, any;
+    float s = s_lay_ok ? s_lay.s : 1.0f;
+    xbox_InputPointerTake(&p);
+    if (p.seq == s_ptr_seq && !p.wheel)
+        return;
+    s_ptr_seq = p.seq;
+    /* A press and its release can both land between two steps (a tap on a
+     * trackpad or a touch screen, a window pumped only at flips): the
+     * snapshot's pressed bits keep it, at the place it was pressed. */
+    down = (p.buttons & ~s_ptr_btn) | p.pressed;
+    up = s_ptr_btn & ~p.buttons;
+    s_ptr_btn = p.buttons;
+    if (p.x < 0 || p.y < 0)
+        return;
+    nv2a_overlay_placement(&px, &py, &w, &h);
+    /* Window pixels to the output's (present.surface=internal scales the
+     * output into the window after the present), then to the placement's. */
+    x = p.x;
+    y = p.y;
+    nv2a_overlay_to_output(&x, &y);
+    x -= px;
+    y -= py;
+    lx = x;
+    ly = y;
+    if (p.pressed & XBOX_POINTER_LEFT) {
+        lx = p.press[0].x;
+        ly = p.press[0].y;
+        nv2a_overlay_to_output(&lx, &ly);
+        lx -= px;
+        ly -= py;
+    }
+    moved = menu_pointer_moved(s_ptr_ax, s_ptr_ay, p.x, p.y, s);
+    if (moved) {
+        s_ptr_ax = p.x;
+        s_ptr_ay = p.y;
+    }
+    s_ptr_x = x;
+    s_ptr_y = y;
+    if (up & XBOX_POINTER_LEFT)
+        s_drag_row = -1;
+    any = moved || down || p.wheel;
+    if (!any)
+        return;
+    dev_mouse();
+    if (modal) {
+        int r, c;
+        if (s_cap.phase != CAP_OFF || !s_name_on)
+            return;
+        if ((down & XBOX_POINTER_LEFT) && s_osk.on && s_osk_lay_ok
+            && enhance_osk_hit(&s_osk_lay, lx, ly, &r, &c)) {
+            s_osk.row = r;
+            s_osk.col = c;
+            osk_press();
+        } else if (down & XBOX_POINTER_RIGHT) {
+            name_cancel();
+        }
+        s_need_draw = 1;
+        return;
+    }
+    if (!s_lay_ok)
+        return;
+    {
+        struct menu_hit ht = menu_hit(&s_lay, x, y);
+        if (moved && s_drag_row >= 0 && (p.buttons & XBOX_POINTER_LEFT)) {
+            drag_to(s_drag_row, x);
+            s_need_draw = 1;
+        } else if (moved && !p.buttons) {
+            hover(ht);
+        }
+        if (down & XBOX_POINTER_LEFT)
+            click(lx == x && ly == y ? ht : menu_hit(&s_lay, lx, ly), lx);
+        /* A tap's drag ended in the same step it began. */
+        if (!(p.buttons & XBOX_POINTER_LEFT))
+            s_drag_row = -1;
+        if (down & XBOX_POINTER_RIGHT) {
+            /* The pad's B: up a level, then out; in the dialog, Go Back. */
+            MTRACE("right click\n");
+            if (s_dlg.on) {
+                if (dlg_ready())
+                    dlg_activate(DLG_BACK);
+            } else {
+                enhance_menu_event(ENHANCE_EV_BACK, s_now);
+            }
+            s_need_draw = 1;
+        }
+        if (p.wheel && !s_dlg.on && wheel_steps(ht)) {
+            /* Over a slider's or a choice's control: one step a notch,
+             * away from the player up, as Left and Right on the pad. */
+            int n = p.wheel < 0 ? -p.wheel : p.wheel;
+            MTRACE("wheel %d step row %d\n", p.wheel, ht.index);
+            focus_to(MENU_FOCUS_CONTENT);
+            int type = s_row[ht.index].type, ref = s_row[ht.index].ref;
+            for (int i = 0; i < n; i++) {
+                s_sel[s_page] = ht.index;
+                enhance_menu_event(p.wheel > 0 ? ENHANCE_EV_RIGHT : ENHANCE_EV_LEFT, s_now);
+                /* A step can change the rows (a choice that shows or
+                 * hides others): the hit's index may name another row
+                 * now, so the rest of the notches stop here. */
+                if (ht.index >= s_nrow || s_row[ht.index].type != type
+                    || s_row[ht.index].ref != ref)
+                    break;
+            }
+            s_need_draw = 1;
+        } else if (p.wheel && !s_dlg.on && ht.region != MENU_HIT_NONE
+                   && ht.region != MENU_HIT_BACKDROP) {
+            /* Away from the player scrolls up; the selection stays where it
+             * is until a key or the pad moves it (re_anchor). */
+            int max = s_nrow - s_lay.vis, *sc = &s_scroll[s_page];
+            *sc -= p.wheel;
+            if (*sc > max)
+                *sc = max;
+            if (*sc < 0)
+                *sc = 0;
+            s_free_scroll = 1;
+            MTRACE("wheel %d scroll %d\n", p.wheel, *sc);
+            s_need_draw = 1;
+        }
+    }
 }
 
 static void input_step(uint64_t now)
 {
     uint32_t held = 0, press;
-    int dir = 0, redraw = 0;
+    int dir = 0, redraw = 0, n_pad;
+    const struct menu_pad_event *pad_ev = menu_pad_events(&n_pad);
     for (int p = 0; p < PORTS; p++)
         held |= s_held[p];
     for (int src = 1; src < INPUT_SRC_COUNT; src++)
@@ -4094,6 +4753,8 @@ static void input_step(uint64_t now)
             s_extra_t[src] = now ? now : 1;
     press = held & ~s_prev_held;
 
+    if (s_cap.phase != CAP_OFF || s_name_on)
+        pointer_step(1);
     if (capture_step(held, now) || name_step(held, press, now)) {
         /* A button that started there is no press of the menu's, and a
          * Cmd+S typed into a name or a capture is no later Save. */
@@ -4102,24 +4763,26 @@ static void input_step(uint64_t now)
         s_need_draw = 1;
         s_prev_held = held;
         keys_latch();
+        tip_track(now);
         return;
     }
+    pointer_step(0);
 
     if (press)
-        s_kbd = 0;
+        dev_set(0);
 #define EV(e) do { redraw |= enhance_menu_event((e), now); } while (0)
     {
+        /* D3's owner table: the pad's buttons and their events, the menu's
+         * chord buttons on release (A.6). The directions repeat below. */
         uint32_t rel = release_step(held, press);
-        if (rel & (1u << INPUT_SRC_BACK)) EV(ENHANCE_EV_CANCEL);
-        if (rel & (1u << INPUT_SRC_LEFT_STICK_CLICK)) EV(ENHANCE_EV_HINTS);
-        if (rel & (1u << INPUT_SRC_RIGHT_STICK_CLICK)) EV(ENHANCE_EV_SIZE);
+        for (int i = 0; i < n_pad; i++) {
+            uint32_t b = 1u << pad_ev[i].src;
+            if (pad_ev[i].ev >= ENHANCE_EV_UP && pad_ev[i].ev <= ENHANCE_EV_RIGHT)
+                continue;
+            if (pad_ev[i].on_release ? (rel & b) : (press & b))
+                EV((enum enhance_menu_event)pad_ev[i].ev);
+        }
     }
-    if (press & (1u << INPUT_SRC_SOUTH)) EV(ENHANCE_EV_OK);
-    if (press & (1u << INPUT_SRC_EAST)) EV(ENHANCE_EV_BACK);
-    if (press & (1u << INPUT_SRC_WEST)) EV(ENHANCE_EV_CLEAR);
-    if (press & (1u << INPUT_SRC_NORTH)) EV(ENHANCE_EV_SAVE);
-    if (press & (1u << INPUT_SRC_LEFT_SHOULDER)) EV(ENHANCE_EV_PAGE_PREV);
-    if (press & (1u << INPUT_SRC_RIGHT_SHOULDER)) EV(ENHANCE_EV_PAGE_NEXT);
     {
         static const struct { int vk; enum enhance_menu_event ev; } k_keys[] = {
             { 0x0D, ENHANCE_EV_OK }, { 0x20, ENHANCE_EV_OK },
@@ -4127,6 +4790,7 @@ static void input_step(uint64_t now)
             { 'Q', ENHANCE_EV_PAGE_PREV }, { 0x21, ENHANCE_EV_PAGE_PREV },
             { 'E', ENHANCE_EV_PAGE_NEXT }, { 0x22, ENHANCE_EV_PAGE_NEXT },
             { 0x74, ENHANCE_EV_SAVE }, { 0x2E, ENHANCE_EV_CLEAR },
+            { 0x70, ENHANCE_EV_HINTS },
         };
         int shift = xbox_FramebufferKeyDown(XBOX_VK_SHIFT) != 0;
         int ctrl = xbox_FramebufferKeyDown(XBOX_VK_CONTROL) != 0;
@@ -4136,12 +4800,22 @@ static void input_step(uint64_t now)
         for (unsigned i = 0; i < sizeof k_dlg_keys / sizeof k_dlg_keys[0]; i++)
             if (key_edge(k_dlg_keys[i]) && !(ctrl && k_dlg_keys[i] == 'S')
                 && dlg_key(k_dlg_keys[i], shift)) {
-                s_kbd = 1;
+                dev_set(1);
                 redraw = 1;
             }
+        /* Tab and Shift+Tab: the toolbar, the content and the footer, round
+         * (D3); the dialog took it first when it is up. */
+        if (s_state == ST_OPEN && !s_dlg.on && key_edge(0x09)) {
+            int f = menu_focus_cycle(s_focus, shift ? -1 : 1);
+            dev_set(1);
+            if (f == MENU_FOCUS_FOOTER && s_focus != MENU_FOCUS_FOOTER)
+                s_foot_sel = enhance_menu_unsaved() > 0 ? MENU_FB_SAVE : MENU_FB_CANCEL;
+            focus_to(f);
+            redraw = 1;
+        }
         for (unsigned i = 0; i < sizeof k_keys / sizeof k_keys[0]; i++)
             if (key_edge(k_keys[i].vk)) {
-                s_kbd = 1;
+                dev_set(1);
                 if (s_state == ST_OPEN)
                     /* Shift+Esc is Cancel: leave, asking first. */
                     EV(k_keys[i].vk == 0x1B && shift ? ENHANCE_EV_CANCEL : k_keys[i].ev);
@@ -4150,7 +4824,7 @@ static void input_step(uint64_t now)
          * never sees a Cmd key). In the dialog both are swallowed: the
          * save reflex is no answer to "leave?", only a bare S is. */
         if (s_state == ST_OPEN && !s_dlg.on && ((ctrl && key_edge('S')) || cmd_s)) {
-            s_kbd = 1;
+            dev_set(1);
             EV(ENHANCE_EV_SAVE);
         }
     }
@@ -4165,7 +4839,7 @@ static void input_step(uint64_t now)
         dir = ENHANCE_EV_RIGHT;
     if (dir && xbox_FramebufferKeyDown(dir == ENHANCE_EV_UP ? 0x26 : dir == ENHANCE_EV_DOWN ? 0x28
                                        : dir == ENHANCE_EV_LEFT ? 0x25 : 0x27))
-        s_kbd = 1;
+        dev_set(1);
     if (dir != s_dir) {
         s_dir = dir;
         s_dir_next = now + REPEAT_FIRST;
@@ -4177,6 +4851,7 @@ static void input_step(uint64_t now)
             EV((enum enhance_menu_event)dir);
     }
 #undef EV
+    tip_track(now);
     if (redraw)
         s_need_draw = 1;
     s_prev_held = held;
@@ -4321,9 +4996,18 @@ static void draw_row(mu_Context *ctx, const struct row *rw, const struct menu_la
         return;
     }
     if (selected) {
-        nv2a_ovl_ui_rrect(ctx, r, nv2a_ovl_px(s, t->radius) / 2, 1.0f, t->bg_hover);
-        mu_draw_rect(ctx, mu_rect(r.x, r.y + nv2a_ovl_px(s, 6), nv2a_ovl_px(s, 3),
-                                  r.h - 2 * nv2a_ovl_px(s, 6)), t->accent);
+        /* The inline hint is the row's too. */
+        mu_Rect hl = r;
+        if (vr->hint.h > 0)
+            hl.h = vr->hint.y + vr->hint.h - r.y;
+        nv2a_ovl_ui_rrect(ctx, hl, nv2a_ovl_px(s, t->radius) / 2, 1.0f, t->bg_hover);
+        mu_draw_rect(ctx, mu_rect(hl.x, hl.y + nv2a_ovl_px(s, 6), nv2a_ovl_px(s, 3),
+                                  hl.h - 2 * nv2a_ovl_px(s, 6)), t->accent);
+    }
+    if (vr->hint.h > 0 && rw->help[0]) {
+        char hc[300];
+        mu_draw_text(ctx, fs, fit(fs, rw->help, vr->hint.w, hc, sizeof hc), -1,
+                     mu_vec2(vr->hint.x, vr->hint.y), t->text_dim);
     }
     if (st & ENHANCE_ROW_UNSAVED) {
         /* In the row's left pad, between the selection bar and the label. */
@@ -4531,7 +5215,10 @@ static void draw_toolbar(mu_Context *ctx, const struct menu_layout *l, const int
         if (e.h <= 0)
             continue; /* scrolled out of a short bar */
         if (on) {
-            nv2a_ovl_ui_rrect(ctx, mr(e), rad / 2, 1.0f, t->bg_hover);
+            /* The pad's focus on the toolbar (Q12) lights the entry. */
+            nv2a_ovl_ui_rrect(ctx, mr(e), rad / 2, 1.0f,
+                              s_focus == MENU_FOCUS_TOOLBAR ? with_alpha(t->accent, 110)
+                                                            : t->bg_hover);
             mu_draw_rect(ctx, mu_rect(e.x, e.y + nv2a_ovl_px(s, 6), nv2a_ovl_px(s, 3),
                                       e.h - 2 * nv2a_ovl_px(s, 6)), t->accent);
         }
@@ -4586,9 +5273,122 @@ static void draw_header(mu_Context *ctx, const struct menu_layout *l)
         uint32_t cp = b == MENU_HB_SIZE && s_size == MENU_SIZE_EXPANDED ? NV2A_OVL_ICON_MINIMIZE
                                                                          : k_hb[b];
         /* The hints button is lit while they show inline. */
-        mu_Color c = b == MENU_HB_HINTS && s_hints_inline ? t->accent : t->text_dim;
+        mu_Color c = b == MENU_HB_HINTS && s_hints == MENU_HINTS_INLINE ? t->accent : t->text_dim;
         nv2a_ovl_ui_glyph(ctx, nv2a_ovl_glyph_icon(cp), mr(l->hbtn[b]), c);
     }
+}
+
+/* The footer's control pairs per device (D9): the first ones matter most,
+ * as the narrow footer keeps them and drops from the right. */
+#define FOOT_PAIRS_MAX 8
+static const char *const k_hint_pad[FOOT_PAIRS_MAX] = {
+    "{pad:south} Select", "{pad:east} Back", "{pad:lb}{pad:rb} Section", "{pad:west} Clear",
+    "{pad:l3} Hints", NULL,
+};
+static const char *const k_hint_key[FOOT_PAIRS_MAX] = {
+    "{key:enter} Select", "{key:esc} Back", "{key:tab} Focus", "{key:q}{key:e} Section",
+    "{key:F1} Hints", NULL,
+};
+static const char *const k_hint_mouse[FOOT_PAIRS_MAX] = {
+    "{mouse:left} Select", "{mouse:right} Back", "{mouse:wheel_up} Scroll", "{key:F1} Hints", NULL,
+};
+static const char *const k_hint_name[] = {
+    "Type a name", "{key:enter} Keep", "{key:esc} Cancel",
+};
+
+/* Steam runs the game (Steam + X raises its keyboard, D4). */
+static int steam_present(void)
+{
+    const char *id = recomp_env(RENV_STEAM_GAME_ID), *deck = recomp_env(RENV_STEAM_DECK);
+    return (id && *id) || (deck && !strcmp(deck, "1"));
+}
+
+/* D11's card: the selected row's help, under the row (above it when the
+ * viewport's foot is near), up to three lines. */
+static void draw_tooltip(mu_Context *ctx, const struct menu_layout *l, const struct row *rw)
+{
+    const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+    mu_Font fs = OVL_FONT(OVL_FONT_SMALL, nv2a_ovl_px(l->s, t->font_small), 0);
+    const struct menu_layout_row *vr = NULL;
+    const char *p = rw->help;
+    size_t take[3];
+    int nl = 0, lh = nv2a_ovl_text_height(fs), pad = l->pad, w, h, x, y, tw = 0;
+    int rad = nv2a_ovl_px(l->s, t->radius) / 2;
+    for (int i = 0; i < l->nvrow; i++)
+        if (l->row[i].index == s_sel[s_page])
+            vr = &l->row[i];
+    if (!vr)
+        return;
+    w = l->content.w * 3 / 4;
+    while (*p && nl < 3) {
+        char line[200];
+        take[nl] = wrap_take(fs, p, w - 2 * pad, sizeof line - 1);
+        if (!take[nl])
+            break;
+        snprintf(line, sizeof line, "%.*s", (int)take[nl], p);
+        if (text_w(fs, line) > tw)
+            tw = text_w(fs, line);
+        p += take[nl++];
+        while (*p == ' ' || *p == '\n')
+            p++;
+    }
+    if (!nl)
+        return;
+    w = tw + 2 * pad;
+    h = nl * lh + 2 * (pad / 2);
+    x = vr->r.x + pad;
+    y = vr->r.y + vr->r.h + l->gap / 2;
+    if (y + h > l->viewport.y + l->viewport.h)
+        y = vr->r.y - l->gap / 2 - h;
+    nv2a_ovl_ui_shadow(ctx, mu_rect(x, y, w, h), rad, nv2a_ovl_px(l->s, t->shadow), t->shadow_alpha);
+    nv2a_ovl_ui_rrect(ctx, mu_rect(x, y, w, h), rad, 1.0f, with_alpha(t->bg_row, 255));
+    p = rw->help;
+    for (int i = 0; i < nl; i++) {
+        mu_draw_text(ctx, fs, p, (int)take[i], mu_vec2(x + pad, y + pad / 2 + i * lh), t->text);
+        p += take[i];
+        while (*p == ' ' || *p == '\n')
+            p++;
+    }
+}
+
+/* D4's keyboard, docked under the name's row (above it near the foot). */
+static void draw_osk(mu_Context *ctx, const struct menu_layout *l)
+{
+    const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+    float s = l->s;
+    mu_Font fs = OVL_FONT(OVL_FONT_SMALL, nv2a_ovl_px(s, t->font_small), 0);
+    struct menu_rect f = sel_row_rect();
+    int lh = nv2a_ovl_text_height(fs), rad = nv2a_ovl_px(s, 6);
+    enhance_osk_layout(f.x, f.y, f.w, f.h, l->place.w, l->place.h, nv2a_ovl_px(s, 44),
+                       nv2a_ovl_px(s, 6), &s_osk_lay);
+    s_osk_lay_ok = 1;
+    {
+        mu_Rect pr = mu_rect(s_osk_lay.panel.x, s_osk_lay.panel.y, s_osk_lay.panel.w,
+                             s_osk_lay.panel.h);
+        nv2a_ovl_ui_shadow(ctx, pr, rad, nv2a_ovl_px(s, t->shadow), t->shadow_alpha);
+        nv2a_ovl_ui_rrect(ctx, pr, rad, 1.0f, with_alpha(t->bg, 255));
+    }
+    for (int r = 0; r < OSK_ROWS; r++)
+        for (int c = 0; c < OSK_COLS; c++) {
+            const struct osk_rect *k = &s_osk_lay.cell[r][c];
+            const char *lab;
+            int first, kind, foc = r == s_osk.row && c == s_osk.col, lw;
+            if (!s_osk_lay.span[r][c])
+                continue;
+            kind = enhance_osk_key(r, c, s_osk.shift, &first, &lab);
+            nv2a_ovl_ui_rrect(ctx, mu_rect(k->x, k->y, k->w, k->h), rad, 1.0f,
+                              foc ? with_alpha(t->accent, 110)
+                              : kind == OSK_KEY_SHIFT && s_osk.shift ? with_alpha(t->accent, 60)
+                              : t->bg_row);
+            if (foc)
+                mu_draw_rect(ctx, mu_rect(k->x, k->y + k->h - nv2a_ovl_px(s, 3), k->w,
+                                          nv2a_ovl_px(s, 3)), t->accent);
+            if (!lab)
+                continue;
+            lw = text_w(fs, lab);
+            mu_draw_text(ctx, fs, lab, -1, mu_vec2(k->x + (k->w - lw) / 2, k->y + (k->h - lh) / 2),
+                         t->text);
+        }
 }
 
 void enhance_menu_draw(uint64_t now_ms)
@@ -4596,8 +5396,7 @@ void enhance_menu_draw(uint64_t now_ms)
     const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
     static unsigned char kinds[ROWS_MAX];
     static int vw[ROWS_MAX];
-    static struct menu_layout lay;
-    const struct menu_layout *l = &lay;
+    const struct menu_layout *l = &s_lay;
     struct menu_layout_in in;
     mu_Context *ctx;
     int pages[PAGE_COUNT], sel, un, news, nl = 1;
@@ -4626,6 +5425,8 @@ void enhance_menu_draw(uint64_t now_ms)
     in.nrow = s_nrow;
     in.scroll = s_scroll[s_page];
     in.sel = s_sel[s_page];
+    in.free_scroll = s_free_scroll;
+    in.hint_h = s_hints == MENU_HINTS_INLINE ? in.small_h + nv2a_ovl_px(s, 4) : 0;
     in.row_kind = kinds;
     in.row_value_w = vw;
     in.extra_h = s_page == PAGE_STATS ? nv2a_ovl_px(s, 110) : 0;
@@ -4644,7 +5445,9 @@ void enhance_menu_draw(uint64_t now_ms)
     in.dlg_lines = nl;
     for (int b = 0; b < DLG_BUTTONS; b++)
         in.dlg_btn_w[b] = text_w(fs, k_dlg_button[b]);
-    menu_layout_compute(&in, &lay);
+    menu_layout_compute(&in, &s_lay);
+    s_lay_ok = 1;
+    memcpy(s_lay_pages, pages, sizeof s_lay_pages);
     s_scroll[s_page] = l->scroll;
     s_draw_w = in.w;
     s_draw_h = in.h;
@@ -4679,42 +5482,64 @@ void enhance_menu_draw(uint64_t now_ms)
     /* After the rows: open, the bar lies over their left edge. */
     draw_toolbar(ctx, l, pages);
 
-    /* The footer (D9): the device's controls on the left, then the unsaved
+    /* The footer (D9): the device's controls on the left as glyph pairs,
+     * dropped from the right when the room runs out, then the unsaved
      * count (or a status for STATUS_MS) and the Cancel and Save buttons
      * with the shortcut that presses each (Q11). */
     {
-        const char *hint = s_kbd
-            ? "Enter Select \xC2\xB7 Esc Back \xC2\xB7 Q E Section \xC2\xB7 F5 Save"
-            : "A Select \xC2\xB7 B Back \xC2\xB7 LB RB Section \xC2\xB7 Y Save";
-        char cut[200], hcut[200];
-        const char *rt, *hv;
+        const char *const *pairs;
+        const char *one[1];
+        int np, dev = menu_device(), fit_n, sep = nv2a_ovl_px(s, 16), pw[FOOT_PAIRS_MAX];
+        char cut[200];
+        const char *rt;
         int lh = nv2a_ovl_text_height(fs), fy = l->hints.y + (l->hints.h - lh) / 2;
-        int save_off = !un || dlg_save_off();
-        const struct row *cur = s_nrow ? &s_row[sel] : NULL;
-        /* The selected row's help stands in for the controls while no
-         * status shows, until C draws hints at the rows. */
-        if (cur && cur->sel && cur->help[0] && !news)
-            hint = cur->help;
-        if (s_name_on)
-            hint = s_kbd ? "Type a name \xC2\xB7 Enter keep \xC2\xB7 Esc cancel"
-                         : "Up/Down letter \xC2\xB7 Left/Right move \xC2\xB7 X delete \xC2\xB7 A keep \xC2\xB7 B cancel";
+        int save_off = !un || dlg_save_off(), hx = l->hints.x;
+        if (s_name_on && s_osk.on) {
+            one[0] = enhance_osk_hint(steam_present());
+            pairs = one;
+            np = 1;
+        } else if (s_name_on) {
+            pairs = k_hint_name;
+            np = (int)(sizeof k_hint_name / sizeof k_hint_name[0]);
+        } else {
+            pairs = dev == ENHANCE_DEV_PAD ? k_hint_pad : dev == ENHANCE_DEV_MOUSE ? k_hint_mouse
+                                                                                 : k_hint_key;
+            for (np = 0; np < FOOT_PAIRS_MAX && pairs[np]; np++)
+                ;
+        }
+        for (int i = 0; i < np; i++)
+            pw[i] = enhance_text_width(fs, pairs[i], XBOX_PAD_FAMILY_AUTO, dev);
+        fit_n = menu_hints_fit(pw, np, sep, l->hints.w);
+        if (!fit_n && s_name_on && s_osk.on) {
+            /* No room for Steam's own keyboard too: the keys alone. */
+            one[0] = enhance_osk_hint(0);
+            pw[0] = enhance_text_width(fs, one[0], XBOX_PAD_FAMILY_AUTO, dev);
+            fit_n = menu_hints_fit(pw, 1, sep, l->hints.w);
+        }
+        for (int i = 0; i < fit_n; i++) {
+            enhance_text_draw(ctx, fs, pairs[i], hx, fy, t->text_dim, XBOX_PAD_FAMILY_AUTO, dev);
+            hx += pw[i] + sep;
+        }
         if (l->summary.w > 0) {
             rt = fit(fs, right, l->summary.w, cut, sizeof cut);
             mu_draw_text(ctx, fs, rt, -1,
                          mu_vec2(l->summary.x + l->summary.w - text_w(fs, rt), fy),
                          news ? t->text : un ? t->accent : t->text_dim);
         }
-        hv = fit(fs, hint, l->hints.w, hcut, sizeof hcut);
-        mu_draw_text(ctx, fs, hv, -1, mu_vec2(l->hints.x, fy), t->text_dim);
         for (int b = 0; b < MENU_FB_COUNT; b++) {
             struct menu_rect br = l->fbtn[b];
             int off = b == MENU_FB_SAVE && save_off;
+            int foc = s_focus == MENU_FOCUS_FOOTER && b == s_foot_sel;
             const char *lab = foot_label(b);
             int lw;
             if (br.w <= 0)
                 continue;
             nv2a_ovl_ui_rrect(ctx, mr(br), nv2a_ovl_px(s, 6), 1.0f,
-                              b == MENU_FB_SAVE && !off ? with_alpha(t->accent, 60) : t->bg_row);
+                              foc ? with_alpha(t->accent, off ? 60 : 110)
+                              : b == MENU_FB_SAVE && !off ? with_alpha(t->accent, 60) : t->bg_row);
+            if (foc)
+                mu_draw_rect(ctx, mu_rect(br.x, br.y + br.h - nv2a_ovl_px(s, 3), br.w,
+                                          nv2a_ovl_px(s, 3)), t->accent);
             if (!l->foot_glyph) {
                 /* No room for the glyph: the bare word, cut to the button. */
                 lab = fit(fs, k_foot_bare[b], br.w - 2 * l->fbtn_pad, cut, sizeof cut);
@@ -4728,6 +5553,15 @@ void enhance_menu_draw(uint64_t now_ms)
                               off ? t->text_dim : t->text, XBOX_PAD_FAMILY_AUTO, foot_device());
         }
     }
+    s_tip_drawn = 0;
+    if (tip_shown(now_ms)) {
+        draw_tooltip(ctx, l, &s_row[sel]);
+        s_tip_drawn = 1;
+    }
+    if (s_name_on && s_osk.on)
+        draw_osk(ctx, l);
+    else
+        s_osk_lay_ok = 0;
     if (l->dlg_on)
         draw_dialog(ctx, l);
     nv2a_overlay_ui_publish(NV2A_OVL_MENU);
@@ -4813,7 +5647,8 @@ void enhance_menu_hook(unsigned port, uint32_t held, XBOX_INPUT_STATE *st, uint6
         if (s_need_draw || w != s_draw_w || h != s_draw_h
             || (live && now_ms - s_draw_t >= LIVE_DRAW_MS)
             || (s_status_t && now_ms - s_status_t >= STATUS_MS && now_ms - s_draw_t >= STATUS_MS)
-            || (s_peek_t && !s_peek_drawn && now_ms - s_peek_t >= PEEK_MS))
+            || (s_peek_t && !s_peek_drawn && now_ms - s_peek_t >= PEEK_MS)
+            || tip_shown(now_ms) != s_tip_drawn)
             enhance_menu_draw(now_ms);
     }
     if (s_state == ST_CLOSING) {
@@ -4849,6 +5684,7 @@ void enhance_menu_start(void)
     s_size = enhance_cfg_choice("overlay.menu_size", k_menu_size, MENU_SIZE_COMPACT);
     /* The mods' panels and glyph names work with the menu off too. */
     enhance_mod_status_start();
+    s_hints = enhance_cfg_choice("overlay.menu_hints", k_menu_hints, MENU_HINTS_TOOLTIP);
     if (!enhance_actions_keyed("menu.enabled")) {
         fprintf(stderr, LOGP "menu.enabled=off\n");
         return;
@@ -4981,7 +5817,42 @@ const char *enhance_menu_page_intro_text(int page)
 
 int enhance_menu_hints_inline(void)
 {
-    return s_hints_inline;
+    return s_hints == MENU_HINTS_INLINE;
+}
+
+int enhance_menu_osk(void)
+{
+    return s_name_on && s_osk.on;
+}
+
+const struct menu_layout *enhance_menu_last_layout(void)
+{
+    return s_lay_ok ? &s_lay : NULL;
+}
+
+int enhance_menu_hints(void)
+{
+    return s_hints;
+}
+
+int enhance_menu_focus(void)
+{
+    return s_focus;
+}
+
+int enhance_menu_footer_selected(void)
+{
+    return s_focus == MENU_FOCUS_FOOTER ? s_foot_sel : -1;
+}
+
+int enhance_menu_device(void)
+{
+    return menu_device();
+}
+
+int enhance_menu_tooltip(uint64_t now_ms)
+{
+    return tip_shown(now_ms);
 }
 
 int enhance_menu_size(void)
@@ -4991,13 +5862,13 @@ int enhance_menu_size(void)
 
 void enhance_menu_set_toolbar_focus(int on)
 {
-    s_bar_focus = on != 0;
+    focus_to(on ? MENU_FOCUS_TOOLBAR : MENU_FOCUS_CONTENT);
     s_need_draw = 1;
 }
 
 int enhance_menu_toolbar_open(uint64_t now_ms)
 {
-    return s_bar_focus || (s_peek_t && now_ms - s_peek_t < PEEK_MS);
+    return s_focus == MENU_FOCUS_TOOLBAR || (s_peek_t && now_ms - s_peek_t < PEEK_MS);
 }
 
 void enhance_menu_reset_for_test(void)
@@ -5007,6 +5878,7 @@ void enhance_menu_reset_for_test(void)
     if (s_stats_on)
         nv2a_stats_use(NV2A_STATS_PAGE, 0);
     s_snap_on = s_stats_on = 0;
+    enhance_input_menu_hold(0);
     s_state = ST_CLOSED;
     s_page = 0;
     s_shaders_off = s_shaders_said = 0;
@@ -5017,6 +5889,9 @@ void enhance_menu_reset_for_test(void)
     shader_edit_reset_for_test();
     sh_reset_state();
     s_name_on = 0;
+    memset(&s_osk, 0, sizeof s_osk);
+    s_osk_lay_ok = 0;
+    xbox_InputTextReset();
     s_npick = 0;
     s_status[0] = 0;
     s_status_t = s_now = 0;
@@ -5030,6 +5905,22 @@ void enhance_menu_reset_for_test(void)
     memset(s_fpkt, 0, sizeof s_fpkt);
     s_dir = 0;
     s_kbd = 0;
+    s_mouse = 0;
+    s_kbd_seen = 0;
+    s_ptr_seq = 0;
+    s_ptr_ax = s_ptr_ay = 0;
+    s_ptr_x = s_ptr_y = -1;
+    s_ptr_btn = 0;
+    s_drag_row = -1;
+    s_free_scroll = 0;
+    s_hover_row = -1;
+    s_tip_t = 0;
+    s_tip_sel = s_tip_page = -1;
+    s_lay_ok = 0;
+    s_tip_drawn = 0;
+    s_focus = MENU_FOCUS_CONTENT;
+    s_foot_sel = MENU_FB_CANCEL;
+    xbox_InputMouseCursorHide(0);
     s_dir_next = s_close_t = s_draw_t = 0;
     memset(s_extra_t, 0, sizeof s_extra_t);
     s_need_draw = 0;
@@ -5040,9 +5931,8 @@ void enhance_menu_reset_for_test(void)
     memset(s_abase_n, 0, sizeof s_abase_n);
     memset(&s_dlg, 0, sizeof s_dlg);
     memset(s_page_intro, 0, sizeof s_page_intro);
-    s_hints_inline = 0;
+    s_hints = MENU_HINTS_TOOLTIP;
     s_size = MENU_SIZE_COMPACT;
-    s_bar_focus = 0;
     s_peek_t = 0;
     s_peek_drawn = 0;
     s_rel_armed = s_rel_taint = 0;
