@@ -28,6 +28,13 @@
  *   shaders_hidden  no chain presenter, or no library: the page is left out
  *             of the tab strip and the paging, and why is said once
  *   pages     each page's draw list at 1920x1080 against a pinned sum
+ *   files     the Files page (D6): Export settings with its unsaved values
+ *             marked, a refused name, the replace confirm; Import's preview,
+ *             Apply as unsaved changes undone by Exit without saving, a
+ *             key with no setting kept through Save, menu.enabled = false
+ *             written but not applied, the refusals, a shader profile under
+ *             a free name; an unreadable folder, Open exports folder and
+ *             Game Mode, RECOMP_CONFIG=none
  *
  * Runs in its working directory, where it writes config/config.toml. A
  * checksum of 0 below means "not pinned yet": the run prints the value.
@@ -35,12 +42,15 @@
 #include "enhance.h"
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
+#include "enhance_files.h"
 #include "enhance_input.h"
 #include "enhance_menu.h"
 #include "enhance_menu_input.h"
 #include "enhance_menu_layout.h"
 #include "enhance_osk.h"
 #include "enhance_text.h"
+#include "file_browser.h"
+#include "host_open.h"
 #include "host_pad.h"
 #include "input_backend.h"
 #include "input_names.h"
@@ -2365,7 +2375,9 @@ static void test_pages(void)
     /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Files. */
     static const uint32_t k_sum[9] = {
         0x65348BABu, 0xBECB3B03u, 0x0439BB8Du, 0x125C08E1u, 0x4677E872u,
-        0x778983B3u, 0xAB52F585u, 0xDFA436B9u, 0x1CED9BD4u };
+        0x778983B3u, 0xAB52F585u, 0xDFA436B9u, 0x022181CDu };
+    /* Files shows Open exports folder only off Game Mode. */
+    set_env("RECOMP_HOST_GAMESCOPE", NULL);
     start_with(ARMED, k_mods);
     open_menu();
     CHECK(enhance_menu_is_open());
@@ -4518,6 +4530,485 @@ static void test_input_rules(void)
     CHECK(menu_tip_due(ENHANCE_DEV_MOUSE, 1000, 1500));
 }
 
+/* ---- Files: import and export (design D6) ------------------------------ */
+
+#define EXPORTS "config/exports"
+
+static int status_has(const char *s) { return strstr(enhance_menu_status(), s) != NULL; }
+
+/* The menu open: Files, then a main row's browser, which opens on the
+ * Exports folder. */
+static void files_open(const char *row)
+{
+    CHECK(enhance_menu_set_page("Files"));
+    CHECK(enhance_menu_select_row(row));
+    tap(0x0D);
+}
+
+/* Drop what is unsaved and close. */
+static void files_quit(void)
+{
+    enhance_menu_revert();
+    if (enhance_menu_is_open())
+        open_menu();
+    CHECK(!enhance_menu_is_open());
+}
+
+static void name_type(const char *t)
+{
+    for (int i = 0; i < 48; i++)
+        tap(0x08);
+    type_text(t);
+    tap(0x0D);
+}
+
+static void files_unit(void)
+{
+    char kind[EF_KIND_MAX], out[128], err[128];
+    int format = -1;
+    recomp_cfg *c;
+    const char *k[1] = { "render.scale" }, *v[1] = { "2" };
+    char *x;
+    CHECK(ef_marker("\xEF\xBB\xBF\n# a note\n# xbr-export: config 3\nk = 1\n", kind, sizeof kind,
+                    &format) == 1);
+    CHECK(!strcmp(kind, "config") && format == 3);
+    CHECK(ef_marker("k = 1\n# xbr-export: config 1\n", kind, sizeof kind, &format) == 0);
+    CHECK(ef_marker("", kind, sizeof kind, &format) == 0);
+    c = recomp_cfg_load_string("a = 1.0\nb = \"q\\\"\"\nc = [1, \"x\", true]\nd = 0.1\ne = 3\n",
+                               "t", err, sizeof err);
+    CHECK(c != NULL);
+    if (c) {
+        CHECK(ef_literal(c, "a", out, sizeof out) && !strcmp(out, "1.0"));
+        CHECK(ef_literal(c, "b", out, sizeof out) && !strcmp(out, "\"q\\\"\""));
+        CHECK(ef_literal(c, "c", out, sizeof out) && !strcmp(out, "[1, \"x\", true]"));
+        CHECK(ef_literal(c, "d", out, sizeof out) && !strcmp(out, "0.1"));
+        CHECK(ef_literal(c, "e", out, sizeof out) && !strcmp(out, "3"));
+        CHECK(!ef_literal(c, "none", out, sizeof out));
+        CHECK(!ef_literal(c, "c", out, 6));
+        recomp_cfg_free(c);
+    }
+    /* An export of an export: one marker, CRLF kept. */
+    x = ef_export_config("# xbr-export: config 1\r\n[render]\r\nscale = 1\r\n", k, v, 1, k, 1, err,
+                         sizeof err);
+    CHECK(x != NULL);
+    if (x) {
+        static const char head[] = "# xbr-export: config 1\r\n"
+                                   "# xbr-export: 1 unsaved value included: render.scale\r\n";
+        CHECK(!strncmp(x, head, sizeof head - 1));
+        CHECK(strstr(x + 1, "# xbr-export: config") == NULL);
+        CHECK(strstr(x, "scale = 2\r\n") != NULL);
+        free(x);
+    }
+}
+
+static void test_files_export(void)
+{
+    const char *f;
+    char want[64];
+    files_unit();
+    start_with(ARMED, k_mods);
+    open_menu();
+    change_scale();
+    files_open("Export settings");
+    CHECK(row_value("Exports") != NULL);
+    CHECK(row_value("Export here as") && !strncmp(s_val, "settings-", 9)
+          && strstr(s_val, ".toml"));
+    CHECK(enhance_menu_select_row("Export here as"));
+    tap(0x0D);
+    CHECK(xbox_InputTextActive());
+    /* A refused name keeps the field, with the reason. */
+    name_type("a/b");
+    CHECK(xbox_InputTextActive());
+    CHECK(enhance_menu_status()[0] != 0);
+    CHECK(!fb_exists(EXPORTS "/a"));
+    tap(0x1B);
+    CHECK(!xbox_InputTextActive());
+    CHECK(status_has("Export cancelled"));
+    CHECK(row_value("Exports") != NULL);   /* Esc took the field only */
+
+    /* Written with the unsaved value, marked, and named in the status. */
+    CHECK(enhance_menu_select_row("Export here as"));
+    tap(0x0D);
+    name_type("mine");
+    CHECK(!xbox_InputTextActive());
+    CHECK(status_has("Exported to ") && status_has("mine.toml")
+          && status_has("1 unsaved value included"));
+    f = read_file(EXPORTS "/mine.toml");
+    CHECK(!strncmp(f, "# xbr-export: config 1\n", 23));
+    CHECK(strstr(f, "# xbr-export: 1 unsaved value included: render.scale\n") != NULL);
+    CHECK(strstr(f, "scale = 2") != NULL);
+    CHECK(strstr(f, "enabled = true") != NULL);
+    CHECK(!fb_exists(EXPORTS "/mine.toml.tmp"));
+    CHECK(enhance_menu_unsaved() == 1);           /* an export saves nothing */
+    CHECK(strstr(read_file("config/config.toml"), "scale") == NULL);
+    CHECK(row_value("mine.toml") != NULL);        /* the listing refreshed */
+
+    /* The same name asks, on No; No keeps the file. */
+    change_scale();
+    files_open("Export settings");
+    CHECK(enhance_menu_select_row("Export here as"));
+    tap(0x0D);
+    name_type("mine");
+    snprintf(want, sizeof want, "%s", selected_label());
+    CHECK(!strcmp(want, "No"));
+    CHECK(row_value("Yes, replace it") != NULL);
+    tap(0x0D);
+    CHECK(status_has("Not replaced"));
+    CHECK(strstr(read_file(EXPORTS "/mine.toml"), "scale = 2") != NULL);
+    /* B is No too; Yes replaces. */
+    CHECK(enhance_menu_select_row("Export here as"));
+    tap(0x0D);
+    name_type("MINE.toml");
+    tap(0x1B);
+    CHECK(status_has("Not replaced") && row_value("Export here as") != NULL);
+    CHECK(enhance_menu_select_row("mine.toml"));   /* A on a file: its name */
+    tap(0x0D);
+    CHECK(xbox_InputTextActive());
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Yes, replace it"));
+    tap(0x0D);
+    CHECK(status_has("Exported to "));
+    CHECK(strstr(read_file(EXPORTS "/mine.toml"), "scale = 3") != NULL);
+
+    /* B goes up to the places, then back to the page. */
+    tap(0x1B);
+    CHECK(row_value("Exports") && row_value("Home"));
+    tap(0x1B);
+    CHECK(row_value("Import") && row_value("Export settings"));
+    files_quit();
+
+    /* A saved profile exports its file; none is dimmed with the why. */
+    start_with(ARMED, k_mods);
+    open_menu();
+    files_open("Export shader profile");
+    CHECK(status_has("Only a saved profile exports"));
+    CHECK(row_value("Import") != NULL);
+    files_quit();
+    shader_files();
+    MKDIR(PROFILES);
+    write_file(PROFILES "/mine.toml", "version = 1\nname = \"Mine\"\nstages = [\"fsr\"]\n");
+    start_with(CFG_PROF "profile = \"mine\"\n", k_mods);
+    open_menu();
+    files_open("Export shader profile");
+    CHECK(row_value("Export here as") && !strncmp(s_val, "mine-", 5));
+    CHECK(enhance_menu_select_row("Export here as"));
+    tap(0x0D);
+    name_type("prof");
+    CHECK(!strcmp(read_file(EXPORTS "/prof.toml"),
+                  "version = 1\nname = \"Mine\"\nstages = [\"fsr\"]\n"));
+    files_quit();
+    shader_files_remove();
+    remove(PROFILES "/mine.toml");
+    remove(EXPORTS "/prof.toml");
+    remove(EXPORTS "/mine.toml");
+}
+
+static void test_files_import(void)
+{
+    const char *f;
+    MKDIR("config/exports");
+    write_file(EXPORTS "/imp.toml", "[render]\nscale = 3\n[future]\nthing = 7\n");
+
+    /* The preview, then Apply: unsaved changes, and Exit without saving
+     * drops every one, the kept key with them. */
+    start_with(ARMED, k_mods);
+    open_menu();
+    files_open("Import");
+    CHECK(enhance_menu_select_row("imp.toml"));
+    tap(0x0D);
+    CHECK(row_value("Changes") && !strcmp(s_val, "1"));
+    CHECK(row_value("Kept as written") && !strcmp(s_val, "1"));
+    CHECK(row_value("future.thing") != NULL);
+    CHECK(enhance_menu_unsaved() == 0);           /* nothing before Apply */
+    CHECK(enhance_menu_select_row("Apply"));
+    tap(0x0D);
+    CHECK(status_has("1 change, 1 kept as written"));
+    CHECK(enhance_menu_unsaved() == 2);
+    CHECK(row_value("Import") != NULL);           /* back on the page */
+    CHECK(enhance_menu_set_page("Render"));
+    CHECK(!strcmp(row_value("Render scale"), "3"));
+    esc_leave();
+    advance(160);
+    CHECK(enhance_menu_dialog() == 2);
+    tap('N');                                     /* Exit without saving */
+    CHECK(!enhance_menu_is_open());
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(!strcmp(row_value("Render scale"), "1"));
+    CHECK(strstr(read_file("config/config.toml"), "thing") == NULL);
+
+    /* A key with no slot survives Save, as it was read. */
+    start_with(ARMED, k_mods);
+    open_menu();
+    files_open("Import");
+    CHECK(enhance_menu_select_row("imp.toml"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Apply"));
+    tap(0x0D);
+    tap(VK_F5);
+    CHECK(enhance_menu_unsaved() == 0);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "[future]\nthing = 7") != NULL);
+    CHECK(strstr(f, "scale = 3") != NULL);
+    files_quit();
+
+    /* menu.enabled = false is written on Save, never applied to the menu
+     * that is open; the preview says when it applies. Cancel changes
+     * nothing first. */
+    write_file(EXPORTS "/off.toml", "[menu]\nenabled = false\n[render]\nscale = 2\n");
+    start_with(ARMED, k_mods);
+    open_menu();
+    files_open("Import");
+    CHECK(enhance_menu_select_row("off.toml"));
+    tap(0x0D);
+    CHECK(row_value("menu.enabled = false") && strstr(s_val, "next start"));
+    CHECK(enhance_menu_select_row("Cancel"));
+    tap(0x0D);
+    CHECK(status_has("Import cancelled") && enhance_menu_unsaved() == 0);
+    CHECK(enhance_menu_select_row("off.toml"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Apply"));
+    tap(0x0D);
+    CHECK(status_has("next start"));
+    CHECK(enhance_menu_is_open());
+    tap(VK_F5);
+    CHECK(enhance_menu_is_open());
+    CHECK(strstr(read_file("config/config.toml"), "enabled = false") != NULL);
+    tap(VK_F10);
+    CHECK(!enhance_menu_is_open());
+    open_menu();                                  /* still armed this run */
+    CHECK(enhance_menu_is_open());
+    open_menu();
+    {
+        const char *out = start_with(read_file("config/config.toml"), k_mods);
+        CHECK(strstr(out, "menu.enabled=off") != NULL);
+    }
+
+    /* Refusals leave everything as it was: a file that does not parse, a
+     * newer format, an export of something else, a text that is not, a
+     * file over the cap. */
+    write_file(EXPORTS "/bad.toml", "[render\nscale = 3\n");
+    write_file(EXPORTS "/newer.toml", "# xbr-export: config 9\n[render]\nscale = 3\n");
+    write_file(EXPORTS "/save.toml", "# xbr-export: savestate 1\n[render]\nscale = 3\n");
+    {
+        FILE *b = fopen(EXPORTS "/bin.toml", "wb");
+        if (b) {
+            fwrite("scale = 3\n\0\0", 1, 12, b);
+            fclose(b);
+        }
+        b = fopen(EXPORTS "/big.toml", "wb");
+        if (b) {
+            for (int i = 0; i < 300 * 1024 / 16; i++)
+                fputs("# padding......\n", b);
+            fclose(b);
+        }
+    }
+    start_with(ARMED, k_mods);
+    open_menu();
+    files_open("Import");
+    {
+        static const struct { const char *file, *says; } k_ref[] = {
+            { "bad.toml", "Not imported" },
+            { "newer.toml", "newer build" },
+            { "save.toml", "not of settings" },
+            { "bin.toml", "not a text file" },
+            { "big.toml", "over 256 KB" },
+        };
+        for (size_t i = 0; i < sizeof k_ref / sizeof k_ref[0]; i++) {
+            CHECK(enhance_menu_select_row(k_ref[i].file));
+            tap(0x0D);
+            CHECK(status_has(k_ref[i].says));
+            CHECK(row_value("Apply") == NULL && row_value("..") != NULL);
+            CHECK(enhance_menu_unsaved() == 0);
+        }
+    }
+    files_quit();
+
+    /* Env-forced and mistyped keys are skipped and named. */
+    write_file(EXPORTS "/mixed.toml",
+               "[present]\nfilter = \"nearest\"\n[render]\nscale = \"big\"\n");
+    set_env("RECOMP_PRESENT_FILTER", "linear");
+    start_with(ARMED, k_mods);
+    open_menu();
+    files_open("Import");
+    CHECK(enhance_menu_select_row("mixed.toml"));
+    tap(0x0D);
+    CHECK(row_value("Changes") && !strcmp(s_val, "0"));
+    CHECK(row_value("Set by the environment") && strstr(s_val, "present.filter"));
+    CHECK(row_value("Skipped") && strstr(s_val, "render.scale"));
+    files_quit();
+    set_env("RECOMP_PRESENT_FILTER", NULL);
+
+    /* A shader profile: copied under a name not taken, never replacing. */
+    MKDIR(PROFILES);
+    write_file(PROFILES "/later.toml", "version = 1\nname = \"Later\"\nstages = [\"fsr\"]\n");
+    write_file(EXPORTS "/p.toml", "version = 1\nname = \"Later\"\nstages = [\"fsr\"]\n");
+    start_with(ARMED, k_mods);
+    open_menu();
+    files_open("Import");
+    CHECK(enhance_menu_select_row("p.toml"));
+    tap(0x0D);
+    CHECK(row_value("Name") && !strcmp(s_val, "Later"));
+    CHECK(row_value("Stages") && !strcmp(s_val, "1"));
+    CHECK(enhance_menu_select_row("Apply"));
+    tap(0x0D);
+    CHECK(status_has("Imported as later-2.toml"));
+    CHECK(!strcmp(read_file(PROFILES "/later-2.toml"), read_file(EXPORTS "/p.toml")));
+    CHECK(enhance_menu_unsaved() == 0);
+    files_quit();
+
+    /* A name with no ASCII letter or digit has no slug: the file's stem
+     * names the copy. */
+    write_file(EXPORTS "/neon.toml",
+               "version = 1\nname = \"\xE2\x98\x85 \xE2\x98\x85\"\nstages = [\"fsr\"]\n");
+    start_with(ARMED, k_mods);
+    open_menu();
+    files_open("Import");
+    CHECK(enhance_menu_select_row("neon.toml"));
+    tap(0x0D);
+    CHECK(row_value("Saved as") && !strncmp(s_val, "neon.toml", 9));
+    CHECK(enhance_menu_select_row("Apply"));
+    tap(0x0D);
+    CHECK(status_has("Imported as neon.toml"));
+    CHECK(!strcmp(read_file(PROFILES "/neon.toml"), read_file(EXPORTS "/neon.toml")));
+    files_quit();
+    remove(PROFILES "/neon.toml");
+
+    /* The kept keys' cap (64 a session): the same file again takes its
+     * keys' places, not 40 more; a file over the cap is refused whole. */
+    {
+        char body[4096];
+        size_t at;
+        at = (size_t)snprintf(body, sizeof body, "[render]\nscale = 2\n[keep]\n");
+        for (int i = 0; i < 40; i++)
+            at += (size_t)snprintf(body + at, sizeof body - at, "a%d = %d\n", i, i);
+        write_file(EXPORTS "/k40.toml", body);
+        at = (size_t)snprintf(body, sizeof body, "[render]\nscale = 3\n[more]\n");
+        for (int i = 0; i < 30; i++)
+            at += (size_t)snprintf(body + at, sizeof body - at, "b%d = %d\n", i, i);
+        write_file(EXPORTS "/k30.toml", body);
+        at = (size_t)snprintf(body, sizeof body, "[many]\n");
+        for (int i = 0; i < 65; i++)
+            at += (size_t)snprintf(body + at, sizeof body - at, "c%d = %d\n", i, i);
+        write_file(EXPORTS "/k65.toml", body);
+    }
+    start_with(ARMED, k_mods);
+    open_menu();
+    files_open("Import");
+    for (int round = 0; round < 2; round++) {
+        CHECK(enhance_menu_select_row("k40.toml"));
+        tap(0x0D);
+        CHECK(row_value("Kept as written") && !strcmp(s_val, "40"));
+        CHECK(enhance_menu_select_row("Apply"));
+        tap(0x0D);
+        CHECK(status_has("40 kept as written"));
+        CHECK(enhance_menu_unsaved() == 41);
+        files_open("Import");
+    }
+    CHECK(enhance_menu_select_row("k30.toml"));
+    tap(0x0D);
+    CHECK(status_has("70 keys to keep as written, at most 64"));
+    CHECK(row_value("Apply") == NULL && enhance_menu_unsaved() == 41);
+    CHECK(enhance_menu_set_page("Render"));
+    CHECK(!strcmp(row_value("Render scale"), "2"));
+    files_quit();
+    start_with(ARMED, k_mods);
+    open_menu();
+    files_open("Import");
+    CHECK(enhance_menu_select_row("k65.toml"));
+    tap(0x0D);
+    CHECK(status_has("65 keys to keep as written, at most 64"));
+    CHECK(enhance_menu_unsaved() == 0);
+    files_quit();
+
+    remove(PROFILES "/later.toml");
+    remove(PROFILES "/later-2.toml");
+    {
+        static const char *const k_rm[] = { "imp", "off", "bad", "newer", "save", "bin", "big",
+                                            "mixed", "p", "neon", "k40", "k30", "k65", NULL };
+        char p[96];
+        for (int i = 0; k_rm[i]; i++) {
+            snprintf(p, sizeof p, EXPORTS "/%s.toml", k_rm[i]);
+            remove(p);
+        }
+    }
+    remove("config/config.toml");
+}
+
+static void test_files_folders(void)
+{
+    char path[XBOX_HOST_OPEN_PATH_MAX];
+    MKDIR("config/exports");
+#ifndef _WIN32
+    /* An unreadable folder says so (no system picker before phase I). */
+    MKDIR(EXPORTS "/locked");
+    chmod(EXPORTS "/locked", 0);
+    start_with(ARMED, k_mods);
+    open_menu();
+    files_open("Import");
+    CHECK(enhance_menu_select_row("locked/"));
+    tap(0x0D);
+    if (geteuid() != 0)
+        CHECK(row_value("This folder cannot be read") != NULL);
+    tap(0x1B);
+    CHECK(row_value("locked/") != NULL);
+    files_quit();
+    chmod(EXPORTS "/locked", 0755);
+    rmdir(EXPORTS "/locked");
+#endif
+
+    /* Open exports folder: the host's file manager, asked through the
+     * present thread's slot; none in Game Mode. */
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Files"));
+    CHECK(enhance_menu_select_row("Open exports folder"));
+#ifndef _WIN32
+    tap(0x0D);
+    CHECK(status_has("Opening ") && status_has("exports"));
+    CHECK(xbox_HostOpenTake(path, sizeof path) == 1);
+    CHECK(strstr(path, "config/exports") != NULL);
+    CHECK(xbox_HostOpenTake(path, sizeof path) == 0);
+    {
+        /* The default user root is ".": a file URL needs the path made
+         * absolute, existing or not, and encoded. */
+        char url[3 * XBOX_HOST_OPEN_PATH_MAX + 8], cwd[1024];
+        CHECK(getcwd(cwd, sizeof cwd) != NULL);
+        CHECK(xbox_HostOpenFileUrl("./" EXPORTS, url, sizeof url));
+        CHECK(!strncmp(url, "file:///", 8) && strstr(url, "file://./") == NULL);
+        CHECK(strstr(url, "/" EXPORTS) != NULL && strstr(url, "/./") == NULL);
+        CHECK(xbox_HostOpenFileUrl("no such/dir", url, sizeof url));
+        CHECK(!strncmp(url, "file:///", 8) && strstr(url, "/no%20such/dir") != NULL);
+        CHECK(xbox_HostOpenFileUrl("/tmp/a#b", url, sizeof url));
+        CHECK(!strcmp(url, "file:///tmp/a%23b"));
+        CHECK(!xbox_HostOpenFileUrl("x", url, 4));
+    }
+#else
+    /* Windows opens the folder at once (ShellExecuteW): not in a ctest. */
+    (void)path;
+#endif
+    open_menu();
+    set_env("RECOMP_HOST_GAMESCOPE", "1");
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Files"));
+    CHECK(row_value("Import") != NULL && row_value("Open exports folder") == NULL);
+    open_menu();
+    set_env("RECOMP_HOST_GAMESCOPE", NULL);
+
+    /* RECOMP_CONFIG=none: no user folder, nothing to import or export. */
+    set_env("RECOMP_CONFIG", "none");
+    set_env("RECOMP_MENU", "1");
+    start_with(ARMED, k_mods);
+    open_menu();
+    files_open("Import");
+    CHECK(status_has("RECOMP_CONFIG=none"));
+    CHECK(row_value("Open exports folder") == NULL);
+    files_quit();
+    set_env("RECOMP_MENU", NULL);
+    set_env("RECOMP_CONFIG", NULL);
+    rmdir(EXPORTS);
+}
+
 int main(int argc, char **argv)
 {
     s_pin = argc > 1 && !strcmp(argv[1], "--pin");
@@ -4587,6 +5078,9 @@ int main(int argc, char **argv)
     test_hints_key();
     test_osk();
     test_input_rules();
+    test_files_export();
+    test_files_import();
+    test_files_folders();
     test_shots();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();

@@ -17,6 +17,7 @@
 #include "enhance_mod_status.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -30,10 +31,13 @@
 #include "enhance.h"
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
+#include "enhance_files.h"
 #include "enhance_menu_input.h"
 #include "enhance_menu_layout.h"
 #include "enhance_osk.h"
 #include "enhance_text.h"
+#include "file_browser.h"
+#include "host_open.h"
 #include "host_pad.h"
 #include "hud_anchor.h"
 #include "input_map.h"
@@ -913,7 +917,7 @@ static void join_bindings(int id, char *out, size_t n, char *glyph, size_t gn)
 enum { ST_CLOSED, ST_OPEN, ST_CLOSING };
 enum row_type {
     R_SLOT, R_INFO, R_HEADER, R_BIND, R_MOD, R_RESET,
-    R_FILEIO,           /* Files: import (ref 0) or export (1), hidden for now */
+    R_FILEIO,           /* Files: FIO_* (import, the exports, the folder) */
     R_TEXT,             /* one wrapped line of a mod's Author, About or State */
     R_CTL,              /* a mod's captured control (BUTTON, STICK): rebound by capture */
     R_MODRESET,         /* "Reset this mod" */
@@ -925,11 +929,16 @@ enum row_type {
     R_ADD,              /* "Add shader" */
     R_PICK,             /* a preset in the Add picker: ref indexes s_pick */
     R_ACT,              /* a profile or stage action: ref is ACT_* */
-    R_NAME              /* "Rename": the text entry */
+    R_NAME,             /* "Rename": the text entry */
+    R_FBROOT,           /* the browser's places: ref is the root */
+    R_FBUP,             /* the browser's "..": one folder up */
+    R_FBENT,            /* a folder or file of the listing: ref is its index */
+    R_FBNAME,           /* "Export here as": the name's text entry */
+    R_FBASK,            /* "Replace <name>?": ref 0 No, 1 Yes */
+    R_FBPREV            /* an import's preview: ref 0 Apply, 1 Cancel */
 };
 enum { TINT_NONE, TINT_BAD, TINT_WARN };
-/* The Files page's import and export rows wait for the file browser. */
-static const int k_files_io = 0;
+enum { FIO_IMPORT, FIO_EXPORT_CFG, FIO_EXPORT_SHADER, FIO_OPEN_DIR };
 
 struct row {
     int type;
@@ -995,7 +1004,7 @@ static int s_foot_sel;              /* MENU_FB_* while the footer has the focus 
 static uint64_t s_peek_t;           /* the last section change, 0 for none */
 static int s_peek_drawn;            /* the draw after the peek ran out is done */
 static int s_need_draw;
-static char s_status[128];
+static char s_status[320];
 static uint64_t s_status_t, s_now;
 
 static struct row s_row[ROWS_MAX];
@@ -1821,9 +1830,12 @@ static char s_pnote[NV2A_PRESENT_PARAMS_MAX][32];
 static struct shader_param_kind_info s_pkind[NV2A_PRESENT_PARAMS_MAX];
 static const char *s_pchoice[NV2A_PRESENT_PARAMS_MAX][SHADER_PARAM_CHOICES_MAX + 1];
 
-/* Rename's text entry: the name being edited and the cursor, in bytes. */
-static int s_name_on;
-static char s_name[SHADER_PROFILE_NAME_MAX + 1];
+/* The text entry: a profile's Rename or an export's file name (D6), the
+ * name being edited and the cursor, in bytes. An export's name may carry
+ * its ".toml", which fb_name_check takes off. */
+enum { NAME_RENAME, NAME_EXPORT };
+static int s_name_on, s_name_for;
+static char s_name[FB_NAME_MAX + FB_EXT_MAX + 1];
 static int s_name_cur, s_name_dir;
 static uint64_t s_name_next;
 /* The on-screen keyboard over the name field (D4), and where the last draw
@@ -1887,10 +1899,11 @@ static void name_osk(int on)
  * so a typed letter never also does what it is bound to. Text arrives as
  * the host typed it, in the player's layout (D4, text_input.h); a pad
  * player gets the on-screen keyboard. */
-static void name_begin(const char *name)
+static void name_begin(int what, const char *name)
 {
     struct menu_rect f = sel_row_rect();
     int px, py, w, h;
+    s_name_for = what;
     snprintf(s_name, sizeof s_name, "%s", name);
     s_name_cur = (int)strlen(s_name);
     s_name_on = 1;
@@ -2292,6 +2305,9 @@ static void float_literal(float v, char *out, size_t n)
         strncat(out, ".0", n - strlen(out) - 1);
 }
 
+static int files_view_rows(void);
+static void files_rows(void);
+
 static void build_rows(void)
 {
     char buf[VAL_MAX];
@@ -2429,6 +2445,8 @@ static void build_rows(void)
         /* Save lives in the footer (D9): this page is about the file. */
         const char *path = enhance_cfg_user_path();
         struct row *r;
+        if (files_view_rows())
+            break;
         info("Config file", "%s", path ? path : "off (RECOMP_CONFIG=none)");
         if (s_nrow)
             snprintf(s_row[s_nrow - 1].help, sizeof s_row[s_nrow - 1].help,
@@ -2439,12 +2457,7 @@ static void build_rows(void)
             snprintf(r->help, sizeof r->help,
                      "Every setting, binding and shader back to stock; Save keeps it");
         }
-        /* Import and export land with the file browser (phase FB): the
-         * rows are here, hidden, so the page keeps its order then. */
-        if (k_files_io) {
-            row_add(R_FILEIO, 0, 1, "Import settings");
-            row_add(R_FILEIO, 1, 1, "Export settings");
-        }
+        files_rows();
         break;
     }
     default:
@@ -2484,13 +2497,22 @@ static void build_rows(void)
 /* + 2: the profile choice, present.profile and present.shader (D5). */
 /* + CTL_PENDING_MAX: the mods' captured controls ([input.controls]). */
 #define CTL_PENDING_MAX 64
+/* + KEPT_MAX: an import's keys with no slot, written on Save as they were
+ * read (D6). */
+#define KEPT_MAX 64
 #define PENDING_MAX (SLOTS_MAX + ENHANCE_ACTIONS_MAX + MODS_MAX + 2 * REWRITES_MAX \
-                     + NV2A_PRESENT_OVERRIDES_MAX + 2 + CTL_PENDING_MAX)
+                     + NV2A_PRESENT_OVERRIDES_MAX + 2 + CTL_PENDING_MAX + KEPT_MAX)
 static char s_pkey[PENDING_MAX][96];
 static char s_pval[PENDING_MAX][VAL_MAX * 4];
 static int s_pnull[PENDING_MAX];
+/* The kept keys an applied import left pending: unsaved changes like any
+ * other, so Exit without saving drops them and Save writes them. */
+static char s_kkey[KEPT_MAX][96];
+static char s_kval[KEPT_MAX][VAL_MAX * 4];
+static int s_nkept;
 static int s_rw_done;           /* the rewrites went out with a Save */
 static int s_rw_staged;         /* renamed keys the last collect staged */
+static int s_rw_from, s_rw_to;  /* where in the pending list they sit */
 
 /* The stock of mod m's enable setting e: the defaults file's key, else
  * the descriptor's default. */
@@ -2713,8 +2735,19 @@ static int collect(void)
         }
     }
     s_rw_staged = 0;
+    s_rw_from = n;
     if (!s_rw_done)
         n = rewrites(n);
+    s_rw_to = n;
+    /* Last, so a key the player also changed in the menu after the import
+     * is written as the menu has it. */
+    for (int i = 0; i < s_nkept && n < PENDING_MAX; i++) {
+        if (pending_has(n, s_kkey[i]))
+            continue;
+        snprintf(s_pkey[n], sizeof s_pkey[n], "%s", s_kkey[i]);
+        snprintf(s_pval[n], sizeof s_pval[n], "%s", s_kval[i]);
+        s_pnull[n++] = 0;
+    }
     return n;
 }
 
@@ -2736,7 +2769,8 @@ int enhance_menu_unsaved(void)
             n++;
     for (int id = 0; id < ENHANCE_ACTIONS_MAX; id++)
         n += binds_dirty(id);
-    return n + ctl_dirty(-1) + nv2a_present_chain_overrides_dirty() + shader_edit_unsaved();
+    return n + ctl_dirty(-1) + nv2a_present_chain_overrides_dirty() + shader_edit_unsaved()
+         + s_nkept;
 }
 
 /* Every missing directory above `path`, outermost first: a user config
@@ -2822,6 +2856,7 @@ static int save(void)
     nv2a_present_chain_overrides_saved();
     shader_edit_config_saved();
     s_rw_done = 1;
+    s_nkept = 0;
     if (rc > 0) {
         fprintf(stderr, LOGP "menu: saved to %s, %d key%s left out: %s\n", path, rc,
                 rc == 1 ? "" : "s", err);
@@ -2931,7 +2966,929 @@ static void reset_all(void)
     /* The picker to Off; the profile files stay (D5). */
     shader_edit_reset_defaults();
     sh_reset_state();
+    s_nkept = 0;
     status("Reset to defaults; Save keeps it");
+}
+
+/* ---- Files: the browser, import and export (D6) ------------------------- */
+
+/* The page's sub-views: the main list, the browser for a job, an export's
+ * "Replace <name>?", and an import's preview. */
+enum { FBV_OFF, FBV_BROWSE, FBV_ASK, FBV_PREVIEW };
+enum { FBJ_IMPORT, FBJ_EXPORT_CFG, FBJ_EXPORT_SHADER };
+#define FILES_LIST_MAX 160      /* bytes of a preview's key list */
+#define IMP_BAD_MAX 32
+
+static struct file_browser s_fb;
+static int s_fb_ready;          /* s_fb was fb_init'ed */
+static int s_fb_view, s_fb_job;
+static struct fb_export s_fbx;
+
+/* An import between the pick and Apply. Nothing is changed before Apply:
+ * the plan holds the parsed file and what Apply would do, so a file that
+ * does not parse, or is refused, leaves every setting as it was. */
+static struct {
+    int profile;                /* a shader profile, else a config */
+    char file[FB_ENTRY_NAME_MAX];
+    recomp_cfg *cfg;            /* a config's keys */
+    char *text;                 /* a profile's bytes, written at Apply */
+    size_t len;
+    char pname[SHADER_PROFILE_NAME_MAX + 1];
+    char stem[SHADER_PROFILE_NAME_MAX + 1];
+    int nstages;
+    int changes, nkeep, nnew, nenv, nbad, menu_off;
+    recomp_cfg *disk;           /* the user file as it is on disk now */
+    char *disk_text;
+    char kkey[KEPT_MAX][96];
+    char kval[KEPT_MAX][VAL_MAX * 4];
+    char env[FILES_LIST_MAX];
+    char bad[IMP_BAD_MAX][96];
+} s_imp;
+
+static void imp_drop(void)
+{
+    recomp_cfg_free(s_imp.cfg);
+    recomp_cfg_free(s_imp.disk);
+    free(s_imp.text);
+    free(s_imp.disk_text);
+    memset(&s_imp, 0, sizeof s_imp);
+}
+
+static void files_close(void)
+{
+    if (s_fb_view != FBV_OFF && s_name_on && s_name_for == NAME_EXPORT)
+        name_end();
+    s_fb_view = FBV_OFF;
+    imp_drop();
+    if (s_fb_ready)
+        fb_free(&s_fb);
+    s_fb_ready = 0;
+}
+
+/* The user folder the roots and the exports hang off; 0 under
+ * RECOMP_CONFIG=none, where import and export are off. */
+static int files_user_dir(char *out, size_t n)
+{
+    return enhance_cfg_user_dir(out, n) && out[0];
+}
+
+/* Game Mode has no file manager to show a folder in. */
+static int files_desktop(void)
+{
+    return !recomp_env_on(RENV_HOST_GAMESCOPE);
+}
+
+/* The active entry when it is a saved profile, the only shader state with
+ * a TOML of its own (a bundled preset or a path is a config key). */
+static const struct shader_edit_entry *files_profile(void)
+{
+    const struct shader_edit_entry *e;
+    shader_edit_refresh();
+    e = shader_edit_entry(shader_edit_active());
+    return e && e->kind == SHADER_EDIT_USER && e->file[0] ? e : NULL;
+}
+
+static void files_list_add(char *list, size_t n, const char *key)
+{
+    size_t len = strlen(list);
+    if (len + strlen(key) + 3 < n)
+        snprintf(list + len, n - len, "%s%s", len ? ", " : "", key);
+    else if (len + 5 < n && strcmp(list + len - 3, "..."))
+        snprintf(list + len, n - len, ", ...");
+}
+
+static void imp_bad(const char *key, const char *why)
+{
+    fprintf(stderr, LOGP "menu: import %s: %s %s\n", s_imp.file, key, why);
+    if (s_imp.nbad < IMP_BAD_MAX)
+        snprintf(s_imp.bad[s_imp.nbad], sizeof s_imp.bad[0], "%s", key);
+    s_imp.nbad++;
+}
+
+/* The file's value of key as the slot's item has it ("true", "linear",
+ * "2", "0.5"), or 0 when it is of another type or out of the item's
+ * values: such a key is skipped, never forced into the slot. */
+static int imp_slot_text(const recomp_cfg *c, const char *key, const struct slot *s, char *out,
+                         size_t n)
+{
+    const struct enhance_item *it = s->it;
+    int t = recomp_cfg_type_of(c, key);
+    switch (it->kind) {
+    case ENHANCE_ITEM_TOGGLE:
+        if (t != RCFG_BOOL)
+            return 0;
+        snprintf(out, n, "%s", recomp_cfg_bool(c, key, 0) ? "true" : "false");
+        return 1;
+    case ENHANCE_ITEM_CHOICE:
+        if (it->flags & ENHANCE_ITEM_NUMERIC) {
+            if (t != RCFG_INT)
+                return 0;
+            snprintf(out, n, "%lld", recomp_cfg_int(c, key, 0));
+        } else {
+            if (t != RCFG_STRING)
+                return 0;
+            snprintf(out, n, "%s", recomp_cfg_string(c, key, ""));
+        }
+        return !it->choices || index_of(it->choices, out) >= 0;
+    case ENHANCE_ITEM_RANGE: {
+        double x;
+        if (t != RCFG_INT && t != RCFG_FLOAT)
+            return 0;
+        x = recomp_cfg_float(c, key, 0);
+        if (!(x >= it->lo - 1e-9 && x <= it->hi + 1e-9))
+            return 0;
+        snprintf(out, n, "%g", x);
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
+/* The value the user files hold for key as TOML, "" when none: a kept
+ * key equal to it is no change. The file Save writes is read from disk
+ * (s_imp.disk): the parse from the start is stale after a Save. When a
+ * title file was read, Save writes it, and the user file under it is as
+ * it was read. */
+static void imp_user_literal(const char *key, char *out, size_t n)
+{
+    const recomp_cfg *under = enhance_cfg_file(0) ? enhance_cfg_file(1) : NULL;
+    out[0] = 0;
+    if (s_imp.disk && recomp_cfg_type_of(s_imp.disk, key) != RCFG_NONE)
+        ef_literal(s_imp.disk, key, out, n);
+    else if (under && recomp_cfg_type_of(under, key) != RCFG_NONE)
+        ef_literal(under, key, out, n);
+}
+
+/* The user file Save writes, read for imp_user_literal and
+ * imp_check_patch: NULL text when there is none or it cannot be read. */
+static void imp_read_disk(void)
+{
+    const char *path = enhance_cfg_user_path();
+    size_t len;
+    if (!path || fb_read_file(path, 4u * FB_IMPORT_CAP, &s_imp.disk_text, &len) != FB_OK) {
+        s_imp.disk_text = NULL;
+        return;
+    }
+    s_imp.disk = recomp_cfg_load_string(s_imp.disk_text, path, NULL, 0);
+}
+
+/* A key another page owns (the Shaders page's preset, profile and
+ * parameters, a mod's captured controls): no row here takes it from a
+ * file, so it is kept, and the preview says whose it is. */
+static int imp_owned(const char *key)
+{
+    return !strcmp(key, "present.shader") || !strcmp(key, "present.profile")
+        || !strncmp(key, SHADER_PARAMS, sizeof SHADER_PARAMS - 1)
+        || !strncmp(key, "input.controls.", 15);
+}
+
+/* Walk the file's keys: count what Apply would do (apply 0), or do it
+ * (apply 1). Env-forced keys are skipped and named; a key with a slot or
+ * an action changes it as the menu would; any other key is kept, to be
+ * written on Save as it was read (D6). */
+static void imp_walk(int apply)
+{
+    const recomp_cfg *c = s_imp.cfg;
+    if (!apply) {
+        s_imp.changes = s_imp.nkeep = s_imp.nnew = s_imp.nenv = s_imp.nbad = 0;
+        s_imp.menu_off = 0;
+        s_imp.env[0] = 0;
+    }
+    for (size_t i = 0; i < recomp_cfg_count(c); i++) {
+        const char *key = recomp_cfg_key_at(c, i);
+        int si, id = -1;
+        char v[VAL_MAX];
+        if (!key)
+            continue;
+        si = slot_find(key);
+        if (!strncmp(key, "input.actions.", 14))
+            id = enhance_action_find(key + 14);
+        if (enhance_cfg_source_of(key) == ENHANCE_SRC_ENV || (si >= 0 && s_slot[si].env)) {
+            if (!apply) {
+                s_imp.nenv++;
+                files_list_add(s_imp.env, sizeof s_imp.env, key);
+            }
+            continue;
+        }
+        if (si >= 0) {
+            struct slot *s = &s_slot[si];
+            if (!slot_saveable(s)) {
+                if (!apply)
+                    imp_bad(key, "is not saved by the menu");
+                continue;
+            }
+            if (!imp_slot_text(c, key, s, v, sizeof v)) {
+                if (!apply)
+                    imp_bad(key, "has a value the setting does not take");
+                continue;
+            }
+            if (vals_same(s->it, v, s->cur))
+                continue;
+            if (apply)
+                slot_set(s, v);
+            else
+                s_imp.changes++;
+            continue;
+        }
+        if (id >= 0) {
+            bind_list l, cur;
+            size_t len = recomp_cfg_array_len(c, key);
+            int nl = 0, ok = recomp_cfg_type_of(c, key) == RCFG_ARRAY
+                             && len <= ENHANCE_ACTION_BINDS;
+            char why[96];
+            for (size_t k = 0; ok && k < len; k++) {
+                const char *t = recomp_cfg_array_string(c, key, k, NULL);
+                ok = t && strlen(t) < ENHANCE_ACTION_TEXT
+                  && enhance_action_check(t, why, sizeof why);
+                if (ok)
+                    snprintf(l[nl++], ENHANCE_ACTION_TEXT, "%s", t);
+            }
+            /* The menu's own binding is never left unbound (as Clear). */
+            if (ok && !nl && !strcmp(key + 14, "menu.open"))
+                ok = 0;
+            if (!ok) {
+                if (!apply)
+                    imp_bad(key, "has a binding the rules refuse");
+                continue;
+            }
+            if (same_binds(l, nl, cur, enhance_action_bindings(id, cur, ENHANCE_ACTION_BINDS)))
+                continue;
+            if (apply)
+                action_set(id, l, nl);
+            else
+                s_imp.changes++;
+            continue;
+        }
+        {
+            char lit[VAL_MAX * 4], now[VAL_MAX * 4];
+            int k;
+            if (!ef_literal(c, key, lit, sizeof lit) || strlen(key) >= sizeof s_kkey[0]) {
+                if (!apply)
+                    imp_bad(key, "is too long to keep");
+                continue;
+            }
+            imp_user_literal(key, now, sizeof now);
+            if (!strcmp(lit, now))
+                continue;
+            if (!apply) {
+                if (s_imp.nkeep < KEPT_MAX) {
+                    snprintf(s_imp.kkey[s_imp.nkeep], sizeof s_imp.kkey[0], "%s", key);
+                    snprintf(s_imp.kval[s_imp.nkeep], sizeof s_imp.kval[0], "%s", lit);
+                }
+                s_imp.nkeep++;
+                /* An earlier import's key takes this value in its place. */
+                for (k = 0; k < s_nkept && strcmp(s_kkey[k], key); k++)
+                    ;
+                if (k == s_nkept)
+                    s_imp.nnew++;
+                /* Written on Save, never applied to the menu that is open
+                 * (D6): the import does not close it under the player. */
+                if (!strcmp(key, "menu.enabled") && !strcmp(lit, "false"))
+                    s_imp.menu_off = 1;
+                continue;
+            }
+            for (k = 0; k < s_nkept && strcmp(s_kkey[k], key); k++)
+                ;
+            if (k == s_nkept) {
+                if (s_nkept >= KEPT_MAX)
+                    continue;
+                s_nkept++;
+            }
+            snprintf(s_kkey[k], sizeof s_kkey[k], "%s", key);
+            snprintf(s_kval[k], sizeof s_kval[k], "%s", lit);
+        }
+    }
+}
+
+/* The config the import would leave, as text, must still patch into the
+ * user file (a kept a.b over a file's a = 1 would not): checked before
+ * Apply, so Save cannot fail on it later. NULL, or the reason. */
+static const char *imp_check_patch(char *err, size_t n)
+{
+    const char *keys[2 * KEPT_MAX], *vals[2 * KEPT_MAX];
+    char *out;
+    int k = 0, shown = s_imp.nkeep < KEPT_MAX ? s_imp.nkeep : KEPT_MAX;
+    if (!s_imp.nkeep)
+        return NULL;
+    /* An earlier kept key this import gives again goes in once, as now. */
+    for (int i = 0; i < s_nkept; i++) {
+        int j;
+        for (j = 0; j < shown && strcmp(s_imp.kkey[j], s_kkey[i]); j++)
+            ;
+        if (j < shown)
+            continue;
+        keys[k] = s_kkey[i];
+        vals[k++] = s_kval[i];
+    }
+    for (int i = 0; i < shown; i++) {
+        keys[k] = s_imp.kkey[i];
+        vals[k++] = s_imp.kval[i];
+    }
+    err[0] = 0;
+    out = recomp_cfg_patch_text(s_imp.disk_text ? s_imp.disk_text : "", "config", keys, vals,
+                                (size_t)k, err, n);
+    if (!out)
+        return err[0] ? err : "it does not fit the config file";
+    free(out);
+    return NULL;
+}
+
+static void files_browse(int job)
+{
+    char dir[FB_PATH_MAX];
+    int rc;
+    files_close();
+    if (!files_user_dir(dir, sizeof dir)) {
+        status("Import and export are off (RECOMP_CONFIG=none)");
+        return;
+    }
+    fb_init(&s_fb);
+    s_fb_ready = 1;
+    fb_add_default_roots(&s_fb, dir, NULL);
+    fb_set_filter(&s_fb, ".toml");
+    s_fb_job = job;
+    s_fb_view = FBV_BROWSE;
+    /* At the Exports folder: where an export goes, and where one is
+     * found again. B goes up to the other places. */
+    rc = fb_open_root(&s_fb, 0);
+    if (rc != FB_OK && rc != EACCES && rc != EPERM)
+        fb_close_root(&s_fb);
+    s_sel[PAGE_FILES] = 0;
+    s_scroll[PAGE_FILES] = 0;
+}
+
+static void files_size_text(uint64_t b, char *out, size_t n)
+{
+    if (b < 1024)
+        snprintf(out, n, "%u B", (unsigned)b);
+    else if (b < 1024u * 1024u)
+        snprintf(out, n, "%.1f KB", (double)b / 1024);
+    else
+        snprintf(out, n, "%.1f MB", (double)b / (1024.0 * 1024.0));
+}
+
+static void files_default_name(char *out, size_t n)
+{
+    const struct shader_edit_entry *e = s_fb_job == FBJ_EXPORT_SHADER ? files_profile() : NULL;
+    fb_default_name(e ? e->file : "settings", time(NULL), ".toml", out, n);
+}
+
+/* The browser's rows: the places, or a folder's listing. */
+static void files_browse_rows(void)
+{
+    struct row *r;
+    if (s_fb.root < 0) {
+        header(s_fb_job == FBJ_IMPORT ? "Import from" : "Export to");
+        for (int i = 0; i < s_fb.nroots; i++) {
+            r = row_add(R_FBROOT, i, 1, s_fb.roots[i].label);
+            if (r) {
+                snprintf(r->value, sizeof r->value, "%s", s_fb.roots[i].path);
+                snprintf(r->help, sizeof r->help, "A opens it \xC2\xB7 B goes back to Files");
+            }
+        }
+        return;
+    }
+    info(s_fb.roots[s_fb.root].label, "%s", s_fb.cwd);
+    r = row_add(R_FBUP, -1, 1, "..");
+    if (r)
+        snprintf(r->help, sizeof r->help, "%s",
+                 fb_at_root(&s_fb) ? "Back to the places" : "One folder up");
+    if (s_fb_job != FBJ_IMPORT) {
+        r = row_add(R_FBNAME, -1, 1, "Export here as");
+        if (r) {
+            if (s_name_on && s_name_for == NAME_EXPORT) {
+                snprintf(r->value, sizeof r->value, "%.*s|%s", s_name_cur, s_name,
+                         s_name + s_name_cur);
+                r->tint = TINT_WARN;
+            } else {
+                files_default_name(r->value, sizeof r->value);
+            }
+            snprintf(r->help, sizeof r->help, "%s",
+                     s_fb_job == FBJ_EXPORT_CFG
+                         ? "A names the file: your settings, unsaved values included"
+                         : "A names the file: the active shader profile as saved");
+        }
+    }
+    if (s_fb.err) {
+        /* No system picker before phase I: the browser says so (D6). */
+        r = row_add(R_INFO, -1, 0,
+                    s_fb.err == EACCES || s_fb.err == EPERM ? "This folder cannot be read"
+                                                            : "This folder cannot be listed");
+        if (r && s_fb.err != EACCES && s_fb.err != EPERM)
+            snprintf(r->value, sizeof r->value, "%s", strerror(s_fb.err));
+        return;
+    }
+    if (!s_fb.n)
+        info("No folders or .toml files here", "%s", "");
+    for (int i = 0; i < s_fb.n; i++) {
+        const struct fb_entry *e = &s_fb.entries[i];
+        char label[sizeof r->label];
+        if (s_nrow >= ROWS_MAX - 1) {
+            info("More not shown", "%d", s_fb.n - i);
+            break;
+        }
+        snprintf(label, sizeof label, "%s%s", e->name, e->is_dir ? "/" : "");
+        r = row_add(R_FBENT, i, 1, label);
+        if (!r)
+            break;
+        if (!e->link_ok) {
+            r->dim = 1;
+            snprintf(r->value, sizeof r->value, "link out of %s", s_fb.roots[s_fb.root].label);
+        } else if (e->is_dir) {
+            snprintf(r->value, sizeof r->value, "folder");
+        } else {
+            files_size_text(e->size, r->value, sizeof r->value);
+        }
+        snprintf(r->help, sizeof r->help, "%s",
+                 e->is_dir ? "A opens the folder"
+                 : s_fb_job == FBJ_IMPORT ? "A reads the file and shows what it changes"
+                                          : "A writes over this file (asks first)");
+    }
+}
+
+static void files_preview_rows(void)
+{
+    struct row *r;
+    header(s_imp.profile ? "Import a shader profile" : "Import settings");
+    info("File", "%s", s_imp.file);
+    if (s_imp.profile) {
+        info("Name", "%s", s_imp.pname);
+        info("Stages", "%d", s_imp.nstages);
+        info("Saved as", "%s.toml (or a free name like it)", s_imp.stem);
+    } else {
+        int shown = s_imp.nkeep < KEPT_MAX ? s_imp.nkeep : KEPT_MAX;
+        info("Changes", "%d", s_imp.changes);
+        r = row_add(R_INFO, -1, 0, "Kept as written");
+        if (r) {
+            snprintf(r->value, sizeof r->value, "%d", s_imp.nkeep);
+            snprintf(r->help, sizeof r->help,
+                     "Keys an import does not apply now: Save writes them as they are, "
+                     "for the next start");
+        }
+        for (int i = 0; i < shown && i < 8; i++)
+            info(s_imp.kkey[i], "%s", imp_owned(s_imp.kkey[i]) ? "kept (another page's key)"
+                                                               : "kept (no setting here)");
+        if (shown > 8)
+            info("And more", "%d (the log lists them)", shown - 8);
+        if (s_imp.menu_off)
+            info("menu.enabled = false", "the menu will be off from the next start");
+        if (s_imp.nenv)
+            info("Set by the environment", "%s", s_imp.env);
+        if (s_imp.nbad) {
+            char list[FILES_LIST_MAX] = "";
+            for (int i = 0; i < s_imp.nbad && i < IMP_BAD_MAX; i++)
+                files_list_add(list, sizeof list, s_imp.bad[i]);
+            info("Skipped", "%s", list);
+        }
+    }
+    r = row_add(R_FBPREV, 0, 1, "Apply");
+    if (r)
+        snprintf(r->help, sizeof r->help, "%s",
+                 s_imp.profile ? "Copies the profile into shader-profiles; nothing is replaced"
+                               : "As unsaved changes: Save keeps them, Exit without saving "
+                                 "drops them");
+    r = row_add(R_FBPREV, 1, 1, "Cancel");
+    if (r)
+        snprintf(r->help, sizeof r->help, "Nothing changes");
+}
+
+/* The page's rows for a sub-view; 0 on the main list. */
+static int files_view_rows(void)
+{
+    struct row *r;
+    switch (s_fb_view) {
+    case FBV_BROWSE:
+        files_browse_rows();
+        return 1;
+    case FBV_ASK:
+        info(s_fbx.prompt, "%s", "");
+        r = row_add(R_FBASK, 0, 1, "No");
+        if (r)
+            snprintf(r->help, sizeof r->help, "Keep the file; pick another name");
+        r = row_add(R_FBASK, 1, 1, "Yes, replace it");
+        if (r)
+            snprintf(r->help, sizeof r->help, "%s", s_fbx.path);
+        return 1;
+    case FBV_PREVIEW:
+        files_preview_rows();
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* The main list's Import and Export rows. */
+static void files_rows(void)
+{
+    char dir[FB_PATH_MAX];
+    int on = files_user_dir(dir, sizeof dir);
+    const struct shader_edit_entry *e = on ? files_profile() : NULL;
+    struct row *r;
+    header("Import and export");
+    r = row_add(R_FILEIO, FIO_IMPORT, 1, "Import");
+    if (r) {
+        r->dim = !on;
+        snprintf(r->help, sizeof r->help, "%s",
+                 on ? "Settings or a shader profile from a .toml file; you see it before it applies"
+                    : "Off with RECOMP_CONFIG=none");
+    }
+    r = row_add(R_FILEIO, FIO_EXPORT_CFG, 1, "Export settings");
+    if (r) {
+        int un = enhance_menu_unsaved();
+        r->dim = !on;
+        if (on && un)
+            snprintf(r->value, sizeof r->value, "%d unsaved included", un);
+        snprintf(r->help, sizeof r->help, "%s",
+                 on ? "The config as Save would write it now, to a .toml you name"
+                    : "Off with RECOMP_CONFIG=none");
+    }
+    r = row_add(R_FILEIO, FIO_EXPORT_SHADER, 1, "Export shader profile");
+    if (r) {
+        r->dim = !e;
+        snprintf(r->value, sizeof r->value, "%s", e ? e->name : "none");
+        snprintf(r->help, sizeof r->help, "%s",
+                 e ? (shader_edit_dirty(shader_edit_active())
+                          ? "The profile as last saved: Save first to include its edits"
+                          : "The active profile's file, to a .toml you name")
+                   : "Only a saved profile exports: Save as new on Shaders makes one");
+    }
+    if (on && files_desktop()) {
+        r = row_add(R_FILEIO, FIO_OPEN_DIR, 1, "Open exports folder");
+        if (r)
+            snprintf(r->help, sizeof r->help, "In the desktop's file manager");
+    }
+}
+
+/* The export's bytes: the config as Save would write it, or the profile's
+ * file. 0 with the status set. */
+static int files_export_data(char **data, size_t *len, int *unsaved)
+{
+    *unsaved = 0;
+    if (s_fb_job == FBJ_EXPORT_CFG) {
+        const char *path = enhance_cfg_user_path();
+        const char *keys[PENDING_MAX], *vals[PENDING_MAX], *mine[PENDING_MAX];
+        char *text = NULL, err[512];
+        size_t tl;
+        int n = enhance_menu_pending(keys, vals, PENDING_MAX), rc, nmine = 0;
+        /* The header names the values the player set: not a removal (a
+         * setting back at stock) nor a mod's renamed key, which Save
+         * writes on its own. */
+        for (int i = 0; i < n; i++)
+            if (vals[i] && (i < s_rw_from || i >= s_rw_to))
+                mine[nmine++] = keys[i];
+        rc = path ? fb_read_file(path, 4u * FB_IMPORT_CAP, &text, &tl) : FB_E_IO;
+        if (rc != FB_OK && path && fb_exists(path)) {
+            status("Export failed: %s cannot be read", path);
+            return 0;
+        }
+        *data = ef_export_config(text ? text : "", keys, vals, (size_t)n, mine, (size_t)nmine,
+                                 err, sizeof err);
+        free(text);
+        if (!*data) {
+            status("Export failed: %s", err);
+            return 0;
+        }
+        if (err[0])
+            fprintf(stderr, LOGP "menu: export: %s\n", err);
+        *len = strlen(*data);
+        *unsaved = nmine;
+        return 1;
+    } else {
+        const struct shader_edit_entry *e = files_profile();
+        char dir[FB_PATH_MAX], path[FB_PATH_MAX + 64];
+        if (!e || !shader_profile_dir(dir, sizeof dir)) {
+            status("No saved profile is active");
+            return 0;
+        }
+        shader_profile_path(dir, e->file, path, sizeof path);
+        if (fb_read_file(path, FB_IMPORT_CAP, data, len) != FB_OK) {
+            status("Export failed: %s cannot be read", path);
+            return 0;
+        }
+        return 1;
+    }
+}
+
+static void files_export_write(void)
+{
+    char *data = NULL;
+    size_t len = 0;
+    int unsaved;
+    if (!files_export_data(&data, &len, &unsaved)) {
+        s_fb_view = FBV_BROWSE;
+        return;
+    }
+    if (fb_export_write(&s_fbx, data, len) == FB_EXP_DONE) {
+        fprintf(stderr, LOGP "menu: exported to %s\n", s_fbx.path);
+        if (unsaved)
+            status("Exported to %s (%d unsaved value%s included)", s_fbx.path, unsaved,
+                   unsaved == 1 ? "" : "s");
+        else
+            status("Exported to %s", s_fbx.path);
+        fb_refresh(&s_fb);
+    } else {
+        fprintf(stderr, LOGP "menu: export to %s failed: %s\n", s_fbx.path,
+                s_fbx.reason ? s_fbx.reason : "?");
+        status("Export failed: %s", s_fbx.reason ? s_fbx.reason : s_fbx.path);
+    }
+    free(data);
+    s_fb_view = FBV_BROWSE;
+}
+
+/* Enter on the export's name: 1 closes the field. */
+static int files_name_keep(const char *name)
+{
+    switch (fb_export_begin(&s_fbx, s_fb.cwd, name, ".toml")) {
+    case FB_EXP_REFUSED:
+        status("%s", s_fbx.reason ? s_fbx.reason : "That name is refused");
+        return 0;
+    case FB_EXP_CONFIRM:
+        /* The focus on No (D6). */
+        s_fb_view = FBV_ASK;
+        s_sel[PAGE_FILES] = 0;
+        return 1;
+    case FB_EXP_READY:
+        files_export_write();
+        return 1;
+    default:
+        status("Export failed");
+        return 1;
+    }
+}
+
+/* An imported file's text as an import: refused (status set, 0) or a
+ * plan the preview shows. A profile's plan takes text (s_imp.text); the
+ * caller frees it otherwise. */
+static int files_import_plan(const char *file, char *text, size_t len)
+{
+    char kind[EF_KIND_MAX] = "", err[256];
+    int format = 0;
+    recomp_cfg *c;
+    imp_drop();
+    snprintf(s_imp.file, sizeof s_imp.file, "%s", file);
+    if (strlen(text) != len) {
+        status("%s is not a text file", file);
+        return 0;
+    }
+    if (ef_marker(text, kind, sizeof kind, &format) && strcmp(kind, "config")) {
+        status("%s is an export of %s, not of settings", file, kind[0] ? kind : "something else");
+        return 0;
+    }
+    if (kind[0] && format > EF_CONFIG_FORMAT) {
+        status("%s comes from a newer build (format %d): not imported", file, format);
+        return 0;
+    }
+    c = recomp_cfg_load_string(text, file, err, sizeof err);
+    if (!c) {
+        status("Not imported: %s", err);
+        fprintf(stderr, LOGP "menu: import refused: %s\n", err);
+        return 0;
+    }
+    /* A shader profile carries its stages; a config never has the key. */
+    if (!kind[0] && recomp_cfg_type_of(c, "stages") == RCFG_ARRAY) {
+        static struct shader_profile p;
+        char stem[FB_ENTRY_NAME_MAX], *dot;
+        recomp_cfg_free(c);
+        snprintf(stem, sizeof stem, "%s", file);
+        dot = strrchr(stem, '.');
+        if (dot)
+            *dot = 0;
+        if (!shader_profile_slug(stem, s_imp.stem, sizeof s_imp.stem))
+            snprintf(s_imp.stem, sizeof s_imp.stem, "profile");
+        memset(&p, 0, sizeof p);
+        switch (shader_profile_parse(text, file, s_imp.stem, &p, err, sizeof err)) {
+        case SHADER_PROFILE_OK:
+            break;
+        case SHADER_PROFILE_NEWER:
+            status("%s is a profile from a newer build: not imported", file);
+            return 0;
+        default:
+            status("Not imported: %s", err);
+            return 0;
+        }
+        /* Named by the profile's own name, as Save as new names files; a
+         * name with no ASCII letter or digit keeps the file's stem. */
+        {
+            char slug[sizeof s_imp.stem];
+            if (shader_profile_slug(p.name, slug, sizeof slug))
+                snprintf(s_imp.stem, sizeof s_imp.stem, "%s", slug);
+        }
+        snprintf(s_imp.pname, sizeof s_imp.pname, "%s", p.name);
+        s_imp.nstages = p.nstages;
+        s_imp.profile = 1;
+        s_imp.text = text;
+        s_imp.len = len;
+        return 1;
+    }
+    s_imp.cfg = c;
+    imp_read_disk();
+    imp_walk(0);
+    /* An earlier import's kept keys share the table: the keys new to it
+     * count with them, a key it holds already takes its old place. */
+    if (s_imp.nkeep > KEPT_MAX || s_imp.nnew + s_nkept > KEPT_MAX) {
+        status("Not imported: %d keys to keep as written, at most %d",
+               s_imp.nkeep > KEPT_MAX ? s_imp.nkeep : s_imp.nnew + s_nkept, KEPT_MAX);
+        imp_drop();
+        return 0;
+    }
+    {
+        const char *why = imp_check_patch(err, sizeof err);
+        if (why) {
+            status("Not imported: %s", why);
+            imp_drop();
+            return 0;
+        }
+    }
+    for (int i = 0; i < s_imp.nkeep; i++)
+        fprintf(stderr, LOGP "menu: import %s: %s %s, kept as written\n", file, s_imp.kkey[i],
+                imp_owned(s_imp.kkey[i]) ? "is another page's key" : "has no setting here");
+    return 1;
+}
+
+static void files_pick(int i)
+{
+    const struct fb_entry *e = &s_fb.entries[i];
+    char *text = NULL;
+    size_t len = 0;
+    int rc;
+    if (e->is_dir) {
+        rc = fb_enter(&s_fb, i);
+        if (rc == FB_E_ROOT)
+            status("That link leaves %s", s_fb.roots[s_fb.root].label);
+        s_sel[PAGE_FILES] = 0;
+        s_scroll[PAGE_FILES] = 0;
+        return;
+    }
+    if (!e->link_ok) {
+        status("That link leaves %s", s_fb.roots[s_fb.root].label);
+        return;
+    }
+    if (s_fb_job != FBJ_IMPORT) {
+        if (!s_name_on)
+            name_begin(NAME_EXPORT, e->name);
+        return;
+    }
+    rc = fb_import_entry(&s_fb, i, FB_IMPORT_CAP, &text, &len);
+    if (rc == FB_E_TOO_BIG) {
+        status("%s is over %u KB: not imported", e->name, FB_IMPORT_CAP / 1024u);
+        return;
+    }
+    if (rc != FB_OK) {
+        status("%s cannot be read", e->name);
+        free(text);
+        return;
+    }
+    /* The plan keeps a profile's text for Apply; a config's is done. */
+    rc = files_import_plan(e->name, text, len);
+    if (!s_imp.text)
+        free(text);
+    if (!rc) {
+        imp_drop();
+        return;
+    }
+    s_fb_view = FBV_PREVIEW;
+    s_sel[PAGE_FILES] = 0;
+    s_scroll[PAGE_FILES] = 0;
+}
+
+static void files_apply(void)
+{
+    if (s_imp.profile) {
+        char dir[FB_PATH_MAX], name[FB_ENTRY_NAME_MAX];
+        if (!shader_profile_dir(dir, sizeof dir) || fb_mkdirs(dir) != 0
+            || fb_import_unique(dir, s_imp.stem, ".toml", s_imp.text, s_imp.len, name,
+                                sizeof name) != FB_OK) {
+            status("Import failed: the profile could not be written");
+        } else {
+            fprintf(stderr, LOGP "menu: imported shader profile %s as %s/%s\n", s_imp.file, dir,
+                    name);
+            shader_edit_refresh();
+            status("Imported as %s; pick it on Shaders", name);
+        }
+    } else {
+        int changes = s_imp.changes, kept = s_imp.nkeep;
+        imp_walk(1);
+        fprintf(stderr, LOGP "menu: imported %s: %d change%s, %d kept as written\n", s_imp.file,
+                changes, changes == 1 ? "" : "s", kept);
+        if (s_imp.menu_off)
+            status("%d change%s, %d kept as written; menu.enabled = false applies at the next "
+                   "start. Save keeps it",
+                   changes, changes == 1 ? "" : "s", kept);
+        else
+            status("%d change%s, %d kept as written; Save keeps it", changes,
+                   changes == 1 ? "" : "s", kept);
+    }
+    files_close();
+    s_need_draw = 1;
+}
+
+static void files_open_dir(void)
+{
+    char dir[FB_PATH_MAX], path[FB_PATH_MAX];
+    if (!files_user_dir(dir, sizeof dir) || fb_path_join(dir, "exports", path, sizeof path))
+        return;
+    fb_mkdirs(path);
+    if (xbox_HostOpenFolder(path))
+        status("Opening %s", path);
+    else
+        status("%s could not be opened", path);
+}
+
+/* B in a sub-view: 1 when it took it. */
+static int files_back(void)
+{
+    switch (s_fb_view) {
+    case FBV_ASK:
+        fb_export_answer(&s_fbx, 0);
+        s_fb_view = FBV_BROWSE;
+        status("Not replaced");
+        return 1;
+    case FBV_PREVIEW:
+        imp_drop();
+        s_fb_view = FBV_BROWSE;
+        status("Import cancelled");
+        return 1;
+    case FBV_BROWSE:
+        if (s_fb.root < 0) {
+            files_close();
+        } else if (fb_up(&s_fb) == FB_E_ROOT) {
+            fb_close_root(&s_fb);
+        }
+        s_sel[PAGE_FILES] = 0;
+        s_scroll[PAGE_FILES] = 0;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* A and the arrows on a Files row: 1 when it was one of these. */
+static int files_event(const struct row *r, int ok)
+{
+    switch (r->type) {
+    case R_FILEIO:
+        if (!ok)
+            return 1;
+        if (r->ref == FIO_OPEN_DIR) {
+            files_open_dir();
+        } else if (r->ref == FIO_EXPORT_SHADER && !files_profile()) {
+            status("Only a saved profile exports: Save as new on Shaders makes one");
+        } else {
+            files_browse(r->ref == FIO_IMPORT ? FBJ_IMPORT
+                         : r->ref == FIO_EXPORT_CFG ? FBJ_EXPORT_CFG
+                                                    : FBJ_EXPORT_SHADER);
+        }
+        return 1;
+    case R_FBROOT:
+        if (ok) {
+            int rc = fb_open_root(&s_fb, r->ref);
+            if (rc != FB_OK && rc != EACCES && rc != EPERM && rc != ENOENT)
+                status("%s cannot be opened", s_fb.roots[r->ref].label);
+            s_sel[PAGE_FILES] = 0;
+            s_scroll[PAGE_FILES] = 0;
+        }
+        return 1;
+    case R_FBUP:
+        if (ok)
+            files_back();
+        return 1;
+    case R_FBENT:
+        if (ok && r->ref < s_fb.n)
+            files_pick(r->ref);
+        return 1;
+    case R_FBNAME:
+        if (ok && !s_name_on) {
+            char def[FB_NAME_MAX + FB_EXT_MAX + 1];
+            files_default_name(def, sizeof def);
+            name_begin(NAME_EXPORT, def);
+        }
+        return 1;
+    case R_FBASK:
+        if (!ok)
+            return 1;
+        fb_export_answer(&s_fbx, r->ref == 1);
+        if (r->ref == 1) {
+            files_export_write();
+        } else {
+            s_fb_view = FBV_BROWSE;
+            status("Not replaced");
+        }
+        return 1;
+    case R_FBPREV:
+        if (!ok)
+            return 1;
+        if (r->ref == 0) {
+            files_apply();
+        } else {
+            imp_drop();
+            s_fb_view = FBV_BROWSE;
+            status("Import cancelled");
+        }
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 /* ---- the state machine ---------------------------------------------------- */
@@ -3012,6 +3969,7 @@ int enhance_menu_open(uint64_t now_ms)
     cap_phase(CAP_OFF);
     name_end();
     sh_reset_state();
+    files_close();
     /* The profiles folder is read when the page shows, never before. */
     if (s_page == PAGE_SHADERS)
         shader_edit_refresh();
@@ -3062,6 +4020,7 @@ static void page_to(int p)
     s_free_scroll = 0;
     name_end();
     sh_reset_state();
+    files_close();
     if (p == PAGE_SHADERS)
         shader_edit_refresh();
     stats_page_use();
@@ -3332,7 +4291,7 @@ static int sh_event(const struct row *r, int dir, int ok)
         if (ok && shader_edit_forced())
             status("Set by %s", shader_edit_forced());
         else if (ok)
-            name_begin(e->name);
+            name_begin(NAME_RENAME, e->name);
         return 1;
     case R_PRESET:
         if (ok) {
@@ -3373,6 +4332,8 @@ void enhance_menu_revert(void)
     nv2a_present_chain_override_revert();
     shader_edit_revert();
     sh_reset_state();
+    /* An import's kept keys were never written: dropped with the rest. */
+    s_nkept = 0;
     s_confirm = 0;
     s_need_draw = 1;
 }
@@ -3781,7 +4742,9 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
         hints_toggle();
         break;
     case ENHANCE_EV_BACK:
-        if (s_page == PAGE_SHADERS && s_sh_sub != SH_MAIN) {
+        if (s_page == PAGE_FILES && files_back()) {
+            /* The browser's own level: up a folder, a confirm's No. */
+        } else if (s_page == PAGE_SHADERS && s_sh_sub != SH_MAIN) {
             /* Back to the row the sub-list opened from. */
             if (s_sh_sub == SH_ADD)
                 sh_select(R_ADD, -1);
@@ -3824,7 +4787,7 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
         int dir = ev == ENHANCE_EV_LEFT ? -1 : 1, ok = ev == ENHANCE_EV_OK;
         if (!r)
             break;
-        if (sh_event(r, dir, ok))
+        if (sh_event(r, dir, ok) || files_event(r, ok))
             break;
         switch (r->type) {
         case R_SLOT:
@@ -4378,7 +5341,8 @@ static uint32_t release_step(uint32_t held, uint32_t press)
 static void name_insert_utf8(const char *u)
 {
     size_t len = strlen(s_name), n = strlen(u);
-    if (!n || len + n > SHADER_PROFILE_NAME_MAX)
+    size_t cap = s_name_for == NAME_EXPORT ? sizeof s_name - 1 : SHADER_PROFILE_NAME_MAX;
+    if (!n || len + n > cap)
         return;
     memmove(s_name + s_name_cur + n, s_name + s_name_cur, len - (size_t)s_name_cur + 1);
     memcpy(s_name + s_name_cur, u, n);
@@ -4415,10 +5379,18 @@ static void name_cut(int from, int to)
     s_name_cur = from;
 }
 
+static int files_name_keep(const char *name);
+
 static void name_keep(void)
 {
     char msg[SHADER_PROFILE_ERR_MAX * 2];
     msg[0] = 0;
+    if (s_name_for == NAME_EXPORT) {
+        /* A refused name keeps the field open with the reason (D6). */
+        if (files_name_keep(s_name))
+            name_end();
+        return;
+    }
     if (shader_edit_rename(s_name, msg, sizeof msg) < 0) {
         status("%s", msg[0] ? msg : "That name is refused");
         return;
@@ -4430,7 +5402,7 @@ static void name_keep(void)
 static void name_cancel(void)
 {
     name_end();
-    status("Rename cancelled");
+    status(s_name_for == NAME_EXPORT ? "Export cancelled" : "Rename cancelled");
 }
 
 /* The focused key of the on-screen keyboard, pressed. */
@@ -6081,6 +7053,9 @@ void enhance_menu_reset_for_test(void)
     shader_edit_reset_for_test();
     sh_reset_state();
     s_name_on = 0;
+    s_name_for = NAME_RENAME;
+    files_close();
+    s_nkept = 0;
     memset(&s_osk, 0, sizeof s_osk);
     s_osk_lay_ok = 0;
     xbox_InputTextReset();

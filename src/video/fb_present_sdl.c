@@ -90,6 +90,7 @@
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 #include "mouse_sdl.h"        /* src/input: the mouse and its capture */
 #include "text_input_sdl.h"   /* src/input: typed text for the menu */
+#include "host_open_sdl.h"    /* src/input: the menu's Open exports folder */
 #include "present_sdl_quit.h"
 #ifdef XBOXRECOMP_ENHANCE
 #include "kernel/nv2a_overlay.h"
@@ -993,6 +994,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* Text input for a menu field, asked for on the guest's thread;
          * SDL wants it started and stopped on this one. */
         xbox_InputSdlTextSync(win);
+        /* The menu's Open exports folder, asked for on the guest's thread. */
+        xbox_HostOpenSdlSync();
 #if defined(__APPLE__)
         mac_fullscreen_level(win, full, spaces_off);
 #endif

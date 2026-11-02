@@ -15,6 +15,9 @@
 #   text_input_sdl.c SDL_EVENT_TEXT_INPUT and SDL's text input (POSIX)
 #   pointer.c       the absolute pointer for the menu's mouse: a seqlocked
 #                   snapshot, Win32 and SDL formats (every host)
+#   host_open.c     the menu's "Open exports folder": ShellExecuteW on
+#                   Windows, a request for the window's thread elsewhere
+#   host_open_sdl.c that request through SDL_OpenURL (POSIX)
 
 add_library(xbox_input STATIC
     pad_map.c
@@ -26,6 +29,7 @@ add_library(xbox_input STATIC
     kbm_script.c
     text_input.c
     pointer.c
+    host_open.c
 )
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -44,9 +48,12 @@ if(WIN32)
     # MSVC keeps the plain name. tests/input_xinput_imports checks the result.
     target_link_libraries(xbox_input PUBLIC platform
         $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>)
+    # host_open.c: ShellExecuteW.
+    target_link_libraries(xbox_input PUBLIC shell32 ole32)
 else()
     find_package(SDL3 3.2 CONFIG REQUIRED)
-    target_sources(xbox_input PRIVATE keyboard_sdl.c mouse_sdl.c text_input_sdl.c)
+    target_sources(xbox_input PRIVATE keyboard_sdl.c mouse_sdl.c text_input_sdl.c
+        host_open_sdl.c)
     target_link_libraries(xbox_input PUBLIC platform SDL3::SDL3 m)
 endif()
 

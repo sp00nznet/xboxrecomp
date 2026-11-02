@@ -1457,6 +1457,55 @@ and is never saved (the key names the pack's file). A title's items and a
 mod's items give their own class. Tests: `tests/enhance_menu` (ctest
 `enhance_menu`).
 
+#### Import and export (the Files page)
+
+The Files page browses folders inside the overlay: Exports
+(`<user dir>/exports`), Config, Shader profiles, Home and, on Windows, each
+drive. Only folders and `.toml` files are listed, and a link that leads out
+of its place cannot be opened. Under Proton no drive roots are added
+(Wine's drives are its own prefix), and Home is the Unix home as Wine maps
+it, `Z:\home\<user>`. A folder that cannot be read says so; there is no
+system file picker.
+
+- **Export settings** writes the config as Save would write it now,
+  unsaved values included, to a name you type (the default is
+  `settings-<yyyymmdd-hhmm>.toml`). The first lines say what the file is
+  and which values were unsaved:
+
+  ```
+  # xbr-export: config 1
+  # xbr-export: 1 unsaved value included: render.scale
+  ```
+
+  A name Windows or another host would refuse is refused on every host.
+  An existing file asks before it is replaced, with the focus on No. The
+  write goes to a temporary file and is renamed into place, and the
+  footer names the path.
+- **Export shader profile** writes the active profile's file as last
+  saved. Only a saved profile exports: a bundled preset or a path is a
+  config key and goes out with the settings.
+- **Import** reads a `.toml` file of at most 256 KB and shows what it
+  would do before anything changes: the settings it changes, the keys
+  it keeps as written (keys no setting here takes, and keys of another
+  page such as `present.shader` or `[input.controls]`), and the keys it skips (set
+  by the environment, or with a value the setting does not take). A file
+  that does not parse, an export in a newer format or an export of
+  something else is refused, and nothing changes. **Apply** makes the
+  changes unsaved: Save keeps them, and Exit without saving drops them,
+  the kept keys with them. A kept key takes effect at the next start;
+  `menu.enabled = false` is one, so an import never closes the open menu.
+  A file with `stages` is a shader profile: Apply copies it into
+  `shader-profiles/` under its name's slug, or the first free name after
+  it (`<slug>-2.toml` ...), and never replaces a profile.
+- **Open exports folder** shows the folder in the desktop's file manager
+  (`ShellExecuteW` on Windows, which under Proton opens Wine's explorer;
+  `SDL_OpenURL` elsewhere). It is not shown
+  under Steam Game Mode (`RECOMP_HOST_GAMESCOPE=1`), which has no file
+  manager.
+
+With `RECOMP_CONFIG=none` there is no user folder, so import and export
+are off.
+
 ### Naming rule
 
 - Tables group keys by feature: `[render]`, `[present]`, `[display]`, and a title's own.

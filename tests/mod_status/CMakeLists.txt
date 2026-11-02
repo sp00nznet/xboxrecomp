@@ -43,6 +43,8 @@ add_executable(mod_status_test
     ${XR_SRC}/enhance/enhance_input.c
     ${XR_SRC}/enhance/enhance_actions.c
     ${XR_SRC}/enhance/enhance_menu.c
+    ${XR_SRC}/enhance/enhance_files.c
+    ${XR_SRC}/enhance/file_browser.c
     ${XR_SRC}/enhance/enhance_menu_layout.c
     ${XR_SRC}/enhance/enhance_menu_input.c
     ${XR_SRC}/enhance/enhance_osk.c
@@ -58,6 +60,7 @@ add_executable(mod_status_test
     ${XR_SRC}/input/keyboard.c
     ${XR_SRC}/input/mouse.c
     ${XR_SRC}/input/pointer.c
+    ${XR_SRC}/input/host_open.c
     ${XR_SRC}/input/text_input.c
     ${XR_SRC}/input/input_names.c
     ${XR_SRC}/input/input_map.c
@@ -87,6 +90,10 @@ if(NOT WIN32)
 endif()
 # enhance.c sets present.shader; the chain module dlopens librashader.
 target_link_libraries(mod_status_test PRIVATE ${CMAKE_DL_LIBS})
+if(WIN32)
+    # host_open.c: ShellExecuteW.
+    target_link_libraries(mod_status_test PRIVATE shell32 ole32)
+endif()
 enable_testing()
 add_test(NAME mod_status COMMAND mod_status_test
          WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
