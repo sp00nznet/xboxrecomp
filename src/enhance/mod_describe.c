@@ -6,7 +6,9 @@
  *
  * Schema 1. Fields are only added; one removed or changed in meaning bumps
  * "schema", since the readers ship apart from the game. A field that does
- * not apply to a setting or control is left out.
+ * not apply to a setting or control is left out. The text fields (summary,
+ * help, labels) are written as the descriptor has them, glyph tokens
+ * ({ctl:move}) included; a reader expands or shows them.
  */
 #include "mod.h"
 

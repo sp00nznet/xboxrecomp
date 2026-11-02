@@ -1081,7 +1081,7 @@ static void test_detail_rows(void)
     CHECK(row_value("Move") && !strncmp(s_val, "left_stick", 10));
     CHECK(row_value("Mouse") && !strcmp(s_val, "Look"));
     i = row_index("Rise");
-    CHECK(i >= 0 && strstr(enhance_menu_row_help(i), "A: add a key or a game button") != NULL);
+    CHECK(i >= 0 && strstr(enhance_menu_row_help(i), "A: add a key, a click or a game button") != NULL);
     /* A captured control's row is rebound by capture (test_ctl_capture);
      * Esc leaves it as it was. */
     CHECK(enhance_menu_select_row("Rise"));
@@ -2365,7 +2365,7 @@ static void test_pages(void)
     /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Files. */
     static const uint32_t k_sum[9] = {
         0x65348BABu, 0xBECB3B03u, 0x0439BB8Du, 0x125C08E1u, 0x4677E872u,
-        0x778983B3u, 0x7B63D4BDu, 0xDFA436B9u, 0x1CED9BD4u };
+        0x778983B3u, 0xAB52F585u, 0xDFA436B9u, 0x1CED9BD4u };
     start_with(ARMED, k_mods);
     open_menu();
     CHECK(enhance_menu_is_open());
@@ -3708,6 +3708,100 @@ static void test_pointer_motion(void)
     enhance_input_capture(0);
 }
 
+/* Binding rows carry a glyph form next to the plain text (F.2). */
+static void test_ctl_glyphs(void)
+{
+    start_with(ARMED, k_bmods);
+    open_menu();
+    open_detail("B mod");
+    CHECK(enhance_menu_row_glyph(row_index("Rise")) != NULL
+          && !strcmp(enhance_menu_row_glyph(row_index("Rise")),
+                     "{bind:rt}, {bind:x}, {bind:R} (keys {key:3}, {key:C})"));
+    CHECK(enhance_menu_row_glyph(row_index("Toggle flight")) != NULL
+          && !strcmp(enhance_menu_row_glyph(row_index("Toggle flight")), "{bind:F7}"));
+    CHECK(enhance_menu_row_glyph(row_index("Speed")) != NULL
+          && !enhance_menu_row_glyph(row_index("Speed"))[0]);
+    CHECK(enhance_menu_row_glyph(-1) == NULL);
+}
+
+/* Reset <mod> controls: the bindings go back, the settings stay. */
+static void test_ctl_reset(void)
+{
+    start_with(ARMED "[bmod]\nspeed = 2.0\n"
+                     "[input.actions]\n\"bmod.toggle\" = [\"F8\"]\n"
+                     "[input.controls]\n\"bmod.rise\" = [\"y\"]\n",
+               k_bmods);
+    open_menu();
+    open_detail("B mod");
+    CHECK(row_value("Rise") && !strcmp(s_val, "y (key V)"));
+    CHECK(enhance_menu_select_row("Reset b mod controls"));
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "controls reset to defaults") != NULL);
+    CHECK(row_value("Toggle flight") && !strcmp(s_val, "F7"));
+    CHECK(row_value("Rise") && !strcmp(s_val, "rt, x, R (keys 3, C)"));
+    CHECK(row_value("Speed") && !strcmp(s_val, "2.00"));
+    CHECK(pending_has("input.actions.bmod.toggle", NULL));
+    CHECK(pending_has("input.controls.bmod.rise", NULL));
+    CHECK(!pending_any("bmod.speed"));
+    open_menu();
+}
+
+/* A mouse button binds a fly button; a stick row and an action refuse
+ * it; the click that might have started the capture never binds. */
+static void test_ctl_mouse(void)
+{
+    char l[ENHANCE_ACTION_BINDS][ENHANCE_ACTION_TEXT];
+    start_with(ARMED, k_bmods);
+    open_menu();
+    open_detail("B mod");
+    ptr_move(200, 200);
+    xbox_InputMouseEnable(1);
+
+    ctl_capture_start("Rise");
+    ptr_click(XBOX_POINTER_RIGHT, 200, 200);
+    CHECK(!enhance_menu_capturing());
+    CHECK(xbox_mod_control_bindings(1, 1, l, ENHANCE_ACTION_BINDS, NULL) == 4
+          && !strcmp(l[3], "mouse2"));
+    CHECK(pending_has("input.controls.bmod.rise", "[\"rt\", \"x\", \"R\", \"mouse2\"]"));
+
+    /* Held from before the capture: it waits for the release, then binds
+     * nothing until a fresh click. */
+    CHECK(enhance_menu_select_row("Rise"));
+    xbox_InputPointerButton(XBOX_POINTER_MIDDLE, 1, 200, 200);
+    ptr_step();
+    tap(0x0D);
+    xbox_InputPointerButton(XBOX_POINTER_MIDDLE, 0, 200, 200);
+    ptr_step();
+    ptr_step();
+    CHECK(enhance_menu_capturing());
+    tap(0x1B);
+    CHECK(!enhance_menu_capturing());
+    CHECK(xbox_mod_control_bindings(1, 1, l, ENHANCE_ACTION_BINDS, NULL) == 4);
+
+    ctl_capture_start("Move");
+    ptr_click(XBOX_POINTER_LEFT, 200, 200);
+    CHECK(!enhance_menu_capturing());
+    CHECK(strstr(enhance_menu_status(), "a stick row takes a stick") != NULL);
+
+    ctl_capture_start("Toggle flight");
+    ptr_click(XBOX_POINTER_LEFT, 200, 200);
+    CHECK(!enhance_menu_capturing());
+    CHECK(strstr(enhance_menu_status(), "mouse input") != NULL);
+    CHECK(row_value("Toggle flight") && !strcmp(s_val, "F7"));
+
+    /* input.mouse off: the pointer still reaches the menu, but the mouse
+     * records no press, so the click is refused rather than bound dead. */
+    xbox_InputMouseEnable(0);
+    ctl_capture_start("Rise");
+    ptr_click(XBOX_POINTER_MIDDLE, 200, 200);
+    CHECK(!enhance_menu_capturing());
+    CHECK(strstr(enhance_menu_status(), "mouse3 refused: the mouse is off; turn on input.mouse first")
+          != NULL);
+    CHECK(xbox_mod_control_bindings(1, 1, l, ENHANCE_ACTION_BINDS, NULL) == 4);
+    xbox_InputMouseEnable(-1);
+    open_menu();
+}
+
 static void test_pointer_clicks(void)
 {
     const struct menu_layout *l;
@@ -4479,6 +4573,9 @@ int main(int argc, char **argv)
     test_pad_regions();
     test_pointer_motion();
     test_pointer_clicks();
+    test_ctl_glyphs();
+    test_ctl_reset();
+    test_ctl_mouse();
     test_pointer_wheel();
     test_pointer_taps();
     test_pointer_wheel_steps();

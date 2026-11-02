@@ -415,6 +415,11 @@ static int resolve(const char *tok, int len, int family, int device, int owner,
     if (!strcmp(kind, "key")) {
         return resolve_binding(name, family, 1, m, pad);
     }
+    /* A binding as written in the config (the menu's rows): a chord of
+     * pad names is the pad's glyphs, anything else key caps, as {act:}
+     * draws the binding it picks. */
+    if (!strcmp(kind, "bind"))
+        return resolve_binding(name, family, 0, m, pad);
     if (!strcmp(kind, "act"))
         return resolve_action(name, family, device, m, pad);
     if (!strcmp(kind, "ctl"))

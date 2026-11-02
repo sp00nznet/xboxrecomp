@@ -2255,6 +2255,42 @@ static void test_record_chord(void)
     poll0();
 }
 
+/* A mouse button holds a fly button like a key (overlay-revamp D12);
+ * the wheel, which only steps, is left out with a line. */
+static void test_record_mouse(void)
+{
+    struct xbox_ctl_value v;
+    struct enhance_ctl_src a, b;
+    xbox_mouse_opts o;
+    const char *out = start_with("[input.controls]\n\"rec.sink\" = [\"mouse2\", \"wheelup\"]\n",
+                                 &k_fake, k_recs);
+
+    CHECK(strstr(out, "\"wheelup\" is not a game button, a host key or a mouse button; left out")
+          != NULL);
+    CHECK(enhance_control_parse("mouse2", &a) && a.type == ENHANCE_CTL_MOUSE
+          && a.idx == XBOX_MOUSE_RIGHT);
+    CHECK(!enhance_control_parse("wheeldown", &b) && b.type == ENHANCE_CTL_NONE);
+    CHECK(enhance_control_parse("mouse2", &b) && enhance_control_same(&a, &b));
+    CHECK(enhance_control_parse("mouse3", &b) && !enhance_control_same(&a, &b));
+
+    xbox_InputMouseDefaultOpts(&o);
+    o.capture = XBOX_MOUSE_CAPTURE_NEVER;
+    xbox_InputMouseOpts(&o);
+    xbox_InputMouseEnable(1);
+    s_rec->input_capture(1);
+    poll0();
+    CHECK(rec_value(1, &v) == 1 && v.raw[0] == 0);
+    xbox_InputMouseButton(XBOX_MOUSE_RIGHT, 1);
+    CHECK(rec_value(1, &v) == 1 && v.raw[0] == 255);
+    xbox_InputMouseButton(XBOX_MOUSE_RIGHT, 0);
+    CHECK(rec_value(1, &v) == 1 && v.raw[0] == 0);
+    s_rec->input_capture(0);
+    xbox_InputMouseEnable(0);
+    xbox_InputMouseDefaultOpts(&o);
+    xbox_InputMouseOpts(&o);
+    poll0();
+}
+
 /* The menu's capture, host source to guest name, under a remap. */
 static void test_record_from_host(void)
 {
@@ -2380,6 +2416,7 @@ int main(void)
 #endif
     test_record();
     test_record_chord();
+    test_record_mouse();
     test_record_from_host();
     test_record_conflicts();
 #ifndef _WIN32

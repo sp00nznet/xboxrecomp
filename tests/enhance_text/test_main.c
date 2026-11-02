@@ -11,6 +11,9 @@
  *             off the pad, a captured control bound on the pad only names
  *             its keys (a stubbed keyboard map), an action control its
  *             chord; no owner, or another mod's, names nothing
+ *   bind      a binding as the config writes it: a pad chord as the pad's
+ *             glyphs (padN: and @ms dropped), a stick whole, keys and a
+ *             mouse button as caps; "a" is the pad's there, as in {act:}
  *   text      a token that names nothing draws as its own text; a member
  *             with no glyph draws its name
  *   widths    what enhance_text_width says is what enhance_text_draw draws
@@ -316,6 +319,30 @@ static void test_ctl(void)
           "unknown control");
 }
 
+static void test_bind(void)
+{
+    const int P = ENHANCE_DEV_PAD, K = ENHANCE_DEV_KEYBOARD;
+    nv2a_ovl_glyph home = nv2a_ovl_glyph_src(XBOX_PAD_FAMILY_NINTENDO, INPUT_SRC_GUIDE);
+    nv2a_ovl_glyph b = nv2a_ovl_glyph_src(XBOX_PAD_FAMILY_NINTENDO, INPUT_SRC_SOUTH);
+    /* The menu's rows: the same glyphs whatever device leads, as a row
+     * lists every binding. */
+    CHECK(width("{bind:guide+a@200}", 2, K) == chord_w(home, b), "pad chord: %d",
+          width("{bind:guide+a@200}", 2, K));
+    CHECK(sum_text("{bind:pad2:lb + rb@300}", 0, P) == sum_text("{act:pad.only}", 0, P),
+          "padN: and the hold");
+    CHECK(sum_text("{bind:a}", XBOX_PAD_FAMILY_NINTENDO, K) == sum_glyph(b), "a is the pad's");
+    CHECK(sum_text("{bind:A}", 0, K) == sum_glyph(nv2a_ovl_glyph_key('A')), "A is the key");
+    CHECK(sum_text("{bind:ctrl+F6}", 0, P) == sum_text("{key:ctrl+F6}", 0, K), "a key chord");
+    CHECK(sum_text("{bind:left_stick}", 0, K) == sum_text("{pad:ls}", 0, P), "a whole stick");
+    CHECK(sum_text("{bind:mouse1}", 0, P) == sum_glyph(nv2a_ovl_glyph_mouse(NV2A_OVL_MOUSE_LEFT)),
+          "a click");
+    CHECK(sum_text("{bind:F7} (mod off)", 0, P) == sum_text("{key:F7} (mod off)", 0, K),
+          "with words after");
+    /* Names nothing: its own text. */
+    CHECK(width("{bind:nokey}", 0, P) == text_w("{bind:nokey}"), "unknown");
+    CHECK(width("{bind:lb+}", 0, P) == text_w("{bind:lb+}"), "empty member");
+}
+
 static void test_text(void)
 {
     static const char *const literal[] = {
@@ -362,6 +389,7 @@ int main(void)
     test_tokens();
     test_act();
     test_ctl();
+    test_bind();
     test_text();
     nv2a_overlay_reset_for_test();
     if (fails) {

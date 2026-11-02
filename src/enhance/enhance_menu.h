@@ -156,6 +156,9 @@ int  enhance_menu_row(int i, char *label, size_t ln, char *value, size_t vn,
 /* Row i's help, as the footer shows it while the row is selected ("" for
  * none); NULL when i is out of range. */
 const char *enhance_menu_row_help(int i);
+/* Row i's binding value as {bind:} and {key:} tokens, as drawn (""
+ * for none); NULL when i is out of range. */
+const char *enhance_menu_row_glyph(int i);
 /* Row i's change class (an enhance_item_live) for a setting row, else -1. */
 int  enhance_menu_row_live(int i);
 int  enhance_menu_select_row(const char *label);  /* 1 when found */

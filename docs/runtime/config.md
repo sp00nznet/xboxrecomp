@@ -2209,6 +2209,7 @@ An INFO control is shown and never bound. A binding names:
 | `dpad_up` .. `dpad_right`, `start`, `back`, `left_thumb`, `right_thumb` | the guest's digital button | 255 or 0 |
 | `a`, `b`, `x`, `y`, `black`, `white`, `left_trigger` (`lt`), `right_trigger` (`rt`) | the guest's analog button | 0..255 |
 | `left_stick`, `right_stick` | the guest's stick (STICK controls only) | the two axes |
+| `mouse1` .. `mouse5` | the mouse button (BUTTON controls only; the wheel is no source; reads 0 while `input.mouse` is off) | 255 or 0 |
 | anything else: a key name (`Space`, `E`, `up`, `F6`, `Numpad0`) | the host key | 255 or 0 |
 
 The guest sources are the pad as the game would see it, after
@@ -2217,7 +2218,7 @@ them with the game's own controls. Host-only buttons (Guide, the paddles,
 the touchpad) have no guest slot and are no source; stick directions
 (`left_stick_up`) neither. A text that names nothing is left out with a
 line, `[MOD] input.controls.camera.free.rise: "pad.ls" is not a game
-button or a host key; left out`.
+button, a host key or a mouse button; left out`.
 
 While a mod captures port 0 (`input_capture`), the title reads a
 connected, released pad, with a packet number that moves as the capture
@@ -2227,11 +2228,12 @@ taken out a consumed chord's buttons: `guide+y` toggling flight never
 also sinks on Y, and Y stays out until it is let go. A Y alone sinks.
 
 **Rebinding from the Mods page.** A on a BUTTON row captures one input,
-a key (a modifier alone too: Shift, Ctrl) or a game button, and adds it
-to the list, up to 8; X (Delete) drops the last, and the last binding
-stays. A on a STICK row captures a stick: it takes a direction only past
-0.6 of full travel, so a resting stick never binds. Esc cancels. The
-capture refuses, in the status line and a toast:
+a key (a modifier alone too: Shift, Ctrl), a mouse button (left, right
+or middle click) or a game button, and adds it to the list, up to 8; X
+(Delete) drops the last, and the last binding stays. A on a STICK row
+captures a stick: it takes a direction only past 0.6 of full travel, so
+a resting stick never binds. Esc cancels. The capture refuses, in the
+status line and a toast:
 
 1. a source another captured control of the same mod binds
    (`R is Free camera: Rise`). Two STICK rows trade sticks instead: Move
@@ -2241,14 +2243,22 @@ capture refuses, in the status line and a toast:
    control names, on the Controls page (`R refused: Free camera: Rise
    uses it`);
 3. a paddle or Guide (`fly controls take buttons the game sees`), a
-   stick on a BUTTON row or a button on a STICK row.
+   stick on a BUTTON row or a button on a STICK row (a click there too);
+4. a click while `input.mouse` is off (`the mouse is off; turn on
+   input.mouse first`): the menu's pointer works without it, but the
+   mouse then records no press, so the binding would never fire.
 
 A button inside an action's chord is fine (Y with `guide+y`): the chord
 is taken out before the record. Controls of different mods may share a
 source, since one mod captures at a time. A captured control set by its
 env row is read only. Save writes the changed keys, and a control back at
 its stock removes its key. Reset this mod and Revert cover them as they
-cover the settings.
+cover the settings; "Reset <mod> controls", under the Controls group,
+puts back only the mod's actions and captured controls.
+
+The rows draw their bindings as glyphs for the pad in use and key caps
+(D8), as `{bind:}` writes them; a row too narrow for the glyphs shows the
+names.
 
 **Unknown keys.** A `mods."<id>..."` key a descriptor does not declare,
 a key of an id the build does not have, and an `[input.controls]` key no
@@ -2303,6 +2313,11 @@ Schema 1. Fields are only added; one removed or changed in meaning bumps
   warnings above). The dump builds the action table as a
   start does, so `refused` is what the game would drop; the launcher
   shows these unbound instead of rerunning the rules itself.
+- `summary`, `help` and the labels are the descriptor's text as written,
+  so they may hold the menu's glyph tokens (`{ctl:move}`,
+  `{act:camera.free.reset}`, `{mouse:move}`, see the text tokens in
+  `enhance_text.h`). A reader shows them as text or expands them from
+  the dump's `bindings`.
 
 A top-level `shaders` field lists the presets the menu can pick
 (the bundled ones, and the configured preset when it is a path), each

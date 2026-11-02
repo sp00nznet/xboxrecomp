@@ -1946,8 +1946,17 @@ int enhance_control_parse(const char *text, struct enhance_ctl_src *out)
         out->idx = ctl - INPUT_A;
         return 1;
     }
-    if (ctl >= 0 || !xbox_InputNameToCode(buf, &code, &mouse) || mouse)
+    if (ctl >= 0 || !xbox_InputNameToCode(buf, &code, &mouse))
         return 0;
+    /* A mouse button holds like a key (overlay-revamp D12). The wheel
+     * gives steps, not a held state, so it moves no fly control. */
+    if (mouse) {
+        if (code < XBOX_MOUSE_LEFT || code > XBOX_MOUSE_5)
+            return 0;
+        out->type = ENHANCE_CTL_MOUSE;
+        out->idx = code;
+        return 1;
+    }
     out->type = ENHANCE_CTL_KEY;
     out->key = code;
     return 1;

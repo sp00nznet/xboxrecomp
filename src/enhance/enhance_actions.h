@@ -177,7 +177,8 @@ enum {
     ENHANCE_CTL_BUTTON,         /* idx: the wButtons bit (dpad, start, back, thumbs) */
     ENHANCE_CTL_ANALOG,         /* idx: bAnalogButtons[] (a .. right trigger) */
     ENHANCE_CTL_STICK,          /* idx: XBOX_CTL_SRC_LEFT or _RIGHT */
-    ENHANCE_CTL_KEY             /* key: the virtual-key code */
+    ENHANCE_CTL_KEY,            /* key: the virtual-key code */
+    ENHANCE_CTL_MOUSE           /* idx: the mouse button (XBOX_MOUSE_LEFT .. _5) */
 };
 struct enhance_ctl_src {
     int type, idx, key;

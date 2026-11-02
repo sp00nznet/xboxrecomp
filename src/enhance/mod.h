@@ -310,12 +310,12 @@ struct xbox_mod_api {
     /* A captured control's value, from port 0 as the title would have
      * read it this poll (after [input.pad], [input.bindings] and the
      * consumed-chord mask, before the neutral pad), on the guest's thread.
-     * BUTTON: raw[0] 0..255, the most of its bindings (a digital button or
-     * a host key reads 255). STICK: raw[0..1] the stick's x and y, src
+     * BUTTON: raw[0] 0..255, the most of its bindings (a digital button,
+     * a host key or a mouse button reads 255). STICK: raw[0..1] the stick's x and y, src
      * which stick (the caller picks the dead zone by it). connected is 0
      * while no capture holds port 0, before its first poll, and with no
      * pad (a host key still reads). Returns 1 when it read a source: a
-     * connected pad, or a host key binding. */
+     * connected pad, or a host key or mouse button binding. */
     int (*control_value)(const struct xbox_mod_desc *desc, uint32_t idx,
                          struct xbox_ctl_value *out);
 

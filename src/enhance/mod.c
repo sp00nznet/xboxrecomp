@@ -31,6 +31,7 @@
 #include "recomp_hook_mod.h"
 #include "xbox_memory_layout.h"
 #include "keyboard.h"           /* xbox_FramebufferKeyDown: a host key binding */
+#include "mouse.h"              /* xbox_InputMouseHeld: a mouse button binding */
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1301,7 +1302,7 @@ static void control_codes(int i, uint32_t k, int quiet)
         else if (!quiet)
             fprintf(stderr, LOGP "%s: \"%s\" is not %s; left out\n", r->key, r->bind[b],
                     c->kind == XBOX_CTL_STICK ? "a stick (left_stick, right_stick)"
-                                              : "a game button or a host key");
+                                              : "a game button, a host key or a mouse button");
     }
     code_lock();
     memcpy(r->code, code, sizeof code);
@@ -1567,6 +1568,10 @@ static int api_control_value(const struct xbox_mod_desc *desc, uint32_t idx,
         case ENHANCE_CTL_KEY:
             keys = 1;
             x = xbox_FramebufferKeyDown(code[b].key) ? 255 : 0;
+            break;
+        case ENHANCE_CTL_MOUSE:
+            keys = 1;
+            x = xbox_InputMouseHeld(code[b].idx) ? 255 : 0;
             break;
         }
         if (x > v.raw[0])

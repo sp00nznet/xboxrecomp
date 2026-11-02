@@ -16,6 +16,12 @@
  *                           (a pad binding for the pad, a key for the
  *                           keyboard and the mouse), so a hint follows
  *                           rebinding; a chord's members are joined by +
+ *   {bind:guide+y}          one binding as the config writes it
+ *   {bind:ctrl+F6}          ([input.actions], [input.controls]): a chord
+ *                           of pad names as pad glyphs, anything else as
+ *                           key caps (mouse1 the click); the hold and a
+ *                           padN: prefix are dropped. The menu's binding
+ *                           rows draw their values with it
  *   {ctl:move}              a control of the mod that owns the string, as
  *                           bound now (a mod's labels, help and status
  *                           panel); names nothing in the menu's own text.

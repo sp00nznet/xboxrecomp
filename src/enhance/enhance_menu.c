@@ -845,35 +845,66 @@ static void action_who(int id, char *out, size_t n)
         snprintf(out, n, "%s", label ? label : "another action");
 }
 
+/* A row value's glyph form (D8) grows beside its text: a binding as a
+ * {kind:name} token, words as they are. A name with a brace in it would
+ * end the token early, so it stays text. An overflow empties the form,
+ * and the row then draws its text. */
+struct vbuf {
+    char *p;
+    size_t n, at;
+};
+
+static void vb_put(struct vbuf *b, const char *kind, const char *s)
+{
+    int k;
+    if (!b->p || b->at >= b->n)
+        return;
+    k = kind && !strpbrk(s, "{}") ? snprintf(b->p + b->at, b->n - b->at, "{%s:%s}", kind, s)
+                                 : snprintf(b->p + b->at, b->n - b->at, "%s", s);
+    b->at += (size_t)k;
+    if (b->at >= b->n) {
+        b->p[0] = 0;
+        b->n = 0;
+    }
+}
+
 /* The bindings in effect, and each one the table refuses marked with why:
  * a player who sees "F6" must not think F6 does it when another action
- * holds F6 (one input fires one action). */
-static void join_bindings(int id, char *out, size_t n)
+ * holds F6 (one input fires one action). glyph (NULL for none) takes the
+ * same as tokens. */
+static void join_bindings(int id, char *out, size_t n, char *glyph, size_t gn)
 {
     bind_list l, bad;
     int k = enhance_action_bindings(id, l, ENHANCE_ACTION_BINDS);
     int nb = enhance_action_refused(id, bad, ENHANCE_ACTION_BINDS);
     size_t at = 0;
+    struct vbuf g = { glyph, gn, 0 };
     out[0] = 0;
+    if (glyph && gn)
+        glyph[0] = 0;
     if (!k) {
         snprintf(out, n, "none");
         return;
     }
     for (int i = 0; i < k && at < n; i++) {
         int refused = 0;
+        char tail[160] = "";
         for (int j = 0; j < nb && !refused; j++)
             refused = !strcmp(l[i], bad[j]);
-        at += (size_t)snprintf(out + at, n - at, "%s%s", i ? ", " : "", l[i]);
-        if (refused && at < n) {
+        if (refused) {
             char bound[ENHANCE_ACTION_TEXT], who[96];
             int o = enhance_action_owner(l[i], id, bound, sizeof bound);
             if (o >= 0) {
                 action_who(o, who, sizeof who);
-                at += (size_t)snprintf(out + at, n - at, " (refused: %s has it)", who);
+                snprintf(tail, sizeof tail, " (refused: %s has it)", who);
             } else {
-                at += (size_t)snprintf(out + at, n - at, " (refused)");
+                snprintf(tail, sizeof tail, " (refused)");
             }
         }
+        at += (size_t)snprintf(out + at, n - at, "%s%s%s", i ? ", " : "", l[i], tail);
+        vb_put(&g, NULL, i ? ", " : "");
+        vb_put(&g, "bind", l[i]);
+        vb_put(&g, NULL, tail);
     }
 }
 
@@ -886,6 +917,7 @@ enum row_type {
     R_TEXT,             /* one wrapped line of a mod's Author, About or State */
     R_CTL,              /* a mod's captured control (BUTTON, STICK): rebound by capture */
     R_MODRESET,         /* "Reset this mod" */
+    R_CTLRESET,         /* "Reset <mod> controls": its actions and captured controls */
     R_PARAM,            /* a shader parameter: ref indexes s_ptab */
     R_PRESET,           /* "Reset to preset" */
     R_PROFILE,          /* the Shaders page's Profile picker */
@@ -905,6 +937,9 @@ struct row {
     int sel;
     char label[64];
     char value[VAL_MAX];
+    /* A binding row's value as tokens (D8), drawn as glyphs when they fit
+     * (bind_value); "" for every other row. */
+    char glyph[VAL_MAX * 2];
     int tint;           /* an info or text value's colour: TINT_* */
     const char *note;   /* dim words after the label ("while flying"), or NULL */
     int dim;            /* a row that does nothing now (Add at the limit) */
@@ -975,6 +1010,7 @@ static struct {
     int phase, id, what;
     uint64_t t0, t_set;
     uint32_t max, last;
+    unsigned clicks;        /* XBOX_POINTER_* pressed while armed (pointer_step) */
 } s_cap;
 
 /* Every phase change goes through here: while a capture runs the actions
@@ -983,6 +1019,7 @@ static struct {
 static void cap_phase(int phase)
 {
     s_cap.phase = phase;
+    s_cap.clicks = 0;
     enhance_actions_quiet(phase != CAP_OFF);
 }
 
@@ -1230,9 +1267,37 @@ static int text_col(float s)
     return nv2a_ovl_px(s, 150);
 }
 
+/* ---- text with tokens (D8) ---- */
+
+/* Whose {ctl:} the text names: the mod's own on its page, else none (the
+ * token then draws as its text). */
+static int tok_owner(void)
+{
+    return s_page == PAGE_MODS ? s_mod_sub : -1;
+}
+
+static int tok_w(mu_Font f, const char *s)
+{
+    return enhance_text_width_owned(f, s, XBOX_PAD_FAMILY_AUTO, menu_device(), tok_owner());
+}
+
+/* The width of the first len bytes of s, tokens expanded. */
+static int tok_wn(mu_Font f, const char *s, size_t len)
+{
+    char b[512];
+    snprintf(b, sizeof b, "%.*s", (int)len, s);
+    return tok_w(f, b);
+}
+
+static void tok_draw(mu_Context *ctx, mu_Font f, const char *s, int x, int y, mu_Color c)
+{
+    enhance_text_draw_owned(ctx, f, s, x, y, c, XBOX_PAD_FAMILY_AUTO, menu_device(), tok_owner());
+}
+
 /* The bytes of p that fit in w on one line, up to max: broken after the
  * last word that fits, and a word wider than the line cut at a character.
- * Stops at a newline. */
+ * Stops at a newline. Measured with the tokens expanded, so a line of
+ * glyphs is not wrapped at its braces' width. */
 static size_t wrap_take(mu_Font f, const char *p, int w, size_t max)
 {
     size_t best = 0, i = 0;
@@ -1242,7 +1307,7 @@ static size_t wrap_take(mu_Font f, const char *p, int w, size_t max)
             k++;
         while (p[k] && p[k] != ' ' && p[k] != '\n')
             k++;
-        if (k <= max && nv2a_ovl_text_width(f, p, (int)k) <= w) {
+        if (k <= max && tok_wn(f, p, k) <= w) {
             best = i = k;
             continue;
         }
@@ -1253,7 +1318,7 @@ static size_t wrap_take(mu_Font f, const char *p, int w, size_t max)
             size_t nx = k + 1;
             while (((unsigned char)p[nx] & 0xC0) == 0x80)
                 nx++;
-            if (k && (nx > max || nv2a_ovl_text_width(f, p, (int)nx) > w))
+            if (k && (nx > max || tok_wn(f, p, nx) > w))
                 break;
             k = nx;
         }
@@ -1441,7 +1506,8 @@ static void state_text(int m, char *out, size_t n, int *tint)
 /* The keys [input.bindings] gives a guest control a captured binding
  * names ("left_stick": W A S D), appended to out at *at; nothing for a
  * host key. */
-static void ctl_keys(const char *b, char *out, size_t n, size_t *at, int *nkeys)
+static void ctl_keys(const char *b, char *out, size_t n, size_t *at, int *nkeys,
+                     struct vbuf *g)
 {
     static const struct { const char *name; int ctl[4]; } k_alias[] = {
         { "lt", { INPUT_LEFT_TRIGGER, -1, -1, -1 } },
@@ -1463,6 +1529,8 @@ static void ctl_keys(const char *b, char *out, size_t n, size_t *at, int *nkeys)
                 continue;
             *at += (size_t)snprintf(out + *at, n - *at, "%s%s",
                                     !*nkeys ? "" : c && !j ? " " : ", ", name);
+            vb_put(g, NULL, !*nkeys ? "" : c && !j ? " " : ", ");
+            vb_put(g, "key", name);
             ++*nkeys;
             if (ctl[1] >= 0)
                 break;
@@ -1471,25 +1539,40 @@ static void ctl_keys(const char *b, char *out, size_t n, size_t *at, int *nkeys)
 }
 
 /* A captured control's row value: its bindings, then the keys the guest
- * controls among them come from ("RT, X (keys R, E)"). */
-static void ctl_value(int m, uint32_t k, char *out, size_t n)
+ * controls among them come from ("RT, X (keys R, E)"); glyph the same as
+ * tokens. */
+static void ctl_value(int m, uint32_t k, char *out, size_t n, char *glyph, size_t gn)
 {
     bind_list l;
-    char keys[VAL_MAX];
+    char keys[VAL_MAX], gkeys[VAL_MAX * 2];
     size_t at = 0, kat = 0;
     int nb = xbox_mod_control_bindings(m, k, l, ENHANCE_ACTION_BINDS, NULL), nk = 0;
-    out[0] = keys[0] = 0;
+    struct vbuf g = { glyph, gn, 0 }, gk = { gkeys, sizeof gkeys, 0 };
+    out[0] = keys[0] = gkeys[0] = 0;
+    if (glyph && gn)
+        glyph[0] = 0;
     for (int i = 0; i < nb && at < n; i++) {
         at += (size_t)snprintf(out + at, n - at, "%s%s", i ? ", " : "", l[i]);
+        vb_put(&g, NULL, i ? ", " : "");
+        vb_put(&g, "bind", l[i]);
         /* ctl_keys puts the separator before each key it adds, so a host
          * key, which adds none, leaves no stray comma. */
         if (kat < sizeof keys)
-            ctl_keys(l[i], keys, sizeof keys, &kat, &nk);
+            ctl_keys(l[i], keys, sizeof keys, &kat, &nk, &gk);
     }
-    if (!nb)
+    if (!nb) {
         snprintf(out, n, "none");
-    else if (nk && at < n)
+    } else if (nk && at < n) {
         snprintf(out + at, n - at, " (key%s %s)", nk == 1 ? "" : "s", keys);
+        vb_put(&g, NULL, nk == 1 ? " (key " : " (keys ");
+        /* The keys' own form overflowed: the row draws its text. */
+        if (!gk.n && g.p && g.n) {
+            g.p[0] = 0;
+            g.n = 0;
+        }
+        vb_put(&g, NULL, gkeys);
+        vb_put(&g, NULL, ")");
+    }
 }
 
 static void unavailable(const char *label, const char *help)
@@ -1531,9 +1614,12 @@ static void ctl_row(int m, uint32_t k, int ok)
         r = row_add(R_BIND, id, 1, label);
         if (!r)
             return;
-        join_bindings(id, r->value, sizeof r->value);
-        if (enhance_action_dormant(id))
+        join_bindings(id, r->value, sizeof r->value, r->glyph, sizeof r->glyph);
+        if (enhance_action_dormant(id)) {
             strncat(r->value, " (mod off)", sizeof r->value - strlen(r->value) - 1);
+            if (r->glyph[0])
+                strncat(r->glyph, " (mod off)", sizeof r->glyph - strlen(r->glyph) - 1);
+        }
         snprintf(r->help, sizeof r->help, "%s", c->help ? c->help : "");
         r->note = c->when;
         return;
@@ -1541,12 +1627,12 @@ static void ctl_row(int m, uint32_t k, int ok)
     r = row_add(R_CTL, m << 8 | (int)k, 1, label);
     if (!r)
         return;
-    ctl_value(m, k, r->value, sizeof r->value);
+    ctl_value(m, k, r->value, sizeof r->value, r->glyph, sizeof r->glyph);
     r->note = c->when;
     snprintf(r->help, sizeof r->help, "%s%s%s",
              c->help ? c->help : "", c->help && *c->help ? " \xC2\xB7 " : "",
              c->kind == XBOX_CTL_STICK ? "A: push a stick to swap"
-                                       : "A: add a key or a game button \xC2\xB7 X: drop the last");
+                                       : "A: add a key, a click or a game button \xC2\xB7 X: drop the last");
 }
 
 /* The keys under the mod's names no lookup read: typos the player can
@@ -1565,6 +1651,31 @@ static void unknown_rows(int m)
         snprintf(r->value, sizeof r->value, "not read; kept");
         r->tint = TINT_WARN;
     }
+}
+
+/* "Reset free camera controls": the group's own reset, after its rows,
+ * for a mod with a control to rebind. The title is mid-sentence, so its
+ * first letter goes lowercase (a title like "LOD" keeps its caps). */
+static void ctl_reset_row(int m, const struct xbox_mod_desc *d, int ok)
+{
+    char label[64];
+    const char *title = mod_title(m);
+    int any = 0;
+    struct row *r;
+    for (uint32_t k = 0; k < d->n_controls && !any; k++)
+        any = d->controls[k].kind != XBOX_CTL_INFO;
+    if (!ok || !any)
+        return;
+    snprintf(label, sizeof label, "Reset %s controls", title);
+    /* "Free camera" reads "Reset free camera controls" mid-sentence; a
+     * title whose second letter is a capital too ("HUD", "VMU fix") is an
+     * acronym and keeps its case. */
+    if (isupper((unsigned char)label[6]) && !isupper((unsigned char)label[7]))
+        label[6] = (char)tolower((unsigned char)label[6]);
+    r = row_add(R_CTLRESET, m, 1, label);
+    if (r)
+        snprintf(r->help, sizeof r->help, "%s",
+                 "Puts back the stock binding of every control above; the settings stay.");
 }
 
 static void detail_rows(int m)
@@ -1596,6 +1707,7 @@ static void detail_rows(int m)
         header("Controls");
     for (uint32_t k = 0; k < d->n_controls; k++)
         ctl_row(m, k, ok);
+    ctl_reset_row(m, d, ok);
     for (uint32_t k = 0; k < d->n_settings; k++)
         nset += !(d->settings[k].flags & XBOX_SET_ENABLE);
     for (int i = 0; i < s_nslot && !nset; i++)
@@ -1652,7 +1764,7 @@ static void action_groups(void)
                     continue;
                 r = row_add(R_BIND, id, 1, enhance_action_label(id));
                 if (r)
-                    join_bindings(id, r->value, sizeof r->value);
+                    join_bindings(id, r->value, sizeof r->value, r->glyph, sizeof r->glyph);
             }
         }
         g = g == ENHANCE_ACT_TOOLKIT ? ENHANCE_ACT_GAME : g == ENHANCE_ACT_GAME ? 0 : g + 1;
@@ -2769,10 +2881,11 @@ static void hints_toggle(void)
 
 /* Stage the stock of every slot and action (m -1), or of mod m's own
  * settings and actions but its Enabled row: Reset this mod keeps the mod
- * as it is and puts its options back. */
-static void reset_scope(int m)
+ * as it is and puts its options back. slots 0 leaves the settings, for
+ * "Reset <mod> controls". */
+static void reset_parts(int m, int slots)
 {
-    for (int i = 0; i < s_nslot; i++) {
+    for (int i = 0; i < s_nslot && slots; i++) {
         struct slot *s = &s_slot[i];
         char stock[VAL_MAX];
         if (m >= 0 && (s->mod != m || s->toggle))
@@ -2804,6 +2917,11 @@ static void reset_scope(int m)
                 t[b] = stock[b];
             xbox_mod_control_set_bindings(g, k, t, ns);
         }
+}
+
+static void reset_scope(int m)
+{
+    reset_parts(m, 1);
 }
 
 static void reset_all(void)
@@ -3742,7 +3860,8 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
                 s_cap.t0 = now_ms;
                 s_cap.max = s_cap.last = 0;
                 status(s_cap.what == CAP_CTL_STICK ? "Push a stick (Esc cancels)"
-                                                   : "Press a key or a pad button (Esc cancels)");
+                                                   : "Press a key, a mouse button or a pad button "
+                                                     "(Esc cancels)");
             }
             break;
         case R_PARAM:
@@ -3752,6 +3871,12 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
             if (ok) {
                 reset_scope(r->ref);
                 status("%s: reset to defaults; Save keeps it", mod_title(r->ref));
+            }
+            break;
+        case R_CTLRESET:
+            if (ok) {
+                reset_parts(r->ref, 0);
+                status("%s: controls reset to defaults; Save keeps it", mod_title(r->ref));
             }
             break;
         case R_BIND:
@@ -3947,6 +4072,12 @@ static void ctl_finish(const char *text)
                                                    : "a stick goes on a stick row");
         return;
     }
+    /* The pointer reaches the menu with input.mouse off, but the mouse
+     * then records no press, so the binding would never fire. */
+    if (v.type == ENHANCE_CTL_MOUSE && !xbox_InputMouseOn()) {
+        ctl_refuse(text, "the mouse is off; turn on input.mouse first");
+        return;
+    }
     n = xbox_mod_control_bindings(m, k, l, ENHANCE_ACTION_BINDS, NULL);
     for (int b = 0; b < n; b++)
         if (enhance_control_parse(l[b], &h) && enhance_control_same(&v, &h)) {
@@ -4046,8 +4177,9 @@ static int capture_step(uint32_t held, uint64_t now)
         return 1;
     }
     if (s_cap.phase == CAP_RELEASE) {
-        /* The press that started the capture (A, Enter) must go first. */
-        if (!held && !any_key_down())
+        /* The press that started the capture (A, Enter, a click) must go
+         * first. */
+        if (!held && !any_key_down() && !s_ptr_btn)
             cap_phase(CAP_ARMED);
         return 1;
     }
@@ -4080,6 +4212,26 @@ static int capture_step(uint32_t held, uint64_t now)
         snprintf(text + at, sizeof text - at, "%s", name);
         capture_finish(text);
         return 1;
+    }
+    if (s_cap.clicks) {
+        /* A click, by its binding name: a fly button takes it, a stick row
+         * and an action refuse it with their reason (actions take keys and
+         * pad buttons). The pointer has the first three buttons. */
+        static const int k_btn[XBOX_POINTER_BUTTONS] = { XBOX_MOUSE_LEFT, XBOX_MOUSE_RIGHT,
+                                                         XBOX_MOUSE_MIDDLE };
+        const char *name;
+        int b = 0;
+        while (b < XBOX_POINTER_BUTTONS - 1 && !(s_cap.clicks & (1u << b)))
+            b++;
+        name = xbox_InputCodeName(k_btn[b], 1);
+        s_cap.clicks = 0;
+        if (name) {
+            if (s_cap.what != CAP_ACTION)
+                ctl_finish(name);
+            else
+                capture_finish(name);
+            return 1;
+        }
     }
     if (s_cap.what != CAP_ACTION)
         held = ctl_held(held);
@@ -4667,6 +4819,9 @@ static void pointer_step(int modal)
     dev_mouse();
     if (modal) {
         int r, c;
+        /* A capture takes a click as the input to bind (capture_step). */
+        if (s_cap.phase == CAP_ARMED)
+            s_cap.clicks |= down;
         if (s_cap.phase != CAP_OFF || !s_name_on)
             return;
         if ((down & XBOX_POINTER_LEFT) && s_osk.on && s_osk_lay_ok
@@ -4891,6 +5046,31 @@ static const char *fit(mu_Font f, const char *s, int w, char *out, size_t n)
     return out;
 }
 
+/* fit for text with tokens: cut only outside a token, so a glyph is
+ * whole or gone. */
+static const char *tok_fit(mu_Font f, const char *s, int w, char *out, size_t n)
+{
+    size_t len = strlen(s);
+    if (tok_w(f, s) <= w)
+        return s;
+    while (len > 0) {
+        const char *open;
+        len--;
+        while (len > 0 && ((unsigned char)s[len] & 0xC0) == 0x80)
+            len--;
+        /* Inside a token: back to its brace. */
+        for (open = s + len; open > s && open[-1] != '{' && open[-1] != '}'; open--)
+            ;
+        if (open > s && open[-1] == '{')
+            len = (size_t)(open - 1 - s);
+        snprintf(out, n, "%.*s\xE2\x80\xA6", (int)len, s);
+        if (tok_w(f, out) <= w)
+            return out;
+    }
+    snprintf(out, n, "\xE2\x80\xA6");
+    return out;
+}
+
 static void draw_pill(mu_Context *ctx, mu_Rect r, int on, int dim)
 {
     const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
@@ -4991,8 +5171,7 @@ static void draw_row(mu_Context *ctx, const struct row *rw, const struct menu_la
     if (rw->type == R_TEXT) {
         /* The label column, then the wrapped line text_rows cut to fit. */
         mu_draw_text(ctx, fb, rw->label, -1, mu_vec2(x, ty), t->text);
-        mu_draw_text(ctx, fb, rw->value, -1, mu_vec2(x + text_col(s), ty),
-                     rw->tint ? tint : t->text);
+        tok_draw(ctx, fb, rw->value, x + text_col(s), ty, rw->tint ? tint : t->text);
         return;
     }
     if (selected) {
@@ -5006,8 +5185,8 @@ static void draw_row(mu_Context *ctx, const struct row *rw, const struct menu_la
     }
     if (vr->hint.h > 0 && rw->help[0]) {
         char hc[300];
-        mu_draw_text(ctx, fs, fit(fs, rw->help, vr->hint.w, hc, sizeof hc), -1,
-                     mu_vec2(vr->hint.x, vr->hint.y), t->text_dim);
+        tok_draw(ctx, fs, tok_fit(fs, rw->help, vr->hint.w, hc, sizeof hc), vr->hint.x,
+                 vr->hint.y, t->text_dim);
     }
     if (st & ENHANCE_ROW_UNSAVED) {
         /* In the row's left pad, between the selection bar and the label. */
@@ -5096,7 +5275,7 @@ static void draw_row(mu_Context *ctx, const struct row *rw, const struct menu_la
     if (rw->type == R_CTL && s_cap.phase != CAP_OFF && s_cap.what != CAP_ACTION
         && s_cap.id == rw->ref) {
         v = fit(fb, s_cap.what == CAP_CTL_STICK ? "push a stick\xE2\x80\xA6"
-                                               : "press a key or a button\xE2\x80\xA6",
+                                               : "press a key, a click or a button\xE2\x80\xA6",
                 right - x, cut, sizeof cut);
         mu_draw_text(ctx, fb, v, -1, mu_vec2(right - text_w(fb, v), ty), t->warn);
         return;
@@ -5109,6 +5288,12 @@ static void draw_row(mu_Context *ctx, const struct row *rw, const struct menu_la
     }
     if (!rw->value[0])
         return;
+    /* A binding row: its glyphs while they fit, else the names. */
+    if (rw->glyph[0] && tok_w(fb, rw->glyph) <= right - x) {
+        tok_draw(ctx, fb, rw->glyph, right - tok_w(fb, rw->glyph), ty,
+                 marked && !rw->tint ? vcol : tint);
+        return;
+    }
     v = fit(fb, rw->value, right - x, cut, sizeof cut);
     mu_draw_text(ctx, fb, v, -1, mu_vec2(right - text_w(fb, v), ty),
                  marked && !rw->tint ? vcol : tint);
@@ -5326,8 +5511,8 @@ static void draw_tooltip(mu_Context *ctx, const struct menu_layout *l, const str
         if (!take[nl])
             break;
         snprintf(line, sizeof line, "%.*s", (int)take[nl], p);
-        if (text_w(fs, line) > tw)
-            tw = text_w(fs, line);
+        if (tok_w(fs, line) > tw)
+            tw = tok_w(fs, line);
         p += take[nl++];
         while (*p == ' ' || *p == '\n')
             p++;
@@ -5344,7 +5529,9 @@ static void draw_tooltip(mu_Context *ctx, const struct menu_layout *l, const str
     nv2a_ovl_ui_rrect(ctx, mu_rect(x, y, w, h), rad, 1.0f, with_alpha(t->bg_row, 255));
     p = rw->help;
     for (int i = 0; i < nl; i++) {
-        mu_draw_text(ctx, fs, p, (int)take[i], mu_vec2(x + pad, y + pad / 2 + i * lh), t->text);
+        char line[200];
+        snprintf(line, sizeof line, "%.*s", (int)take[i], p);
+        tok_draw(ctx, fs, line, x + pad, y + pad / 2 + i * lh, t->text);
         p += take[i];
         while (*p == ' ' || *p == '\n')
             p++;
@@ -5466,8 +5653,8 @@ void enhance_menu_draw(uint64_t now_ms)
     if (l->intro.w > 0) {
         const char *intro = enhance_menu_page_intro_text(s_page);
         char cut[400];
-        mu_draw_text(ctx, fs, fit(fs, intro, l->intro.w, cut, sizeof cut), -1,
-                     mu_vec2(l->intro.x, l->intro.y), t->text_dim);
+        tok_draw(ctx, fs, tok_fit(fs, intro, l->intro.w, cut, sizeof cut), l->intro.x,
+                 l->intro.y, t->text_dim);
     }
     mu_push_clip_rect(ctx, mr(l->viewport));
     for (int i = 0; i < l->nvrow; i++) {
@@ -5769,6 +5956,11 @@ int enhance_menu_row_live(int i)
 const char *enhance_menu_row_help(int i)
 {
     return i >= 0 && i < s_nrow ? s_row[i].help : NULL;
+}
+
+const char *enhance_menu_row_glyph(int i)
+{
+    return i >= 0 && i < s_nrow ? s_row[i].glyph : NULL;
 }
 
 int enhance_menu_select_row(const char *label)
