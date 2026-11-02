@@ -20,6 +20,7 @@
 #include "kernel.h"
 #include "kernel_missing.h"
 #include "kernel_pacing.h"
+#include "guest_time.h"
 #include "nv2a_flip_hold.h"
 #include "nv2a_kick_wake.h"
 #include "nv2a_gr_notify.h"
@@ -2601,9 +2602,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * waits on a tick deadline that never arrives and spins forever bringing
          * up XNet. A live clock is also just the truth -- KeTickCount ticks on
          * hardware whether or not anyone is asleep. GetTickCount() shares the
-         * millisecond unit, so the rate matches. */
-        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = GetTickCount();
+         * millisecond unit, so the rate matches. The virtual clock's step
+         * writes it itself (guest_time.h); a write here could land a step
+         * late, read before the step and stored after it, and move the
+         * count back. */
+        if (!xbox_GuestTimeVirtual())
+            *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                                   + g_memory_offset) = xbox_GuestTickCount();
 
         /* Sleep, don't yield. Sleep(0) is sched_yield on macOS and under
          * Wine, and it returns at once when a core is free, so this loop

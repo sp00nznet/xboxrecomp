@@ -18,6 +18,8 @@ set(KERNEL_SOURCES
     kernel_hal.c
     kernel_prof.c
     kernel_pacing.c
+    guest_time.c
+    guest_state_hash.c
     kernel_guest_cpu.c
     kernel_xbox.c
     kernel_ob.c

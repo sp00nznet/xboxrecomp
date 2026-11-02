@@ -28,6 +28,8 @@
 #include "kernel.h"
 #include "kernel_missing.h"
 #include "kernel_pacing.h"
+#include "guest_time.h"
+#include "guest_state_hash.h"
 #include "kernel_ramfs.h"
 #include "recomp_env.h"
 #include "platform/host_time.h"
@@ -237,7 +239,10 @@ static void kernel_data_init(void)
 
     /* KeTickCount (ordinal 156) - initialized to current tick count.
      * A background thread in main.c updates this every ~1ms. */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = GetTickCount();
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = xbox_GuestTickCount();
+
+    /* RECOMP_DEBUG=state_hash: guest RAM is mapped by now. */
+    xbox_GuestStateHashInit();
 
     /* LaunchDataPage (ordinal 164).
      *
@@ -3400,10 +3405,30 @@ static int kernel_vblank_clock_ms(void)
 }
 
 /* The 60 Hz schedule below (either clock); the tick has its own function,
- * kernel_vblank_tick_legacy. */
+ * kernel_vblank_tick_legacy. The virtual clock (guest_time.h) runs the timer
+ * thread's paced loop, so a title on the tick gets its vblanks from the
+ * schedule there: the tick is a 60 Hz approximation, and the virtual clock
+ * must step once per vblank the title sees. */
 static int kernel_vblank_enabled(void)
 {
-    return kernel_vblank_mode() == XBOX_VBLANK_PACED;
+    int m = kernel_vblank_mode();
+
+    return m == XBOX_VBLANK_PACED
+           || (m == XBOX_VBLANK_TICK && xbox_GuestTimeVirtual());
+}
+
+static void kernel_guest_time_publish(void);
+
+/* Virtual time: one period per emulated vblank, before the interrupt is
+ * raised, so the vblank's DPC and every thread it wakes read the new time.
+ * KeTickCount is written here and not only by the 1 ms ack loop, which
+ * would publish it up to a millisecond later, at a host-timed point. */
+static void kernel_guest_time_step(void)
+{
+    if (!xbox_GuestTimeVirtual())
+        return;
+    xbox_GuestTimeVblank();
+    kernel_guest_time_publish();
 }
 
 /* Count one vblank, and once per 600 print the line bench and golden read:
@@ -3417,6 +3442,7 @@ static void kernel_vblank_count(long long now)
     static double gap_min = 1e9, gap_max;
     LARGE_INTEGER q;
 
+    kernel_guest_time_step();
     InterlockedIncrement(&g_vblank_total);
     xbox_Nv2aKickNudge();   /* a flip held for this count may go */
     if (!qf.QuadPart)
@@ -3658,7 +3684,7 @@ static long kernel_vblank_tick(void)
     long long now, due;
     long wait;
 
-    if (!kernel_vblank_enabled())
+    if (!kernel_vblank_enabled() && !xbox_GuestTimeVirtual())
         return 10;
 
     now = kernel_clock_ms();
@@ -3675,11 +3701,15 @@ static long kernel_vblank_tick(void)
             xbox_ProfCount(XBOX_PROF_SCHED_RESTART, now - due);
     }
     count++;
-    kernel_vblank_count(now);
-    xbox_PacingVblank(xbox_HostNowNs());
     wait = (long)(t0 + (long long)(count * 1000ull / 60ull) - now);
     if (wait < 1)
         wait = 1;
+    if (!kernel_vblank_enabled()) {
+        kernel_guest_time_step();    /* the clock runs, no interrupt */
+        return wait;
+    }
+    kernel_vblank_count(now);
+    xbox_PacingVblank(xbox_HostNowNs());
     kernel_vblank_raise();
     return wait;
 }
@@ -3696,10 +3726,15 @@ static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
     uint64_t late;
 
     *next_due_ns = 0;
-    if (!kernel_vblank_enabled())
+    if (!kernel_vblank_enabled() && !xbox_GuestTimeVirtual())
         return 0;
     if (!xbox_VblankSchedule(&sched, now_ns, next_due_ns, &late))
         return 0;
+    if (!kernel_vblank_enabled()) {
+        /* RECOMP_VBLANK off: the virtual clock still steps on the grid. */
+        kernel_guest_time_step();
+        return 0;
+    }
     if (late && xbox_ProfOn())
         xbox_ProfCount(XBOX_PROF_SCHED_RESTART, (long long)(late / 1000000u));
     kernel_vblank_behind(late ? late
@@ -4073,14 +4108,19 @@ static int kernel_timer_paced(void)
 
     if (paced < 0)
         paced = kernel_vblank_mode() == XBOX_VBLANK_PACED
-                || xbox_DispatchGateOn();
+                || xbox_DispatchGateOn()
+                || xbox_GuestTimeVirtual();   /* steps on the 60 Hz grid */
     return paced;
 }
 
 /* The clock the kernel timers' due times are kept on, the same one the loop
- * that fires them reads. */
+ * that fires them reads. With the virtual clock a timer comes due in the
+ * timer thread's pass that steps the clock past it, whatever the host's
+ * speed. */
 static long long kernel_timer_clock_ms(void)
 {
+    if (xbox_GuestTimeVirtual())
+        return (long long)xbox_GuestTimeMs();
     return kernel_timer_paced() ? kernel_clock_ms()
                                 : (long long)GetTickCount64();
 }
@@ -4157,7 +4197,7 @@ static void kernel_timer_loop_ms(void)
         if (kernel_gr_tick())
             wait = 1;
         kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
-        now = kernel_clock_ms();
+        now = kernel_timer_clock_ms();
         kernel_fire_timers(now, &next_due);
         xbox_SpinWake();
     }
@@ -4198,7 +4238,7 @@ static void kernel_timer_loop_ns(void)
         raised = kernel_vblank_tick_ns(xbox_HostNowNs(), &vbl_next);
         gr = kernel_gr_tick();             /* before the drain runs its DPC */
         busy = kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
-        now_ms = kernel_clock_ms();
+        now_ms = kernel_timer_clock_ms();
         fired = kernel_fire_timers(now_ms, &timer_due);
         /* A declined or not-callable vblank ran no DPC, but its PCRTC bits
          * changed all the same. */
@@ -4318,6 +4358,21 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     return 0;
 }
 
+/* The timer thread starts with the first KeSetTimer, or at bridge init when
+ * the virtual clock needs it (xbox_GuestTimeSetStepper): it is the thread
+ * that steps that clock, so a title that waits before it arms a timer, or
+ * never arms one, would otherwise wait on a clock that never moves. Both
+ * callers run one at a time: bridge init before any guest thread, and
+ * KeSetTimer under the guest CPU. */
+static void kernel_timer_start(void)
+{
+    if (g_timer_started)
+        return;
+    InitializeCriticalSection(&g_timer_lock);
+    g_timer_started = 1;
+    CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+}
+
 /* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */
 static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                              long period_ms, uint32_t dpc_va)
@@ -4326,11 +4381,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
-    if (!g_timer_started) {
-        InitializeCriticalSection(&g_timer_lock);
-        g_timer_started = 1;
-        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
-    }
+    kernel_timer_start();
 
     EnterCriticalSection(&g_timer_lock);
     for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -8391,7 +8442,7 @@ static void bridge_MmGlobalData(void)
 static void bridge_KeInterruptTime(void)
 {
     /* Refresh the 100ns-since-boot counter before handing out the pointer. */
-    ULONGLONG t = (ULONGLONG)GetTickCount64() * 10000ull;
+    ULONGLONG t = (ULONGLONG)xbox_GuestInterruptTime();
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 0) = (uint32_t)t;
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 4) = (uint32_t)(t >> 32);
     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME;
@@ -8401,11 +8452,26 @@ static void bridge_KeInterruptTime(void)
 static void bridge_KeSystemTime(void)
 {
     /* Refresh the 100ns-since-1601 clock before handing out the pointer. */
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = ft.dwLowDateTime;
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = ft.dwHighDateTime;
+    ULONGLONG t = (ULONGLONG)xbox_GuestSystemTimeCoarse();
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = (uint32_t)t;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = (uint32_t)(t >> 32);
     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME;
+}
+
+/* Virtual time: the three clock exports as they stand after a step. On a
+ * console the kernel's clock interrupt keeps them current; here they are
+ * written once when the title resolves them, except in virtual mode, where
+ * a frozen value would be the one clock that does not follow the others. */
+static void kernel_guest_time_publish(void)
+{
+    uint64_t it = xbox_GuestInterruptTime();
+    uint64_t st = xbox_GuestSystemTime();
+
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT) = xbox_GuestTickCount();
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 4) = (uint32_t)(it >> 32);
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 0) = (uint32_t)it;
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = (uint32_t)(st >> 32);
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = (uint32_t)st;
 }
 
 /* --- ObDirectoryObjectType (ordinal 240, 0 args) --- */
@@ -11965,4 +12031,6 @@ void xbox_kernel_bridge_init(void)
     fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
 
+    /* Virtual time: start the clock's stepper now (a no-op in real mode). */
+    xbox_GuestTimeSetStepper(kernel_timer_start);
 }

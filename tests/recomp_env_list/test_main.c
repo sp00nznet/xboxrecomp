@@ -67,6 +67,25 @@ static void test_comma_values(void)
     CHECK(noted("unknown key 'BB'"));
 }
 
+/* The state hash's lists (guest_state_hash.h): a switch after one ends it,
+ * and a list key after another list starts its own. */
+static void test_state_hash_lists(void)
+{
+    load_debug("state_hash_skip=a-b,c-d,deterministic");
+    CHECK(streq(recomp_env(RENV_STATE_HASH_SKIP), "a-b,c-d"));
+    CHECK(recomp_env_on(RENV_DETERMINISTIC));
+    CHECK(!noted("unknown key"));
+
+    load_debug("state_dump=5,10");
+    CHECK(streq(recomp_env(RENV_STATE_DUMP), "5,10"));
+    CHECK(!noted("unknown key"));
+
+    load_debug("pad_script=@f,state_dump=1,2");
+    CHECK(streq(recomp_env(RENV_PAD_SCRIPT), "@f"));
+    CHECK(streq(recomp_env(RENV_STATE_DUMP), "1,2"));
+    CHECK(!noted("unknown key"));
+}
+
 static void test_later_wins(void)
 {
     load_debug("pb_fast=1,pb_fast=0");
@@ -94,6 +113,7 @@ static void test_comma_keys_exist(void)
 int main(void)
 {
     test_comma_values();
+    test_state_hash_lists();
     test_later_wins();
     test_comma_keys_exist();
     load_debug(NULL);

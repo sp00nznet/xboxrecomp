@@ -15,6 +15,7 @@
  */
 
 #include "kernel.h"
+#include "guest_time.h"
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -44,7 +45,7 @@ static DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
 
     /* Absolute: compute delta from now */
     LARGE_INTEGER now;
-    GetSystemTimeAsFileTime((LPFILETIME)&now);
+    now.QuadPart = (LONGLONG)xbox_GuestSystemTimeCoarse();
     LONGLONG diff = Timeout->QuadPart - now.QuadPart;
     if (diff <= 0)
         return 0;
@@ -199,8 +200,34 @@ static NTSTATUS xbox_wait_result_to_ntstatus(DWORD result, ULONG count)
  * without a context switch on the console, so a time-critical holder keeps
  * the guest CPU through it. Poll first, and say the call blocks only when
  * it is about to. */
-static DWORD sync_wait_one(HANDLE h, DWORD ms, BOOL alertable)
+/* Virtual time (guest_time.h): a timed wait ends when the guest clock
+ * reaches its due time, not when the host's milliseconds run out, so a
+ * timeout lands on the same vblank on every run. It waits in 1 ms host
+ * slices and checks the clock between them; the object still ends it at
+ * once. Returns 0 (no virtual wait: untimed, zero or real mode) or the due
+ * time on the interrupt-time clock. */
+static uint64_t sync_virtual_due(PLARGE_INTEGER Timeout)
 {
+    if (!Timeout || Timeout->QuadPart == 0 || !xbox_GuestTimeVirtual())
+        return 0;
+    return xbox_GuestTimeDue(Timeout->QuadPart) | 1;   /* never 0 */
+}
+
+static DWORD sync_wait_one(HANDLE h, DWORD ms, BOOL alertable, uint64_t due)
+{
+    if (due) {
+        DWORD r = WaitForSingleObjectEx(h, 0, alertable);
+        if (r != WAIT_TIMEOUT)
+            return r;
+        if (xbox_GuestSchedOn())
+            xbox_GuestCpuBlocked();
+        while (!xbox_GuestTimeReached(due)) {
+            r = WaitForSingleObjectEx(h, 1, alertable);
+            if (r != WAIT_TIMEOUT)
+                return r;
+        }
+        return WAIT_TIMEOUT;
+    }
     if (ms && xbox_GuestSchedOn()) {
         DWORD r = WaitForSingleObjectEx(h, 0, alertable);
         if (r != WAIT_TIMEOUT)
@@ -211,8 +238,21 @@ static DWORD sync_wait_one(HANDLE h, DWORD ms, BOOL alertable)
 }
 
 static DWORD sync_wait_many(DWORD n, const HANDLE *h, BOOL all, DWORD ms,
-                            BOOL alertable)
+                            BOOL alertable, uint64_t due)
 {
+    if (due) {
+        DWORD r = WaitForMultipleObjectsEx(n, h, all, 0, alertable);
+        if (r != WAIT_TIMEOUT)
+            return r;
+        if (xbox_GuestSchedOn())
+            xbox_GuestCpuBlocked();
+        while (!xbox_GuestTimeReached(due)) {
+            r = WaitForMultipleObjectsEx(n, h, all, 1, alertable);
+            if (r != WAIT_TIMEOUT)
+                return r;
+        }
+        return WAIT_TIMEOUT;
+    }
     if (ms && xbox_GuestSchedOn()) {
         DWORD r = WaitForMultipleObjectsEx(n, h, all, 0, alertable);
         if (r != WAIT_TIMEOUT)
@@ -228,7 +268,7 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObject(
     PLARGE_INTEGER Timeout)
 {
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = sync_wait_one(Handle, ms, Alertable);
+    DWORD result = sync_wait_one(Handle, ms, Alertable, sync_virtual_due(Timeout));
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -248,7 +288,7 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
      */
     (void)WaitMode;
 
-    result = sync_wait_one(Handle, ms, Alertable);
+    result = sync_wait_one(Handle, ms, Alertable, sync_virtual_due(Timeout));
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -266,7 +306,8 @@ NTSTATUS __stdcall xbox_NtWaitForMultipleObjectsEx(
     /* WaitType: 0 = WaitAll, 1 = WaitAny (matches NT definitions) */
     bWaitAll = (WaitType == 0) ? TRUE : FALSE;
 
-    result = sync_wait_many(Count, Handles, bWaitAll, ms, Alertable);
+    result = sync_wait_many(Count, Handles, bWaitAll, ms, Alertable,
+                            sync_virtual_due(Timeout));
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 
@@ -287,7 +328,7 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
 
     HANDLE hObject = (HANDLE)Object;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
-    DWORD result = sync_wait_one(hObject, ms, Alertable);
+    DWORD result = sync_wait_one(hObject, ms, Alertable, sync_virtual_due(Timeout));
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -310,7 +351,7 @@ NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(
 
     /* Objects[] is an array of PVOID which we treat as HANDLE[] */
     DWORD result = sync_wait_many(Count, (HANDLE*)Objects, bWaitAll, ms,
-                                  Alertable);
+                                  Alertable, sync_virtual_due(Timeout));
     return xbox_wait_result_to_ntstatus(result, Count);
 }
 
@@ -447,7 +488,7 @@ BOOLEAN __stdcall xbox_KeSetTimerEx(
         due_ms = 0;
     } else {
         LARGE_INTEGER now;
-        GetSystemTimeAsFileTime((LPFILETIME)&now);
+        now.QuadPart = (LONGLONG)xbox_GuestSystemTimeCoarse();
         LONGLONG diff = DueTime.QuadPart - now.QuadPart;
         due_ms = (diff > 0) ? (DWORD)(diff / 10000) : 0;
     }

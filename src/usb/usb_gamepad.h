@@ -78,6 +78,11 @@ typedef struct {
 } UsbPadSource;
 
 void usb_gamepad_set_source(const UsbPadSource *src);
+
+/* Called at the end of every port-0 poll with that poll's number (the g<poll>
+ * clock), on the polling thread, before the clock moves on. One hook; NULL
+ * removes it. The guest state hash (kernel guest_state_hash.c) uses it. */
+void usb_gamepad_set_poll_hook(void (*fn)(uint32_t poll));
 const UsbPadSource *usb_gamepad_source(void);
 
 /* With a source: the pads that should be plugged in now -- the source's,

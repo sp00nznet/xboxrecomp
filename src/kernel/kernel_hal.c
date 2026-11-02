@@ -17,6 +17,7 @@
 #include "recomp_env.h"
 #include "recomp_regs.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
+#include "guest_time.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1030,7 +1031,6 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
  *
  * Exported as a data pointer, not a function. The Xbox kernel increments
  * this every ~1ms (approximating the Xbox tick interval).
- * Updated lazily when read, using GetTickCount.
  * ============================================================================ */
 
 volatile ULONG xbox_KeTickCount = 0;
@@ -1038,87 +1038,38 @@ volatile ULONG xbox_KeTickCount = 0;
 /* Call this periodically or on-demand to update KeTickCount */
 static void xbox_update_tick_count(void)
 {
-    xbox_KeTickCount = GetTickCount();
+    xbox_KeTickCount = xbox_GuestTickCount();
 }
 
 /* ============================================================================
- * Performance Counters
+ * Performance Counters and System Time
  *
- * Direct 1:1 mapping to Win32 QueryPerformanceCounter/Frequency.
- * Both Xbox and Windows return LARGE_INTEGER.
+ * Every clock the guest reads comes from guest_time.c, which maps them to the
+ * host (or, in deterministic mode, to the vblank count).
  * ============================================================================ */
 
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
 {
     LARGE_INTEGER counter;
-    QueryPerformanceCounter(&counter);
+    counter.QuadPart = xbox_GuestPerfCounter();
     return counter;
 }
 
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceFrequency(void)
 {
     LARGE_INTEGER freq;
-    QueryPerformanceFrequency(&freq);
+    freq.QuadPart = xbox_GuestPerfFrequency();
     return freq;
 }
 
-/* ============================================================================
- * System Time
- *
- * KeQuerySystemTime returns the current time as a FILETIME (100ns since
- * January 1, 1601). Direct Win32 mapping.
- * ============================================================================ */
-
-static LONGLONG s_time_anchor_100ns;
-static LONGLONG s_time_anchor_counts;
-static LONGLONG s_time_freq_counts;
-static INIT_ONCE s_time_once = INIT_ONCE_STATIC_INIT;
-
-static BOOL CALLBACK anchor_system_time(PINIT_ONCE once, PVOID param, PVOID *ctx)
-{
-    FILETIME ft;
-    LARGE_INTEGER f, now;
-    (void)once; (void)param; (void)ctx;
-    QueryPerformanceFrequency(&f);
-    GetSystemTimeAsFileTime(&ft);
-    QueryPerformanceCounter(&now);
-    s_time_freq_counts = f.QuadPart ? f.QuadPart : 1;
-    s_time_anchor_100ns = ((LONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-    s_time_anchor_counts = now.QuadPart;
-    return TRUE;
-}
-
+/* KeQuerySystemTime returns the current time as a FILETIME (100ns since
+ * January 1, 1601). guest_time.c says why it is anchored once and advanced
+ * by the performance counter. */
 VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
 {
-    /* Anchored once to the wall clock, advanced by the performance counter.
-     *
-     * GetSystemTimeAsFileTime alone moves in steps of about 15.6 ms, the
-     * host's scheduler tick. The console's clock is far finer, and a title
-     * that busy-waits on this -- reading it until enough time has passed --
-     * spins for the whole of each step instead of a few iterations.
-     *
-     * Measured on Shin Megami Tensei: Nine: one such wait called this
-     * **11.8 million times in two seconds**, which is most of what the
-     * title was doing at that moment, and it came out of the spin in a
-     * state where it no longer polled the gamepad.
-     *
-     * The anchor keeps the absolute value right; the counter supplies the
-     * resolution between ticks.
-     *
-     * Whole seconds and the remainder are scaled separately: scaling the
-     * whole count by 10^7 overflows after about a day at 10 MHz. */
-    LARGE_INTEGER now;
-    LONGLONG delta;
-
     if (!CurrentTime)
         return;
-
-    InitOnceExecuteOnce(&s_time_once, anchor_system_time, NULL, NULL);
-    QueryPerformanceCounter(&now);
-    delta = now.QuadPart - s_time_anchor_counts;
-    CurrentTime->QuadPart = s_time_anchor_100ns
-        + (delta / s_time_freq_counts) * 10000000LL
-        + (delta % s_time_freq_counts) * 10000000LL / s_time_freq_counts;
+    CurrentTime->QuadPart = (LONGLONG)xbox_GuestSystemTime();
 }
 
 /* ============================================================================
@@ -1414,7 +1365,7 @@ VOID __stdcall xbox_WRITE_PORT_BUFFER_USHORT(PUSHORT Port, PUSHORT Buffer, ULONG
 NTSTATUS __stdcall xbox_NtSetSystemTime(PLARGE_INTEGER SystemTime, PLARGE_INTEGER PreviousTime)
 {
     if (PreviousTime)
-        GetSystemTimeAsFileTime((LPFILETIME)PreviousTime);
+        PreviousTime->QuadPart = (LONGLONG)xbox_GuestSystemTimeCoarse();
 
     xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
         "NtSetSystemTime: ignored (not setting system clock)");
@@ -1771,57 +1722,12 @@ VOID __stdcall xbox_DbgBreakPoint(void)
 
 ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
 {
-    /*
-     * Time since boot in NT 100ns units. GetTickCount64 is milliseconds, so
-     * scale by 10,000. Resolution is coarser than the real kernel's, but it is
-     * monotonic, which is the property callers actually depend on.
-     */
-    return (ULONGLONG)GetTickCount64() * 10000ULL;
+    /* Time since boot in NT 100ns units (guest_time.c). */
+    return (ULONGLONG)xbox_GuestInterruptTime();
 }
 
-/* ============================================================================
- * Time stamp counter
- *
- * Xbox's QueryPerformanceCounter is a bare `rdtsc`, and its
- * QueryPerformanceFrequency returns the CPU clock as a constant the title
- * compiles in: Half-Life 2's is 0x2BB5C755 (733,333,333 Hz) at 0x0059C6C7.
- * So a frame timer computes seconds as counter / 733333333.
- *
- * Returning the host's own TSC would make that division wrong by the ratio of
- * the two clocks -- a 3.5 GHz host would have the guest believe nearly five
- * seconds had passed for every real one. Scaling the host's performance
- * counter to the console's rate keeps the guest's arithmetic honest.
- *
- * Monotonic and shared by every thread, which is what a TSC is. The first
- * call establishes the origin so the counter starts near zero rather than at
- * whatever the host had been running for.
- * ========================================================================= */
-#define XBOX_TSC_HZ 733333333ull
-
-uint64_t xbox_ReadTimeStampCounter(void)
-{
-    static LARGE_INTEGER freq;
-    static LARGE_INTEGER origin;
-    LARGE_INTEGER now;
-
-    if (freq.QuadPart == 0) {
-        QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&origin);
-        if (freq.QuadPart == 0)
-            freq.QuadPart = 1;
-    }
-    QueryPerformanceCounter(&now);
-
-    {
-        uint64_t ticks = (uint64_t)(now.QuadPart - origin.QuadPart);
-        /* Split the scaling so a long run cannot overflow: whole seconds
-         * first, then the remainder. */
-        uint64_t secs = ticks / (uint64_t)freq.QuadPart;
-        uint64_t rem  = ticks % (uint64_t)freq.QuadPart;
-        return secs * XBOX_TSC_HZ
-             + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart;
-    }
-}
+/* xbox_ReadTimeStampCounter, the rdtsc helper, lives in guest_time.c with
+ * every other clock the guest reads. */
 
 /* =========================================================================
  * x86 port I/O

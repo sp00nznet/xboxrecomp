@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "guest_time.h"
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
 #include "recomp_env.h"           /* RECOMP_GUEST_CPUS, guest_priority */
 #include "platform/host_time.h"   /* xbox_HostUnderWine */
@@ -183,6 +184,26 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         return STATUS_SUCCESS;
     }
 
+    if (xbox_GuestTimeVirtual()) {
+        /* Virtual time (guest_time.h): sleep in 1 ms host slices until the
+         * guest clock passes the due time, so the delay ends on the same
+         * vblank on every run. */
+        uint64_t due = xbox_GuestTimeDue(Interval->QuadPart);
+
+        if (xbox_GuestTimeReached(due))
+            return STATUS_SUCCESS;
+        xbox_GuestCpuBlocked();
+        while (!xbox_GuestTimeReached(due)) {
+            if (Alertable) {
+                if (SleepEx(1, TRUE) == WAIT_IO_COMPLETION)
+                    return STATUS_ALERTED;
+            } else {
+                Sleep(1);
+            }
+        }
+        return STATUS_SUCCESS;
+    }
+
     if (Interval->QuadPart < 0) {
         /* Negative = relative time in 100ns units. Convert to milliseconds. */
         LONGLONG relative_100ns = -Interval->QuadPart;
@@ -193,7 +214,7 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
     } else {
         /* Positive = absolute time. Calculate relative delay from now. */
         LARGE_INTEGER now;
-        GetSystemTimeAsFileTime((LPFILETIME)&now);
+        now.QuadPart = (LONGLONG)xbox_GuestSystemTimeCoarse();
         LONGLONG diff = Interval->QuadPart - now.QuadPart;
         if (diff <= 0)
             return STATUS_SUCCESS; /* Already past */

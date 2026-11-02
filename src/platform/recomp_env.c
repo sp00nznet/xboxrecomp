@@ -91,7 +91,7 @@ void recomp_env_flush_notes(void)
 static const char *const s_comma_keys[] = {
     "peek", "peek_chain", "px", "px_consts", "dsp_ack", "apu_dsp_ack",
     "poke", "fb_dump_at", "window_shot", "pad_script", "vsh_const_prog",
-    "fb_dump_prog", "opts_at", "mod_set_at",
+    "fb_dump_prog", "opts_at", "mod_set_at", "state_hash_skip", "state_dump",
 #ifdef RECOMP_ENV_GAME_COMMA_KEYS
     RECOMP_ENV_GAME_COMMA_KEYS
 #endif

@@ -1007,11 +1007,22 @@ static uint32_t script_at(uint32_t flip, uint32_t polls)
     return s_script_poll ? polls : flip;
 }
 
+static void (*volatile s_poll_hook)(uint32_t poll);
+
+void usb_gamepad_set_poll_hook(void (*fn)(uint32_t poll))
+{
+    s_poll_hook = fn;
+}
+
 /* A port-0 poll is over: the poll clock moves on. */
 static void poll_done(int pad)
 {
-    if (pad == 0)
+    if (pad == 0) {
+        void (*hook)(uint32_t) = s_poll_hook;
+        if (hook)
+            hook(s_polls);
         s_polls = s_polls + 1;
+    }
 }
 
 int usb_gamepad_report(int pad, uint8_t *out, int max)
