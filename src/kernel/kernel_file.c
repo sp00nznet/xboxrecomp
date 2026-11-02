@@ -19,6 +19,7 @@
 #endif
 #include "kernel.h"
 #include "kernel_ramfs.h"
+#include "guest_det_device.h"
 #include <stddef.h>
 #include <string.h>
 #include <stdio.h>
@@ -70,6 +71,33 @@ uint32_t g_xbox_last_file_error;
 uint32_t xbox_LastFileError(void)
 {
     return g_xbox_last_file_error;
+}
+
+/* The deterministic mode's fixed file times (XBOX_DET_FILETIME). */
+static void det_file_times(LARGE_INTEGER *c, LARGE_INTEGER *a,
+                           LARGE_INTEGER *w, LARGE_INTEGER *ch)
+{
+    if (!xbox_GuestDetOn())
+        return;
+    c->QuadPart = a->QuadPart = w->QuadPart = ch->QuadPart = XBOX_DET_FILETIME;
+}
+
+/* FileFsSizeInformation in the deterministic mode (kernel_guest_det.c).
+ *
+ * The free space is the host disk's, which moves as anything on the host
+ * writes, and a title may keep it in guest memory (a global, or a value
+ * left on a stack), so two runs of the same input would differ there. The
+ * mode reports the fallback geometry instead (16 GB, half free), the same
+ * on every host and run. Returns 1 when it filled the answer. */
+static int fs_size_pinned(PXBOX_FILE_FS_SIZE_INFORMATION info)
+{
+    if (!xbox_GuestDetOn())
+        return 0;
+    info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+    info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+    info->TotalAllocationUnits.QuadPart = 1048576;
+    info->AvailableAllocationUnits.QuadPart = 524288;
+    return 1;
 }
 
 /* FileFsVolumeInformation, shared by every backend.
@@ -531,6 +559,8 @@ static NTSTATUS host_NtQueryInformationFile(
             info->LastWriteTime.LowPart   = fi.ftLastWriteTime.dwLowDateTime;
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
             info->ChangeTime = info->LastWriteTime;
+            det_file_times(&info->CreationTime, &info->LastAccessTime,
+                           &info->LastWriteTime, &info->ChangeTime);
             info->FileAttributes = fi.dwFileAttributes;
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_BASIC_INFORMATION);
@@ -591,6 +621,8 @@ static NTSTATUS host_NtQueryInformationFile(
             info->LastWriteTime.LowPart   = fi.ftLastWriteTime.dwLowDateTime;
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
             info->ChangeTime = info->LastWriteTime;
+            det_file_times(&info->CreationTime, &info->LastAccessTime,
+                           &info->LastWriteTime, &info->ChangeTime);
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
             info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->FileAttributes = fi.dwFileAttributes;
@@ -726,7 +758,9 @@ static NTSTATUS host_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
-            if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
+            if (fs_size_pinned(info)) {
+                /* the deterministic mode's fixed answer */
+            } else if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
@@ -785,6 +819,10 @@ static NTSTATUS host_NtQueryFullAttributesFile(
     FileInformation->LastWriteTime.LowPart   = fad.ftLastWriteTime.dwLowDateTime;
     FileInformation->LastWriteTime.HighPart  = fad.ftLastWriteTime.dwHighDateTime;
     FileInformation->ChangeTime = FileInformation->LastWriteTime;
+    det_file_times(&FileInformation->CreationTime,
+                   &FileInformation->LastAccessTime,
+                   &FileInformation->LastWriteTime,
+                   &FileInformation->ChangeTime);
     FileInformation->EndOfFile.QuadPart = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
     FileInformation->AllocationSize.QuadPart = (FileInformation->EndOfFile.QuadPart + 4095) & ~4095LL;
     FileInformation->FileAttributes = fad.dwFileAttributes;
@@ -940,6 +978,8 @@ static NTSTATUS host_NtQueryDirectoryFile(
     entry->LastWriteTime.LowPart  = ctx->find_data.ftLastWriteTime.dwLowDateTime;
     entry->LastWriteTime.HighPart = ctx->find_data.ftLastWriteTime.dwHighDateTime;
     entry->ChangeTime = entry->LastWriteTime;
+    det_file_times(&entry->CreationTime, &entry->LastAccessTime,
+                   &entry->LastWriteTime, &entry->ChangeTime);
     entry->EndOfFile.QuadPart = ((LONGLONG)ctx->find_data.nFileSizeHigh << 32) | ctx->find_data.nFileSizeLow;
     entry->AllocationSize.QuadPart = (entry->EndOfFile.QuadPart + 4095) & ~4095LL;
     entry->FileAttributes = ctx->find_data.dwFileAttributes;
@@ -1418,6 +1458,8 @@ static NTSTATUS host_NtQueryInformationFile(
             unix_to_filetime(st.st_atime, 0, &info->LastAccessTime);
             unix_to_filetime(st.st_mtime, 0, &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
+            det_file_times(&info->CreationTime, &info->LastAccessTime,
+                           &info->LastWriteTime, &info->ChangeTime);
             info->FileAttributes = mode_to_xbox_attrs(st.st_mode);
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_BASIC_INFORMATION);
@@ -1463,6 +1505,8 @@ static NTSTATUS host_NtQueryInformationFile(
             unix_to_filetime(st.st_atime, 0, &info->LastAccessTime);
             unix_to_filetime(st.st_mtime, 0, &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
+            det_file_times(&info->CreationTime, &info->LastAccessTime,
+                           &info->LastWriteTime, &info->ChangeTime);
             info->EndOfFile.QuadPart = st.st_size;
             info->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
             info->FileAttributes = mode_to_xbox_attrs(st.st_mode);
@@ -1650,7 +1694,9 @@ static NTSTATUS host_NtQueryVolumeInformationFile(
              * XBOX_SECTORS_PER_CLUSTER above. */
             info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
             info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
-            if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
+            if (fs_size_pinned(info)) {
+                /* the deterministic mode's fixed answer */
+            } else if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
                 ULONGLONG avail = (ULONGLONG)vfs.f_bavail * vfs.f_frsize;
@@ -1700,6 +1746,10 @@ static NTSTATUS host_NtQueryFullAttributesFile(
     unix_to_filetime(st.st_atime, 0, &FileInformation->LastAccessTime);
     unix_to_filetime(st.st_mtime, 0, &FileInformation->LastWriteTime);
     FileInformation->ChangeTime = FileInformation->LastWriteTime;
+    det_file_times(&FileInformation->CreationTime,
+                   &FileInformation->LastAccessTime,
+                   &FileInformation->LastWriteTime,
+                   &FileInformation->ChangeTime);
     FileInformation->EndOfFile.QuadPart = st.st_size;
     FileInformation->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
     FileInformation->FileAttributes = mode_to_xbox_attrs(st.st_mode);
@@ -1824,6 +1874,8 @@ static NTSTATUS host_NtQueryDirectoryFile(
     unix_to_filetime(st.st_atime, 0, &entry->LastAccessTime);
     unix_to_filetime(st.st_mtime, 0, &entry->LastWriteTime);
     entry->ChangeTime = entry->LastWriteTime;
+    det_file_times(&entry->CreationTime, &entry->LastAccessTime,
+                   &entry->LastWriteTime, &entry->ChangeTime);
     entry->EndOfFile.QuadPart = st.st_size;
     entry->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
     entry->FileAttributes = mode_to_xbox_attrs(st.st_mode);

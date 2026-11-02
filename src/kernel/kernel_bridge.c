@@ -493,6 +493,7 @@ static int bridge_file_apc_defer(void)
 struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top, routine, obj_va, tls_size;
+    uint32_t tib;   /* 0: the new thread takes its own at its start */
 };
 
 /* Lay out a thread's TLS the way the Xbox kernel does.
@@ -646,6 +647,7 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h);
 static uint32_t s_thobj_va[THOBJ_MAX];     /* 0 = slot never carved */
 static LONG     s_thobj_refs[THOBJ_MAX];   /* 0 = free */
 static uint32_t s_thobj_count;             /* slots carved so far */
+static HANDLE   s_thobj_end_ev[THOBJ_MAX]; /* deterministic mode: set at the end */
 static uint32_t s_token_thobj[16384];      /* token index -> object VA */
 static volatile LONG s_thobj_lock;
 static RECOMP_TLS uint32_t g_thread_obj_va;
@@ -695,6 +697,12 @@ static uint32_t thobj_alloc(void)
     if (i < s_thobj_count) {
         va = s_thobj_va[i];
         s_thobj_refs[i] = 1;
+        if (xbox_GuestDetOn()) {
+            if (!s_thobj_end_ev[i])
+                s_thobj_end_ev[i] = CreateEventA(NULL, TRUE, FALSE, NULL);
+            else
+                ResetEvent(s_thobj_end_ev[i]);
+        }
     }
     thobj_unlock();
 
@@ -748,7 +756,45 @@ static void thobj_exit(uint32_t va, uint32_t status)
         return;
     BRIDGE_MEM32(va + THOBJ_EXIT_STATUS) = status;
     InterlockedExchange((volatile LONG *)XBOX_TO_NATIVE(va + THOBJ_SIGNAL), 1);
+    if (xbox_GuestDetOn()) {
+        int s;
+
+        thobj_lock();
+        s = thobj_slot(va);
+        thobj_unlock();
+        if (s >= 0 && s_thobj_end_ev[s])
+            SetEvent(s_thobj_end_ev[s]);
+    }
     thobj_unref(va);
+}
+
+/* What a wait on a thread waits on in the deterministic mode: an event set
+ * with SignalState, under the token, instead of the host thread handle,
+ * which is signalled only once the host thread has left the ring and so at
+ * a host-timed pass (the wait-side twin of D15's GetExitCodeThread poll).
+ * NULL when the mode is off or va is not a thread object. */
+static HANDLE thobj_det_wait_handle(uint32_t va)
+{
+    HANDLE h = NULL;
+    int s;
+
+    if (!va || !xbox_GuestDetOn())
+        return NULL;
+    thobj_lock();
+    s = thobj_slot(va);
+    if (s >= 0 && s_thobj_refs[s] > 0)
+        h = s_thobj_end_ev[s];
+    thobj_unlock();
+    return h;
+}
+
+/* A worker's end: its stack back to the pool, then its object signalled. */
+static void bridge_thread_end(uint32_t status)
+{
+    xbox_FreeThreadStack(g_thread_stack_top);
+    g_thread_stack_top = 0;
+    thobj_exit(g_thread_obj_va, status);
+    g_thread_obj_va = 0;
 }
 
 /* Handle tokens that lead to a thread object. */
@@ -773,6 +819,17 @@ static uint32_t thobj_from_token(uint32_t token)
     if ((token & 0xFF000000u) != 0x48000000u || !i || i >= 16384)
         return 0;
     return s_token_thobj[i];
+}
+
+static HANDLE bridge_resolve_handle(uint32_t token);
+
+/* A wait target given as a handle token: the thread's end event in the
+ * deterministic mode, else the token's host handle. */
+static HANDLE bridge_resolve_wait(uint32_t token)
+{
+    HANDLE h = thobj_det_wait_handle(thobj_from_token(token));
+
+    return h ? h : bridge_resolve_handle(token);
 }
 
 static void thobj_detach_token(uint32_t token)
@@ -836,6 +893,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
+    int det;
 
     xbox_log_thread_role("guest-worker", s->routine);
 
@@ -850,7 +908,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     g_thread_stack_top = s->stack_top;
     g_thread_obj_va = s->obj_va;
     {
-        uint32_t tib = xbox_AllocThreadTib();
+        uint32_t tib = s->tib ? s->tib : xbox_AllocThreadTib();
         if (tib)
             g_fs_base = tib;
         else
@@ -880,18 +938,21 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     xbox_GuestSchedBind(g_thread_obj_va);
     guest_cpu_join();
     bridge_run_thread_inline(fn, ctx1, ctx2);
-    guest_cpu_part();
+    /* In the deterministic mode the end is published while the thread still
+     * holds the guest CPU, so the others see it at the same pass every run
+     * (bridge_thread_end). */
+    det = xbox_GuestDetOn();
+    if (!det)
+        guest_cpu_part();
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
     /* The routine returned instead of calling PsTerminateSystemThread; the
-     * stack is still ours to give back. */
-    xbox_FreeThreadStack(g_thread_stack_top);
-    g_thread_stack_top = 0;
-    /* The kernel's thread startup ends a returning routine with
-     * PsTerminateSystemThread(STATUS_SUCCESS). */
-    thobj_exit(g_thread_obj_va, 0);
-    g_thread_obj_va = 0;
+     * stack is still ours to give back. The kernel's thread startup ends a
+     * returning routine with PsTerminateSystemThread(STATUS_SUCCESS). */
+    bridge_thread_end(0);
+    if (det)
+        guest_cpu_part();
     return 0;
 }
 
@@ -908,9 +969,18 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     s->routine = routine;
     s->obj_va = obj_va;
     s->tls_size = tls_size;
+    /* In the deterministic ring the creator carves the TIB, in creation
+     * order: taken from the heap at the host thread's start, two workers
+     * created in one window got each other's address from one run to the
+     * next, and every pointer to their TIBs and stacks with them. */
+    s->tib = xbox_GuestDetOn() ? xbox_AllocThreadTib() : 0;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
-    if (!th) free(s);
+    if (!th) {
+        if (s->tib)
+            xbox_HeapFree(s->tib);
+        free(s);
+    }
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
      * spawn workers too, but never read it back. See kernel_thread.c. */
@@ -953,6 +1023,10 @@ static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
     uint32_t obj = thobj_alloc();
     HANDLE th, shadow = NULL;
 
+    /* Its place in the deterministic ring is taken here, by the creator,
+     * not at the host thread's start. */
+    xbox_GuestDetThreadNew(obj);
+
     /* CreateSuspended: the host thread starts at once, as it always has;
      * with guest_sched the guest CPU holds it at its join until the title
      * resumes it (JSRF's ADX spinner sub_0013B180 must not run before its
@@ -970,6 +1044,9 @@ static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
     th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, routine, obj, tls_size);
     if (!th) {
         thobj_unref(obj);   /* the thread's own: it never ran */
+        /* Its ring slot too: a NEW slot counts as runnable, and the token
+         * handed to a thread that never joins would wait for good. */
+        xbox_GuestDetThreadDrop(obj);
     } else {
         if (obj && DuplicateHandle(GetCurrentProcess(), th, GetCurrentProcess(),
                                    &shadow, 0, FALSE, DUPLICATE_SAME_ACCESS))
@@ -2305,7 +2382,9 @@ static void bridge_KeWaitForSingleObject(void)
         }
     }
 
-    h = ke_shadow_lookup(object);
+    h = thobj_det_wait_handle(object);
+    if (!h)
+        h = ke_shadow_lookup(object);
     if (!h)
         h = bridge_resolve_handle(object);
     if (!h)
@@ -2325,7 +2404,7 @@ static void bridge_KeWaitForSingleObject(void)
  */
 static void bridge_NtWaitForSingleObject(void)
 {
-    HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
+    HANDLE   handle      = bridge_resolve_wait(STACK_ARG(0));
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
 
@@ -2383,7 +2462,7 @@ static HANDLE bridge_resolve_handle(uint32_t token);
 
 static void bridge_NtWaitForSingleObjectEx(void)
 {
-    HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
+    HANDLE   handle      = bridge_resolve_wait(STACK_ARG(0));
     uint32_t wait_mode   = STACK_ARG(1);
     uint32_t alertable   = STACK_ARG(2);
     uint32_t timeout_ptr = STACK_ARG(3);
@@ -2463,7 +2542,7 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     apc = bridge_user_apc_pending(wait_mode, alertable);
     timeout = bridge_user_apc_timeout(apc, timeout_ptr, &zero);
     for (i = 0; i < count; i++)
-        handles[i] = bridge_resolve_handle(BRIDGE_MEM32(handles_va + i * 4));
+        handles[i] = bridge_resolve_wait(BRIDGE_MEM32(handles_va + i * 4));
 
     {
         static int logged;
@@ -2737,12 +2816,15 @@ static void bridge_PsTerminateSystemThread(void)
         /* The normal exit for a worker, and therefore the one that has to
          * return the stack -- ExitThread never comes back to bridge_thread_main
          * to do it. */
-        xbox_FreeThreadStack(g_thread_stack_top);
-        g_thread_stack_top = 0;
-        thobj_exit(g_thread_obj_va, exit_status);
-        g_thread_obj_va = 0;
+        bridge_thread_end(exit_status);
+        /* The deterministic mode kept the guest CPU through this call
+         * (xbox_GuestCpuRelease) so the end above lands at a fixed pass. */
+        if (xbox_GuestDetOn())
+            guest_cpu_part();
         ExitThread(exit_status);
     }
+    if (xbox_GuestDetOn())
+        guest_cpu_part();
 }
 
 /* ── HalReadSMCTrayState (ordinal 47) ─────────────────────
@@ -4266,6 +4348,34 @@ static void kernel_timer_loop_ns(void)
     }
 }
 
+/* The deterministic mode's loop (xbox_GuestDetOn): no host schedule. A pass
+ * runs only when the guest ring grants one, which it does when every guest
+ * thread is idle in a virtual wait (kernel_guest_det.c), so each vblank and
+ * each virtual millisecond lands at the same point of guest progress on
+ * every run. One pass is one vblank: the time step, its interrupt, then
+ * the DPCs and timers it made due. */
+static void kernel_timer_loop_det(void)
+{
+    for (;;) {
+        long long timer_due;
+        int ran;
+
+        xbox_GuestDetDeviceWait(XBOX_DET_DEV_TIMER);
+        if (kernel_vblank_enabled()) {
+            kernel_vblank_count(kernel_clock_ms());
+            kernel_vblank_raise();
+        } else {
+            kernel_guest_time_step();
+        }
+        kernel_gr_tick();
+        kernel_drain_dpcs(&ran);
+        kernel_fire_timers(kernel_timer_clock_ms(), &timer_due);
+        kernel_drain_dpcs(&ran);
+        xbox_SpinWake();
+        xbox_GuestDetDeviceDone(XBOX_DET_DEV_TIMER, 1);
+    }
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -4294,6 +4404,10 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    if (xbox_GuestDetOn()) {
+        kernel_timer_loop_det();
+        return 0;
+    }
     if (!kernel_timer_paced()) {
         /* Neither the 60 Hz vblank nor the gate: the 10 ms tick, the
          * vblank tick when RECOMP_VBLANK asks for it, DPCs before due
@@ -4370,6 +4484,8 @@ static void kernel_timer_start(void)
         return;
     InitializeCriticalSection(&g_timer_lock);
     g_timer_started = 1;
+    if (xbox_GuestDetOn())
+        xbox_GuestDetDeviceAdd(XBOX_DET_DEV_TIMER);
     CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
 }
 
@@ -6267,7 +6383,7 @@ static uint32_t bridge_sched_target(uint32_t arg, int *self)
     uint32_t obj;
 
     *self = 0;
-    if (!xbox_GuestSchedOn())
+    if (!xbox_GuestSchedOn() && !xbox_GuestDetOn())
         return 0;
     if (arg == 0xFFFFFFFEu) {
         *self = 1;
@@ -6288,11 +6404,16 @@ static uint32_t bridge_sched_target(uint32_t arg, int *self)
 }
 
 /* A self-suspend parks on the host for as long as another thread wants: the
- * guest CPU let go of at the call is free for any level meanwhile. */
-static void bridge_sched_self_suspend(int self)
+ * guest CPU let go of at the call is free for any level meanwhile. In the
+ * deterministic ring it is counted and parks there instead (a host suspend
+ * would keep the token): 1 then, with *prev the count before. */
+static int bridge_sched_self_suspend(int self, ULONG *prev)
 {
+    if (self && xbox_GuestDetThread())
+        return xbox_GuestDetSuspendSelf(prev);
     if (self)
         xbox_GuestCpuBlocked();
+    return 0;
 }
 
 /* A resume the guest CPU cannot tie to a guest thread goes to the host. If
@@ -6322,7 +6443,12 @@ static void bridge_NtSuspendThread(void)
         g_eax = 0;
         return;
     }
-    bridge_sched_self_suspend(self);
+    if (bridge_sched_self_suspend(self, &prev)) {
+        if (count_va)
+            BRIDGE_MEM32(count_va) = prev;
+        g_eax = 0;
+        return;
+    }
     g_eax = (uint32_t)xbox_NtSuspendThread(
         bridge_resolve_handle(STACK_ARG(0)),
         count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
@@ -6573,9 +6699,11 @@ static void bridge_KeWaitForMultipleObjects(void)
         if (handles[i]) {
             guest_events[i] = object;
         } else {
-            handles[i] = ke_shadow_lookup(object);
+            handles[i] = thobj_det_wait_handle(object);
             if (!handles[i])
-                handles[i] = bridge_resolve_handle(object);
+                handles[i] = ke_shadow_lookup(object);
+            if (!handles[i])
+                handles[i] = bridge_resolve_wait(object);
         }
     }
 
@@ -9295,7 +9423,10 @@ static void bridge_KeSuspendThread(void)
         g_eax = prev;
         return;
     }
-    bridge_sched_self_suspend(self);
+    if (bridge_sched_self_suspend(self, &prev)) {
+        g_eax = prev;
+        return;
+    }
     hThread = bridge_resolve_handle(STACK_ARG(0));
     if (!hThread)
         hThread = XBOX_TO_NATIVE(STACK_ARG(0));
@@ -11576,6 +11707,10 @@ static void kernel_thunk_dispatch(void)
                                     slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE
                                     ? g_slot_ordinals[slot] : 0);
     kernel_thunk_dispatch_body();
+    if (xbox_GuestDetOn())
+        xbox_GuestDetTraceCall(slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE
+                               ? g_slot_ordinals[slot] : 0,
+                               g_xbox_kernel_caller, g_eax);
     if (held)
         xbox_GuestCpuAcquire();
 }

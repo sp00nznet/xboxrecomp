@@ -190,6 +190,15 @@ static void spin_wait(uint32_t va, int sleep)
             return;
     }
     xbox_IrqSafePoint();
+    /* The deterministic ring (kernel_guest_det.c): every pass hands the
+     * turn on, so the thread it waits for runs, and once all are spinning or
+     * waiting the devices and the clock move. Not at DISPATCH, where the
+     * console switched no threads. */
+    if (xbox_GuestDetThread()) {
+        if (!xbox_IrqlThisThreadBlocksDpcs())
+            xbox_GuestDetYield(va);
+        return;
+    }
     if (!sleep) {
         /* Not at DISPATCH: there the console's scheduler could not switch
          * threads either, and the loop's DPC is held off by this thread's

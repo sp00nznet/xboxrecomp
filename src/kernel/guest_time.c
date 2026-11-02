@@ -82,6 +82,16 @@ uint64_t xbox_GuestTimeVblanks(void)
         ? (uint64_t)vt_read() : 0;
 }
 
+/* The calling thread's reads of the virtual clock since it last saw it
+ * move: the deterministic scheduler (kernel_guest_det.c) takes a loop that
+ * keeps reading a clock that cannot move as idle. */
+static _Thread_local uint64_t t_vt_last_v, t_vt_reads;
+
+uint64_t xbox_GuestTimeFrozenReads(void)
+{
+    return t_vt_last_v == xbox_GuestTimeVblanks() ? t_vt_reads : 0;
+}
+
 /* Virtual nanoseconds since boot. v * 10^9 overflows 64 bits at
  * v = 1.8 * 10^10 vblanks, about 9.7 years at 60 Hz: far past any run, so
  * no split is needed. */
@@ -91,14 +101,13 @@ static uint64_t vt_ns(void)
      * holds its thread until the next vblank here, and one doing it on the
      * timer thread (in a DPC) would wait for a step that thread itself has
      * to make. Say so once per thread, so a stall in this mode has a name. */
-    static _Thread_local uint64_t last_v, reads;
     static _Thread_local int warned;
     uint64_t v = xbox_GuestTimeVblanks();
 
-    if (v != last_v) {
-        last_v = v;
-        reads = 0;
-    } else if (++reads == 1000000 && !warned) {
+    if (v != t_vt_last_v) {
+        t_vt_last_v = v;
+        t_vt_reads = 0;
+    } else if (++t_vt_reads == 1000000 && !warned) {
         warned = 1;
         fprintf(stderr, "  [TIME] a thread read the virtual clock 10^6 times"
                         " in vblank %llu: a busy-wait on a frozen clock\n",

@@ -719,6 +719,7 @@ void xbox_GuestSchedThreadGone(uint32_t obj)
 
 void xbox_GuestSchedBind(uint32_t obj)
 {
+    xbox_GuestDetBind(obj);
     if (!xbox_GuestSchedOn())
         return;
     EnterCriticalSection(&s_lock);
@@ -772,6 +773,8 @@ int xbox_GuestSchedSuspend(uint32_t obj, int delta, ULONG *prev)
     GuestSchedThread *t;
     int handled = 0;
 
+    if (xbox_GuestDetOn())
+        return xbox_GuestDetSuspend(obj, delta, prev);
     if (!xbox_GuestSchedOn())
         return 0;
     EnterCriticalSection(&s_lock);
@@ -1139,6 +1142,14 @@ static int ordinal_is_wait(uint32_t ordinal)
 void xbox_GuestCpuJoin(void)
 {
     t_guest = 1;
+    xbox_GuestDetArm();
+    if (xbox_GuestDetOn()) {
+        /* The deterministic ring (kernel_guest_det.c) is the guest CPU. */
+        if (!t_held)
+            xbox_GuestDetJoin();
+        t_held = 1;
+        return;
+    }
     if (xbox_GuestCpuOn() && !t_held) {
         t_joining = 1;              /* a created-suspended thread waits here */
         guest_cpu_acquire(0);
@@ -1147,6 +1158,13 @@ void xbox_GuestCpuJoin(void)
 
 void xbox_GuestCpuPart(void)
 {
+    if (xbox_GuestDetOn()) {
+        if (t_held)
+            xbox_GuestDetPart();
+        t_held = 0;
+        t_guest = 0;
+        return;
+    }
     if (t_held)
         guest_cpu_handoff(XBOX_GUEST_CPU_EXIT, 0);
     if (t_sched && s_sched) {
@@ -1173,6 +1191,17 @@ int xbox_GuestCpuRelease(int kind, uint32_t where)
 {
     if (!t_held)
         return 0;
+    if (xbox_GuestDetOn()) {
+        /* The holder keeps the token through the call; the calls that
+         * block give it up themselves, and so does a yield. The thread's
+         * end (258) keeps it too: PsTerminateSystemThread parts only after
+         * it has published the end in the thread object, or a thread
+         * polling GetExitCodeThread would see the end at whatever pass the
+         * host got round to writing it. */
+        if (kind == XBOX_GUEST_CPU_KERNEL && where == 238)
+            xbox_GuestDetYield(238);
+        return 0;
+    }
     if (kind == XBOX_GUEST_CPU_KERNEL) {
         if (where == 258 /* PsTerminateSystemThread: ExitThread, no return */)
             guest_cpu_handoff(XBOX_GUEST_CPU_EXIT, where);
@@ -1230,7 +1259,7 @@ int xbox_GuestCpuRelease(int kind, uint32_t where)
 
 void xbox_GuestCpuAcquire(void)
 {
-    if (!t_held && xbox_GuestCpuOn())
+    if (!t_held && xbox_GuestCpuOn() && !xbox_GuestDetOn())
         guest_cpu_acquire(1);
 }
 
@@ -1242,7 +1271,7 @@ void xbox_GuestCpuAcquire(void)
  * any level may take it. */
 void xbox_GuestCpuBlocked(void)
 {
-    if (t_held || !t_guest || !xbox_GuestCpuOn())
+    if (t_held || !t_guest || !xbox_GuestCpuOn() || xbox_GuestDetOn())
         return;
     if (!s_sched && !s_waiting)
         return;
@@ -1264,7 +1293,7 @@ int xbox_GuestCpuYield(uint32_t va)
 {
     GuestCpuThread *r;
 
-    if (!t_held || !s_waiting)
+    if (!t_held || !s_waiting || xbox_GuestDetOn())
         return 0;
     if (s_sched && !sched_should_yield(XBOX_GUEST_CPU_SPIN, va))
         return 0;
@@ -1286,6 +1315,10 @@ void xbox_GuestCpuPreempt(uint32_t va)
 {
     GuestCpuThread *r;
 
+    if (xbox_GuestDetOn()) {
+        xbox_GuestDetBackEdge(va, xbox_IrqlThisThreadBlocksDpcs());
+        return;
+    }
     if (!t_held)
         return;
     if (s_sched ? xbox_IrqlThisThreadBlocksDpcs()

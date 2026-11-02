@@ -32,6 +32,7 @@
 #include "fpconv.h"
 #include "recomp_env.h"
 #include "../kernel/xbox_memory_layout.h"
+#include "../kernel/guest_det_device.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -538,13 +539,16 @@ void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
      * An EPRST write restarts the EP period, as xemu's ep_frame_div = 0. */
     if (idle(GP) && apu_dsp_emu_poll_rst(gp)) {
         d->gp_lag_cycles = 0;
-        if (apu_dsp_emu_running(gp))
+        /* Deterministic mode: no warm-up worker. A frame that missed the
+         * worker's deadline would be silent or skipped by host time; the
+         * frame thread is not on the device's pace there anyway. */
+        if (apu_dsp_emu_running(gp) && !xbox_GuestDetOn())
             apu_dsp_warm_start(&s.wk[GP].warm, GP_WARM_FRAMES);
     }
     if (idle(EP) && apu_dsp_emu_poll_rst(ep)) {
         d->ep_frame_div = 0;
         off = 0;
-        if (apu_dsp_emu_running(ep))
+        if (apu_dsp_emu_running(ep) && !xbox_GuestDetOn())
             apu_dsp_warm_start(&s.wk[EP].warm, EP_WARM_PERIODS);
     }
 

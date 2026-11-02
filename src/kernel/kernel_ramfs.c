@@ -23,6 +23,7 @@
  */
 #include "kernel.h"
 #include "kernel_ramfs.h"
+#include "guest_det_device.h"
 #include "mem_stats.h"
 #include "recomp_env.h"
 #include <ctype.h>
@@ -891,6 +892,10 @@ static void fill_net(const ram_node *nd, PXBOX_FILE_NETWORK_OPEN_INFORMATION inf
     info->LastAccessTime = nd->mtime;
     info->LastWriteTime = nd->mtime;
     info->ChangeTime = nd->mtime;
+    if (xbox_GuestDetOn())      /* the deterministic mode's fixed file times */
+        info->CreationTime.QuadPart = info->LastAccessTime.QuadPart =
+            info->LastWriteTime.QuadPart = info->ChangeTime.QuadPart =
+            XBOX_DET_FILETIME;
     info->EndOfFile.QuadPart = nd->is_dir ? 0 : (LONGLONG)nd->size;
     info->AllocationSize.QuadPart = nd->is_dir ? 0 : (LONGLONG)clusters(nd->size);
     info->FileAttributes = nd->is_dir ? XBOX_FILE_ATTRIBUTE_DIRECTORY

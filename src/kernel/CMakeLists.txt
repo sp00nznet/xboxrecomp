@@ -21,6 +21,7 @@ set(KERNEL_SOURCES
     guest_time.c
     guest_state_hash.c
     kernel_guest_cpu.c
+    kernel_guest_det.c
     kernel_xbox.c
     kernel_ob.c
     kernel_io.c

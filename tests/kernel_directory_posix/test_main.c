@@ -2,6 +2,7 @@
  * Explicit checks execute in Release, including when NDEBUG is defined. */
 #define _GNU_SOURCE
 #include "kernel.h"
+#include "guest_det_device.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,10 @@ void xbox_log(int level, const char *subsystem, const char *fmt, ...)
 /* This fixture creates no symbolic links; normal device-path translation is real. */
 const char *xbox_LookupSymbolicLink(const char *link)
 { (void)link; return NULL; }
+
+/* The deterministic scheduler is not linked; the size test flips the mode. */
+static int det_on;
+int xbox_GuestDetOn(void) { return det_on; }
 
 static int failures;
 static void check(int ok, const char *name)
@@ -95,6 +100,46 @@ static void independent_searches(void)
     check(ok,"ordinary file close");
     check(xbox_NtClose(NULL)==STATUS_INVALID_HANDLE,"null close retains invalid-handle status");
 }
+/* FileFsSizeInformation on a host-backed drive (the game's D:, not the RAM
+ * cache's Z:): the host disk's free space normally, and in the deterministic
+ * mode a fixed volume, since the host's moves between runs. */
+static void volume_size(void)
+{
+    HANDLE h=NULL; XBOX_IO_STATUS_BLOCK ios={0}; XBOX_FILE_FS_SIZE_INFORMATION fs;
+    int ok=open_guest("d:\\",XBOX_FILE_DIRECTORY_FILE,&h)==STATUS_SUCCESS && h;
+    memset(&fs,0,sizeof fs);
+    ok = ok && xbox_NtQueryVolumeInformationFile(h,&ios,&fs,sizeof fs,XboxFileFsSizeInformation)==STATUS_SUCCESS;
+    check(ok && fs.BytesPerSector*fs.SectorsPerAllocationUnit==16384 &&
+          fs.TotalAllocationUnits.QuadPart>0,"volume size from the host disk");
+    det_on=1; memset(&fs,0,sizeof fs);
+    ok = ok && xbox_NtQueryVolumeInformationFile(h,&ios,&fs,sizeof fs,XboxFileFsSizeInformation)==STATUS_SUCCESS;
+    det_on=0;
+    check(ok && fs.TotalAllocationUnits.QuadPart==1048576 &&
+          fs.AvailableAllocationUnits.QuadPart==524288 &&
+          fs.BytesPerSector*fs.SectorsPerAllocationUnit==16384,
+          "deterministic mode reports a fixed volume");
+    if (h) xbox_NtClose(h);
+}
+/* File times on the host-backed drive: the host's normally, and in the
+ * deterministic mode the fixed 2004-01-01, since a file the run creates
+ * carries the wall clock. */
+static void file_times(void)
+{
+    HANDLE h=NULL; XBOX_IO_STATUS_BLOCK ios={0}; XBOX_FILE_NETWORK_OPEN_INFORMATION ni;
+    int ok=open_guest("d:\\",XBOX_FILE_DIRECTORY_FILE,&h)==STATUS_SUCCESS && h;
+    memset(&ni,0,sizeof ni);
+    ok = ok && xbox_NtQueryInformationFile(h,&ios,&ni,sizeof ni,XboxFileNetworkOpenInformation)==STATUS_SUCCESS;
+    check(ok && ni.LastWriteTime.QuadPart>XBOX_DET_FILETIME,"file times from the host");
+    det_on=1; memset(&ni,0,sizeof ni);
+    ok = ok && xbox_NtQueryInformationFile(h,&ios,&ni,sizeof ni,XboxFileNetworkOpenInformation)==STATUS_SUCCESS;
+    det_on=0;
+    check(ok && ni.CreationTime.QuadPart==XBOX_DET_FILETIME &&
+          ni.LastAccessTime.QuadPart==XBOX_DET_FILETIME &&
+          ni.LastWriteTime.QuadPart==XBOX_DET_FILETIME &&
+          ni.ChangeTime.QuadPart==XBOX_DET_FILETIME,
+          "deterministic mode reports fixed file times");
+    if (h) xbox_NtClose(h);
+}
 int main(void)
 {
     char root[]="/tmp/xbox-dir-search-XXXXXX",path[512];
@@ -108,7 +153,7 @@ int main(void)
         }
     }
     xbox_path_init(root,root);
-    lifetime();independent_searches();
+    lifetime();independent_searches();volume_size();file_times();
     for(int i=0;i<8;i++) {
         for(int j=0;j<4;j++) {
             snprintf(path,sizeof path,"%s/Cache/dir%d/dir%d-%c.%s",root,i,i,'a'+j,j<3?"sav":"txt");unlink(path);

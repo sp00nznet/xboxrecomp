@@ -937,6 +937,43 @@ int      xbox_GuestSchedSuspend(uint32_t obj, int delta, ULONG *prev);
 void     xbox_GuestSchedTestWindows(uint64_t soft_ns, uint64_t valve_ns);
 long     xbox_GuestSchedValves(void);
 
+/* The deterministic guest scheduler (kernel_guest_det.c): with the virtual
+ * clock (RECOMP_DEBUG=deterministic) and the guest CPU lock on, the guest
+ * CPU is a token passed round the guest threads in ring-slot order (the
+ * creator takes the slot under the token, so the order is the same every
+ * run; an ended thread's slot is reused, so it is not creation order). The
+ * holder keeps it through every kernel call that does not block; waits,
+ * delays, contended critical sections, self-suspends and lowered spin
+ * passes give it up; when every runnable thread is idle the devices catch
+ * up, and when they had nothing to do the clock steps one vblank (the
+ * timer thread's pass). The device threads run a pass only when granted
+ * one. Off, nothing here is called. */
+#define XBOX_GUEST_DET 1         /* for game code built against older trees */
+#include "guest_det_device.h"
+typedef int (*XboxDetCheck)(void *ctx);         /* 1: the wait is satisfied */
+void     xbox_GuestDetArm(void);                /* at the first guest join */
+int      xbox_GuestDetThread(void);             /* the caller is in the ring */
+void     xbox_GuestDetThreadNew(uint32_t obj);  /* the creator, at spawn */
+void     xbox_GuestDetThreadDrop(uint32_t obj); /* the spawn failed */
+void     xbox_GuestDetBind(uint32_t obj);
+void     xbox_GuestDetJoin(void);
+void     xbox_GuestDetPart(void);
+int      xbox_GuestDetSuspend(uint32_t obj, int delta, ULONG *prev);
+int      xbox_GuestDetSuspendSelf(ULONG *prev);
+/* 1 when check said so, 0 when the virtual due time (0: none) came first.
+ * site names the give-up for the idle count and the watchdog. */
+int      xbox_GuestDetBlock(XboxDetCheck check, void *ctx, uint64_t due,
+                            uint32_t site);
+void     xbox_GuestDetYield(uint32_t site);
+void     xbox_GuestDetBackEdge(uint32_t va, int at_dispatch);
+/* Wait for the virtual vblank count to leave seen; 0 when the caller is not
+ * in the ring (do the host wait). */
+int      xbox_GuestDetWaitVblank(uint64_t seen, uint32_t site);
+void     xbox_GuestDetStats(long *steps, long *catchups, long *passes);
+/* det_trace inside the det_snap window: one K line per kernel call. */
+void     xbox_GuestDetTraceCall(uint32_t ordinal, uint32_t caller, uint32_t ret);
+void     xbox_GuestDetTestReset(int on);        /* ctests */
+
 /* ============================================================================
  * Synchronization (kernel_sync.c)
  * ============================================================================ */

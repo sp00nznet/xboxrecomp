@@ -471,6 +471,14 @@ static void xbox_cs_clear_owner(CRITICAL_SECTION* cs)
     }
 }
 
+/* The deterministic ring: the holder is another guest thread, which needs
+ * the turn to get out, so the waiter hands it on and retries each time the
+ * turn comes back. */
+static int cs_det_try(void *ctx)
+{
+    return TryEnterCriticalSection((CRITICAL_SECTION *)ctx) != 0;
+}
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
@@ -513,8 +521,14 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     }
     /* Contended: the holder is a guest thread that needs the CPU to leave
      * it (RECOMP_GUEST_LOCK), so tell the waiters the CPU is free now. */
-    xbox_GuestCpuBlocked();
-    EnterCriticalSection(cs);
+    if (xbox_GuestDetThread())
+        xbox_GuestDetBlock(cs_det_try, cs, 0,
+                           (uint32_t)((uintptr_t)CriticalSection
+                                      - (uintptr_t)g_xbox_mem_offset));
+    else {
+        xbox_GuestCpuBlocked();
+        EnterCriticalSection(cs);
+    }
     xbox_cs_note_owner(cs);
     if (g_cs_contention_reports <= 16) {
         fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",

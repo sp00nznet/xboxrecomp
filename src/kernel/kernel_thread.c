@@ -166,6 +166,13 @@ NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus)
  * Maps to: SleepEx (for alertable waits) or Sleep
  * ============================================================================ */
 
+/* An alertable delay in the deterministic ring: a queued APC ends it. */
+static int delay_det_alerted(void *ctx)
+{
+    (void)ctx;
+    return SleepEx(0, TRUE) == WAIT_IO_COMPLETION;
+}
+
 NTSTATUS __stdcall xbox_KeDelayExecutionThread(
     KPROCESSOR_MODE WaitMode,
     BOOLEAN Alertable,
@@ -179,7 +186,12 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         return STATUS_INVALID_PARAMETER;
 
     if (Interval->QuadPart == 0) {
-        /* Zero interval = yield the thread's time slice */
+        /* Zero interval = yield the thread's time slice; in the
+         * deterministic ring, to the next guest thread in it. */
+        if (xbox_GuestDetThread()) {
+            xbox_GuestDetYield(99);
+            return STATUS_SUCCESS;
+        }
         SwitchToThread();
         return STATUS_SUCCESS;
     }
@@ -192,6 +204,10 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
 
         if (xbox_GuestTimeReached(due))
             return STATUS_SUCCESS;
+        if (xbox_GuestDetThread())
+            return xbox_GuestDetBlock(Alertable ? delay_det_alerted : NULL,
+                                      NULL, due | 1, 99)
+                   ? STATUS_ALERTED : STATUS_SUCCESS;
         xbox_GuestCpuBlocked();
         while (!xbox_GuestTimeReached(due)) {
             if (Alertable) {

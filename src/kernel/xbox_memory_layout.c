@@ -2361,7 +2361,27 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     xbox_log_thread_role("nv2a-ack", 0);
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    /* The deterministic mode (xbox_GuestDetOn): a pass only when the guest
+     * ring grants one, which it does when every guest thread is idle, so
+     * what the title reads back (GET, the kick ack, the busy bits) changes
+     * at the same point of its progress on every run. worked tells the
+     * ring whether the pass changed anything the title could be waiting
+     * on; when it did not, the ring steps the clock instead. */
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        /* Per pass: the mode is decided at the first guest join, after
+         * this thread starts (xbox_GuestDetArm). Undecided first, then the
+         * mode: the other order let a join between the two reads run a
+         * stock pass with the mode on, outside any grant. */
+        int det, det_worked = 0;
+        if (xbox_GuestDetUndecided()) {
+            /* The deterministic key is set and the first guest join has
+             * not come: no pass, which the join could find half done. */
+            Sleep(1);
+            continue;
+        }
+        det = xbox_GuestDetOn();        /* decided now: final for the run */
+        if (det)
+            xbox_GuestDetDeviceWait(XBOX_DET_DEV_NV2A);
         /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
          * nothing and acknowledges no KickOff, which is how the title feels
          * the console's FLIP_STALL. Nothing is held while it waits; the
@@ -2373,7 +2393,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
             uint32_t mask = NV2A_ACK[i].busy_mask;
-            if (NV2A_ACK[i].offset == NV2A_KICK_REG && (g_kick_fast || flip_held))
+            if (NV2A_ACK[i].offset == NV2A_KICK_REG
+                    && ((g_kick_fast && !det) || flip_held))
                 continue;               /* kick_ack, below; or held */
             /* Once the vblank is delivered its two bits belong to the
              * vblank-ack thread (kernel_bridge.c), which clears them on the
@@ -2399,6 +2420,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
              * bits of the same word meanwhile. */
             if (*r & mask) {
                 InterlockedAnd((volatile LONG *)r, (LONG)~mask);
+                det_worked = 1;
                 if (NV2A_ACK[i].offset == NV2A_KICK_REG)
                     kick_cleared(nv2a_pb_now_ns());
             }
@@ -2463,7 +2485,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
             nv2a_pb_exec_put_read(idle_vbl, put);
             if (!flip_held
-                    && (put != g_scanned_put || (now_ms - last_put_ms) > 2000)) {
+                    && (put != g_scanned_put
+                        || (!det && (now_ms - last_put_ms) > 2000))) {
+                if (put != g_scanned_put)
+                    det_worked = 1;
                 /* Survey the segment the title just submitted, once. */
                 {
                     extern void nv2a_pb_scan(uint32_t, uint32_t);
@@ -2617,6 +2642,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * executor's flip rate (20 -> 41 per s, RECOMP_PB_EXEC=1), with the
          * thread at ~14%. A native Windows host needs timeBeginPeriod(1)
          * for this, as the kernel timer's Sleep(10) already does. */
+        if (det) {
+            xbox_GuestDetDeviceDone(XBOX_DET_DEV_NV2A, det_worked);
+            continue;
+        }
         if (!g_kick_fast) {
             Sleep(1);
             continue;
@@ -2748,6 +2777,7 @@ static void xbox_Nv2aAckStart(void)
     kick_wake_init(g_nv2a_memory);
     run_ahead_init();
     kick_wake_report_start();
+    xbox_GuestDetDeviceAdd(XBOX_DET_DEV_NV2A);   /* used only when on */
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     xbox_Nv2aKickStart(g_nv2a_memory);

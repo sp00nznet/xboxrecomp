@@ -28,6 +28,7 @@
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 #include "../kernel/kernel_prof.h"          /* RECOMP_TRACE=dpc: ISR, se_frame */
 #include "apu_lockstat.h"                    /* RECOMP_TRACE=apu_lock */
+#include "../kernel/guest_det_device.h"      /* RECOMP_DEBUG=deterministic */
 
 /* ============================================================
  * Globals
@@ -1350,13 +1351,61 @@ static void *mcpx_apu_frame_thread(void *arg)
     apu_lockstat_lock(d, APU_LOCK_FRAME);
 
     while (!qatomic_read(&d->exiting)) {
+        /* Deterministic mode: a frame only when the guest scheduler grants
+         * one (25 a vblank step, all guest threads parked), never on the
+         * device's pace, so what the frame writes to guest memory (the
+         * doorbell, the GP's FIFOs, the interrupt) lands at the same point
+         * of guest progress on every run. Read each frame: the mode is
+         * decided at the first guest join, after this thread starts.
+         * Undecided is asked first and the mode read after: read the other
+         * way round, a join between the two reads left det 0 with the mode
+         * on, and the pass below reached the untimed wait while
+         * device_round held the turn for this frame's grant. */
+        int det;
+        if (xbox_GuestDetUndecided()) {
+            /* Undecided (the deterministic key is set, the first guest
+             * join has not come): no frame, a nap. A frame run here could
+             * still be in flight when the join turns the mode on, and the
+             * pause branch's untimed wait would miss the first grant. A
+             * pause asked meanwhile is honoured as the pause branch does. */
+            if (d->pause_requested) {
+                d->is_idle = true;
+                qemu_cond_signal(&d->idle_cond);
+            }
+            apu_lockstat_hold_end(APU_LOCK_FRAME);
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+            apu_lockstat_hold_begin(APU_LOCK_FRAME);
+            d->is_idle = false;
+            continue;
+        }
+        det = xbox_GuestDetOn();        /* decided now: final for the run */
+        if (det) {
+            apu_lockstat_unlock(d, APU_LOCK_FRAME);
+            xbox_GuestDetDeviceWait(XBOX_DET_DEV_APU);
+            apu_lockstat_lock(d, APU_LOCK_FRAME);
+            if (qatomic_read(&d->exiting)) {
+                xbox_GuestDetDeviceDone(XBOX_DET_DEV_APU, 0);
+                break;
+            }
+        }
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
+            if (det) {
+                /* Paused: the granted frame passes, and the next grant is
+                 * the wait. */
+                d->is_idle = true;
+                qemu_cond_signal(&d->idle_cond);
+                xbox_GuestDetDeviceDone(XBOX_DET_DEV_APU, 0);
+                continue;
+            }
             d->is_idle = true;
             if (xa2_is_active())
                 xa2_expect_drain();     /* a pause, not an underrun */
             hs_rebase();
             qemu_cond_signal(&d->idle_cond);
             apu_lockstat_hold_end(APU_LOCK_FRAME);
+            /* The mode is off for good here: det was read after the
+             * undecided check, so 0 is the decision, not a read that came
+             * before it. The untimed wait cannot miss a grant. */
             qemu_cond_wait(&d->cond, &d->lock);
             apu_lockstat_hold_begin(APU_LOCK_FRAME);
             d->is_idle = false;
@@ -1366,7 +1415,10 @@ static void *mcpx_apu_frame_thread(void *arg)
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
-        throttle(d);
+        if (!det)
+            throttle(d);
+        else
+            d->is_idle = false;
         int div0 = d->ep_frame_div;
 
         /* The doorbell ack stands in for the GP DSP, which on hardware runs
@@ -1443,6 +1495,8 @@ static void *mcpx_apu_frame_thread(void *arg)
             d->set_irq = false;
         }
         apu_deliver_irq(d);
+        if (det)
+            xbox_GuestDetDeviceDone(XBOX_DET_DEV_APU, 1);
 
         /* Drop the lock once per frame.
          *
@@ -1464,7 +1518,7 @@ static void *mcpx_apu_frame_thread(void *arg)
         mcpx_apu_vp_trace_flush();
         SwitchToThread();
         apu_lockstat_lock(d, APU_LOCK_FRAME);
-        if (fe_trapped &&
+        if (!det && fe_trapped &&
             (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
              NV_PAPU_FECTL_FEMETHMODE_TRAPPED)) {
             /* Still trapped after the delivery (held off at raised IRQL, or
@@ -1478,6 +1532,7 @@ static void *mcpx_apu_frame_thread(void *arg)
 
     apu_lockstat_unlock(d, APU_LOCK_FRAME);
     mcpx_apu_vp_trace_flush();
+    xbox_GuestDetDeviceRemove(XBOX_DET_DEV_APU);
     return NULL;
 }
 
@@ -1598,6 +1653,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     }
 
     /* Start background frame thread */
+    xbox_GuestDetDeviceAdd(XBOX_DET_DEV_APU);   /* passes only in det mode */
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
     mcpx_apu_thread_priority(d);
@@ -1619,8 +1675,17 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
     fprintf(stderr, "[APU] Shutting down MCPX APU...\n");
 
     qemu_mutex_lock(&d->lock);
-    mcpx_apu_wait_for_idle(d);
-    qatomic_set(&d->exiting, true);
+    if (xbox_GuestDetOn()) {
+        /* The frame thread waits for the guest scheduler's grants, which
+         * stop with the guest: no idle to wait for; the removal wakes it. */
+        qatomic_set(&d->exiting, true);
+        qemu_mutex_unlock(&d->lock);
+        xbox_GuestDetDeviceRemove(XBOX_DET_DEV_APU);
+        qemu_mutex_lock(&d->lock);
+    } else {
+        mcpx_apu_wait_for_idle(d);
+        qatomic_set(&d->exiting, true);
+    }
     qemu_cond_signal(&d->cond);
     qemu_mutex_unlock(&d->lock);
 

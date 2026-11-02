@@ -213,8 +213,44 @@ static uint64_t sync_virtual_due(PLARGE_INTEGER Timeout)
     return xbox_GuestTimeDue(Timeout->QuadPart) | 1;   /* never 0 */
 }
 
+/* The deterministic mode (xbox_GuestDetOn): a guest thread that would block
+ * hands the guest ring on and polls its objects each time its turn comes
+ * back; the clock moves only when every guest thread is idle like this, so
+ * the wait ends at the same point of the run every time. A zero timeout is
+ * a plain poll and never gives the turn up. */
+typedef struct {
+    DWORD n;
+    const HANDLE *h;
+    BOOL all, alertable;
+    DWORD r;
+} SyncDetWait;
+
+static int sync_det_check(void *ctx)
+{
+    SyncDetWait *w = (SyncDetWait *)ctx;
+
+    w->r = w->n == 1 ? WaitForSingleObjectEx(w->h[0], 0, w->alertable)
+                     : WaitForMultipleObjectsEx(w->n, w->h, w->all, 0,
+                                                w->alertable);
+    return w->r != WAIT_TIMEOUT;
+}
+
+static DWORD sync_det_wait(DWORD n, const HANDLE *h, BOOL all,
+                           BOOL alertable, uint64_t due, uint32_t site)
+{
+    SyncDetWait w = { n, h, all, alertable, WAIT_TIMEOUT };
+
+    return xbox_GuestDetBlock(sync_det_check, &w, due, site) ? w.r
+                                                             : WAIT_TIMEOUT;
+}
+
+/* A due time under 1 ms ahead rounds ms to 0 and still waits: the ring's
+ * wait, not the host's 1 ms slices with the token held and the clock
+ * frozen. */
 static DWORD sync_wait_one(HANDLE h, DWORD ms, BOOL alertable, uint64_t due)
 {
+    if ((ms || due) && xbox_GuestDetThread())
+        return sync_det_wait(1, &h, FALSE, alertable, due, 233);
     if (due) {
         DWORD r = WaitForSingleObjectEx(h, 0, alertable);
         if (r != WAIT_TIMEOUT)
@@ -240,6 +276,8 @@ static DWORD sync_wait_one(HANDLE h, DWORD ms, BOOL alertable, uint64_t due)
 static DWORD sync_wait_many(DWORD n, const HANDLE *h, BOOL all, DWORD ms,
                             BOOL alertable, uint64_t due)
 {
+    if ((ms || due) && xbox_GuestDetThread())
+        return sync_det_wait(n, h, all, alertable, due, 235);
     if (due) {
         DWORD r = WaitForMultipleObjectsEx(n, h, all, 0, alertable);
         if (r != WAIT_TIMEOUT)

@@ -86,6 +86,8 @@ void     xbox_GuestTimeSetStepper(void (*start)(void));
 
 /* How many vblanks the virtual clock has counted (0 in real mode). */
 uint64_t xbox_GuestTimeVblanks(void);
+/* This thread's reads of the virtual clock in the current vblank. */
+uint64_t xbox_GuestTimeFrozenReads(void);
 
 /* Guest milliseconds since boot, 64 bits: the clock the kernel timers keep
  * their due times on in virtual mode. */
