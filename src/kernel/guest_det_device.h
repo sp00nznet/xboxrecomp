@@ -41,6 +41,15 @@ void xbox_GuestDetDeviceRemove(int id);     /* the device thread is leaving */
 void xbox_GuestDetDeviceWait(int id);       /* the device thread: until granted a pass */
 void xbox_GuestDetDeviceDone(int id, int worked);
 
+/* RECOMP_DEBUG=det_profile=<path>: where the vblanks of a game
+ * frame go. The executor's flips, whether a flip was held at the walker's
+ * last pass, and the wall time the per-poll state hash took; no-ops while
+ * the profile is off. */
+void xbox_GuestDetProfileFlip(void);
+void xbox_GuestDetProfileFlipHeld(int held);
+void xbox_GuestDetProfileHashNs(unsigned long long ns);
+int  xbox_GuestDetProfileOn(void);
+
 #ifdef __cplusplus
 }
 #endif

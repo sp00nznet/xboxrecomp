@@ -1351,6 +1351,8 @@ void xbox_Nv2aFrameCounterFlip(void)
 {
     int i;
 
+    xbox_GuestDetProfileFlip();
+
     /* Both stamps here and in frame_counters_tick read the guest clock, so
      * in the deterministic mode the "is something presenting" test is a
      * function of emulated vblanks, not of host speed. Off the mode
@@ -2403,6 +2405,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * release depends only on the vblank count and the clock. */
         extern int nv2a_pb_exec_flip_poll(void);
         int flip_held = nv2a_pb_exec_flip_poll();
+        if (det)
+            xbox_GuestDetProfileFlipHeld(flip_held);
         gr_ack_tick();                  /* run_ahead's notify, before its mask */
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =

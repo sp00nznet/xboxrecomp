@@ -1198,8 +1198,8 @@ int xbox_GuestCpuRelease(int kind, uint32_t where)
          * it has published the end in the thread object, or a thread
          * polling GetExitCodeThread would see the end at whatever pass the
          * host got round to writing it. */
-        if (kind == XBOX_GUEST_CPU_KERNEL && where == 238)
-            xbox_GuestDetYield(238);
+        if (kind == XBOX_GUEST_CPU_KERNEL && where == DET_SITE_YIELD)
+            xbox_GuestDetYield(DET_SITE_YIELD);
         return 0;
     }
     if (kind == XBOX_GUEST_CPU_KERNEL) {

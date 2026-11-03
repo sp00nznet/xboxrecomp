@@ -189,7 +189,7 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         /* Zero interval = yield the thread's time slice; in the
          * deterministic ring, to the next guest thread in it. */
         if (xbox_GuestDetThread()) {
-            xbox_GuestDetYield(99);
+            xbox_GuestDetYield(DET_SITE_DELAY);
             return STATUS_SUCCESS;
         }
         SwitchToThread();
@@ -206,7 +206,7 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
             return STATUS_SUCCESS;
         if (xbox_GuestDetThread())
             return xbox_GuestDetBlock(Alertable ? delay_det_alerted : NULL,
-                                      NULL, due | 1, 99)
+                                      NULL, due | 1, DET_SITE_DELAY)
                    ? STATUS_ALERTED : STATUS_SUCCESS;
         xbox_GuestCpuBlocked();
         while (!xbox_GuestTimeReached(due)) {

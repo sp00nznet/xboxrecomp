@@ -38,6 +38,8 @@
 #include "recomp_env.h"
 #include "guest_state_hash.h"
 #include "xbox_memory_layout.h"
+#include "recomp_regs.h"
+#include "platform/host_time.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +56,10 @@ typedef struct {
     int suspend;                /* the guest's suspend count */
     unsigned long tid;          /* host tid, for the watchdog's line */
     uint32_t site;              /* where it last gave the token up */
+    /* det_profile: the last give-up's kind and guest call sites. */
+    char pf_kind;
+    uint32_t pf_site;
+    uint32_t pf_bt[4];
 } DetSlot;
 
 typedef struct {
@@ -96,6 +102,179 @@ static int s_snap_n;
 
 static XBOX_THREAD_LOCAL int t_slot = -1;
 static XBOX_THREAD_LOCAL uint32_t t_bind;
+/* The back-edge quantum's state (xbox_GuestDetBackEdge), zeroed at the
+ * join: a host thread reused for a new guest thread starts afresh. The
+ * quanta a thread runs at dispatch level (a DPC or an interrupt on the gate
+ * holder) count into the same state as its own code's, so a DPC's loop
+ * takes a place in the thread's edge cache. */
+static XBOX_THREAD_LOCAL unsigned t_edges;
+static XBOX_THREAD_LOCAL XboxDetEdge t_edge;
+
+/* RECOMP_DEBUG=det_profile=<path>: where a game frame's vblanks
+ * go. A frame spanned 6-7 steps in the mode against 1-2 on the console, and
+ * the step comes only when every thread is idle, so the question is what
+ * each thread sat in when the clock moved. One S line per step: the
+ * vblank, the executor's flips so far, catch-ups and hand-offs since the
+ * last step, the wall time since then split into ring (guest code and
+ * hand-offs), each device's rounds and the per-poll state hash, then each
+ * live thread's last give-up (kind, site, guest call sites). One W line per
+ * wait or yield that spanned a step: what it was, how it ended and how many
+ * steps it took. Kinds: w timed wait, u untimed wait, d delay, v the
+ * vblank wait, c critical section, s self-suspend, y yield (a zero delay
+ * or NtYieldExecution), p a lowered spin-wait's pass, e a back edge
+ * repeating, k a clock poll, b a busy quantum (no give-up). */
+extern RECOMP_TLS uint32_t g_xbox_kernel_caller;
+extern uint32_t g_xbox_code_lo, g_xbox_code_hi;
+static FILE *s_prof;
+static uint64_t s_pf_last_ns, s_pf_dev_ns[XBOX_DET_DEV_COUNT];
+static volatile LONGLONG s_pf_hash_ns;
+static volatile LONG s_pf_flips, s_pf_held;
+static long s_pf_catch0, s_pf_pass0;
+static XBOX_THREAD_LOCAL char t_pf_kind;
+
+int xbox_GuestDetProfileOn(void)
+{
+    return s_prof != NULL;
+}
+
+void xbox_GuestDetProfileFlip(void)
+{
+    if (s_prof)
+        InterlockedIncrement(&s_pf_flips);
+}
+
+void xbox_GuestDetProfileFlipHeld(int held)
+{
+    if (s_prof)
+        InterlockedExchange(&s_pf_held, held);
+}
+
+void xbox_GuestDetProfileHashNs(unsigned long long ns)
+{
+    /* prof_step takes and clears it under s_lock, which this does not
+     * take. Only the 64-bit compare-exchange is in the POSIX shim. */
+    LONGLONG o;
+
+    if (!s_prof)
+        return;
+    do
+        o = s_pf_hash_ns;
+    while (InterlockedCompareExchange64(&s_pf_hash_ns, o + (LONGLONG)ns, o) != o);
+}
+
+static void prof_open(void)
+{
+    const char *path = recomp_env(RENV_DET_PROFILE);
+
+    if (!path || !*path)
+        return;
+    s_prof = fopen(path, "w");
+    if (!s_prof) {
+        fprintf(stderr, "  [DET] cannot write %s; det_profile off\n", path);
+        fflush(stderr);
+        return;
+    }
+    fprintf(s_prof, "# S step vblank flips held catchups passes wall_us ring_us"
+                    " nv2a_us timer_us ohci_us apu_us hash_us | slot:kind[!]:site:"
+                    "bt0,bt1,bt2,bt3 ...\n# W step slot kind site how(o obj,"
+                    " t due, r resumed, y yield) spanned bt0,bt1,bt2,bt3\n");
+    s_pf_last_ns = xbox_HostNowNs();
+}
+
+/* The holder's give-up: what it is and where in the guest it came from. A
+ * kernel call's own return address first, then the code addresses on the
+ * guest stack above it (a lifted call pushes its return address; stale
+ * words can look like frames, as in kernel_rtl.c's backtrace). */
+static void prof_note(uint32_t site)
+{
+    DetSlot *sl = &s_slot[t_slot];
+    char kind = t_pf_kind ? t_pf_kind : 'y';
+    uint32_t sp = g_esp, first;
+    int i, n = 0;
+
+    sl->pf_kind = kind;
+    sl->pf_site = site;
+    memset(sl->pf_bt, 0, sizeof sl->pf_bt);
+    first = (kind == 'e' || kind == 'k' || kind == 'b' || kind == 'p')
+            ? site : g_xbox_kernel_caller;
+    if (kind == 'k')
+        first = 0;
+    if (first)
+        sl->pf_bt[n++] = first;
+    if (!sp || !g_xbox_code_hi)
+        return;
+    /* Only guest RAM: a thread whose esp sits near the top (or outside it,
+     * in a host-made context) must not read past the mapping. */
+    if ((uint64_t)sp >= g_xbox_total_ram)
+        return;
+    for (i = 0; i < 64 && n < 4
+                && (uint64_t)sp + i * 4 + 4 <= g_xbox_total_ram; i++) {
+        uint32_t w = *(const uint32_t *)((uintptr_t)(sp + i * 4)
+                                         + g_xbox_mem_offset);
+        if (w >= g_xbox_code_lo && w < g_xbox_code_hi && w != first)
+            sl->pf_bt[n++] = w;
+    }
+}
+
+static void prof_bt(FILE *f, const uint32_t *bt)
+{
+    fprintf(f, "%x,%x,%x,%x", bt[0], bt[1], bt[2], bt[3]);
+}
+
+/* Lock held: a wait or yield of this thread that spanned a step. */
+static void prof_wait_end(long steps0, char how)
+{
+    DetSlot *sl;
+
+    if (!s_prof || t_slot < 0 || s_steps == steps0)
+        return;
+    sl = &s_slot[t_slot];
+    fprintf(s_prof, "W %ld %d %c %x %c %ld ", s_steps, t_slot,
+            sl->pf_kind ? sl->pf_kind : '?', sl->pf_site, how, s_steps - steps0);
+    prof_bt(s_prof, sl->pf_bt);
+    fputc('\n', s_prof);
+}
+
+/* The step's line; called by the stepping thread after the devices' round. */
+static void prof_step(void)
+{
+    uint64_t now = xbox_HostNowNs(), wall, dev = 0, hash;
+    int i;
+
+    EnterCriticalSection(&s_lock);
+    wall = now - s_pf_last_ns;
+    do
+        hash = (uint64_t)s_pf_hash_ns;
+    while ((uint64_t)InterlockedCompareExchange64(&s_pf_hash_ns, 0, (LONGLONG)hash) != hash);
+    for (i = 0; i < XBOX_DET_DEV_COUNT; i++)
+        dev += s_pf_dev_ns[i];
+    fprintf(s_prof, "S %ld %llu %ld %ld %ld %ld %llu %llu %llu %llu %llu %llu %llu |",
+            s_steps, (unsigned long long)xbox_GuestTimeVblanks(),
+            (long)s_pf_flips, (long)s_pf_held, s_catchups - s_pf_catch0,
+            s_passes - s_pf_pass0, (unsigned long long)(wall / 1000),
+            (unsigned long long)((wall > dev + hash ? wall - dev - hash : 0) / 1000),
+            (unsigned long long)(s_pf_dev_ns[XBOX_DET_DEV_NV2A] / 1000),
+            (unsigned long long)(s_pf_dev_ns[XBOX_DET_DEV_TIMER] / 1000),
+            (unsigned long long)(s_pf_dev_ns[XBOX_DET_DEV_OHCI] / 1000),
+            (unsigned long long)(s_pf_dev_ns[XBOX_DET_DEV_APU] / 1000),
+            (unsigned long long)(hash / 1000));
+    for (i = 0; i < s_count; i++) {
+        DetSlot *sl = &s_slot[i];
+        if (sl->state != DET_NEW && sl->state != DET_LIVE)
+            continue;
+        fprintf(s_prof, " %d:%c%s:%x:", i, sl->pf_kind ? sl->pf_kind : '-',
+                sl->suspend ? "!" : "", sl->pf_site);
+        prof_bt(s_prof, sl->pf_bt);
+    }
+    fputc('\n', s_prof);
+    if (s_steps % 64 == 0)
+        fflush(s_prof);
+    memset(s_pf_dev_ns, 0, sizeof s_pf_dev_ns);
+    s_pf_catch0 = s_catchups;
+    s_pf_pass0 = s_passes;
+    s_pf_last_ns = xbox_HostNowNs();
+    LeaveCriticalSection(&s_lock);
+}
 
 static BOOL CALLBACK det_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
@@ -309,6 +488,7 @@ int xbox_GuestDetOn(void)
         on = xbox_GuestTimeVirtual() && xbox_GuestCpuOn();
         if (InterlockedCompareExchange(&s_on, on, -1) == -1 && on) {
             trace_open();
+            prof_open();
             fprintf(stderr, "  [DET] deterministic guest scheduler: the guest"
                             " CPU passes round the threads in ring-slot order,"
                             " and the clock steps when they are all idle\n");
@@ -534,6 +714,8 @@ void xbox_GuestDetJoin(void)
     }
     if (i >= 0) {
         t_slot = i;
+        t_edges = 0;
+        memset(&t_edge, 0, sizeof t_edge);
         s_slot[i].state = DET_LIVE;
         s_slot[i].tid = (unsigned long)GetCurrentThreadId();
         if (s_turn < 0)
@@ -668,6 +850,7 @@ void xbox_GuestDetDeviceDone(int id, int worked)
 static int device_round(int id)
 {
     int worked;
+    uint64_t t0 = s_prof ? xbox_HostNowNs() : 0;
 
     EnterCriticalSection(&s_lock);
     if (!s_dev[id].present) {
@@ -681,6 +864,8 @@ static int device_round(int id)
         SleepConditionVariableCS(&s_cv, &s_lock, INFINITE);
     s_dev[id].grant = 0;
     worked = s_dev[id].worked;
+    if (s_prof)
+        s_pf_dev_ns[id] += xbox_HostNowNs() - t0;
     LeaveCriticalSection(&s_lock);
     return worked;
 }
@@ -710,6 +895,8 @@ static void idle_step(void)
                 break;
     }
     trace_ram('S', s_steps);
+    if (s_prof)
+        prof_step();
 }
 
 /* ── Giving the token up ─────────────────────────────────── */
@@ -717,15 +904,22 @@ static void idle_step(void)
 /* Lock held, the token this thread's. Counts the turn as idle, and either
  * steps (everyone idle) or passes and waits for the token. Returns with the
  * lock held and the token this thread's again. */
-static void give_up_locked(uint32_t site, int self_suspended)
+static void give_up_locked(uint32_t site, int self_suspended, int known)
 {
     int n, nxt;
 
+    if (s_prof)
+        prof_note(site);
+
     /* A thread giving up somewhere new left its last wait or loop: it got
-     * somewhere since. */
+     * somewhere since. Not so for an idle back-edge verdict (known): the
+     * thread came back to a loop it was in, and a thread whose quanta
+     * alternate between two idle loops would otherwise reset the count at
+     * every turn and the clock would never step (D24). */
     if (site != s_slot[t_slot].site) {
         s_slot[t_slot].site = site;
-        s_idle = 0;
+        if (!known)
+            s_idle = 0;
     }
     if (!self_suspended)
         s_idle++;
@@ -758,9 +952,76 @@ static void give_up_locked(uint32_t site, int self_suspended)
 #define DET_QUANTUM 4096u
 #define DET_CLOCK_POLL 64u
 #define DET_SITE_CLOCK 0xFFFFFFC1u      /* the give-up site of a clock poll */
-static XBOX_THREAD_LOCAL unsigned t_edges;
-static XBOX_THREAD_LOCAL uint32_t t_edge_site;
 static XBOX_THREAD_LOCAL uint64_t t_clock_mark;
+
+/* Is a quantum that ran out at va the end of an idle turn? The same edge
+ * twice in a row was taken for a poll loop (D7), but a compute loop whose
+ * hot inner loop holds most of its edges (a list walk, a vertex loop) ends
+ * two quanta there just as often: BLiNX 2's frame code was counted idle
+ * mid-frame and the clock stepped under it, 6-7 vblanks a frame
+ * (D24). A poll re-reads memory nobody wrote into the same registers; a
+ * compute loop usually has its cursor or count in one of them. So the
+ * edge must come back with the guest registers it had the last time a
+ * quantum ended there. The test is blind to what it does not compare: ebp
+ * (a local of the lifted function), x87 and SSE state, memory, and an index
+ * masked to a period that divides the quantum; a compute loop that moves
+ * only those still reads as a poll, as under D7.
+ *
+ * Each of the last DET_EDGE_SITES sites keeps its own record. BLiNX 1's
+ * boot waits for the GPU in a loop that calls a 400-pass delay loop: most
+ * quanta end in the delay with its count moving, one in 25 at the wait's
+ * edge with the same registers each time. With one record the sites reset
+ * each other, nothing was ever idle and the clock never stepped. A site
+ * whose registers keep moving (a poll that counts its spins) turns idle
+ * after DET_EDGE_MOVED quanta there and stays idle until the clock steps:
+ * a reset at each verdict would let two counting pollers out of phase
+ * never be idle in the same round. After the step its moving visits are
+ * busy again, so a long load in one hot loop (a decompressor, a copy) is
+ * left to the DET_EDGE_BUSY bound and steps the clock once per bound, not
+ * at each quantum past DET_EDGE_MOVED. That verdict (2) is not a still
+ * one (1): the bound keeps counting through it. The
+ * records go when the thread gives its turn up in a kernel wait (a wait
+ * that is satisfied at once keeps them, or a poll that takes a free mutex
+ * each pass would never be idle). The least recently ended site makes room
+ * for a new one; more sites than the cache holds are caught by the
+ * DET_EDGE_BUSY bound (edge_bound). Every input is guest state, so the
+ * verdict is the same on every run. */
+int xbox_GuestDetEdgeIdle(XboxDetEdge *e, uint32_t va, const uint32_t regs[7],
+                          long step)
+{
+    unsigned i, lru = 0;
+    int same_regs;
+
+    e->tick++;
+    for (i = 0; i < DET_EDGE_SITES; i++) {
+        if (e->at[i].used && e->at[i].site == va)
+            break;
+        if (e->at[i].used < e->at[lru].used)
+            lru = i;
+    }
+    if (i == DET_EDGE_SITES) {
+        i = lru;
+        e->at[i].site = va;
+        memcpy(e->at[i].regs, regs, sizeof e->at[i].regs);
+        e->at[i].moved = 0;
+        e->at[i].stuck_at = 0;
+        e->at[i].used = e->tick;
+        return 0;
+    }
+    e->at[i].used = e->tick;
+    same_regs = memcmp(regs, e->at[i].regs, sizeof e->at[i].regs) == 0;
+    memcpy(e->at[i].regs, regs, sizeof e->at[i].regs);
+    /* A still visit is idle and keeps the moved count: one still pass must
+     * not cost a sticky site another DET_EDGE_MOVED quanta. */
+    if (same_regs)
+        return 1;
+    if (e->at[i].moved >= DET_EDGE_MOVED)
+        return e->at[i].stuck_at == step ? 2 : 0;
+    if (++e->at[i].moved < DET_EDGE_MOVED)
+        return 0;
+    e->at[i].stuck_at = step;
+    return 2;
+}
 
 /* The clock reads since the last quantum ran out, in this vblank. */
 static int clock_polled(void)
@@ -772,6 +1033,32 @@ static int clock_polled(void)
     return d >= DET_CLOCK_POLL;
 }
 
+/* The bound (D24): a thread that has run DET_EDGE_BUSY quanta in a row
+ * with no still verdict and no wait that gave its turn up (more cycling
+ * loops than the cache holds, a counting site past its step, long guest
+ * work) counts as idle until it has a still verdict or the clock steps,
+ * then counts again. Idle until a step, so two such threads are idle in
+ * the same round; counting again after it, so a long load steps the clock
+ * once per DET_EDGE_BUSY quanta, not at each. It bounds one thread's busy
+ * run; it does not make the ring step on its own, since a busy quantum or
+ * a satisfied wait of another thread still resets the idle count. idle is
+ * the verdict: 1 still (the bound starts again), 2 a counting site before
+ * its step (the bound counts on through it), 0 busy. s_steps only moves in
+ * a step, which the token holder (this thread) makes, so it is stable here
+ * and guest progress like the rest of the verdict. */
+static int edge_bound(int idle)
+{
+    if (idle == 1) {
+        t_edge.busy = 0;
+        return 1;
+    }
+    if (t_edge.busy >= DET_EDGE_BUSY && s_steps != t_edge.bound_at)
+        t_edge.busy = 0;
+    if (t_edge.busy < DET_EDGE_BUSY && ++t_edge.busy == DET_EDGE_BUSY)
+        t_edge.bound_at = s_steps;
+    return idle || t_edge.busy >= DET_EDGE_BUSY;
+}
+
 void xbox_GuestDetBackEdge(uint32_t va, int at_dispatch)
 {
     int again, nxt;
@@ -779,10 +1066,14 @@ void xbox_GuestDetBackEdge(uint32_t va, int at_dispatch)
     if (t_slot < 0 || ++t_edges < DET_QUANTUM)
         return;
     t_edges = 0;
-    if (clock_polled())
-        va = DET_SITE_CLOCK;
-    again = va == t_edge_site || va == DET_SITE_CLOCK;
-    t_edge_site = va;
+    {
+        uint32_t regs[7] = { g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_esp };
+        if (clock_polled())
+            va = DET_SITE_CLOCK;
+        /* The clock site takes no place in the cache. */
+        again = edge_bound(va == DET_SITE_CLOCK
+                           ? 1 : xbox_GuestDetEdgeIdle(&t_edge, va, regs, s_steps));
+    }
     if (at_dispatch) {
         if (again && device_round(XBOX_DET_DEV_NV2A) > 0) {
             EnterCriticalSection(&s_lock);
@@ -793,23 +1084,73 @@ void xbox_GuestDetBackEdge(uint32_t va, int at_dispatch)
         return;
     }
     EnterCriticalSection(&s_lock);
-    if (again) {
-        give_up_locked(va, 0);
-    } else {
-        /* Busy: progress since the last give-up, so nobody is idle yet. */
-        s_slot[t_slot].site = va;
-        s_idle = 0;
-        nxt = next_runnable(t_slot);
-        if (nxt >= 0 && nxt != t_slot) {
-            pass_locked(nxt);
-            wait_turn();
+    {
+        long steps0 = s_steps;
+        t_pf_kind = va == DET_SITE_CLOCK ? 'k' : again ? 'e' : 'b';
+        if (again) {
+            give_up_locked(va, 0, 1);
+        } else {
+            /* Busy: progress since the last give-up, so nobody is idle yet. */
+            s_slot[t_slot].site = va;
+            s_idle = 0;
+            if (s_prof)
+                prof_note(va);
+            nxt = next_runnable(t_slot);
+            if (nxt >= 0 && nxt != t_slot) {
+                pass_locked(nxt);
+                wait_turn();
+            }
         }
+        prof_wait_end(steps0, 'y');
+        t_pf_kind = 0;
     }
     LeaveCriticalSection(&s_lock);
 }
 
+static int vblank_moved(void *ctx);
+
+/* det_profile's kind of a blocking give-up, from its site (the callers'
+ * fixed ones: 99 delay, 231 self-suspend, 233/235 waits; a critical
+ * section's site is its address). */
+static char prof_block_kind(XboxDetCheck check, uint64_t due, uint32_t site)
+{
+    if (check == vblank_moved)
+        return 'v';
+    if (site == DET_SITE_DELAY)
+        return 'd';
+    if (site == DET_SITE_SUSPEND)
+        return 's';
+    if (site == DET_SITE_WAIT_ONE || site == DET_SITE_WAIT_MANY)
+        return due ? 'w' : 'u';
+    return 'c';
+}
+
+static int det_block(XboxDetCheck check, void *ctx, uint64_t due,
+                     uint32_t site, char *how);
+
 int xbox_GuestDetBlock(XboxDetCheck check, void *ctx, uint64_t due,
                        uint32_t site)
+{
+    long steps0;
+    char how = 'o';
+    int r;
+
+    if (!s_prof)
+        return det_block(check, ctx, due, site, &how);
+    EnterCriticalSection(&s_lock);
+    steps0 = s_steps;
+    LeaveCriticalSection(&s_lock);
+    t_pf_kind = prof_block_kind(check, due, site);
+    r = det_block(check, ctx, due, site, &how);
+    EnterCriticalSection(&s_lock);
+    prof_wait_end(steps0, how);
+    LeaveCriticalSection(&s_lock);
+    t_pf_kind = 0;
+    return r;
+}
+
+static int det_block(XboxDetCheck check, void *ctx, uint64_t due,
+                     uint32_t site, char *how)
 {
     for (;;) {
         int suspended;
@@ -824,21 +1165,36 @@ int xbox_GuestDetBlock(XboxDetCheck check, void *ctx, uint64_t due,
                 LeaveCriticalSection(&s_lock);
                 return 1;
             }
-            if (due && xbox_GuestTimeReached(due))
+            if (due && xbox_GuestTimeReached(due)) {
+                *how = 't';
                 return 0;
-            if (!check && !due)
+            }
+            if (!check && !due) {
+                *how = 'r';
                 return 1;               /* a self-suspend, resumed */
+            }
         }
+        /* A thread that gives its turn up in a wait has left its loops:
+         * their edge records go (D24). A wait satisfied at once above keeps
+         * them. */
+        memset(&t_edge, 0, sizeof t_edge);
         EnterCriticalSection(&s_lock);
-        give_up_locked(site, suspended);
+        give_up_locked(site, suspended, 0);
         LeaveCriticalSection(&s_lock);
     }
 }
 
 void xbox_GuestDetYield(uint32_t site)
 {
+    long steps0;
+
     EnterCriticalSection(&s_lock);
-    give_up_locked(site, 0);
+    steps0 = s_steps;
+    /* 99 a zero delay, 238 the yield call, else a lowered spin's pass. */
+    t_pf_kind = site == DET_SITE_DELAY || site == DET_SITE_YIELD ? 'y' : 'p';
+    give_up_locked(site, 0, 0);
+    prof_wait_end(steps0, 'y');
+    t_pf_kind = 0;
     LeaveCriticalSection(&s_lock);
 }
 
@@ -851,7 +1207,7 @@ int xbox_GuestDetSuspendSelf(ULONG *prev)
         *prev = (ULONG)s_slot[t_slot].suspend;
     s_slot[t_slot].suspend++;
     LeaveCriticalSection(&s_lock);
-    xbox_GuestDetBlock(NULL, NULL, 0, 231);
+    xbox_GuestDetBlock(NULL, NULL, 0, DET_SITE_SUSPEND);
     return 1;
 }
 

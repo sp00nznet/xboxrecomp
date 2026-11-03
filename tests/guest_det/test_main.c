@@ -35,7 +35,16 @@
  *  - a timed wait due less than 1 ms ahead is a ring wait that ends on the
  *    next step, not a host poll with the clock frozen;
  *  - the USB controller gets exactly one pass per vblank step, on the new
- *    time, and none between steps: the pads are read at one point a frame.
+ *    time, and none between steps: the pads are read at one point a frame;
+ *  - a compute loop whose quanta end at one edge with its registers moving
+ *    is busy, and steps nothing, until DET_EDGE_MOVED quanta, then idle
+ *    until the clock steps, and a long load there steps about once per
+ *    DET_EDGE_BUSY quanta; one load, or two out of phase, at sites that
+ *    never repeat steps the same; a poll there with its registers still is idle
+ *    at its second quantum; two pollers that count as they poll, out of
+ *    phase, still let the clock step; a poll around a delay loop, whose
+ *    quanta end at the delay's edge but for one in 25 at the poll's,
+ *    steps the clock (D24).
  * A watchdog fails the test instead of hanging it.
  */
 #include "kernel.h"
@@ -750,6 +759,315 @@ static void usb_pass(void)
     join(d);
 }
 
+/* D24: the back-edge idle test, then a ring with a compute loop in it. */
+extern RECOMP_TLS uint32_t g_esi;
+
+static void edge_idle(void)
+{
+    XboxDetEdge e;
+    uint32_t r[7] = { 1, 2, 3, 4, 5, 6, 7 };
+    unsigned k;
+    long step = 0;
+    int ok;
+
+    memset(&e, 0, sizeof e);
+    ok = !xbox_GuestDetEdgeIdle(&e, 0x9000, r, step)          /* first: new site */
+         && xbox_GuestDetEdgeIdle(&e, 0x9000, r, step)        /* still: a poll */
+         && !xbox_GuestDetEdgeIdle(&e, 0x9004, r, step);      /* moved on */
+    check(ok, "edge: the same edge with the same registers is idle");
+    memset(&e, 0, sizeof e);
+    ok = !xbox_GuestDetEdgeIdle(&e, 0x9000, r, step);
+    for (k = 1; ok && k < DET_EDGE_MOVED; k++) {
+        r[4]++;                                         /* esi, a cursor */
+        ok = !xbox_GuestDetEdgeIdle(&e, 0x9000, r, step);
+    }
+    r[4]++;
+    ok = ok && xbox_GuestDetEdgeIdle(&e, 0x9000, r, step);
+    check(ok, "edge: moving registers are busy until DET_EDGE_MOVED quanta");
+    for (k = 0; ok && k < 3 * DET_EDGE_MOVED; k++) {
+        r[4]++;
+        ok = xbox_GuestDetEdgeIdle(&e, 0x9000, r, step);
+    }
+    check(ok, "edge: past DET_EDGE_MOVED it stays idle while the edge repeats");
+    ok = xbox_GuestDetEdgeIdle(&e, 0x9000, r, step);          /* one still visit */
+    r[4]++;
+    ok = ok && xbox_GuestDetEdgeIdle(&e, 0x9000, r, step);
+    check(ok, "edge: a still visit keeps the sticky count");
+    /* Counting is idle only until the clock steps: past it the site's
+     * moving visits are busy (a hot loop in a long load), still ones idle. */
+    step++;
+    r[4]++;
+    ok = !xbox_GuestDetEdgeIdle(&e, 0x9000, r, step);
+    ok = ok && xbox_GuestDetEdgeIdle(&e, 0x9000, r, step) == 1;
+    r[4]++;
+    ok = ok && !xbox_GuestDetEdgeIdle(&e, 0x9000, r, step);
+    check(ok, "edge: a counting site is busy again after the clock steps");
+    r[4]++;
+    ok = !xbox_GuestDetEdgeIdle(&e, 0x9008, r, step);
+    r[4]++;
+    ok = ok && !xbox_GuestDetEdgeIdle(&e, 0x9008, r, step);
+    check(ok, "edge: a new edge starts the count again");
+    /* Each recent site keeps its own record: a site that comes back with
+     * the registers of its last visit is idle with others between. */
+    memset(&e, 0, sizeof e);
+    ok = !xbox_GuestDetEdgeIdle(&e, 0x9000, r, step);
+    r[0]++;
+    ok = ok && !xbox_GuestDetEdgeIdle(&e, 0x9004, r, step);
+    r[0]--;
+    ok = ok && xbox_GuestDetEdgeIdle(&e, 0x9000, r, step);
+    check(ok, "edge: a site keeps its record while another runs between");
+    /* DET_EDGE_SITES newer sites push the oldest out. */
+    for (k = 1; k <= DET_EDGE_SITES; k++)
+        (void)xbox_GuestDetEdgeIdle(&e, 0x9000 + k * 0x10, r, step);
+    ok = !xbox_GuestDetEdgeIdle(&e, 0x9000, r, step);
+    check(ok, "edge: the least recently ended site leaves the cache");
+}
+
+static volatile LONG s_compute_quanta;
+
+static void body_compute(int id)
+{
+    unsigned long k, n = (unsigned long)s_compute_quanta * 4096u;
+
+    (void)id;
+    for (k = 0; k < n; k++) {
+        g_esi++;
+        xbox_GuestDetBackEdge(0x9000, 0);
+    }
+    InterlockedIncrement(&s_done);
+}
+
+static void compute_loop(void)
+{
+    long st, cu, pa;
+
+    s_compute_quanta = (LONG)DET_EDGE_MOVED - 1;
+    run_ring(1, body_compute, NULL);
+    xbox_GuestDetStats(&st, &cu, &pa);
+    check(st == 0, "compute: a loop at one edge with moving registers steps nothing");
+    /* A long load in one hot loop (a decompressor): one step at quantum
+     * DET_EDGE_MOVED, then one per DET_EDGE_BUSY from the bound, counted
+     * from the first quantum. Idle at every quantum past DET_EDGE_MOVED it
+     * stepped 705 times here. */
+    s_compute_quanta = 3 * (LONG)DET_EDGE_BUSY;
+    run_ring(1, body_compute, NULL);
+    xbox_GuestDetStats(&st, &cu, &pa);
+    check(st >= 3 && st <= 5,
+          "compute: a long single-loop load steps about once per DET_EDGE_BUSY quanta");
+}
+
+/* Two pollers that count as they poll, each at its own edge, reaching
+ * DET_EDGE_MOVED at different turns (thread 1 after 10 quanta of other
+ * work, thread 2 after 40). If the count started again at each verdict
+ * they would never be idle in the same round and the clock would never
+ * step; once past it each stays idle, so the steps come. The cap ends the
+ * case when they do not. */
+#define COUNT_POLL_CAP 2000
+
+static void body_count_poll(int id)
+{
+    unsigned long k;
+    int q, lead = id == 1 ? 10 : 40;
+    long st, cu, pa;
+
+    for (q = 0; q < lead; q++)
+        for (k = 0; k < 4096u; k++) {
+            g_esi++;
+            xbox_GuestDetBackEdge(0x9100u + (uint32_t)id * 4u, 0);
+        }
+    for (q = 0; q < COUNT_POLL_CAP; q++) {
+        xbox_GuestDetStats(&st, &cu, &pa);
+        if (st >= 3)
+            break;
+        for (k = 0; k < 4096u; k++) {
+            g_esi++;
+            xbox_GuestDetBackEdge(0x9200u + (uint32_t)id * 4u, 0);
+        }
+    }
+    InterlockedIncrement(&s_done);
+}
+
+static void count_pollers(void)
+{
+    long st, cu, pa;
+
+    run_ring(2, body_count_poll, NULL);
+    xbox_GuestDetStats(&st, &cu, &pa);
+    check(st >= 3, "count poll: two counting pollers out of phase still step the clock");
+}
+
+/* BLiNX 1's boot wait (D24): a loop that polls the GPU and calls a delay
+ * loop between polls. NESTED_INNER delay passes and one poll make a round
+ * of NESTED_INNER + 1 edges, so a quantum ends at the poll's edge, with the
+ * same registers each time, once in 25 and at the delay's edge, its count
+ * moving, the rest. With one record per thread the two sites reset each
+ * other and the clock never stepped. */
+#define NESTED_INNER 399u
+
+static volatile LONG s_nested_stepped;
+
+static void body_nested(int id)
+{
+    unsigned long k;
+    uint32_t n = NESTED_INNER;
+    int q;
+    long st, cu, pa;
+
+    (void)id;
+    for (q = 0; q < COUNT_POLL_CAP; q++) {
+        xbox_GuestDetStats(&st, &cu, &pa);
+        if (st >= 3) {
+            s_nested_stepped = 1;       /* in the loop, not at the parting */
+            break;
+        }
+        /* One quantum's edges; the rounds run on across quanta. */
+        for (k = 0; k < 4096u; k++) {
+            if (n > 0) {
+                g_esi = n--;                            /* the delay count */
+                xbox_GuestDetBackEdge(0x9300u, 0);
+            } else {
+                g_esi = 0x1234;                         /* GET, unchanged */
+                xbox_GuestDetBackEdge(0x9304u, 0);
+                n = NESTED_INNER;
+            }
+        }
+    }
+    InterlockedIncrement(&s_done);
+}
+
+static void nested_loops(void)
+{
+    long st, cu, pa;
+
+    s_nested_stepped = 0;
+    run_ring(1, body_nested, NULL);
+    xbox_GuestDetStats(&st, &cu, &pa);
+    check(s_nested_stepped && st >= 3,
+          "nested: a poll around a delay loop steps the clock");
+}
+
+/* Pollers whose registers stand still, in shapes the review of D24 found
+ * (s_shape picks one); each must step the clock within the cap:
+ * - 'w': a poll that waits each pass on an object already signaled, with
+ *   a timeout. The wait gives nothing up, so it keeps the edge records.
+ * - 'a': two threads, each ending its quanta in turn at two idle loops.
+ *   A site change at an idle verdict is not progress.
+ * - 'c': DET_EDGE_SITES + 1 loops in a cycle, more than the cache holds:
+ *   every visit misses, and the DET_EDGE_BUSY bound makes it idle. */
+static int s_shape;
+static volatile LONG s_shape_stepped;
+
+static int signaled(void *ctx)
+{
+    (void)ctx;
+    return 1;
+}
+
+static void body_shape(int id)
+{
+    unsigned long k;
+    unsigned nsites = s_shape == 'c' ? DET_EDGE_SITES + 1 : s_shape == 'a' ? 2 : 1;
+    int q;
+    long st, cu, pa;
+
+    for (q = 0; q < COUNT_POLL_CAP; q++) {
+        uint32_t site = 0x9400u + (uint32_t)id * 0x40u + (uint32_t)(q % nsites) * 4u;
+
+        xbox_GuestDetStats(&st, &cu, &pa);
+        if (st >= 3) {
+            InterlockedExchange(&s_shape_stepped, 1);
+            break;
+        }
+        if (s_shape == 'w')
+            xbox_GuestDetBlock(signaled, NULL, xbox_GuestTimeDue(-50 * 10000LL),
+                               DET_SITE_WAIT_ONE);
+        for (k = 0; k < 4096u; k++) {
+            g_esi = site;                       /* still at each site */
+            xbox_GuestDetBackEdge(site, 0);
+        }
+    }
+    InterlockedIncrement(&s_done);
+}
+
+static void shape_case(int shape, int threads, const char *what)
+{
+    long st, cu, pa;
+
+    s_shape = shape;
+    s_shape_stepped = 0;
+    run_ring(threads, body_shape, NULL);
+    xbox_GuestDetStats(&st, &cu, &pa);
+    check(s_shape_stepped && st >= 3, what);
+}
+
+/* A long load: guest work that never repeats (a new site and moving
+ * registers each quantum) while nothing else runs. The bound must step the
+ * clock (the virtual time a load takes), once per DET_EDGE_BUSY quanta, not
+ * once per quantum after the first DET_EDGE_BUSY. */
+#define LOAD_QUANTA (4u * DET_EDGE_BUSY)
+
+static int s_load_threads;
+
+/* With two threads, thread 2 polls with its registers still for two
+ * quanta after its 30th: the still verdict starts its bound again, so it
+ * reaches the bound about 30 turns after thread 1. */
+#define LOAD_LEAD 30u
+
+static void body_load(int id)
+{
+    unsigned long k;
+    unsigned q;
+
+    if (s_load_threads > 1 && id == 2)
+        for (q = 0; q < LOAD_LEAD + 2; q++) {
+            uint32_t site = q < LOAD_LEAD ? 0x30000u + q * 4u : 0x3F000u;
+
+            for (k = 0; k < 4096u; k++) {
+                g_esi = q < LOAD_LEAD ? (uint32_t)k : 0x1234u;
+                xbox_GuestDetBackEdge(site, 0);
+            }
+        }
+    for (q = 0; q < LOAD_QUANTA; q++) {
+        uint32_t site = 0x20000u + (uint32_t)id * 0x100000u + q * 4u;
+
+        for (k = 0; k < 4096u; k++) {
+            g_esi = (uint32_t)k;                /* moving: never still */
+            xbox_GuestDetBackEdge(site, 0);
+        }
+    }
+    InterlockedIncrement(&s_done);
+}
+
+static void load_bound(void)
+{
+    long st, cu, pa;
+
+    s_load_threads = 1;
+    run_ring(1, body_load, NULL);
+    xbox_GuestDetStats(&st, &cu, &pa);
+    check(st >= (long)(LOAD_QUANTA / DET_EDGE_BUSY) - 1
+              && st <= (long)(LOAD_QUANTA / DET_EDGE_BUSY) + 1,
+          "bound: a long load steps once per DET_EDGE_BUSY quanta");
+    /* Two loads out of phase: the first to reach the bound must stay idle
+     * until the other does, or the two are never idle in the same round
+     * and the clock never steps; idle at every quantum past it (faaf96d4),
+     * they step about once per round. */
+    s_load_threads = 2;
+    run_ring(2, body_load, NULL);
+    xbox_GuestDetStats(&st, &cu, &pa);
+    check(st >= (long)(LOAD_QUANTA / DET_EDGE_BUSY) - 1
+              && st <= (long)(LOAD_QUANTA / DET_EDGE_BUSY) + 1,
+          "bound: two loads out of phase step once per DET_EDGE_BUSY quanta");
+}
+
+static void idle_shapes(void)
+{
+    shape_case('w', 1, "shapes: a poll through a signaled wait steps the clock");
+    shape_case('a', 2, "shapes: two threads alternating idle loops step the clock");
+    shape_case('c', 1, "shapes: more cycling loops than the cache steps the clock");
+    load_bound();
+}
+
 int main(void)
 {
     CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
@@ -772,6 +1090,11 @@ int main(void)
     part_bound();
     short_due();
     usb_pass();
+    edge_idle();
+    compute_loop();
+    count_pollers();
+    nested_loops();
+    idle_shapes();
     xbox_GuestTimeTestMode(-1);
     printf("guest_det: %s (%d failures)\n", failures ? "FAIL" : "PASS",
            failures);

@@ -997,6 +997,46 @@ int      xbox_GuestDetBlock(XboxDetCheck check, void *ctx, uint64_t due,
                             uint32_t site);
 void     xbox_GuestDetYield(uint32_t site);
 void     xbox_GuestDetBackEdge(uint32_t va, int at_dispatch);
+/* The give-up sites of the kernel calls that block or yield in the ring:
+ * their kernel ordinals. A critical section passes its address, a lowered
+ * spin-wait its loop's address. */
+#define DET_SITE_DELAY      99u     /* KeDelayExecutionThread */
+#define DET_SITE_SUSPEND    231u    /* NtSuspendThread (self) */
+#define DET_SITE_WAIT_ONE   233u    /* NtWaitForSingleObject(Ex) */
+#define DET_SITE_WAIT_MANY  235u    /* NtWaitForMultipleObjectsEx */
+#define DET_SITE_YIELD      238u    /* NtYieldExecution */
+/* The back-edge quantum's idle test (D24): nonzero when a quantum that ran
+ * out at va ends an idle turn. 1 (still): va's last quantum end left the
+ * guest registers (eax, ecx, edx, ebx, esi, edi, esp) as they are now. 2
+ * (counting): quanta have ended at va DET_EDGE_MOVED times with them
+ * moving, and the clock has not stepped since (step, the caller's step
+ * count, is still the one of the DET_EDGE_MOVED-th); past that step its
+ * moving visits are busy (0) again. The thread remembers its last
+ * DET_EDGE_SITES edge sites, so a poll whose quanta alternate between
+ * nested loops (a delay call inside a wait) keeps each loop's record. e is
+ * the thread's state, zeroed at start, at the thread's join and when it
+ * gives its turn up in a kernel wait (a wait satisfied at once keeps it).
+ * busy and bound_at belong to the back edge's bound (DET_EDGE_BUSY quanta
+ * with no still verdict and no wait that gave the turn up,
+ * xbox_GuestDetBackEdge). The bound limits one thread's busy run; it is
+ * not a ring-wide guarantee that the clock steps. */
+#define DET_EDGE_MOVED 64u
+#define DET_EDGE_SITES 4u
+#define DET_EDGE_BUSY  (DET_EDGE_MOVED * DET_EDGE_SITES)
+typedef struct {
+    struct {
+        uint32_t site;
+        uint32_t regs[7];
+        unsigned moved;
+        long stuck_at;      /* the step count when moved reached DET_EDGE_MOVED */
+        uint64_t used;      /* e->tick at its last quantum end; 0: empty */
+    } at[DET_EDGE_SITES];
+    uint64_t tick;          /* quantum ends seen: the LRU clock (no wrap) */
+    unsigned busy;          /* quanta in a row with no still verdict */
+    long bound_at;          /* the step count when busy reached the bound */
+} XboxDetEdge;
+int      xbox_GuestDetEdgeIdle(XboxDetEdge *e, uint32_t va, const uint32_t regs[7],
+                               long step);
 /* Wait for the virtual vblank count to leave seen; 0 when the caller is not
  * in the ring (do the host wait). */
 int      xbox_GuestDetWaitVblank(uint64_t seen, uint32_t site);

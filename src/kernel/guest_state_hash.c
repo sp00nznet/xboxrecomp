@@ -3,6 +3,7 @@
  */
 #include "kernel.h"
 #include "guest_state_hash.h"
+#include "platform/host_time.h"
 #include "guest_time.h"
 #include "xbox_memory_layout.h"
 #include "recomp_env.h"
@@ -195,7 +196,19 @@ static void dump_ram(uint32_t poll)
 
 /* At the end of each port-0 poll, on the polling thread (the title's own,
  * for a title that answers XInputGetState itself). */
+static void on_poll_hash(uint32_t poll);
+
+/* det_profile counts the hash's wall time apart from the guest's. */
 static void on_poll(uint32_t poll)
+{
+    uint64_t t0 = xbox_GuestDetProfileOn() ? xbox_HostNowNs() : 0;
+
+    on_poll_hash(poll);
+    if (t0)
+        xbox_GuestDetProfileHashNs(xbox_HostNowNs() - t0);
+}
+
+static void on_poll_hash(uint32_t poll)
 {
     uint64_t all = 0x84222325CBF29CE4ULL;
     uint32_t nchanged = 0;

@@ -250,7 +250,7 @@ static DWORD sync_det_wait(DWORD n, const HANDLE *h, BOOL all,
 static DWORD sync_wait_one(HANDLE h, DWORD ms, BOOL alertable, uint64_t due)
 {
     if ((ms || due) && xbox_GuestDetThread())
-        return sync_det_wait(1, &h, FALSE, alertable, due, 233);
+        return sync_det_wait(1, &h, FALSE, alertable, due, DET_SITE_WAIT_ONE);
     if (due) {
         DWORD r = WaitForSingleObjectEx(h, 0, alertable);
         if (r != WAIT_TIMEOUT)
@@ -277,7 +277,7 @@ static DWORD sync_wait_many(DWORD n, const HANDLE *h, BOOL all, DWORD ms,
                             BOOL alertable, uint64_t due)
 {
     if ((ms || due) && xbox_GuestDetThread())
-        return sync_det_wait(n, h, all, alertable, due, 235);
+        return sync_det_wait(n, h, all, alertable, due, DET_SITE_WAIT_MANY);
     if (due) {
         DWORD r = WaitForMultipleObjectsEx(n, h, all, 0, alertable);
         if (r != WAIT_TIMEOUT)
