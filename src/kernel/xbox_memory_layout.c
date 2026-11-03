@@ -1286,6 +1286,7 @@ static uint32_t g_frame_counters_owned;
 
 extern int nv2a_pb_exec_flip_pacing(void);
 extern void nv2a_pb_exec_put_read(uint32_t vbl, uint32_t put);
+extern uint32_t nv2a_pb_exec_flip_vblanks(void);
 
 /* Registered counters the title is moving itself right now. */
 uint32_t xbox_Nv2aFrameCountersOwned(void) { return g_frame_counters_owned; }
@@ -1305,7 +1306,7 @@ static void frame_counter_bump(int i)
     p = (volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
                               + g_memory_offset);
     r = xbox_FrameCounterBump(&g_frame_counters[i].bump, p,
-                              nv2a_pb_exec_flip_pacing(), GetTickCount());
+                              nv2a_pb_exec_flip_pacing(), xbox_GuestTickCount());
     if (r == XBOX_FRAME_COUNTER_HANDED_OVER) {
         g_frame_counters_owned++;
         fprintf(stderr, "  Frame counter: device at 0x%08X, count +0x%X keeps"
@@ -1350,7 +1351,11 @@ void xbox_Nv2aFrameCounterFlip(void)
 {
     int i;
 
-    g_frame_counter_flip_ms = GetTickCount();
+    /* Both stamps here and in frame_counters_tick read the guest clock, so
+     * in the deterministic mode the "is something presenting" test is a
+     * function of emulated vblanks, not of host speed. Off the mode
+     * xbox_GuestTickCount is GetTickCount. */
+    g_frame_counter_flip_ms = xbox_GuestTickCount();
     if (!g_frame_counter_flip_ms)
         g_frame_counter_flip_ms = 1;          /* 0 means "never" */
     for (i = 0; i < g_frame_counter_count; i++)
@@ -1359,9 +1364,15 @@ void xbox_Nv2aFrameCounterFlip(void)
 
 static void frame_counters_tick(void)
 {
-    DWORD now = GetTickCount();
+    DWORD now = xbox_GuestTickCount();
     int i;
 
+    /* 0 means "never" in both stamps. The virtual clock reads 0 for the
+     * whole of the first vblank, so it counts as 1 here as it does in the
+     * flip stamp: otherwise every pass of that vblank would bump, and
+     * now - flip_ms would wrap. */
+    if (!now)
+        now = 1;
     if (!g_frame_counter_count)
         return;
     if (g_frame_counter_last_ms
@@ -1845,7 +1856,11 @@ static void kick_wake_init(void *regs)
     g_kick_wake.kick_bit = NV2A_KICK_BIT;
     g_kick_wake.put = (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
     g_kick_wake.done_put = &g_scanned_put;
-    g_kick_wake.vblank_count = xbox_VblankCount;
+    /* The count the ack loop hands to the nudged sleep: in the deterministic
+     * mode that is the virtual clock's (nv2a_pb_exec_flip_vblanks), and the
+     * host's count would never match it. */
+    g_kick_wake.vblank_count = xbox_GuestTimeVirtual()
+                             ? nv2a_pb_exec_flip_vblanks : xbox_VblankCount;
     g_kick_wake.waker = xbox_HostWakerCreate();
     if (!g_kick_wake.waker)
         g_kick_event = 0;
@@ -2476,7 +2491,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             DWORD now_ms = GetTickCount();
             /* Read before PUT: the last read that saw the old PUT bounds
              * the kick's vblank from below (nv2a_pb_exec_put_read). */
-            uint32_t idle_vbl = xbox_VblankCount();
+            uint32_t idle_vbl = nv2a_pb_exec_flip_vblanks();
             uint32_t put;
             __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* the count first */
             put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
@@ -2662,7 +2677,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 (volatile uint32_t *)((char *)regs + NV2A_KICK_REG);
             for (;;) {
                 /* Before the hold's poll, and before PUT: as at the scan. */
-                uint32_t vbl = xbox_VblankCount();
+                uint32_t vbl = nv2a_pb_exec_flip_vblanks();
                 uint32_t put;
                 int held, acked = 0;
                 __atomic_thread_fence(__ATOMIC_ACQUIRE);

@@ -37,6 +37,7 @@
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 #include "nv2a_flip_hold.h"
 #include "platform/host_time.h"   /* xbox_HostNowNs */
+#include "guest_time.h"   /* the flip hold on the virtual clock */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
@@ -558,16 +559,39 @@ static uint64_t s_vbl_moved_ns;
  * vblank past it; the title's next frame then counted as a second flip in
  * the same vblank and was held for most of a frame. */
 static uint32_t s_walk_vbl;
+
+/* The vblank count the hold measures flips on. In the deterministic mode
+ * it is the virtual clock's, which steps whether or not RECOMP_VBLANK
+ * raises the interrupt: the kernel's count only moves with the interrupt,
+ * and a hold on a count that never moves would never arm. The ack loop
+ * reads it too, for its PUT reads. */
+uint32_t nv2a_pb_exec_flip_vblanks(void)
+{
+    if (xbox_GuestTimeVirtual())
+        return (uint32_t)xbox_GuestTimeVblanks();
+    return xbox_VblankCount();
+}
+
+/* The hold's clock: the host's, or the virtual clock in the deterministic
+ * mode, where a timeout or a stale count measured on the host would release
+ * a flip at a different point of guest progress on every run. */
+static uint64_t flip_now_ns(void)
+{
+    if (xbox_GuestTimeVirtual())
+        return xbox_GuestInterruptTime() * 100u;
+    return xbox_HostNowNs();
+}
+
 /* Each read of PUT by the ack loop, with the count read before it: the
  * flip hold's bound on a late walk's kick (nv2a_flip_hold.h). */
 void nv2a_pb_exec_put_read(uint32_t vbl, uint32_t put)
 {
-    xbox_FlipHoldPutRead(&s_flip_hold, vbl, put, xbox_HostNowNs());
+    xbox_FlipHoldPutRead(&s_flip_hold, vbl, put, flip_now_ns());
 }
 
 void nv2a_pb_exec_walk_begin(void)
 {
-    s_walk_vbl = xbox_VblankCount();
+    s_walk_vbl = nv2a_pb_exec_flip_vblanks();
     /* The stamp after the count: seeing a catch-up vblank's count without
      * its stamp (arm64 may load them out of order) would take the late
      * count for the flip, the slip the stamp exists to prevent. */
@@ -579,7 +603,11 @@ void nv2a_pb_exec_walk_begin(void)
  * counters are bumped on every flip, as before), edge (D3D's rule: a late
  * frame waits for the next vblank), anything else on. Opt-in: it holds the
  * title's GPU on the guest vblank clock, and a held flip is a stall a
- * title's own pacing has never seen here. The first caller can be the timer
+ * title's own pacing has never seen here. In the deterministic mode unset
+ * means on: the mode steps the clock only when no GPU work is left, so a
+ * title that flips without waiting for a vblank (a loading screen) keeps
+ * the GPU busy and stops its own clock, and the hold is what lets a vblank
+ * in. The first caller can be the timer
  * thread, a KeSetTimer caller (through the vblank mode) or the ack thread;
  * two first callers store the same values, the edge flag before the mode,
  * so the race costs at most a second log line. */
@@ -588,13 +616,15 @@ int nv2a_pb_exec_flip_pacing(void)
     static volatile int mode = -1;
     if (mode < 0) {
         const char *e = recomp_env(RENV_FLIP_PACING);
-        int m = (!e || !*e || !strcmp(e, "0")) ? 0
-                : !strcmp(e, "edge") ? 2 : 1;
-        s_flip_hold.edge = m == 2;
+        int m = xbox_FlipPacingMode(e, xbox_GuestTimeVirtual());
+        s_flip_hold.edge = m == XBOX_FLIP_PACING_EDGE;
         mode = m;
         if (e)
             fprintf(stderr, "  [GPU] flip pacing %s (RECOMP_FLIP_PACING=%s)\n",
-                    m == 0 ? "off" : m == 2 ? "edge" : "on", e);
+                    m == XBOX_FLIP_PACING_OFF ? "off"
+                    : m == XBOX_FLIP_PACING_EDGE ? "edge" : "on", e);
+        else if (m)
+            fprintf(stderr, "  [GPU] flip pacing on (deterministic)\n");
     }
     return mode;
 }
@@ -604,7 +634,7 @@ int nv2a_pb_exec_flip_pacing(void)
  * would only ever end on its timeout. */
 static uint32_t flip_clock(uint64_t now_ns, int *ok)
 {
-    uint32_t c = xbox_VblankCount();
+    uint32_t c = nv2a_pb_exec_flip_vblanks();
     if (c != s_vbl_count) {
         s_vbl_count = c;
         s_vbl_moved_ns = now_ns;
@@ -622,7 +652,7 @@ int nv2a_pb_exec_flip_poll(void)
 
     if (!s_flip_hold.held)
         return 0;
-    now = xbox_HostNowNs();
+    now = flip_now_ns();
     c = flip_clock(now, &ok);
     return xbox_FlipHoldPoll(&s_flip_hold, c, now, ok);
 }
@@ -631,7 +661,7 @@ int nv2a_pb_exec_flip_poll(void)
  * title is out of step with it, so nothing waits on it. */
 void nv2a_pb_exec_flip_cancel(void)
 {
-    xbox_FlipHoldCancel(&s_flip_hold, xbox_HostNowNs());
+    xbox_FlipHoldCancel(&s_flip_hold, flip_now_ns());
 }
 
 /* For the RECOMP_TRACE=pacing window line, then reset. */
@@ -7440,7 +7470,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * walk's start, s_walk_vbl); the hold's clock starts here, before
          * the backend's present: a vsynced present can hold this thread for
          * a host frame, and that time counts against the hold. */
-        uint64_t stall_ns = xbox_HostNowNs();
+        uint64_t stall_ns = flip_now_ns();
         int clock_ok;
         uint32_t stall_vbl;
         (void)flip_clock(stall_ns, &clock_ok);

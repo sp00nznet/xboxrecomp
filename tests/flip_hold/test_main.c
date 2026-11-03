@@ -12,7 +12,8 @@
  * a walk that starts vblanks after its kick in the clock's catch-up (the
  * grid must not shift) and one with no catch-up (the old rule), the frame
  * counter ownership rule with its seeding, window and hand-back, and the
- * bump of a counter word with flip pacing off and on.
+ * bump of a counter word with flip pacing off and on, and the pacing mode
+ * RECOMP_FLIP_PACING selects on the host and the virtual clock.
  */
 #include "nv2a_flip_hold.h"
 
@@ -459,6 +460,23 @@ int main(void)
               == XBOX_FRAME_COUNTER_HANDED_BACK && word == 74,
               "on: quiet 300 ms, handed back and bumped");
     }
+
+    printf("flip pacing mode (RECOMP_FLIP_PACING)\n");
+    check(xbox_FlipPacingMode(NULL, 0) == XBOX_FLIP_PACING_OFF
+          && xbox_FlipPacingMode("", 0) == XBOX_FLIP_PACING_OFF,
+          "unset, host clock: off");
+    check(xbox_FlipPacingMode(NULL, 1) == XBOX_FLIP_PACING_ON
+          && xbox_FlipPacingMode("", 1) == XBOX_FLIP_PACING_ON,
+          "unset, virtual clock: on");
+    check(xbox_FlipPacingMode("0", 0) == XBOX_FLIP_PACING_OFF
+          && xbox_FlipPacingMode("0", 1) == XBOX_FLIP_PACING_OFF,
+          "0: off, on either clock");
+    check(xbox_FlipPacingMode("edge", 0) == XBOX_FLIP_PACING_EDGE
+          && xbox_FlipPacingMode("edge", 1) == XBOX_FLIP_PACING_EDGE,
+          "edge: edge, on either clock");
+    check(xbox_FlipPacingMode("1", 0) == XBOX_FLIP_PACING_ON
+          && xbox_FlipPacingMode("yes", 1) == XBOX_FLIP_PACING_ON,
+          "anything else: on");
 
     printf("%s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

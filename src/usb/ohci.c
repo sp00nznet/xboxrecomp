@@ -1458,10 +1458,11 @@ static void ohci_pass_end(void)
     xbox_GuestDetDeviceRemove(XBOX_DET_DEV_OHCI);
 }
 
-static DWORD WINAPI ohci_thread(LPVOID unused)
+/* The controller thread's own TIB; 0, with the thread leaving, when the
+ * heap has none. */
+static int ohci_thread_tib(void)
 {
-    xbox_log_thread_role("ohci", 0);
-    /* This thread calls recompiled code, so it needs what any thread running
+    /* The thread calls recompiled code, so it needs what any thread running
      * recompiled code needs: its own TIB. The guest register set is already
      * thread-local and the ISR gets a worker stack, but fs:[0] is the SEH
      * chain head and fs:[4] reaches the CRT's per-thread data -- and a guest
@@ -1469,6 +1470,22 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
      * dereferences null before it executes a line of its own body. That is
      * what killed the process here, two interrupts in, with no fault report
      * because the fault was in the runtime rather than in the title. */
+    uint32_t tib = xbox_AllocThreadTib();
+
+    if (!tib) {
+        fprintf(stderr, "  [OHCI0] no TIB for the controller thread; "
+                        "not delivering interrupts\n");
+        fflush(stderr);
+        ohci_pass_end();
+        return 0;
+    }
+    g_fs_base = tib;
+    return 1;
+}
+
+static DWORD WINAPI ohci_thread(LPVOID unused)
+{
+    xbox_log_thread_role("ohci", 0);
     unsigned waited = 0;
     int plugged = 0;
     uint32_t last_status = 0;
@@ -1478,18 +1495,18 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     unsigned last_ack = 0;
     unsigned first_port = 0, settle = 0;
     int      npl = 1;              /* pads plugged without a source */
+    /* The TIB: at thread start off the virtual clock, where the mode
+     * cannot turn on, as it always was. On it, from the first pass, which
+     * the mode grants with every guest thread idle: taken at thread start
+     * it raced the main thread's first heap allocations, and its place in
+     * the heap moved every later allocation between runs. */
+    int      tib_ready = 0;
 
     (void)unused;
-    {
-        uint32_t tib = xbox_AllocThreadTib();
-        if (!tib) {
-            fprintf(stderr, "  [OHCI0] no TIB for the controller thread; "
-                            "not delivering interrupts\n");
-            fflush(stderr);
-            ohci_pass_end();
+    if (!xbox_GuestTimeVirtual()) {
+        if (!ohci_thread_tib())
             return 0;
-        }
-        g_fs_base = tib;
+        tib_ready = 1;
     }
 
     for (;;) {
@@ -1499,6 +1516,11 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
 
         if (!ohci_pass_begin())
             continue;
+        if (!tib_ready) {
+            if (!ohci_thread_tib())
+                return 0;
+            tib_ready = 1;
+        }
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 

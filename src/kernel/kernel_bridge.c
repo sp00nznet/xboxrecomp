@@ -4354,13 +4354,28 @@ static void kernel_timer_loop_ns(void)
  * each virtual millisecond lands at the same point of guest progress on
  * every run. One pass is one vblank: the time step, its interrupt, then
  * the DPCs and timers it made due. */
+static int kernel_timer_thread_setup(void);
+
 static void kernel_timer_loop_det(void)
 {
+    int ready = 0;
+
     for (;;) {
         long long timer_due;
         int ran;
 
         xbox_GuestDetDeviceWait(XBOX_DET_DEV_TIMER);
+        /* The stack slice and the TIB come from the first grant, when the
+         * guest threads are all idle: taken at thread start they raced the
+         * main thread's first heap allocations, and the TIB's place in the
+         * heap moved every later allocation between runs. */
+        if (!ready) {
+            if (!kernel_timer_thread_setup()) {
+                xbox_GuestDetDeviceRemove(XBOX_DET_DEV_TIMER);
+                return;
+            }
+            ready = 1;
+        }
         if (kernel_vblank_enabled()) {
             kernel_vblank_count(kernel_clock_ms());
             kernel_vblank_raise();
@@ -4376,12 +4391,11 @@ static void kernel_timer_loop_det(void)
     }
 }
 
-static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+/* The thread's guest stack and TIB. 0 when either is missing. */
+static int kernel_timer_thread_setup(void)
 {
     int slot = xbox_worker_stack_alloc();
 
-    (void)unused;
-    xbox_log_thread_role("kernel-timer", 0);
     if (slot < 0) {
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
                         "timer DPCs will not run\n");
@@ -4403,11 +4417,19 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         }
         g_fs_base = tib;
     }
+    return 1;
+}
 
+static DWORD WINAPI kernel_timer_thread(LPVOID unused)
+{
+    (void)unused;
+    xbox_log_thread_role("kernel-timer", 0);
     if (xbox_GuestDetOn()) {
         kernel_timer_loop_det();
         return 0;
     }
+    if (!kernel_timer_thread_setup())
+        return 0;
     if (!kernel_timer_paced()) {
         /* Neither the 60 Hz vblank nor the gate: the 10 ms tick, the
          * vblank tick when RECOMP_VBLANK asks for it, DPCs before due

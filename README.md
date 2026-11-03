@@ -693,7 +693,7 @@ below was looked at twice.*
   - `RECOMP_DISPATCH_GATE=1`: a one-CPU DISPATCH gate, with DPCs at the raise
     and interrupts at safe points.
   - `RECOMP_VBLANK=paced`: a 60 Hz vblank schedule with an ack thread.
-  - `RECOMP_FLIP_PACING=1`: flips held to the guest's vblank.
+  - `RECOMP_FLIP_PACING=1`: flips held to the guest's vblank (on by default with `RECOMP_DETERMINISTIC=1`).
   - `RECOMP_GUEST_CPUS=<n>`: guest threads pinned to fewer cores.
   - The lifter's `--back-edge-yield`: loop checks for the guest CPU
     scheduler.

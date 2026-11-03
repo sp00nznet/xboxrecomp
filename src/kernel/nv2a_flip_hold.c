@@ -3,6 +3,19 @@
  */
 #include "nv2a_flip_hold.h"
 
+#include <string.h>
+
+int xbox_FlipPacingMode(const char *env, int virtual_clock)
+{
+    if (!env || !*env)
+        return virtual_clock ? XBOX_FLIP_PACING_ON : XBOX_FLIP_PACING_OFF;
+    if (!strcmp(env, "0"))
+        return XBOX_FLIP_PACING_OFF;
+    if (!strcmp(env, "edge"))
+        return XBOX_FLIP_PACING_EDGE;
+    return XBOX_FLIP_PACING_ON;
+}
+
 int xbox_FlipHoldSwap(XboxFlipHold *h, uint32_t param)
 {
     uint32_t payload;

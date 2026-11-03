@@ -26,7 +26,8 @@
  * interval per frame (one that waits for two vblanks itself) is never held,
  * and a late frame on a slow backend is not pushed to the next vblank.
  * The hold is opt-in: RECOMP_FLIP_PACING=1 turns it on, =edge with D3D's
- * rule for A/B runs; unset, flips complete at once as before.
+ * rule for A/B runs; unset, flips complete at once as before, except in
+ * the deterministic mode, where unset means on (xbox_FlipPacingMode).
  *
  * The count a stall is measured at is the vblank the walk began in. After
  * a host stall that can be vblanks after the one the title kicked in: the
@@ -98,6 +99,17 @@ typedef struct {
     uint32_t late_walks, late_max;
     uint64_t held_ns;
 } XboxFlipHold;
+
+/* Pacing modes (RECOMP_FLIP_PACING). */
+#define XBOX_FLIP_PACING_OFF  0
+#define XBOX_FLIP_PACING_ON   1
+#define XBOX_FLIP_PACING_EDGE 2
+
+/* The pacing mode env selects: 0 off, edge D3D's rule, anything else on.
+ * Unset or empty is off, or on when virtual_clock (the deterministic
+ * mode), where the hold is what lets a vblank in while a title keeps the
+ * GPU busy (nv2a_pb_exec_flip_pacing). */
+int xbox_FlipPacingMode(const char *env, int virtual_clock);
 
 /* A NO_OPERATION parameter. Returns 1 when it is the swap (software method
  * 1) and was recorded, 0 for anything else, which changes nothing. */
