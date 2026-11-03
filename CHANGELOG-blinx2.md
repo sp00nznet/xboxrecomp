@@ -9,6 +9,50 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.13.0] - 2026-11-03
+
+### Added
+- A Saves page in the menu exports a title's saves to a zip and imports
+  one back. An import is checked whole (names, sizes, CRCs, title, keys)
+  and previewed, the live saves are backed up, and the new ones swap in
+  with renames that roll back; the game then quits so it cannot write its
+  old saves over them. Export and import wait while the game is saving.
+- The Files page imports and exports settings and shader profiles through
+  an in-menu file browser (Home, and each drive on Windows). An import is
+  previewed before Apply, and keys the menu does not know are kept.
+  "Open exports folder" opens the folder in the host's file manager.
+- The menu takes the mouse: hover, click, slider drag and wheel steps,
+  pad focus regions with button hints, and an on-screen keyboard for
+  renames started by mouse or touch. Esc and Backspace act as B. The
+  pointer maps through the presented view on Metal and D3D11.
+- A new menu layout: compact and expanded sizes (R3), a left toolbar that
+  folds to icons, footer buttons with their shortcut glyphs, and
+  `overlay.ui_scale` (0.75-2, restart-only).
+- Mod API version 7: `glyph_name` and the `{ctl:}` token name a mod's
+  controls for the device in use, and a per-mod status panel redraws
+  them after a rebind or a device switch. A v6 mod still loads.
+- The free camera page draws bindings as glyphs (`{bind:}`), fly controls
+  can be held on mouse buttons 1-5, and "Reset <mod> controls" restores a
+  mod's bindings without touching its settings.
+- Deterministic mode (debug key `deterministic`, off by default): every
+  guest clock read goes through one time source that steps once per
+  emulated vblank, guest threads take turns in a fixed order, file times
+  are fixed, and OHCI pads report on the virtual clock, so a pad replay
+  gives the same per-frame state hashes (`state_hash`) run after run on
+  one host. With the mode off the clock reads are unchanged.
+- `pad_record` can count steps on the title's own pad polls
+  (`pad_clock=poll`), ends a record with `@end`, and `pad_quit` closes the
+  game once a script has run out.
+
+### Fixed
+- Text the CLI packages (`*.sh *.py *.in *.toml *.env *.default *.slang
+  *.slangp`) stays LF on Windows checkouts with `core.autocrlf=true`, so
+  the build wizard's package step no longer refuses
+  `shaders/param-kinds.toml`.
+- `pad_record` writes one `@end` when the quit hooks race a poll, a failed
+  window close falls back to the quit thread, and the signal path no
+  longer formats with `snprintf`.
+
 ## [blinx2-v0.12.0] - 2026-11-01
 
 ### Added
