@@ -450,6 +450,80 @@ void xbox_path_set_title_id(uint32_t title_id)
     s_title_id = title_id;
 }
 
+uint32_t xbox_path_title_id(void)
+{
+    return s_title_id;
+}
+
+/* The certificate's title name as UTF-8, for the saves zip's manifest
+ * (enhance_menu.c's Saves page). Written once at load, before any menu. */
+static char s_title_name[128];
+
+void xbox_path_set_title_name(const uint16_t *name, int max_chars)
+{
+    size_t o = 0;
+    int i;
+    for (i = 0; name && i < max_chars && name[i]; i++) {
+        unsigned c = name[i];
+        if (c >= 0xD800 && c <= 0xDFFF)
+            c = '?';                    /* a FATX title name is UCS-2 */
+        if (c < 0x80 && o + 1 < sizeof s_title_name) {
+            s_title_name[o++] = c < 0x20 ? ' ' : (char)c;
+        } else if (c < 0x800 && o + 2 < sizeof s_title_name) {
+            s_title_name[o++] = (char)(0xC0 | (c >> 6));
+            s_title_name[o++] = (char)(0x80 | (c & 0x3F));
+        } else if (c >= 0x800 && o + 3 < sizeof s_title_name) {
+            s_title_name[o++] = (char)(0xE0 | (c >> 12));
+            s_title_name[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            s_title_name[o++] = (char)(0x80 | (c & 0x3F));
+        } else {
+            break;
+        }
+    }
+    while (o && s_title_name[o - 1] == ' ')
+        o--;
+    s_title_name[o] = '\0';
+}
+
+const char *xbox_path_title_name(void)
+{
+    return s_title_name;
+}
+
+/*
+ * Whether a guest path lands in the title's saves, for the Saves page's
+ * busy guard (kernel_file.c): UDATA and TDATA on Partition1, and the T:\ and
+ * U:\ fallbacks a title that never links its drives writes through. Not
+ * E:\CACHE, though it shares their root: a title rewrites its scratch all
+ * the time, and an import never touches it. The same links and rules as
+ * xbox_path_tree; relative names are 0 (the caller tracks their handles).
+ */
+int xbox_path_is_save(const char *xbox_path)
+{
+    char linked[2][512];
+    const char *p = xbox_path;
+    int i, hop;
+
+    if (!p || !p[0])
+        return 0;
+    for (hop = 0; hop < 8; hop++) {
+        if (!resolve_symlink(p, linked[hop & 1], sizeof linked[0]))
+            break;
+        p = linked[hop & 1];
+    }
+    if (xbox_partition_device_digit(p))
+        return 0;
+    for (i = 0; i < PATH_RULE_COUNT; i++) {
+        const char *sub;
+        if (!match_rule(p, &s_rules[i]))
+            continue;
+        sub = s_rules[i].sub_posix;
+        return sub && (strcmp(sub, "/UDATA") == 0 || strcmp(sub, "/TDATA") == 0
+                       || strcmp(sub, "/TitleData") == 0 || strcmp(sub, "/UserData") == 0);
+    }
+    return 0;
+}
+
 #if defined(_WIN32)
 #define XBOX_HOST_SEP '\\'
 #else
@@ -1096,6 +1170,19 @@ int xbox_path_hdd_root(char *out, size_t n)
         return 0;
     return WideCharToMultiByte(CP_UTF8, 0, s_save_dir, -1, out, (int)n,
                                NULL, NULL) > 0;
+}
+
+int xbox_path_save_root(int tdata, char *out, size_t n)
+{
+    WCHAR w[MAX_PATH];
+    const WCHAR *base;
+    if (!path_ready() || !n)
+        return 0;
+    base = s_user_in_game[tdata ? 1 : 0] ? s_game_dir : s_user_dir;
+    if (_snwprintf_s(w, MAX_PATH, _TRUNCATE, L"%s\\%s", base,
+                     tdata ? L"TDATA" : L"UDATA") < 0)
+        return 0;
+    return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)n, NULL, NULL) > 0;
 }
 
 /* The host path the last translation produced.
@@ -1784,6 +1871,17 @@ int xbox_path_hdd_root(char *out, size_t n)
         return 0;
     memcpy(out, s_save_dir, strlen(s_save_dir) + 1);
     return 1;
+}
+
+int xbox_path_save_root(int tdata, char *out, size_t n)
+{
+    const char *base;
+    int w;
+    if (!path_ready() || !n)
+        return 0;
+    base = s_user_in_game[tdata ? 1 : 0] ? s_game_dir : s_user_dir;
+    w = snprintf(out, n, "%s/%s", base, tdata ? "TDATA" : "UDATA");
+    return w > 0 && (size_t)w < n;
 }
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)

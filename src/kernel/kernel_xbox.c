@@ -57,6 +57,35 @@ UCHAR xbox_SignatureKey[16]           = {0};
 UCHAR xbox_LANKey[16]                 = {0};
 UCHAR xbox_AlternateSignatureKeys[16][16] = {{0}};
 
+/* A title signs its saves with these keys (XCalculateSignature mixes the
+ * signature key with the title's; "noroam" saves add the HD key), so a save
+ * moves between hosts only when they match. Every build leaves them zero;
+ * the saves zip records which set made it (openspec overlay-saves, D1). */
+const char *xbox_saves_keys_id(void)
+{
+    static char id[17];
+    static const char hex[] = "0123456789abcdef";
+    XBOX_SHA_CONTEXT sha;
+    UCHAR d[20];
+    int i, zero = 1;
+    for (i = 0; i < 16; i++)
+        if (xbox_HDKey[i] || xbox_SignatureKey[i])
+            zero = 0;
+    if (zero)
+        return "zero";
+    xbox_XcSHAInit(&sha);
+    xbox_XcSHAUpdate(&sha, (const UCHAR *)"xbr-saves-keys", 14);
+    xbox_XcSHAUpdate(&sha, xbox_HDKey, 16);
+    xbox_XcSHAUpdate(&sha, xbox_SignatureKey, 16);
+    xbox_XcSHAFinal(&sha, d);
+    for (i = 0; i < 8; i++) {
+        id[2 * i] = hex[d[i] >> 4];
+        id[2 * i + 1] = hex[d[i] & 15];
+    }
+    id[16] = '\0';
+    return id;
+}
+
 /* Public key data for Xbox Live signature verification - not needed */
 UCHAR xbox_XePublicKeyData[284] = {0};
 

@@ -7390,6 +7390,10 @@ static void bridge_NtDuplicateObject(void)
         g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */
         return;
     }
+    /* The Saves page's busy table: CLOSE_SOURCE closes the source without
+     * an xbox_NtClose. */
+    xbox_saves_duplicated(src, dup == (HANDLE)(intptr_t)-1 ? NULL : dup,
+                          (opts & DUPLICATE_CLOSE_SOURCE) != 0);
     /* A host may hand back the current-process pseudo-handle itself as the
      * duplicate (the POSIX shim does). It is not a table handle -- the token
      * allocator would read it as INVALID_HANDLE_VALUE -- so give the guest

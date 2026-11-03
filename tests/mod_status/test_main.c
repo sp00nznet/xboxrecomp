@@ -91,6 +91,38 @@ int xbox_path_shader_cache(char *out, size_t n)
 
 ptrdiff_t xbox_GetMemoryOffset(void);
 ptrdiff_t xbox_GetMemoryOffset(void) { return 0; }
+
+/* kernel_path.c and kernel_xbox.c: the running title and its save roots,
+ * for the Saves page. s_tid 0: no title yet, as before the XBE loads. */
+static uint32_t s_tid;
+static const char *s_save_root[2];
+static int s_saves_busy;
+uint32_t xbox_path_title_id(void);
+uint32_t xbox_path_title_id(void) { return s_tid; }
+const char *xbox_path_title_name(void);
+const char *xbox_path_title_name(void) { return s_tid ? "Test Title" : ""; }
+int xbox_path_save_root(int tdata, char *out, size_t n);
+int xbox_path_save_root(int tdata, char *out, size_t n)
+{
+    if (!s_tid || !s_save_root[tdata ? 1 : 0])
+        return 0;
+    snprintf(out, n, "%s", s_save_root[tdata ? 1 : 0]);
+    return 1;
+}
+int xbox_saves_busy(void);
+int xbox_saves_busy(void) { return s_saves_busy; }
+/* Each read moves it by s_saves_gen_step: 1 plays a game that saves
+ * while the page copies. */
+static unsigned s_saves_gen, s_saves_gen_step;
+unsigned xbox_saves_gen(void);
+unsigned xbox_saves_gen(void)
+{
+    unsigned g = s_saves_gen;
+    s_saves_gen += s_saves_gen_step;
+    return g;
+}
+const char *xbox_saves_keys_id(void);
+const char *xbox_saves_keys_id(void) { return "zero"; }
 /* mod.c's v6 guest calls run guest code (recomp_guest_call.c, tested in
  * mod_guest_call); this test has none to run. */
 int recomp_guest_call(const char *who, uint32_t va, uint32_t eax, uint32_t ecx, uint32_t edx,

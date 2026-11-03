@@ -1506,6 +1506,72 @@ system file picker.
 With `RECOMP_CONFIG=none` there is no user folder, so import and export
 are off.
 
+#### Saves (the Saves page)
+
+The Saves page lists the running title's saves (`UDATA/<title id>` on the
+emulated hard disk; each save by the `Name=` in its `SaveMeta.xbx`, with
+its size and date) and the host folder they live in, and moves them
+between computers as one `.zip`. It shares the Files page's browser,
+listing folders and `.zip` files, and the same name rules. Until the XBE
+has loaded the title is not known, and the rows say so.
+
+A saves zip is stored (not compressed), so any unzip tool opens it:
+
+```
+xbr-saves.toml           format, kind = "saves", title_id, title, created,
+                         keys, files, bytes, toolkit
+hdd/UDATA/<tid>/...      the saves
+hdd/TDATA/<tid>/...      the title's own data, when it has any
+```
+
+- **Export saves** writes both trees to a name you type (the default is
+  `<title slug>-saves-<yyyymmdd-hhmm>.zip`), through a temporary file and
+  a rename, as the Files exports are.
+- **Import saves** reads the zip whole (at most 64 MB) and checks it
+  before showing anything: the structure, every name (the FATX rules:
+  42 bytes a component, no `..`, no device names, at most 8 deep), the
+  sizes (16 MB a file, 64 MB in all, 4096 entries), each CRC, and the
+  manifest. A zip for another title, in a newer format, or made with other
+  console keys is refused, and nothing changes. The preview names the
+  file, the game, when it was exported, the saves in it, and what it
+  replaces.
+- **Import and quit** first exports the saves here to
+  `<user dir>/exports/save-backups/<title slug>-saves-backup-<stamp>.zip`
+  (a failed backup stops the import), then writes the zip's trees beside
+  the live ones, each in a folder of its own
+  (`.saves-import-<stamp>-<pid>-<n>-<TREE>` in the hdd folder), renames
+  each live tree aside and the new one in, and removes the old ones last.
+  A failed rename puts back every tree already swapped. If putting one
+  back fails too, the message says so and names the folder that keeps
+  that tree's old saves, which is left in place. On Windows a folder the
+  game holds open does not move; the message then says to quit to the
+  title menu and try again. A tree the zip does not
+  carry (often TDATA) is kept as it is. The game is then asked to quit,
+  since it still holds the old saves in memory and would write them back;
+  with no window to take the quit (a headless run) the page says to quit
+  without saving.
+
+**Keys.** The saves are signed with the console's keys, which this runtime
+leaves at zero, so a save moves between hosts as it is and is never
+re-signed. The manifest's `keys` is `zero`, or a fingerprint of the keys
+in force (`xbox_saves_keys_id`); an import needs the same value.
+
+**A save in progress.** The kernel keeps a table of open handles under a
+title's save trees (`xbox_saves_busy`, `kernel_file.c`): export and
+import refuse while one is open for a file or for 2 seconds after the
+last create, write, rename, delete or close there ("The game is saving;
+try again in a moment"). The game is not paused while the page copies,
+so every such touch also moves a generation (`xbox_saves_gen`): the page
+reads it before the export (or the backup) and again after it, and just
+before the import's first rename, and drops the copy when it moved. A
+handle `NtDuplicateObject` closes with `DUPLICATE_CLOSE_SOURCE` leaves
+the table too.
+
+Tests: `tests/saves_zip` (the zip, the manifest, the checks, the export,
+the swap, its rollback with renames failed on purpose, and a failed
+undo), `tests/kernel_directory_posix` (the busy table and the
+generation), `tests/enhance_menu` (the page).
+
 ### Naming rule
 
 - Tables group keys by feature: `[render]`, `[present]`, `[display]`, and a title's own.

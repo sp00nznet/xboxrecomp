@@ -576,6 +576,11 @@ void xbox_path_init(const char* game_dir, const char* save_dir);
 /* The running title's id, which names the default root above.
  * xbox_MemoryLayoutInit sets it from the XBE certificate; 0 clears it. */
 void xbox_path_set_title_id(uint32_t title_id);
+uint32_t xbox_path_title_id(void);
+/* The certificate's title name (UTF-16, up to max_chars), kept as UTF-8 for
+ * the Saves page; "" until xbox_MemoryLayoutInit sets it. */
+void xbox_path_set_title_name(const uint16_t *name, int max_chars);
+const char *xbox_path_title_name(void);
 
 /* Copy UDATA/<tid> and TDATA/<tid> (tid as 8 lower-case hex digits) from
  * legacy_root to root, each only when root has no copy yet, and only once:
@@ -596,6 +601,32 @@ int xbox_path_hdd_root(char *out, size_t n);
  * host-side shader caches, the D3D11 dxbc folder and the composed shader
  * profile presets (slangp/). 0 as xbox_path_hdd_root. */
 int xbox_path_shader_cache(char *out, size_t n);
+
+/* The host folder behind UDATA (tdata 0) or TDATA (tdata 1), in UTF-8:
+ * where the title's <tid> save folder lives, in the game dir when the saves
+ * stayed there (see xbox_path_init). 0 as xbox_path_hdd_root. */
+int xbox_path_save_root(int tdata, char *out, size_t n);
+
+/* 1 when a guest path lands in the title's saves (UDATA, TDATA, and the T:
+ * and U: fallbacks; not E:\CACHE), after the title's drive links. Relative
+ * names are 0. For the Saves page's busy guard. */
+int xbox_path_is_save(const char *xbox_path);
+
+/* The Saves page's busy guard (kernel_file.c): 1 while the title has a file
+ * open in its saves, or touched one (create, write, rename, delete, close)
+ * within the last two seconds; an export or import waits until it is 0. */
+int xbox_saves_busy(void);
+/* Moves on every such touch: equal before and after a copy, nothing was
+ * touched during it. */
+unsigned xbox_saves_gen(void);
+/* NtDuplicateObject of a handle: dup is tracked as src was, and src is
+ * dropped when close_src. */
+void xbox_saves_duplicated(HANDLE src, HANDLE dup, int close_src);
+
+/* The console keys a save signature depends on (the HD and signature keys)
+ * as a short id for the saves zip's manifest: "zero" while they are zero,
+ * as every build so far leaves them, else 16 hex digits of a SHA-1. */
+const char *xbox_saves_keys_id(void);
 
 /*
  * Character type of a translated host path. The Win32 file APIs take wide

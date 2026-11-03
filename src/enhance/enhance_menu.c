@@ -59,6 +59,9 @@
 #include "shader_profile_edit.h"
 #include "recomp_cfg.h"
 #include "recomp_env.h"
+#include "recomp_exit_hook.h"
+#include "saves_store.h"
+#include "saves_zip.h"
 #include "text_input.h"
 
 #define LOGP "[ENHANCE] "
@@ -77,10 +80,10 @@
 
 enum page {
     PAGE_RENDER, PAGE_SHADERS, PAGE_PACK, PAGE_GAME, PAGE_MODS, PAGE_STATS, PAGE_CONTROLS,
-    PAGE_DEBUG, PAGE_FILES, PAGE_COUNT
+    PAGE_DEBUG, PAGE_SAVES, PAGE_FILES, PAGE_COUNT
 };
 static const char *const s_page_name[PAGE_COUNT] = {
-    "Render", "Shaders", "Pack", "Game", "Mods", "Stats", "Controls", "Debug", "Files"
+    "Render", "Shaders", "Pack", "Game", "Mods", "Stats", "Controls", "Debug", "Saves", "Files"
 };
 /* Each section's intro line (A.8): the toolkit's below, a title's through
  * enhance_menu_page_intro. Held for the section header to draw. */
@@ -94,6 +97,7 @@ static const char *const k_page_intro[PAGE_COUNT] = {
     "Live numbers: frame rate, frame time and the draw counts.",
     "What each action is bound to, on the pad and the keyboard, and the mouse.",
     "The renderer's state and the trace channels, for bug reports.",
+    "This game's saves: export them to a zip, or import one from another computer.",
     "Where the settings are saved, and the way back to the defaults.",
 };
 
@@ -938,7 +942,8 @@ enum row_type {
     R_FBPREV            /* an import's preview: ref 0 Apply, 1 Cancel */
 };
 enum { TINT_NONE, TINT_BAD, TINT_WARN };
-enum { FIO_IMPORT, FIO_EXPORT_CFG, FIO_EXPORT_SHADER, FIO_OPEN_DIR };
+enum { FIO_IMPORT, FIO_EXPORT_CFG, FIO_EXPORT_SHADER, FIO_OPEN_DIR, FIO_SAVES_EXPORT,
+       FIO_SAVES_IMPORT };
 
 struct row {
     int type;
@@ -1199,7 +1204,7 @@ static void slot_rows(int page, int mod)
 static const uint32_t k_page_icon[PAGE_COUNT] = {
     NV2A_OVL_ICON_SLIDERS, NV2A_OVL_ICON_SPARKLES, NV2A_OVL_ICON_PACKAGE, NV2A_OVL_ICON_GAMEPAD,
     NV2A_OVL_ICON_PUZZLE, NV2A_OVL_ICON_ACTIVITY, NV2A_OVL_ICON_KEYBOARD, NV2A_OVL_ICON_BUG,
-    NV2A_OVL_ICON_FOLDER
+    NV2A_OVL_ICON_DOWNLOAD, NV2A_OVL_ICON_FOLDER
 };
 
 /* Q11: the footer's buttons carry the shortcut that presses them. */
@@ -2307,6 +2312,10 @@ static void float_literal(float v, char *out, size_t n)
 
 static int files_view_rows(void);
 static void files_rows(void);
+static void saves_rows(void);
+/* The page the browser runs on: Files, or Saves for a saves zip. They
+ * share one browser and one name entry; a page change closes it. */
+static int s_fb_page = PAGE_FILES;
 
 static void build_rows(void)
 {
@@ -2441,11 +2450,16 @@ static void build_rows(void)
 #undef TRACE_ROW_
         break;
     }
+    case PAGE_SAVES:
+        if (s_fb_page == PAGE_SAVES && files_view_rows())
+            break;
+        saves_rows();
+        break;
     case PAGE_FILES: {
         /* Save lives in the footer (D9): this page is about the file. */
         const char *path = enhance_cfg_user_path();
         struct row *r;
-        if (files_view_rows())
+        if (s_fb_page == PAGE_FILES && files_view_rows())
             break;
         info("Config file", "%s", path ? path : "off (RECOMP_CONFIG=none)");
         if (s_nrow)
@@ -2975,7 +2989,7 @@ static void reset_all(void)
 /* The page's sub-views: the main list, the browser for a job, an export's
  * "Replace <name>?", and an import's preview. */
 enum { FBV_OFF, FBV_BROWSE, FBV_ASK, FBV_PREVIEW };
-enum { FBJ_IMPORT, FBJ_EXPORT_CFG, FBJ_EXPORT_SHADER };
+enum { FBJ_IMPORT, FBJ_EXPORT_CFG, FBJ_EXPORT_SHADER, FBJ_SAVES_EXPORT, FBJ_SAVES_IMPORT };
 #define FILES_LIST_MAX 160      /* bytes of a preview's key list */
 #define IMP_BAD_MAX 32
 
@@ -3014,12 +3028,159 @@ static void imp_drop(void)
     memset(&s_imp, 0, sizeof s_imp);
 }
 
+/* ---- the Saves page (openspec overlay-saves) ----
+ *
+ * The title's two save trees (UDATA/<tid>, TDATA/<tid>) as one zip, out
+ * and back in. The zip work is saves_zip.c and saves_store.c; this half
+ * holds the rows, the busy check and the backup. */
+
+/* kernel.h's side, declared here as kernel_pacing.h's are: the menu takes
+ * no kernel header. */
+uint32_t xbox_path_title_id(void);
+const char *xbox_path_title_name(void);
+int xbox_path_save_root(int tdata, char *out, size_t n);
+int xbox_saves_busy(void);
+unsigned xbox_saves_gen(void);
+const char *xbox_saves_keys_id(void);
+
+#ifndef XBR_TOOLKIT_VERSION
+#define XBR_TOOLKIT_VERSION ""
+#endif
+#define SAVES_BUSY "The game is saving; try again in a moment"
+
+static struct saves_info s_saves;   /* the live saves, read lazily */
+static int s_saves_read;            /* 0 unread, 1 read, -1 failed */
+static int s_saves_quit;            /* imported, and no window took the quit */
+
+/* An import between the pick and "Import and quit". Nothing changes
+ * before it: the archive is checked whole at the pick. */
+static struct {
+    char file[FB_ENTRY_NAME_MAX];
+    char *zip;                      /* the file; s_simp.a points into it */
+    struct sz_archive a;
+    struct saves_manifest m;
+    int trees;
+    struct saves_info info;
+} s_simp;
+
+static void simp_drop(void)
+{
+    sz_archive_free(&s_simp.a);
+    free(s_simp.zip);
+    memset(&s_simp, 0, sizeof s_simp);
+}
+
+static int saves_paths(struct saves_paths *p)
+{
+    memset(p, 0, sizeof *p);
+    p->tid = xbox_path_title_id();
+    return p->tid && xbox_path_save_root(0, p->root[0], sizeof p->root[0])
+        && xbox_path_save_root(1, p->root[1], sizeof p->root[1]);
+}
+
+static void saves_refresh(void)
+{
+    struct saves_paths p;
+    memset(&s_saves, 0, sizeof s_saves);
+    s_saves_read = saves_paths(&p) && saves_scan(&p, &s_saves) == 0 ? 1 : -1;
+}
+
+/* The export names' kind: "<title slug>-saves" ("blinx-2-saves"), or
+ * "saves-<tid>" for a title with no ASCII name. */
+static void saves_kind(const char *what, char *out, size_t n)
+{
+    char slug[33];
+    if (shader_profile_slug(xbox_path_title_name(), slug, sizeof slug))
+        snprintf(out, n, "%s-%s", slug, what);
+    else
+        snprintf(out, n, "%s-%08x", what, (unsigned)xbox_path_title_id());
+}
+
+static void saves_base(struct saves_manifest *m)
+{
+    time_t t = time(NULL);
+    struct tm tm;
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    memset(m, 0, sizeof *m);
+    m->format = SAVES_FORMAT;
+    snprintf(m->kind, sizeof m->kind, "saves");
+    m->title_id = xbox_path_title_id();
+    {
+        /* Cut at a character, not inside one: the manifest is UTF-8. */
+        const char *name = xbox_path_title_name();
+        size_t l = strlen(name);
+        if (l >= sizeof m->title) {
+            l = sizeof m->title - 1;
+            while (l && ((unsigned char)name[l] & 0xC0) == 0x80)
+                l--;
+        }
+        memcpy(m->title, name, l);
+        m->title[l] = 0;
+    }
+    strftime(m->created, sizeof m->created, "%Y-%m-%dT%H:%M:%SZ", &tm);
+    snprintf(m->keys, sizeof m->keys, "%s", xbox_saves_keys_id());
+    snprintf(m->toolkit, sizeof m->toolkit, "xboxrecomp %s", XBR_TOOLKIT_VERSION);
+}
+
+static void saves_date_text(int64_t when, char *out, size_t n)
+{
+    time_t t = (time_t)when;
+    struct tm tm;
+    if (when <= 0) {
+        snprintf(out, n, "-");
+        return;
+    }
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    strftime(out, n, "%Y-%m-%d %H:%M", &tm);
+}
+
+static void files_size_text(uint64_t b, char *out, size_t n);
+
+/* One save as a row: its name, then size and date. */
+static void saves_item_row(const struct saves_item *it)
+{
+    char size[24], date[32];
+    struct row *r;
+    files_size_text(it->bytes, size, sizeof size);
+    saves_date_text(it->mtime, date, sizeof date);
+    r = row_add(R_INFO, -1, 0, it->name);
+    if (r) {
+        snprintf(r->value, sizeof r->value, "%s \xC2\xB7 %s", size, date);
+        snprintf(r->help, sizeof r->help, "UDATA folder %s", it->id);
+    }
+}
+
+static void saves_list_rows(const struct saves_info *in)
+{
+    for (int i = 0; i < in->n; i++)
+        saves_item_row(&in->item[i]);
+    if (in->saves > in->n)
+        info("And more", "%d", in->saves - in->n);
+}
+
+/* Busy, or touched since *ctx was read: the copy or the backup may be
+ * torn. */
+static int saves_busy_cb(void *ctx)
+{
+    return xbox_saves_busy() || xbox_saves_gen() != *(const unsigned *)ctx;
+}
+
 static void files_close(void)
 {
     if (s_fb_view != FBV_OFF && s_name_on && s_name_for == NAME_EXPORT)
         name_end();
     s_fb_view = FBV_OFF;
     imp_drop();
+    simp_drop();
+    s_saves_read = 0;
     if (s_fb_ready)
         fb_free(&s_fb);
     s_fb_ready = 0;
@@ -3306,7 +3467,8 @@ static void files_browse(int job)
     fb_init(&s_fb);
     s_fb_ready = 1;
     fb_add_default_roots(&s_fb, dir, NULL);
-    fb_set_filter(&s_fb, ".toml");
+    s_fb_page = job == FBJ_SAVES_EXPORT || job == FBJ_SAVES_IMPORT ? PAGE_SAVES : PAGE_FILES;
+    fb_set_filter(&s_fb, s_fb_page == PAGE_SAVES ? ".zip" : ".toml");
     s_fb_job = job;
     s_fb_view = FBV_BROWSE;
     /* At the Exports folder: where an export goes, and where one is
@@ -3314,8 +3476,8 @@ static void files_browse(int job)
     rc = fb_open_root(&s_fb, 0);
     if (rc != FB_OK && rc != EACCES && rc != EPERM)
         fb_close_root(&s_fb);
-    s_sel[PAGE_FILES] = 0;
-    s_scroll[PAGE_FILES] = 0;
+    s_sel[s_fb_page] = 0;
+    s_scroll[s_fb_page] = 0;
 }
 
 static void files_size_text(uint64_t b, char *out, size_t n)
@@ -3328,9 +3490,20 @@ static void files_size_text(uint64_t b, char *out, size_t n)
         snprintf(out, n, "%.1f MB", (double)b / (1024.0 * 1024.0));
 }
 
+static const char *files_ext(void)
+{
+    return s_fb_page == PAGE_SAVES ? ".zip" : ".toml";
+}
+
 static void files_default_name(char *out, size_t n)
 {
     const struct shader_edit_entry *e = s_fb_job == FBJ_EXPORT_SHADER ? files_profile() : NULL;
+    if (s_fb_job == FBJ_SAVES_EXPORT) {
+        char kind[64];
+        saves_kind("saves", kind, sizeof kind);
+        fb_default_name(kind, time(NULL), ".zip", out, n);
+        return;
+    }
     fb_default_name(e ? e->file : "settings", time(NULL), ".toml", out, n);
 }
 
@@ -3339,12 +3512,14 @@ static void files_browse_rows(void)
 {
     struct row *r;
     if (s_fb.root < 0) {
-        header(s_fb_job == FBJ_IMPORT ? "Import from" : "Export to");
+        header(s_fb_job == FBJ_IMPORT || s_fb_job == FBJ_SAVES_IMPORT ? "Import from"
+                                                                       : "Export to");
         for (int i = 0; i < s_fb.nroots; i++) {
             r = row_add(R_FBROOT, i, 1, s_fb.roots[i].label);
             if (r) {
                 snprintf(r->value, sizeof r->value, "%s", s_fb.roots[i].path);
-                snprintf(r->help, sizeof r->help, "A opens it \xC2\xB7 B goes back to Files");
+                snprintf(r->help, sizeof r->help, "A opens it \xC2\xB7 B goes back to %s",
+                         s_page_name[s_fb_page]);
             }
         }
         return;
@@ -3354,7 +3529,7 @@ static void files_browse_rows(void)
     if (r)
         snprintf(r->help, sizeof r->help, "%s",
                  fb_at_root(&s_fb) ? "Back to the places" : "One folder up");
-    if (s_fb_job != FBJ_IMPORT) {
+    if (s_fb_job != FBJ_IMPORT && s_fb_job != FBJ_SAVES_IMPORT) {
         r = row_add(R_FBNAME, -1, 1, "Export here as");
         if (r) {
             if (s_name_on && s_name_for == NAME_EXPORT) {
@@ -3367,6 +3542,8 @@ static void files_browse_rows(void)
             snprintf(r->help, sizeof r->help, "%s",
                      s_fb_job == FBJ_EXPORT_CFG
                          ? "A names the file: your settings, unsaved values included"
+                     : s_fb_job == FBJ_SAVES_EXPORT
+                         ? "A names the file: this game's saves, as one .zip"
                          : "A names the file: the active shader profile as saved");
         }
     }
@@ -3380,7 +3557,8 @@ static void files_browse_rows(void)
         return;
     }
     if (!s_fb.n)
-        info("No folders or .toml files here", "%s", "");
+        info(s_fb_page == PAGE_SAVES ? "No folders or .zip files here"
+                                     : "No folders or .toml files here", "%s", "");
     for (int i = 0; i < s_fb.n; i++) {
         const struct fb_entry *e = &s_fb.entries[i];
         char label[sizeof r->label];
@@ -3403,6 +3581,7 @@ static void files_browse_rows(void)
         snprintf(r->help, sizeof r->help, "%s",
                  e->is_dir ? "A opens the folder"
                  : s_fb_job == FBJ_IMPORT ? "A reads the file and shows what it changes"
+                 : s_fb_job == FBJ_SAVES_IMPORT ? "A checks the zip and shows the saves in it"
                                           : "A writes over this file (asks first)");
     }
 }
@@ -3453,6 +3632,40 @@ static void files_preview_rows(void)
         snprintf(r->help, sizeof r->help, "Nothing changes");
 }
 
+static void saves_preview_rows(void)
+{
+    const struct saves_manifest *m = &s_simp.m;
+    char size[24];
+    struct row *r;
+    header("Import saves");
+    info("File", "%s", s_simp.file);
+    if (m->title[0])
+        info("Game", "%s", m->title);
+    /* The manifest's UTC stamp, shown as written: "2026-11-03 12:00 UTC". */
+    if (strlen(m->created) >= 16)
+        info("Exported", "%.10s %.5s UTC", m->created, m->created + 11);
+    files_size_text(s_simp.info.bytes, size, sizeof size);
+    info("In the zip", "%d save%s, %d file%s, %s", s_simp.info.saves,
+         s_simp.info.saves == 1 ? "" : "s", s_simp.info.files,
+         s_simp.info.files == 1 ? "" : "s", size);
+    saves_list_rows(&s_simp.info);
+    if (s_saves_read > 0 && s_saves.files)
+        info("Replaces", "the %d save%s here now (backed up first)", s_saves.saves,
+             s_saves.saves == 1 ? "" : "s");
+    else
+        info("Replaces", "nothing: no saves here yet");
+    if (!(s_simp.trees & SAVES_TREE_TDATA))
+        info("Game data", "none in the zip: the data here is kept");
+    r = row_add(R_FBPREV, 0, 1, "Import and quit");
+    if (r)
+        snprintf(r->help, sizeof r->help,
+                 "Backs up the saves here to save-backups, puts these in, and quits the "
+                 "game so it cannot write over them");
+    r = row_add(R_FBPREV, 1, 1, "Cancel");
+    if (r)
+        snprintf(r->help, sizeof r->help, "Nothing changes");
+}
+
 /* The page's rows for a sub-view; 0 on the main list. */
 static int files_view_rows(void)
 {
@@ -3471,10 +3684,85 @@ static int files_view_rows(void)
             snprintf(r->help, sizeof r->help, "%s", s_fbx.path);
         return 1;
     case FBV_PREVIEW:
-        files_preview_rows();
+        if (s_fb_job == FBJ_SAVES_IMPORT)
+            saves_preview_rows();
+        else
+            files_preview_rows();
         return 1;
     default:
         return 0;
+    }
+}
+
+/* The Saves page's main list: the saves, where they are, and the jobs. */
+static void saves_rows(void)
+{
+    char dir[FB_PATH_MAX];
+    int on = files_user_dir(dir, sizeof dir);
+    struct saves_paths p;
+    int known = saves_paths(&p);
+    const char *title = xbox_path_title_name();
+    struct row *r;
+    if (!s_saves_read)
+        saves_refresh();
+    if (s_saves_quit) {
+        r = row_add(R_INFO, -1, 0, "Saves imported");
+        if (r) {
+            snprintf(r->value, sizeof r->value, "quit the game now, without saving");
+            r->tint = TINT_WARN;
+            snprintf(r->help, sizeof r->help,
+                     "The game still holds the old saves in memory; a save now writes over "
+                     "the imported ones");
+        }
+    }
+    header(title[0] ? title : "Saves");
+    if (!known) {
+        info("Save folder", "not known until the game has started");
+    } else if (s_saves_read < 0) {
+        r = row_add(R_INFO, -1, 0, "Save folder");
+        if (r) {
+            snprintf(r->value, sizeof r->value, "cannot be read");
+            r->tint = TINT_BAD;
+        }
+    } else if (!s_saves.saves) {
+        info(s_saves.files ? "No saves yet (only the game's own data)" : "No saves yet", "%s",
+             "");
+    } else {
+        saves_list_rows(&s_saves);
+    }
+    if (known) {
+        r = row_add(R_INFO, -1, 0, "Folder");
+        if (r) {
+            snprintf(r->value, sizeof r->value, "%s%c%08x", p.root[0],
+#ifdef _WIN32
+                     '\\',
+#else
+                     '/',
+#endif
+                     (unsigned)p.tid);
+            snprintf(r->help, sizeof r->help, "Where the game keeps its saves on this computer");
+        }
+    }
+    header("Move your saves");
+    r = row_add(R_FILEIO, FIO_SAVES_EXPORT, 1, "Export saves");
+    if (r) {
+        r->dim = !on || !known || !s_saves.files;
+        snprintf(r->help, sizeof r->help, "%s",
+                 !on ? "Off with RECOMP_CONFIG=none"
+                     : "This game's saves as one .zip you name, for another computer");
+    }
+    r = row_add(R_FILEIO, FIO_SAVES_IMPORT, 1, "Import saves");
+    if (r) {
+        r->dim = !on || !known;
+        snprintf(r->help, sizeof r->help, "%s",
+                 !on ? "Off with RECOMP_CONFIG=none"
+                     : "A .zip from Export saves; you see what it holds before anything "
+                       "changes");
+    }
+    if (on && files_desktop()) {
+        r = row_add(R_FILEIO, FIO_OPEN_DIR, 1, "Open exports folder");
+        if (r)
+            snprintf(r->help, sizeof r->help, "In the desktop's file manager");
     }
 }
 
@@ -3525,6 +3813,41 @@ static void files_rows(void)
 static int files_export_data(char **data, size_t *len, int *unsaved)
 {
     *unsaved = 0;
+    if (s_fb_job == FBJ_SAVES_EXPORT) {
+        struct saves_paths p;
+        struct saves_manifest base;
+        unsigned char *zip = NULL;
+        char err[SZ_ERR_MAX];
+        unsigned gen = xbox_saves_gen();
+        int n;
+        /* Read now, not at the button: the game may have saved since. */
+        if (xbox_saves_busy()) {
+            status(SAVES_BUSY);
+            return 0;
+        }
+        if (!saves_paths(&p)) {
+            status("Export failed: the save folder is not known yet");
+            return 0;
+        }
+        saves_base(&base);
+        n = saves_export(&p, &base, &zip, len, err, sizeof err);
+        if (n < 0) {
+            fprintf(stderr, LOGP "menu: saves export failed: %s\n", err);
+            status("Export failed: %s", err);
+            return 0;
+        }
+        if (!n) {
+            status("No saves yet");
+            return 0;
+        }
+        if (saves_busy_cb(&gen)) {   /* the game saved while it was read */
+            free(zip);
+            status(SAVES_BUSY);
+            return 0;
+        }
+        *data = (char *)zip;
+        return 1;
+    }
     if (s_fb_job == FBJ_EXPORT_CFG) {
         const char *path = enhance_cfg_user_path();
         const char *keys[PENDING_MAX], *vals[PENDING_MAX], *mine[PENDING_MAX];
@@ -3599,14 +3922,14 @@ static void files_export_write(void)
 /* Enter on the export's name: 1 closes the field. */
 static int files_name_keep(const char *name)
 {
-    switch (fb_export_begin(&s_fbx, s_fb.cwd, name, ".toml")) {
+    switch (fb_export_begin(&s_fbx, s_fb.cwd, name, files_ext())) {
     case FB_EXP_REFUSED:
         status("%s", s_fbx.reason ? s_fbx.reason : "That name is refused");
         return 0;
     case FB_EXP_CONFIRM:
         /* The focus on No (D6). */
         s_fb_view = FBV_ASK;
-        s_sel[PAGE_FILES] = 0;
+        s_sel[s_fb_page] = 0;
         return 1;
     case FB_EXP_READY:
         files_export_write();
@@ -3706,6 +4029,41 @@ static int files_import_plan(const char *file, char *text, size_t len)
     return 1;
 }
 
+/* A picked .zip: read and checked whole (saves_zip_check) before the
+ * preview, so a refused one changes nothing. */
+static void saves_pick(int i)
+{
+    const struct fb_entry *e = &s_fb.entries[i];
+    char *data = NULL, err[SZ_ERR_MAX];
+    size_t len = 0;
+    int rc = fb_import_entry(&s_fb, i, SZ_MAX_ZIP, &data, &len);
+    if (rc == FB_E_TOO_BIG) {
+        status("%s is over %u MB: not a saves zip", e->name, SZ_MAX_ZIP >> 20);
+        return;
+    }
+    if (rc != FB_OK) {
+        status("%s cannot be read", e->name);
+        free(data);
+        return;
+    }
+    simp_drop();
+    snprintf(s_simp.file, sizeof s_simp.file, "%s", e->name);
+    s_simp.zip = data;
+    if (sz_read(data, len, &s_simp.a, err, sizeof err) != 0
+        || saves_zip_check(&s_simp.a, xbox_path_title_id(), xbox_saves_keys_id(), &s_simp.m,
+                           &s_simp.trees, err, sizeof err) != 0) {
+        fprintf(stderr, LOGP "menu: saves import of %s refused: %s\n", e->name, err);
+        status("Not imported: %s", err);
+        simp_drop();
+        return;
+    }
+    saves_scan_archive(&s_simp.a, xbox_path_title_id(), &s_simp.info);
+    saves_refresh();
+    s_fb_view = FBV_PREVIEW;
+    s_sel[s_fb_page] = 0;
+    s_scroll[s_fb_page] = 0;
+}
+
 static void files_pick(int i)
 {
     const struct fb_entry *e = &s_fb.entries[i];
@@ -3716,12 +4074,16 @@ static void files_pick(int i)
         rc = fb_enter(&s_fb, i);
         if (rc == FB_E_ROOT)
             status("That link leaves %s", s_fb.roots[s_fb.root].label);
-        s_sel[PAGE_FILES] = 0;
-        s_scroll[PAGE_FILES] = 0;
+        s_sel[s_fb_page] = 0;
+        s_scroll[s_fb_page] = 0;
         return;
     }
     if (!e->link_ok) {
         status("That link leaves %s", s_fb.roots[s_fb.root].label);
+        return;
+    }
+    if (s_fb_job == FBJ_SAVES_IMPORT) {
+        saves_pick(i);
         return;
     }
     if (s_fb_job != FBJ_IMPORT) {
@@ -3748,8 +4110,8 @@ static void files_pick(int i)
         return;
     }
     s_fb_view = FBV_PREVIEW;
-    s_sel[PAGE_FILES] = 0;
-    s_scroll[PAGE_FILES] = 0;
+    s_sel[s_fb_page] = 0;
+    s_scroll[s_fb_page] = 0;
 }
 
 static void files_apply(void)
@@ -3783,6 +4145,81 @@ static void files_apply(void)
     s_need_draw = 1;
 }
 
+/* "Import and quit": back up, swap, quit. Any refusal keeps the preview
+ * and the saves as they are. */
+static void saves_apply(void)
+{
+    struct saves_paths p;
+    struct saves_manifest base;
+    unsigned char *zip = NULL;
+    size_t len = 0;
+    char err[SZ_ERR_MAX], dir[FB_PATH_MAX], bdir[FB_PATH_MAX], tmp[FB_PATH_MAX];
+    char kind[64], name[FB_ENTRY_NAME_MAX];
+    unsigned gen = xbox_saves_gen();
+    int n;
+    if (xbox_saves_busy()) {
+        status(SAVES_BUSY);
+        return;
+    }
+    if (!saves_paths(&p) || !files_user_dir(dir, sizeof dir)) {
+        status("Not imported: the save folder is not known yet");
+        return;
+    }
+    /* The backup, as an export, so it imports back the same way. */
+    saves_base(&base);
+    n = saves_export(&p, &base, &zip, &len, err, sizeof err);
+    if (n < 0) {
+        fprintf(stderr, LOGP "menu: saves backup failed: %s\n", err);
+        status("Not imported: the backup failed: %s", err);
+        return;
+    }
+    if (n > 0 && saves_busy_cb(&gen)) {   /* a torn backup is no backup */
+        free(zip);
+        status(SAVES_BUSY);
+        return;
+    }
+    if (n > 0) {
+        char stem[FB_NAME_MAX + 1];
+        int rc = fb_path_join(dir, "exports", tmp, sizeof tmp) == FB_OK
+                 && fb_path_join(tmp, "save-backups", bdir, sizeof bdir) == FB_OK
+                 && fb_mkdirs(bdir) == 0 ? FB_OK : FB_E_IO;
+        saves_kind("saves-backup", kind, sizeof kind);
+        fb_default_name(kind, time(NULL), "", stem, sizeof stem);
+        if (rc == FB_OK)
+            rc = fb_import_unique(bdir, stem, ".zip", zip, len, name, sizeof name);
+        free(zip);
+        if (rc != FB_OK) {
+            fprintf(stderr, LOGP "menu: saves backup to %s failed\n", bdir);
+            status("Not imported: the backup could not be written to %s", bdir);
+            return;
+        }
+        fprintf(stderr, LOGP "menu: saves backed up to %s%c%s\n", bdir,
+#ifdef _WIN32
+                '\\',
+#else
+                '/',
+#endif
+                name);
+    }
+    if (saves_import(&p, &s_simp.a, s_simp.trees, saves_busy_cb, &gen, err, sizeof err)) {
+        fprintf(stderr, LOGP "menu: saves import of %s failed: %s\n", s_simp.file, err);
+        status("Not imported: %s", err);
+        return;
+    }
+    fprintf(stderr, LOGP "menu: imported saves from %s (%d files)\n", s_simp.file,
+            s_simp.info.files);
+    files_close();
+    saves_refresh();
+    s_need_draw = 1;
+    /* The game holds its old saves in memory and would write them back. */
+    if (recomp_quit_post("saves_import")) {
+        status("Saves imported; the game is quitting");
+    } else {
+        s_saves_quit = 1;
+        status("Saves imported. Quit the game now without saving");
+    }
+}
+
 static void files_open_dir(void)
 {
     char dir[FB_PATH_MAX], path[FB_PATH_MAX];
@@ -3806,6 +4243,7 @@ static int files_back(void)
         return 1;
     case FBV_PREVIEW:
         imp_drop();
+        simp_drop();
         s_fb_view = FBV_BROWSE;
         status("Import cancelled");
         return 1;
@@ -3815,8 +4253,8 @@ static int files_back(void)
         } else if (fb_up(&s_fb) == FB_E_ROOT) {
             fb_close_root(&s_fb);
         }
-        s_sel[PAGE_FILES] = 0;
-        s_scroll[PAGE_FILES] = 0;
+        s_sel[s_fb_page] = 0;
+        s_scroll[s_fb_page] = 0;
         return 1;
     default:
         return 0;
@@ -3832,6 +4270,19 @@ static int files_event(const struct row *r, int ok)
             return 1;
         if (r->ref == FIO_OPEN_DIR) {
             files_open_dir();
+        } else if (r->ref == FIO_SAVES_EXPORT || r->ref == FIO_SAVES_IMPORT) {
+            struct saves_paths p;
+            if (!saves_paths(&p)) {
+                status("The save folder is not known until the game has started");
+            } else if (r->ref == FIO_SAVES_IMPORT) {
+                files_browse(FBJ_SAVES_IMPORT);
+            } else {
+                saves_refresh();
+                if (s_saves_read > 0 && s_saves.files)
+                    files_browse(FBJ_SAVES_EXPORT);
+                else
+                    status(s_saves_read < 0 ? "The save folder cannot be read" : "No saves yet");
+            }
         } else if (r->ref == FIO_EXPORT_SHADER && !files_profile()) {
             status("Only a saved profile exports: Save as new on Shaders makes one");
         } else {
@@ -3845,8 +4296,8 @@ static int files_event(const struct row *r, int ok)
             int rc = fb_open_root(&s_fb, r->ref);
             if (rc != FB_OK && rc != EACCES && rc != EPERM && rc != ENOENT)
                 status("%s cannot be opened", s_fb.roots[r->ref].label);
-            s_sel[PAGE_FILES] = 0;
-            s_scroll[PAGE_FILES] = 0;
+            s_sel[s_fb_page] = 0;
+            s_scroll[s_fb_page] = 0;
         }
         return 1;
     case R_FBUP:
@@ -3878,10 +4329,13 @@ static int files_event(const struct row *r, int ok)
     case R_FBPREV:
         if (!ok)
             return 1;
-        if (r->ref == 0) {
+        if (r->ref == 0 && s_fb_job == FBJ_SAVES_IMPORT) {
+            saves_apply();
+        } else if (r->ref == 0) {
             files_apply();
         } else {
             imp_drop();
+            simp_drop();
             s_fb_view = FBV_BROWSE;
             status("Import cancelled");
         }
@@ -4742,7 +5196,7 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
         hints_toggle();
         break;
     case ENHANCE_EV_BACK:
-        if (s_page == PAGE_FILES && files_back()) {
+        if (s_page == s_fb_page && files_back()) {
             /* The browser's own level: up a folder, a confirm's No. */
         } else if (s_page == PAGE_SHADERS && s_sh_sub != SH_MAIN) {
             /* Back to the row the sub-list opened from. */
@@ -7055,6 +7509,8 @@ void enhance_menu_reset_for_test(void)
     s_name_on = 0;
     s_name_for = NAME_RENAME;
     files_close();
+    s_fb_page = PAGE_FILES;
+    s_saves_quit = 0;
     s_nkept = 0;
     memset(&s_osk, 0, sizeof s_osk);
     s_osk_lay_ok = 0;

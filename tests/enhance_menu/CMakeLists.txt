@@ -50,6 +50,8 @@ add_executable(enhance_menu_test
     ${XR_SRC}/enhance/enhance_menu.c
     ${XR_SRC}/enhance/enhance_files.c
     ${XR_SRC}/enhance/file_browser.c
+    ${XR_SRC}/enhance/saves_zip.c
+    ${XR_SRC}/enhance/saves_store.c
     ${XR_SRC}/enhance/enhance_menu_layout.c
     ${XR_SRC}/enhance/enhance_menu_input.c
     ${XR_SRC}/enhance/enhance_osk.c

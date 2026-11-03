@@ -20,6 +20,7 @@
 #include "kernel.h"
 #include "kernel_ramfs.h"
 #include "guest_det_device.h"
+#include <stdatomic.h>
 #include <stddef.h>
 #include <string.h>
 #include <stdio.h>
@@ -27,6 +28,7 @@
 
 #if !defined(_WIN32)
 #include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
@@ -1905,18 +1907,194 @@ static NTSTATUS host_NtQueryDirectoryFile(
         }                                           \
     } while (0)
 
+/* ---- the Saves page's busy guard (openspec overlay-saves, D4) ----
+ *
+ * The menu's export reads the title's save folders and its import swaps them
+ * on the host, both from the present thread while the title runs. A title
+ * writes a save as several files over several frames (BLiNX 2: SaveMeta.xbx,
+ * SaveImage.xbx, blinx2data.bin), so a copy taken mid-save is torn, and a
+ * swap under an open handle loses the write or fails on Windows. The guard
+ * keeps the handles the title holds in its saves, and when it last touched
+ * them; xbox_saves_busy is 1 while a file is open or for SAVES_QUIET_MS after.
+ *
+ * Absolute names go through xbox_path_is_save. XDeleteSaveGame opens each
+ * child relative to the save folder's handle, so a relative open under a
+ * tracked handle is tracked too. A full table only stamps: the quiet window
+ * still covers it.
+ *
+ * The title is not paused while the menu copies, so the check alone could
+ * pass just before a save starts. Every stamp also moves s_saves_gen: the
+ * menu reads xbox_saves_gen before a copy and again after it (and before
+ * the first rename of an import), and drops the copy when it moved. */
+#define SAVES_HANDLES  256
+#define SAVES_QUIET_MS 2000
+
+static struct { HANDLE h; int dir; } s_saves_h[SAVES_HANDLES];
+static int s_saves_n;
+static long long s_saves_stamp;          /* host ms of the last touch, 0 never */
+static unsigned s_saves_gen;             /* moves with each stamp */
+static atomic_flag s_saves_lock = ATOMIC_FLAG_INIT;
+
+static long long saves_now_ms(void)
+{
+#if defined(_WIN32)
+    return (long long)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
+static void saves_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_saves_lock, memory_order_acquire))
+        ;
+}
+
+static void saves_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_saves_lock, memory_order_release);
+}
+
+/* Under the lock. */
+static void saves_stamp(void)
+{
+    s_saves_stamp = saves_now_ms();
+    s_saves_gen++;
+}
+
+static int saves_find(HANDLE h)
+{
+    int i;
+    for (i = 0; i < s_saves_n; i++)
+        if (s_saves_h[i].h == h)
+            return i;
+    return -1;
+}
+
+/* Is this handle one of the title's save handles? Stamps it when it is. */
+static int saves_touch(HANDLE h)
+{
+    int hit;
+    if (!h)
+        return 0;
+    saves_lock();
+    hit = saves_find(h) >= 0;
+    if (hit)
+        saves_stamp();
+    saves_unlock();
+    return hit;
+}
+
+/* Does this name land in the saves? A relative one (as posix_obj_path and
+ * translate_obj_path join it) does when its RootDirectory is tracked. */
+static int saves_name(PXBOX_OBJECT_ATTRIBUTES oa)
+{
+    const char *path = get_xbox_path(oa);
+    int hit;
+    if (!path)
+        return 0;
+    if (oa->RootDirectory && path[0] != '\\' && !(path[0] && path[1] == ':')) {
+        saves_lock();
+        hit = saves_find(oa->RootDirectory) >= 0;
+        saves_unlock();
+        return hit;
+    }
+    return xbox_path_is_save(path);
+}
+
+static void saves_opened(PXBOX_OBJECT_ATTRIBUTES oa, HANDLE h, ULONG options)
+{
+    if (!saves_name(oa))
+        return;
+    saves_lock();
+    if (s_saves_n < SAVES_HANDLES && saves_find(h) < 0) {
+        s_saves_h[s_saves_n].h = h;
+        s_saves_h[s_saves_n].dir = (options & XBOX_FILE_DIRECTORY_FILE) != 0;
+        s_saves_n++;
+    }
+    saves_stamp();
+    saves_unlock();
+    /* RECOMP_LOG_LEVEL=3: which save handles a title holds, the one thing
+     * that keeps the Saves page busy. */
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_FILE, "save handle %p opened (%s)", (void *)h,
+             (options & XBOX_FILE_DIRECTORY_FILE) ? "folder" : "file");
+}
+
+static void saves_closed(HANDLE h)
+{
+    int i;
+    saves_lock();
+    i = saves_find(h);
+    if (i >= 0) {
+        s_saves_h[i] = s_saves_h[--s_saves_n];
+        saves_stamp();
+    }
+    saves_unlock();
+    if (i >= 0)
+        xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_FILE, "save handle %p closed", (void *)h);
+}
+
+unsigned xbox_saves_gen(void)
+{
+    unsigned g;
+    saves_lock();
+    g = s_saves_gen;
+    saves_unlock();
+    return g;
+}
+
+/* NtDuplicateObject: the copy of a save handle is one too, and with
+ * DUPLICATE_CLOSE_SOURCE the source is gone without an NtClose, which
+ * would otherwise keep the page busy for good. */
+void xbox_saves_duplicated(HANDLE src, HANDLE dup, int close_src)
+{
+    int i, dir;
+    saves_lock();
+    i = src ? saves_find(src) : -1;
+    if (i >= 0) {
+        dir = s_saves_h[i].dir;
+        if (close_src)
+            s_saves_h[i] = s_saves_h[--s_saves_n];
+        if (dup && saves_find(dup) < 0 && s_saves_n < SAVES_HANDLES) {
+            s_saves_h[s_saves_n].h = dup;
+            s_saves_h[s_saves_n].dir = dir;
+            s_saves_n++;
+        }
+        saves_stamp();
+    }
+    saves_unlock();
+}
+
+int xbox_saves_busy(void)
+{
+    int i, busy = 0;
+    saves_lock();
+    for (i = 0; i < s_saves_n && !busy; i++)
+        busy = !s_saves_h[i].dir;
+    if (!busy && s_saves_stamp)
+        busy = saves_now_ms() - s_saves_stamp < SAVES_QUIET_MS;
+    saves_unlock();
+    return busy;
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
     ULONG CreateDisposition, ULONG CreateOptions)
 {
+    NTSTATUS st;
     RAMFS_FIRST(xbox_ramfs_create(FileHandle, DesiredAccess, ObjectAttributes,
                                   IoStatusBlock, CreateDisposition, CreateOptions,
                                   &ramfs_st));
-    return host_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
-                             IoStatusBlock, AllocationSize, FileAttributes,
-                             ShareAccess, CreateDisposition, CreateOptions);
+    st = host_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
+                           IoStatusBlock, AllocationSize, FileAttributes,
+                           ShareAccess, CreateDisposition, CreateOptions);
+    if (NT_SUCCESS(st) && FileHandle && ObjectAttributes)
+        saves_opened(ObjectAttributes, *FileHandle, CreateOptions);
+    return st;
 }
 
 NTSTATUS __stdcall xbox_NtReadFile(
@@ -1937,6 +2115,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 {
     RAMFS_FIRST(xbox_ramfs_write(FileHandle, Event, IoStatusBlock, Buffer, Length,
                                  ByteOffset, &ramfs_st));
+    saves_touch(FileHandle);
     return host_NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext,
                             IoStatusBlock, Buffer, Length, ByteOffset);
 }
@@ -1945,12 +2124,18 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     if (xbox_ramfs_active() && xbox_ramfs_close(Handle))
         return STATUS_SUCCESS;
+    saves_closed(Handle);
     return host_NtClose(Handle);
 }
 
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     RAMFS_FIRST(xbox_ramfs_delete(ObjectAttributes, &ramfs_st));
+    if (ObjectAttributes && saves_name(ObjectAttributes)) {
+        saves_lock();
+        saves_stamp();
+        saves_unlock();
+    }
     return host_NtDeleteFile(ObjectAttributes);
 }
 
@@ -1970,6 +2155,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
 {
     RAMFS_FIRST(xbox_ramfs_set_info(FileHandle, IoStatusBlock, FileInformation,
                                     Length, FileInformationClass, &ramfs_st));
+    saves_touch(FileHandle);
     return host_NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
                                      Length, FileInformationClass);
 }
@@ -2016,6 +2202,7 @@ NTSTATUS __stdcall xbox_RenameFileByHandle(
     HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
 {
     RAMFS_FIRST(xbox_ramfs_rename(FileHandle, NewName, ReplaceIfExists, &ramfs_st));
+    saves_touch(FileHandle);
     return host_RenameFileByHandle(FileHandle, NewName, ReplaceIfExists);
 }
 

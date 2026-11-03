@@ -127,6 +127,38 @@ int xbox_path_shader_cache(char *out, size_t n)
 
 ptrdiff_t xbox_GetMemoryOffset(void);
 ptrdiff_t xbox_GetMemoryOffset(void) { return 0; }
+
+/* kernel_path.c and kernel_xbox.c: the running title and its save roots,
+ * for the Saves page. s_tid 0: no title yet, as before the XBE loads. */
+static uint32_t s_tid;
+static const char *s_save_root[2];
+static int s_saves_busy;
+uint32_t xbox_path_title_id(void);
+uint32_t xbox_path_title_id(void) { return s_tid; }
+const char *xbox_path_title_name(void);
+const char *xbox_path_title_name(void) { return s_tid ? "Test Title" : ""; }
+int xbox_path_save_root(int tdata, char *out, size_t n);
+int xbox_path_save_root(int tdata, char *out, size_t n)
+{
+    if (!s_tid || !s_save_root[tdata ? 1 : 0])
+        return 0;
+    snprintf(out, n, "%s", s_save_root[tdata ? 1 : 0]);
+    return 1;
+}
+int xbox_saves_busy(void);
+int xbox_saves_busy(void) { return s_saves_busy; }
+/* Each read moves it by s_saves_gen_step: 1 plays a game that saves
+ * while the page copies. */
+static unsigned s_saves_gen, s_saves_gen_step;
+unsigned xbox_saves_gen(void);
+unsigned xbox_saves_gen(void)
+{
+    unsigned g = s_saves_gen;
+    s_saves_gen += s_saves_gen_step;
+    return g;
+}
+const char *xbox_saves_keys_id(void);
+const char *xbox_saves_keys_id(void) { return "zero"; }
 /* mod.c's v6 guest calls run guest code (recomp_guest_call.c, tested in
  * mod_guest_call); this test has none to run. */
 int recomp_guest_call(const char *who, uint32_t va, uint32_t eax, uint32_t ecx, uint32_t edx,
@@ -439,7 +471,7 @@ static void test_navigate(void)
     CHECK(enhance_menu_is_open());
     CHECK(enhance_menu_page() == 0);
     CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
-    CHECK(enhance_menu_page_count() == 9);
+    CHECK(enhance_menu_page_count() == 10);
 
     /* The title: no buttons, one packet number while the pad changes. A
      * trigger: the menu reads none, so the press does nothing there. */
@@ -2372,10 +2404,11 @@ static uint32_t sum_of(const struct nv2a_ovl_list *l)
 
 static void test_pages(void)
 {
-    /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Files. */
-    static const uint32_t k_sum[9] = {
-        0x65348BABu, 0xBECB3B03u, 0x0439BB8Du, 0x125C08E1u, 0x4677E872u,
-        0x778983B3u, 0xAB52F585u, 0xDFA436B9u, 0x022181CDu };
+    /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Saves,
+     * Files. Saves with no title yet: its rows hold no dates. */
+    static const uint32_t k_sum[10] = {
+        0xDA889433u, 0xF5E5A2AAu, 0xD56F9851u, 0xF9F4DC86u, 0x39FA9CFAu,
+        0x0813383Bu, 0xFB3B6519u, 0xCC7407C7u, 0x7B5D7063u, 0x7778B546u };
     /* Files shows Open exports folder only off Game Mode. */
     set_env("RECOMP_HOST_GAMESCOPE", NULL);
     start_with(ARMED, k_mods);
@@ -2383,7 +2416,7 @@ static void test_pages(void)
     CHECK(enhance_menu_is_open());
     for (int p = 0; p < enhance_menu_page_count(); p++) {
         const struct nv2a_ovl_list *l;
-        uint32_t want = p < 9 ? k_sum[p] : 0;   /* a tenth page lands unpinned */
+        uint32_t want = p < 10 ? k_sum[p] : 0;  /* an eleventh page lands unpinned */
         CHECK(enhance_menu_set_page(enhance_menu_page_name(p)));
         enhance_menu_draw(100000);
         l = nv2a_overlay_acquire(NV2A_OVL_MENU);
@@ -5009,6 +5042,207 @@ static void test_files_folders(void)
     rmdir(EXPORTS);
 }
 
+/* ---- Saves: export and import (openspec overlay-saves) ----------------- */
+
+#define SV_U "saves_hdd/UDATA"
+#define SV_T "saves_hdd/TDATA"
+#define SV_SAVE SV_U "/4d530065/0123456789AB"
+
+/* A SaveMeta.xbx as the dashboard writes it: UTF-16LE, a BOM, Name=. */
+static void sv_meta(const char *path, const char *name)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        exit(2);
+    fputc(0xFF, f);
+    fputc(0xFE, f);
+    for (const char *c = "Name="; *c; c++) {
+        fputc(*c, f);
+        fputc(0, f);
+    }
+    for (const char *c = name; *c; c++) {
+        fputc(*c, f);
+        fputc(0, f);
+    }
+    fclose(f);
+}
+
+static void sv_tree(const char *data)
+{
+    MKDIR("saves_hdd");
+    MKDIR(SV_U);
+    MKDIR(SV_T);
+    MKDIR(SV_U "/4d530065");
+    MKDIR(SV_SAVE);
+    sv_meta(SV_SAVE "/SaveMeta.xbx", "Slot A");
+    write_file(SV_SAVE "/progress.bin", data);
+}
+
+static void sv_tree_remove(void)
+{
+    remove(SV_SAVE "/SaveMeta.xbx");
+    remove(SV_SAVE "/progress.bin");
+    rmdir(SV_SAVE);
+    rmdir(SV_U "/4d530065");
+    rmdir(SV_U);
+    rmdir(SV_T);
+    rmdir("saves_hdd");
+}
+
+/* The backup the import wrote, by its name's shape. */
+static int sv_backup_emit(void *ctx, const struct fb_entry *e)
+{
+    char *out = ctx;
+    if (!e->is_dir && strstr(e->name, "test-title-saves-backup-") && strstr(e->name, ".zip"))
+        snprintf(out, 160, EXPORTS "/save-backups/%s", e->name);
+    return 0;
+}
+
+static void test_saves(void)
+{
+    char backup[160] = "";
+    s_save_root[0] = SV_U;
+    s_save_root[1] = SV_T;
+    MKDIR("config/exports");
+
+    /* Before the XBE loads: no title, nothing to move. */
+    s_tid = 0;
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Saves"));
+    CHECK(row_value("Save folder") && strstr(s_val, "not known"));
+    CHECK(enhance_menu_select_row("Export saves"));
+    tap(0x0D);
+    CHECK(status_has("not known until the game has started"));
+    files_quit();
+
+    /* A title with no saves yet. */
+    s_tid = 0x4d530065;
+    MKDIR("saves_hdd");
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Saves"));
+    CHECK(row_value("No saves yet") != NULL);
+    CHECK(row_value("Folder") && strstr(s_val, "4d530065"));
+    CHECK(enhance_menu_select_row("Export saves"));
+    tap(0x0D);
+    CHECK(status_has("No saves yet"));
+    files_quit();
+
+    /* One save, listed by its SaveMeta name, then exported. */
+    sv_tree("first");
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Saves"));
+    CHECK(row_value("Slot A") != NULL);
+    if (s_ref_out)
+        shot("1080p-compact-saves", 1920, 1080);
+    CHECK(enhance_menu_select_row("Export saves"));
+    tap(0x0D);
+    CHECK(row_value("Export here as") && !strncmp(s_val, "test-title-saves-", 17)
+          && strstr(s_val, ".zip"));
+    /* B: back to Saves, not Files. */
+    tap(0x1B);
+    CHECK(row_value("Exports") != NULL);
+    tap(0x1B);
+    CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Saves"));
+    CHECK(row_value("Export saves") != NULL);
+    /* A save in progress refuses the export at the write. */
+    CHECK(enhance_menu_select_row("Export saves"));
+    tap(0x0D);
+    s_saves_busy = 1;
+    CHECK(enhance_menu_select_row("Export here as"));
+    tap(0x0D);
+    name_type("sv");
+    CHECK(status_has("The game is saving"));
+    CHECK(!fb_exists(EXPORTS "/sv.zip"));
+    s_saves_busy = 0;
+    /* A save that starts while the zip is read: the copy is dropped. */
+    s_saves_gen_step = 1;
+    CHECK(enhance_menu_select_row("Export here as"));
+    tap(0x0D);
+    name_type("sv");
+    CHECK(status_has("The game is saving"));
+    CHECK(!fb_exists(EXPORTS "/sv.zip"));
+    s_saves_gen_step = 0;
+    CHECK(enhance_menu_select_row("Export here as"));
+    tap(0x0D);
+    name_type("sv");
+    CHECK(status_has("Exported to ") && status_has("sv.zip"));
+    CHECK(fb_exists(EXPORTS "/sv.zip"));
+    files_quit();
+
+    /* A file that is no saves zip: refused at the pick, nothing changes. */
+    write_file(EXPORTS "/bad.zip", "not a zip");
+    write_file(SV_SAVE "/progress.bin", "second");
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Saves"));
+    CHECK(enhance_menu_select_row("Import saves"));
+    tap(0x0D);
+    CHECK(row_value("sv.zip") != NULL && row_value("bad.zip") != NULL);
+    CHECK(enhance_menu_select_row("bad.zip"));
+    tap(0x0D);
+    CHECK(status_has("Not imported: "));
+    CHECK(row_value("sv.zip") != NULL);
+
+    /* The good one: a preview first, Cancel changes nothing. */
+    CHECK(enhance_menu_select_row("sv.zip"));
+    tap(0x0D);
+    CHECK(row_value("Import and quit") != NULL);
+    CHECK(row_value("Game") && !strcmp(s_val, "Test Title"));
+    CHECK(row_value("Slot A") != NULL);
+    CHECK(row_value("Replaces") && strstr(s_val, "backed up first"));
+    if (s_ref_out)
+        shot("1080p-compact-saves-import", 1920, 1080);
+    CHECK(enhance_menu_select_row("Cancel"));
+    tap(0x0D);
+    CHECK(status_has("Import cancelled"));
+    CHECK(!strcmp(read_file(SV_SAVE "/progress.bin"), "second"));
+
+    /* Busy at "Import and quit": refused, the preview kept. */
+    CHECK(enhance_menu_select_row("sv.zip"));
+    tap(0x0D);
+    s_saves_busy = 1;
+    CHECK(enhance_menu_select_row("Import and quit"));
+    tap(0x0D);
+    CHECK(status_has("The game is saving"));
+    CHECK(row_value("Import and quit") != NULL);
+    CHECK(!strcmp(read_file(SV_SAVE "/progress.bin"), "second"));
+    s_saves_busy = 0;
+    /* A save during the backup: refused, nothing written. */
+    s_saves_gen_step = 1;
+    CHECK(enhance_menu_select_row("Import and quit"));
+    tap(0x0D);
+    CHECK(status_has("The game is saving"));
+    CHECK(row_value("Import and quit") != NULL);
+    CHECK(!strcmp(read_file(SV_SAVE "/progress.bin"), "second"));
+    CHECK(fb_list_host(EXPORTS "/save-backups", sv_backup_emit, backup, NULL) != 0
+          || !backup[0]);
+    s_saves_gen_step = 0;
+    CHECK(enhance_menu_select_row("Import and quit"));
+
+    /* Imported: the old saves backed up, the zip's in, and with no window
+     * to take the quit the page says to quit by hand. */
+    tap(0x0D);
+    CHECK(status_has("Saves imported") && status_has("Quit the game now"));
+    CHECK(!strcmp(read_file(SV_SAVE "/progress.bin"), "first"));
+    CHECK(row_value("Saves imported") != NULL);
+    CHECK(row_value("Slot A") != NULL);
+    CHECK(fb_list_host(EXPORTS "/save-backups", sv_backup_emit, backup, NULL) == 0);
+    CHECK(backup[0] != 0);
+    files_quit();
+
+    remove(backup);
+    rmdir(EXPORTS "/save-backups");
+    remove(EXPORTS "/sv.zip");
+    remove(EXPORTS "/bad.zip");
+    sv_tree_remove();
+    rmdir(EXPORTS);
+    s_tid = 0;
+    s_save_root[0] = s_save_root[1] = NULL;
+}
+
 int main(int argc, char **argv)
 {
     s_pin = argc > 1 && !strcmp(argv[1], "--pin");
@@ -5081,6 +5315,7 @@ int main(int argc, char **argv)
     test_files_export();
     test_files_import();
     test_files_folders();
+    test_saves();
     test_shots();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();

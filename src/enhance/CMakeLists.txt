@@ -24,6 +24,10 @@
 #                  Save (shader_profile_edit.h)
 #   file_browser.c the in-overlay file browser's model: roots, listing, name
 #                  checks, import cap, atomic writes (file_browser.h)
+#   saves_zip.c    the Saves page's zip: a stored writer, a validating
+#                  reader, the manifest (saves_zip.h)
+#   saves_store.c  the Saves page's file work: list, export, staged import
+#                  with rollback (saves_store.h)
 #   enhance_files.c the menu's import and export texts: the export marker
 #                  and header, a config value as TOML (enhance_files.h)
 #   shader_param_kinds.c a parameter as a toggle, a choice or a slider: the
@@ -52,6 +56,10 @@ target_include_directories(xbox_enhance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_enhance PUBLIC recomp_env xbox_kernel xbox_input)
 target_sources(xbox_enhance PRIVATE enhance_text.c enhance_menu_layout.c)
 target_sources(xbox_enhance PRIVATE enhance_mod_status.c enhance_menu_input.c enhance_osk.c)
+target_sources(xbox_enhance PRIVATE saves_zip.c saves_store.c)
+# The saves zip's manifest names the toolkit that wrote it (overlay-saves).
+target_compile_definitions(xbox_enhance PRIVATE
+    XBR_TOOLKIT_VERSION="${xboxrecomp_VERSION}")
 if(NOT MSVC)
     target_compile_options(xbox_enhance PRIVATE -Wall -Wextra)
 endif()
