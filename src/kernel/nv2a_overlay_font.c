@@ -304,7 +304,17 @@ int nv2a_ovl_font_bake(uint32_t out_h, int symbols)
         { 2048, 2048, 2 },
     };
     const int *tok = token_px();
-    float s = nv2a_ovl_ui_scale(out_h);
+    /* At the display's height when it is known, the size a
+     * fullscreen menu draws at, so the Deck's text is not grown from a
+     * 1080-line bake. Both scales include the display floor and
+     * overlay.ui_scale and stop at OVL_UI_SCALE_MAX, the bound test_fit
+     * proves fits 2048x2048 with the symbols (a Retina floor of 2 at
+     * ui_scale 1.5 or more reaches it). Past 2.0 the bake also keeps to
+     * the output's own scale: a small window on a 4K or Retina display
+     * draws smaller than the display's size, and baking past that only
+     * costs bake time and the large text's oversampling. */
+    uint32_t lines = nv2a_ovl_bake_lines(out_h);
+    float s = nv2a_ovl_ui_scale(lines), s0 = nv2a_ovl_ui_scale(out_h);
     int per = 0, i, k, si, asc, desc, gap;
     stbtt_pack_range r[OVL_FONT_SLOTS * NRANGES];
     stbtt_pack_range sr[OVL_FACES * OVL_SYM_SIZES];
@@ -314,6 +324,8 @@ int nv2a_ovl_font_bake(uint32_t out_h, int symbols)
     int w = 0, h = 0, packed = 0, nsym = 0, ng, one = 0;
     uint64_t t0 = nv2a_ovl_now_ns();
 
+    if (s > s0 && s > 2.0f)
+        s = s0 > 2.0f ? s0 : 2.0f;
     nv2a_ovl_font_free();
     if (!stbtt_InitFont(&s_font.info, nv2a_ovl_font_regular,
                         stbtt_GetFontOffsetForIndex(nv2a_ovl_font_regular, 0))) {
@@ -406,12 +418,12 @@ int nv2a_ovl_font_bake(uint32_t out_h, int symbols)
                 s_font.slot[OVL_FONT_SMALL].px, s_font.slot[OVL_FONT_BODY].px,
                 s_font.slot[OVL_FONT_TITLE].px,
                 one >= 2 ? ", large at 1x, no 2x prompt" : one ? ", large at 1x" : "",
-                s_font.sym[OVL_FACE_ICONS].n, s_font.sym[OVL_FACE_INPUT].n, out_h);
+                s_font.sym[OVL_FACE_ICONS].n, s_font.sym[OVL_FACE_INPUT].n, lines);
     else
         fprintf(stderr, OVL_LOGP "atlas %dx%d %.1f ms (%d glyphs at %d/%d/%d px%s for %u lines)\n",
                 w, h, (double)(nv2a_ovl_now_ns() - t0) / 1e6, per,
                 s_font.slot[OVL_FONT_SMALL].px, s_font.slot[OVL_FONT_BODY].px,
-                s_font.slot[OVL_FONT_TITLE].px, one ? ", large at 1x" : "", out_h);
+                s_font.slot[OVL_FONT_TITLE].px, one ? ", large at 1x" : "", lines);
     return 0;
 oom:
     free(rects);

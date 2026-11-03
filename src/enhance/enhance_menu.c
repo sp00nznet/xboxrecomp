@@ -109,6 +109,7 @@ static const char *const k_pacing[] = { "spin", "sleep", NULL };
 static const char *const k_aspect[] = { "4:3", "16:9", "16:10", "21:9", NULL };
 static const char *const k_movie[] = { "black", "fit", "fill", NULL };
 static const char *const k_surface[] = { "auto", "window", "internal", NULL };
+static const char *const k_ui_fit[] = { "display", "output", NULL };
 static const char *const k_onoff[] = { "off", "on", NULL };
 /* input.mouse_capture in the menu's order; the enum's is focus, click, never. */
 static const char *const k_capture[] = { "click", "focus", "never", NULL };
@@ -374,7 +375,13 @@ static const struct enhance_item k_items[] = {
      * for the next run. */
     { ITEM("overlay.ui_scale", "Overlay scale", "Render", ENHANCE_ITEM_RANGE), .lo = 0.75,
       .hi = 2.0, .step = 0.25, .live = ENHANCE_LIVE_RESTART, .def = "1",
-      .help = "Sizes the menu and the overlays: larger for a TV across the room" },
+      .help = "Sizes the menu and the overlays over the size the display picks: larger "
+              "for a TV across the room" },
+    /* Read with the ui scale, before the atlas bake. */
+    { ITEM("overlay.ui_fit", "Overlay fit", "Render", ENHANCE_ITEM_CHOICE),
+      .choices = k_ui_fit, .live = ENHANCE_LIVE_RESTART, .def = "display",
+      .help = "What the overlay's size follows: the display (larger on a handheld) or the "
+              "picture's height alone" },
     /* textures.pack names the file: the toggle is this session's only. */
     { ITEM("textures.pack", "Texture pack", "Pack", ENHANCE_ITEM_TOGGLE), .set = set_pack_bit,
       .get = get_pack_bit, .live = ENHANCE_LIVE_FLUSH, .flags = ENHANCE_ITEM_NOSAVE,

@@ -104,6 +104,14 @@ static const char *s_ref_out;
     fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 /* ---- stubs for what the runtime would link ---------------------------- */
+/* The display probe needs a window system: the Deck shots set
+ * the display it would have found. */
+static const struct nv2a_ovl_display *s_display;
+void enhance_display_start(void)
+{
+    if (s_display)
+        nv2a_overlay_set_display(s_display);
+}
 
 static int s_pacing = 1;
 int xbox_PacingMode(void);
@@ -538,13 +546,13 @@ static void test_navigate(void)
     tap(0x26);
     CHECK(!strcmp(selected_label(), "Render scale"));
     CHECK(enhance_menu_focus() == 0);
-    CHECK(enhance_menu_select_row("Overlay scale"));
+    CHECK(enhance_menu_select_row("Overlay fit"));
     tap(0x28);
     CHECK(enhance_menu_focus() == 2 && enhance_menu_footer_selected() == 0);
-    CHECK(!strcmp(selected_label(), "Overlay scale"));
+    CHECK(!strcmp(selected_label(), "Overlay fit"));
     tap(0x26);
     CHECK(enhance_menu_focus() == 0 && enhance_menu_footer_selected() == -1);
-    CHECK(!strcmp(selected_label(), "Overlay scale"));
+    CHECK(!strcmp(selected_label(), "Overlay fit"));
 
     /* Right on Render scale: 1 -> 2, at the flip; unsaved. */
     CHECK(enhance_menu_select_row("Render scale"));
@@ -2424,7 +2432,7 @@ static void test_pages(void)
     /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Saves,
      * Files. Saves with no title yet: its rows hold no dates. */
     static const uint32_t k_sum[10] = {
-        0xDA889433u, 0xF5E5A2AAu, 0xD56F9851u, 0xF9F4DC86u, 0x39FA9CFAu,
+        0xF7235058u, 0xF5E5A2AAu, 0xD56F9851u, 0xF9F4DC86u, 0x39FA9CFAu,
         0x0813383Bu, 0xFB3B6519u, 0xCC7407C7u, 0x7B5D7063u, 0x7778B546u };
     /* Files shows Open exports folder only off Game Mode. */
     set_env("RECOMP_HOST_GAMESCOPE", NULL);
@@ -3539,6 +3547,21 @@ static void test_shots(void)
     CHECK(enhance_menu_set_page("Stats"));
     shot("1080p-compact-stats", 1920, 1080);
     open_menu();
+    /* The Deck's panel: baked and drawn at its 800 lines. */
+    {
+        struct nv2a_ovl_display deck = { 1280, 800, 1.0f, 0, 0 };
+        nv2a_overlay_display_mark_deck(&deck, "1");
+        s_display = &deck;
+        start_with(ARMED, k_mods);
+        s_display = NULL;
+        nv2a_overlay_set_game("BLiNX 2: Masters of Time & Space");
+        open_menu();
+        shot("deck-compact-folded", 1280, 800);
+        CHECK(enhance_menu_set_page("Controls"));
+        shot("deck-compact-controls", 1280, 800);
+        open_menu();
+        nv2a_overlay_reset_for_test();
+    }
     nv2a_overlay_set_game(NULL);
     remove("config/config.toml");
 }

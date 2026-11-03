@@ -809,6 +809,44 @@ static void test_fit(void)
           "an icon not packed at 3240");
     nv2a_ovl_font_free();
 
+    /* The largest reachable bakes under ui_fit = display: the
+     * display's floor and overlay.ui_scale both feed the bake's scale, so
+     * a Retina display (floor 2) at ui_scale 1.5 and 2.0, fullscreen or
+     * in a small window, and a 4K desktop at 150% asks for
+     * OVL_UI_SCALE_MAX. Each must bake there and fit with every symbol. */
+    {
+        static const struct {
+            struct nv2a_ovl_display d;
+            float mul;
+            uint32_t out_h;
+        } k_max[] = {
+            { { 2560, 1600, 2.0f, 0, 0 }, 1.5f, 1600 },
+            { { 2560, 1600, 2.0f, 0, 0 }, 2.0f, 1600 },
+            { { 3456, 2234, 2.0f, 0, 0 }, 2.0f, 1200 },
+            { { 3840, 2160, 1.5f, 0, 0 }, 2.0f, 2160 },
+        };
+        for (i = 0; i < (int)(sizeof k_max / sizeof k_max[0]); i++) {
+            int j;
+            nv2a_overlay_reset_for_test();
+            nv2a_overlay_set_display(&k_max[i].d);
+            nv2a_overlay_set_ui_scale(k_max[i].mul);
+            CHECK(nv2a_ovl_ui_scale(nv2a_ovl_bake_lines(k_max[i].out_h)) == OVL_UI_SCALE_MAX,
+                  "case %d does not reach the max: %.3f", i,
+                  nv2a_ovl_ui_scale(nv2a_ovl_bake_lines(k_max[i].out_h)));
+            CHECK(nv2a_ovl_font_bake(k_max[i].out_h, 1) == 0, "no atlas in max case %d", i);
+            a = nv2a_ovl_font_atlas();
+            CHECK(a && a->w <= 2048 && a->h <= 2048 && nv2a_ovl_font_symbols(),
+                  "max case %d: atlas %ux%u", i, a ? a->w : 0, a ? a->h : 0);
+            for (j = 0; j < s_nrows; j++)
+                CHECK(nv2a_ovl_font_symbol(OVL_FACE_INPUT, s_rows[j], 0, 0, 96, &q)
+                          && q.x1 > q.x0 && q.u1 > q.u0, "U+%04X not packed in max case %d",
+                      s_rows[j], i);
+            CHECK(nv2a_ovl_font_symbol(OVL_FACE_ICONS, NV2A_OVL_ICON_GAMEPAD, 0, 0, 96, &q),
+                  "an icon not packed in max case %d", i);
+            nv2a_ovl_font_free();
+        }
+    }
+
     /* The strip and the toasts alone keep the text-only atlas of before
      * the symbol faces, and draw no symbol. */
     nv2a_overlay_reset_for_test();
@@ -959,6 +997,159 @@ static void test_view(void)
     CHECK(x == 77 && y == 88, "reset kept the view: %d,%d", x, y);
 }
 
+/* The display's floor: the Deck's 1280x800 7" panel at 216 ppi
+ * grows the menu by 1.35 (held to 800 / 600); docked on a 1080p TV, or
+ * with SteamDeck unset, it is a desktop again. The OS's scale lifts a
+ * desktop; a small window keeps its 600 lines; under the internal surface
+ * the floor is in the output's pixels; ui_fit = output is the old rule. */
+static int deck_probe(struct nv2a_ovl_display *d)
+{
+    d->w = 1280, d->h = 800, d->scale = 1.0f;
+    nv2a_overlay_display_mark_deck(d, "1");
+    return 1;
+}
+
+static int near(float a, float b) { return a > b - 0.002f && a < b + 0.002f; }
+
+static void test_display_scale(void)
+{
+    struct nv2a_ovl_display d = { 1280, 800, 1.0f, 0, 0 };
+    nv2a_overlay_reset_for_test();
+    CHECK(nv2a_ovl_display_floor(NULL) == 0 && nv2a_ovl_display_floor(&d) == 1.0f,
+          "desktop floor %.3f", nv2a_ovl_display_floor(&d));
+    nv2a_overlay_display_mark_deck(&d, NULL);
+    CHECK(!d.handheld, "SteamDeck unset is not a handheld");
+    nv2a_overlay_display_mark_deck(&d, "0");
+    CHECK(!d.handheld, "SteamDeck=0 is not a handheld");
+    nv2a_overlay_display_mark_deck(&d, "1");
+    CHECK(d.handheld && d.diag_in == 7.0f, "the Deck's panel");
+    CHECK(near(nv2a_ovl_display_floor(&d), 1.348f), "Deck floor %.3f",
+          nv2a_ovl_display_floor(&d));
+    CHECK(nv2a_overlay_is_deck_board("Valve\n", "Jupiter\n") &&
+              nv2a_overlay_is_deck_board("Valve", "Galileo"),
+          "the Deck's SMBIOS names, LCD and OLED");
+    CHECK(!nv2a_overlay_is_deck_board("Valve", "Index") &&
+              !nv2a_overlay_is_deck_board("ValveX", "Jupiter") &&
+              !nv2a_overlay_is_deck_board("Valve", "Jupiter2") &&
+              !nv2a_overlay_is_deck_board("", "") && !nv2a_overlay_is_deck_board(NULL, "Jupiter"),
+          "other boards are not a Deck");
+    {
+        struct nv2a_ovl_display tv = { 1920, 1080, 1.0f, 0, 0 };
+        nv2a_overlay_display_mark_deck(&tv, "1");
+        CHECK(!tv.handheld, "a docked Deck is a desktop");
+    }
+
+    /* Nothing known: the stock rule. */
+    CHECK(nv2a_ovl_ui_scale(800) == 800.0f / 1080.0f, "no display at 800: %.3f",
+          nv2a_ovl_ui_scale(800));
+    CHECK(nv2a_ovl_bake_lines(1080) == 1080, "no display bakes for 1080");
+
+    /* The Deck: 1.35 held to 800 / 600, baked for its 800 lines. */
+    nv2a_overlay_set_display(&d);
+    CHECK(near(nv2a_ovl_ui_scale(800), 1.333f), "Deck at 800: %.3f", nv2a_ovl_ui_scale(800));
+    CHECK(nv2a_ovl_bake_lines(1080) == 800, "Deck bakes for 800: %u", nv2a_ovl_bake_lines(1080));
+    CHECK(nv2a_overlay_set_ui_scale(0.75f) == 0.75f && near(nv2a_ovl_ui_scale(800), 1.0f),
+          "Deck at 0.75: %.3f", nv2a_ovl_ui_scale(800));
+    nv2a_overlay_set_ui_scale(1.0f);
+    /* A 640x480 output stretched to the panel: 0.6 output pixels per
+     * window pixel, the floor 0.81 held to 480 / 600. */
+    nv2a_overlay_set_view(0, 0, 1280, 800, 640, 480);
+    CHECK(near(nv2a_ovl_ui_scale(480), 0.8f), "Deck internal 480: %.3f", nv2a_ovl_ui_scale(480));
+    nv2a_overlay_set_view(0, 0, 0, 0, 0, 0);
+
+    /* ui_fit = output: the display is ignored. */
+    nv2a_overlay_set_ui_fit(0);
+    CHECK(nv2a_ovl_ui_scale(800) == 800.0f / 1080.0f, "output fit at 800: %.3f",
+          nv2a_ovl_ui_scale(800));
+    CHECK(nv2a_ovl_bake_lines(1080) == 1080, "output fit bakes for 1080");
+    nv2a_overlay_set_ui_fit(1);
+
+    /* A desktop at 150%: 1.5 at 1080, the base at 2160; a 480-line window
+     * keeps 600 token lines. */
+    {
+        struct nv2a_ovl_display desk = { 2560, 1440, 1.5f, 0, 0 };
+        nv2a_overlay_set_display(&desk);
+        CHECK(near(nv2a_ovl_ui_scale(1080), 1.5f), "150%% at 1080: %.3f",
+              nv2a_ovl_ui_scale(1080));
+        CHECK(nv2a_ovl_ui_scale(2160) == 2.0f, "150%% at 2160: %.3f", nv2a_ovl_ui_scale(2160));
+        CHECK(near(nv2a_ovl_ui_scale(480), 0.8f), "150%% at 480: %.3f", nv2a_ovl_ui_scale(480));
+        desk.scale = 1.0f;
+        nv2a_overlay_set_display(&desk);
+        CHECK(near(nv2a_ovl_ui_scale(480), 0.8f), "100%% at 480: %.3f", nv2a_ovl_ui_scale(480));
+        CHECK(nv2a_ovl_ui_scale(1080) == 1.0f, "100%% at 1080");
+    }
+
+    /* The probe runs once, at the first bake's lines. */
+    nv2a_overlay_set_display_probe(deck_probe);
+    CHECK(nv2a_ovl_bake_lines(1080) == 800 && near(nv2a_ovl_ui_scale(800), 1.333f),
+          "probed Deck");
+    nv2a_overlay_reset_for_test();
+    CHECK(nv2a_ovl_bake_lines(1080) == 1080, "reset dropped the display");
+
+    /* A pad glyph in small text is drawn at the body size; an icon keeps
+     * the line's. */
+    {
+        const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+        mu_Font sm = OVL_FONT(OVL_FONT_SMALL, 17, 0), body = OVL_FONT(OVL_FONT_BODY, 22, 0);
+        nv2a_ovl_glyph a = nv2a_ovl_glyph_src(2, 1);
+        int want = (nv2a_ovl_text_height(sm) * t->font_body + t->font_small / 2) / t->font_small;
+        CHECK(a != 0, "a pad glyph");
+        CHECK(nv2a_ovl_glyph_box(a, sm) == want && want > nv2a_ovl_text_height(sm),
+              "small pad glyph %d, want %d", nv2a_ovl_glyph_box(a, sm), want);
+        CHECK(nv2a_ovl_glyph_width(a, sm) == want, "its width");
+        CHECK(nv2a_ovl_glyph_box(a, body) == nv2a_ovl_text_height(body), "body pad glyph");
+        CHECK(nv2a_ovl_glyph_box(NV2A_OVL_GLYPH(NV2A_OVL_GLYPH_ICON, 0xe000), sm) == nv2a_ovl_text_height(sm),
+              "a small icon");
+        /* The menu's footer buttons are the small line plus 10 token px
+         * (enhance_menu_layout.c), and the taller glyph is centred on the
+         * line: it stays inside at every scale. */
+        for (int q = 2; q <= 12; q++) {
+            float sc = (float)q / 4.0f;
+            int px = (int)((float)t->font_small * sc + 0.5f), btn = px + (int)(10.0f * sc + 0.5f);
+            int gh = nv2a_ovl_glyph_box(a, OVL_FONT(OVL_FONT_SMALL, px, 0));
+            CHECK(gh <= btn, "footer glyph at %.2f: %d in %d", (double)sc, gh, btn);
+        }
+    }
+}
+
+/* A probe that is not ready at the first arm (SDL before the presenter's
+ * SDL_Init) leaves the stock bake; display_ready probes and bakes again
+ * while nothing has drawn, and only once. */
+static int s_ready_calls, s_ready_up;
+static int late_probe(struct nv2a_ovl_display *d)
+{
+    s_ready_calls++;
+    if (!s_ready_up)
+        return -1;
+    return deck_probe(d);
+}
+
+static void test_display_ready(void)
+{
+    const struct nv2a_ovl_atlas *a;
+    uint32_t gen;
+    nv2a_overlay_reset_for_test();
+    s_ready_calls = s_ready_up = 0;
+    nv2a_overlay_set_display_probe(late_probe);
+    CHECK(nv2a_overlay_display_ready() == 0, "ready before any arm bakes nothing");
+    s_ready_calls = 0;
+    CHECK(nv2a_overlay_arm(1u << NV2A_OVL_STATS, 1080) == 0, "arm");
+    a = nv2a_overlay_atlas();
+    gen = a ? a->gen : 0;
+    CHECK(s_ready_calls == 1 && nv2a_ovl_bake_lines(1080) == 1080, "not ready: the stock bake");
+    s_ready_up = 1;
+    CHECK(nv2a_overlay_display_ready() == 1, "ready re-bakes");
+    a = nv2a_overlay_atlas();
+    CHECK(a && a->gen != gen && nv2a_ovl_bake_lines(1080) == 800, "baked for the Deck's 800 lines");
+    {
+        /* The arm's, the stock-bake check's (each bake asks while it is
+         * not ready) and display_ready's: none after it answered. */
+        int r = nv2a_overlay_display_ready();
+        CHECK(r == 0 && s_ready_calls == 3, "probed once it answered: %d, %d calls", r, s_ready_calls);
+    }
+    nv2a_overlay_reset_for_test();
+}
+
 int main(void)
 {
     s_ref_out = getenv("OVERLAY_REF_OUT");
@@ -974,6 +1165,8 @@ int main(void)
     test_fit();
     test_ui_scale();
     test_view();
+    test_display_scale();
+    test_display_ready();
     nv2a_overlay_reset_for_test();
     if (fails) {
         printf("overlay: %d failure(s)\n", fails);

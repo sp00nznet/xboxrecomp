@@ -93,6 +93,48 @@ int nv2a_overlay_arm(uint32_t layers, uint32_t out_h);
  * draw glyphs at sizes the atlas does not hold. enhance.c sets it at
  * init; unset it is 1.0. */
 float nv2a_overlay_set_ui_scale(float mul);
+
+/* The display the window opens on (overlay.ui_fit = display).
+ * The output height alone shrinks the menu on a small, dense panel held
+ * close: the Steam Deck's 1280x800 at 7" drew 16 px body text and glyphs
+ * nobody could tell apart. Any field 0 is unknown. */
+struct nv2a_ovl_display {
+    uint32_t w, h;          /* the display's desktop mode, in pixels */
+    float scale;            /* pixels per 96-dpi pixel the OS asks for (its UI scale) */
+    float diag_in;          /* the panel's diagonal, in inches */
+    int handheld;           /* held at arm's length (a Steam Deck's own panel) */
+};
+/* The probe that fills one: the enhance layer installs it (SDL's or
+ * Win32's display). The first atlas bake calls it; it returns 1 when it
+ * filled d, 0 when it learned nothing (final), and -1 when the window
+ * system is not up yet: SDL's video, which the probe never starts itself
+ * (a second video bring-up before the presenter's). Then
+ * nv2a_overlay_display_ready asks again. */
+typedef int (*nv2a_ovl_display_probe)(struct nv2a_ovl_display *out);
+void nv2a_overlay_set_display_probe(nv2a_ovl_display_probe fn);
+/* A presenter whose window system is now up (SDL's, after SDL_Init and
+ * before the guest thread starts) calls this: a probe that answered -1 at
+ * the first bake runs again, and when it learns the display the atlas is
+ * baked again for it, as long as no layer has drawn (a presenter may hold
+ * the old atlas then). Returns 1 when it re-baked. */
+int nv2a_overlay_display_ready(void);
+/* overlay.ui_fit: 1 (display, the default) scales with the display as
+ * well as the output height, 0 (output) with the output height alone, as
+ * before the display floor. Set before the first arm, like the ui scale. */
+void nv2a_overlay_set_ui_fit(int display);
+/* Marks d a handheld with the Deck's 7" diagonal when steam_deck (the
+ * SteamDeck variable Steam sets) is "1" and d is the Deck panel's
+ * 1280x800: a docked Deck keeps the variable, and its monitor is no
+ * handheld. A probe's helper. */
+void nv2a_overlay_display_mark_deck(struct nv2a_ovl_display *d, const char *steam_deck);
+/* Whether the SMBIOS system vendor and product name a Steam Deck: Valve's
+ * Jupiter (LCD) or Galileo (OLED). Steam sets SteamDeck only in Game Mode,
+ * so a run from Desktop Mode or a shortcut outside Steam learns it here
+ * (the probe reads /sys's DMI on Linux, the BIOS registry key on Windows,
+ * which Wine fills from the same DMI). Trailing whitespace is ignored. */
+int nv2a_overlay_is_deck_board(const char *vendor, const char *product);
+/* The display the probe found, set directly (ctests); NULL forgets it. */
+void nv2a_overlay_set_display(const struct nv2a_ovl_display *d);
 int nv2a_overlay_armed(void);
 /* Whether layer l is armed (the menu: menu.enabled at enhance init). */
 int nv2a_overlay_layer_armed(enum nv2a_overlay_layer l);

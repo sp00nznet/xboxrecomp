@@ -941,6 +941,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
 #ifdef XBOXRECOMP_ENHANCE
     nv2a_overlay_set_presenter(s_layer ? "Metal" : "SDL");
     nv2a_overlay_set_wake(ovl_wake);
+    /* The video is up and the guest not started: the display probe that
+     * waited for it runs now, and the atlas is baked for it. */
+    nv2a_overlay_display_ready();
 #endif
     s_guest_main = guest_main;
     xbox_InputSetMainPump(1);

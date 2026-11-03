@@ -96,8 +96,12 @@ nv2a_ovl_glyph nv2a_ovl_glyph_key(int vk);
 typedef const char *(*nv2a_ovl_key_namer)(int vk, char *buf, int n);
 void nv2a_ovl_glyph_set_key_namer(nv2a_ovl_key_namer fn);
 
-/* The width of g drawn in a line of font: a symbol is a square of the
- * line's height, a key cap fits its label. */
+/* The side of g's square in a line of font: the line's height, and for
+ * a pad glyph in small text the body size's (a legible minimum),
+ * centred on the line. */
+int nv2a_ovl_glyph_box(nv2a_ovl_glyph g, mu_Font font);
+/* The width of g drawn in a line of font: a symbol is its square, a key
+ * cap fits its label. */
 int nv2a_ovl_glyph_width(nv2a_ovl_glyph g, mu_Font font);
 /* Draw g in r (a symbol centred in r's square of side r.h, a key cap
  * filling r) in color. A key cap is the colour with its label cut out in

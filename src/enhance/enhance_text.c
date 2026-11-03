@@ -474,8 +474,9 @@ static int walk(mu_Context *ctx, mu_Font font, const char *text, int x, int y, m
                 x += run(ctx, font, &m[i].sep, 1, x + gap, y, color) + 2 * gap;
             if (m[i].g) {
                 int w = nv2a_ovl_glyph_width(m[i].g, font);
+                int gh = nv2a_ovl_glyph_box(m[i].g, font);
                 if (ctx)
-                    nv2a_ovl_ui_glyph(ctx, m[i].g, mu_rect(x, y, w, h), color);
+                    nv2a_ovl_ui_glyph(ctx, m[i].g, mu_rect(x, y - (gh - h) / 2, w, gh), color);
                 x += w;
             } else {
                 x += run(ctx, font, m[i].name, (int)strlen(m[i].name), x, y, color);

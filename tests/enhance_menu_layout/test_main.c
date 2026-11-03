@@ -151,10 +151,16 @@ static void one(int w, int h, float ui, int mode)
     if (w < 640 || h > w) {
         CHECK(l.narrow && l.panel.w == w - 2 * l.pad && !l.labels);
     } else if (mode == MENU_SIZE_COMPACT) {
-        /* Today's panel: 40% up to 720 px at 1080. */
-        int pw = (int)((float)w * 0.40f);
+        /* Today's panel: 40% up to 720 px at 1080, at least 500 token
+         * columns up to 3/4 of the width over the height's own scale
+         *. */
+        int pw = (int)((float)w * 0.40f), lo = menu_layout_px(s, 500);
         if (pw > menu_layout_px(s, 720))
             pw = menu_layout_px(s, 720);
+        if (lo > w * 3 / 4)
+            lo = w * 3 / 4;
+        if (s > eff_scale(h, 1.0f) * 1.01f && pw < lo)
+            pw = lo;
         CHECK(l.panel.x == l.pad && l.panel.y == l.pad && l.panel.w == pw
               && l.panel.h == h - 2 * l.pad && !l.backdrop);
     } else {
@@ -338,8 +344,8 @@ int main(void)
      * entries keep their height and scroll to the shown one. */
     g_w = 640, g_h = 360, g_u = 2.0f, g_mode = 0;
     input(&in, 640, 360, eff_scale(360, 2.0f), MENU_SIZE_COMPACT, 1);
-    in.cancel_w = menu_layout_px(in.s, 140);
-    in.save_w = menu_layout_px(in.s, 110);
+    in.cancel_w = menu_layout_px(in.s, 220);
+    in.save_w = menu_layout_px(in.s, 180);
     menu_layout_compute(&in, &l);
     CHECK(l.summary.w == 0);
     in.cancel_w = menu_layout_px(in.s, 400);
@@ -399,6 +405,17 @@ int main(void)
     input(&in, 640, 480, eff_scale(480, 1.0f), MENU_SIZE_COMPACT, 1);
     menu_layout_compute(&in, &l);
     CHECK(!l.labels && !l.open && l.tooltip.w > 0);
+    /* The Deck's panel at its display floor: 4/3 is past
+     * 800 / 1080, so 40% of the width would squeeze the rows; the panel
+     * keeps 500 token columns. Three quarters of a narrow output at most. */
+    g_w = 1280, g_h = 800, g_u = 1.0f;
+    input(&in, 1280, 800, 4.0f / 3.0f, MENU_SIZE_COMPACT, 0);
+    menu_layout_compute(&in, &l);
+    CHECK(l.panel.w == menu_layout_px(4.0f / 3.0f, 500) && l.panel.w > 1280 * 2 / 5);
+    g_w = 800, g_h = 600;
+    input(&in, 800, 600, 4.0f / 3.0f, MENU_SIZE_COMPACT, 0);
+    menu_layout_compute(&in, &l);
+    CHECK(l.panel.w == 800 * 3 / 4);
 
     if (s_fail) {
         printf("%d failures\n", s_fail);

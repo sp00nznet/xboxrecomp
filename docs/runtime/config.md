@@ -175,7 +175,8 @@ the stock settings, `present.pacing = "spin"` included.
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
 | `overlay.stats` | bool | the stats strip in the window's top right corner: fps, frame ms (average and worst of the last second), pacing, scale and backend, at 2 Hz; never in a frame dump | `false` | `RECOMP_OVERLAY_STATS` |
-| `overlay.ui_scale` | number | the menu's and the overlays' size over the output-height scale, 0.75 to 2 in quarter steps: larger for a TV across the room. Read at start (the font atlas is baked then) | `1` | none |
+| `overlay.ui_scale` | number | the menu's and the overlays' size over the automatic scale (`overlay.ui_fit`), 0.75 to 2 in quarter steps: larger for a TV across the room. Read at start (the font atlas is baked then) | `1` | `RECOMP_OVERLAY_UI_SCALE` |
+| `overlay.ui_fit` | string | what the automatic scale follows: `"display"` (the larger of the output height over 1080 and the display's floor: the OS's UI scale, and on a Steam Deck's own 1280x800 panel (`SteamDeck=1` or its SMBIOS names) its 216 ppi over 160, held to the output height over 600; [Overlay scale](#overlay-scale)) or `"output"` (the output height over 1080 alone, the rule before the display floor). Read at start | `"display"` | `RECOMP_OVERLAY_UI_FIT` |
 | `overlay.menu_size` | string | `"compact"` (a panel at the left, the game beside it) or `"expanded"` (the whole window over a dimmed game). R3 in the menu flips it and writes this key at once, alone; not with `RECOMP_CONFIG=none` | `"compact"` | none |
 | `overlay.menu_hints` | string | where the menu shows the selected row's help: `"tooltip"` (a card beside the row, 350 ms after a pad or key selection settles, 500 ms after the mouse rests), `"inline"` (a line under every row) or `"off"`. L3 (on release), F1 and the header's `?` flip between tooltip and inline (from off: inline) and write this key at once, alone; not with `RECOMP_CONFIG=none` | `"tooltip"` | none |
 | `menu.enabled` | bool | the in-game menu, opened by the `menu.open` action ([In-game menu](#in-game-menu-menuenabled)) | `false` | `RECOMP_MENU` |
@@ -1352,8 +1353,45 @@ their names when the toolbar has it, drawn over the rows' left edge so
 the rows do not move. LB and RB unfold it for 1.5 s to show where they
 went. The footer holds the selected row's help, the unsaved count, and
 Cancel and Save with the input that fires them (View and Y on a pad,
-Shift+Esc and F5 on the keyboard). Everything scales with the output
-height times `overlay.ui_scale`.
+Shift+Esc and F5 on the keyboard). Everything scales with the
+automatic scale times `overlay.ui_scale` ([Overlay scale](#overlay-scale)).
+
+<a id="overlay-scale"></a>
+**Overlay scale.** The theme's sizes are set for 1080 lines; the
+automatic scale is `max(clamp(out_h / 1080, 0.5, 3), floor)`, then times
+`overlay.ui_scale` and clamped to 0.5-3. Under `overlay.ui_fit = "display"`
+the floor is the primary display's, probed once:
+the OS's UI scale (DPI over 96 on Windows; SDL3's pixel density times
+content scale elsewhere) and, on a handheld, its density over 160 ppi.
+The one handheld known is the Steam Deck's own panel (`SteamDeck=1`, or
+the SMBIOS names Valve Jupiter or Galileo since Steam sets `SteamDeck`
+only in Game Mode, and a 1280x800 display; docked to a TV it is a desktop): 1280x800 at 7" is
+216 ppi, a floor of 1.35. An explicit `SteamDeck=0` does not override the
+SMBIOS names (a Desktop Mode run on the Deck may carry it); `ui_fit =
+"output"` turns the floor off. The floor is in window pixels, so under
+`present.surface = internal` it is turned into the output's, and it is
+held to `out_h / 600` so a small window keeps 600 token lines. The atlas
+is baked for the display's height (the size a fullscreen menu draws at);
+past 2.0 it keeps to the output's own scale, and it never passes 3, the
+largest scale, at which `test_fit` proves the atlas fits 2048x2048 with
+the symbols. Only the primary display is probed: a window on another
+monitor keeps the primary's floor, and a Deck docked to a 1280x800
+external screen counts as its own handheld panel. Over the output height's own scale the compact panel
+keeps 500 token columns (up to 3/4 of the width), and a pad glyph in
+small text is drawn at the body size so its letter or shape stays
+legible. Both hold under `ui_fit = "output"` too: the wider panel when
+`overlay.ui_scale` lifts the scale over the output height's, the glyphs
+always (a look change, not a size rule). Under 1080 lines a desktop
+window grows as well: a 1280x720 window on a 100% desktop was 0.667 and
+is 1.0, the OS's scale, unless `ui_fit = "output"`. On Windows the exe is
+not DPI aware (a GDI window, no manifest entry), so the probe reads the
+virtualised 96 dpi and scaled size and DWM stretches the window, menu
+included, by the desktop's scale; the OS term is 1 there. The probe runs
+at the first atlas bake on Windows (cheap GDI calls); with SDL it waits
+for the presenter's own `SDL_Init` and never starts the video itself, so
+the atlas is baked again then, before the guest starts. A headless run,
+or one whose window does not open, never probes. Tests:
+`tests/overlay` (`test_display_scale`), `tests/enhance_menu_layout`.
 
 The pages are Render, Shaders, Pack, Game (a title's own items, from
 `enhance_menu_add`), Mods, Stats, Controls, Debug and Save.
@@ -1451,7 +1489,7 @@ points, its live class; the footer names the selected row's:
 | at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
-| at restart | at the next start; the change is saved, not applied | `display.aspect`, `present.surface`, `overlay.ui_scale`, a mod without `on_enable` |
+| at restart | at the next start; the change is saved, not applied | `display.aspect`, `present.surface`, `overlay.ui_scale`, `overlay.ui_fit`, a mod without `on_enable` |
 
 The `textures.pack` toggle turns the loaded pack off for this session only
 and is never saved (the key names the pack's file). A title's items and a

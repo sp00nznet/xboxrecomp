@@ -10,6 +10,7 @@
 
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
+#include "enhance_display.h"
 #include "enhance_input.h"
 #include "enhance_menu.h"
 #include "hud_anchor.h"
@@ -354,6 +355,8 @@ int xbox_enhance_init(const char *root, const char *title)
             fprintf(stderr, LOGP "overlay.ui_scale=%g%s\n", got,
                     (float)want != got ? " (clamped to 0.75..2.0)" : "");
     }
+    /* overlay.ui_fit before any arm, for the same reason. */
+    enhance_display_start();
     {
         int stats = enhance_actions_keyed("overlay.stats");
         fprintf(stderr, LOGP "overlay.stats=%s\n", stats ? "on" : "off");

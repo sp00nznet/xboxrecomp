@@ -119,14 +119,28 @@ static int cap_width(const char *label, int h)
     return w > h ? w : h;
 }
 
+int nv2a_ovl_glyph_box(nv2a_ovl_glyph g, mu_Font font)
+{
+    const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+    int h = nv2a_ovl_text_height(font);
+    /* A pad glyph is a letter or a shape inside a button's outline, so at
+     * the small text's size Guide, Back and Start, or White and Black,
+     * blur into one: it never goes under the body size. */
+    if (NV2A_OVL_GLYPH_KIND(g) == NV2A_OVL_GLYPH_INPUT && OVL_FONT_SLOT(font) == OVL_FONT_SMALL
+        && t->font_small > 0 && t->font_body > t->font_small)
+        return (h * t->font_body + t->font_small / 2) / t->font_small;
+    return h;
+}
+
 int nv2a_ovl_glyph_width(nv2a_ovl_glyph g, mu_Font font)
 {
     int h = nv2a_ovl_text_height(font);
     char buf[64];
     switch (NV2A_OVL_GLYPH_KIND(g)) {
     case NV2A_OVL_GLYPH_ICON:
-    case NV2A_OVL_GLYPH_INPUT:
         return h;
+    case NV2A_OVL_GLYPH_INPUT:
+        return nv2a_ovl_glyph_box(g, font);
     case NV2A_OVL_GLYPH_KEY:
         return cap_width(key_label((int)NV2A_OVL_GLYPH_CODE(g), buf, sizeof buf), h);
     }

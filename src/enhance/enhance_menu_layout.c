@@ -43,9 +43,20 @@ static void panel_of(const struct menu_layout_in *in, struct menu_layout *l)
         l->panel = rect((w - pw) / 2, m, pw, h - 2 * m);
         l->backdrop = 1;
     } else {
-        int pw = (int)((float)w * 0.40f);
+        int pw = (int)((float)w * 0.40f), lo = menu_layout_px(l->s, 500);
+        float base = (float)h / 1080.0f;
         if (pw > menu_layout_px(l->s, 720))
             pw = menu_layout_px(l->s, 720);
+        /* A scale over the output height's own (the display's floor on a
+         * handheld, or a large ui_scale) grows the text past what
+         * 40% of the width holds: the panel keeps 500 token columns for
+         * the rows, up to three quarters of the width. At the height's
+         * own scale the panel is the one it always was. */
+        base = base < 0.5f ? 0.5f : base > 3.0f ? 3.0f : base;
+        if (lo > w * 3 / 4)
+            lo = w * 3 / 4;
+        if (l->s > base * 1.01f && pw < lo)
+            pw = lo;
         l->panel = rect(l->pad, l->pad, pw, h - 2 * l->pad);
     }
 }

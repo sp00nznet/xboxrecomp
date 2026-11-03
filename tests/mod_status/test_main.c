@@ -68,6 +68,9 @@ static int s_fail, s_checks;
     fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
 
 /* ---- stubs for what the runtime would link ---------------------------- */
+/* The display probe needs a window system; the ui scale
+ * ctests set a display directly. */
+void enhance_display_start(void) {}
 
 static int s_pacing = 1;
 int xbox_PacingMode(void);

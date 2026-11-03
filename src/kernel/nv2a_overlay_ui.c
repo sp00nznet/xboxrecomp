@@ -56,6 +56,119 @@ float nv2a_overlay_set_ui_scale(float mul)
     return mul;
 }
 
+/* The display, written on the init thread before the first arm
+ * (whose release store publishes it to the writers and presenters), or by
+ * nv2a_overlay_display_ready on the presenter's thread before the guest
+ * thread starts (the thread start publishes it). */
+static int s_ui_fit = 1;
+static struct nv2a_ovl_display s_disp;
+static nv2a_ovl_display_probe s_probe;
+static int s_probed;
+
+void nv2a_overlay_set_ui_fit(int display) { s_ui_fit = !!display; }
+
+void nv2a_overlay_set_display_probe(nv2a_ovl_display_probe fn)
+{
+    s_probe = fn;
+    s_probed = 0;
+}
+
+void nv2a_overlay_set_display(const struct nv2a_ovl_display *d)
+{
+    if (d)
+        s_disp = *d;
+    else
+        memset(&s_disp, 0, sizeof s_disp);
+    s_probed = 1;
+}
+
+float nv2a_ovl_display_floor(const struct nv2a_ovl_display *d)
+{
+    float f = 0;
+    if (!d)
+        return 0;
+    if (d->scale > 0 && d->scale == d->scale)
+        f = d->scale;
+    /* A handheld is read at a third of a desktop's distance, so its text
+     * keeps the size a phone's would: 1 px per 160 ppi. The Deck's
+     * 1280x800 at 7" is 216 ppi, 1.35. */
+    if (d->handheld && d->diag_in > 0 && d->w && d->h) {
+        float ppi = sqrtf((float)d->w * (float)d->w + (float)d->h * (float)d->h) / d->diag_in;
+        if (ppi / 160.0f > f)
+            f = ppi / 160.0f;
+    }
+    return f > 3.0f ? 3.0f : f;
+}
+
+/* The Deck's LCD (the OLED's panel is 7.4", the same 1280x800 and 5%
+ * less dense: one rule serves both). */
+#define DECK_W 1280u
+#define DECK_H 800u
+#define DECK_DIAG_IN 7.0f
+
+void nv2a_overlay_display_mark_deck(struct nv2a_ovl_display *d, const char *steam_deck)
+{
+    if (d && steam_deck && strcmp(steam_deck, "1") == 0 && d->w == DECK_W && d->h == DECK_H) {
+        d->handheld = 1;
+        d->diag_in = DECK_DIAG_IN;
+    }
+}
+
+/* a equals b up to a's trailing whitespace (sysfs ends its files in \n). */
+static int board_is(const char *a, const char *b)
+{
+    size_t n = strlen(b);
+    if (strncmp(a, b, n) != 0)
+        return 0;
+    for (a += n; *a; a++)
+        if (*a != ' ' && *a != '\n' && *a != '\r' && *a != '\t')
+            return 0;
+    return 1;
+}
+
+int nv2a_overlay_is_deck_board(const char *vendor, const char *product)
+{
+    return vendor && product && board_is(vendor, "Valve") &&
+           (board_is(product, "Jupiter") || board_is(product, "Galileo"));
+}
+
+static void probe_once(void)
+{
+    struct nv2a_ovl_display d;
+    int r;
+    if (s_probed)
+        return;
+    memset(&d, 0, sizeof d);
+    r = s_probe ? s_probe(&d) : 0;
+    if (r < 0)
+        return;   /* the window system is not up: display_ready asks again */
+    s_probed = 1;
+    if (r > 0) {
+        s_disp = d;
+        char hand[32] = "";
+        if (d.handheld)
+            snprintf(hand, sizeof hand, ", handheld %.1f\"", (double)d.diag_in);
+        fprintf(stderr, OVL_LOGP "display %ux%u, os scale %.2f%s: floor %.2f\n", d.w, d.h,
+                (double)d.scale, hand, (double)nv2a_ovl_display_floor(&d));
+    }
+}
+
+int nv2a_ovl_display_reprobe(void)
+{
+    if (!s_ui_fit || s_probed)
+        return 0;
+    probe_once();
+    return s_probed && s_disp.h != 0;
+}
+
+uint32_t nv2a_ovl_bake_lines(uint32_t out_h)
+{
+    if (!s_ui_fit)
+        return out_h;
+    probe_once();
+    return s_disp.h ? s_disp.h : out_h;
+}
+
 float nv2a_ovl_ui_scale(uint32_t out_h)
 {
     float s = (float)out_h / 1080.0f;
@@ -63,13 +176,25 @@ float nv2a_ovl_ui_scale(uint32_t out_h)
         s = 0.5f;
     if (s > 3.0f)
         s = 3.0f;
-    /* The outer clamp: 4K at 2.0 would ask for 4.0, past what the atlas
-     * holds; 480 lines at 0.75 for text under the smallest size it packs. */
+    if (s_ui_fit && out_h) {
+        /* The display's floor is in window pixels; under present.surface
+         * = internal the lists are drawn in the output's and scaled. A
+         * small window keeps 600 token lines (a list page and its footer)
+         * rather than the display's size. */
+        float f = nv2a_ovl_display_floor(&s_disp) * nv2a_ovl_view_ratio();
+        float cap = (float)out_h / 600.0f;
+        if (f > cap)
+            f = cap;
+        if (f > s)
+            s = f;
+    }
+    /* The outer clamp: 4K at 2.0, or a Retina floor of 2 at 1.5, would
+     * ask for 4.0, past what the atlas holds; 480 lines at 0.75 for text under the smallest size it packs. */
     s *= s_ui_mul;
     if (s < 0.5f)
         s = 0.5f;
-    if (s > 3.0f)
-        s = 3.0f;
+    if (s > OVL_UI_SCALE_MAX)
+        s = OVL_UI_SCALE_MAX;
     return s;
 }
 

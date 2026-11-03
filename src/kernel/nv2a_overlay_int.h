@@ -31,9 +31,31 @@ struct nv2a_ovl_theme {
 };
 extern const struct nv2a_ovl_theme nv2a_ovl_theme_default;
 
-/* clamp(clamp(out_h / 1080, 0.5, 3.0) * overlay.ui_scale, 0.5, 3.0)
- * (nv2a_overlay_set_ui_scale). */
+/* The most any scale reaches: the bound the atlas is proven to fit at
+ * (the overlay ctest's test_fit bakes 2048x2048 at it, symbols in). */
+#define OVL_UI_SCALE_MAX 3.0f
+/* clamp(max(clamp(out_h / 1080, 0.5, 3.0), fit) * overlay.ui_scale,
+ * 0.5, OVL_UI_SCALE_MAX) (nv2a_overlay_set_ui_scale), where fit is the display's
+ * floor in output pixels (nv2a_ovl_display_floor, times the output's
+ * pixels per window pixel under present.surface = internal), held to
+ * out_h / 600 so at least 600 token lines fit; 0 under ui_fit = output or
+ * with no display known. */
 float nv2a_ovl_ui_scale(uint32_t out_h);
+/* The display's floor in its own pixels: the OS's UI scale,
+ * and on a handheld its density over 160 ppi (Android's dp, the rule for
+ * a screen held at arm's length; a desktop's 96 dpi is the theme's 1.0).
+ * 0 when nothing is known. Pure: the ctest pins it. */
+float nv2a_ovl_display_floor(const struct nv2a_ovl_display *d);
+/* The lines the atlas is baked for: the display's height when ui_fit =
+ * display knows it (the size a fullscreen menu draws at), else out_h.
+ * Runs the display probe the first time. */
+uint32_t nv2a_ovl_bake_lines(uint32_t out_h);
+/* A probe that was not ready at the first bake asked again: 1 when it
+ * learned the display now (nv2a_overlay_display_ready). */
+int nv2a_ovl_display_reprobe(void);
+/* The output's pixels per window pixel down (nv2a_overlay_set_view), 1
+ * while the two are one. */
+float nv2a_ovl_view_ratio(void);
 /* A token scaled and rounded to whole pixels (at least 1 for a non-zero
  * token). */
 int nv2a_ovl_px(float s, int token);

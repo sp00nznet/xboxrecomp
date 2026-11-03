@@ -144,6 +144,23 @@ static int arm_layer(enum nv2a_overlay_layer l)
     return 0;
 }
 
+int nv2a_overlay_display_ready(void)
+{
+    if (!nv2a_ovl_display_reprobe() || !__atomic_load_n(&s_armed, __ATOMIC_ACQUIRE))
+        return 0;   /* nothing new, or the first arm bakes with it */
+    if (__atomic_load_n(&s_published, __ATOMIC_ACQUIRE)) {
+        fprintf(stderr, OVL_LOGP "display known after a layer drew; the atlas keeps its size\n");
+        return 0;
+    }
+    /* The arms bake for 1080 output lines (enhance's); the symbols stay as
+     * they were. A failed bake (out of memory) falls back as an arm's. */
+    if (nv2a_ovl_font_bake(1080, nv2a_ovl_font_symbols()) < 0 && nv2a_ovl_font_bake(1080, 0) < 0) {
+        fprintf(stderr, OVL_LOGP "display: atlas bake failed; no overlay text\n");
+        return 0;
+    }
+    return 1;
+}
+
 static void free_layer(struct layer *y)
 {
     int i;
@@ -315,6 +332,12 @@ static int view_get(int v[6])
     v[4] = (int)(uint32_t)o;
     v[5] = (int)(uint32_t)(o >> 32);
     return v[2] > 0 && v[3] > 0 && v[4] > 0 && v[5] > 0;
+}
+
+float nv2a_ovl_view_ratio(void)
+{
+    int v[6];
+    return view_get(v) ? (float)v[5] / (float)v[3] : 1.0f;
 }
 
 /* Rounds toward minus infinity, so a pixel just outside the view's left
@@ -785,6 +808,9 @@ void nv2a_overlay_reset_for_test(void)
     s_published = 0;
     s_game[0] = 0;
     nv2a_overlay_set_ui_scale(1.0f);
+    nv2a_overlay_set_ui_fit(1);
+    nv2a_overlay_set_display(NULL);
+    nv2a_overlay_set_display_probe(NULL);
     s_wake = NULL;
     s_toast_head = 0;
     s_toast_read = 0;
