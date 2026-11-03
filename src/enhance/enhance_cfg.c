@@ -46,8 +46,9 @@ static void bind_builtins(void)
     if (s_builtin_bound)
         return;
     s_builtin_bound = 1;
-    /* A main-table key: the kernel reads it without the enhance layer. */
+    /* Main-table keys: the kernel reads them without the enhance layer. */
     enhance_cfg_bind_env("storage.ram_cache", RENV_STORAGE_RAM_CACHE);
+    enhance_cfg_bind_env("system.language", RENV_SYSTEM_LANGUAGE);
 #ifdef RECOMP_ENV_HAVE_ENHANCE_KEYS
     enhance_cfg_bind_env("render.scale", RENV_RENDER_SCALE);
     enhance_cfg_bind_env("render.aniso", RENV_RENDER_ANISO);

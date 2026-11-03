@@ -23,6 +23,7 @@ set(KERNEL_SOURCES
     kernel_guest_cpu.c
     kernel_guest_det.c
     kernel_xbox.c
+    kernel_language.c
     kernel_ob.c
     kernel_io.c
     kernel_crypto.c
@@ -101,6 +102,24 @@ if(XBOXRECOMP_ENHANCE)
 endif()
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
+
+# The languages the game ships (kernel_language.h), from its game.toml
+# [system] languages through the CLI: the menu offers only these, and
+# system.language refuses any other. On kernel_language.c alone, so a new
+# list recompiles one file. Empty: the game declares none.
+set(XBOXRECOMP_LANGUAGES "" CACHE STRING
+    "Languages the game ships, a comma list of en ja de fr es it ko zh pt (game.toml [system] languages)")
+if(XBOXRECOMP_LANGUAGES)
+    string(REPLACE "," ";" _xr_langs "${XBOXRECOMP_LANGUAGES}")
+    foreach(_l IN LISTS _xr_langs)
+        if(NOT _l MATCHES "^(en|ja|de|fr|es|it|ko|zh|pt)$")
+            message(FATAL_ERROR "XBOXRECOMP_LANGUAGES=${XBOXRECOMP_LANGUAGES}: '${_l}' "
+                "is not one of en ja de fr es it ko zh pt")
+        endif()
+    endforeach()
+    set_source_files_properties(kernel_language.c PROPERTIES
+        COMPILE_DEFINITIONS "XBOXRECOMP_LANGUAGES=\"${XBOXRECOMP_LANGUAGES}\"")
+endif()
 if(XBOXRECOMP_ENHANCE)
     target_include_directories(xbox_kernel PUBLIC "${_xr_tp}/microui" "${_xr_tp}/stb"
                                                   "${_xr_tp}/librashader")

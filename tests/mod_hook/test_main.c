@@ -81,6 +81,9 @@ void xbox_PacingSetMode(int mode) { (void)mode; }
 /* kernel_ramfs.c's switch, which this test does not link. */
 void xbox_RamCacheEnable(int on);
 void xbox_RamCacheEnable(int on) { (void)on; }
+/* kernel_language.c's setter (enhance.c), which this test does not link. */
+uint32_t xbox_SetLanguage(const char *code);
+uint32_t xbox_SetLanguage(const char *code) { (void)code; return 1; }
 /* kernel_path.c: no save root in this test, so a chain profile cannot
  * compose (shader_profile_req.c). */
 int xbox_path_shader_cache(char *out, size_t n);

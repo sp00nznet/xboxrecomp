@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include "kernel_language.h"
 #include <string.h>
 #include <time.h>
 
@@ -152,7 +153,7 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  * SMBus. For recompilation, we return sensible defaults:
  *   - Region: North America
  *   - Video: NTSC, widescreen+HDTV enabled
- *   - Language: English
+ *   - Language: system.language, English by default (kernel_language.h)
  *   - Audio: Stereo, Dolby Digital
  *   - DVD Region: Region 1 (North America)
  *   - Time zone: the host's
@@ -242,9 +243,9 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     switch (ValueIndex) {
     case XC_LANGUAGE:
-        /* English = 1 */
+        /* system.language; English (1) unless set (kernel_language.h). */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 1;
+            *(PULONG)Value = xbox_Language();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -343,7 +344,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         memcpy(blk + 0x1C, &s_tz.dlt_date, 4);
         memcpy(blk + 0x28, &s_tz.std_bias, 4);
         memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
-        { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
+        { ULONG v = xbox_Language(); memcpy(blk + 0x30, &v, 4); }         /* XC_LANGUAGE */
         { ULONG v = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV; memcpy(blk + 0x34, &v, 4); }
         /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
         { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */

@@ -64,6 +64,9 @@ void xbox_PacingSetMode(int mode);
 void xbox_PacingSetMode(int mode) { (void)mode; }
 void xbox_RamCacheEnable(int on);
 void xbox_RamCacheEnable(int on) { (void)on; }
+/* kernel_language.c's setter (enhance.c), which this test does not link. */
+uint32_t xbox_SetLanguage(const char *code);
+uint32_t xbox_SetLanguage(const char *code) { (void)code; return 1; }
 int xbox_path_shader_cache(char *out, size_t n);
 int xbox_path_shader_cache(char *out, size_t n) { (void)out; (void)n; return 0; }
 int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)

@@ -113,6 +113,23 @@ void xbox_PacingSetMode(int mode) { s_pacing = mode; }
 /* kernel_ramfs.c's switch, which this test does not link. */
 void xbox_RamCacheEnable(int on);
 void xbox_RamCacheEnable(int on) { (void)on; }
+/* kernel_language.c, which this test does not link: the menu lists the
+ * game's languages (s_langs), empty unless a test sets one. */
+static const char *const k_no_langs[] = { NULL };
+static const char *const *s_langs = k_no_langs;
+static char s_lang_set[8];
+uint32_t xbox_SetLanguage(const char *code);
+uint32_t xbox_SetLanguage(const char *code)
+{
+    snprintf(s_lang_set, sizeof s_lang_set, "%s", code ? code : "");
+    return 1;
+}
+const char *const *xbox_LanguagesShipped(void);
+const char *const *xbox_LanguagesShipped(void) { return s_langs; }
+uint32_t xbox_LanguageFromCode(const char *code);
+uint32_t xbox_LanguageFromCode(const char *code) { return !strcmp(code, "fr") ? 4 : 1; }
+const char *xbox_LanguageName(uint32_t lang);
+const char *xbox_LanguageName(uint32_t lang) { return lang == 4 ? "French" : "English"; }
 /* kernel_path.c: the shader cache root a chain profile composes under
  * (shader_profile_req.c); NULL: none yet, as before the save root is up. */
 static const char *s_cache_root;
@@ -3425,6 +3442,37 @@ static void test_ui_scale_row(void)
     open_menu();
 }
 
+/* system.language: no Language row for a game that names no
+ * languages; with a list, a restart row on the Game page offering those
+ * only, its value from the config, and enhance.c hands the kernel the
+ * config's code at start. */
+static void test_language_row(void)
+{
+    static const char *const langs[] = { "en", "fr", NULL };
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Game"));
+    CHECK(row_value("Language") == NULL);
+    open_menu();
+
+    s_langs = langs;
+    start_with(ARMED "[system]\nlanguage = \"fr\"\n", k_mods);
+    CHECK(!strcmp(s_lang_set, "fr"));
+    open_menu();
+    CHECK(enhance_menu_set_page("Game"));
+    CHECK(row_value("Language") && !strcmp(row_value("Language"), "fr"));
+    for (int i = 0; i < enhance_menu_rows(); i++) {
+        char lb[96];
+        enhance_menu_row(i, lb, sizeof lb, NULL, 0, NULL);
+        if (!strcmp(lb, "Language"))
+            CHECK(enhance_menu_row_live(i) == ENHANCE_LIVE_RESTART);
+    }
+    open_menu();
+    s_langs = k_no_langs;
+    start_with(ARMED, k_mods);
+    CHECK(!strcmp(s_lang_set, "en"));
+}
+
 /* The menu's sizes and toolbar states as pictures (MENU_REF_OUT only):
  * the review of a layout change, since a sum says only that it moved. */
 static void shot(const char *name, int w, int h)
@@ -5293,6 +5341,7 @@ int main(int argc, char **argv)
     test_toolbar_fold();
     test_header_game();
     test_ui_scale_row();
+    test_language_row();
     test_help();
     test_owner_table();
     test_pad_regions();

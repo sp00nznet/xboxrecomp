@@ -77,6 +77,23 @@ void xbox_PacingSetMode(int mode) { s_pacing = mode; }
 /* kernel_ramfs.c's switch, which this test does not link. */
 void xbox_RamCacheEnable(int on);
 void xbox_RamCacheEnable(int on) { (void)on; }
+/* kernel_language.c, which this test does not link: the menu lists the
+ * game's languages (s_langs), empty unless a test sets one. */
+static const char *const k_no_langs[] = { NULL };
+static const char *const *s_langs = k_no_langs;
+static char s_lang_set[8];
+uint32_t xbox_SetLanguage(const char *code);
+uint32_t xbox_SetLanguage(const char *code)
+{
+    snprintf(s_lang_set, sizeof s_lang_set, "%s", code ? code : "");
+    return 1;
+}
+const char *const *xbox_LanguagesShipped(void);
+const char *const *xbox_LanguagesShipped(void) { return s_langs; }
+uint32_t xbox_LanguageFromCode(const char *code);
+uint32_t xbox_LanguageFromCode(const char *code) { return !strcmp(code, "fr") ? 4 : 1; }
+const char *xbox_LanguageName(uint32_t lang);
+const char *xbox_LanguageName(uint32_t lang) { return lang == 4 ? "French" : "English"; }
 /* kernel_path.c: the shader cache root a chain profile composes under
  * (shader_profile_req.c); NULL: none yet, as before the save root is up. */
 static const char *s_cache_root;

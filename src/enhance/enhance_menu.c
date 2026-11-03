@@ -310,6 +310,34 @@ static const struct enhance_item k_hud_margin = {
     .help = "Pulls the HUD in from the screen edges on a wide picture"
 };
 
+/* kernel_language.h's side, declared here as kernel_pacing.h's are: the
+ * menu takes no kernel header. */
+const char *const *xbox_LanguagesShipped(void);
+uint32_t xbox_LanguageFromCode(const char *code);
+const char *xbox_LanguageName(uint32_t lang);
+
+/* Listed only when the game declares its languages (game.toml [system]
+ * languages): the choices are those, and the title reads XC_LANGUAGE once
+ * at boot, so a change waits for the next run. */
+static struct enhance_item s_language = {
+    ITEM("system.language", "Language", "Game", ENHANCE_ITEM_CHOICE),
+    .live = ENHANCE_LIVE_RESTART, .def = "en"
+};
+static char s_language_help[160];
+
+static void language_item(void)
+{
+    const char *const *l = xbox_LanguagesShipped();
+    size_t n;
+    s_language.choices = l;
+    n = (size_t)snprintf(s_language_help, sizeof s_language_help,
+                         "The language the game is told the console is set to:");
+    for (int i = 0; l[i] && n < sizeof s_language_help; i++)
+        n += (size_t)snprintf(s_language_help + n, sizeof s_language_help - n, "%s%s %s",
+                              i ? ", " : " ", l[i], xbox_LanguageName(xbox_LanguageFromCode(l[i])));
+    s_language.help = s_language_help;
+}
+
 static const struct enhance_item k_items[] = {
     { ITEM("render.scale", "Render scale", "Render", ENHANCE_ITEM_RANGE), .lo = 1, .hi = 4,
       .step = 1, .set = set_scale, .get = get_scale, .live = ENHANCE_LIVE_FLUSH, .def = "1",
@@ -629,6 +657,10 @@ static void build_slots(void)
         slot_add(&k_items[i], page_by_name(k_items[i].page, PAGE_RENDER), -1);
     if (hud_layer_has_mod_table())
         slot_add(&k_hud_margin, PAGE_RENDER, -1);
+    if (xbox_LanguagesShipped()[0]) {
+        language_item();
+        slot_add(&s_language, PAGE_GAME, -1);
+    }
     for (int i = 0; i < s_ntitle; i++)
         slot_add(s_title[i], page_by_name(s_title[i]->page, PAGE_GAME), -1);
     for (int m = 0; m < xbox_mod_count() && m < MODS_MAX; m++) {

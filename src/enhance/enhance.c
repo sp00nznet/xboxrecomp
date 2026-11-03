@@ -13,6 +13,7 @@
 #include "enhance_input.h"
 #include "enhance_menu.h"
 #include "hud_anchor.h"
+#include "kernel_language.h"
 #include "kernel_pacing.h"
 #include "kernel_ramfs.h"
 #include "mod.h"
@@ -197,6 +198,10 @@ int xbox_enhance_init(const char *root, const char *title)
      * dashboard throws away anyway. Set before the guest opens a
      * file; the store fixes on or off at its first use. */
     xbox_RamCacheEnable(enhance_cfg_bool("storage.ram_cache", 1));
+    /* The dashboard language (kernel_language.h): English is stock. Set
+     * before the guest, since titles read it once at boot; the menu's
+     * choice applies at the next start. */
+    xbox_SetLanguage(enhance_cfg_string("system.language", "en"));
     /* Who scales the frame to the screen. Under gamescope the compositor
      * should: its filter (Steam's FSR) upscales only a surface smaller than
      * its output, and a window at the screen size leaves it nothing to do.
