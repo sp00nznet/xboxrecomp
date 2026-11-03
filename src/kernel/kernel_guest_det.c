@@ -697,6 +697,11 @@ static void idle_step(void)
     s_steps++;
     if (device_round(XBOX_DET_DEV_TIMER) < 0)
         xbox_GuestTimeVblank();         /* no timer thread yet */
+    /* The USB controller's pass for this vblank, on the new time: its
+     * frame counter, the pads' reports and their interrupt. A title's
+     * XAPI then reads its pads at one point of guest progress per frame,
+     * which is what a pad script or a record on the poll clock counts. */
+    device_round(XBOX_DET_DEV_OHCI);
     /* The APU's frames for this vblank, after its interrupt and DPCs. */
     {
         int k;

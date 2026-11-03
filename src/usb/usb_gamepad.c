@@ -245,6 +245,19 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
  * A real controller plugged into the PC drives this emulated one. */
 #include "../input/xinput_xbox.h"
 #include "../input/keyboard.h"   /* xbox_FramebufferKeyDown */
+#include "../kernel/guest_time.h"   /* xbox_GuestTimeVirtual */
+
+/* The millisecond clock of RECOMP_PAD_PRESS and of millisecond-timed
+ * RECOMP_PAD_SCRIPT steps: the host's, or on the virtual clock
+ * (RECOMP_DEBUG=deterministic) guest milliseconds, so a step lands on the
+ * same vblank in every run rather than wherever the host's pace has got to
+ * (the deterministic-mode design, D14 and the phase 3 decisions). */
+static unsigned long pad_ms(void)
+{
+    if (xbox_GuestTimeVirtual())
+        return (unsigned long)xbox_GuestTimeMs();
+    return (unsigned long)GetTickCount();
+}
 
 /*
  * The Xbox report is 20 bytes and fixed:
@@ -290,7 +303,7 @@ static uint8_t synthetic_buttons(void)
             if (!hold_ms || hold_ms >= period_ms) hold_ms = period_ms / 4u;
             if (mask) {
                 configured = 1;
-                t0 = (unsigned long)GetTickCount();
+                t0 = pad_ms();
                 fprintf(stderr, "  PAD: synthesising button mask 0x%02X for "
                         "%u ms every %u ms\n", mask, hold_ms, period_ms);
                 fflush(stderr);
@@ -299,7 +312,7 @@ static uint8_t synthetic_buttons(void)
     }
     if (!configured)
         return 0;
-    now = (unsigned long)GetTickCount();
+    now = pad_ms();
     phase = (now - t0) % period_ms;
     return (uint8_t)((phase < hold_ms) ? mask : 0u);
 }
@@ -639,14 +652,17 @@ static void pad_script_quit(unsigned long t, uint32_t clock)
 static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
 {
     static unsigned long t0;
-    static int warned;
+    static int warned, started;
     unsigned long now, t;
     int i;
 
     pad_script_load();
-    now = (unsigned long)GetTickCount();
-    if (!t0)
+    now = pad_ms();
+    /* A flag, not t0 == 0: the virtual clock may read 0 at the first poll. */
+    if (!started) {
+        started = 1;
         t0 = now;
+    }
     t = now - t0;
     pad_live_poll(t);
     /* Only the LLE pushbuffer walker counts flips (usb_gamepad_flip); a

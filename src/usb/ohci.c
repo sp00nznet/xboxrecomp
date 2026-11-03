@@ -12,6 +12,7 @@
 #include "../platform/mmio_decode_a64.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
+#include "../kernel/guest_time.h"   /* the virtual clock's ms (deterministic) */
 #include "usb_gamepad.h"
 
 #include <stdio.h>
@@ -136,7 +137,9 @@ static void wr32(uint32_t va, uint32_t v);
 
 /* Passes this thread will keep an interrupt back while the guest is at
  * DISPATCH_LEVEL or above. One pass is the OHCI_TICK_MS (4 ms) loop tick, so
- * this is two seconds.
+ * this is two seconds. Under RECOMP_DEBUG=deterministic a pass is one vblank
+ * step instead, so the same count is about 8.3 s of virtual time: still a
+ * bound, and a slow section is still not mistaken for a stuck one.
  *
  * It was 80 ms, on the reasoning that no real critical section lasts longer.
  * True of the hardware and false here: recompiled code under an emulated
@@ -1376,6 +1379,85 @@ uint32_t xbox_OhciHotplugForTest(int reset, uint32_t ports[4])
  * the interrupt it has been waiting for. Repeat delivery and the transfer
  * lists come after that answer, not before it.
  */
+/* RECOMP_DEBUG=deterministic with the guest lock (kernel_guest_det.c): a
+ * pass runs only when the guest scheduler grants one, once per vblank step
+ * with every guest thread parked, so the pads' reports, the done queue and
+ * the interrupt land at the same point of guest progress on every run, and
+ * a title's XAPI polls its pads once per frame there. On the host's 4 ms
+ * tick a pass fell anywhere in the guest's frame, and a record on the poll
+ * clock (port-0 reports) counted host time. Until the first guest join
+ * decides the mode the thread naps and does nothing (D8): a pass begun then
+ * could still run when the mode turns on, ungranted. */
+static int  s_det;                      /* this thread's passes are granted */
+static int  s_det_granted;              /* a grant is open: done owed */
+static int  s_det_started;              /* s_det_ms set by the first grant */
+static uint64_t s_det_ms;               /* the virtual ms of the last pass */
+
+/* Before a pass: the host tick, or the next grant. 0 when this round is a
+ * nap (the mode undecided) and the pass must not run. */
+static int ohci_pass_begin(void)
+{
+    if (s_det_granted) {
+        xbox_GuestDetDeviceDone(XBOX_DET_DEV_OHCI, 1);
+        s_det_granted = 0;
+    }
+    if (!s_det) {
+        if (xbox_GuestDetUndecided()) {
+            Sleep(1);
+            return 0;
+        }
+        s_det = xbox_GuestDetOn() ? 1 : -1;     /* decided: final */
+    }
+    if (s_det > 0) {
+        xbox_GuestDetDeviceWait(XBOX_DET_DEV_OHCI);
+        s_det_granted = 1;
+        /* The clock's origin is read inside the first grant, not when the
+         * mode is decided: the nap before that can end on either side of
+         * the first vblank step, and an origin one vblank early would shift
+         * every later frame number by one between runs. */
+        if (!s_det_started) {
+            s_det_started = 1;
+            s_det_ms = xbox_GuestTimeMs();
+        }
+    } else {
+        Sleep(OHCI_TICK_MS);
+    }
+    return 1;
+}
+
+/* USB frames this pass is worth: the tick on the host clock, the virtual
+ * milliseconds since the last pass (16 or 17 a vblank) in the mode. */
+static uint32_t ohci_pass_frames(void)
+{
+    uint64_t now, d;
+
+    if (s_det <= 0)
+        return OHCI_TICK_MS;
+    now = xbox_GuestTimeMs();
+    d = now - s_det_ms;
+    s_det_ms = now;
+    return (uint32_t)d;
+}
+
+/* A pass with the controller not Operational: no frames go by. Real OHCI
+ * counts frames only while Operational, so in the mode the origin follows
+ * virtual time here; otherwise the first Operational pass would add every
+ * millisecond since the mode was decided (more than a 16-bit frame number
+ * holds on a slow boot). Passes with MIE clear still count: the controller
+ * runs then, it just does not interrupt. */
+static void ohci_pass_idle(void)
+{
+    if (s_det > 0)
+        s_det_ms = xbox_GuestTimeMs();
+}
+
+/* The thread is leaving: the scheduler stops waiting for its passes. */
+static void ohci_pass_end(void)
+{
+    s_det_granted = 0;
+    xbox_GuestDetDeviceRemove(XBOX_DET_DEV_OHCI);
+}
+
 static DWORD WINAPI ohci_thread(LPVOID unused)
 {
     xbox_log_thread_role("ohci", 0);
@@ -1404,6 +1486,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             fprintf(stderr, "  [OHCI0] no TIB for the controller thread; "
                             "not delivering interrupts\n");
             fflush(stderr);
+            ohci_pass_end();
             return 0;
         }
         g_fs_base = tib;
@@ -1414,15 +1497,19 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         uint32_t control, enable, status;
         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
 
-        Sleep(OHCI_TICK_MS);
+        if (!ohci_pass_begin())
+            continue;
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
+            /* 6 s on the 4 ms tick; about 25 s of virtual time in the mode,
+             * where a pass is one vblank. */
+            if (++waited > 1500)
                 break;
+            ohci_pass_idle();
             continue;
         }
         if (!(enable & INTR_MIE))
@@ -1452,8 +1539,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             plugged = 1;
             s_plugged = 1u;
             first_port = port;
-            fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port %u\n", waited * 20, port + 1);
+            fprintf(stderr, "  [OHCI0] operational after %u passes; device "
+                            "arriving on port %u\n", waited, port + 1);
             fflush(stderr);
         }
 
@@ -1462,7 +1549,9 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * turn and there is only ever one device at the default address.
          * RECOMP_USB_PADS sets how many (1-4). */
         if (plugged && npl < s_npads && usb_gamepad_configured(npl - 1)) {
-            if (++settle > 50) {                 /* ~200 ms after the last */
+            /* ~200 ms after the last on the 4 ms tick, ~830 ms of virtual
+             * time in the mode (a pass a vblank). */
+            if (++settle > 50) {
                 unsigned port = (first_port + (unsigned)npl) % s_ndp;
                 reg_set(&hc->reg[(HcRhPortStatus1 + port * 4) / 4], PORT_CCS | PORT_CSC);
                 reg_set(&hc->reg[HcInterruptStatus / 4], INTR_RHSC);
@@ -1490,12 +1579,14 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * Twenty frames a tick because a frame is 1 ms and this loop sleeps
          * 20. The count is what drivers compare; the rate is what they feel,
          * and both are closer to right this way than a counter that never
-         * moves. */
+         * moves. (The tick is 4 ms now; under RECOMP_DEBUG=deterministic a
+         * pass is a vblank, so the count moves by 16 or 17 virtual ms and
+         * StartOfFrame is raised once a vblank, not once a frame.) */
         {
             uint32_t hcca = hc->reg[HcHCCA / 4];
 
             hc->reg[HcFmNumber / 4] =
-                (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
+                (hc->reg[HcFmNumber / 4] + ohci_pass_frames()) & 0xFFFFu;
             /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
              * controller zeroes, so a dword write is what hardware does. */
             if (hcca)
@@ -1659,6 +1750,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         if (gated)
             xbox_DispatchGateLeave();
     }
+    ohci_pass_end();
     return 0;
 }
 
@@ -1750,9 +1842,16 @@ void xbox_OhciInit(void)
     fflush(stderr);
 
     {
-        HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
+        HANDLE th;
+
+        /* Before the thread: in the deterministic mode a step grants it a
+         * pass from then on (a no-op otherwise). */
+        xbox_GuestDetDeviceAdd(XBOX_DET_DEV_OHCI);
+        th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
             CloseHandle(th);
+        else
+            xbox_GuestDetDeviceRemove(XBOX_DET_DEV_OHCI);
     }
 }
 

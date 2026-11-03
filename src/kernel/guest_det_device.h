@@ -3,11 +3,11 @@
  * (kernel_guest_det.c; the guest side is in kernel.h).
  *
  * A device thread that writes guest memory or raises interrupts (the GPU
- * walker, the timer thread, the APU frame thread) runs a pass only when the
- * scheduler grants one, while every guest thread is parked, so what it
- * writes lands at the same point of guest progress on every run. Kept apart
- * from kernel.h so the device models (src/apu) can use it without the
- * kernel's types.
+ * walker, the timer thread, the APU frame thread, the USB controller) runs
+ * a pass only when the scheduler grants one, while every guest thread is
+ * parked, so what it writes lands at the same point of guest progress on
+ * every run. Kept apart from kernel.h so the device models (src/apu,
+ * src/usb) can use it without the kernel's types.
  */
 #ifndef XBOX_GUEST_DET_DEVICE_H
 #define XBOX_GUEST_DET_DEVICE_H
@@ -20,6 +20,7 @@ enum {
     XBOX_DET_DEV_NV2A,          /* the push-buffer walker (nv2a-ack thread) */
     XBOX_DET_DEV_TIMER,         /* the timer thread: vblank, DPCs, timers */
     XBOX_DET_DEV_APU,           /* the APU frame thread: one frame a pass */
+    XBOX_DET_DEV_OHCI,          /* the USB controller: one pass a vblank */
     XBOX_DET_DEV_COUNT
 };
 

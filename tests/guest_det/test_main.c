@@ -33,7 +33,9 @@
  *  - when nothing resumes them, the parting thread's steps end after a
  *    minute of guest time and the turn is left empty;
  *  - a timed wait due less than 1 ms ahead is a ring wait that ends on the
- *    next step, not a host poll with the clock frozen.
+ *    next step, not a host poll with the clock frozen;
+ *  - the USB controller gets exactly one pass per vblank step, on the new
+ *    time, and none between steps: the pads are read at one point a frame.
  * A watchdog fails the test instead of hanging it.
  */
 #include "kernel.h"
@@ -680,6 +682,74 @@ static void short_due(void)
           "due: a wait due under 1 ms ahead ends on the next step");
 }
 
+/* The USB controller thread (ohci.c in the mode): one pass per grant, each
+ * noting the vblank it saw. */
+#define USB_MAX 16
+static volatile LONG s_usb_quit, s_usb_n;
+static uint64_t s_usb_vb[USB_MAX];
+
+static DWORD WINAPI usb_main(LPVOID p)
+{
+    (void)p;
+    for (;;) {
+        LONG n;
+        xbox_GuestDetDeviceWait(XBOX_DET_DEV_OHCI);
+        if (InterlockedCompareExchange(&s_usb_quit, 0, 0))
+            return 0;
+        n = InterlockedIncrement(&s_usb_n) - 1;
+        if (n < USB_MAX)
+            s_usb_vb[n] = xbox_GuestTimeVblanks();
+        Sleep(2);                           /* host-timed work */
+        xbox_GuestDetDeviceDone(XBOX_DET_DEV_OHCI, 1);
+    }
+}
+
+static uint64_t s_usb_vb0;
+
+static void body_three_vblanks(int id)
+{
+    int k;
+
+    (void)id;
+    s_usb_vb0 = xbox_GuestTimeVblanks();
+    for (k = 0; k < 3; k++)
+        xbox_GuestDetWaitVblank(xbox_GuestTimeVblanks(), 0x8100);
+    s_vb_after = xbox_GuestTimeVblanks();
+    InterlockedIncrement(&s_done);
+}
+
+static void usb_pass(void)
+{
+    HANDLE d;
+    long st, cu, pa;
+    int ok, k;
+    LONG want = 1;
+    Guest g = { 1, body_three_vblanks, 0 };
+    HANDLE t;
+
+    s_usb_quit = s_usb_n = 0;
+    xbox_GuestTimeTestMode(1);
+    xbox_GuestDetTestReset(1);
+    xbox_GuestDetDeviceAdd(XBOX_DET_DEV_OHCI);
+    d = CreateThread(NULL, 0, usb_main, NULL, 0, NULL);
+    s_done = 0;
+    xbox_GuestDetBind(OBJ(0));
+    xbox_GuestDetJoin();
+    xbox_GuestDetThreadNew(OBJ(1));
+    t = CreateThread(NULL, 0, guest_main, &g, 0, NULL);
+    xbox_GuestDetBlock(all_done, &want, 0, 0x1000);
+    xbox_GuestDetPart();
+    join(t);
+    xbox_GuestDetStats(&st, &cu, &pa);
+    ok = st == 3 && s_usb_n == 3 && s_vb_after == s_usb_vb0 + 3;
+    for (k = 0; ok && k < 3; k++)
+        ok = s_usb_vb[k] == s_usb_vb0 + 1 + (uint64_t)k;
+    check(ok, "usb: one controller pass per step, after the vblank");
+    InterlockedExchange(&s_usb_quit, 1);
+    xbox_GuestDetDeviceRemove(XBOX_DET_DEV_OHCI);   /* wakes it to quit */
+    join(d);
+}
+
 int main(void)
 {
     CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
@@ -701,6 +771,7 @@ int main(void)
     part_reuse();
     part_bound();
     short_due();
+    usb_pass();
     xbox_GuestTimeTestMode(-1);
     printf("guest_det: %s (%d failures)\n", failures ? "FAIL" : "PASS",
            failures);

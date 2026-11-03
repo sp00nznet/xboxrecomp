@@ -841,7 +841,107 @@ static void test_poll_depth_not_a_press(void)
     CHECK(rec.presses == 1 && rec.press_at[0] == 11);
 }
 
-int main(void)
+/* The recorded files the replays depend on keep parsing: the pad_record
+ * header, flip (f) and poll (g) clocks, anchors, comment lines the user adds,
+ * steps written out of order (a stick step is written when it ends) and
+ * @end. Each excerpt is shaped like one of the BLiNX 2 clip records; every
+ * line that is not a comment is a step or an anchor. */
+static int count_entries(const char *text)
+{
+    int n = 0, start = 1;
+    for (const char *c = text; *c; c++) {
+        if (start && *c != '#' && *c != '\n')
+            n++;
+        start = *c == '\n';
+    }
+    return n;
+}
+
+static void check_record(const char *text, int clock, int anchors)
+{
+    static PadAnchors a;
+    static PadStep s[PAD_SCRIPT_MAX];
+    int n;
+
+    memset(&a, 0, sizeof a);
+    n = pad_script_parse_anchored(text, s, 0, PAD_SCRIPT_MAX, &a);
+    CHECK(n + a.n == count_entries(text));
+    CHECK(a.clock == clock);
+    if (anchors >= 0)
+        CHECK(a.n == anchors);
+    for (int i = 0; i < n; i++)
+        CHECK(s[i].by_flip == clock);
+}
+
+static void test_record_formats(void)
+{
+    static PadStep s[8];
+    static PadAnchors a;
+    int n;
+
+    /* clip: flip clock, no anchors. */
+    check_record("# pad_record: pad_script steps timed by flip (f<flip>:<buttons>"
+                 ":<hold flips>, sticks lx=<v>)\n"
+                 "f116:a:9\nf168:a:8\n"
+                 "f114:lx=3107+ly=-1766+rx=-1037+ry=-2720:376\n"
+                 "f490:lx=3107+ly=-2167+rx=-1037+ry=-2775:2\n", 1, 0);
+    /* clip2: flip clock with anchors, out of order. */
+    check_record("# pad_record: pad_script steps timed by flip (f<flip>:<buttons>"
+                 ":<hold flips>, sticks lx=<v>)\n"
+                 "f0:@open:logo_mgs.sfd\n"
+                 "f0:lx=2330+ly=-1568+rx=-254+ry=-2069:33\n"
+                 "f32:start:9\nf83:a:13\n"
+                 "f187:@open:blinx2_opening.sfd\n"
+                 "f305:a:8\n"
+                 "f50:lx=2330+ly=-1568+rx=-136+ry=-2997:267\n", 1, 2);
+    /* clip3: poll clock, a comment between steps, sticks, @end. */
+    check_record("# pad_record: pad_script steps timed by the title's pad polls "
+                 "(g<poll>:<buttons>:<hold polls>, sticks lx=<v>, analog depth "
+                 "lt=<v>)\n"
+                 "g2:@open:logo_mgs.sfd\n"
+                 "g0:ly=-1+rx=25108+ry=29163:1\n"
+                 "g56:start:8\n"
+                 "# no retry start: pressed at f56 f121 f166 (gaps 65 45)\n"
+                 "g211:@open:blinx2_opening.sfd\n"
+                 "g369:@open:song_TITLE.adx\n"
+                 "g131:lx=2460+ly=-1114+rx=-445+ry=-2197:287\n"
+                 "g4381:start:6\ng4428:@end\n", 2, 3);
+
+    /* An out-of-order stick step counts from the anchor its start is past,
+     * not the one written before it. */
+    memset(&a, 0, sizeof a);
+    n = pad_script_parse_anchored("g2:@open:x.sfd\ng211:@open:y.sfd\n"
+                                  "g250:a:2\ng131:lx=100:200\n", s, 0, 8, &a);
+    CHECK(n == 2 && a.n == 2 && s[0].anchor == 2 && s[1].anchor == 1);
+}
+
+/* Each argument is a pad file to check the same way (the recorded clips are
+ * game data and stay out of the tree): its first timed line sets the clock. */
+static void check_files(int argc, char **argv)
+{
+    static char buf[4 << 20];
+    for (int i = 1; i < argc; i++) {
+        FILE *f = fopen(argv[i], "rb");
+        size_t len;
+        const char *c;
+        if (!f) {
+            fprintf(stderr, "pad_script: cannot open %s\n", argv[i]);
+            fails++;
+            continue;
+        }
+        len = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[len] = 0;
+        for (c = buf; *c == '#' && strchr(c, '\n'); c = strchr(c, '\n') + 1)
+            ;
+        int before = fails;
+        /* g: guest vblanks, f: flips, a leading digit: milliseconds. */
+        check_record(buf, *c == 'g' ? 2 : (*c >= '0' && *c <= '9') ? 0 : 1, -1);
+        printf("pad_script: %s %s\n", argv[i], fails == before ? "ok" : "FAILED");
+    }
+}
+
+int main(int argc, char **argv)
 {
     test_parse();
     test_timing();
@@ -863,6 +963,8 @@ int main(void)
     test_poll_anchor();
     test_end_marker();
     test_poll_depth_not_a_press();
+    test_record_formats();
+    check_files(argc, argv);
     if (fails) {
         fprintf(stderr, "pad_script: %d failure(s)\n", fails);
         return 1;
