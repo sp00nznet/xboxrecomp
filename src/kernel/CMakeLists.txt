@@ -22,6 +22,7 @@ set(KERNEL_SOURCES
     guest_state_hash.c
     kernel_guest_cpu.c
     kernel_guest_det.c
+    kernel_reset_probe.c
     kernel_xbox.c
     kernel_language.c
     kernel_ob.c

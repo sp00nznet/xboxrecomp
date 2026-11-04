@@ -64,6 +64,7 @@
 #include "recomp_env.h"
 #include "platform/host_time.h"
 #include "kernel_pacing.h"
+#include "kernel_reset_probe.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -945,6 +946,9 @@ static void guest_cpu_acquire(int barge)
     unsigned my;
     uint64_t t0 = 0;
 
+    /* A thread here is where a reset can stop it: it waits for the CPU. */
+    xbox_ResetProbeState(XBOX_RESET_IN_QUEUE, 0);
+    xbox_ResetProbeHit(XBOX_RESET_STOP_ACQUIRE, 0);
     EnterCriticalSection(&s_lock);
     if (s_sched) {
         t0 = sched_take(barge);
@@ -979,6 +983,7 @@ static void guest_cpu_acquire(int barge)
     note_flush();
     t_held = 1;
     t_joining = 0;
+    xbox_ResetProbeState(XBOX_RESET_RUN, 0);
     if (t0) {
         uint64_t now = xbox_HostNowNs();
         LONG wait_us = (LONG)((now - t0) / 1000u);
@@ -1137,11 +1142,20 @@ static int ordinal_is_wait(uint32_t ordinal)
     }
 }
 
+/* The kernel calls a reset finds a thread stopped in (kernel_reset_probe.c):
+ * the waits, a sleep and a self-suspend. File I/O may block too, but it
+ * ends on its own and the thread stops when it returns. */
+int xbox_GuestCpuOrdinalIsWait(uint32_t ordinal)
+{
+    return ordinal_is_wait(ordinal) || ordinal == 99 || ordinal == 231;
+}
+
 /* ── The entry points (kernel.h) ─────────────────────────── */
 
 void xbox_GuestCpuJoin(void)
 {
     t_guest = 1;
+    xbox_ResetProbeJoin();
     xbox_GuestDetArm();
     if (xbox_GuestDetOn()) {
         /* The deterministic ring (kernel_guest_det.c) is the guest CPU. */
@@ -1175,6 +1189,7 @@ void xbox_GuestCpuPart(void)
     }
     t_guest = 0;
     t_sched = NULL;
+    xbox_ResetProbePart();
 }
 
 int xbox_GuestCpuHeld(void)
@@ -1271,6 +1286,8 @@ void xbox_GuestCpuAcquire(void)
  * any level may take it. */
 void xbox_GuestCpuBlocked(void)
 {
+    xbox_ResetProbeState(XBOX_RESET_IN_BLOCK, 0);
+    xbox_ResetProbeHit(XBOX_RESET_STOP_BLOCKED, 0);
     if (t_held || !t_guest || !xbox_GuestCpuOn() || xbox_GuestDetOn())
         return;
     if (!s_sched && !s_waiting)
@@ -1315,6 +1332,9 @@ void xbox_GuestCpuPreempt(uint32_t va)
 {
     GuestCpuThread *r;
 
+    /* Before every early return: the probe asks whether the thread gets
+     * here at all, not whether it hands over. */
+    xbox_ResetProbeHit(XBOX_RESET_STOP_BACK_EDGE, va);
     if (xbox_GuestDetOn()) {
         xbox_GuestDetBackEdge(va, xbox_IrqlThisThreadBlocksDpcs());
         return;

@@ -34,6 +34,7 @@
 #include <time.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "kernel_pacing.h"
+#include "kernel_reset_probe.h"
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 #include "nv2a_flip_hold.h"
 #include "platform/host_time.h"   /* xbox_HostNowNs */
@@ -7509,6 +7510,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         present_pick();
         if (recomp_env(RENV_OPTS_AT))
             opts_at_flip(s_gpu.flips);
+        /* RECOMP_DEBUG=reset_probe: the stop probe's samples open here,
+         * where every backend passes; the probe thread does the waiting. */
+        if (recomp_env(RENV_RESET_PROBE))
+            xbox_ResetProbeFlip(s_gpu.flips);
         /* The GPU backends apply live options (nv2a_host_opts_request) in
          * their on_flip, after the present; these two have none that does,
          * so it is done here and a request never stays pending. Scale and overscan

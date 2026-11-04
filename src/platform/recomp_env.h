@@ -297,6 +297,7 @@ extern "C" {
     X(FB_WINDOW_DUMP_EVERY, DEBUG, "fb_window_dump_every", "RECOMP_FB_WINDOW_DUMP_EVERY", "=n: window dump period") \
     X(WINDOW_SHOT,       DEBUG, "window_shot",     "RECOMP_WINDOW_SHOT",       "=flips: SDL window shots") \
     X(WINDOW_SHOT_PREFIX, DEBUG, "window_shot_prefix", "RECOMP_WINDOW_SHOT_PREFIX", "=prefix: window shot files") \
+    X(RESET_PROBE,       DEBUG, "reset_probe",     NULL,                       "=flips (N, A-B or A-B/S, comma-separated): the stop probe (game-reset phase 0): at each flip, how long every guest thread takes to reach a point where a reset could stop it, one [RESET-PROBE] line per thread and a summary; nothing is stopped") \
     X(OPTS_AT,           DEBUG, "opts_at",         NULL,                       "=flip:key=value,...: live option requests at those flips, as the in-game menu makes them (scale, filter, fullscreen, aniso, movie, overscan, snap_2d, pacing)") \
     X(MOD_SET_AT,        DEBUG, "mod_set_at",      NULL,                       "=frame:key=value,...: mod settings changed live from the flip tick once the guest reaches that xbox_mod_frame count, as the Mods page does (needs the menu armed)") \
     X(TEX_DUMP,          DEBUG, "tex_dump",        "RECOMP_TEX_DUMP",          "=dir: Metal and D3D11 write each uploaded texture once per texel hash as <hash>.xtd and <hash>.json, the hash a texture pack matches (docs/formats/texture-dump.md); the CPU rasteriser writes first-use BMPs with it as a file prefix instead") \

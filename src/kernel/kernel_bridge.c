@@ -28,6 +28,7 @@
 #include "kernel.h"
 #include "kernel_missing.h"
 #include "kernel_pacing.h"
+#include "kernel_reset_probe.h"
 #include "guest_time.h"
 #include "guest_state_hash.h"
 #include "kernel_ramfs.h"
@@ -2821,6 +2822,9 @@ static void bridge_PsTerminateSystemThread(void)
          * (xbox_GuestCpuRelease) so the end above lands at a fixed pass. */
         if (xbox_GuestDetOn())
             guest_cpu_part();
+        /* Outside the deterministic mode this exit never parts, so the
+         * stop probe would count the dead thread as one still running. */
+        xbox_ResetProbePart();
         ExitThread(exit_status);
     }
     if (xbox_GuestDetOn())
@@ -11729,14 +11733,20 @@ void guest_cpu_part(void)
 static void kernel_thunk_dispatch(void)
 {
     int slot = g_kernel_dispatch_slot;
-    int held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL,
-                                    slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE
-                                    ? g_slot_ordinals[slot] : 0);
+    uint32_t ordinal = slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE
+                       ? g_slot_ordinals[slot] : 0;
+    int held;
+
+    /* The bridge entry and exit are stop points (RECOMP_DEBUG=reset_probe);
+     * the state says a wait in between is a thread already stopped. */
+    xbox_ResetProbeHit(XBOX_RESET_STOP_BRIDGE, ordinal);
+    xbox_ResetProbeState(XBOX_RESET_IN_BRIDGE, ordinal);
+    held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, ordinal);
     kernel_thunk_dispatch_body();
+    xbox_ResetProbeState(XBOX_RESET_RUN, 0);
+    xbox_ResetProbeHit(XBOX_RESET_STOP_BRIDGE, ordinal);
     if (xbox_GuestDetOn())
-        xbox_GuestDetTraceCall(slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE
-                               ? g_slot_ordinals[slot] : 0,
-                               g_xbox_kernel_caller, g_eax);
+        xbox_GuestDetTraceCall(ordinal, g_xbox_kernel_caller, g_eax);
     if (held)
         xbox_GuestCpuAcquire();
 }

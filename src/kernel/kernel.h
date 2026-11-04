@@ -918,6 +918,7 @@ void     xbox_GuestCpuAcquire(void);
 void     xbox_GuestCpuBlocked(void);   /* a bridge blocks inside a non-blocking ordinal */
 int      xbox_GuestCpuYield(uint32_t va);   /* 1: handed over */
 void     xbox_GuestCpuPreempt(uint32_t va); /* RECOMP_BACK_EDGE with the flag set */
+int      xbox_GuestCpuOrdinalIsWait(uint32_t ordinal); /* a wait, sleep or suspend (the reset probe) */
 int      xbox_GuestCpuEnterCallback(void);      /* 1 when it took the CPU */
 void     xbox_GuestCpuLeaveCallback(int took);
 unsigned long xbox_GuestCpuOwner(void);         /* the holder's tid, 0 when free */
