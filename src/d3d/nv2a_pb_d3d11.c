@@ -5696,6 +5696,33 @@ static void d3d11_on_poll(void)
         nv2a_occ_settle(&s_occ);
 }
 
+/* Under Hor+ or render.snap_2d, at a batch's END: whether the walker may
+ * hold it for a merged list (nv2a_merge_placed), as metal_merge_placed.
+ * The program and stages are the ones its draw would look up (both
+ * memoised); a stage counts as reading a target when its offset is one,
+ * whatever rt_texture would then make of the format. */
+static int d3d11_merge_placed(int program)
+{
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    const VsEntry *vs;
+    int n, i, rt = 0;
+
+    if (!program || !v->depth_enable || !init())
+        return 0;
+    vs = vertex_shader(program);
+    if (!vs)
+        return 0;
+    build_stages();
+    for (n = 0; n < 4 && !rt; n++) {
+        const Stage *t = &s_stage[n];
+        if (!t->mode || t->mode == 4 || !t->offset)
+            continue;
+        for (i = 0; i < RT_MAX && !rt; i++)
+            rt = s_rt[i].tex && !((s_rt[i].addr ^ t->offset) & 0x07FFFFFFu);
+    }
+    return nv2a_merge_placed(program, v->depth_enable, &vs->hp, rt);
+}
+
 static const struct nv2a_pb_backend s_d3d11_backend = {
     d3d11_on_clear,
     d3d11_on_zclear,
@@ -5708,6 +5735,7 @@ static const struct nv2a_pb_backend s_d3d11_backend = {
     0,                  /* writes_back: presents and dumps from its swap chain */
     NULL,               /* sync_guest */
     1,                  /* merge_draws */
+    d3d11_merge_placed,
 };
 
 /* For tests/d3d11_backend_smoke: the size of the target at a colour offset

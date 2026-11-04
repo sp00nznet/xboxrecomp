@@ -21,10 +21,18 @@
  *   cap        a batch that grows past the batch cap while a chain is
  *              held ends the chain, and is drawn whole on its own
  *   aspect     with display.aspect set (Hor+ places each batch from its
- *              own vertices) nothing is merged
+ *              own vertices) only what the backend's merge_placed takes
+ *              is merged: nothing without the hook or when it says no,
+ *              the strips as stock when it says yes, which it is asked
+ *              with the batch's program flag, 1 for a program batch;
+ *              a no mid-chain draws the chain held so far and leaves
+ *              that batch alone
+ *   placed     nv2a_merge_placed takes only a settled 3D program batch
+ *              with the depth test on that samples no render target
  *   snap       with render.snap_2d on above scale 1 (it classes each
- *              batch from its own vertices) nothing is merged; at scale
- *              1, where the snap is off, batches merge as stock
+ *              batch from its own vertices) only what merge_placed takes
+ *              is merged, as under Hor+; at scale 1, where the snap is
+ *              off, batches merge as stock
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -51,6 +59,7 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define COLOR_OFF   0x0210u     /* SET_SURFACE_COLOR_OFFSET */
 #define TEX0_OFF    0x1B00u     /* SET_TEXTURE_OFFSET(0) */
 #define TEX0_CTL0   0x1B0Cu     /* SET_TEXTURE_CONTROL0(0), bit 30 enables */
+#define XFORM_MODE  0x1E94u     /* SET_TRANSFORM_EXECUTION_MODE, 2: PROGRAM */
 
 #define MAX_DRAWS 16
 static struct {
@@ -77,6 +86,27 @@ static const struct nv2a_pb_backend s_rec = {
     0,                  /* writes_back */
     NULL,               /* sync_guest */
     1,                  /* merge_draws */
+};
+
+/* The same backend with a merge_placed hook that answers s_placed (or,
+ * when s_placed_seq is set, its call'th character, '1' for yes) and
+ * records what it was asked. */
+static int s_placed, s_placed_calls, s_placed_program = -1;
+static const char *s_placed_seq;
+static int rec_merge_placed(int program)
+{
+    s_placed_calls++;
+    s_placed_program = program;
+    if (s_placed_seq)
+        return s_placed_seq[s_placed_calls - 1] == '1';
+    return s_placed;
+}
+static const struct nv2a_pb_backend s_rec_placed = {
+    NULL, NULL, rec_on_draw, NULL, NULL, NULL, NULL, NULL,
+    0,                  /* writes_back */
+    NULL,               /* sync_guest */
+    1,                  /* merge_draws */
+    rec_merge_placed,
 };
 
 static void batch(uint32_t prim, uint32_t start, uint32_t count)
@@ -235,8 +265,60 @@ int main(void)
     batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
     batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
     M(BLEND, 0);
-    check("aspect: Hor+ draws every batch on its own", s_draws == 2
+    check("aspect: without merge_placed Hor+ draws every batch alone", s_draws == 2
           && draw_is(0, NV_PRIM_TRIANGLE_STRIP, strip4, 4));
+    nv2a_pb_set_backend(&s_rec_placed);
+    s_placed = 0;
+    s_placed_calls = 0;
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    M(BLEND, 0);
+    check("aspect: merge_placed 0 draws every batch on its own", s_draws == 2
+          && draw_is(0, NV_PRIM_TRIANGLE_STRIP, strip4, 4) && s_placed_calls == 2);
+    s_placed = 1;
+    s_placed_calls = 0;
+    s_placed_program = -1;
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    batch(NV_PRIM_TRIANGLE_STRIP, 7, 4);
+    M(BLEND, 0);
+    check("aspect: merge_placed 1 merges the strips as stock", s_draws == 1
+          && draw_is(0, NV_PRIM_TRIANGLES, chain, 15) && s_draw[0].batches == 3);
+    check("aspect: merge_placed is asked per batch with its program flag",
+          s_placed_calls == 3 && s_placed_program == 0);
+    /* Yes, yes, then no: the no flushes the pair held so far as one list
+     * and the third batch draws alone with its own indices. */
+    {
+        static const uint16_t third[] = {7, 8, 9, 10};
+        s_placed_seq = "110";
+        s_placed_calls = 0;
+        s_draws = 0;
+        batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+        batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+        batch(NV_PRIM_TRIANGLE_STRIP, 7, 4);
+        M(BLEND, 0);
+        check("aspect: yes, yes, no draws the pair merged, the third alone",
+              s_draws == 2 && draw_is(0, NV_PRIM_TRIANGLES, chain, 9)
+              && s_draw[0].batches == 2
+              && draw_is(1, NV_PRIM_TRIANGLE_STRIP, third, 4)
+              && s_placed_calls == 3);
+        s_placed_seq = NULL;
+    }
+    /* A program batch (SET_TRANSFORM_EXECUTION_MODE PROGRAM) asks with 1. */
+    M(XFORM_MODE, 2);
+    s_placed_calls = 0;
+    s_placed_program = -1;
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    M(BLEND, 0);
+    check("aspect: a program batch is asked with program 1 and merges",
+          s_placed_calls == 2 && s_placed_program == 1 && s_draws == 1
+          && s_draw[0].prim == NV_PRIM_TRIANGLES);
+    M(XFORM_MODE, 0);
+    nv2a_pb_set_backend(&s_rec);
 
     {
         struct nv2a_host_opts o = *nv2a_host_opts();
@@ -261,8 +343,42 @@ int main(void)
     batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
     batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
     M(BLEND, 0);
-    check("snap: render.snap_2d above scale 1 draws every batch on its own", s_draws == 2
+    check("snap: render.snap_2d above scale 1 without merge_placed draws every batch alone", s_draws == 2
           && draw_is(0, NV_PRIM_TRIANGLE_STRIP, strip4, 4));
+    nv2a_pb_set_backend(&s_rec_placed);
+    s_placed = 0;
+    s_placed_calls = 0;
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    M(BLEND, 0);
+    check("snap: merge_placed 0 draws every batch on its own", s_draws == 2
+          && s_placed_calls == 2);
+    s_placed = 1;
+    s_placed_calls = 0;
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    batch(NV_PRIM_TRIANGLE_STRIP, 7, 4);
+    M(BLEND, 0);
+    check("snap: merge_placed 1 merges the strips as stock", s_draws == 1
+          && draw_is(0, NV_PRIM_TRIANGLES, chain, 15) && s_placed_calls == 3);
+    nv2a_pb_set_backend(&s_rec);
+
+    {
+        /* A program whose first 16 batches were all 3D, depth on, no
+         * target sampled: placed the same from any vertices. */
+        struct nv2a_aspect_gate g3 = { 0, 16, 0 }, g2 = { 1, 40, 0 }, gnew = { -1, 0, 0 },
+                                gearly = { 0, 15, 0 };
+        check("placed: a settled 3D program batch may merge",
+              nv2a_merge_placed(1, 1, &g3, 0));
+        check("placed: pass-through, no depth test, or a target read may not",
+              !nv2a_merge_placed(0, 1, &g3, 0) && !nv2a_merge_placed(1, 0, &g3, 0)
+              && !nv2a_merge_placed(1, 1, &g3, 1));
+        check("placed: a program seen 2D, unchecked or not settled may not",
+              !nv2a_merge_placed(1, 1, &g2, 0) && !nv2a_merge_placed(1, 1, &gnew, 0)
+              && !nv2a_merge_placed(1, 1, &gearly, 0) && !nv2a_merge_placed(1, 1, NULL, 0));
+    }
 
     if (s_fail) {
         fprintf(stderr, "[pb_draw_merge] FAIL: %d check(s)\n", s_fail);

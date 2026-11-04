@@ -6856,11 +6856,13 @@ static uint32_t s_mrg_save_n;
 static uint16_t s_mrg_save[NV2A_MERGE_BATCH_MAX];
 
 /* Whether this batch's END may hold it: on a backend that takes merged
- * lists, with display.aspect stock (Hor+ places each batch from its own
- * vertices, nv2a_aspect_place), render.snap_2d off (it classes each batch
- * from its own vertices too: one w, one depth, a sample of 33, so a chain
- * of sprites at several depths or with a 3D tail would snap differently
- * merged) and pb_merge not 0. */
+ * lists, with pb_merge not 0. Hor+ places each batch from its own
+ * vertices (nv2a_aspect_place) and render.snap_2d classes each from its
+ * own vertices too (one w, one depth, a sample of 33, so a chain of
+ * sprites at several depths or with a 3D tail would snap differently
+ * merged): under either only a batch the backend's merge_placed accepts
+ * is held, the settled 3D world (nv2a_merge_placed). Hor+ used to stop
+ * merging altogether. */
 static int merge_on(void)
 {
     static int env = -1;
@@ -6868,8 +6870,11 @@ static int merge_on(void)
         const char *e = recomp_env(RENV_PB_MERGE);
         env = !(e && !strcmp(e, "0"));
     }
-    return env && s_backend->merge_draws && s_backend->on_draw
-        && !nv2a_host_opts()->aspect_w && !nv2a_snap_2d_on(nv2a_host_render_scale());
+    if (!env || !s_backend->merge_draws || !s_backend->on_draw)
+        return 0;
+    if (!nv2a_host_opts()->aspect_w && !nv2a_snap_2d_on(nv2a_host_render_scale()))
+        return 1;
+    return s_backend->merge_placed && s_backend->merge_placed(vsh_batch_active());
 }
 
 /* Draw the held batches. Runs before the method that ended the chain is

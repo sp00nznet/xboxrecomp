@@ -3675,6 +3675,35 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
 
 /* ---- registration ---------------------------------------------------------- */
 
+/* Under Hor+ or render.snap_2d, at a batch's END: whether the walker may
+ * hold it for a merged list (nv2a_merge_placed), as d3d11_merge_placed.
+ * The program and stages are the ones its draw would look up (both
+ * memoised); a stage counts as reading a target when its offset is one,
+ * whatever rt_texture would then make of the format. */
+static int metal_merge_placed(int program)
+{
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    const VsEntry *ve;
+    int n, i, rt = 0;
+
+    if (!program || !v->depth_enable || !init())
+        return 0;
+    @autoreleasepool {
+        ve = vs_cache();
+    }
+    if (!ve)
+        return 0;
+    build_stages();
+    for (n = 0; n < 4 && !rt; n++) {
+        const Stage *t = &s_stage[n];
+        if (!t->mode || t->mode == 4 || !t->offset)
+            continue;
+        for (i = 0; i < RT_MAX && !rt; i++)
+            rt = s_rt[i].tex && !((s_rt[i].addr ^ t->offset) & 0x07FFFFFFu);
+    }
+    return nv2a_merge_placed(program, v->depth_enable, &ve->hp, rt);
+}
+
 static const struct nv2a_pb_backend s_metal_backend = {
     metal_on_clear,
     metal_on_zclear,
@@ -3687,6 +3716,7 @@ static const struct nv2a_pb_backend s_metal_backend = {
     1,                  /* writes_back: dumps read guest memory, after sync_guest */
     metal_sync_guest,
     1,                  /* merge_draws */
+    metal_merge_placed,
 };
 
 const struct nv2a_pb_backend *nv2a_pb_metal_backend(void)

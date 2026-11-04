@@ -366,9 +366,20 @@ struct nv2a_pb_backend {
     void (*sync_guest)(uint32_t offset, uint32_t pitch, uint32_t w, uint32_t h);
     /* merge_draws: on_draw may get back-to-back batches as one triangle
      * list (nv2a_merge); the backend keeps no per-batch rule that the
-     * merged list would change. The walker merges only with display.aspect
-     * stock, since Hor+ places each batch from its own vertices. */
+     * merged list would change. With display.aspect stock and
+     * render.snap_2d off the walker merges every joinable batch; under
+     * either, which place or snap each batch from its own vertices, only
+     * the batches merge_placed accepts. */
     int  merge_draws;
+    /* merge_placed (optional; NULL: no merging under Hor+ or snap_2d):
+     * whether the batch about to end, drawn with the current state, would
+     * be placed the same from any vertices (nv2a_merge_placed). `program`
+     * is 1 for a title program batch (transform mode PROGRAM). A
+     * fixed-function batch asks with 0, even one that will draw through
+     * its synthesised program: ff_begin runs at the draw, after END, so
+     * fixed-function batches never merge under Hor+ or snap_2d. Walker
+     * thread, at the batch's END. */
+    int  (*merge_placed)(int program);
 };
 
 /* Route the executor's events to `backend`. NULL restores the CPU rasteriser.

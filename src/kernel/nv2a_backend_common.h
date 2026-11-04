@@ -1726,6 +1726,29 @@ struct nv2a_aspect_gate {
  * a backend that has to gather the inputs first skips that when it won't. */
 int nv2a_aspect_due(const struct nv2a_aspect_gate *gate);
 
+/* Under Hor+ or render.snap_2d: whether a batch may join a merged list
+ * (nv2a_merge), its placement being one no set of its own vertices could
+ * change. A program batch whose program's first 16 batches were all 3D
+ * (gate two_d 0) is centred and never snapped whatever its vertices; with
+ * the depth test on it is no flat near layer (nv2a_aspect_flat) nor a
+ * letterbox band (nv2a_aspect_band); sampling no render target it is no
+ * screen quad (nv2a_aspect_screen_quad). Everything else (pass-through,
+ * a program not yet settled or seen 2D, a batch reading a target) is
+ * placed from its own vertices and drawn alone. The walker asks at every
+ * batch's END: a batch answering 0 flushes the chain held so far and draws
+ * alone, so a chain only ever holds batches that each answered 1. With
+ * merging, the gate's n counts draws, not batches, so its every-256th
+ * recheck of a settled 3D program comes later in guest batches, and scans
+ * the merged list: a program that turns orthographic is caught later, and
+ * a merged list whose vertices span several depths sets vary_z, so the
+ * snap leaves that one draw alone. Merging used to stop altogether under
+ * Hor+, so wide views drew every guest batch on its own. */
+static inline int nv2a_merge_placed(int program, int depth_enable,
+                                    const struct nv2a_aspect_gate *gate, int samples_rt)
+{
+    return program && depth_enable && gate && gate->two_d == 0 && gate->n >= 16 && !samples_rt;
+}
+
 int nv2a_aspect_scan(struct nv2a_aspect_gate *gate,
                      const uint32_t prog[][4], uint32_t start, float c[][4],
                      const float *vf, unsigned nf4, const int *slot, uint32_t count,
