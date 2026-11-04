@@ -97,6 +97,7 @@ if(XBOXRECOMP_ENHANCE)
         nv2a_overlay_glyph.c
         nv2a_stats.c
         nv2a_present_chain.c
+        nv2a_dbg_draw.c
         ${_ovl_vendored}
         "${_ovl_fonts_c}")
 endif()

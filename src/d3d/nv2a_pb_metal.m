@@ -89,6 +89,9 @@
 #include "d3d8_msl.h"
 #include "nv2a_basic_msl.h"
 #include "metal_compile.h"
+#ifdef XBOXRECOMP_ENHANCE
+#include "nv2a_dbg_draw.h"
+#endif
 /* xbox_memory_layout.h pulls in the Win32 shim (BOOL, GetCurrentThread),
  * which collides with Objective-C and CoreServices: declare what is used. */
 ptrdiff_t xbox_GetMemoryOffset(void);
@@ -3438,6 +3441,150 @@ static void host_dump(RenderTarget *rt, uint32_t hcw, uint32_t hch)
     fclose(f);
 }
 
+#ifdef XBOXRECOMP_ENHANCE
+/* ── The mods' 3D debug draw (nv2a_dbg_draw.h, mod API version 8) ─────────
+ *
+ * As the D3D11 backend's: at the flip, into the target about to be shown,
+ * before the sync, the readbacks and the dumps, in a loading pass on the
+ * target that attaches its own depth buffer (rt->dt), whose z is the
+ * frame's normalised z, the clip z / w of the game's projection. The
+ * vertices are clip space already; the shader only narrows x to the
+ * guest's columns of a hor+ target. The vertex buffer is reused: the
+ * flip's flush(1) waits for the pass that read it. */
+static const char s_dbg_msl[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct DV { packed_float4 p; uchar4 c; };\n"
+    "struct VO { float4 p [[position]]; float4 c; };\n"
+    "vertex VO dbg_vs(uint id [[vertex_id]], device const DV *v [[buffer(0)]],\n"
+    "                 constant float &xs [[buffer(1)]]) {\n"
+    "    VO o;\n"
+    "    float4 p = float4(v[id].p);\n"
+    "    o.p = float4(p.x * xs, p.yzw);\n"
+    "    o.c = float4(v[id].c) / 255.0;\n"
+    "    return o;\n"
+    "}\n"
+    "fragment float4 dbg_fs(VO i [[stage_in]]) { return i.c; }\n";
+
+static id<MTLRenderPipelineState> s_dbg_pso[2];     /* without, with a depth attachment */
+static id<MTLDepthStencilState> s_dbg_dss[3];       /* test and write, test, off */
+static id<MTLBuffer> s_dbg_vb;
+static size_t s_dbg_vb_cap;
+static int s_dbg_failed;
+
+static int dbg_init(void)
+{
+    id<MTLFunction> vs, fs;
+    int k;
+
+    /* s_dbg_failed, not s_dbg_pso[0], says whether the whole pipeline is
+     * there: a depth state can fail after both pipelines were made. */
+    if (s_dbg_pso[0] || s_dbg_failed)
+        return !s_dbg_failed;
+    s_dbg_failed = 1;
+    vs = compile_fn(s_dbg_msl, @"dbg_vs", "nv2a_dbg_vs");
+    fs = compile_fn(s_dbg_msl, @"dbg_fs", "nv2a_dbg_fs");
+    if (!vs || !fs)
+        return 0;
+    for (k = 0; k < 2; k++) {
+        MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+        NSError *err = nil;
+        pd.vertexFunction = vs;
+        pd.fragmentFunction = fs;
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        /* Straight alpha: the mods' colours are 0xAARRGGBB as written. */
+        pd.colorAttachments[0].blendingEnabled = YES;
+        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        if (k) {
+            pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+            pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+        }
+        s_dbg_pso[k] = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        [pd release];
+        if (!s_dbg_pso[k]) {
+            fprintf(stderr, LOGP "debug draw pipeline failed (%s); no 3D debug drawing\n",
+                    err ? [[err localizedDescription] UTF8String] : "?");
+            if (s_dbg_pso[0]) {
+                [s_dbg_pso[0] release];
+                s_dbg_pso[0] = nil;
+            }
+            return 0;
+        }
+    }
+    for (k = 0; k < 3; k++) {
+        MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor alloc] init];
+        dd.depthCompareFunction = k < 2 ? MTLCompareFunctionLessEqual : MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = k == 0 ? YES : NO;
+        s_dbg_dss[k] = [s_dev newDepthStencilStateWithDescriptor:dd];
+        [dd release];
+        if (!s_dbg_dss[k]) {
+            fprintf(stderr, LOGP "debug draw depth state failed; no 3D debug drawing\n");
+            return 0;
+        }
+    }
+    s_dbg_failed = 0;
+    return 1;
+}
+
+static void dbg_present(RenderTarget *rt)
+{
+    const struct nv2a_dbg_list *l = nv2a_dbg_take();
+    const size_t stride = sizeof(struct nv2a_dbg_vtx);
+    uint32_t first[NV2A_DBG_SEGS], at = 0;
+    float xs;
+    int s, z;
+
+    if (!l || !l->total || !rt || !rt->tex || !dbg_init())
+        return;
+    for (s = 0; s < NV2A_DBG_SEGS; s++) {
+        first[s] = at;
+        at += l->n[s];
+    }
+    if ((size_t)at * stride > s_dbg_vb_cap) {
+        size_t c = s_dbg_vb_cap ? s_dbg_vb_cap : 65536;
+        while (c < (size_t)at * stride)
+            c *= 2;
+        [s_dbg_vb release];
+        s_dbg_vb = [s_dev newBufferWithLength:c options:MTLResourceStorageModeShared];
+        s_dbg_vb_cap = s_dbg_vb ? c : 0;
+        if (!s_dbg_vb)
+            return;
+    }
+    for (s = 0; s < NV2A_DBG_SEGS; s++)
+        if (l->n[s])
+            memcpy((uint8_t *)[s_dbg_vb contents] + (size_t)first[s] * stride, l->v[s],
+                   (size_t)l->n[s] * stride);
+    begin_pass(rt, 0, NULL, 0, 1.0f, 0);
+    if (!s_enc)
+        return;
+    z = s_enc_dt != NULL;
+    xs = nv2a_dbg_xscale(rt->w, rt->pad);
+    {
+        MTLViewport vp = {0.0, 0.0, (double)rt->hw, (double)rt->hh, 0.0, 1.0};
+        [s_enc setRenderPipelineState:s_dbg_pso[z]];
+        [s_enc setViewport:vp];
+        [s_enc setCullMode:MTLCullModeNone];
+        [s_enc setVertexBuffer:s_dbg_vb offset:0 atIndex:0];
+        [s_enc setVertexBytes:&xs length:sizeof xs atIndex:1];
+    }
+    for (s = 0; s < NV2A_DBG_SEGS; s++) {
+        int xray = s == NV2A_DBG_TRI_XRAY || s == NV2A_DBG_LINE_XRAY;
+        int line = s == NV2A_DBG_LINE || s == NV2A_DBG_LINE_XRAY;
+        if (!l->n[s] || (!xray && !z))
+            continue;
+        if (z)
+            [s_enc setDepthStencilState:s_dbg_dss[xray ? 2 : s == NV2A_DBG_TRI_OPAQUE ? 0 : 1]];
+        [s_enc drawPrimitives:line ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle
+                  vertexStart:first[s]
+                  vertexCount:l->n[s]];
+    }
+    end_encoder();
+}
+#endif /* XBOXRECOMP_ENHANCE */
+
 static void metal_flip(uint32_t surface_offset, uint32_t pitch)
 {
     RenderTarget *rt = NULL;
@@ -3461,6 +3608,9 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 hch = ch * rt->n;
                 s_shown_w = cw;
                 s_shown_h = ch;
+#ifdef XBOXRECOMP_ENHANCE
+                dbg_present(rt);
+#endif
             }
             win = rt && xbox_FramebufferWindowRunning();
             /* Layer mode: the frame goes to the window as a GPU copy into the

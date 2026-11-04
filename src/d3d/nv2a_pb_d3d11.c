@@ -52,6 +52,7 @@
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
 #ifdef XBOXRECOMP_ENHANCE
+#include "nv2a_dbg_draw.h"
 #include "nv2a_overlay.h"
 #include "nv2a_present_chain.h"
 #define LIBRA_RUNTIME_D3D11
@@ -259,6 +260,8 @@ typedef struct {
     uint32_t                fmt;        /* the SET_SURFACE_FORMAT word it was drawn with */
     struct nv2a_rt_own      own;        /* is the guest memory under it still its own */
     uint32_t                bar_flip[2]; /* hor+ band bars per third (nv2a_aspect_bar_mark) */
+    uint32_t                zeta;       /* the zeta offset of its last depth draw ... */
+    int                     has_zeta;   /* ... once it has had one (Metal's rt->dt) */
 } RenderTarget;
 
 typedef struct nv2a_stage Stage;
@@ -1163,6 +1166,8 @@ static void d3d11_on_zclear(uint32_t param)
     dt = depth_target(rt->w, rt->h);
     if (!dt)
         return;
+    rt->zeta = dt->zeta;
+    rt->has_zeta = 1;
     z = nv2a_zclear_depth(g->format, v->zclear);
     ID3D11DeviceContext_ClearDepthStencilView(s_ctx, dt->dsv,
         ((param & 1u) ? D3D11_CLEAR_DEPTH : 0u) | ((param & 2u) ? D3D11_CLEAR_STENCIL : 0u),
@@ -3777,6 +3782,8 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 dsv = dt->dsv;
                 dss = depth_state(v->depth_enable, use_s);
                 s_draws_z++;
+                rt->zeta = dt->zeta;
+                rt->has_zeta = 1;
             }
         }
         {
@@ -5211,6 +5218,186 @@ static void ovl_present(void)
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
     s_sc_init = 0;
 }
+
+/* ── The mods' 3D debug draw (nv2a_dbg_draw.h, mod API version 8) ─────────
+ *
+ * At the flip, into the target about to be presented and before the copy
+ * and the dumps, so a capture shows what the player sees. The vertices
+ * are clip space already (the mod's view and projection, applied on the
+ * CPU); the shader only narrows x to the guest's columns of a hor+
+ * target. Depth is the target's own depth buffer: the DepthTarget of the
+ * same guest size used last, which holds the frame's normalised z, the
+ * clip z / w the game's projection gives for its [0, zmax] viewport. */
+static const char s_dbg_vs_src[] =
+    "cbuffer X : register(b0) { float4 xs; };\n"
+    "struct VI { float4 p : POSITION; float4 c : COLOR0; };\n"
+    "struct VO { float4 p : SV_Position; float4 c : COLOR0; };\n"
+    "VO main(VI i) {\n"
+    "    VO o;\n"
+    "    o.p = float4(i.p.x * xs.x, i.p.yzw);\n"
+    "    o.c = i.c;\n"
+    "    return o;\n"
+    "}\n";
+static const char s_dbg_ps_src[] =
+    "struct VO { float4 p : SV_Position; float4 c : COLOR0; };\n"
+    "float4 main(VO i) : SV_Target { return i.c; }\n";
+
+static ID3D11VertexShader *s_dbg_vs;
+static ID3D11PixelShader  *s_dbg_ps;
+static ID3D11InputLayout  *s_dbg_il;
+static ID3D11BlendState   *s_dbg_bs;
+static ID3D11DepthStencilState *s_dbg_ds[2];    /* test and write, test only */
+static ID3D11Buffer       *s_dbg_vb, *s_dbg_cb;
+static UINT                s_dbg_vb_cap;
+static int                 s_dbg_failed;
+
+static int dbg_init(void)
+{
+    static const D3D11_INPUT_ELEMENT_DESC il[2] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    ID3DBlob *code = NULL;
+    D3D11_BLEND_DESC bd;
+    D3D11_DEPTH_STENCIL_DESC dd;
+    int k;
+
+    /* A partial failure leaves some objects made: s_dbg_failed, not
+     * s_dbg_ps, says whether the whole pipeline is there. */
+    if (s_dbg_ps || s_dbg_failed)
+        return !s_dbg_failed;
+    s_dbg_failed = 1;
+    if (!compile("nv2a_dbg_vs", s_dbg_vs_src, "vs_5_0", &code))
+        return 0;
+    ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                    ID3D10Blob_GetBufferSize(code), NULL, &s_dbg_vs);
+    ID3D11Device_CreateInputLayout(s_dev, il, 2, ID3D10Blob_GetBufferPointer(code),
+                                   ID3D10Blob_GetBufferSize(code), &s_dbg_il);
+    ID3D10Blob_Release(code);
+    if (!s_dbg_vs || !s_dbg_il || !compile("nv2a_dbg_ps", s_dbg_ps_src, "ps_5_0", &code))
+        return 0;
+    ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                   ID3D10Blob_GetBufferSize(code), NULL, &s_dbg_ps);
+    ID3D10Blob_Release(code);
+    /* Straight alpha: the mods' colours are 0xAARRGGBB as written. */
+    memset(&bd, 0, sizeof bd);
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ID3D11Device_CreateBlendState(s_dev, &bd, &s_dbg_bs);
+    for (k = 0; k < 2; k++) {
+        memset(&dd, 0, sizeof dd);
+        dd.DepthEnable = TRUE;
+        dd.DepthWriteMask = k == 0 ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+        dd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+        ID3D11Device_CreateDepthStencilState(s_dev, &dd, &s_dbg_ds[k]);
+    }
+    s_dbg_cb = make_buffer(16, D3D11_BIND_CONSTANT_BUFFER);
+    if (!s_dbg_ps || !s_dbg_bs || !s_dbg_ds[0] || !s_dbg_ds[1] || !s_dbg_cb) {
+        fprintf(stderr, LOGP "debug draw pipeline failed; no 3D debug drawing\n");
+        return 0;
+    }
+    s_dbg_failed = 0;
+    return 1;
+}
+
+/* The depth buffer rt's own last depth draw used (its zeta, as Metal's
+ * rt->dt), or NULL when it had none or that buffer was evicted since: the
+ * x-ray segments still draw, the others are skipped. Not the newest buffer of
+ * rt's size, which with many views a frame can be another view's. */
+static ID3D11DepthStencilView *dbg_depth(const RenderTarget *rt)
+{
+    int i;
+
+    if (!rt->has_zeta)
+        return NULL;
+    for (i = 0; i < DT_MAX; i++) {
+        const DepthTarget *d = &s_dt[i];
+        if (d->tex && d->zeta == rt->zeta && d->w == rt->w && d->h == rt->h
+            && d->hw == rt->hw && d->hh == rt->hh)
+            return d->dsv;
+    }
+    return NULL;
+}
+
+static void dbg_present(RenderTarget *rt)
+{
+    const struct nv2a_dbg_list *l = nv2a_dbg_take();
+    ID3D11DepthStencilView *dsv;
+    D3D11_VIEWPORT vp;
+    UINT stride = sizeof(struct nv2a_dbg_vtx), off = 0, cb_cap = 16;
+    float xs[4];
+    int s;
+    uint32_t first[NV2A_DBG_SEGS], at = 0;
+
+    if (!l || !l->total || !rt || !rt->rtv || !dbg_init())
+        return;
+    for (s = 0; s < NV2A_DBG_SEGS; s++) {
+        first[s] = at;
+        at += l->n[s];
+    }
+    /* One upload: the segments back to back, in draw order. */
+    if (at * stride > s_dbg_vb_cap) {
+        UINT c = s_dbg_vb_cap ? s_dbg_vb_cap : 65536;
+        while (c < at * stride)
+            c *= 2;
+        if (s_dbg_vb)
+            ID3D11Buffer_Release(s_dbg_vb);
+        s_dbg_vb = make_buffer(c, D3D11_BIND_VERTEX_BUFFER);
+        s_dbg_vb_cap = s_dbg_vb ? c : 0;
+        if (!s_dbg_vb)
+            return;
+    }
+    {
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_dbg_vb, 0,
+                                           D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            return;
+        for (s = 0; s < NV2A_DBG_SEGS; s++)
+            if (l->n[s])
+                memcpy((uint8_t *)m.pData + (size_t)first[s] * stride, l->v[s],
+                       (size_t)l->n[s] * stride);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_dbg_vb, 0);
+    }
+    xs[0] = nv2a_dbg_xscale(rt->w, rt->pad);
+    xs[1] = xs[2] = xs[3] = 0.0f;
+    if (!ovl_fill(&s_dbg_cb, &cb_cap, D3D11_BIND_CONSTANT_BUFFER, xs, sizeof xs))
+        return;
+    dsv = dbg_depth(rt);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, dsv);
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (float)rt->hw;
+    vp.Height = (float)rt->hh;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs[0][0]);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_dbg_bs, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_dbg_il);
+    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_dbg_vb, &stride, &off);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_dbg_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_dbg_cb);
+    ID3D11DeviceContext_GSSetShader(s_ctx, NULL, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_dbg_ps, NULL, 0);
+    for (s = 0; s < NV2A_DBG_SEGS; s++) {
+        int xray = s == NV2A_DBG_TRI_XRAY || s == NV2A_DBG_LINE_XRAY;
+        int line = s == NV2A_DBG_LINE || s == NV2A_DBG_LINE_XRAY;
+        if (!l->n[s] || (!xray && !dsv))
+            continue;
+        ID3D11DeviceContext_OMSetDepthStencilState(
+            s_ctx, xray ? s_ds_off : s_dbg_ds[s == NV2A_DBG_TRI_OPAQUE ? 0 : 1], 0);
+        ID3D11DeviceContext_IASetPrimitiveTopology(
+            s_ctx, line ? D3D11_PRIMITIVE_TOPOLOGY_LINELIST : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_Draw(s_ctx, l->n[s], first[s]);
+    }
+    s_sc_init = 0;
+}
 #endif /* XBOXRECOMP_ENHANCE */
 /* nv2a_pb_d3d11_back_pixel: a back-buffer pixel read at each flip before
  * Present, since FLIP_DISCARD leaves nothing to read after it. */
@@ -5280,6 +5467,9 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     /* The frame's target size, for a HUD canvas on "frame". */
     if (s_drawn)
         nv2a_aspect_frame_publish(s_drawn->w, s_drawn->h);
+#ifdef XBOXRECOMP_ENHANCE
+    dbg_present(s_drawn);
+#endif
     s_dump_rt = 0;
 #ifdef XBOXRECOMP_ENHANCE
     s_ovl_place.w = s_ovl_place.h = 0;     /* no frame: the whole back buffer */

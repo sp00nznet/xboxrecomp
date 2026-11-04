@@ -1112,7 +1112,7 @@ static void test_mod_api(void)
     const char *out;
     int id;
 
-    CHECK(XBOX_MOD_API_VERSION == 7u);
+    CHECK(XBOX_MOD_API_VERSION == 8u);
     out = start_with("[camera]\nfree = true\n", &k_fake, mods);
     CHECK(strstr(out, "[ENHANCE] actions hook=on (camera.free)\n") != NULL);
     CHECK(s_cam_armed == 1);

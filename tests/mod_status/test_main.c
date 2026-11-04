@@ -32,6 +32,7 @@
 #include "keyboard.h"
 #include "mod.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_dbg_draw.h"
 #include "nv2a_overlay.h"
 #include "nv2a_overlay_int.h"
 #include "nv2a_pb_state.h"
@@ -440,7 +441,7 @@ static void test_status(void)
     s = mod_index("second");
     CHECK(p == 0 && s == 1);
     CHECK(xbox_mod_state(p) == XBOX_MOD_ON && xbox_mod_state(s) == XBOX_MOD_ON);
-    CHECK(s_papi && s_papi->version == 7u && s_papi->glyph_name && s_papi->status);
+    CHECK(s_papi && s_papi->version == 8u && s_papi->glyph_name && s_papi->status);
     /* The one second's init set, kept once it started. */
     CHECK(!strcmp(panel(s), "Second\nline"));
 
@@ -774,6 +775,80 @@ static void test_v6(void)
     CHECK(!nv2a_overlay_layer_armed(NV2A_OVL_STATUS));
 }
 
+/* ---- 6. the 3D debug draw (version 8) ----------------------------------------- */
+
+static void test_draw3d(void)
+{
+    static const float k_id[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    const struct xbox_dbg_vtx tri[3] = {
+        { { 0, 0, 0.5f }, 0x80FF0000u }, { { 1, 0, 0.5f }, 0x80FF0000u },
+        { { 0, 1, 0.5f }, 0x80FF0000u } };
+    const struct xbox_dbg_vtx line[2] = { { { 0, 0, 0.5f }, 0xFF00FF00u },
+                                          { { 1, 1, 0.5f }, 0xFF00FF00u } };
+    const struct nv2a_dbg_list *l;
+    int p, s;
+
+    start_with(ARMED, k_mods);
+    nv2a_dbg_reset();
+    p = mod_index("probe");
+    s = mod_index("second");
+    CHECK(s_papi->draw3d_begin && s_papi->draw3d_tris && s_papi->draw3d_lines
+          && s_papi->draw3d_end);
+    /* Nothing drawn before the first frame ends. */
+    CHECK(nv2a_dbg_take() == NULL);
+    CHECK(s_papi->draw3d_tris(tri, 1, 0) == 0);
+    CHECK(s_papi->draw3d_end(&k_probe) == -1);
+
+    CHECK(s_papi->draw3d_begin(&k_probe, k_id, k_id) == 0);
+    /* One mod at a time; the same mod's second begin adds to its frame. */
+    CHECK(s_sapi->draw3d_begin(&k_second, k_id, k_id) == -1);
+    CHECK(s_papi->draw3d_begin(&k_probe, k_id, k_id) == 0);
+    CHECK(s_papi->draw3d_tris(tri, 1, XBOX_DBG_OPAQUE) == 1);
+    CHECK(s_papi->draw3d_lines(line, 1, XBOX_DBG_XRAY | XBOX_DBG_PULL) == 1);
+    CHECK(s_papi->draw3d_tris(tri, 1, 0x80u) == 0);
+    CHECK(s_sapi->draw3d_end(&k_second) == -1);
+    CHECK(s_papi->draw3d_end(&k_probe) == 0);
+    l = nv2a_dbg_take();
+    CHECK(l && l->total == 5 && l->n[NV2A_DBG_TRI_OPAQUE] == 3 && l->n[NV2A_DBG_LINE_XRAY] == 2);
+    /* Straight colour bytes: 0x80FF0000 is red at alpha 0x80. */
+    CHECK(l && l->v[NV2A_DBG_TRI_OPAQUE][0].rgba[0] == 0xFF
+          && l->v[NV2A_DBG_TRI_OPAQUE][0].rgba[3] == 0x80);
+    /* The frame stays until the next one. */
+    CHECK(nv2a_dbg_take() == l);
+
+    /* The other mod may draw once the frame is closed. */
+    CHECK(s_sapi->draw3d_begin(&k_second, k_id, k_id) == 0);
+    CHECK(s_sapi->draw3d_end(&k_second) == 0);
+    l = nv2a_dbg_take();
+    CHECK(l && l->total == 0);
+
+    /* The last drawer turned off: its drawing goes at once, and an off
+     * mod is refused. */
+    CHECK(s_papi->draw3d_begin(&k_probe, k_id, k_id) == 0);
+    CHECK(s_papi->draw3d_tris(tri, 1, 0) == 1);
+    CHECK(s_papi->draw3d_end(&k_probe) == 0);
+    CHECK(nv2a_dbg_take() != NULL);
+    CHECK(xbox_mod_set_enabled(p, 0) == XBOX_MOD_OFF);
+    CHECK(nv2a_dbg_take() == NULL);
+    CHECK(s_papi->draw3d_begin(&k_probe, k_id, k_id) == -1);
+    CHECK(xbox_mod_set_enabled(p, 1) == XBOX_MOD_ON);
+    /* Turned off with its frame open: the end does not bring it back. */
+    CHECK(s_papi->draw3d_begin(&k_probe, k_id, k_id) == 0);
+    CHECK(xbox_mod_set_enabled(p, 0) == XBOX_MOD_OFF);
+    CHECK(s_papi->draw3d_end(&k_probe) == -1);
+    CHECK(nv2a_dbg_take() == NULL);
+    CHECK(xbox_mod_set_enabled(p, 1) == XBOX_MOD_ON);
+    /* Turning off a mod that did not draw last leaves the drawing. */
+    CHECK(s_sapi->draw3d_begin(&k_second, k_id, k_id) == 0);
+    CHECK(s_sapi->draw3d_tris(tri, 1, 0) == 1);
+    CHECK(s_sapi->draw3d_end(&k_second) == 0);
+    CHECK(xbox_mod_set_enabled(p, 0) == XBOX_MOD_OFF);
+    CHECK(nv2a_dbg_take() != NULL);
+    CHECK(xbox_mod_set_enabled(p, 1) == XBOX_MOD_ON);
+    (void)s;
+    nv2a_dbg_reset();
+}
+
 int main(void)
 {
     MKDIR("config");
@@ -785,6 +860,7 @@ int main(void)
     test_glyphs();
     test_device();
     test_v6();
+    test_draw3d();
     xbox_mod_shutdown();
     printf("mod_status: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;

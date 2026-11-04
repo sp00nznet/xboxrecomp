@@ -1767,7 +1767,7 @@ The title's glue calls two entries:
 - `xbox_mod_input_captured()` from its pad read. While it returns true, the
   title must see a released pad.
 
-`struct xbox_mod_api` (version 7, `XBOX_MOD_API_VERSION`) holds:
+`struct xbox_mod_api` (version 8, `XBOX_MOD_API_VERSION`) holds:
 
 | Member | What it gives |
 | --- | --- |
@@ -1795,6 +1795,7 @@ The title's glue calls two entries:
 | `guest_alloc(mod, size, align)` | v6. A zeroed block of guest memory the title's heap never hands out ([Guest calls](#guest-calls-v6)). Same threads as `guest_call`. |
 | `glyph_name(mod, ref, out, cap, flags)` | v7. The binding of a source, an action or one of the mod's controls, named for the device in use ([Glyphs and the status panel](#glyphs-and-the-status-panel-v7)). Any thread. |
 | `status(mod, text)` | v7. The mod's status panel at the top left of the screen ([Glyphs and the status panel](#glyphs-and-the-status-panel-v7)). Any thread. |
+| `draw3d_begin(mod, view, proj)`, `draw3d_tris(v, n, flags)`, `draw3d_lines(v, n, flags)`, `draw3d_end(mod)` | v8. World-space triangles and lines drawn over the game's 3D frame ([3D debug draw](#3d-debug-draw-v8)). The guest's thread, once a frame. |
 
 `struct xbox_mod` gained two fields in v4, after `desc`:
 
@@ -1975,6 +1976,66 @@ flip tick, which runs only while that hook is armed: a feature key on
 panel shows, and `status` still stores the text for when one is armed.
 When the hook disarms, the toolkit hides the panels at once, so none
 stays on the screen.
+
+### 3D debug draw (v8)
+
+A mod can draw world-space triangles and lines over the frame, seen through
+the game's own camera: a collision mesh, a trigger volume, a path. Each
+frame, from `on_frame` or a hook on the guest's thread:
+
+```c
+if (api->draw3d_begin(&s_mod, view, proj) == 0) {
+    api->draw3d_tris(tris, n_tris, XBOX_DBG_OPAQUE);   /* 3 vertices each */
+    api->draw3d_lines(edges, n_edges, XBOX_DBG_PULL);  /* 2 vertices each */
+    api->draw3d_end(&s_mod);
+}
+```
+
+A vertex is `struct xbox_dbg_vtx`: a world position and a colour
+`0xAARRGGBB` with straight alpha. The flags:
+
+- `XBOX_DBG_XRAY`: no depth test, so it shows through walls.
+- `XBOX_DBG_OPAQUE`: triangles write depth, so later lines and blended
+  faces behind them hide. Alpha still blends.
+- `XBOX_DBG_PULL`: each vertex moves 0.2% of its distance toward the eye,
+  so an edge drawn on its own face wins the depth test.
+
+**Where the matrices come from.** The toolkit does not know the game's
+camera: the mod passes it. `view` and `proj` are 16 floats each,
+row-major, in the row-vector D3D convention the Xbox titles use
+(`clip = [x y z 1] . view . proj`, clip z in [0, w]). A title keeps them
+in its own memory: the mod reads them there, usually right after the
+function that builds them, from a hook or the title's wrapper of that
+function. The backends store depth as z / zmax,
+which matches the projection's z for the usual viewport (z scale zmax, no
+offset), so the overlay tests against the game's own depth buffer.
+
+**When it is drawn.** At the flip, into the frame being presented, after
+all the game's draws and before the dumps and the copy to the window. So
+it sits over the game's HUD too, and a frame dump with the mod on shows
+it. The drawing goes into the guest's own colour target, not into a copy
+made for presentation, and opaque triangles also write the guest's depth
+buffer. A title that does not clear that target before its next frame, or
+that samples or reads back the last frame (a pause backdrop, a motion
+blur, a screenshot), can capture the overlay in what it draws next. The order is opaque triangles, depth-tested lines,
+blended triangles, then the x-ray parts. Hor+ is accounted for: the
+guest's 0..w lands in the middle of the wide target.
+
+**Which frame.** The list drawn is the last one `draw3d_end` published.
+It stays on the screen until the next one, so a mod that draws every
+other frame does not flicker, and an empty frame (`begin` then `end`)
+clears it. A mod that is turned off is cleared at once. The camera the
+mod read can be one frame older than the frame on the screen, which shows
+only while the camera moves fast.
+
+**Rules.** One mod draws a frame: `draw3d_begin` returns -1 while another
+mod's frame is open or when the mod is not on, and 0 otherwise (when the
+mod's own frame is already open, the calls add to it). `draw3d_tris` and
+`draw3d_lines` return the primitives they added. A list holds at most 2^20
+vertices; what goes past is dropped and counted. With no mod drawing,
+the flip's cost is one atomic load. D3D11 and Metal draw it; the CPU
+rasteriser does not. Without a depth buffer for the frame (D3D11 before
+the game draws with one), only the x-ray parts show.
 
 ### HUD table (v5)
 
@@ -2453,7 +2514,7 @@ Schema 1. Fields are only added; one removed or changed in meaning bumps
 `schema`. A field that does not apply is left out.
 
 ```json
-{"schema": 1, "api": 7, "mods": [
+{"schema": 1, "api": 8, "mods": [
   {"id": "fly", "title": "Free camera", "descriptor": true, "init": "no", "enable": "fly.enabled",
    "settings": [
       {"name": "speed", "key": "mods.fly.speed", "kind": "float", "label": "Speed",

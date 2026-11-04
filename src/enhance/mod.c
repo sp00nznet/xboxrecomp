@@ -22,6 +22,7 @@
 #include "hud_anchor.h"
 #include "hud_capture.h"
 #ifdef XBOXRECOMP_ENHANCE
+#include "nv2a_dbg_draw.h"
 #include "nv2a_overlay.h"
 #endif
 #include "enhance_menu.h"
@@ -630,15 +631,26 @@ static void status_drop(int i)
  * switch from the mod's own thread either lands before the drop (and is
  * dropped) or sees the new state (and is refused). Never a card left
  * behind to come back on the next switch on. */
+static int s_dbg_last = -1;         /* atomic: the table index whose draw3d frame shows */
+
 static void state_store(int i, enum xbox_mod_state st)
 {
     status_lock();
-    __atomic_store_n(&s_state[i], st, __ATOMIC_RELAXED);
+    /* Sequentially consistent, as is the load of s_dbg_last below and its
+     * pair in api_draw3d_end (store s_dbg_last, load s_state): of a switch
+     * and an end that race, at least one sees the other's store, so either
+     * this hides the frame the end published or the end hides it itself.
+     * Weaker orders allow both loads to miss (a store buffer) and the
+     * drawing of a mod that is off stays on screen. */
+    __atomic_store_n(&s_state[i], st, __ATOMIC_SEQ_CST);
     if (st != XBOX_MOD_ON && s_status[i][0]) {
         s_status[i][0] = 0;
         __atomic_add_fetch(&s_status_serial, 1, __ATOMIC_RELEASE);
     }
     status_unlock();
+    /* Off or failed, a mod's 3D drawing goes with its panel. */
+    if (st != XBOX_MOD_ON && __atomic_load_n(&s_dbg_last, __ATOMIC_SEQ_CST) == i)
+        nv2a_dbg_hide();
 }
 
 static int api_status(const struct xbox_mod *m, const char *text)
@@ -667,6 +679,72 @@ static int api_status(const struct xbox_mod *m, const char *text)
     }
     status_unlock();
     return cut ? -1 : 0;
+}
+
+/* ---- the 3D debug draw (version 8) -------------------------------------
+ *
+ * A front over nv2a_dbg_draw: the kernel side keeps the lists and the
+ * backends draw them, this side only says which mod's frame is open and
+ * keeps a mod that is not ON from drawing. One producer, the guest thread,
+ * so the open frame needs no lock. */
+
+static int s_dbg_open = -1;         /* the table index whose frame is open */
+
+static int api_draw3d_begin(const struct xbox_mod *m, const float view[16], const float proj[16])
+{
+    int i = table_of(m);
+
+    if (i < 0 || !view || !proj || __atomic_load_n(&s_state[i], __ATOMIC_RELAXED) != XBOX_MOD_ON)
+        return -1;
+    /* A frame left open by a mod that was switched off before its end
+     * would lock every other mod out: it is dropped. */
+    if (s_dbg_open >= 0 && s_dbg_open != i
+        && __atomic_load_n(&s_state[s_dbg_open], __ATOMIC_RELAXED) != XBOX_MOD_ON) {
+        nv2a_dbg_cancel();
+        s_dbg_open = -1;
+    }
+    if (s_dbg_open >= 0)
+        return s_dbg_open == i ? 0 : -1;
+    if (!nv2a_dbg_begin(view, proj))
+        return -1;
+    s_dbg_open = i;
+    return 0;
+}
+
+/* The two layouts match (three floats, then the colour), so the vertices
+ * go to the kernel side as they are. */
+_Static_assert(sizeof(struct xbox_dbg_vtx) == 16, "xbox_dbg_vtx is 16 bytes");
+_Static_assert(XBOX_DBG_XRAY == NV2A_DBG_XRAY && XBOX_DBG_OPAQUE == NV2A_DBG_OPAQUE
+                   && XBOX_DBG_PULL == NV2A_DBG_PULL,
+               "draw3d flags match nv2a_dbg_draw's");
+
+static int api_draw3d_tris(const struct xbox_dbg_vtx *v, uint32_t n_tris, uint32_t flags)
+{
+    return s_dbg_open < 0 ? 0 : nv2a_dbg_add(0, v, sizeof *v, n_tris, flags);
+}
+
+static int api_draw3d_lines(const struct xbox_dbg_vtx *v, uint32_t n_lines, uint32_t flags)
+{
+    return s_dbg_open < 0 ? 0 : nv2a_dbg_add(1, v, sizeof *v, n_lines, flags);
+}
+
+static int api_draw3d_end(const struct xbox_mod *m)
+{
+    int i = table_of(m);
+
+    if (i < 0 || i != s_dbg_open)
+        return -1;
+    s_dbg_open = -1;
+    nv2a_dbg_publish();
+    __atomic_store_n(&s_dbg_last, i, __ATOMIC_SEQ_CST);
+    /* Turned off between begin and end: the publish above must not bring
+     * the drawing back (state_store may have hidden it before it). Both
+     * sides are SEQ_CST: see state_store. */
+    if (__atomic_load_n(&s_state[i], __ATOMIC_SEQ_CST) != XBOX_MOD_ON) {
+        nv2a_dbg_hide();
+        return -1;
+    }
+    return 0;
 }
 
 void xbox_mod_status_text(int i, char *out, size_t cap)
@@ -1822,6 +1900,10 @@ static int mod_init(int describe)
     s_api.guest_alloc = api_guest_alloc;
     s_api.glyph_name = api_glyph_name;
     s_api.status = api_status;
+    s_api.draw3d_begin = api_draw3d_begin;
+    s_api.draw3d_tris = api_draw3d_tris;
+    s_api.draw3d_lines = api_draw3d_lines;
+    s_api.draw3d_end = api_draw3d_end;
     hud_layer_set_mem(&s_api.mem);
     s_menu_on = enhance_cfg_bool("menu.enabled", 0);
 

@@ -56,9 +56,21 @@
 extern "C" {
 #endif
 
-#define XBOX_MOD_API_VERSION 7u
+#define XBOX_MOD_API_VERSION 8u
 
 struct xbox_mod_api;
+
+/* draw3d's vertex: a world-space point and its colour, 0xAARRGGBB
+ * (straight alpha). */
+struct xbox_dbg_vtx {
+    float p[3];
+    uint32_t argb;
+};
+
+/* draw3d_tris and draw3d_lines flags. */
+#define XBOX_DBG_XRAY   0x1u    /* no depth test: seen through walls, drawn last */
+#define XBOX_DBG_OPAQUE 0x2u    /* triangles: also write depth, so they hide what is behind */
+#define XBOX_DBG_PULL   0x4u    /* nudged toward the eye, so edges on a face are not lost */
 
 /* The HUD layer's kinds (api->hud_table's groups, hud_anchor.h). */
 enum {
@@ -434,6 +446,44 @@ struct xbox_mod_api {
      * dropped when m is turned off or fails. Any thread; the text is
      * copied. Returns 0, or -1 when it was cut to fit (what fits is set). */
     int (*status)(const struct xbox_mod *m, const char *text);
+
+    /* Version 8: the 3D debug draw (nv2a_dbg_draw.h). World-space
+     * triangles and lines with a colour each, drawn at the flip into the
+     * frame being presented, after everything the game drew, through the
+     * view and projection given to draw3d_begin. Depth-tested against the
+     * game's depth buffer unless XBOX_DBG_XRAY; always alpha-blended.
+     *
+     * The matrices come from the mod, not from the toolkit: the NV2A sees
+     * only composite matrices or a game's own vertex program, so there is
+     * no game-agnostic "the view" to recover. A mod reads the title's
+     * camera (a title often keeps view and projection in guest memory)
+     * and passes them as 16 floats, row-major, row-vector D3D (clip = [x y z 1]
+     * . view . proj, clip z in [0, w]). The depth test compares that clip
+     * z / w with the frame's stored z / zmax, so it holds for a title
+     * whose viewport maps z to [0, zmax].
+     *
+     * The drawing goes into the guest's own colour target, the one being
+     * presented (and, for opaque faces, into its depth buffer), not into a
+     * copy made for presentation. A title that does not clear that target
+     * before its next frame, or that samples or reads back the last frame
+     * (a pause backdrop, a motion blur, a screenshot), can capture the
+     * drawing in what it draws next. It is a debug view: keep that in
+     * mind before using it while such an effect is on screen.
+     *
+     * One frame: draw3d_begin, any number of draw3d_tris and draw3d_lines,
+     * draw3d_end. Each flip draws the last ended frame, so a mod that
+     * stops calling leaves its drawing on screen; an empty frame (begin,
+     * end) clears it, and so does turning the mod off. One mod draws at a
+     * time: begin while another mod's frame is open is refused. Call from
+     * one thread, the guest's (an on_frame or a hook); the vertices are
+     * copied, and taken to clip space, at the call. Draws nothing on the
+     * CPU rasteriser. Returns: begin and end 0, or -1 (refused, not ON);
+     * tris and lines the primitives taken (n_tris, n_lines, or fewer past
+     * the list's limit), 0 outside a frame or for unknown flags. */
+    int (*draw3d_begin)(const struct xbox_mod *m, const float view[16], const float proj[16]);
+    int (*draw3d_tris)(const struct xbox_dbg_vtx *v, uint32_t n_tris, uint32_t flags);
+    int (*draw3d_lines)(const struct xbox_dbg_vtx *v, uint32_t n_lines, uint32_t flags);
+    int (*draw3d_end)(const struct xbox_mod *m);
 };
 
 /* glyph_name's flags: one of the two. */
