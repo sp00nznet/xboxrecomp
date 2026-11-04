@@ -16,6 +16,7 @@
 
 #include "kernel.h"
 #include "guest_time.h"
+#include "kernel_guest_unwind.h"
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -258,6 +259,7 @@ static DWORD sync_wait_one(HANDLE h, DWORD ms, BOOL alertable, uint64_t due)
         if (xbox_GuestSchedOn())
             xbox_GuestCpuBlocked();
         while (!xbox_GuestTimeReached(due)) {
+            xbox_GuestUnwindPoint(XBOX_UNWIND_WAIT, 2);
             r = WaitForSingleObjectEx(h, 1, alertable);
             if (r != WAIT_TIMEOUT)
                 return r;
@@ -270,7 +272,8 @@ static DWORD sync_wait_one(HANDLE h, DWORD ms, BOOL alertable, uint64_t due)
             return r;
         xbox_GuestCpuBlocked();
     }
-    return WaitForSingleObjectEx(h, ms, alertable);
+    /* Also ends on a reset, which unwinds the thread from here. */
+    return xbox_GuestUnwindWait(1, &h, FALSE, ms, alertable);
 }
 
 static DWORD sync_wait_many(DWORD n, const HANDLE *h, BOOL all, DWORD ms,
@@ -285,6 +288,7 @@ static DWORD sync_wait_many(DWORD n, const HANDLE *h, BOOL all, DWORD ms,
         if (xbox_GuestSchedOn())
             xbox_GuestCpuBlocked();
         while (!xbox_GuestTimeReached(due)) {
+            xbox_GuestUnwindPoint(XBOX_UNWIND_WAIT, 2);
             r = WaitForMultipleObjectsEx(n, h, all, 1, alertable);
             if (r != WAIT_TIMEOUT)
                 return r;
@@ -297,7 +301,7 @@ static DWORD sync_wait_many(DWORD n, const HANDLE *h, BOOL all, DWORD ms,
             return r;
         xbox_GuestCpuBlocked();
     }
-    return WaitForMultipleObjectsEx(n, h, all, ms, alertable);
+    return xbox_GuestUnwindWait(n, h, all, ms, alertable);
 }
 
 NTSTATUS __stdcall xbox_NtWaitForSingleObject(

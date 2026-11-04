@@ -243,4 +243,83 @@ section 2 misses: outside the deterministic mode, a worker that ends in
 `PsTerminateSystemThread` calls `ExitThread` without
 `xbox_GuestCpuPart`, so the guest CPU scheduler never forgets its record
 (`sched_forget`). The reset's thread count must not rely on Part alone;
-the probe parts its own slot there.
+the probe parts its own slot there. The guest unwind closes the gap: that
+exit now calls `xbox_GuestCpuPart` on every path.
+
+## The guest unwind
+
+src/kernel/kernel_guest_unwind.c brings every guest thread back out of
+guest code when a reset asks. It is inert until `xbox_GuestUnwindEnable`:
+no thread is tracked, and each unwind point is one load of
+`g_xbox_reset_pending` and a branch.
+
+- **The jump.** `bridge_thread_main` runs the worker's guest code under
+  `xbox_GuestUnwindCallIn`, which keeps a `jmp_buf` (`setjmp` on Windows,
+  `_setjmp` on POSIX). A nested call-in (an inline worker, a callback) runs
+  plainly, so the thread always goes back to its outermost one. Lifted
+  frames own no host resources, so the `longjmp` leaks nothing. The call-in
+  puts back the IRQL, the IRQL holder count and the one-CPU gate depth as
+  they were when it was entered.
+- **The points.**
+  - `xbox_GuestCpuPreempt`, ahead of its early returns. The request keeps
+    the preempt flag and the waiter count up, so every back edge calls in.
+  - `xbox_SpinWait` and `xbox_SpinWaitKick`.
+  - The guest CPU lock: its entry, its queue (`sched_take` unlinks the
+    waiter), and after the grant.
+  - The entry and exit of `kernel_thunk_dispatch`.
+  - The blocking waits: `sync_wait_one`, `sync_wait_many` and the delay
+    also wait on the thread's unwind event. On Windows the event is added to
+    the wait. A wait-all or a 64-handle wait polls the flag in 20 ms slices
+    instead. On POSIX the shim's `w32_wait_abortable` registers the event.
+    The virtual-time slices check the flag on every pass.
+  - A contended guest critical section, once it is taken.
+  - The deterministic ring's turn and its block loop.
+- **What the thread lets go of.**
+  - Before the jump, the guest critical sections it owns, every recursion.
+    The single-lock mode included. Their waiters wake.
+  - A guest mutant it owns stays owned (abandoned). Its waiters wake on
+    their own unwind events.
+  - The guest CPU: the exit path parts it. A boot loop that parks drops it
+    with `xbox_GuestCpuUnwindDrop` and takes it back after the resume.
+  - Its registry slot (`xbox_GuestUnwindPart`) is freed last, after the
+    thread object's end is written. A reset that waits for the thread can
+    then clear guest memory safely.
+- **Held regions.** An ISR or a DPC drain that runs on a guest thread
+  borrows the worker stack. `xbox_GuestUnwindHold` counts the region, and a
+  point inside it refuses: it logs `[RESET] unwind refused` and returns.
+  The first point after the region unwinds.
+- **Host threads.** The DPC, ISR, OHCI and APU call-ins wrap their guest
+  call in `xbox_GuestUnwindHostBegin` and `xbox_GuestUnwindHostEnd`. A
+  call-in that starts while a reset is pending skips the guest code. One
+  that is already running is counted, and the reset waits for it to end.
+  With the unwind off the begin is one load and a branch, and nothing is
+  counted.
+- **The join race.** `xbox_GuestUnwindSpawnBegin` counts a thread before
+  its `CreateThread`, so the reset waits for it. When the thread joins with
+  the flag up, its call-in runs no guest code.
+- **The request.** `xbox_GuestUnwindRequest` raises the flag and sets every
+  tracked thread's event. It returns 1 when it raised the flag. It returns
+  0, raising nothing, when the unwind is off or an untracked thread lives.
+  `xbox_GuestUnwindWaitStopped` returns once each tracked thread has parted
+  or parked, no untracked thread lives and no host call-in is running. On a
+  timeout it lists the tids still running and the counts. `xbox_GuestUnwindResume` drops the flag.
+- **Limits.**
+  - The title's main thread has no call-in until the boot loop owns it.
+    Until then its points return.
+  - A thread from `xbox_PsCreateSystemThreadEx` has no call-in. A request
+    with such a thread live logs it and aborts. No current title has one
+    (section 2).
+  - The registry holds 64 threads. A 65th, or one whose unwind event
+    cannot be made, is logged and counted as untracked. A request refuses
+    while any untracked thread lives, because nothing could stop it.
+- **Lock records.** A thread that ends holding a guest critical section
+  clears its owner records at its part. The host reuses thread ids, and a
+  later thread with the same id would otherwise let go of a lock it never
+  took.
+- **Stats.** `xbox_GuestUnwindStatsGet` gives the unwinds per point kind,
+  the refusals, the critical-section recursions let go, the untracked
+  threads and the host call-ins running.
+- **Test.** The `guest_unwind` ctest covers every point kind (the kernel
+  wait on one object, any of two and all of two), the lock off and on, the
+  hold, a thread at DISPATCH under the one-CPU gate, the join race, the
+  park, the deterministic ring, the registry limit and the host call-ins.

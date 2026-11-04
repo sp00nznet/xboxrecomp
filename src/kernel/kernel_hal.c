@@ -18,6 +18,7 @@
 #include "recomp_regs.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include "guest_time.h"
+#include "kernel_guest_unwind.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -512,13 +513,18 @@ static void irq_note_wait(int line, uint64_t posted_ns)
 static void dpc_run_here(void)
 {
     RecompRegs saved;
+    int host;
 
     if (!xbox_DpcPending() || !t_guest_thread || t_in_dpc || t_in_isr)
         return;
     if (!xbox_DpcOnRaise())
         return;
+    host = xbox_GuestUnwindHostBegin();
+    if (!host)
+        return;
     recomp_regs_save(&saved);
     t_in_dpc = 1;
+    xbox_GuestUnwindHold(1);            /* the registers come back below */
     /* The routines run without the guest CPU (RECOMP_GUEST_LOCK), as on the
      * timer thread: a DPC never takes it. This drain runs under the gate,
      * and taking the CPU here would wait on a holder spinning in a loop
@@ -527,8 +533,10 @@ static void dpc_run_here(void)
      * what a DPC's body is atomic against; passive code on another thread
      * may see its intermediate state, as it may on the timer thread. */
     xbox_DpcDrainHere();
+    xbox_GuestUnwindHold(-1);
     t_in_dpc = 0;
     recomp_regs_restore(&saved);
+    xbox_GuestUnwindHostEnd(host);
 }
 
 /* Run one posted line here, on the holder. 0 when no worker stack was free
@@ -537,12 +545,17 @@ static int irq_run_line(int line)
 {
     void (*run)(void) = s_irq_run[line];
     RecompRegs saved;
-    int slot, irql;
+    int slot, irql, host;
 
     if (!run)
         return 1;                       /* nothing to run it with: dropped */
+    /* The guest is being thrown away (kernel_guest_unwind.c). */
+    host = xbox_GuestUnwindHostBegin();
+    if (!host)
+        return 1;
     slot = xbox_worker_stack_alloc();
     if (slot < 0) {
+        xbox_GuestUnwindHostEnd(host);
         static volatile LONG said;
         if (!InterlockedExchange(&said, 1)) {
             fprintf(stderr, "  [IRQ] no worker stack for the %s interrupt on "
@@ -557,12 +570,16 @@ static int irq_run_line(int line)
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
     t_in_isr = 1;
     irql = xbox_IrqlEnterInterrupt(16);
+    /* The worker stack is the routine's: no unwind out of it. */
+    xbox_GuestUnwindHold(1);
     run();
+    xbox_GuestUnwindHold(-1);
     xbox_IrqlLeaveInterrupt(irql);
     t_in_isr = 0;
     recomp_regs_restore(&saved);
     xbox_worker_stack_free(slot);
     InterlockedIncrement(&s_irq.on_holder[line]);
+    xbox_GuestUnwindHostEnd(host);
     return 1;
 }
 
@@ -931,6 +948,42 @@ int xbox_IrqlThisThreadBlocksDpcs(void)
 int xbox_IrqlCurrent(void)
 {
     return (int)g_current_irql;
+}
+
+/* A guest unwind (kernel_guest_unwind.c) jumps past every lower and gate
+ * leave between its point and the call-in: whatever the thread raised or
+ * entered since the mark is let go here, so the count of raised threads
+ * and the gate are as if each lower had run. A posted interrupt the leaves
+ * skip waits for the next holder's release point, as one posted while the
+ * gate is free does. */
+void xbox_IrqlUnwindMark(XboxIrqlMark *m)
+{
+    m->irql = (int)g_current_irql;
+    m->gate_depth = t_gate_depth;
+    m->gate_held = t_dispatch_gate_held;
+    m->counted = t_irql_counted;
+    m->in_isr = t_in_isr;
+    m->in_dpc = t_in_dpc;
+}
+
+void xbox_IrqlUnwindRestore(const XboxIrqlMark *m)
+{
+    if (t_irql_counted && !m->counted) {
+        t_irql_counted = 0;
+        InterlockedDecrement(&g_irql_raised_count);
+        irql_holder_drop();
+    }
+    t_dispatch_gate_held = m->gate_held;
+    while (t_gate_depth > m->gate_depth)
+        gate_leave_raw();
+    t_in_isr = m->in_isr;
+    t_in_dpc = m->in_dpc;
+    t_release_due = 0;
+    /* The KPCR byte only when the jump skipped a lower. */
+    if (g_current_irql != (KIRQL)m->irql) {
+        g_current_irql = (KIRQL)m->irql;
+        irql_publish();
+    }
 }
 
 /*

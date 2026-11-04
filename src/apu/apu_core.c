@@ -29,6 +29,7 @@
 #include "../kernel/kernel_prof.h"          /* RECOMP_TRACE=dpc: ISR, se_frame */
 #include "apu_lockstat.h"                    /* RECOMP_TRACE=apu_lock */
 #include "../kernel/guest_det_device.h"      /* RECOMP_DEBUG=deterministic */
+#include "../kernel/kernel_guest_unwind.h"
 
 /* ============================================================
  * Globals
@@ -315,15 +316,19 @@ static int apu_call_isr(void)
 {
     uint32_t kint, routine, context;
     apu_guest_fn fn;
+    int host;
 
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
-        return -1;
+        return -1;                      /* nothing connected */
     routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
     context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
     fn = routine ? recomp_lookup(routine) : NULL;
     if (!fn)
         return -1;
+    host = xbox_GuestUnwindHostBegin();
+    if (!host)
+        return -1;                      /* a reset is taking the guest down */
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
@@ -337,6 +342,7 @@ static int apu_call_isr(void)
     } else {
         int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql);
     }
+    xbox_GuestUnwindHostEnd(host);
     {
         static unsigned n;
         if (n++ < 3) {

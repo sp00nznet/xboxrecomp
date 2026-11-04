@@ -37,6 +37,7 @@
 #include "guest_time.h"
 #include "recomp_env.h"
 #include "guest_state_hash.h"
+#include "kernel_guest_unwind.h"
 #include "xbox_memory_layout.h"
 #include "recomp_regs.h"
 #include "platform/host_time.h"
@@ -630,15 +631,33 @@ static void watchdog_line(void)
     slots_line();
 }
 
-/* Lock held: wait until the token is this thread's. */
+/* Lock held: wait until the token is this thread's. A reset unwinds a
+ * waiting thread from here, out of the lock (kernel_guest_unwind.c); its
+ * part marks the slot dead, and the token was never its own. */
 static void wait_turn(void)
 {
     int waited = 0;
 
-    while (s_turn != t_slot)
+    while (s_turn != t_slot) {
+        if (xbox_GuestUnwindArmed()) {
+            LeaveCriticalSection(&s_lock);
+            xbox_GuestUnwindSlow(XBOX_UNWIND_DET, (uint32_t)t_slot);
+            EnterCriticalSection(&s_lock);
+            continue;
+        }
         if (!SleepConditionVariableCS(&s_cv, &s_lock, 1000)
             && ++waited % 10 == 0)
             watchdog_line();
+    }
+}
+
+void xbox_GuestDetUnwindWake(void)
+{
+    if (s_on != 1)
+        return;
+    EnterCriticalSection(&s_lock);
+    WakeAllConditionVariable(&s_cv);
+    LeaveCriticalSection(&s_lock);
 }
 
 /* Lock held: hand the token on. */
@@ -1155,6 +1174,7 @@ static int det_block(XboxDetCheck check, void *ctx, uint64_t due,
     for (;;) {
         int suspended;
 
+        xbox_GuestUnwindPoint(XBOX_UNWIND_DET, site);
         EnterCriticalSection(&s_lock);
         suspended = s_slot[t_slot].suspend > 0;
         LeaveCriticalSection(&s_lock);

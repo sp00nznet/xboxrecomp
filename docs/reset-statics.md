@@ -569,6 +569,7 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/kernel_rtl.c | - | g_cs_single | file_static | reset | kernel | single recursive lock an exiting thread may hold; replace |
 | src/kernel/kernel_rtl.c | - | g_cs_single_once | once | reset | kernel | rerun: new single lock replaces an abandoned one |
 | src/kernel/kernel_rtl.c | - | g_cs_single_mode | file_static | keep | - | CS mode from env |
+| src/kernel/kernel_rtl.c | - | t_cs_single_depth | tls | reset | kernel | this thread's recursions on the single lock; the guest unwind lets them go and zeroes it |
 | src/kernel/kernel_rtl.c | - | g_cs_contention_reports | file_static | keep | - | CS statistics |
 | src/kernel/kernel_rtl.c | - | g_cs_enters | file_static | keep | - | CS statistics |
 | src/kernel/kernel_rtl.c | - | g_cs_leaves | file_static | keep | - | CS statistics |
@@ -902,6 +903,32 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/kernel_reset_probe.c | - | s_thread_up | file_static | keep | - | debug stop probe (RECOMP_DEBUG=reset_probe) |
 | src/kernel/kernel_reset_probe.c | - | s_tracking | file_static | keep | - | debug stop probe (RECOMP_DEBUG=reset_probe) |
 | src/kernel/kernel_reset_probe.c | - | t_slot | tls | keep | - | debug stop probe (RECOMP_DEBUG=reset_probe) |
+
+### src/kernel/kernel_guest_unwind.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/kernel/kernel_guest_unwind.c | - | g_xbox_reset_pending | global | keep | - | guest unwind: the reset's own flag: up from the request to the resume |
+| src/kernel/kernel_guest_unwind.c | - | s_once | once | keep | - | guest unwind: no rerun: the registry lock and condition, made once |
+| src/kernel/kernel_guest_unwind.c | - | s_lock | file_static | keep | - | guest unwind: registry lock; never held at a stop point |
+| src/kernel/kernel_guest_unwind.c | - | s_cv | file_static | keep | - | guest unwind: registry condition |
+| src/kernel/kernel_guest_unwind.c | - | g_xbox_unwind_on | global | keep | - | guest unwind: the unwind is on (the boot loop, a ctest) |
+| src/kernel/kernel_guest_unwind.c | - | s_slot | file_static | keep | - | guest unwind: tracked threads; each emptied as its thread parts, the events kept for reuse |
+| src/kernel/kernel_guest_unwind.c | - | s_live | file_static | keep | - | guest unwind: tracked thread count; back to the parked boot loop by the reset itself |
+| src/kernel/kernel_guest_unwind.c | - | s_starting | file_static | keep | - | guest unwind: threads counted by a creator, not joined yet |
+| src/kernel/kernel_guest_unwind.c | - | s_parked | file_static | keep | - | guest unwind: threads waiting at a boot loop |
+| src/kernel/kernel_guest_unwind.c | - | s_unwound | file_static | keep | - | guest unwind: stats totals since boot |
+| src/kernel/kernel_guest_unwind.c | - | s_refused | file_static | keep | - | guest unwind: stats totals since boot |
+| src/kernel/kernel_guest_unwind.c | - | s_cs_released | file_static | keep | - | guest unwind: stats totals since boot |
+| src/kernel/kernel_guest_unwind.c | - | s_full_said | file_static | keep | - | guest unwind: log-once guard |
+| src/kernel/kernel_guest_unwind.c | - | s_untracked | file_static | keep | - | guest unwind: live threads the registry could not take; a request refuses while it is not zero |
+| src/kernel/kernel_guest_unwind.c | - | s_host_calls | file_static | keep | - | guest unwind: host call-ins running guest code; zero when no call-in runs |
+| src/kernel/kernel_guest_unwind.c | - | s_foreign | file_static | keep | - | guest unwind: live threads with no call-in; zero whenever a reset may run |
+| src/kernel/kernel_guest_unwind.c | - | t_slot1 | tls | keep | - | guest unwind: the thread's registry slot; cleared at its part |
+| src/kernel/kernel_guest_unwind.c | - | t_ev | tls | keep | - | guest unwind: the thread's unwind event; cleared at its part |
+| src/kernel/kernel_guest_unwind.c | - | t_target | tls | keep | - | guest unwind: the outermost call-in's jmp_buf; cleared by the jump and the part |
+| src/kernel/kernel_guest_unwind.c | - | t_hold | tls | keep | - | guest unwind: held host regions; cleared at the part |
+| src/kernel/kernel_guest_unwind.c | - | t_untracked | tls | keep | - | guest unwind: the thread is counted as untracked; its part takes it off |
 
 ## Host-half inits that write guest memory
 

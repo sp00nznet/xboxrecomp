@@ -164,6 +164,11 @@ DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable);
 DWORD WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL waitAll, DWORD ms);
 DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                                DWORD ms, BOOL alertable);
+/* The wait above that also ends, returning WAIT_OBJECT_0 + count, once the
+ * event abort_ev is set: the guest unwind's wake (kernel_guest_unwind.c),
+ * for WaitAll too. Not Win32: there the event joins a WaitAny. */
+DWORD w32_wait_abortable(HANDLE abort_ev, DWORD count, const HANDLE *handles,
+                         BOOL waitAll, DWORD ms, BOOL alertable);
 
 /* ---- Threads ---------------------------------------------------------- */
 HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,

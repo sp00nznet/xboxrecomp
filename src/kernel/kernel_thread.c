@@ -16,6 +16,7 @@
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
 #include "recomp_env.h"           /* RECOMP_GUEST_CPUS, guest_priority */
 #include "platform/host_time.h"   /* xbox_HostUnderWine */
+#include "kernel_guest_unwind.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,7 +47,11 @@ static DWORD WINAPI xbox_thread_wrapper(LPVOID lpParameter)
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "Thread %u starting at %p",
         GetCurrentThreadId(), info.StartRoutine);
 
+    /* No call-in here: this creator is the native thunk table's, which no
+     * current title reaches, so a reset refuses to run past such a thread. */
+    xbox_GuestUnwindForeign(1);
     info.StartRoutine(info.StartContext);
+    xbox_GuestUnwindForeign(-1);
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "Thread %u returned normally",
         GetCurrentThreadId());
@@ -210,6 +215,7 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
                    ? STATUS_ALERTED : STATUS_SUCCESS;
         xbox_GuestCpuBlocked();
         while (!xbox_GuestTimeReached(due)) {
+            xbox_GuestUnwindPoint(XBOX_UNWIND_DELAY, 1);
             if (Alertable) {
                 if (SleepEx(1, TRUE) == WAIT_IO_COMPLETION)
                     return STATUS_ALERTED;
@@ -242,11 +248,11 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
     if (ms)
         xbox_GuestCpuBlocked();
     if (Alertable) {
-        DWORD result = SleepEx(ms, TRUE);
+        DWORD result = xbox_GuestUnwindSleep(ms, TRUE);
         if (result == WAIT_IO_COMPLETION)
             return STATUS_ALERTED;
     } else {
-        Sleep(ms);
+        xbox_GuestUnwindSleep(ms, FALSE);
     }
 
     return STATUS_SUCCESS;

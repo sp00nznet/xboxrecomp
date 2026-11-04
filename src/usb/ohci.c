@@ -13,6 +13,7 @@
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
 #include "../kernel/guest_time.h"   /* the virtual clock's ms (deterministic) */
+#include "../kernel/kernel_guest_unwind.h"
 #include "usb_gamepad.h"
 
 #include <stdio.h>
@@ -1077,6 +1078,7 @@ static int ohci_isr_call(int index)
     uint32_t routine, context;
     recomp_func_t fn;
     uint8_t *mem;
+    int host;
 
     if (!kinterrupt)
         return -1;                      /* nothing connected yet            */
@@ -1095,6 +1097,10 @@ static int ohci_isr_call(int index)
         return -1;
     }
 
+    host = xbox_GuestUnwindHostBegin();
+    if (!host)
+        return -1;                      /* a reset is taking the guest down */
+
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = context;      /* arg 2 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
@@ -1109,6 +1115,7 @@ static int ohci_isr_call(int index)
     } else {
         int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql);
     }
+    xbox_GuestUnwindHostEnd(host);
     return (int)(g_eax & 1u);
 }
 

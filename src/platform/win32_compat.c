@@ -272,6 +272,9 @@ typedef struct w32_object {
     int             manual_reset;
     unsigned        set_gen;        /* SetEvent/PulseEvent count */
     int             release_on_set; /* see w32_event_release_on_set */
+    /* An abort event of w32_wait_abortable: the object its thread waits on
+     * now (a reference held), whose waiters a set must wake. */
+    struct w32_object *abort_wait;
 
     /* semaphore */
     long            sem_count;
@@ -645,11 +648,21 @@ static int waitable_due(w32_object *o)
     return 1;
 }
 
+/* w32_wait_abortable's: the abort event is set. Read without its lock;
+ * the set wakes the waiter through the waited object's lock (SetEvent). */
+static int abort_set(w32_object *ab)
+{
+    return ab && __atomic_load_n(&ab->signaled, __ATOMIC_ACQUIRE);
+}
+
+#define W32_WAIT_ABORTED 0xFFFF0001u
+
 /*
  * Wait on a single object. The object lock must NOT be held.
- * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT.
+ * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT, or W32_WAIT_ABORTED once ab (an
+ * event, or NULL) is set.
  */
-static DWORD wait_single(w32_object *o, DWORD ms)
+static DWORD wait_single(w32_object *o, DWORD ms, w32_object *ab)
 {
     struct timespec ts;
     int timed = (ms != INFINITE);
@@ -675,6 +688,7 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         default:       ready = 1; break;
         }
         if (ready) break;
+        if (abort_set(ab)) { result = W32_WAIT_ABORTED; break; }
 
         /* An armed timer has its own deadline. Waiting on the caller's alone
          * would sleep straight past the due time, so take whichever comes
@@ -712,7 +726,7 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
-    return wait_single((w32_object *)h, ms);
+    return wait_single((w32_object *)h, ms, NULL);
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
@@ -758,8 +772,8 @@ static int multi_ready(HANDLE h, int marked, unsigned gen0)
     return marked && marked_event_gen(h, &gen) && gen != gen0;
 }
 
-DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
-                               DWORD ms, BOOL alertable)
+static DWORD wait_multi(DWORD count, const HANDLE *handles, BOOL waitAll,
+                        DWORD ms, BOOL alertable, w32_object *ab)
 {
     struct timespec ts;
     int timed = (ms != INFINITE);
@@ -795,8 +809,51 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                 (now.tv_sec == ts.tv_sec && now.tv_nsec >= ts.tv_nsec))
                 return WAIT_TIMEOUT;
         }
+        if (abort_set(ab))
+            return WAIT_OBJECT_0 + count;
         usleep(1000);
     }
+}
+
+DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
+                               DWORD ms, BOOL alertable)
+{
+    return wait_multi(count, handles, waitAll, ms, alertable, NULL);
+}
+
+/* A wait that also ends, as index count, when abort_ev is set: what Win32
+ * gives by adding the event to a WaitAny, for a WaitAll too. The single
+ * object waits on its condition variable as before; the event's set wakes
+ * it through abort_wait. */
+DWORD w32_wait_abortable(HANDLE abort_ev, DWORD count, const HANDLE *handles,
+                         BOOL waitAll, DWORD ms, BOOL alertable)
+{
+    w32_object *ab = (w32_object *)abort_ev, *o;
+    DWORD r;
+
+    if (!ab || ab->kind != K_EVENT)
+        ab = NULL;
+    if (count != 1)
+        return wait_multi(count, handles, waitAll, ms, alertable, ab);
+    if (alertable && drain_apcs() > 0)
+        return WAIT_IO_COMPLETION;
+    if (abort_set(ab))
+        return WAIT_OBJECT_0 + 1;
+    o = (w32_object *)handles[0];
+    if (!o || handles[0] == PSEUDO_CURRENT_THREAD || handles[0] == PSEUDO_CURRENT_PROCESS)
+        return WAIT_OBJECT_0;
+    if (!ab)
+        return wait_single(o, ms, NULL);
+    pthread_mutex_lock(&ab->lock);
+    InterlockedIncrement(&o->refcount);
+    ab->abort_wait = o;
+    pthread_mutex_unlock(&ab->lock);
+    r = wait_single(o, ms, ab);
+    pthread_mutex_lock(&ab->lock);
+    ab->abort_wait = NULL;
+    pthread_mutex_unlock(&ab->lock);
+    obj_release(o);
+    return r == W32_WAIT_ABORTED ? WAIT_OBJECT_0 + 1 : r;
 }
 
 /* ===================================================================== */
@@ -822,9 +879,17 @@ BOOL SetEvent(HANDLE h)
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
-    o->signaled = 1;
+    __atomic_store_n(&o->signaled, 1, __ATOMIC_RELEASE);
     o->set_gen++;
     pthread_cond_broadcast(&o->cond);
+    /* An abort event: its thread re-reads it under the lock of the object
+     * it waits on, so wake that one's waiters too. */
+    if (o->abort_wait) {
+        w32_object *t = o->abort_wait;
+        pthread_mutex_lock(&t->lock);
+        pthread_cond_broadcast(&t->cond);
+        pthread_mutex_unlock(&t->lock);
+    }
     pthread_mutex_unlock(&o->lock);
     return TRUE;
 }

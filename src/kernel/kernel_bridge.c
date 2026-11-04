@@ -29,6 +29,7 @@
 #include "kernel_missing.h"
 #include "kernel_pacing.h"
 #include "kernel_reset_probe.h"
+#include "kernel_guest_unwind.h"
 #include "guest_time.h"
 #include "guest_state_hash.h"
 #include "kernel_ramfs.h"
@@ -495,6 +496,7 @@ struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top, routine, obj_va, tls_size;
     uint32_t tib;   /* 0: the new thread takes its own at its start */
+    int unwind_counted;     /* xbox_GuestUnwindSpawnBegin's, for the join */
 };
 
 /* Lay out a thread's TLS the way the Xbox kernel does.
@@ -889,12 +891,28 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
 void guest_cpu_join(void);
 void guest_cpu_part(void);
 
+struct bridge_thread_body {
+    recomp_func_t fn;
+    uint32_t ctx1, ctx2;
+};
+
+static void bridge_thread_body(void *p)
+{
+    struct bridge_thread_body *b = (struct bridge_thread_body *)p;
+
+    guest_cpu_join();
+    bridge_run_thread_inline(b->fn, b->ctx1, b->ctx2);
+}
+
 static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
-    recomp_func_t fn = s->fn;
-    uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
-    int det;
+    struct bridge_thread_body body;
+    int det, unwound, counted = s->unwind_counted;
+
+    body.fn = s->fn;
+    body.ctx1 = s->ctx1;
+    body.ctx2 = s->ctx2;
 
     xbox_log_thread_role("guest-worker", s->routine);
 
@@ -937,8 +955,10 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     /* Before the join: the guest CPU takes this thread at its priority,
      * and not at all while a suspend (CreateSuspended) holds it. */
     xbox_GuestSchedBind(g_thread_obj_va);
-    guest_cpu_join();
-    bridge_run_thread_inline(fn, ctx1, ctx2);
+    xbox_GuestUnwindJoin(counted);
+    /* A reset unwinds the thread back here (kernel_guest_unwind.c): it then
+     * ends as a returning routine does, minus the line. */
+    unwound = xbox_GuestUnwindCallIn(bridge_thread_body, &body);
     /* In the deterministic mode the end is published while the thread still
      * holds the guest CPU, so the others see it at the same pass every run
      * (bridge_thread_end). */
@@ -946,14 +966,17 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     if (!det)
         guest_cpu_part();
 
-    fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
-    fflush(stderr);
+    if (!unwound) {
+        fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
+        fflush(stderr);
+    }
     /* The routine returned instead of calling PsTerminateSystemThread; the
      * stack is still ours to give back. The kernel's thread startup ends a
      * returning routine with PsTerminateSystemThread(STATUS_SUCCESS). */
     bridge_thread_end(0);
     if (det)
         guest_cpu_part();
+    xbox_GuestUnwindPart();
     return 0;
 }
 
@@ -975,9 +998,13 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
      * created in one window got each other's address from one run to the
      * next, and every pointer to their TIBs and stacks with them. */
     s->tib = xbox_GuestDetOn() ? xbox_AllocThreadTib() : 0;
+    /* Counted until it joins, so a reset never finds "every thread stopped"
+     * with this one on its way in. */
+    s->unwind_counted = xbox_GuestUnwindSpawnBegin();
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
     if (!th) {
+        xbox_GuestUnwindSpawnCancel(s->unwind_counted);
         if (s->tib)
             xbox_HeapFree(s->tib);
         free(s);
@@ -2819,12 +2846,12 @@ static void bridge_PsTerminateSystemThread(void)
          * to do it. */
         bridge_thread_end(exit_status);
         /* The deterministic mode kept the guest CPU through this call
-         * (xbox_GuestCpuRelease) so the end above lands at a fixed pass. */
-        if (xbox_GuestDetOn())
-            guest_cpu_part();
-        /* Outside the deterministic mode this exit never parts, so the
-         * stop probe would count the dead thread as one still running. */
-        xbox_ResetProbePart();
+         * (xbox_GuestCpuRelease) so the end above lands at a fixed pass;
+         * outside it the call handed the CPU over, and the part ends the
+         * thread's records (the stop probe's, the per-thread table's). */
+        guest_cpu_part();
+        /* Last: a reset waiting for this thread may wipe its stack now. */
+        xbox_GuestUnwindPart();
         ExitThread(exit_status);
     }
     if (xbox_GuestDetOn())
@@ -2880,6 +2907,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
 {
     uint32_t routine, context;
     recomp_func_t fn;
+    int host;
 
     if (!dpc_va)
         return 0;
@@ -2896,6 +2924,11 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
         fflush(stderr);
         return 0;
     }
+    /* A host thread's call-in while the guest is being thrown away
+     * (kernel_guest_unwind.c): counted as run, so nothing retries it. */
+    host = xbox_GuestUnwindHostBegin();
+    if (!host)
+        return 1;
 
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
@@ -2923,6 +2956,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
         }
         callback_regs_restore(&saved, 0);
     }
+    xbox_GuestUnwindHostEnd(host);
     return 1;
 }
 
@@ -3133,6 +3167,7 @@ static int kernel_call_isr(uint32_t vector)
     uint32_t kint = xbox_GetConnectedInterrupt(vector);
     uint32_t routine, context;
     recomp_func_t fn;
+    int host;
 
     if (!kint)
         return -1;
@@ -3144,6 +3179,9 @@ static int kernel_call_isr(uint32_t vector)
     if (!fn) fn = recomp_lookup_manual(routine);
     if (!fn)
         return -1;
+    host = xbox_GuestUnwindHostBegin();
+    if (!host)
+        return 0;                       /* not claimed: a reset is pending */
 
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
@@ -3160,6 +3198,7 @@ static int kernel_call_isr(uint32_t vector)
         }
         xbox_IrqlLeaveInterrupt(_irql);
     }
+    xbox_GuestUnwindHostEnd(host);
     return (int)(g_eax & 1u);
 }
 
@@ -11739,12 +11778,14 @@ static void kernel_thunk_dispatch(void)
 
     /* The bridge entry and exit are stop points (RECOMP_DEBUG=reset_probe);
      * the state says a wait in between is a thread already stopped. */
+    xbox_GuestUnwindPoint(XBOX_UNWIND_BRIDGE, ordinal);
     xbox_ResetProbeHit(XBOX_RESET_STOP_BRIDGE, ordinal);
     xbox_ResetProbeState(XBOX_RESET_IN_BRIDGE, ordinal);
     held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, ordinal);
     kernel_thunk_dispatch_body();
     xbox_ResetProbeState(XBOX_RESET_RUN, 0);
     xbox_ResetProbeHit(XBOX_RESET_STOP_BRIDGE, ordinal);
+    xbox_GuestUnwindPoint(XBOX_UNWIND_BRIDGE, ordinal);
     if (xbox_GuestDetOn())
         xbox_GuestDetTraceCall(ordinal, g_xbox_kernel_caller, g_eax);
     if (held)

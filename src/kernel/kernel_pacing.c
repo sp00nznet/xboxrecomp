@@ -19,6 +19,7 @@
 #include "kernel.h"
 #include "kernel_pacing.h"
 #include "kernel_reset_probe.h"
+#include "kernel_guest_unwind.h"
 #include "xbox_memory_layout.h"
 #include "recomp_env.h"
 #include "platform/host_time.h"
@@ -280,6 +281,7 @@ static void spin_wait(uint32_t va, int sleep)
 
 void xbox_SpinWait(uint32_t va)
 {
+    xbox_GuestUnwindPoint(XBOX_UNWIND_SPIN, va);
     xbox_ResetProbeHit(XBOX_RESET_STOP_SPIN, va);
     spin_wait(va, g_xbox_spin_sleep);
 }
@@ -292,6 +294,7 @@ void xbox_SpinWaitKick(uint32_t va)
      * guest CPU hand-off costs frames: 56 against 59.4 fps on the Deck.
      * With the event wait on, the pass pokes the walker awake,
      * its ack wakes this sleep, and the frames stay. */
+    xbox_GuestUnwindPoint(XBOX_UNWIND_KICK, va);
     xbox_ResetProbeHit(XBOX_RESET_STOP_KICK, va);
     spin_wait(va, g_xbox_spin_sleep && xbox_Nv2aKickEventOn());
 }

@@ -65,6 +65,7 @@
 #include "platform/host_time.h"
 #include "kernel_pacing.h"
 #include "kernel_reset_probe.h"
+#include "kernel_guest_unwind.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -554,6 +555,24 @@ static int sched_holder_level(void)
     return s_free ? s_last_level : sched_level(s_holder);
 }
 
+/* sched_take's result when the thread left the queue to unwind: it does
+ * not hold the CPU (kernel_guest_unwind.c). */
+#define SCHED_UNWOUND UINT64_MAX
+
+static void sched_unlink(GuestSchedWaiter *w)
+{
+    GuestSchedWaiter **pp = &s_wait_head, *prev = NULL;
+    while (*pp != w) {
+        prev = *pp;
+        pp = &(*pp)->next;
+    }
+    *pp = w->next;
+    if (s_wait_tail == w)
+        s_wait_tail = prev;
+    s_waiting--;
+    g_xbox_guest_cpu_waiters = (int)s_waiting | (int)g_xbox_reset_pending;
+}
+
 static uint64_t sched_take(int barge)
 {
     GuestSchedWaiter w;
@@ -582,12 +601,22 @@ static uint64_t sched_take(int barge)
         s_wait_head = &w;
     s_wait_tail = &w;
     s_waiting++;
-    g_xbox_guest_cpu_waiters = (int)s_waiting;
+    g_xbox_guest_cpu_waiters = (int)s_waiting | (int)g_xbox_reset_pending;
     if (!s_free && sched_wants_cpu(&w, now))
         preempt_set(1);
     while (!(s_free && sched_best() == &w
              && (s_valve == &w || sched_soft_ok(sched_level(t_sched), now)))) {
         SleepConditionVariableCS(&s_cv, &s_lock, GUEST_CPU_POLL_MS);
+        /* A reset: a queued thread leaves the list (the guest CPU is not
+         * a FIFO here) and unwinds once out of the lock. */
+        if (xbox_GuestUnwindArmed()) {
+            sched_unlink(&w);
+            if (s_valve == &w)
+                s_valve = NULL;
+            if (s_free && s_waiting)
+                WakeAllConditionVariable(&s_cv);
+            return SCHED_UNWOUND;
+        }
         now = xbox_HostNowNs();
         if (!s_free && !preempt_get()
             && (s_valve == &w || sched_wants_cpu(&w, now)))
@@ -654,18 +683,7 @@ static uint64_t sched_take(int barge)
             now = xbox_HostNowNs();
         }
     }
-    {
-        GuestSchedWaiter **pp = &s_wait_head, *prev = NULL;
-        while (*pp != &w) {
-            prev = *pp;
-            pp = &(*pp)->next;
-        }
-        *pp = w.next;
-        if (s_wait_tail == &w)
-            s_wait_tail = prev;
-    }
-    s_waiting--;
-    g_xbox_guest_cpu_waiters = (int)s_waiting;
+    sched_unlink(&w);
     if (s_valve == &w) {
         s_valve = NULL;
         s_valve_tid = (unsigned long)GetCurrentThreadId();
@@ -947,17 +965,23 @@ static void guest_cpu_acquire(int barge)
     uint64_t t0 = 0;
 
     /* A thread here is where a reset can stop it: it waits for the CPU. */
+    xbox_GuestUnwindPoint(XBOX_UNWIND_ACQUIRE, 0);
     xbox_ResetProbeState(XBOX_RESET_IN_QUEUE, 0);
     xbox_ResetProbeHit(XBOX_RESET_STOP_ACQUIRE, 0);
     EnterCriticalSection(&s_lock);
     if (s_sched) {
-        t0 = sched_take(barge);
+        while ((t0 = sched_take(barge)) == SCHED_UNWOUND) {
+            LeaveCriticalSection(&s_lock);
+            note_flush();
+            xbox_GuestUnwindSlow(XBOX_UNWIND_ACQUIRE, 1);
+            EnterCriticalSection(&s_lock);
+        }
     } else if (s_free && !s_granted && (barge || !s_waiting)) {
         s_free = 0;
     } else {
         my = s_next_ticket++;
         s_waiting++;
-        g_xbox_guest_cpu_waiters = (int)s_waiting;
+        g_xbox_guest_cpu_waiters = (int)s_waiting | (int)g_xbox_reset_pending;
         t0 = xbox_HostNowNs();
         if (barge && !s_free)
             preempt_set(1);
@@ -976,7 +1000,7 @@ static void guest_cpu_acquire(int barge)
         s_granted = 0;
         s_head++;
         s_waiting--;
-        g_xbox_guest_cpu_waiters = (int)s_waiting;
+        g_xbox_guest_cpu_waiters = (int)s_waiting | (int)g_xbox_reset_pending;
     }
     InterlockedExchange(&s_owner_tid, (LONG)GetCurrentThreadId());
     LeaveCriticalSection(&s_lock);
@@ -984,6 +1008,9 @@ static void guest_cpu_acquire(int barge)
     t_held = 1;
     t_joining = 0;
     xbox_ResetProbeState(XBOX_RESET_RUN, 0);
+    /* The ticket queue cannot be left from the middle: a queued thread
+     * unwinds once its turn comes, and lets the CPU go at its exit. */
+    xbox_GuestUnwindPoint(XBOX_UNWIND_ACQUIRE, 2);
     if (t0) {
         uint64_t now = xbox_HostNowNs();
         LONG wait_us = (LONG)((now - t0) / 1000u);
@@ -1170,6 +1197,28 @@ void xbox_GuestCpuJoin(void)
     }
 }
 
+/* With the guest unwind on, threads end and start again at every reset:
+ * a parting thread gives its table slot back, or the table would fill. */
+static void thread_rec_free(void)
+{
+    GuestCpuThread *r = t_rec;
+
+    if (!r || !xbox_GuestUnwindEnabled())
+        return;
+    t_rec = NULL;
+    memset((char *)r + sizeof r->tid, 0, sizeof *r - sizeof r->tid);
+    InterlockedExchange(&r->tid, 0);
+}
+
+int xbox_GuestCpuThreadRecsUsed(void)
+{
+    int i, n = 0;
+
+    for (i = 0; i < GUEST_CPU_THREADS; i++)
+        n += InterlockedCompareExchange(&s_threads[i].tid, 0, 0) != 0;
+    return n;
+}
+
 void xbox_GuestCpuPart(void)
 {
     if (xbox_GuestDetOn()) {
@@ -1177,6 +1226,8 @@ void xbox_GuestCpuPart(void)
             xbox_GuestDetPart();
         t_held = 0;
         t_guest = 0;
+        thread_rec_free();
+        xbox_ResetProbePart();
         return;
     }
     if (t_held)
@@ -1189,7 +1240,31 @@ void xbox_GuestCpuPart(void)
     }
     t_guest = 0;
     t_sched = NULL;
+    thread_rec_free();
     xbox_ResetProbePart();
+}
+
+int xbox_GuestCpuUnwindDrop(void)
+{
+    if (!t_held)
+        return 0;
+    if (xbox_GuestDetOn()) {
+        xbox_GuestDetPart();
+        t_held = 0;
+        return 2;
+    }
+    guest_cpu_handoff(XBOX_GUEST_CPU_EXIT, 0);
+    return 1;
+}
+
+void xbox_GuestCpuUnwindRetake(int how)
+{
+    if (how == 2) {
+        xbox_GuestDetJoin();
+        t_held = 1;
+    } else if (how == 1) {
+        guest_cpu_acquire(0);
+    }
 }
 
 int xbox_GuestCpuHeld(void)
@@ -1332,6 +1407,7 @@ void xbox_GuestCpuPreempt(uint32_t va)
 {
     GuestCpuThread *r;
 
+    xbox_GuestUnwindPoint(XBOX_UNWIND_BACK_EDGE, va);
     /* Before every early return: the probe asks whether the thread gets
      * here at all, not whether it hands over. */
     xbox_ResetProbeHit(XBOX_RESET_STOP_BACK_EDGE, va);
