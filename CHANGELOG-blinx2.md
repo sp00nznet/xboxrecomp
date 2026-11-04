@@ -9,6 +9,45 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.14.0] - 2026-11-04
+
+### Added
+- `system.language` sets the language the game is told
+  (`XC_LANGUAGE`), and the menu's Game page offers the languages the game
+  declares. The game reads it at boot, so a change applies at the next
+  start; the default stays English.
+- Mod API version 8: `draw3d_begin`, `draw3d_tris`, `draw3d_lines` and
+  `draw3d_end` let a mod draw world-space triangles and lines over the
+  frame at the flip, depth-tested against the game's own depth buffer or
+  as x-ray, on D3D11 and Metal. With nothing submitted the flip is
+  unchanged. A v7 mod still loads.
+- `RECOMP_DEBUG=tex_dump=<dir>` writes each uploaded texture once, by the
+  same hash the texture pack loader looks up, so a pack author replaces
+  exactly what the game asks for. Off by default.
+- The groundwork for restarting a game in its window: a stop probe
+  (debug, off by default), a scanner and ctest that classify every
+  static, and the guest unwind that brings each guest thread to a known
+  stop point. Everything stays off until a game enables it.
+
+### Changed
+- The menu sizes to the display it is shown on, not the output height
+  alone (`overlay.ui_fit`, default `display`): it is readable on a Steam
+  Deck's 7" panel and follows a high-DPI desktop's scale. Its size no
+  longer changes with render scale or a shader, the Size setting applies
+  at once, and pointer and touch map through the window's fit, so taps
+  land at render scale 2 and 3. `output` keeps the old rule.
+- Hor+ and `render.snap_2d` no longer stop draw merging: settled 3D
+  batches merge as at 4:3, on D3D11 and Metal, so BLiNX 2's stage 2 at
+  16:9 no longer slows down.
+- Deterministic mode steps its clock only at frame-wait loops, so BLiNX 2
+  runs at about 32 flips per virtual second in the mode (8 before).
+
+### Fixed
+- On a dump of another release, a hand-written wrap whose address is no
+  longer a function start stopped the build at link with an undefined
+  `sub_X_gen` and no reason given. `recomp` now stops first, naming each
+  address and the likely cause.
+
 ## [blinx2-v0.13.0] - 2026-11-03
 
 ### Added
