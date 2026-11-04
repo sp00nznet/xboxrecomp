@@ -9,9 +9,11 @@
  * from one texture. Row 4 stays empty, so a glyph on the first packed row
  * sampled bilinearly (scaled text) never picks up the block's white.
  *
- * A size drawn at other than its baked size (the placement changed since
- * the bake; phase 3E rebakes on the worker) is the baked glyphs scaled,
- * which the presenters' linear sampler keeps legible.
+ * The bake is in display pixels: a size drawn at other than its
+ * baked size (a window smaller than the display, render.scale's larger
+ * back buffer) is the baked glyphs scaled, which the presenters' linear
+ * sampler keeps legible. A change of overlay.ui_scale or ui_fit bakes
+ * again (nv2a_overlay_rebake).
  *
  * Two symbol faces share the atlas (overlay-revamp D7, D8): the Lucide
  * icon subset at the three text sizes, and the input-prompt font made by
@@ -314,7 +316,7 @@ int nv2a_ovl_font_bake(uint32_t out_h, int symbols)
      * draws smaller than the display's size, and baking past that only
      * costs bake time and the large text's oversampling. */
     uint32_t lines = nv2a_ovl_bake_lines(out_h);
-    float s = nv2a_ovl_ui_scale(lines), s0 = nv2a_ovl_ui_scale(out_h);
+    float s = nv2a_ovl_ui_scale_shown(lines), s0 = nv2a_ovl_ui_scale_shown(out_h);
     int per = 0, i, k, si, asc, desc, gap;
     stbtt_pack_range r[OVL_FONT_SLOTS * NRANGES];
     stbtt_pack_range sr[OVL_FACES * OVL_SYM_SIZES];

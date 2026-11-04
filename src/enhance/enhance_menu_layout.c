@@ -44,7 +44,7 @@ static void panel_of(const struct menu_layout_in *in, struct menu_layout *l)
         l->backdrop = 1;
     } else {
         int pw = (int)((float)w * 0.40f), lo = menu_layout_px(l->s, 500);
-        float base = (float)h / 1080.0f;
+        float base = in->base > 0 ? in->base : (float)h / 1080.0f;
         if (pw > menu_layout_px(l->s, 720))
             pw = menu_layout_px(l->s, 720);
         /* A scale over the output height's own (the display's floor on a
@@ -52,7 +52,8 @@ static void panel_of(const struct menu_layout_in *in, struct menu_layout *l)
          * 40% of the width holds: the panel keeps 500 token columns for
          * the rows, up to three quarters of the width. At the height's
          * own scale the panel is the one it always was. */
-        base = base < 0.5f ? 0.5f : base > 3.0f ? 3.0f : base;
+        if (in->base <= 0)
+            base = base < 0.5f ? 0.5f : base > 3.0f ? 3.0f : base;
         if (lo > w * 3 / 4)
             lo = w * 3 / 4;
         if (l->s > base * 1.01f && pw < lo)

@@ -184,6 +184,24 @@ static void set_pack_bit(const struct enhance_item *it, const char *v)
     req(e_pack, v, NV2A_OPT_PACK);
 }
 
+/* overlay.ui_scale and ui_fit: live, the atlas baked again between
+ * frames at the new size. The draw that follows the change
+ * still measures with the old atlas; the menu composes again once the
+ * atlas's generation moves. */
+static void set_ui_scale(const struct enhance_item *it, const char *v)
+{
+    (void)it;
+    nv2a_overlay_set_ui_scale((float)atof(v));
+    nv2a_overlay_rebake();
+}
+
+static void set_ui_fit(const struct enhance_item *it, const char *v)
+{
+    (void)it;
+    nv2a_overlay_set_ui_fit(strcmp(v, "output") != 0);
+    nv2a_overlay_rebake();
+}
+
 static void set_stats(const struct enhance_item *it, const char *v)
 {
     (void)it;
@@ -371,15 +389,14 @@ static const struct enhance_item k_items[] = {
     { ITEM("present.surface", "Present surface", "Render", ENHANCE_ITEM_CHOICE),
       .choices = k_surface, .live = ENHANCE_LIVE_RESTART, .def = "auto",
       .help = "The window surface the picture is shown on; auto picks the best one" },
-    /* The atlas is baked at the first overlay arm, so a new scale waits
-     * for the next run. */
+    /* Live: the presenter bakes the atlas again. */
     { ITEM("overlay.ui_scale", "Overlay scale", "Render", ENHANCE_ITEM_RANGE), .lo = 0.75,
-      .hi = 2.0, .step = 0.25, .live = ENHANCE_LIVE_RESTART, .def = "1",
+      .hi = 2.0, .step = 0.25, .set = set_ui_scale, .def = "1",
       .help = "Sizes the menu and the overlays over the size the display picks: larger "
               "for a TV across the room" },
-    /* Read with the ui scale, before the atlas bake. */
+    /* Live like the ui scale. */
     { ITEM("overlay.ui_fit", "Overlay fit", "Render", ENHANCE_ITEM_CHOICE),
-      .choices = k_ui_fit, .live = ENHANCE_LIVE_RESTART, .def = "display",
+      .choices = k_ui_fit, .set = set_ui_fit, .def = "display",
       .help = "What the overlay's size follows: the display (larger on a handheld) or the "
               "picture's height alone" },
     /* textures.pack names the file: the toggle is this session's only. */
@@ -1163,6 +1180,7 @@ static uint64_t s_dir_next, s_close_t, s_draw_t;
 static uint64_t s_extra_t[INPUT_SRC_COUNT];
 static int s_snap_on, s_stats_on;
 static int s_draw_w, s_draw_h;
+static uint64_t s_draw_atlas;       /* the atlas generation the last draw measured with */
 
 /* rates over one-second windows (Stats, Debug) */
 static uint64_t s_rate_t0, s_rate_c0[NV2A_STAT_COUNT];
@@ -1280,6 +1298,7 @@ static void layout_base(struct menu_layout_in *in, int pages[PAGE_COUNT])
     in->w = w;
     in->h = h;
     in->s = nv2a_ovl_ui_scale((uint32_t)h);
+    in->base = nv2a_ovl_ui_base((uint32_t)h);
     in->tok.pad = t->pad;
     in->tok.gap = t->gap;
     in->tok.row_h = t->row_h;
@@ -7103,6 +7122,7 @@ void enhance_menu_draw(uint64_t now_ms)
     s_scroll[s_page] = l->scroll;
     s_draw_w = in.w;
     s_draw_h = in.h;
+    s_draw_atlas = nv2a_overlay_atlas_gen();
     sel = s_sel[s_page];
 
     /* Expanded (D1) covers the game; compact leaves it beside the panel,
@@ -7297,6 +7317,7 @@ void enhance_menu_hook(unsigned port, uint32_t held, XBOX_INPUT_STATE *st, uint6
         if (w <= 0 || h <= 0)
             w = 1920, h = 1080;
         if (s_need_draw || w != s_draw_w || h != s_draw_h
+            || nv2a_overlay_atlas_gen() != s_draw_atlas
             || (live && now_ms - s_draw_t >= LIVE_DRAW_MS)
             || (s_status_t && now_ms - s_status_t >= STATUS_MS && now_ms - s_draw_t >= STATUS_MS)
             || (s_peek_t && !s_peek_drawn && now_ms - s_peek_t >= PEEK_MS)

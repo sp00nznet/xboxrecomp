@@ -69,6 +69,7 @@ struct menu_layout_tokens {
 struct menu_layout_in {
     int w, h;              /* the placement */
     float s;               /* nv2a_ovl_ui_scale(h) */
+    float base;            /* nv2a_ovl_ui_base(h); 0: clamp(h / 1080, 0.5, 3) */
     struct menu_layout_tokens tok;
     int size;              /* enum menu_size */
     int toolbar_open;      /* the toolbar has the focus, or the LB/RB peek shows */

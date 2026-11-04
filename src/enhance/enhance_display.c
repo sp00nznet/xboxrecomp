@@ -134,8 +134,9 @@ void enhance_display_start(void)
     static const char *const k_fit[] = {"display", "output", NULL};
     int fit = enhance_cfg_choice("overlay.ui_fit", k_fit, 0);
     nv2a_overlay_set_ui_fit(fit == 0);
-    if (fit == 0)
-        nv2a_overlay_set_display_probe(probe);
+    /* Under ui_fit = output too: the menu's switch to display is live, and
+     * gamescope's fit of the window needs the display's size. */
+    nv2a_overlay_set_display_probe(probe);
     if (enhance_cfg_source_of("overlay.ui_fit") != ENHANCE_SRC_DEFAULT)
         fprintf(stderr, "[ENHANCE] overlay.ui_fit=%s\n", k_fit[fit]);
 }

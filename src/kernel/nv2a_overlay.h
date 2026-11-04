@@ -88,11 +88,16 @@ struct nv2a_ovl_image { const uint32_t *px; uint32_t w, h; uint64_t gen; };
  * hook; stock leaves the overlay disarmed. */
 int nv2a_overlay_arm(uint32_t layers, uint32_t out_h);
 /* overlay.ui_scale (D2): the player's multiplier on the output's scale,
- * clamped to 0.75..2.0 (returned). Set before the first arm: the atlas
- * is baked once, at the scale of that moment, so a later value would
- * draw glyphs at sizes the atlas does not hold. enhance.c sets it at
- * init; unset it is 1.0. */
+ * clamped to 0.75..2.0 (returned). enhance.c sets it at init, the menu's
+ * Render page live; unset it is 1.0. A change after the first arm needs
+ * nv2a_overlay_rebake, so the atlas holds the new sizes. */
 float nv2a_overlay_set_ui_scale(float mul);
+/* Bakes the atlas again at the scale now set, on the presenting thread's
+ * next poll (between frames, under the menu's lock). Any thread. */
+void nv2a_overlay_rebake(void);
+/* The atlas's generation, 0 before any bake: a writer that composed
+ * before it moved composes again. */
+uint64_t nv2a_overlay_atlas_gen(void);
 
 /* The display the window opens on (overlay.ui_fit = display).
  * The output height alone shrinks the menu on a small, dense panel held
@@ -120,8 +125,16 @@ void nv2a_overlay_set_display_probe(nv2a_ovl_display_probe fn);
 int nv2a_overlay_display_ready(void);
 /* overlay.ui_fit: 1 (display, the default) scales with the display as
  * well as the output height, 0 (output) with the output height alone, as
- * before the display floor. Set before the first arm, like the ui scale. */
+ * before the display floor. Live like the ui scale: a change after the first arm
+ * needs nv2a_overlay_rebake. */
 void nv2a_overlay_set_ui_fit(int display);
+/* The window's client area, cw x ch, is scaled to fit the display by a
+ * compositor after the present (gamescope under present.surface=internal:
+ * the window is the render target's size and gamescope fits it to the
+ * screen). The overlay's scale then follows the lines shown, not the
+ * window's. 0, 0 for none, the default. Any thread; a presenter
+ * calls it at each present. */
+void nv2a_overlay_set_compositor(int cw, int ch);
 /* Marks d a handheld with the Deck's 7" diagonal when steam_deck (the
  * SteamDeck variable Steam sets) is "1" and d is the Deck panel's
  * 1280x800: a docked Deck keeps the variable, and its monitor is no
@@ -172,8 +185,10 @@ int nv2a_overlay_lists(const struct nv2a_ovl_list *out[NV2A_OVL_COUNT]);
 const struct nv2a_ovl_atlas *nv2a_overlay_atlas(void);
 const struct nv2a_ovl_image *nv2a_overlay_image(uint16_t tex);
 
-/* The frame's placement rect in output pixels, written at each present.
- * Every overlay size comes from it, never from the window. */
+/* The overlay's placement rect in output pixels, written at each present:
+ * the whole back buffer or drawable, never the frame's rectangle in it,
+ * whose size follows render.scale, the filter and present.shader
+ *. Every overlay size comes from it and the view's ratio. */
 void nv2a_overlay_set_placement(int x, int y, int w, int h);
 void nv2a_overlay_placement(int *x, int *y, int *w, int *h);
 

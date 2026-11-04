@@ -175,8 +175,8 @@ the stock settings, `present.pacing = "spin"` included.
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
 | `overlay.stats` | bool | the stats strip in the window's top right corner: fps, frame ms (average and worst of the last second), pacing, scale and backend, at 2 Hz; never in a frame dump | `false` | `RECOMP_OVERLAY_STATS` |
-| `overlay.ui_scale` | number | the menu's and the overlays' size over the automatic scale (`overlay.ui_fit`), 0.75 to 2 in quarter steps: larger for a TV across the room. Read at start (the font atlas is baked then) | `1` | `RECOMP_OVERLAY_UI_SCALE` |
-| `overlay.ui_fit` | string | what the automatic scale follows: `"display"` (the larger of the output height over 1080 and the display's floor: the OS's UI scale, and on a Steam Deck's own 1280x800 panel (`SteamDeck=1` or its SMBIOS names) its 216 ppi over 160, held to the output height over 600; [Overlay scale](#overlay-scale)) or `"output"` (the output height over 1080 alone, the rule before the display floor). Read at start | `"display"` | `RECOMP_OVERLAY_UI_FIT` |
+| `overlay.ui_scale` | number | the menu's and the overlays' size over the automatic scale (`overlay.ui_fit`), 0.75 to 2 in quarter steps: larger for a TV across the room. Live from the menu: the font atlas is baked again between frames | `1` | `RECOMP_OVERLAY_UI_SCALE` |
+| `overlay.ui_fit` | string | what the automatic scale follows: `"display"` (the larger of the output height over 1080 and the display's floor: the OS's UI scale, and on a Steam Deck's own 1280x800 panel (`SteamDeck=1` or its SMBIOS names) its 216 ppi over 160, held to the output height over 600; [Overlay scale](#overlay-scale)) or `"output"` (the output height over 1080 alone, the rule before the display floor; the height shown, so under gamescope the window's lines after the compositor's fit to the screen). Live from the menu, like `overlay.ui_scale` | `"display"` | `RECOMP_OVERLAY_UI_FIT` |
 | `overlay.menu_size` | string | `"compact"` (a panel at the left, the game beside it) or `"expanded"` (the whole window over a dimmed game). R3 in the menu flips it and writes this key at once, alone; not with `RECOMP_CONFIG=none` | `"compact"` | none |
 | `overlay.menu_hints` | string | where the menu shows the selected row's help: `"tooltip"` (a card beside the row, 350 ms after a pad or key selection settles, 500 ms after the mouse rests), `"inline"` (a line under every row) or `"off"`. L3 (on release), F1 and the header's `?` flip between tooltip and inline (from off: inline) and write this key at once, alone; not with `RECOMP_CONFIG=none` | `"tooltip"` | none |
 | `menu.enabled` | bool | the in-game menu, opened by the `menu.open` action ([In-game menu](#in-game-menu-menuenabled)) | `false` | `RECOMP_MENU` |
@@ -1358,8 +1358,17 @@ automatic scale times `overlay.ui_scale` ([Overlay scale](#overlay-scale)).
 
 <a id="overlay-scale"></a>
 **Overlay scale.** The theme's sizes are set for 1080 lines; the
-automatic scale is `max(clamp(out_h / 1080, 0.5, 3), floor)`, then times
-`overlay.ui_scale` and clamped to 0.5-3. Under `overlay.ui_fit = "display"`
+automatic scale is `max(clamp(lines / 1080, 0.5, 3), floor)`, then times
+`overlay.ui_scale` and clamped to 0.5-3. `lines` is the height the
+overlay shows at on screen, not the frame's: the overlay is placed on the
+whole back buffer or drawable (never the frame's rectangle in it), and its
+height is taken through the window's stretch (`present.surface =
+internal`) and, under gamescope, through the compositor's fit of the
+window to the screen. So `render.scale`, `present.filter` and
+`present.shader` change neither the overlay's size nor its hit areas.
+Under `present.surface = internal` on Windows the window is
+held to the screen (aspect kept) and the larger back buffer is stretched
+into it, so a pointer or touch reaches every part of the menu. Under `overlay.ui_fit = "display"`
 the floor is the primary display's, probed once:
 the OS's UI scale (DPI over 96 on Windows; SDL3's pixel density times
 content scale elsewhere) and, on a handheld, its density over 160 ppi.
@@ -1368,9 +1377,9 @@ the SMBIOS names Valve Jupiter or Galileo since Steam sets `SteamDeck`
 only in Game Mode, and a 1280x800 display; docked to a TV it is a desktop): 1280x800 at 7" is
 216 ppi, a floor of 1.35. An explicit `SteamDeck=0` does not override the
 SMBIOS names (a Desktop Mode run on the Deck may carry it); `ui_fit =
-"output"` turns the floor off. The floor is in window pixels, so under
-`present.surface = internal` it is turned into the output's, and it is
-held to `out_h / 600` so a small window keeps 600 token lines. The atlas
+"output"` turns the floor off (the height shown, through the window's
+stretch and gamescope's fit, still sets the scale). The floor is in
+display pixels and is held to `lines / 600` so a small window keeps 600 token lines. The atlas
 is baked for the display's height (the size a fullscreen menu draws at);
 past 2.0 it keeps to the output's own scale, and it never passes 3, the
 largest scale, at which `test_fit` proves the atlas fits 2048x2048 with
@@ -1386,10 +1395,14 @@ window grows as well: a 1280x720 window on a 100% desktop was 0.667 and
 is 1.0, the OS's scale, unless `ui_fit = "output"`. On Windows the exe is
 not DPI aware (a GDI window, no manifest entry), so the probe reads the
 virtualised 96 dpi and scaled size and DWM stretches the window, menu
-included, by the desktop's scale; the OS term is 1 there. The probe runs
+included, by the desktop's scale; the OS term is 1 there. A change of either key in the menu bakes the atlas again on the
+presenting thread's next poll, under the menu's lock, and every layer
+composes again (a list composed from the old atlas is not drawn). The probe and
+its `[OVERLAY] display` log line run under either `ui_fit` (a live switch to
+`"display"` needs the floor, and gamescope's fit needs the display's size),
 at the first atlas bake on Windows (cheap GDI calls); with SDL it waits
 for the presenter's own `SDL_Init` and never starts the video itself, so
-the atlas is baked again then, before the guest starts. A headless run,
+the atlas is baked again then (between frames when a layer already drew). A headless run,
 or one whose window does not open, never probes. Tests:
 `tests/overlay` (`test_display_scale`), `tests/enhance_menu_layout`.
 
@@ -1485,11 +1498,11 @@ points, its live class; the footer names the selected row's:
 
 | Class | Takes effect | Items |
 |---|---|---|
-| live | at the next flip | `render.aniso`, `render.snap_2d`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `overlay.stats`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
+| live | at the next flip | `render.aniso`, `render.snap_2d`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `overlay.stats`, `overlay.ui_scale`, `overlay.ui_fit`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
 | at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
-| at restart | at the next start; the change is saved, not applied | `display.aspect`, `present.surface`, `overlay.ui_scale`, `overlay.ui_fit`, a mod without `on_enable` |
+| at restart | at the next start; the change is saved, not applied | `display.aspect`, `present.surface`, a mod without `on_enable` |
 
 The `textures.pack` toggle turns the loaded pack off for this session only
 and is never saved (the key names the pack's file). A title's items and a

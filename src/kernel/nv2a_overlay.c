@@ -149,8 +149,10 @@ int nv2a_overlay_display_ready(void)
     if (!nv2a_ovl_display_reprobe() || !__atomic_load_n(&s_armed, __ATOMIC_ACQUIRE))
         return 0;   /* nothing new, or the first arm bakes with it */
     if (__atomic_load_n(&s_published, __ATOMIC_ACQUIRE)) {
-        fprintf(stderr, OVL_LOGP "display known after a layer drew; the atlas keeps its size\n");
-        return 0;
+        /* A writer may be composing from the atlas: the presenter's poll
+         * bakes again between frames. */
+        nv2a_overlay_rebake();
+        return 1;
     }
     /* The arms bake for 1080 output lines (enhance's); the symbols stay as
      * they were. A failed bake (out of memory) falls back as an arm's. */
@@ -522,13 +524,22 @@ const struct nv2a_ovl_list *nv2a_overlay_acquire(enum nv2a_overlay_layer l)
 
 int nv2a_overlay_lists(const struct nv2a_ovl_list *out[NV2A_OVL_COUNT])
 {
+    const struct nv2a_ovl_atlas *a = nv2a_ovl_font_atlas();
     int l, n = 0;
     for (l = 0; l < NV2A_OVL_COUNT; l++) {
         const struct nv2a_ovl_list *p = nv2a_overlay_acquire((enum nv2a_overlay_layer)l);
-        if (p && p->nidx)
+        /* A list composed before a rebake holds the old atlas's texture
+         * coordinates: it is left out until its writer composes again. */
+        if (p && p->nidx && (!a || !p->atlas_gen || p->atlas_gen == a->gen))
             out[n++] = p;
     }
     return n;
+}
+
+uint64_t nv2a_overlay_atlas_gen(void)
+{
+    const struct nv2a_ovl_atlas *a = nv2a_ovl_font_atlas();
+    return a ? a->gen : 0;
 }
 
 const struct nv2a_ovl_atlas *nv2a_overlay_atlas(void)
@@ -689,10 +700,42 @@ const struct nv2a_ovl_image *nv2a_overlay_image(uint16_t tex)
 static uint64_t s_stats_t;          /* when the strip was last composed */
 static uint32_t s_stats_w, s_stats_h, s_toast_w, s_toast_h;
 
+static int s_rebake;                /* atomic: nv2a_overlay_rebake asked */
+
+void nv2a_overlay_rebake(void)
+{
+    __atomic_store_n(&s_rebake, 1, __ATOMIC_RELEASE);
+    wake();
+}
+
+/* The atlas baked again at the scale now set, on the presenting thread
+ * between frames: the strip and the toasts compose here, and the menu's
+ * and the mod status's writers hold the menu's lock while they read the
+ * atlas, so none reads it mid-bake. A lock held now waits for the next
+ * poll. Every list then composes again (nv2a_overlay_lists leaves out
+ * the old ones). */
+static void rebake_poll(void)
+{
+    int sym;
+    if (!__atomic_load_n(&s_rebake, __ATOMIC_ACQUIRE) || !nv2a_overlay_armed()
+        || !nv2a_overlay_menu_trylock())
+        return;
+    __atomic_store_n(&s_rebake, 0, __ATOMIC_RELAXED);
+    sym = nv2a_ovl_font_symbols();
+    if (nv2a_ovl_font_bake(1080, sym) < 0 && (!sym || nv2a_ovl_font_bake(1080, 0) < 0))
+        fprintf(stderr, OVL_LOGP "rebake failed; no overlay text\n");
+    nv2a_overlay_menu_unlock();
+    s_stats_t = 0;
+    s_toast_w = s_toast_h = 0;
+    bump();
+}
+
 uint64_t nv2a_overlay_poll(uint64_t now_ms)
 {
-    uint32_t vis = __atomic_load_n(&s_visible, __ATOMIC_ACQUIRE);
+    uint32_t vis;
     int px, py, w, h;
+    rebake_poll();
+    vis = __atomic_load_n(&s_visible, __ATOMIC_ACQUIRE);
     nv2a_overlay_placement(&px, &py, &w, &h);
     if (vis && nv2a_overlay_armed() && w > 0 && h > 0) {
         /* The strip at 2 Hz, and at once after a resize. */
@@ -820,7 +863,9 @@ void nv2a_overlay_reset_for_test(void)
     memset(s_toast, 0, sizeof s_toast);
     s_stats_t = 0;
     s_stats_w = s_stats_h = s_toast_w = s_toast_h = 0;
+    s_rebake = 0;
     nv2a_overlay_set_view(0, 0, 0, 0, 0, 0);
+    nv2a_overlay_set_compositor(0, 0);
 }
 
 void nv2a_overlay_toast_hook_for_test(void (*seen)(const char *line), void (*mid_push)(void))

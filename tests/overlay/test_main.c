@@ -24,6 +24,7 @@
  * A change to the converter, the font or the theme moves them: look at the
  * pictures (OVERLAY_REF_OUT) before pinning the new values.
  */
+#include <math.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -1150,6 +1151,105 @@ static void test_display_ready(void)
     nv2a_overlay_reset_for_test();
 }
 
+/* The menu's size on screen follows the display, never the frame.
+ * The Deck under gamescope (present.surface=internal): at render.scale 1
+ * the 640x480 window is fitted to the 1280x800 screen by gamescope; at
+ * render.scale 3 the 1920x1440 back buffer is stretched into a window held
+ * to the screen (1067x800); with present.shader the window is the
+ * screen's size. All three show the same size, and a touch at the held
+ * window's far corner still lands in the back buffer. */
+static void test_shown_size(void)
+{
+    struct nv2a_ovl_display deck = { 1280, 800, 1.0f, 0, 0 };
+    float a, b, c;
+    int x, y;
+    nv2a_overlay_reset_for_test();
+    nv2a_overlay_display_mark_deck(&deck, "1");
+    nv2a_overlay_set_display(&deck);
+
+    CHECK(nv2a_ovl_compositor_fit(0, 0, 1280, 800) == 1.0f, "no compositor: 1");
+    CHECK(near(nv2a_ovl_compositor_fit(640, 480, 1280, 800), 1.6667f), "640x480 fitted: %.3f",
+          nv2a_ovl_compositor_fit(640, 480, 1280, 800));
+
+    for (int q = 0; q < 3; q++) {
+        static const float mul[] = { 1.0f, 0.75f, 2.0f };
+        nv2a_overlay_set_ui_scale(mul[q]);
+        nv2a_overlay_set_view(0, 0, 0, 0, 0, 0);
+        nv2a_overlay_set_compositor(640, 480);
+        a = nv2a_ovl_ui_scale(480) * 800.0f / 480.0f;
+        nv2a_overlay_set_view(0, 0, 1067, 800, 1920, 1440);
+        nv2a_overlay_set_compositor(1067, 800);
+        b = nv2a_ovl_ui_scale(1440) * 800.0f / 1440.0f;
+        nv2a_overlay_set_view(0, 0, 0, 0, 0, 0);
+        nv2a_overlay_set_compositor(1280, 800);
+        c = nv2a_ovl_ui_scale(800);
+        CHECK(fabsf(a - c) < 0.01f * c && fabsf(b - c) < 0.01f * c,
+              "ui %.2f shown at rs1 %.3f, rs3 %.3f, shader %.3f", (double)mul[q], (double)a,
+              (double)b, (double)c);
+    }
+    nv2a_overlay_set_ui_scale(1.0f);
+    c = nv2a_ovl_ui_scale(800);
+    CHECK(near(c, 1.333f), "the Deck's own size: %.3f", (double)c);
+
+    /* The held window's pointer: its far corner is the back buffer's. */
+    nv2a_overlay_set_view(0, 0, 1067, 800, 1920, 1440);
+    x = 1066, y = 799;
+    nv2a_overlay_to_output(&x, &y);
+    CHECK(x >= 1915 && x < 1920 && y >= 1435 && y < 1440, "far corner at %d,%d", x, y);
+    x = 533, y = 400;
+    nv2a_overlay_to_output(&x, &y);
+    CHECK(abs(x - 959) <= 2 && abs(y - 720) <= 2, "centre at %d,%d", x, y);
+    nv2a_overlay_reset_for_test();
+}
+
+/* overlay.ui_scale live: the poll bakes again once the menu's
+ * lock is free, the strip composes again from the new atlas and a list
+ * composed before it is not drawn. */
+static void test_rebake(void)
+{
+    const struct nv2a_ovl_list *ls[NV2A_OVL_COUNT];
+    const struct nv2a_ovl_atlas *at;
+    mu_Font body = OVL_FONT(OVL_FONT_BODY, 0, 0);
+    uint64_t g0, g1;
+    int px0, n, menu = 0, stats = 0;
+    mu_Context *ctx;
+    nv2a_overlay_reset_for_test();
+    CHECK(nv2a_overlay_arm(1u << NV2A_OVL_STATS | 1u << NV2A_OVL_MENU, 1080) == 0, "arm");
+    nv2a_overlay_set_stats(1);
+    nv2a_overlay_set_placement(0, 0, 1280, 720);
+    nv2a_overlay_poll(1);
+    ctx = nv2a_overlay_ui_begin(NV2A_OVL_MENU);
+    nv2a_ovl_compose_stats(ctx, 1280, 720, k_line, 0);
+    nv2a_overlay_ui_publish(NV2A_OVL_MENU);
+    at = nv2a_overlay_atlas();
+    g0 = at ? at->gen : 0;
+    px0 = nv2a_ovl_text_height(body);
+    CHECK(g0 && nv2a_overlay_atlas_gen() == g0 && nv2a_overlay_lists(ls) == 2, "two lists");
+
+    nv2a_overlay_set_ui_scale(2.0f);
+    nv2a_overlay_rebake();
+    CHECK(nv2a_overlay_menu_trylock(), "lock");
+    nv2a_overlay_poll(2);
+    CHECK(nv2a_overlay_atlas_gen() == g0, "no bake under the menu's lock");
+    nv2a_overlay_menu_unlock();
+    nv2a_overlay_poll(3);
+    CHECK(nv2a_overlay_atlas_gen() != g0 && nv2a_ovl_font_symbols(), "baked again, symbols kept");
+    CHECK(nv2a_ovl_text_height(body) >= 2 * px0 - 1, "body %d px, was %d",
+          nv2a_ovl_text_height(body), px0);
+    n = nv2a_overlay_lists(ls);
+    for (int i = 0; i < n; i++) {
+        menu |= ls[i]->layer == NV2A_OVL_MENU;
+        stats |= ls[i]->layer == NV2A_OVL_STATS && ls[i]->atlas_gen == nv2a_overlay_atlas_gen();
+    }
+    CHECK(!menu && stats, "the old menu list left out (%d), the strip composed again (%d)", menu,
+          stats);
+    g1 = nv2a_overlay_atlas_gen();
+    nv2a_overlay_poll(4);
+    CHECK(nv2a_overlay_atlas_gen() == g1, "one bake per ask");
+    nv2a_overlay_set_ui_scale(1.0f);
+    nv2a_overlay_reset_for_test();
+}
+
 int main(void)
 {
     s_ref_out = getenv("OVERLAY_REF_OUT");
@@ -1167,6 +1267,8 @@ int main(void)
     test_view();
     test_display_scale();
     test_display_ready();
+    test_shown_size();
+    test_rebake();
     nv2a_overlay_reset_for_test();
     if (fails) {
         printf("overlay: %d failure(s)\n", fails);

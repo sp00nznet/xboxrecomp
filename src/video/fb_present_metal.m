@@ -884,13 +884,13 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
             }
         }
 #ifdef XBOXRECOMP_ENHANCE
-        /* Every overlay size comes from the frame's rectangle (the whole
-         * drawable before the first frame). */
-        if (r.w <= 0 || r.h <= 0) {
-            r.x = r.y = 0;
-            r.w = dw;
-            r.h = dh;
-        }
+        /* The overlay sits on the whole drawable, not the frame's
+         * rectangle: that follows render.scale, display.filter and
+         * present.shader, and the overlay's size and hit areas must follow
+         * none of them (D3D11 places on its back buffer). */
+        r.x = r.y = 0;
+        r.w = dw;
+        r.h = dh;
         nv2a_overlay_set_placement(r.x, r.y, r.w, r.h);
         /* Under internal the layer fits the drawable into the window after
          * this pass, so the pointer's window pixels map through that fit

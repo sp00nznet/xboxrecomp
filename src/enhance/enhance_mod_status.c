@@ -41,6 +41,7 @@ static unsigned char s_vk_down[VKS];
 /* The tick's own state: the flip thread is its only caller. */
 static uint32_t s_serial = ~0u;
 static int s_shown_device = -1, s_shown_family = -2, s_shown_w, s_shown_h;
+static uint64_t s_shown_atlas;      /* the atlas generation of the last compose */
 static uint64_t s_shown_ms;
 static int s_shown;
 /* Bumped by each stop, from whichever thread disarmed: a tick that sees
@@ -242,7 +243,8 @@ void enhance_mod_status_tick(int stopping)
         w = 1920, h = 1080;
     now = xbox_InputNowMs();
     if (s_shown && serial == s_serial && dev == s_shown_device && family == s_shown_family
-        && w == s_shown_w && h == s_shown_h && now - s_shown_ms < REFRESH_MS)
+        && w == s_shown_w && h == s_shown_h && nv2a_overlay_atlas_gen() == s_shown_atlas
+        && now - s_shown_ms < REFRESH_MS)
         return;
     if (serial != s_serial && !any_panel()) {
         s_serial = serial;
@@ -272,6 +274,7 @@ void enhance_mod_status_tick(int stopping)
     s_shown_family = family;
     s_shown_w = w;
     s_shown_h = h;
+    s_shown_atlas = nv2a_overlay_atlas_gen();
     s_shown_ms = now;
 }
 

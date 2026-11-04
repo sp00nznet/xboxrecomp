@@ -556,6 +556,7 @@ static const char s_ps_snap_src[] = NV2A_HLSL_PS_BASIC_SNAP;
 static const char s_vs_passthrough_src[] = NV2A_HLSL_VS_PASS;
 
 static void create_black_texture(void);
+static void internal_client(UINT fw, UINT fh, UINT *cw, UINT *ch);
 
 static int init(void)
 {
@@ -597,14 +598,18 @@ static int init(void)
     if (!xbox_FramebufferWindowTitleText(title, 192, &s_title_clock))
         title[0] = 0;
     if (internal) {
-        /* present.surface=internal: the surface is the frame, and a scaling
-         * compositor (gamescope) fits it to its output with its own filter.
-         * The screen size is not asked: under gamescope it is the output,
-         * and a surface that large leaves FSR nothing to upscale. */
+        /* present.surface=internal: the swap chain is the frame, and a
+         * scaling compositor (gamescope) fits the window to its output with
+         * its own filter. The window is the frame's size while that fits the
+         * screen (render.scale 1 on the Deck); above it internal_client
+         * holds the window to the screen and DXGI shrinks the frame into it,
+         * so the pointer reaches the whole window. */
+        UINT ww, wh;
         bw = nv2a_host_window_w(640, 480, nv2a_host_render_scale());
         bh = 480u * nv2a_host_render_scale();
-        r.right = (LONG)bw;
-        r.bottom = (LONG)bh;
+        internal_client(bw, bh, &ww, &wh);
+        r.right = (LONG)ww;
+        r.bottom = (LONG)wh;
     } else if (full) {
         /* present.fullscreen: borderless over the primary monitor (no HWND
          * yet to ask MonitorFromWindow), no exclusive mode. */
@@ -618,7 +623,9 @@ static int init(void)
     }
     if (full) {
         s_hwnd = CreateWindowW(L"" D3D11_WND_CLASS, title,
-                               WS_POPUP | WS_VISIBLE, 0, 0, (int)bw, (int)bh,
+                               WS_POPUP | WS_VISIBLE, 0, 0,
+                               internal ? (int)r.right : (int)bw,
+                               internal ? (int)r.bottom : (int)bh,
                                NULL, NULL, wc.hInstance, NULL);
     } else {
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
@@ -4307,6 +4314,30 @@ static void present_resize(void)
     fprintf(stderr, LOGP "window resized: swap chain %ux%u\n", s_back_w, s_back_h);
 }
 
+/* The client area for a present.surface=internal frame of fw x fh: the
+ * frame's own size, fitted into the screen when it is larger.
+ * Under gamescope the screen is Xwayland's, the size gamescope shows: a
+ * 1920x1440 window (render.scale 3) on the Deck's 1280x800 put its lower
+ * part and its right side past the pointer's reach, which X keeps on the
+ * screen, so a touch could not land on what the menu drew there. The
+ * swap chain stays the frame's size and DXGI shrinks it into the client
+ * area; the overlay's view (ovl_present) maps the pointer through that. */
+static void internal_client(UINT fw, UINT fh, UINT *cw, UINT *ch)
+{
+    UINT sw = (UINT)GetSystemMetrics(SM_CXSCREEN), sh = (UINT)GetSystemMetrics(SM_CYSCREEN);
+    *cw = fw;
+    *ch = fh;
+    if (!sw || !sh || !fw || !fh || (fw <= sw && fh <= sh))
+        return;
+    if ((uint64_t)fw * sh > (uint64_t)fh * sw) {
+        *cw = sw;
+        *ch = (UINT)(((uint64_t)fh * sw * 2 + fw) / ((uint64_t)fw * 2));
+    } else {
+        *ch = sh;
+        *cw = (UINT)(((uint64_t)fw * sh * 2 + fh) / ((uint64_t)fh * 2));
+    }
+}
+
 /* present.surface=internal after a render.scale change (the in-game menu):
  * the swap chain and the client area follow the frame's host size, so the
  * compositor keeps getting the whole frame rather than a scaling blit into
@@ -4321,10 +4352,14 @@ static void internal_resize(const RenderTarget *rt, UINT cw, UINT ch)
         return;
     if (cw != rt->w || ch != rt->h || !rt->hw || !rt->hh)
         return;
-    r.left = 0;
-    r.top = 0;
-    r.right = (LONG)rt->hw;
-    r.bottom = (LONG)rt->hh;
+    {
+        UINT ww, wh;
+        internal_client(rt->hw, rt->hh, &ww, &wh);
+        r.left = 0;
+        r.top = 0;
+        r.right = (LONG)ww;
+        r.bottom = (LONG)wh;
+    }
     if (!nv2a_host_opts()->fullscreen)
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     SetWindowPos(s_hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
@@ -4362,7 +4397,7 @@ static void present_extent(RenderTarget *rt, UINT *w, UINT *h)
  * present.surface=internal the back buffer is the frame: the crop fills it,
  * point-sampled for integer as Metal's internal present is. */
 #ifdef XBOXRECOMP_ENHANCE
-static struct nv2a_rect s_ovl_place;    /* the overlay's: the frame in the back buffer */
+static struct nv2a_rect s_ovl_place;    /* where this present put the frame; 0x0: nothing copied */
 #endif
 static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int internal)
 {
@@ -5064,13 +5099,15 @@ static int ovl_fill(ID3D11Buffer **b, UINT *cap, UINT bind, const void *src, UIN
     return 1;
 }
 
+static int s_gamescope = -1;   /* RENV_HOST_GAMESCOPE, read at the first present */
+
 /* After dump_frame, before Present. On the stock copy path this is the
  * only draw into the back buffer: it binds its own target and viewport
  * and leaves the draw path's state shadow stale, as present_blit does. */
 static void ovl_present(void)
 {
     const struct nv2a_ovl_list *ls[NV2A_OVL_COUNT];
-    struct nv2a_rect r = s_ovl_place;
+    struct nv2a_rect r;
     ID3D11ShaderResourceView *none = NULL;
     D3D11_VIEWPORT vp;
     UINT stride = sizeof(struct nv2a_ovl_vtx), off = 0, cb_cap = 16;
@@ -5079,14 +5116,16 @@ static void ovl_present(void)
 
     if (!s_back || !nv2a_overlay_armed())
         return;
-    int copied = r.w > 0 && r.h > 0;
+    int copied = s_ovl_place.w > 0 && s_ovl_place.h > 0;
 
     nv2a_overlay_set_presenter("D3D11");
-    if (!copied) {
-        r.x = r.y = 0;
-        r.w = (int32_t)s_back_w;
-        r.h = (int32_t)s_back_h;
-    }
+    /* The whole back buffer, not the frame's rectangle in it: the frame's
+     * size follows render.scale, display.filter and present.shader (its
+     * scale passes), and the overlay's size and hit areas must follow none
+     * of them. Metal places on the whole drawable the same way. */
+    r.x = r.y = 0;
+    r.w = (int32_t)s_back_w;
+    r.h = (int32_t)s_back_h;
     nv2a_overlay_set_placement(r.x, r.y, r.w, r.h);
     /* A back buffer of another size than the client area is stretched into
      * it by DXGI (the legacy description's scaling): under
@@ -5100,6 +5139,15 @@ static void ovl_present(void)
             nv2a_overlay_set_view(0, 0, (int)vw, (int)vh, (int)s_back_w, (int)s_back_h);
         else
             nv2a_overlay_set_view(0, 0, 0, 0, 0, 0);
+        /* Under gamescope the client area is scaled once more, to fit the
+         * screen: the overlay sizes by the lines shown there, so the menu
+         * keeps its size at any render.scale. */
+        if (s_gamescope < 0)
+            s_gamescope = recomp_env_on(RENV_HOST_GAMESCOPE) ? 1 : 0;
+        if (s_gamescope && vw && vh)
+            nv2a_overlay_set_compositor((int)vw, (int)vh);
+        else
+            nv2a_overlay_set_compositor(0, 0);
     }
     nv2a_overlay_poll(GetTickCount64());
     if (!nv2a_overlay_visible() || !(n = nv2a_overlay_lists(ls)) || !ovl_init())
@@ -5476,9 +5524,11 @@ static void fullscreen_switch(int full)
         }
         mi.cbSize = sizeof mi;
         if (internal) {
+            UINT ww, wh;
+            internal_client(s_back_w, s_back_h, &ww, &wh);
             r.left = r.top = 0;
-            r.right = (LONG)s_back_w;
-            r.bottom = (LONG)s_back_h;
+            r.right = (LONG)ww;
+            r.bottom = (LONG)wh;
         } else if (GetMonitorInfoW(MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
             r = mi.rcMonitor;
         } else {
@@ -5489,9 +5539,12 @@ static void fullscreen_switch(int full)
         SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_POPUP | WS_VISIBLE));
     } else {
         if (internal || !s_have_windowed) {
+            UINT ww = nv2a_host_window_w(640, 480, 1), wh = 480;
+            if (internal)
+                internal_client(s_back_w, s_back_h, &ww, &wh);
             r.left = r.top = 0;
-            r.right = internal ? (LONG)s_back_w : (LONG)nv2a_host_window_w(640, 480, 1);
-            r.bottom = internal ? (LONG)s_back_h : 480;
+            r.right = (LONG)ww;
+            r.bottom = (LONG)wh;
             AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
             OffsetRect(&r, 64 - r.left, 64 - r.top);
         } else {

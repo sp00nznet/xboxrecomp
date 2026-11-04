@@ -610,8 +610,10 @@ static SDL_Texture *ovl_texture(SDL_Renderer *ren, uint16_t k)
     return s_ovl_tex[k];
 }
 
-/* The visible lists over the frame at place (output pixels), after the
- * frame and before the shot, so a window shot has them. */
+/* The visible lists over the whole output at place (output pixels, not
+ * the frame's rectangle, so render.scale and the filter leave the size
+ * alone), after the frame and before the shot, so a window shot
+ * has them. */
 static void ovl_draw(SDL_Renderer *ren, const SDL_FRect *place)
 {
     const struct nv2a_ovl_list *ls[NV2A_OVL_COUNT];
@@ -1159,16 +1161,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 SDL_RenderTexture(ren, tex, NULL, NULL);
 #ifdef XBOXRECOMP_ENHANCE
             if (nv2a_overlay_visible()) {
+                /* The whole output, not the frame's rectangle, as D3D11 and
+                 * Metal: the overlay's size must not follow the filter or
+                 * the frame's scale. */
                 SDL_FRect pl = {0, 0, 0, 0};
                 int ow = 0, oh = 0;
-                if (tex && filter == NV2A_PRESENT_INTEGER && dst_ok)
-                    pl = dst;
-                else if (!tex || !SDL_GetRenderLogicalPresentationRect(ren, &pl)
-                         || pl.w <= 0) {
-                    SDL_GetCurrentRenderOutputSize(ren, &ow, &oh);
-                    pl.w = (float)ow;
-                    pl.h = (float)oh;
-                }
+                SDL_GetCurrentRenderOutputSize(ren, &ow, &oh);
+                pl.w = (float)ow;
+                pl.h = (float)oh;
                 ovl_draw(ren, &pl);
             }
 #endif

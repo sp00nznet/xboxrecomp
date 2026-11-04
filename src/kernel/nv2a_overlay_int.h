@@ -34,13 +34,32 @@ extern const struct nv2a_ovl_theme nv2a_ovl_theme_default;
 /* The most any scale reaches: the bound the atlas is proven to fit at
  * (the overlay ctest's test_fit bakes 2048x2048 at it, symbols in). */
 #define OVL_UI_SCALE_MAX 3.0f
-/* clamp(max(clamp(out_h / 1080, 0.5, 3.0), fit) * overlay.ui_scale,
- * 0.5, OVL_UI_SCALE_MAX) (nv2a_overlay_set_ui_scale), where fit is the display's
- * floor in output pixels (nv2a_ovl_display_floor, times the output's
- * pixels per window pixel under present.surface = internal), held to
- * out_h / 600 so at least 600 token lines fit; 0 under ui_fit = output or
- * with no display known. */
+/* The scale in the lines the player sees: clamp(max(clamp(lines / 1080,
+ * 0.5, 3.0), fit) * overlay.ui_scale, 0.5, OVL_UI_SCALE_MAX)
+ * (nv2a_overlay_set_ui_scale), where fit is the display's floor
+ * (nv2a_ovl_display_floor) held to lines / 600 so at least 600 token
+ * lines fit; 0 under ui_fit = output or with no display known. The atlas
+ * is baked at it. */
+float nv2a_ovl_ui_scale_shown(uint32_t lines);
+/* The scale for a placement of out_h output lines, in output pixels:
+ * nv2a_ovl_ui_scale_shown of the lines it covers on the display
+ * (out_h / nv2a_ovl_shown_ratio) times the ratio. So the menu keeps its
+ * size on screen whatever render.scale makes the output's pixels under
+ * present.surface=internal. Past OVL_UI_SCALE_MAX only when an
+ * output pixel is smaller than a shown one; the glyphs are then drawn
+ * from the atlas grown, and the present shrinks them back. */
 float nv2a_ovl_ui_scale(uint32_t out_h);
+/* clamp(lines / 1080, 0.5, 3.0) in output pixels, the scale without the
+ * display's floor or the multiplier (the menu's compact panel compares
+ * to it). */
+float nv2a_ovl_ui_base(uint32_t out_h);
+/* Output pixels per pixel on the display: nv2a_ovl_view_ratio, over the
+ * compositor's fit of the window into the display when one scales it
+ * (nv2a_overlay_set_compositor). */
+float nv2a_ovl_shown_ratio(void);
+/* The factor a compositor scales a cw x ch window by to fit a dw x dh
+ * display, aspect kept; 1 when any is 0. Pure: the ctest pins it. */
+float nv2a_ovl_compositor_fit(uint32_t cw, uint32_t ch, uint32_t dw, uint32_t dh);
 /* The display's floor in its own pixels: the OS's UI scale,
  * and on a handheld its density over 160 ppi (Android's dp, the rule for
  * a screen held at arm's length; a desktop's 96 dpi is the theme's 1.0).

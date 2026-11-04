@@ -2432,7 +2432,7 @@ static void test_pages(void)
     /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Saves,
      * Files. Saves with no title yet: its rows hold no dates. */
     static const uint32_t k_sum[10] = {
-        0xF7235058u, 0xF5E5A2AAu, 0xD56F9851u, 0xF9F4DC86u, 0x39FA9CFAu,
+        0xD2D6070Cu, 0xF5E5A2AAu, 0xD56F9851u, 0xF9F4DC86u, 0x39FA9CFAu,
         0x0813383Bu, 0xFB3B6519u, 0xCC7407C7u, 0x7B5D7063u, 0x7778B546u };
     /* Files shows Open exports folder only off Game Mode. */
     set_env("RECOMP_HOST_GAMESCOPE", NULL);
@@ -3434,7 +3434,8 @@ static void test_header_game(void)
     open_menu();
 }
 
-/* The overlay scale row: restart class, quarter steps. */
+/* The overlay scale and fit rows: live, quarter steps, a step
+ * sets the scale at once and Cancel puts it back. */
 static void test_ui_scale_row(void)
 {
     start_with(ARMED, k_mods);
@@ -3444,9 +3445,18 @@ static void test_ui_scale_row(void)
     for (int i = 0; i < enhance_menu_rows(); i++) {
         char lb[96];
         enhance_menu_row(i, lb, sizeof lb, NULL, 0, NULL);
-        if (!strcmp(lb, "Overlay scale"))
-            CHECK(enhance_menu_row_live(i) == ENHANCE_LIVE_RESTART);
+        if (!strcmp(lb, "Overlay scale") || !strcmp(lb, "Overlay fit"))
+            CHECK(enhance_menu_row_live(i) == ENHANCE_LIVE);
     }
+    nv2a_overlay_set_ui_fit(0);
+    CHECK(nv2a_ovl_ui_scale(1080) == 1.0f);
+    CHECK(enhance_menu_select_row("Overlay scale"));
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    CHECK(!strcmp(row_value("Overlay scale"), "1.25"));
+    CHECK(nv2a_ovl_ui_scale(1080) == 1.25f);
+    enhance_menu_revert();
+    CHECK(nv2a_ovl_ui_scale(1080) == 1.0f);
+    nv2a_overlay_set_ui_fit(1);
     open_menu();
 }
 
@@ -4517,6 +4527,41 @@ static void test_pointer_view(void)
     CHECK(!enhance_menu_is_open());
 }
 
+/* The Deck's report: render.scale 3 under present.surface =
+ * internal is a 1920x1440 back buffer shrunk into a window held to the
+ * 1067x800 screen. A touch on the size button, then on the expanded
+ * panel's Save at the far bottom-right, lands on what is drawn there. */
+#define HELD_X(x) (((x) * 1067 + 960) / 1920)
+#define HELD_Y(y) (((y) * 800 + 720) / 1440)
+static void test_pointer_held(void)
+{
+    const struct menu_layout *l;
+    start_with(ARMED, k_mods);
+    nv2a_overlay_set_placement(0, 0, 1920, 1440);
+    nv2a_overlay_set_view(0, 0, 1067, 800, 1920, 1440);
+    open_menu();
+    CHECK(enhance_menu_set_page("Render"));
+    change_scale();
+    l = lay_now();
+    CHECK(enhance_menu_size() == 0);
+    ptr_tap(XBOX_POINTER_LEFT, HELD_X(CX(l->hbtn[MENU_HB_SIZE])), HELD_Y(CY(l->hbtn[MENU_HB_SIZE])));
+    CHECK(enhance_menu_size() == 1);
+    l = lay_now();
+    CHECK(l->fbtn[MENU_FB_SAVE].x + l->fbtn[MENU_FB_SAVE].w > 1920 * 3 / 4 &&
+          l->fbtn[MENU_FB_SAVE].y > 1440 * 3 / 4);
+    CHECK(enhance_menu_unsaved() == 1);
+    ptr_tap(XBOX_POINTER_LEFT, HELD_X(CX(l->fbtn[MENU_FB_SAVE])), HELD_Y(CY(l->fbtn[MENU_FB_SAVE])));
+    CHECK(enhance_menu_unsaved() == 0);
+    l = lay_now();
+    ptr_tap(XBOX_POINTER_LEFT, HELD_X(CX(l->hbtn[MENU_HB_SIZE])), HELD_Y(CY(l->hbtn[MENU_HB_SIZE])));
+    CHECK(enhance_menu_size() == 0);
+    l = lay_now();
+    ptr_tap(XBOX_POINTER_LEFT, HELD_X(CX(l->hbtn[MENU_HB_CLOSE])), HELD_Y(CY(l->hbtn[MENU_HB_CLOSE])));
+    CHECK(!enhance_menu_is_open());
+    nv2a_overlay_set_view(0, 0, 0, 0, 0, 0);
+    nv2a_overlay_set_placement(0, 0, 1920, 1080);
+}
+
 /* A slider drag answers a pending ask with no, as the pad's step does. */
 static void test_drag_cancels_ask(void)
 {
@@ -5379,6 +5424,7 @@ int main(int argc, char **argv)
     test_back_keys();
     test_osk_pointer();
     test_pointer_view();
+    test_pointer_held();
     test_drag_cancels_ask();
     test_tooltip();
     test_hints_key();

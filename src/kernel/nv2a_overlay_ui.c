@@ -52,7 +52,7 @@ float nv2a_overlay_set_ui_scale(float mul)
         mul = 0.75f;
     if (mul > 2.0f)
         mul = 2.0f;
-    s_ui_mul = mul;
+    __atomic_store(&s_ui_mul, &mul, __ATOMIC_RELAXED);
     return mul;
 }
 
@@ -65,7 +65,7 @@ static struct nv2a_ovl_display s_disp;
 static nv2a_ovl_display_probe s_probe;
 static int s_probed;
 
-void nv2a_overlay_set_ui_fit(int display) { s_ui_fit = !!display; }
+void nv2a_overlay_set_ui_fit(int display) { __atomic_store_n(&s_ui_fit, !!display, __ATOMIC_RELAXED); }
 
 void nv2a_overlay_set_display_probe(nv2a_ovl_display_probe fn)
 {
@@ -155,47 +155,106 @@ static void probe_once(void)
 
 int nv2a_ovl_display_reprobe(void)
 {
-    if (!s_ui_fit || s_probed)
+    if (s_probed)
         return 0;
     probe_once();
-    return s_probed && s_disp.h != 0;
+    return s_probed && s_disp.h != 0 && __atomic_load_n(&s_ui_fit, __ATOMIC_RELAXED);
 }
 
 uint32_t nv2a_ovl_bake_lines(uint32_t out_h)
 {
-    if (!s_ui_fit)
-        return out_h;
+    /* Probed under ui_fit = output too: a compositor's fit
+     * (nv2a_overlay_set_compositor) needs the display's size. */
     probe_once();
+    if (!__atomic_load_n(&s_ui_fit, __ATOMIC_RELAXED))
+        return out_h;
     return s_disp.h ? s_disp.h : out_h;
 }
 
-float nv2a_ovl_ui_scale(uint32_t out_h)
+/* The client area scaled to the display by a compositor
+ * (gamescope under present.surface=internal), as cw | ch << 32; 0 for
+ * none. The presenter stores it at each present. */
+static uint64_t s_comp;
+
+void nv2a_overlay_set_compositor(int cw, int ch)
 {
-    float s = (float)out_h / 1080.0f;
-    if (s < 0.5f)
-        s = 0.5f;
-    if (s > 3.0f)
-        s = 3.0f;
-    if (s_ui_fit && out_h) {
-        /* The display's floor is in window pixels; under present.surface
-         * = internal the lists are drawn in the output's and scaled. A
-         * small window keeps 600 token lines (a list page and its footer)
-         * rather than the display's size. */
-        float f = nv2a_ovl_display_floor(&s_disp) * nv2a_ovl_view_ratio();
-        float cap = (float)out_h / 600.0f;
+    uint64_t v = cw > 0 && ch > 0 ? (uint64_t)(uint32_t)cw | (uint64_t)(uint32_t)ch << 32 : 0;
+    if (__atomic_load_n(&s_comp, __ATOMIC_RELAXED) != v)
+        __atomic_store_n(&s_comp, v, __ATOMIC_RELAXED);
+}
+
+float nv2a_ovl_compositor_fit(uint32_t cw, uint32_t ch, uint32_t dw, uint32_t dh)
+{
+    float kw, kh;
+    if (!cw || !ch || !dw || !dh)
+        return 1.0f;
+    kw = (float)dw / (float)cw;
+    kh = (float)dh / (float)ch;
+    return kw < kh ? kw : kh;
+}
+
+float nv2a_ovl_shown_ratio(void)
+{
+    float r = nv2a_ovl_view_ratio();
+    uint64_t c = __atomic_load_n(&s_comp, __ATOMIC_RELAXED);
+    if (c) {
+        float k = nv2a_ovl_compositor_fit((uint32_t)c, (uint32_t)(c >> 32), s_disp.w, s_disp.h);
+        if (k > 0)
+            r /= k;
+    }
+    return r > 0 && r == r ? r : 1.0f;
+}
+
+static float base_at(float lines)
+{
+    float s = lines / 1080.0f;
+    return s < 0.5f ? 0.5f : s > 3.0f ? 3.0f : s;
+}
+
+float nv2a_ovl_ui_scale_shown(uint32_t lines)
+{
+    float s = base_at((float)lines), mul;
+    if (__atomic_load_n(&s_ui_fit, __ATOMIC_RELAXED) && lines) {
+        /* A small window keeps 600 token lines (a list page and its
+         * footer) rather than the display's size. */
+        float f = nv2a_ovl_display_floor(&s_disp);
+        float cap = (float)lines / 600.0f;
         if (f > cap)
             f = cap;
         if (f > s)
             s = f;
     }
     /* The outer clamp: 4K at 2.0, or a Retina floor of 2 at 1.5, would
-     * ask for 4.0, past what the atlas holds; 480 lines at 0.75 for text under the smallest size it packs. */
-    s *= s_ui_mul;
+     * ask for 4.0, past what the atlas holds; 480 lines at 0.75 for text
+     * under the smallest size it packs. */
+    __atomic_load(&s_ui_mul, &mul, __ATOMIC_RELAXED);
+    s *= mul;
     if (s < 0.5f)
         s = 0.5f;
     if (s > OVL_UI_SCALE_MAX)
         s = OVL_UI_SCALE_MAX;
     return s;
+}
+
+/* The rule runs in the lines the player sees (the display's pixels the
+ * output covers) and comes back in the output's: the lists are built in
+ * the output's pixels, and present.surface=internal makes those the
+ * render target's, render.scale times 480. Scaling there kept the menu at
+ * a size in render-target pixels, so a larger render.scale drew it
+ * smaller on screen. */
+float nv2a_ovl_ui_scale(uint32_t out_h)
+{
+    float r = nv2a_ovl_shown_ratio();
+    uint32_t lines = (uint32_t)((float)out_h / r + 0.5f);
+    if (out_h && !lines)
+        lines = 1;
+    return nv2a_ovl_ui_scale_shown(lines) * r;
+}
+
+float nv2a_ovl_ui_base(uint32_t out_h)
+{
+    float r = nv2a_ovl_shown_ratio();
+    return base_at((float)out_h / r) * r;
 }
 
 int nv2a_ovl_px(float s, int token)
