@@ -45,6 +45,7 @@ set(KERNEL_SOURCES
     nv2a_opts_at.c
     nv2a_aspect.c
     nv2a_tex_pack.c
+    nv2a_tex_dump.c
     nv2a_vsh_cpu.c
     nv2a_vsh_ff.c
     nv2a_vsh_cdump.c

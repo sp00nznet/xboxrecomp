@@ -51,6 +51,7 @@
 #include "nv2a_backend_common.h"
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
+#include "nv2a_tex_dump.h"
 #ifdef XBOXRECOMP_ENHANCE
 #include "nv2a_dbg_draw.h"
 #include "nv2a_overlay.h"
@@ -1902,10 +1903,18 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
         levels = t->levels;
         bc3 = 0;
     }
+    /* RECOMP_DEBUG=tex_dump writes the guest's texels, never the pack's:
+     * under a hit they are decoded for it alone, once. s_texels is free
+     * for that, since src points into the pack's buffer. */
+    if (src && nv2a_tex_dump_on())
+        nv2a_tex_dump_upload(t, hash, nv2a_tex_dump_wants(t, hash) && decode_texture(t)
+                                      ? s_texels : NULL);
     if (!src) {
         if (!decode_texture(t) || !tex_alloc(e, width, height, levels, 0))
             return 0;
         src = s_texels;
+        if (nv2a_tex_dump_on())
+            nv2a_tex_dump_upload(t, hash, s_texels);
     }
     /* BC3 levels go up as they are, one row of 4x4 blocks per pitch. */
     p = (const uint8_t *)src;
@@ -2580,6 +2589,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
                 pc.alpha_only[n] = 2;
             srv[n] = src->srv;
             s_rtt_binds++;
+            nv2a_tex_dump_rt(t);
             textured = 1;
         } else if (t->mode && t->mode != 4) {
             srv[n] = tex_bind(t);
@@ -4148,6 +4158,7 @@ static void flip_log(uint32_t surface_offset)
                     p_occ, p_occ_vis, p_occ_us, p_occ_late, p_occ_super,
                     p_occ_set, p_occ_stale, p_occ_first, p_loop;
     static int zt = -1;
+    nv2a_tex_dump_flip(s_presents);
     /* With a pack, its hit count every 600 flips, flip trace or not. */
     if (nv2a_tex_pack_count() && s_presents % 600 == 0) {
         fprintf(stderr, LOGP "textures.pack: %llu hits so far\n",

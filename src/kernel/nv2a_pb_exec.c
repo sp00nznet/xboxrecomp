@@ -7114,6 +7114,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 && (s_backend == &s_cpu_backend || s_backend == &s_null_backend))
             fprintf(stderr, "[ENHANCE] textures.pack ignored: the CPU rasteriser"
                     " samples guest memory\n");
+        /* The texture dump hooks the GPU backends' uploads; the CPU path
+         * keeps its first-use BMPs under the same entry instead. */
+        if (recomp_env(RENV_TEX_DUMP)
+                && (s_backend == &s_cpu_backend || s_backend == &s_null_backend))
+            fprintf(stderr, "[TEXDUMP] the CPU rasteriser does not write the texture"
+                    " dump (<hash>.xtd); tex_dump is its BMP file prefix here\n");
     }
     s_perf.methods++;
     /* One flip's method stream, to see what a heavy flip spends its batches

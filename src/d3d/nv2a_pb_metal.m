@@ -86,6 +86,7 @@
 #include "nv2a_backend_common.h"
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
+#include "nv2a_tex_dump.h"
 #include "d3d8_msl.h"
 #include "nv2a_basic_msl.h"
 #include "metal_compile.h"
@@ -1365,11 +1366,28 @@ static id<MTLTexture> tex_upload(const Stage *t, uint64_t hash)
     return tex;
 }
 
-static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash)
+/* The guest texels of t into s_texels, or 0 when it cannot grow. */
+static int tex_decode_guest(const Stage *t)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
     const uint32_t *pal = NULL;
+    if (n > s_texels_cap) {
+        uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
+        if (!p)
+            return 0;
+        s_texels = p;
+        s_texels_cap = n;
+    }
+    if (t->color == NV2A_TEX_P8)
+        pal = (const uint32_t *)(mem + t->palette);
+    nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
+                    t->levels, pal, pal ? t->pal_len : 0, s_texels);
+    return 1;
+}
+
+static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash)
+{
     id<MTLTexture> tex = nil;
 
     if (nv2a_tex_pack_count()) {
@@ -1388,19 +1406,17 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash)
         /* A refused entry is a miss too, tagged so in the trace. */
         if (!tex)
             nv2a_tex_pack_miss(hash, t->width, t->height, t->color, t->levels);
+        /* RECOMP_DEBUG=tex_dump writes the guest's texels, never the
+         * pack's: under a hit they are decoded for it alone, once. */
+        else if (nv2a_tex_dump_on())
+            nv2a_tex_dump_upload(t, hash, nv2a_tex_dump_wants(t, hash)
+                                          && tex_decode_guest(t) ? s_texels : NULL);
     }
     if (!tex) {
-        if (n > s_texels_cap) {
-            uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
-            if (!p)
-                return nil;
-            s_texels = p;
-            s_texels_cap = n;
-        }
-        if (t->color == NV2A_TEX_P8)
-            pal = (const uint32_t *)(mem + t->palette);
-        nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
-                        t->levels, pal, pal ? t->pal_len : 0, s_texels);
+        if (!tex_decode_guest(t))
+            return nil;
+        if (nv2a_tex_dump_on())
+            nv2a_tex_dump_upload(t, hash, s_texels);
         tex = tex_make(t->width, t->height, t->levels, s_texels, 0);
         if (!tex)
             return nil;
@@ -2383,6 +2399,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     else
                         padded_rt = 1;
                     s_rtt_binds++;
+                    nv2a_tex_dump_rt(t);
                 } else {
                     stex[k] = tex_bind(t);
                     if (nv2a_aspect_picture(t->width, rt->w, bump_src >> k & 1))
@@ -3291,6 +3308,7 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
                 s_sh_flip.lib, s_sh_flip.lib_ns / 1e6, s_sh_flip.pso, s_sh_flip.pso_ns / 1e6,
                 s_sh_flip.tex, s_sh_flip.tex_ns / 1e6);
     memset(&s_sh_flip, 0, sizeof s_sh_flip);
+    nv2a_tex_dump_flip(s_presents);
     /* With a pack, its hit count every 600 flips, flip trace or not. */
     if (nv2a_tex_pack_count() && s_presents % 600 == 0) {
         fprintf(stderr, LOGP "textures.pack: %llu hits so far\n",

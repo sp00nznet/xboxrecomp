@@ -299,7 +299,7 @@ extern "C" {
     X(WINDOW_SHOT_PREFIX, DEBUG, "window_shot_prefix", "RECOMP_WINDOW_SHOT_PREFIX", "=prefix: window shot files") \
     X(OPTS_AT,           DEBUG, "opts_at",         NULL,                       "=flip:key=value,...: live option requests at those flips, as the in-game menu makes them (scale, filter, fullscreen, aniso, movie, overscan, snap_2d, pacing)") \
     X(MOD_SET_AT,        DEBUG, "mod_set_at",      NULL,                       "=frame:key=value,...: mod settings changed live from the flip tick once the guest reaches that xbox_mod_frame count, as the Mods page does (needs the menu armed)") \
-    X(TEX_DUMP,          DEBUG, "tex_dump",        "RECOMP_TEX_DUMP",          "=prefix: textures, first use") \
+    X(TEX_DUMP,          DEBUG, "tex_dump",        "RECOMP_TEX_DUMP",          "=dir: Metal and D3D11 write each uploaded texture once per texel hash as <hash>.xtd and <hash>.json, the hash a texture pack matches (docs/formats/texture-dump.md); the CPU rasteriser writes first-use BMPs with it as a file prefix instead") \
     X(TEX_DUMP_EVERY,    DEBUG, "tex_dump_every",  "RECOMP_TEX_DUMP_EVERY",    "=n: tex_dump every nth bind too") \
     X(VSH_DUMP,          DEBUG, "vsh_dump",        "RECOMP_VSH_DUMP",          "=prefix: vertex programs, raw, once each (every backend)") \
     X(VSH_CONST_DUMP,    DEBUG, "vsh_const_dump",  NULL,                       "=path: every program batch's constants c[0..191] with its flip, draw and program hash, one file (src/kernel/nv2a_vsh_cdump.h); stops at 256 MB") \

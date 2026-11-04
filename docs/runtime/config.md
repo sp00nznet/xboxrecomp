@@ -824,6 +824,22 @@ declares `OriginalSize` in its uniform block) is not a read.
   flip: the backends upload again every texture made under the old
   setting. A golden run must show
   `textures.pack=none`: the golden check fails any other value.
+- **Texture dump: `RECOMP_DEBUG=tex_dump=<dir>`.** Not a config key: a
+  debug entry, off by default. The Metal and D3D11 backends write every
+  texture they upload into `<dir>` once per texel hash, the hash a pack
+  entry replaces: `<hash>.xtd` (the decoded A8R8G8B8 levels behind a
+  64-byte header) and `<hash>.json` (size, levels, format, layout,
+  palette, wrap, filters, address, first flip), with `counts.json` and
+  `volatile.json` beside them ([texture-dump.md](../formats/texture-dump.md)).
+  Under a pack hit the guest texels are decoded for the dump, so it
+  always holds the game's own texture. Linear textures get their
+  sidecar only; an address that takes more than 8 hashes, a render
+  target bound as a texture and a texture over 16384 are counted, not
+  written. A `[TEXDUMP]` line every 600 flips and at exit gives the
+  counts. A run writes at most 2048 MiB, then the dump stops with one
+  line. The CPU rasteriser keeps its first-use BMPs under the same
+  entry and says it does not write the dump. The dump holds game
+  texels: keep it out of anything published.
 
 ### Input
 
