@@ -2345,6 +2345,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/input/keyboard.c | - | s_walk_code | file_static | keep | - | host keyboard state and bindings |
 | src/input/keyboard.c | - | s_walk_scale | file_static | keep | - | host keyboard state and bindings |
 | src/input/keyboard.c | - | s_kb_enable | file_static | keep | - | host keyboard state and bindings |
+| src/input/keyboard.c | - | s_square_left | file_static | keep | - | host keyboard state and bindings |
 | src/input/keyboard.c | - | s_layout | file_static | keep | - | host keyboard state and bindings |
 | src/input/keyboard.c | compose | packet | local_static | keep | - | host keyboard state and bindings |
 | src/input/keyboard.c | compose | s_dir | local_static | keep | - | host keyboard state and bindings |

@@ -47,6 +47,7 @@ static void fresh(void)
     xbox_InputKeysClear();
     xbox_InputBindingsReset();
     xbox_InputKeyboardOpts(0, 0, 1.0);
+    xbox_InputSetPadSetup(NULL);
     xbox_InputMouseOpts(NULL);
     xbox_InputMouseReset();
     xbox_InputKeyboardEnable(1);
@@ -230,6 +231,58 @@ static void test_compiled_rows(void)
             CHECK(memcmp(&a.Gamepad, &(XBOX_GAMEPAD){0}, sizeof a.Gamepad),
                   "row %s (vk 0x%02X) drives nothing", xbox_key_map[r].keys, vk);
         }
+    xbox_InputKeysClear();
+}
+
+/* input.pad_square_left keeps the left pair's ramped corner at full on
+ * each axis; the right pair, the option off and a held walk key keep
+ * 1/sqrt 2, and with the ramp off every key is full (or walk_scale) on its
+ * axis either way. The bit arrives through the pad setup, as the config
+ * and the menu install it. */
+static void test_square_left(void)
+{
+    static const struct { int ramp, square, walk, lx, ly, rx, ry; } rows[] = {
+        { 60, 1, 0, 32767, 32767, 23170, 23170 },
+        { 60, 0, 0, 23170, 23170, 23170, 23170 },
+        {  0, 1, 0, 32767, 32767, 32767, 32767 },
+        {  0, 0, 0, 32767, 32767, 32767, 32767 },
+        /* walk_scale 0.5: 0.5 / sqrt 2 on a ramped corner, 0.5 unramped. */
+        { 60, 1, 1, 11585, 11585, 11585, 11585 },
+        { 60, 0, 1, 11585, 11585, 11585, 11585 },
+        {  0, 1, 1, 16383, 16383, 16383, 16383 },
+        {  0, 0, 1, 16383, 16383, 16383, 16383 },
+    };
+    XBOX_INPUT_STATE s;
+
+    for (size_t i = 0; i < sizeof rows / sizeof rows[0]; i++) {
+        xbox_pad_setup ps;
+
+        fresh();
+        bind_only(INPUT_LSTICK_UP, "W");
+        bind_only(INPUT_LSTICK_RIGHT, "D");
+        bind_only(INPUT_RSTICK_UP, "Up");
+        bind_only(INPUT_RSTICK_RIGHT, "Right");
+        xbox_InputKeyboardOpts(rows[i].ramp, code_of("LAlt"), 0.5);
+        xbox_PadSetupIdentity(&ps);
+        ps.square_left = (uint8_t)rows[i].square;
+        xbox_InputSetPadSetup(&ps);
+        xbox_InputKeyEvent(code_of("W"), 1);
+        xbox_InputKeyEvent(code_of("D"), 1);
+        xbox_InputKeyEvent(code_of("Up"), 1);
+        xbox_InputKeyEvent(code_of("Right"), 1);
+        if (rows[i].walk)
+            xbox_InputKeyEvent(code_of("LAlt"), 1);
+        s = state(1, 0);                 /* the ramp runs from this poll */
+        f_now += 100;
+        s = state(1, 0);
+        CHECK(NEAR(s.Gamepad.sThumbLX, rows[i].lx) && NEAR(s.Gamepad.sThumbLY, rows[i].ly),
+              "ramp %d square %d walk %d W + D: (%d, %d)", rows[i].ramp, rows[i].square,
+              rows[i].walk, s.Gamepad.sThumbLX, s.Gamepad.sThumbLY);
+        CHECK(NEAR(s.Gamepad.sThumbRX, rows[i].rx) && NEAR(s.Gamepad.sThumbRY, rows[i].ry),
+              "ramp %d square %d walk %d Up + Right: (%d, %d)", rows[i].ramp, rows[i].square,
+              rows[i].walk, s.Gamepad.sThumbRX, s.Gamepad.sThumbRY);
+    }
+    xbox_InputSetPadSetup(NULL);
     xbox_InputKeysClear();
 }
 
@@ -875,6 +928,7 @@ int main(void)
     test_bindings();
     test_compiled_rows();
     test_ramp();
+    test_square_left();
     test_sides();
     test_wheel();
     test_mouse_model();

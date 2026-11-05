@@ -105,6 +105,11 @@ void xbox_InputSetPadSetup(const xbox_pad_setup *s)
         c->extras = xbox_PadSetupNeedsExtras(s);
     }
     __atomic_store_n(&g_cfg, c, __ATOMIC_RELEASE);
+    /* The keys' diagonal follows the squared stick, or a ramped W + D
+     * would stay short of the corner the pad now reaches. A second atomic,
+     * not part of g_cfg: the setters (config load, the menu) never run at
+     * once, so the two cannot disagree past one poll. */
+    xbox_InputKeyboardSquareLeft(s && s->square_left);
 }
 
 void xbox_InputPadSetup(xbox_pad_setup *out)

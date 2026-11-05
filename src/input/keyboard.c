@@ -408,12 +408,18 @@ static int      s_walk_code;
 static double   s_walk_scale = 1.0;
 static uint64_t (*s_clock)(void);
 static int      s_kb_enable = -1;
+static int      s_square_left;   /* atomic; xbox_InputSetPadSetup's copy */
 
 void xbox_InputKeyboardOpts(int stick_ramp_ms, int walk_code, double walk_scale)
 {
     s_ramp_ms = stick_ramp_ms > 0 ? stick_ramp_ms : 0;
     s_walk_code = walk_code > 0 && walk_code < 256 ? walk_code : 0;
     s_walk_scale = walk_scale > 0.0 && walk_scale <= 1.0 ? walk_scale : 1.0;
+}
+
+void xbox_InputKeyboardSquareLeft(int on)
+{
+    __atomic_store_n(&s_square_left, on != 0, __ATOMIC_RELEASE);
 }
 
 int xbox_InputKeyboardWalkKey(void)
@@ -528,8 +534,16 @@ static void compose(XBOX_INPUT_STATE *out, const bind_set *t,
     if (o->ramp_ms > 0) {
         /* Two perpendicular keys give one key's magnitude, as a stick
          * pushed into a corner does. With the ramp off the keys stay what
-         * the compiled-in map always gave: full on each axis. */
-        for (int s = 0; s < 4; s += 2)
+         * the compiled-in map always gave: full on each axis. A square left
+         * stick (input.pad_square_left) keeps the left pair's corner at
+         * full on each axis, as the Duke's square gate and a squared pad
+         * read it; read live, since the menu toggles it without a Commit.
+         * Not while walking: a title that runs at the stick's length would
+         * then walk a diagonal at walk_scale * sqrt 2, far past a straight
+         * walk, so the walk keeps its round corner. */
+        int walking = keys && o->walk_code && s_key_down[o->walk_code];
+        int square = !walking && __atomic_load_n(&s_square_left, __ATOMIC_ACQUIRE);
+        for (int s = square ? 2 : 0; s < 4; s += 2)
             if (v[s] != 0.0 && v[s + 1] != 0.0) {
                 v[s] *= 0.70710678118654752440;   /* 1/sqrt 2 */
                 v[s + 1] *= 0.70710678118654752440;   /* 1/sqrt 2 */

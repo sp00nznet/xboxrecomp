@@ -156,6 +156,8 @@ and fails if the table below and the code disagree. Regenerate it with
   default off) stretch a host stick along its angle by
   `max(1, min(|v|, 32767) / max(|x|, |y|))`, so a round diagonal reaches
   the corner again; cardinals, the deadzone and -32768 are unchanged.
+  `_left` also keeps ramped left-stick keys' diagonal at the corner
+  (not with the walk key held).
 - SDL's stick Y points down and is inverted as `-1 - v`, so -32768 and
   32767 swap exactly (an SDL stick at rest reads -1 on Y).
 - SDL3 names the face buttons by position: `SOUTH`, `EAST`, `WEST` and
@@ -326,8 +328,9 @@ the pad from the runtime bindings: a control (`a`, `start`,
   `right_stick_left`, `right_stick_right`.
 - **Stick keys**: with `stick_ramp_ms` above 0 a stick key starts at 0.41 of
   full deflection (just past a 0.4 deadzone) and reaches full over that
-  time; two perpendicular keys give 1/√2 each, and the walk key caps the
-  magnitude at `walk_scale`. With 0, every key is full deflection as the
+  time; two perpendicular keys give 1/√2 each (the left pair stays full
+  under `input.pad_square_left`, as the squared pad does, except while
+  walking), and the walk key caps the magnitude at `walk_scale`. With 0, every key is full deflection as the
   table above gives.
 - **Mouse**: the counts since the last poll become a stick deflection
   (`min_deflection + (1 - min_deflection) · min(1, counts · sensitivity / 40)`),

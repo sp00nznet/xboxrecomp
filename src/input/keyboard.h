@@ -179,6 +179,11 @@ int  xbox_InputBindingsOf(int control, int *codes, int *is_mouse, int max);
  * walk_scale of full. Code defaults: 0, 0, 1.0. */
 #define XBOX_KBM_STICK_FLOOR 0.41
 void xbox_InputKeyboardOpts(int stick_ramp_ms, int walk_code, double walk_scale);
+/* input.pad_square_left for the keys: with the ramp on, two perpendicular
+ * left-stick keys stay full on each axis instead of 1/sqrt 2 of it.
+ * xbox_InputSetPadSetup sets it from the setup it installs; any thread,
+ * taken at the next poll. Default 0. */
+void xbox_InputKeyboardSquareLeft(int on);
 /* The walk key the last KeyboardOpts set (0: none), for the host actions'
  * check that an action key is not one the guest receives. */
 int  xbox_InputKeyboardWalkKey(void);
