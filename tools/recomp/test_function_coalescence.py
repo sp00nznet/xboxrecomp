@@ -44,7 +44,7 @@ def translator(body=CLAMP, splits=SPLITS):
 def test_repaired_clamp_matches_unsplit_translation():
     split = translator()
     old = split.translate_function(SPLITS[1], split.func_db[SPLITS[1]])
-    assert "if (_flags /* jge" in old
+    assert "/* eflags */" in old
     # Translation does not discover ownership, so it is safe to recover here.
     split.coalesce_function(BASE, END, SPLITS)
     repaired = split.translate_function(BASE, split.func_db[BASE])

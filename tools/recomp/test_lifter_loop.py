@@ -64,17 +64,16 @@ def test_loop_preserves_the_comparison_for_a_later_branch():
         assert "if (CMP_GE(_fas, _fbs)) goto loc_00010009;" in code, code
 
 
-def test_loope_without_a_tracked_setter_keeps_the_fallback():
-    # nop; loope +4; nops; ret -- nothing owns ZF, so the loop must not
-    # invent a termination condition, but ECX still counts down.
+def test_loope_without_a_local_setter_reads_the_caller_zero_flag():
+    # nop; loope +4; nops; ret -- ZF arrives from the caller.
     code = _translate(b"\x90\xE1\x04\x90\x90\x90\x90\xC3")
     assert "ecx -= 1;" in code, code
-    assert "(ecx != 0) && (_flags)" in code, code
+    assert "(ecx != 0) && ((g_eflags & 0x40u) /* eflags */)" in code, code
 
 
 if __name__ == "__main__":
     test_loop_counts_ecx_down_and_branches_on_it()
     test_loope_and_loopne_combine_the_counter_with_the_zero_flag()
     test_loop_preserves_the_comparison_for_a_later_branch()
-    test_loope_without_a_tracked_setter_keeps_the_fallback()
+    test_loope_without_a_local_setter_reads_the_caller_zero_flag()
     print("ok")
