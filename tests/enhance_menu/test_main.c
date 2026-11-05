@@ -1000,6 +1000,75 @@ static void test_mouse(void)
     open_menu();
 }
 
+/* ---- 6b. the Sticks group: input.pad_square_left / _right --------------- */
+
+static void test_sticks(void)
+{
+    xbox_pad_setup ps;
+    const char *f;
+    char l[96], v[128];
+    int n, at = -1;
+
+    start_with(ARMED, NULL);
+    xbox_InputPadSetup(&ps);
+    CHECK(!ps.square_left && !ps.square_right);
+    open_menu();
+    CHECK(enhance_menu_set_page("Controls"));
+    n = enhance_menu_rows();
+    for (int i = 0; i < n; i++) {
+        enhance_menu_row(i, l, sizeof l, v, sizeof v, NULL);
+        if (!strcmp(l, "Sticks"))
+            at = i;
+    }
+    CHECK(at > 0);
+    enhance_menu_row(at + 1, l, sizeof l, v, sizeof v, NULL);
+    CHECK(!strcmp(l, "Square left stick") && !strcmp(v, "false"));
+    enhance_menu_row(at + 2, l, sizeof l, v, sizeof v, NULL);
+    CHECK(!strcmp(l, "Square right stick") && !strcmp(v, "false"));
+
+    /* The toggle installs the setup at once, the other stick untouched. */
+    CHECK(enhance_menu_select_row("Square left stick"));
+    tap(0x27);
+    CHECK(!strcmp(row_value("Square left stick"), "true"));
+    xbox_InputPadSetup(&ps);
+    CHECK(ps.square_left && !ps.square_right);
+    {
+        const char *keys[4], *vals[4];
+        CHECK(enhance_menu_pending(keys, vals, 4) == 1);
+        CHECK(!strcmp(keys[0], "input.pad_square_left") && !strcmp(vals[0], "true"));
+    }
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "pad_square_left = true") != NULL);
+    CHECK(strstr(f, "pad_square_right") == NULL);
+    open_menu();
+
+    /* The input layer reads its knobs from the files as loaded, which Save
+     * leaves alone: a reload over the re-read file keeps the stick, and so
+     * does the next start. */
+    capture_begin();
+    enhance_cfg_init(".", NULL);
+    enhance_input_reload();
+    capture_end();
+    xbox_InputPadSetup(&ps);
+    CHECK(ps.square_left && !ps.square_right);
+    start_with(read_file("config/config.toml"), NULL);
+    xbox_InputPadSetup(&ps);
+    CHECK(ps.square_left && !ps.square_right);
+    open_menu();
+    CHECK(enhance_menu_set_page("Controls"));
+    CHECK(!strcmp(row_value("Square left stick"), "true"));
+
+    /* Back off: the key leaves the file and the setup is the identity. */
+    CHECK(enhance_menu_select_row("Square left stick"));
+    tap(0x27);
+    tap(VK_F5);
+    CHECK(strstr(read_file("config/config.toml"), "pad_square_left") == NULL);
+    xbox_InputPadSetup(&ps);
+    CHECK(xbox_PadSetupIsIdentity(&ps));
+    open_menu();
+}
+
 /* ---- 7. the miss snapshot ------------------------------------------------- */
 
 static void test_snapshot(void)
@@ -2433,7 +2502,7 @@ static void test_pages(void)
      * Files. Saves with no title yet: its rows hold no dates. */
     static const uint32_t k_sum[10] = {
         0xD2D6070Cu, 0xF5E5A2AAu, 0xD56F9851u, 0xF9F4DC86u, 0x39FA9CFAu,
-        0x0813383Bu, 0xFB3B6519u, 0xCC7407C7u, 0x7B5D7063u, 0x7778B546u };
+        0x0813383Bu, 0x05CA29ACu, 0xCC7407C7u, 0x7B5D7063u, 0x7778B546u };
     /* Files shows Open exports folder only off Game Mode. */
     set_env("RECOMP_HOST_GAMESCOPE", NULL);
     start_with(ARMED, k_mods);
@@ -5386,6 +5455,7 @@ int main(int argc, char **argv)
     test_ctl_swap();
     test_controls_groups();
     test_mouse();
+    test_sticks();
     test_snapshot();
     test_shaders();
     test_param_kinds();

@@ -585,6 +585,8 @@ static void pad_init(int none)
         (uint8_t)knob_int("input.pad_threshold", 1, 100, 50);
     s.invert_ly = (uint8_t)knob_bool("input.pad_invert_ly", 0);
     s.invert_ry = (uint8_t)knob_bool("input.pad_invert_ry", 0);
+    s.square_left = (uint8_t)knob_bool("input.pad_square_left", 0);
+    s.square_right = (uint8_t)knob_bool("input.pad_square_right", 0);
     if (env_dz && *env_dz && (dzl || dzr))
         fprintf(stderr, "[INPUT] config: input.pad_deadzone_%s wins over"
                 " RECOMP_PAD_DEADZONE=%s on the %s\n",
@@ -608,6 +610,8 @@ static void pad_init(int none)
             fprintf(stderr, " deadzone=%d/%d%%", dzl, dzr);
         if (s.invert_ly || s.invert_ry)
             fprintf(stderr, " invert=%s%s", s.invert_ly ? "ly" : "", s.invert_ry ? "ry" : "");
+        if (s.square_left || s.square_right)
+            fprintf(stderr, " square=%s%s", s.square_left ? "l" : "", s.square_right ? "r" : "");
         fputc('\n', stderr);
     }
 }

@@ -304,6 +304,28 @@ static const char *get_capture(const struct enhance_item *it, char *b, size_t n)
     return b;
 }
 
+/* input.pad_square_left / _right: a copy of the pad setup in force with
+ * one bit changed, installed whole; the poll reads it at the next frame.
+ * .user picks the stick (0 left, 1 right). */
+static void set_square(const struct enhance_item *it, const char *v)
+{
+    xbox_pad_setup s;
+    xbox_InputPadSetup(&s);
+    if (it->user)
+        s.square_right = (uint8_t)on_text(v);
+    else
+        s.square_left = (uint8_t)on_text(v);
+    xbox_InputSetPadSetup(&s);
+}
+
+static const char *get_square(const struct enhance_item *it, char *b, size_t n)
+{
+    xbox_pad_setup s;
+    xbox_InputPadSetup(&s);
+    snprintf(b, n, "%s", (it->user ? s.square_right : s.square_left) ? "true" : "false");
+    return b;
+}
+
 /* display.hud_margin: a plain store the HUD layer reads per call. */
 static void set_hud_margin(const struct enhance_item *it, const char *v)
 {
@@ -418,6 +440,12 @@ static const struct enhance_item k_items[] = {
     { ITEM("input.mouse_capture", "Capture", "Controls", ENHANCE_ITEM_CHOICE),
       .choices = k_capture, .set = set_capture, .get = get_capture,
       .def = "focus", .help = "When the game takes the mouse: on focus, on a click, or never" },
+    { ITEM("input.pad_square_left", "Square left stick", "Controls", ENHANCE_ITEM_TOGGLE),
+      .set = set_square, .get = get_square, .def = "false",
+      .help = "Full diagonals: a round stick's corner reads as the Duke's square gate" },
+    { ITEM("input.pad_square_right", "Square right stick", "Controls", ENHANCE_ITEM_TOGGLE),
+      .set = set_square, .get = get_square, .def = "false", .user = (void *)(uintptr_t)1,
+      .help = "The same for the right stick" },
 };
 #define N_ITEMS ((int)(sizeof k_items / sizeof k_items[0]))
 
@@ -2454,6 +2482,9 @@ static void build_rows(void)
         xbox_mouse_opts mo;
         const char *rk;
         action_groups();
+        header("Sticks");
+        slot_row("input.pad_square_left");
+        slot_row("input.pad_square_right");
         header("Mouse");
         slot_row("input.mouse_capture");
         xbox_InputMouseGetOpts(&mo);

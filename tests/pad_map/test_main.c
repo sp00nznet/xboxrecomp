@@ -11,6 +11,7 @@
 #include "input_backend.h"
 #include "recomp_env.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -694,6 +695,103 @@ static void test_setup(void)
     CHECK(g.bAnalogButtons[XBOX_BUTTON_X] == 255, "paddle 1 held, X %d", g.bAnalogButtons[XBOX_BUTTON_X]);
 }
 
+/* ── 7b. circle to square (input.pad_square_left / _right) ─────────────── */
+
+static void test_square(void)
+{
+    static const SHORT keep[][2] = {
+        { 0, 0 }, { 32767, 0 }, { 0, -32768 }, { -32768, 0 }, { -32768, -32768 },
+        { 32767, 32767 }, { 1234, 0 }, { 0, -77 },
+    };
+    xbox_pad_setup s;
+    XBOX_HOST_XINPUT_GAMEPAD xi;
+    XBOX_GAMEPAD g;
+    InputRaw raw;
+    SHORT x, y;
+    int bad = 0;
+
+    /* Cardinals, the centre, a square corner and -32768: k is 1 or less. */
+    for (size_t i = 0; i < sizeof keep / sizeof keep[0]; i++) {
+        x = keep[i][0]; y = keep[i][1];
+        xbox_InputSquareStick(&x, &y);
+        CHECK(x == keep[i][0] && y == keep[i][1], "square moved %d,%d to %d,%d",
+              keep[i][0], keep[i][1], x, y);
+    }
+
+    /* A round gate's full diagonal reaches the corner, each sign. */
+    for (int q = 0; q < 4; q++) {
+        int sx = q & 1 ? -1 : 1, sy = q & 2 ? -1 : 1;
+        x = (SHORT)(sx * 23170); y = (SHORT)(sy * 23170);
+        xbox_InputSquareStick(&x, &y);
+        CHECK(x == sx * 32767 && y == sy * 32767, "diagonal %d,%d: %d,%d", sx, sy, x, y);
+    }
+
+    /* Half deflection on the diagonal: the radius becomes the larger axis. */
+    x = 11585; y = 11585;
+    xbox_InputSquareStick(&x, &y);
+    CHECK(x == 16384 && y == 16384, "half diagonal: %d,%d", x, y);
+
+    /* 30 degrees on the unit circle: the angle is kept, the larger axis
+     * reaches full, and nothing leaves int16. */
+    x = 28377; y = 16383;
+    xbox_InputSquareStick(&x, &y);
+    CHECK(x == 32767 && abs(y - 18917) <= 1, "30 degrees: %d,%d", x, y);
+
+    /* Every point of the round gate: max(|x|,|y|) == min(r, 32767) within
+     * rounding, the angle within rounding, and k never below 1. */
+    for (int a = -32768; a <= 32767; a += 191)
+        for (int b = -32768; b <= 32767; b += 211) {
+            double r = sqrt((double)a * a + (double)b * b), mx, want;
+            x = (SHORT)a; y = (SHORT)b;
+            xbox_InputSquareStick(&x, &y);
+            mx = abs(x) > abs(y) ? abs(x) : abs(y);
+            want = r > 32767 ? 32767 : r;
+            if (abs(a) > abs(b) ? abs(a) : abs(b)) {
+                double ma = abs(a) > abs(b) ? abs(a) : abs(b);
+                if (want < ma) want = ma;   /* k >= 1: never shrinks */
+            }
+            bad += fabs(mx - want) > 1
+                || ((a < 0) != (x < 0) && a) || ((b < 0) != (y < 0) && b)
+                || fabs((double)x * b - (double)y * a) > 1.5 * (fabs(a) + fabs(b) + 1);
+        }
+    CHECK(!bad, "%d gate points off the square or off their angle", bad);
+
+    /* In the setup: off is the identity and changes nothing; on is not, and
+     * runs after the RECOMP_PAD_DEADZONE rescale (radial, so the diagonal
+     * just past the deadzone stays small) and per stick. */
+    xbox_PadSetupIdentity(&s);
+    CHECK(xbox_PadSetupIsIdentity(&s), "square off is not the identity");
+    s.square_left = 1;
+    CHECK(!xbox_PadSetupIsIdentity(&s), "square on reads as the identity");
+    memset(&xi, 0, sizeof xi);
+    xi.sThumbLX = 23170; xi.sThumbLY = 23170; xi.sThumbRX = 23170; xi.sThumbRY = -23170;
+    xbox_PadRawXInput(&xi, 0, &raw);
+    xbox_PadSetupApply(&s, &raw, &g);
+    CHECK(g.sThumbLX == 32767 && g.sThumbLY == 32767, "left squared: %d,%d", g.sThumbLX, g.sThumbLY);
+    CHECK(g.sThumbRX == 23170 && g.sThumbRY == -23170, "right left alone: %d,%d",
+          g.sThumbRX, g.sThumbRY);
+    s.square_left = 0; s.square_right = 1;
+    xbox_PadSetupApply(&s, &raw, &g);
+    CHECK(g.sThumbLX == 23170 && g.sThumbRX == 32767 && g.sThumbRY == -32767,
+          "right squared: L %d R %d,%d", g.sThumbLX, g.sThumbRX, g.sThumbRY);
+
+    xbox_InputSetDeadzone(7849);
+    s.square_left = 1; s.square_right = 0;
+    xi.sThumbLX = 6000; xi.sThumbLY = 6000;          /* r 8485, past 7849 */
+    xbox_PadRawXInput(&xi, 0, &raw);
+    xbox_PadSetupApply(&s, &raw, &g);
+    x = 6000; y = 6000;
+    xbox_InputApplyDeadzone(&x, &y, 7849);
+    xbox_InputSquareStick(&x, &y);
+    CHECK(g.sThumbLX == x && g.sThumbLY == y && x > 0 && x < 2000,
+          "deadzone then square: %d,%d want %d,%d", g.sThumbLX, g.sThumbLY, x, y);
+    xi.sThumbLX = 5000; xi.sThumbLY = 5000;          /* r 7071, inside */
+    xbox_PadRawXInput(&xi, 0, &raw);
+    xbox_PadSetupApply(&s, &raw, &g);
+    CHECK(g.sThumbLX == 0 && g.sThumbLY == 0, "inside the deadzone: %d,%d", g.sThumbLX, g.sThumbLY);
+    xbox_InputSetDeadzone(0);
+}
+
 /* ── 8. the poll asks the backend for extras only when needed ──────────── */
 
 static void dummy_filter(DWORD port, const struct xbox_host_pad *host, XBOX_INPUT_STATE *st)
@@ -844,6 +942,7 @@ int main(int argc, char **argv)
     test_pad_only();
     test_identity();
     test_setup();
+    test_square();
     test_extras_flag();
     test_rumble_gate();
     printf("pad_map: %d checks, %d failed\n", g_checks, g_fail);

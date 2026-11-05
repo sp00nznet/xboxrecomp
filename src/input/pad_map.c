@@ -69,6 +69,22 @@ static SHORT clamp16(double v)
     return (SHORT)(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
 }
 
+void xbox_InputSquareStick(SHORT *x, SHORT *y)
+{
+    double fx = *x, fy = *y;
+    double mx = fabs(fx) > fabs(fy) ? fabs(fx) : fabs(fy);
+    double m = sqrt(fx * fx + fy * fy), k;
+    if (mx == 0)
+        return;
+    if (m > 32767)
+        m = 32767;
+    k = m / mx;
+    if (k <= 1)
+        return;
+    *x = clamp16(fx * k);
+    *y = clamp16(fy * k);
+}
+
 void xbox_InputApplyDeadzone(SHORT *x, SHORT *y, int dz)
 {
     double fx = *x, fy = *y, m, mc, f;
@@ -393,6 +409,12 @@ void xbox_PadSetupApply(const xbox_pad_setup *s, const InputRaw *raw, XBOX_GAMEP
         map_one(&s->alt, raw, &a);
         xbox_InputMap_PadMerge(out, &a);
     }
+    /* After the deadzone and the merge, so the deadzone stays radial and
+     * the square applies to the stick the guest actually sees. */
+    if (s->square_left)
+        xbox_InputSquareStick(&out->sThumbLX, &out->sThumbLY);
+    if (s->square_right)
+        xbox_InputSquareStick(&out->sThumbRX, &out->sThumbRY);
 }
 
 /* ── the README table ─────────────────────────────────────────────────── */

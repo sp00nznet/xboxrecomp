@@ -875,6 +875,8 @@ table of `src/input/README.md` and no mouse.
 | `input.pad_threshold` | int | `1` .. `100`: percent a trigger or stick direction must reach to press a digital control it is mapped to | `50` | none |
 | `input.pad_invert_ly` | bool | the left stick's Y axis is inverted, before `left_stick`/`right_stick` swap | `false` | none |
 | `input.pad_invert_ry` | bool | the right stick's Y axis is inverted | `false` | none |
+| `input.pad_square_left` | bool | circle to square: the left stick is stretched along its angle so a full diagonal of a round gate reads about (1, 1), as on the Duke's square gate. Full diagonal movement in titles that run at the length of the stick (BLiNX). Applied last, after the deadzone, the swap and the merge of the alternate map (inversion comes before them, on the raw stick); cardinals unchanged. Menu: Controls | `false` | `RECOMP_INPUT_PAD_SQUARE_LEFT` |
+| `input.pad_square_right` | bool | as above, for the right stick | `false` | `RECOMP_INPUT_PAD_SQUARE_RIGHT` |
 | `input.glyphs` | string | `"auto"`, `"xbox"`, `"playstation"`, `"nintendo"`, `"steam"`, `"generic"`, `"gamecube"`: the button family the overlay draws button glyphs for (`generic` is lettered, for a pad of no known family); `auto` asks the pad (below), and stays `xbox` on Windows and under Proton, where XInput cannot tell | `"auto"` | none |
 
 These defaults are the layer's. The three stick knobs default to the
@@ -1440,10 +1442,11 @@ The pages are Render, Shaders, Pack, Game (a title's own items, from
   owner and label ("F6 refused: Free camera: Toggle flight has it (F6)
   (mod off); clear it there first"), a mod that is off included, and so
   is a key a mod's captured control names ("R refused: Free camera: Rise
-  uses it"). Esc or 10 s without input cancels. A Mouse group
-  ends the page: `input.mouse_capture` as a choice, the release key and
-  the free keys as information, and the capture state now (`captured`,
-  `free: click to capture`, `free: F9`).
+  uses it"). Esc or 10 s without input cancels. A Sticks group
+  follows the actions: `input.pad_square_left` and `_right` as toggles,
+  live at once. A Mouse group ends the page: `input.mouse_capture` as a
+  choice, the release key and the free keys as information, and the
+  capture state now (`captured`, `free: click to capture`, `free: F9`).
 - **Mods** has one row per mod, under its descriptor title (else its name):
   its switch (left and right), and, entered
   with A, the mod's page. A mod that gave `on_enable` turns off and on at

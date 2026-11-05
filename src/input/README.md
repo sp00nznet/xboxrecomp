@@ -151,6 +151,11 @@ and fails if the table below and the code disagree. Regenerate it with
   its own). `RECOMP_PAD_DEADZONE=N` (0..32767, default 0) adds a radial
   deadzone of N, rescaled so full deflection still reads full, for pads
   that drift.
+- A modern pad's gate is round, the Duke's was square: its diagonal read
+  about (32767, 32767). `input.pad_square_left` / `_right` (enhancements,
+  default off) stretch a host stick along its angle by
+  `max(1, min(|v|, 32767) / max(|x|, |y|))`, so a round diagonal reaches
+  the corner again; cardinals, the deadzone and -32768 are unchanged.
 - SDL's stick Y points down and is inverted as `-1 - v`, so -32768 and
   32767 swap exactly (an SDL stick at rest reads -1 on Y).
 - SDL3 names the face buttons by position: `SOUTH`, `EAST`, `WEST` and

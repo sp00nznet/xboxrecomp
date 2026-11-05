@@ -128,6 +128,14 @@ void xbox_PadMapSdl(const XBOX_HOST_SDL_GAMEPAD *in, XBOX_GAMEPAD *out);
  * unchanged). dz <= 0 is the identity. */
 void xbox_InputApplyDeadzone(SHORT *x, SHORT *y, int dz);
 
+/* Circle to square: scales (x, y) by k = max(1, min(|v|, 32767) / max(|x|,
+ * |y|)), keeping the angle, so a full diagonal of a round host gate reads
+ * about (32767, 32767) the way the Duke's square gate did. Titles that take
+ * the length of a per-axis clamped stick (BLiNX's run speed) only reach full
+ * speed on a diagonal from there. k never drops below 1, so cardinals, the
+ * deadzone and -32768 pass through unchanged; the result clamps to int16. */
+void xbox_InputSquareStick(SHORT *x, SHORT *y);
+
 /* The deadzone the helpers apply: RECOMP_PAD_DEADZONE (0..32767, default 0),
  * read once. xbox_InputSetDeadzone overrides it (tests; -1 = back to env). */
 int  xbox_InputDeadzone(void);
@@ -179,6 +187,8 @@ typedef struct xbox_pad_setup {
                                unless [input.pad] gives a control two */
     uint8_t invert_ly;      /* input.pad_invert_ly / _ry (xbox_PadRawInvert) */
     uint8_t invert_ry;
+    uint8_t square_left;    /* input.pad_square_left / _right */
+    uint8_t square_right;   /* (xbox_InputSquareStick) */
 } xbox_pad_setup;
 
 /* The fork's identity: xbox_InputMap_PadMapDefaults, then White = left
@@ -200,8 +210,9 @@ int  xbox_PadSetupNeedsExtras(const xbox_pad_setup *s);
  * honoured, none centred) and RECOMP_PAD_DEADZONE's xbox_InputApplyDeadzone,
  * because PadMap's radial rescale clamps to the unit circle even at 0 and
  * real pads report corners outside it. The alternate map, when it has any
- * source, is merged with xbox_InputMap_PadMerge. Every field of *out is
- * written. */
+ * source, is merged with xbox_InputMap_PadMerge. Last, a stick whose
+ * square_* is set goes through xbox_InputSquareStick. Every field of *out
+ * is written. */
 void xbox_PadSetupApply(const xbox_pad_setup *s, const InputRaw *raw, XBOX_GAMEPAD *out);
 
 /* Install the setup input_core.c applies to every pad read (any thread; a

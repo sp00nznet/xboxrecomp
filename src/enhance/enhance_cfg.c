@@ -68,6 +68,8 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("textures.pack", RENV_TEXTURES_PACK);
     enhance_cfg_bind_env("textures.font", RENV_TEXTURES_FONT);
     enhance_cfg_bind_env("textures.text", RENV_TEXTURES_TEXT);
+    enhance_cfg_bind_env("input.pad_square_left", RENV_INPUT_PAD_SQUARE_LEFT);
+    enhance_cfg_bind_env("input.pad_square_right", RENV_INPUT_PAD_SQUARE_RIGHT);
     enhance_cfg_bind_env("overlay.stats", RENV_OVERLAY_STATS);
     enhance_cfg_bind_env("overlay.ui_scale", RENV_OVERLAY_UI_SCALE);
     enhance_cfg_bind_env("overlay.ui_fit", RENV_OVERLAY_UI_FIT);
