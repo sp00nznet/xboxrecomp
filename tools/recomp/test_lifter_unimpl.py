@@ -83,6 +83,12 @@ class UnimplementedMarkerTest(unittest.TestCase):
         self.assertNotIn("TODO", out)
         self.assertEqual(lifter.unimplemented, {})
 
+    def test_writeback_cache_flush_uses_coherent_host_memory(self):
+        lifter, out = _lift("wbinvd")
+        self.assertNotIn("RECOMP_UNIMPL", out)
+        self.assertIn("coherent host memory", out)
+        self.assertEqual(lifter.unimplemented, {})
+
 
 if __name__ == "__main__":
     unittest.main()
