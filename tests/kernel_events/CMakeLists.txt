@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_events_test C)
-# Windows only: the event bridges wrap Win32 events.
+if(NOT WIN32)
+    message(FATAL_ERROR "This harness checks the Win32 event bridges; run it on Windows or under Proton.")
+endif()
 set(CMAKE_C_STANDARD 11)
 add_subdirectory(../.. runtime)
 add_executable(kernel_events_test test_main.c)

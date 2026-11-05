@@ -103,6 +103,61 @@ def _wrap_generated_bodies(batch, funcs, manual, wrapped):
     return funcs, manual - wrapped
 
 
+def _owner_of(inner, addr):
+    """The name of the function whose recovered CFG took addr in, or a
+    plain description when none is recorded."""
+    owners = [start for start, cfg in getattr(inner, "_recovered_cfg", {}).items()
+              if start < addr < cfg["end"]]
+    if not owners:
+        return "another function"
+    start = max(owners)
+    name = inner.func_db.get(start, {}).get("name") or f"sub_{start:08X}"
+    return f"{name} (0x{start:08X})"
+
+
+def _wraps_without_body(batch, wrapped):
+    """The wraps the manual file declares (extern void sub_X_gen(void);)
+    that would get no sub_X_gen body, as (addr, why).
+
+    A body is emitted only for an address the analysis found as a function
+    start of its own. One it did not find, or folded into another
+    function's CFG, used to be dropped here without a word; the hand-written
+    sub_X still calls sub_X_gen, so the build then failed at link, far from
+    the cause. The usual cause is a dump of another release than the one
+    the manual file was written for: its code sits at other addresses.
+    """
+    known = set(batch.func_db)
+    inner = batch.translator
+    owned = inner.owned_function_starts
+    out = []
+    for addr in sorted(wrapped):
+        if addr not in known:
+            out.append((addr, "not a function in this XBE's analysis"))
+        elif addr in owned:
+            out.append((addr, f"inside {_owner_of(inner, addr)}, "
+                              "not a function start of its own"))
+    return out
+
+
+def _wrap_failure(path, missing, calls=()):
+    """The error recomp stops with for _wraps_without_body's list and the
+    uses of functions the analysis lacks. The player reads the first
+    sentence; the rest is for whoever looks into it."""
+    n = len(missing) + len(calls)
+    lines = [
+        "ERROR: Your game's XBE is probably another release (another "
+        "region or version) than the one this port was made from: the "
+        "hand-written code is keyed to that release's addresses, and the "
+        "game's fingerprint command names both releases.",
+        f"{path} needs {n} function{'s' if n != 1 else ''} this XBE's "
+        f"analysis does not give it, so the link would fail:"]
+    lines += [f"  sub_{addr:08X}_gen: 0x{addr:08X} is {why}"
+              for addr, why in missing]
+    lines += [f"  sub_{addr:08X}: used, but 0x{addr:08X} is not a function "
+              f"in this XBE's analysis" for addr in calls]
+    return "\n".join(lines)
+
+
 def _load_manual_protection(manual_functions, exclude_manual):
     """Load manual entry points before any destructive boundary repair."""
     protected = _load_addrs(manual_functions)
@@ -289,8 +344,29 @@ def main():
     parser.add_argument("--seh-epilog", metavar="ADDR",
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
+    parser.add_argument("--seeds", metavar="JSON", action="append",
+                        default=[],
+                        help="seed_functions.json; the flag-fallback report "
+                             "lists its sites in the seeds marked observed")
+    parser.add_argument("--spin-waits", metavar="JSON",
+                        help="Lower guest busy-wait loops to RECOMP_SPIN_WAIT "
+                             "(the runtime sleeps in them when its pacing "
+                             "mode is sleep): {\"auto\": bool, \"sites\": "
+                             "[{\"va\": ...}], \"exclude\": [...]}. Writes "
+                             "spin_waits.json (every candidate) to -o. Without "
+                             "it nothing is matched and the output is "
+                             "unchanged")
+
     args = parser.parse_args()
 
+    spin_waits = None
+    if args.spin_waits:
+        from .spin_waits import SpinWaitConfig
+        try:
+            spin_waits = SpinWaitConfig.load(args.spin_waits)
+        except (OSError, ValueError, KeyError) as e:
+            print(f"ERROR: --spin-waits {args.spin_waits}: {e}", file=sys.stderr)
+            sys.exit(1)
     # Reset on every CLI invocation, including one with no manual file.
     from . import translator as translator_module
     from .manual_scan import entry_hooks
@@ -361,9 +437,11 @@ def main():
         icall_sites_json_path=args.icall_sites or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "output",
             "icall_sites.json"),
+        spin_waits=spin_waits,
         back_edge_yield=args.back_edge_yield,
         entry_stubs=args.entry_stubs,
     )
+    translator.observed_seeds = _load_observed_seeds(args.seeds)
 
     t_load = time.time() - t0
     print(f"Loaded {len(translator.func_db)} functions, "
@@ -497,6 +575,31 @@ def main():
                     info["name"] = plain
                     pinned += 1
 
+            # Named in code but not in the analysis: gen defines no sub_X
+            # for them. A use in a function body (a call, or the name as a
+            # value) fails at link unless another of the game's source
+            # files defines that sub_X, which recomp cannot see (it reads
+            # only this file); no game does today. So a use stops recomp
+            # with the
+            # wraps that would get no body; a declaration alone links, and
+            # another source file may define it, so that only warns
+            # (comments do not count either way).
+            from .manual_scan import code_uses, code_references
+            missing = _wraps_without_body(translator, wrap)
+            calls = sorted((code_uses(args.exclude_manual) - known) - wrap - skip)
+            if missing or calls:
+                raise SystemExit(_wrap_failure(args.exclude_manual, missing, calls))
+            unknown_refs = sorted(
+                (code_references(args.exclude_manual) - known) - wrap - skip)
+            if unknown_refs:
+                shown = ", ".join(f"sub_{a:08X}" for a in unknown_refs[:8])
+                more = len(unknown_refs) - 8
+                print(f"WARN: {args.exclude_manual} declares {len(unknown_refs)} "
+                      f"sub_ functions this XBE's analysis lacks ({shown}"
+                      f"{f' and {more} more' if more > 0 else ''}); another "
+                      f"release than the port's would explain it",
+                      file=sys.stderr)
+
             funcs, manual = _wrap_generated_bodies(
                 translator, funcs, manual, wrap & known)
 
@@ -526,6 +629,16 @@ def main():
               f"{stats['total_lines']} lines of C, "
               f"{stats['num_chunks']} source files",
               file=sys.stderr)
+        falloffs = sorted(set(
+            getattr(translator, "translator", translator).falloffs))
+        if falloffs:
+            # Each is a body cut short (a misdetected start inside it) or data
+            # decoded after a ret; the first kind hung a BLiNX 2 rank exam.
+            names = ", ".join(f"sub_{a:08X}" for a, _ in falloffs[:8])
+            print(f"WARN: {len(falloffs)} bodies run off their end with"
+                  f" no function there, tail-dispatched by address ({names}"
+                  f"{', ...' if len(falloffs) > 8 else ''})",
+                  file=sys.stderr)
         if stats.get("unresolved_stubs"):
             print(f"{stats['unresolved_stubs']} unresolved call targets stubbed "
                   f"(addresses called but not detected as functions)",
@@ -551,6 +664,59 @@ def main():
         os.path.dirname(__file__), "output")
     summary_path = write_summary(stats, output_dir)
     print(f"\nSummary: {summary_path}", file=sys.stderr)
+    if "flag_fallbacks" in stats:
+        _write_flag_fallbacks(translator, output_dir)
+
+    if translator.translator.spin_waits is not None:
+        _finish_spin_waits(translator.translator.spin_waits, output_dir)
+
+
+def _load_observed_seeds(paths):
+    """Starts of the seeds marked `"observed": true` (seen at runtime)."""
+    starts = set()
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as fh:
+            for entry in json.load(fh):
+                if isinstance(entry, dict) and entry.get("observed"):
+                    starts.add(int(str(entry["start"]), 16))
+    return starts
+
+
+def _write_flag_fallbacks(translator, output_dir):
+    """flag_fallbacks.json and one summary line (flag_fallbacks.py says why
+    this is a report and not an error)."""
+    report = translator.translator.flag_fallbacks
+    doc = report.to_json(translator.observed_seeds)
+    path = os.path.join(output_dir, "flag_fallbacks.json")
+    with open(path, "w", newline="\n") as f:
+        json.dump(doc, f, indent=1)
+        f.write("\n")
+    print(f"Flag fallbacks: {doc['unique_sites']} unique sites "
+          f"({doc['emitted']} emitted), {doc['joins']} at joins ({path})",
+          file=sys.stderr)
+    if doc["observed_functions"]:
+        print("  in observed seeds: " + ", ".join(doc["observed_functions"]),
+              file=sys.stderr)
+
+
+def _finish_spin_waits(report, output_dir):
+    """Write the candidate report; a listed site that did not lower in every
+    body that has it fails the run (the generated files are already written,
+    so the stage's regeneration marker stays and gen/ counts as stale)."""
+    errors = report.finish()
+    doc = report.to_json()
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "spin_waits.json")
+    with open(path, "w", newline="\n") as f:
+        json.dump(doc, f, indent=1)
+        f.write("\n")
+    print(f"Spin waits: {doc['lowered_sites']} sites lowered in "
+          f"{doc['lowered_bodies']} bodies, {doc['candidates']} candidates "
+          f"({path})", file=sys.stderr)
+    if errors:
+        for e in errors:
+            print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

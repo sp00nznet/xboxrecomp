@@ -20,9 +20,9 @@
  *    while the thread stays at DISPATCH (the timer drain finds the gate
  *    busy) and completes at the lower;
  *  - (c) a spin at DISPATCH on loop back edges only: the line stays posted,
- *    the wait log names the holder past RECOMP_IRQ_SAFE_MS, and the first
- *    kernel call runs it. With RECOMP_IRQ_SAFE_FORCE=1 a repeat post past
- *    RECOMP_IRQ_SAFE_MS delivers it beside the holder instead;
+ *    the wait log names the holder past irq_safe_ms, and the first
+ *    kernel call runs it. With irq_safe_force=1 a repeat post past
+ *    irq_safe_ms delivers it beside the holder instead;
  *  - (d) raised above DISPATCH: the kernel calls' safe points refuse and
  *    count it, and the lower back to DISPATCH runs it, before any further
  *    kernel call, as the console takes it at the lower.
@@ -30,23 +30,11 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "platform/host_time.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* The tests change the environment the kernel reads its switches from. */
-static void test_setenv(const char *name, const char *v)
-{
-#ifdef _WIN32
-    _putenv_s(name, v ? v : "");
-#else
-    if (v)
-        setenv(name, v, 1);
-    else
-        unsetenv(name);
-#endif
-}
 
 /* The DPC routine is "generated code" looked up by its guest address. */
 #define DPC_ROUTINE_VA 0x00001000u
@@ -84,13 +72,6 @@ static const uint32_t k_ordinals[K_COUNT] = {
 
 static int failures;
 
-/* The flag is only ever accessed atomically (kernel.h). */
-static int32_t preempt_flag(void)
-{
-    return (int32_t)InterlockedCompareExchange(
-        (volatile LONG *)&g_xbox_guest_cpu_preempt, 0, 0);
-}
-
 static void check(int ok, const char *what)
 {
     printf("  %-70s %s\n", what, ok ? "PASS" : "FAIL");
@@ -122,7 +103,7 @@ static uint32_t kcall(int k, uint32_t ecx)
 /* RECOMP_BACK_EDGE, as generated code has it at every loop back edge. */
 static void back_edge(void)
 {
-    if (preempt_flag())
+    if (g_xbox_guest_cpu_preempt)
         xbox_GuestCpuPreempt(0x00401000u);
 }
 
@@ -375,7 +356,7 @@ static void dispatch_spin_back_edges(void)
     xbox_IrqStatsGet(&st, 0);
     check(s_isr_runs == 0 && d.gated == 0 && d.ungated == 0,
           "(c) back edges only: the line stays posted for 150 ms");
-    check(st.wait_logs >= 1, "(c) the wait log named the holder past RECOMP_IRQ_SAFE_MS");
+    check(st.wait_logs >= 1, "(c) the wait log named the holder past irq_safe_ms");
     kcall(K_QPC, 0);
     age = s_isr_ns - s_post_ns;
     printf("    post to ISR %.3f ms (the first kernel call)\n", ms_of(age));
@@ -386,8 +367,8 @@ static void dispatch_spin_back_edges(void)
     check(s_dpc_runs == 1, "(c) and its DPC completed at the lower");
     settle();
 
-    /* RECOMP_IRQ_SAFE_FORCE: a repeat post past the wait goes beside the holder. */
-    test_setenv("RECOMP_IRQ_SAFE_FORCE", "1");
+    /* irq_safe_force: a repeat post past the wait goes beside the holder. */
+    recomp_env_set(RENV_IRQ_SAFE_FORCE, "1");
     xbox_IrqReloadConfig();
     reset();
     memset(&d, 0, sizeof d);
@@ -399,20 +380,20 @@ static void dispatch_spin_back_edges(void)
     spin(2000 * MS, &s_isr_runs, 0);
     device_join(t);
     age = s_isr_ns - s_post_ns;
-    printf("    post to forced ISR %.3f ms (RECOMP_IRQ_SAFE_MS=%u, reposts every 5 ms)\n",
+    printf("    post to forced ISR %.3f ms (irq_safe_ms=%u, reposts every 5 ms)\n",
            ms_of(age), SAFE_MS);
     xbox_IrqStatsGet(&st, 0);
     check(s_isr_runs == 1 && s_isr_tid == d.tid && d.ungated == 1
           && st.forced[XBOX_IRQ_APU] == 1,
-          "(c) RECOMP_IRQ_SAFE_FORCE=1: delivered beside the holder on the device's thread");
+          "(c) irq_safe_force=1: delivered beside the holder on the device's thread");
     check(age >= SAFE_MS * MS && age < SAFE_MS * MS + PROMPT_NS,
-          "(c) after RECOMP_IRQ_SAFE_MS, within one repost and 50 ms more");
+          "(c) after irq_safe_ms, within one repost and 50 ms more");
     spin(30 * MS, NULL, 0);
     check(s_dpc_runs == 0, "(c) its DPC still waits for the holder to leave DISPATCH");
     kcall(K_LOWER, old);
     spin(1000 * MS, &s_dpc_runs, 0);
     check(s_dpc_runs == 1, "(c) and completes at the lower");
-    test_setenv("RECOMP_IRQ_SAFE_FORCE", NULL);
+    recomp_env_set(RENV_IRQ_SAFE_FORCE, NULL);
     xbox_IrqReloadConfig();
     settle();
 }
@@ -481,9 +462,9 @@ int main(void)
     for (i = 0; i < K_COUNT; i++)
         MEM32(THUNK_VA + 4u * (uint32_t)i) = 0x80000000u | k_ordinals[i];
 
-    test_setenv("RECOMP_GUEST_LOCK", "1");
-    test_setenv("RECOMP_DISPATCH_GATE", "1");
-    test_setenv("RECOMP_IRQ_SAFE_MS", "20");
+    recomp_env_set(RENV_GUEST_LOCK, "1");
+    recomp_env_set(RENV_DISPATCH_GATE, "1");
+    recomp_env_set(RENV_IRQ_SAFE_MS, "20");
     xbox_GuestCpuReloadConfig();
     xbox_IrqReloadConfig();
     xbox_kernel_set_thunk_address(THUNK_VA, K_COUNT);

@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.20)
+project(kernel_language_test C)
+set(CMAKE_C_STANDARD 11)
+# BLiNX 1's list: German and Italian left out, so a refusal can be seen.
+set(XBOXRECOMP_LANGUAGES "en,ja,fr,es" CACHE STRING "" FORCE)
+add_subdirectory(../.. runtime)
+add_executable(kernel_language_test test_main.c)
+target_include_directories(kernel_language_test PRIVATE ../../src/kernel)
+target_link_libraries(kernel_language_test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME kernel_language_test COMMAND kernel_language_test)

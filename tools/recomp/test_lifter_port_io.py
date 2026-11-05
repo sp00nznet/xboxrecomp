@@ -45,6 +45,21 @@ class PortIoTest(unittest.TestCase):
         self.assertNotIn("RECOMP_UNIMPL", out)
         self.assertEqual(lifter.unimplemented, {})
 
+    def test_in_ax_dx_writes_only_ax(self):
+        _, out = _lift("in", "ax, dx", [_reg("ax"), _reg("dx")])
+        self.assertIn("SET_LO16(eax, xbox_PortIn((edx & 0xFFFFu), 2));", out)
+
+    def test_out_imm_port_eax(self):
+        _, out = _lift("out", "0x80, eax", [_imm(0x80), _reg("eax")])
+        self.assertIn("xbox_PortOut(0x80u, (uint32_t)(eax), 4);", out)
+
+    def test_rep_insb_is_not_a_silent_comment(self):
+        # The rep-string lifter's fallback used to return a bare comment, so
+        # a port block transfer vanished with nothing at run time to say so.
+        lifter, out = _lift("rep insb", "byte ptr es:[edi], dx", [])
+        self.assertIn('RECOMP_UNIMPL("rep insb', out)
+        self.assertIn("rep insb", lifter.unimplemented)
+
     def test_helpers_are_declared_for_generated_code(self):
         import pathlib
         hdr = (pathlib.Path(__file__).resolve().parents[2] / "templates" /

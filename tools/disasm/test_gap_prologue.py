@@ -14,12 +14,17 @@ to gaps separates the two by construction. Half-Life 2 has 20 of these: 12 in
 gaps, 8 tails.
 """
 import os
+import struct
 import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
+from tools.disasm.engine import DisasmEngine  # noqa: E402
 from tools.disasm.functions import FunctionDetector  # noqa: E402
+from tools.disasm.labels import LabelManager  # noqa: E402
+from tools.disasm.test_jump_table_follower import BASE, Image  # noqa: E402
+from tools.disasm.xrefs import XRefTracker  # noqa: E402
 
 
 class _Insn:
@@ -52,6 +57,10 @@ class _Image:
 
 class _Engine:
     jump_tables = {}
+    entries = {}
+
+    def jump_table_entries(self, tbl):
+        return self.entries.get(tbl, [])
 
     def get_instruction(self, addr):
         return self.instructions.get(addr)
@@ -60,6 +69,7 @@ class _Engine:
         self.instructions = {i.address: i for i in insns}
         self._prologues = set(prologues)
         self._stub = False
+        self.jump_tables = {}
 
     def probes_as_prologue(self, addr):
         return addr in self._prologues
@@ -79,6 +89,7 @@ def _detector(insns, functions, prologues):
     det.image = _Image()
     det.functions = {f.start: f for f in functions}
     det._candidates = {}
+    det._alias_entries = {}
     det.added = []
     det._add_candidate = lambda addr, conf, why: det.added.append((addr, why))
     return det
@@ -173,6 +184,92 @@ class GapPrologueTest(unittest.TestCase):
     def test_nops_that_reach_no_alignment_are_not_padding(self):
         det = self._padded(0x0026B62C, 0x0026B62E)
         self.assertFalse(det._pass_gap_prologues([]))
+
+    # SSX 3's memcpy, whose tail-copy switch (table 0x00213BCC) keeps its
+    # arms after the table, each ending in a ret and padded to the next:
+    #
+    #     0x00213BE4  mov al, [esi]; ...; leave; ret
+    #     0x00213BEF  nop
+    #     0x00213BF0  mov al, [esi]; ...; leave; ret   <- arm 3, closed body
+    #     0x00213C04  mov al, [esi]; ...                <- arm 4
+    #
+    # Started as a function, arm 3 clamped memcpy at 0x00213BEF and left
+    # arm 4 owned by nothing: a three-byte copy jumped to an unresolved
+    # address and the game crashed entering Single Event.
+    def test_a_switch_arm_past_padding_is_not_a_function(self):
+        det = self._padded(0x00213BEF, 0x00213BF0)
+        det.engine._prologues = set()
+        det.engine.bodies = {0x00213BF0}
+        det.engine.jump_tables = {0x00213BCC: 0x00213BDC}
+        det.engine.entries = {
+            0x00213BCC: [0x00213BDC, 0x00213BE4, 0x00213BF0, 0x00213C04]}
+        self.assertFalse(det._pass_gap_prologues([]))
+        self.assertEqual(det.added, [])
+
+    def test_a_switch_arm_straight_after_a_ret_is_not_a_function(self):
+        insns = [_Insn(0x0001003F, 1, is_ret=True)]
+        funcs = [_Func(0x00010030, 0x00010040), _Func(0x00010100, 0x00010110)]
+        det = _detector(insns, funcs, prologues={0x00010040})
+        det.engine.jump_tables = {0x00010010: 0x00010018}
+        det.engine.entries = {0x00010010: [0x00010020, 0x00010040]}
+        self.assertFalse(det._pass_gap_prologues([]))
+
+
+# Hand-assembled, no game data; the shape mirrors SSX 3's memcpy. The engine
+# measures only the forward tail table: the backward-indexed site reads its
+# first slot at arm code, so it never anchors. The arms are reached from that
+# one table alone.
+_TAIL = b"\x8b\x45\x08\x5e\x5f\xc9\xc3"     # mov eax,[ebp+8]; pop esi; pop edi; leave; ret
+
+
+def _copy(n):
+    """mov al,[esi+i]; mov [edi+i],al for i < n."""
+    return b"".join(b"\x8a\x46" + bytes([i]) + b"\x88\x47" + bytes([i])
+                    if i else b"\x8a\x06\x88\x07" for i in range(n))
+
+
+def _memcpy_blob():
+    """(code, table, arms): a memcpy whose 0-3 byte tails follow its table."""
+    head = (b"\x55\x8b\xec\x57\x56"                    # push ebp; mov ebp,esp; push edi; push esi
+            b"\x8b\x75\x0c\x8b\x7d\x08\x8b\x4d\x10"     # mov esi,src; mov edi,dst; mov ecx,n
+            b"\x8b\xd1\x83\xe2\x03"                     # mov edx,ecx; and edx,3
+            b"\x83\xe9\x04\x73\x07")                    # sub ecx,4; jae forward
+    pre = len(head) + 14
+    pad = (0xC - (BASE + pre + 2)) % 16                  # the table lands at 0xC mod 16
+    table = BASE + pre + pad + 2
+    bodies = [_TAIL + b"\x90", _copy(1) + _TAIL + b"\x90",
+              _copy(2) + _TAIL + b"\x8d\x49\x00", _copy(3) + _TAIL + b"\x90"]
+    arms, at = [], table + 16
+    for body in bodies:
+        arms.append(at)
+        at += len(body)
+    code = (head
+            + b"\xff\x24\x8d" + struct.pack("<I", arms[0])   # jmp [ecx*4 + arm 0], ecx < 0
+            + b"\xff\x24\x95" + struct.pack("<I", table)     # jmp [edx*4 + table]
+            + b"\x90" * pad + b"\x8b\xff"
+            + struct.pack("<4I", *arms) + b"".join(bodies))
+    return code + b"\xcc" * (-(BASE + len(code)) % 16), table, arms
+
+
+class MemcpySwitchArmsTest(unittest.TestCase):
+    """Arms after a table, each closed by a ret, stay with their function.
+
+    The two-byte arm sits on a 16-byte boundary after the one-byte arm's nop,
+    which is exactly what the gap sweep takes for a new function.
+    """
+
+    def test_no_arm_after_the_table_is_split_off(self):
+        code, table, arms = _memcpy_blob()
+        self.assertEqual(arms[2] % 16, 0)
+        image = Image(code)
+        engine = DisasmEngine(image)
+        engine.linear_sweep(image.section)
+        engine.resync_jump_tables()
+        self.assertIn(table, engine.jump_tables)
+        det = FunctionDetector(engine, image, XRefTracker(), LabelManager())
+        det.detect_all([image.section])
+        self.assertIn(BASE, det.functions)
+        self.assertEqual([a for a in arms if a in det.functions], [])
 
 
 class SehPrologueShapeTest(unittest.TestCase):

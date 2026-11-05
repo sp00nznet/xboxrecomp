@@ -24,6 +24,7 @@ import sys
 from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
+from .flag_fallbacks import FlagFallbacks
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                      detect_setjmp_helpers, _func_ident, _operand_width)
@@ -447,9 +448,9 @@ def _mark_back_edges(bb, stmts):
     CPU's quantum check (templates/runtime/recomp_types.h): with the lock on,
     a thread that has run its quantum with another waiting hands over there,
     as the console's timer tick preempted it; otherwise it is one relaxed
-    load and a branch not taken. Blocks have one entry, so a target at or
-    before the block's start is the only backward target a jump at its end
-    can have."""
+    load and a branch not taken. A lowered spin-wait's edge yields already
+    and is left alone. Blocks have one entry, so a target at or before the
+    block's start is the only backward target a jump at its end can have."""
     va = bb.instructions[-1].address if bb.instructions else bb.start
 
     def mark(m):
@@ -460,7 +461,7 @@ def _mark_back_edges(bb, stmts):
 
     out = None
     for i, stmt in enumerate(stmts):
-        if "goto loc_" not in stmt:
+        if "goto loc_" not in stmt or "RECOMP_SPIN_WAIT" in stmt:
             continue
         new = _BACK_EDGE_GOTO_RE.sub(mark, stmt)
         if new != stmt:
@@ -525,9 +526,17 @@ class FunctionTranslator:
         # (end, last instruction) of cut bodies already warned about: the
         # tail_jump_aliases that share a cut parent's end would repeat it.
         self._teardown_reported = set()
+        # (start, end) of bodies that run off their end with no function
+        # starting there; translate_function tail-dispatches each by address.
+        self.falloffs = []
         # The guest CPU's quantum check at every loop back edge
         # (RECOMP_BACK_EDGE), with --back-edge-yield; off, edges stay bare.
         self.back_edge_yield = False
+        # --spin-waits: a spin_waits.SpinWaitReport, or None (the matcher
+        # does not run and the output is unchanged).
+        self.spin_waits = None
+        # Every `_flags` fallback emitted, with why (flag_fallbacks.py).
+        self.flag_fallbacks = FlagFallbacks()
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover callbacks and the gap entries their bodies reference."""
@@ -2682,6 +2691,18 @@ class FunctionTranslator:
         if ((continues_past_end or bypasses_to_end) and end in self.func_db
                 and end not in self.owned_function_starts):
             fallthrough_target = end
+        # Running off the end with no function there to bridge to. x86 just
+        # keeps executing at `end`, and a C body that returns instead drops
+        # the rest of the code and the ret: BLiNX 2's sub_001CFCA0, cut
+        # mid-instruction by a phantom start, returned four bytes of esp short
+        # and hung the Tom Tom Gang rank exam. Most of these are data decoded
+        # after a real ret and never run; for the rest, dispatch by address,
+        # which reaches an alias there or logs the miss loudly at runtime.
+        falloff_target = None
+        if (continues_past_end and fallthrough_target is None
+                and is_code_address(end)):
+            falloff_target = end
+            self.falloffs.append((start, end))
         # `leave` and `pop ebp` tear a frame down and in compiler output only
         # ever precede a ret, so a body that ends on one with nowhere to fall
         # is cut short, not data: Spartan's D3DXMatrixLookAtLH lost its
@@ -2714,7 +2735,8 @@ class FunctionTranslator:
                 and not (start <= insn.jump_target < end))
             for insn in instructions
         )
-        if has_tail_jump or fallthrough_target is not None:
+        if (has_tail_jump or fallthrough_target is not None
+                or falloff_target is not None):
             used_regs.add("ebp")
 
 
@@ -2865,6 +2887,7 @@ class FunctionTranslator:
         # sub_000EEA10 in Wreckless is exactly `bsf eax, ecx; ret`.
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
+        # sahf snapshots the AH image it loads, for the same reason.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
                                  "lock cmpxchg", "inc", "dec", "sahf", "fcomi",
                                  "fcomip", "fcompi", "fucomi", "fucomip", "fucompi")
@@ -3080,6 +3103,11 @@ class FunctionTranslator:
                             edge_sets.extend((p, var, c) for p, c in conds.items())
                             break
 
+            self.flag_fallbacks.note_block(
+                start, name, bb, stmts, preds[bb.start], settled_state,
+                bb.start == start, incoming)
+            if self.spin_waits is not None:
+                stmts = self.spin_waits.consider(start, bb, stmts)
             if self.back_edge_yield:
                 stmts = _mark_back_edges(bb, stmts)
 
@@ -3125,6 +3153,11 @@ class FunctionTranslator:
             ft_name = self.lifter._call_target_name(fallthrough_target)
             lines.append(f"    g_seh_ebp = ebp; {ft_name}(); return;"
                          f" /* fallthrough 0x{fallthrough_target:08X} */")
+            lines.append(f"")
+        elif falloff_target is not None:
+            lines.append(f"    g_seh_ebp = ebp; RECOMP_FALLOFF_TAIL(0x{falloff_target:08X}u);"
+                         f" return; /* runs off the end: no function at"
+                         f" 0x{falloff_target:08X} */")
             lines.append(f"")
 
         # Insert _icall_esp save points before RECOMP_ICALL_SAFE arg pushes.
@@ -3225,13 +3258,17 @@ class BatchTranslator:
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
-                 icall_sites_json_path=None, back_edge_yield=False,
-                 entry_stubs=False):
-        """back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
+                 icall_sites_json_path=None, spin_waits=None,
+                 back_edge_yield=False, entry_stubs=False):
+        """spin_waits: a spin_waits.SpinWaitConfig (--spin-waits), or None.
+        back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
         (--back-edge-yield; off by default). entry_stubs: an unresolved
         target inside a function enters a copy of it (--entry-stubs)."""
         self.xbe_path = xbe_path
         self.back_edge_yield = back_edge_yield
+        # Starts of the seeds a run saw (--seeds, `"observed": true`): the
+        # flag-fallback report names its sites in these functions.
+        self.observed_seeds = set()
         self.entry_stubs = entry_stubs
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
@@ -3292,6 +3329,9 @@ class BatchTranslator:
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions,
             force_returns=force_returns, icall_sites=self.icall_sites)
+        if spin_waits is not None:
+            from .spin_waits import SpinWaitReport
+            self.translator.spin_waits = SpinWaitReport(spin_waits)
         self.translator.back_edge_yield = self.back_edge_yield
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
@@ -3584,6 +3624,10 @@ class BatchTranslator:
             m: list(addrs)
             for m, addrs in self.translator.lifter.unimplemented.items()
         }
+        fallbacks = getattr(self.translator, "flag_fallbacks", None)
+        if fallbacks is not None:
+            stats["flag_fallbacks"] = fallbacks.summary(
+                getattr(self, "observed_seeds", ()))
 
         # Generate header with all forward declarations
         header_path = os.path.join(output_dir, header_name)

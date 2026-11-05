@@ -2,12 +2,14 @@
  * input_keyboard test: see CMakeLists.txt.
  *
  * The expected map below is written out independently of the table in
- * src/input/keyboard.c (arrows d-pad, Enter START, Backspace BACK,
- * Shift/Ctrl stick clicks, Z X C V = A B X Y, Q E = White Black, 1 3 =
- * triggers, W/S/A/D and keypad 8/2/4/6 the left stick, I/K/J/L the right),
- * so a wrong row fails here rather than being compared with itself.
+ * src/input/keyboard.c (it is the spec's, input-real-devices D9: arrows
+ * d-pad, Enter START, Backspace BACK, Shift/Ctrl stick clicks, Z X C V =
+ * A B X Y, Q E = White Black, 1 3 = triggers, W/S/A/D and keypad 8/2/4/6
+ * the left stick, I/K/J/L the right), so a wrong row fails here rather than
+ * being compared with itself.
  */
 #include "keyboard.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +31,7 @@ static void set_env(const char *k, const char *v)
 #else
     if (v) setenv(k, v, 1); else unsetenv(k);
 #endif
+    recomp_env_reload();   /* the runtime reads the environment once */
 }
 
 enum { F_BTN, F_ANALOG, F_STICK };
@@ -201,7 +204,7 @@ static void test_combos(void)
     CHECK(!xbox_FramebufferKeyDown(-1) && !xbox_FramebufferKeyDown(256), "out of range");
 }
 
-/* ── 4. RECOMP_KEYBOARD gates the poll ─────────────────────────────────── */
+/* ── 4. RECOMP_KEYBOARD gates the backend hook ─────────────────────────── */
 
 static void test_enable(void)
 {
@@ -221,12 +224,59 @@ static void test_enable(void)
     xbox_InputKeysClear();
 }
 
-int main(void)
+/* ── 5. README ─────────────────────────────────────────────────────────── */
+
+static void test_readme(const char *path)
+{
+    char line[512], want[512];
+    FILE *f;
+    size_t row = 0;
+    int in = 0, found = 0;
+    const char *out = getenv("INPUT_KEYBOARD_README_OUT");
+
+    if (out) {
+        FILE *o = fopen(out, "w");
+        if (o) {
+            fprintf(o, "%s\n", XBOX_KEY_MAP_README_BEGIN);
+            for (size_t i = 0; xbox_InputKeyMapReadmeRow(i, want, sizeof want); i++)
+                fprintf(o, "%s\n", want);
+            fprintf(o, "%s\n", XBOX_KEY_MAP_README_END);
+            fclose(o);
+        }
+    }
+
+    f = fopen(path, "r");
+    CHECK(f != NULL, "cannot open %s", path);
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (!in) {
+            if (!strcmp(line, XBOX_KEY_MAP_README_BEGIN)) in = found = 1;
+            continue;
+        }
+        if (!strcmp(line, XBOX_KEY_MAP_README_END)) { in = 0; break; }
+        if (!xbox_InputKeyMapReadmeRow(row, want, sizeof want)) {
+            CHECK(0, "README has an extra key line: %s", line);
+            break;
+        }
+        CHECK(!strcmp(line, want), "README key line %u:\n  have: %s\n  want: %s",
+              (unsigned)row, line, want);
+        row++;
+    }
+    fclose(f);
+    CHECK(found, "README has no '%s' marker", XBOX_KEY_MAP_README_BEGIN);
+    CHECK(!in, "README key table is not closed by '%s'", XBOX_KEY_MAP_README_END);
+    CHECK(!xbox_InputKeyMapReadmeRow(row, want, sizeof want),
+          "README key table is missing line %u: %s", (unsigned)row, want);
+}
+
+int main(int argc, char **argv)
 {
     test_rows();
     test_unique();
     test_combos();
     test_enable();
+    test_readme(argc > 1 ? argv[1] : "input_README.md");
     printf("input_keyboard: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

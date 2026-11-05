@@ -8,6 +8,19 @@
  *   NtFreeVirtualMemory (199) reads its arguments as guest pointers; it used
  *                             to call the host VirtualFree on a guest VA and
  *                             fail every call.
+ *   NtProtectVirtualMemory (204), MmSetAddressProtect (182)
+ *                             a read-only guest page does not take its host
+ *                             page's neighbours with it (16 KB host pages),
+ *                             and memory a title made read-only can be
+ *                             decommitted, released (also through
+ *                             MmFreeContiguousMemory) and handed out again.
+ *                             Each used to fault in the bridge or the heap.
+ *                             A whole read-only host page does fault on
+ *                             write, and a host page allows what its most
+ *                             permissive guest page asks for. A page
+ *                             allocation handed the rest of a host page
+ *                             behind a read-only one is zeroed without a
+ *                             fault.
  *   NtSetInformationFile (226) FileRenameInformation: a title that writes
  *                             x.tmp and renames it to x.dat must find x.dat.
  *   FATX overwrite            an overwrite followed by a smaller end-of-file
@@ -19,11 +32,14 @@
  */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <sys/stat.h>
 
 typedef void (*recomp_func_t)(void);
@@ -61,11 +77,13 @@ enum { ORD_MMALLOC = 165, ORD_MMALLOCEX = 166, ORD_MMFREE = 171,
        ORD_NTCREATE = 190, ORD_NTFREE = 199, ORD_NTSETINFO = 226,
        ORD_KEWAIT = 159, ORD_NTDUP = 197, ORD_NTWAIT = 233, ORD_OBREF = 246,
        ORD_OBDEREF = 250, ORD_PSCREATE = 255, ORD_PSTERM = 258,
-       ORD_NTWRITE = 236, ORD_NTQUERYINFO = 211 };
+       ORD_NTWRITE = 236, ORD_NTQUERYINFO = 211, ORD_NTPROTECT = 204,
+       ORD_MMSETPROTECT = 182 };
 static const uint32_t ORDS[] = { ORD_MMALLOC, ORD_MMALLOCEX, ORD_MMFREE,
     ORD_MMQUERYSIZE, ORD_NTALLOC, ORD_NTCLOSE, ORD_NTCREATE, ORD_NTFREE,
     ORD_NTSETINFO, ORD_KEWAIT, ORD_NTDUP, ORD_NTWAIT, ORD_OBREF, ORD_OBDEREF,
-    ORD_PSCREATE, ORD_PSTERM, ORD_NTWRITE, ORD_NTQUERYINFO };
+    ORD_PSCREATE, ORD_PSTERM, ORD_NTWRITE, ORD_NTQUERYINFO, ORD_NTPROTECT,
+    ORD_MMSETPROTECT };
 #define NORDS (sizeof ORDS / sizeof ORDS[0])
 
 static uint32_t g_thunks, g_stack, g_scratch;
@@ -207,10 +225,254 @@ static void test_virtual_memory(void)
     st = CALL(ORD_NTFREE, pbase, psize, 0x8000 /* MEM_RELEASE */);
     snprintf(d, sizeof d, "status 0x%08X size 0x%X", st, G32(psize));
     check(st == 0 && G32(psize) == 0x10000, "MEM_RELEASE frees the region", d);
+    G32(pbase) = 0;
+    G32(psize) = 0x10000;
+    CALL(ORD_NTALLOC, pbase, 0, psize, 0x3000, 4);
+    snprintf(d, sizeof d, "got 0x%08X, released 0x%08X", G32(pbase), base);
+    check(G32(pbase) == base, "released region is reused", d);
+
     G32(pbase) = 0x00001000;
     G32(psize) = 0;
     st = CALL(ORD_NTFREE, pbase, psize, 0x8000);
     check(st == 0xC00000A0u, "free below the heap is refused, not zeroed", NULL);
+}
+
+/* ---- page protection ---------------------------------------------------- */
+
+/* Whether touching p faults, through a handler of our own for the one
+ * access: a protection that never reached the host would pass every
+ * "stays writable" check, so the restricting side is checked too. */
+static sigjmp_buf g_fault_jb;
+static void on_fault(int sig)
+{
+    (void)sig;
+    siglongjmp(g_fault_jb, 1);
+}
+
+static int faults(volatile uint8_t *p, int write)
+{
+    struct sigaction sa, old_segv, old_bus;
+    volatile int hit = 0;
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_fault;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS, &sa, &old_bus);   /* macOS reports a write to a read-only page so */
+    if (sigsetjmp(g_fault_jb, 1))
+        hit = 1;
+    else if (write)
+        *p = 0x33;
+    else
+        (void)*p;
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGBUS, &old_bus, NULL);
+    return hit;
+}
+
+static void test_protect(void)
+{
+    char d[160];
+    uint32_t pbase = g_scratch, psize = g_scratch + 4, pold = g_scratch + 8;
+    uint32_t base, page, again, st;
+    uint32_t hp = (uint32_t)sysconf(_SC_PAGESIZE);
+
+    printf("guest page protection (host page %u bytes)\n", hp);
+    G32(pbase) = 0;
+    G32(psize) = 0x20000;
+    st = CALL(ORD_NTALLOC, pbase, 0, psize, 0x3000, 4);
+    base = G32(pbase);
+    check(st == 0 && base, "allocate 128 KB", NULL);
+
+    /* JSRF: a 480-byte table made read-only at the start of a host page.
+     * The next guest page belongs to someone else and must stay writable. */
+    page = (base + hp - 1) & ~(hp - 1);
+    G32(pbase) = page;
+    G32(psize) = 480;
+    st = CALL(ORD_NTPROTECT, pbase, psize, 0x02 /* PAGE_READONLY */, pold);
+    snprintf(d, sizeof d, "status 0x%08X", st);
+    check(st == 0, "NtProtectVirtualMemory(PAGE_READONLY) succeeds", d);
+    GP(page + 0x1000)[0] = 0x5A;        /* faulted with 16 KB host pages */
+    check(GP(page + 0x1000)[0] == 0x5A, "the next guest page stays writable", NULL);
+    CALL(ORD_MMSETPROTECT, page, 0x1000, 0x404 /* READWRITE|WRITECOMBINE */);
+    GP(page)[0] = 0x5B;
+    check(GP(page)[0] == 0x5B, "MmSetAddressProtect(READWRITE|WRITECOMBINE) gives it back", NULL);
+
+    /* A whole host page made read-only really is, and NtProtect reports the
+     * guest protection it replaced. */
+    G32(pbase) = page;
+    G32(psize) = hp;
+    G32(pold) = 0;
+    st = CALL(ORD_NTPROTECT, pbase, psize, 0x02, pold);
+    snprintf(d, sizeof d, "status 0x%08X old 0x%X", st, G32(pold));
+    check(st == 0 && G32(pold) == 0x04, "OldProtect is the guest's previous protection", d);
+    check(faults(GP(page + hp - 1), 1), "a read-only host page faults on write", NULL);
+    check(!faults(GP(page + hp - 1), 0), "but not on read", NULL);
+
+    /* No access over the host page, then read-only on one guest page of it:
+     * the host page must allow the read the newer protection asks for. */
+    CALL(ORD_NTPROTECT, pbase, psize, 0x01 /* PAGE_NOACCESS */, pold);
+    check(faults(GP(page), 0), "a no-access host page faults on read", NULL);
+    G32(psize) = 480;
+    CALL(ORD_NTPROTECT, pbase, psize, 0x02, pold);
+    check(!faults(GP(page), 0), "read-only on part of it makes it readable", NULL);
+    CALL(ORD_MMSETPROTECT, page, hp, 0x04);
+    check(!faults(GP(page + hp - 1), 1), "MmSetAddressProtect(READWRITE) undoes both", NULL);
+
+    /* The whole block read-only, then decommitted and released: both zero
+     * or reuse the pages, which faulted while the protection stayed. */
+    G32(pbase) = base;
+    G32(psize) = 0x20000;
+    CALL(ORD_NTPROTECT, pbase, psize, 0x02, pold);
+    G32(pbase) = base + 0x4000;
+    G32(psize) = 0x4000;
+    st = CALL(ORD_NTFREE, pbase, psize, 0x4000 /* MEM_DECOMMIT */);
+    snprintf(d, sizeof d, "status 0x%08X", st);
+    check(st == 0 && GP(base + 0x4000)[0] == 0, "decommit of read-only pages zeroes them", d);
+    G32(pbase) = base;
+    G32(psize) = 0;
+    st = CALL(ORD_NTFREE, pbase, psize, 0x8000 /* MEM_RELEASE */);
+    snprintf(d, sizeof d, "status 0x%08X", st);
+    check(st == 0, "release of read-only memory succeeds", d);
+    G32(pbase) = 0;
+    G32(psize) = 0x20000;
+    st = CALL(ORD_NTALLOC, pbase, 0, psize, 0x3000, 4);
+    again = G32(pbase);
+    snprintf(d, sizeof d, "got 0x%08X, released 0x%08X", again, base);
+    check(st == 0 && again == base, "the block is handed out again", d);
+    GP(again + 0x1FFFF)[0] = 0x77;
+    check(GP(again)[0] == 0 && GP(again + 0x1FFFF)[0] == 0x77,
+          "and is zeroed and writable", NULL);
+    G32(pbase) = again;
+    G32(psize) = 0;
+    CALL(ORD_NTFREE, pbase, psize, 0x8000);
+
+    /* MmFreeContiguousMemory gives read-only pages back writable too. */
+    base = CALL(ORD_MMALLOC, 2 * hp);
+    page = (base + hp - 1) & ~(hp - 1);
+    CALL(ORD_MMSETPROTECT, page, hp, 0x02);
+    check(base && faults(GP(page), 1), "a read-only contiguous page faults on write", NULL);
+    CALL(ORD_MMFREE, base);
+    again = CALL(ORD_MMALLOC, 2 * hp);
+    snprintf(d, sizeof d, "got 0x%08X, freed 0x%08X", again, base);
+    check(again == base && !faults(GP(page), 1),
+          "and is writable once freed and handed out again", d);
+    CALL(ORD_MMFREE, again);
+}
+
+/* JSRF on the Mac died in the heap's own zeroing (__bzero under
+ * xbox_HeapAlloc, from NtAllocateVirtualMemory) about 40 s into the intro.
+ * The title had made a page allocation read-only that ended inside a 16 KB
+ * host page; the next page allocation was handed the rest of that host page,
+ * and the host protection, rounded out to the whole page, covered it. Run
+ * first, on a heap with no free blocks yet, so the second allocation is the
+ * bump right behind the first. A fault here leaves the heap lock held, so it
+ * ends the run rather than going on. */
+static sigjmp_buf g_alloc_jb;
+static void on_alloc_fault(int sig)
+{
+    (void)sig;
+    siglongjmp(g_alloc_jb, 1);
+}
+
+static void test_protect_next_alloc(void)
+{
+    char d[160];
+    uint32_t pbase = g_scratch, psize = g_scratch + 4, pold = g_scratch + 8;
+    uint32_t hp = (uint32_t)sysconf(_SC_PAGESIZE);
+    uint32_t next = g_scratch + 0x1000, gap = (hp - next % hp) % hp;
+    uint32_t a, b = 0, st = 0;
+    struct sigaction sa, old_segv, old_bus;
+
+    printf("allocation behind a read-only page allocation (host page %u bytes)\n", hp);
+    if (gap) {                          /* the next block starts a host page */
+        G32(pbase) = 0;
+        G32(psize) = gap;
+        CALL(ORD_NTALLOC, pbase, 0, psize, 0x3000, 4);
+    }
+    G32(pbase) = 0;
+    G32(psize) = 0x2000;
+    CALL(ORD_NTALLOC, pbase, 0, psize, 0x3000, 4);
+    a = G32(pbase);
+    snprintf(d, sizeof d, "got 0x%08X", a);
+    check(a && a % hp == 0, "a page allocation at the start of a host page", d);
+    G32(pbase) = a;
+    G32(psize) = 0x2000;
+    CALL(ORD_NTPROTECT, pbase, psize, 0x02 /* PAGE_READONLY */, pold);
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_alloc_fault;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS, &sa, &old_bus);
+    if (sigsetjmp(g_alloc_jb, 1)) {
+        check(0, "the next allocation is zeroed without a fault",
+              "faulted in the heap's zeroing");
+        printf("\n%d failure(s)\n", failures);
+        _exit(1);
+    }
+    G32(pbase) = 0;
+    G32(psize) = 0x1000;
+    st = CALL(ORD_NTALLOC, pbase, 0, psize, 0x3000, 4);
+    b = G32(pbase);
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGBUS, &old_bus, NULL);
+    snprintf(d, sizeof d, "status 0x%08X, got 0x%08X", st, b);
+    check(st == 0 && b == a + 0x2000, "the next allocation follows it", d);
+    check(!faults(GP(b + 0xFFF), 1), "and is writable", NULL);
+    if (hp == 0x1000)
+        check(faults(GP(a), 1), "the read-only block still faults on write", NULL);
+    /* Both stay allocated: freed, they would leave a hole the later tests'
+     * "released region is reused" checks find first under reclaim. */
+}
+
+/* ---- contiguous arena -------------------------------------------------- */
+static void test_contiguous(void)
+{
+    char d[160];
+    uint32_t a, b, c, e, big, i, ok = 1;
+
+    printf("contiguous arena\n");
+    a = CALL(ORD_MMALLOC, 0x2000);
+    b = CALL(ORD_MMALLOC, 0x1000);
+    snprintf(d, sizeof d, "a=0x%08X b=0x%08X", a, b);
+    check(a >= XBOX_CONTIG_BASE && b >= XBOX_CONTIG_BASE && a != b,
+          "allocations come from the window", d);
+    snprintf(d, sizeof d, "got %u", CALL(ORD_MMQUERYSIZE, a));
+    check(CALL(ORD_MMQUERYSIZE, a) == 0x2000,
+          "MmQueryAllocationSize answers for a contiguous block", d);
+    check(CALL(ORD_MMQUERYSIZE, a + 0x1800) == 0x800,
+          "MmQueryAllocationSize on an interior address", NULL);
+    CALL(ORD_MMFREE, a);
+    check(CALL(ORD_MMQUERYSIZE, a) == 0, "freed block reports size 0", NULL);
+    c = CALL(ORD_MMALLOC, 0x1000);
+    snprintf(d, sizeof d, "c=0x%08X a=0x%08X", c, a);
+    check(c == a, "freed pages are reused", d);
+
+    /* MmAllocateContiguousMemoryEx: range and alignment honoured. */
+    e = CALL(ORD_MMALLOCEX, 0x3000, 0x01000000, 0x01FFFFFF, 0x10000, 4);
+    snprintf(d, sizeof d, "e=0x%08X", e);
+    check(e && (e - XBOX_CONTIG_BASE) >= 0x01000000
+            && (e - XBOX_CONTIG_BASE) + 0x3000 - 1 <= 0x01FFFFFF
+            && (e & 0xFFFF) == 0,
+          "Ex honours lowest/highest and alignment", d);
+    check(CALL(ORD_MMALLOCEX, 0x1000, 0x5000000, 0x4000000, 0, 4) == 0,
+          "Ex with highest < lowest fails", NULL);
+    CALL(ORD_MMFREE, e);
+    CALL(ORD_MMFREE, b);
+    CALL(ORD_MMFREE, c);
+
+    /* Churn: 40 MB allocated and freed eight times would exhaust a bump
+     * allocator over a 64 MB window on the second pass. */
+    for (i = 0; i < 8 && ok; i++) {
+        big = CALL(ORD_MMALLOC, 40u << 20);
+        ok = big != 0;
+        if (ok) CALL(ORD_MMFREE, big);
+    }
+    check(ok, "allocate/free 40 MB eight times without exhausting", NULL);
+    snprintf(d, sizeof d, "%u bytes still in use",
+             xbox_ContiguousInUseBytes());
+    check(xbox_ContiguousInUseBytes() == 0, "everything freed is released", d);
 }
 
 /* ---- FileRenameInformation -------------------------------------------- */
@@ -447,17 +709,27 @@ int main(int argc, char **argv)
     unsigned i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
+    /* The z: checks read the host files under Cache; the in-memory store,
+     * on by default, has its own (kernel_ram_cache). */
+    recomp_env_set(RENV_STORAGE_RAM_CACHE, "0");
     if (!mkdtemp(tmpl)) return 2;
     setenv("XDG_DATA_HOME", tmpl, 1);
-    snprintf(cache, sizeof cache, "%s/xboxrecomp/Cache", tmpl);
-    snprintf(cmd, sizeof cmd, "mkdir -p '%s'", cache);
-    if (system(cmd) != 0) return 2;
 
     xbe = load(argc > 1 ? argv[1] : "tools/conformance/test.xbe", &n);
     if (!xbe || !xbox_MemoryLayoutInit(xbe, n)) {
         printf("cannot map guest memory (run tools/conformance/mkxbe.py)\n");
         return 2;
     }
+    /* The default hard disk is per title (<XDG>/xboxrecomp/<title id>), and
+     * the title id is the XBE's, so Cache is found through the path layer. */
+    {
+        char root[200];
+        xbox_path_init(NULL, NULL);
+        if (!xbox_path_hdd_root(root, sizeof root)) return 2;
+        snprintf(cache, sizeof cache, "%s/Cache", root);
+    }
+    snprintf(cmd, sizeof cmd, "mkdir -p '%s'", cache);
+    if (system(cmd) != 0) return 2;
 
     g_thunks  = xbox_HeapAlloc(0x1000, 4096);
     g_stack   = xbox_HeapAlloc(0x1000, 4096);
@@ -468,7 +740,10 @@ int main(int argc, char **argv)
     xbox_kernel_set_thunk_address(g_thunks, NORDS + 1);
     xbox_kernel_bridge_init();
 
+    test_protect_next_alloc();
     test_virtual_memory();
+    test_protect();
+    test_contiguous();
     test_rename(cache);
     test_overwrite(cache);
     test_threads();

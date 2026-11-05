@@ -18,6 +18,11 @@ LGPL-2.1-or-later — extracted from xemu
                           2019-2025 Matt Borgerson
     src/apu/apu_dsp.c     MCPX APU DSP (GP/EP)
                           (c) 2012 espes; 2019-2025 Matt Borgerson
+    src/apu/apu_dsp_emu.c MCPX APU GP/EP device on the dsp56300 JIT
+    src/apu/apu_dsp_emu.h (gp_ep.c and dsp_dma.c; the glue to the core
+                          is this project's own)
+                          (c) 2012, 2015 espes; 2018-2019 Jannik Vogel;
+                          2019-2025 Matt Borgerson
     src/apu/apu_vp.c      MCPX APU voice processor
                           (c) 2012 espes; 2018-2019 Jannik Vogel;
                           2019-2025 Matt Borgerson
@@ -54,6 +59,244 @@ LGPL-2.1-or-later — extracted from xemu
   satisfies that.
 
 
+MIT and permissive — dsp56300 (XBOXRECOMP_APU_DSP)
+--------------------------------------------------
+
+  https://github.com/xemu-project/dsp56300  (v1.0.0)
+  (c) 2026 Matt Borgerson. MIT; the text is in LICENSES/MIT-dsp56300.txt.
+
+  A Motorola DSP56300 JIT in Rust with a C interface. It is not in this
+  repository: a build with -DXBOXRECOMP_APU_DSP=ON (the default on every
+  target with an archive) downloads the project's prebuilt static library
+  for its target, pinned by sha256 in cmake/dsp56300.cmake, and links it
+  into the APU. Builds with the option OFF contain none of it.
+
+  That library bundles the Rust standard library, copyright The Rust
+  Project Developers, used here under Apache-2.0 (it is MIT OR Apache-2.0;
+  the text is in LICENSES/Apache-2.0.txt), and these crates, the normal dependencies of dsp56300-emu-ffi in its
+  Cargo.lock at v1.0.0 (build-only tools such as cbindgen, MPL-2.0, are
+  not linked). None is GPL or LGPL.
+
+    Apache-2.0 WITH LLVM-exception
+      cranelift-assembler-x64, cranelift-bforest, cranelift-bitset,
+      cranelift-codegen, cranelift-codegen-shared, cranelift-control,
+      cranelift-entity, cranelift-frontend, cranelift-jit,
+      cranelift-module, cranelift-native, regalloc2, target-lexicon,
+      wasmtime-internal-core, wasmtime-internal-jit-icache-coherence
+    MIT
+      dsp56300-core, dsp56300-emu, dsp56300-emu-ffi, libm, region
+    Zlib
+      foldhash (c) 2024 Orson Peters
+    (MIT OR Apache-2.0) AND Unicode-3.0
+      unicode-ident
+    MIT OR Apache-2.0 (some also BSD-2-Clause)
+      allocator-api2, anyhow, arbitrary, bitflags, bumpalo, cfg-if,
+      equivalent, fnv, gimli, hashbrown, indexmap, libc, log, mach2,
+      memmap2, proc-macro2, quote, rustc-hash, serde, serde_core,
+      serde_derive, smallvec, stable_deref_trait, syn, windows-link,
+      windows-sys, windows-targets, windows_*_gnu, windows_*_gnullvm,
+      windows_*_msvc
+
+  The texts: LICENSES/Apache-2.0.txt, LICENSES/LLVM-exception.txt,
+  LICENSES/Unicode-3.0.txt, LICENSES/Zlib-foldhash.txt; MIT is the
+  licence of this repository. LICENSES/THIRDPARTY-dsp56300-emu.txt is the
+  archive's own third-party file, verbatim, with each crate's copyright.
+
+
+MIT and permissive — the enhancements overlay (XBOXRECOMP_ENHANCE)
+-------------------------------------------------------------------
+
+  Vendored unmodified under third_party/ and compiled only in builds with
+  -DXBOXRECOMP_ENHANCE=ON. Each directory's VERSION file names the
+  upstream commit and the sha256 of every file.
+
+  third_party/microui/  microui 2.02
+                        https://github.com/rxi/microui
+                        (c) 2024 rxi. MIT; the text is in
+                        LICENSES/MIT-microui.txt.
+
+  third_party/stb/      stb_truetype.h v1.26
+                        https://github.com/nothings/stb
+                        (c) 2017 Sean Barrett. MIT or public domain, at
+                        the user's choice; the text is in
+                        LICENSES/MIT-stb.txt.
+
+  third_party/fonts/atkinson-hyperlegible/
+                        Atkinson Hyperlegible Regular 1.006
+                        https://github.com/google/fonts (ofl/atkinsonhyperlegible)
+                        (c) 2020 Braille Institute of America, Inc.
+                        SIL Open Font License 1.1; the text is in OFL.txt
+                        beside the font and in
+                        LICENSES/OFL-1.1-atkinson-hyperlegible.txt.
+                        The fonts are embedded in the binary as they are.
+                        The OFL allows bundling them with software; they
+                        are not sold on their own and are not renamed.
+
+  third_party/lucide/    Lucide 1.57.0 icon font, a 19-icon subset
+                        https://github.com/lucide-icons/lucide
+                        (c) 2026 Lucide Icons and Contributors. ISC; the
+                        icons Lucide took from Feather are (c) 2013-present
+                        Cole Bemis, MIT. Both texts are in LICENSE beside
+                        the font and in LICENSES/ISC-MIT-lucide.txt.
+                        Subset by tools/overlay/glyphs_to_ttf.py and
+                        embedded in the binary.
+
+  third_party/kenney-input/
+                        Kenney Input Prompts 1.3, 129 prompts converted to
+                        a font by tools/overlay/glyphs_to_ttf.py
+                        https://kenney.nl/assets/input-prompts
+                        Created and distributed by Kenney (www.kenney.nl).
+                        CC0 1.0: no credit is required; this one is given
+                        as the pack asks. The pack's licence and the CC0
+                        legal code are in LICENSES/CC0-1.0-kenney-input.txt.
+
+  third_party/librashader/librashader.h
+                        librashader v0.12.0 C header, unmodified
+                        https://github.com/SnowflakePowered/librashader
+                        (c) the librashader authors. MIT (its comment).
+
+  assets/shaders/       RetroArch slang presets for present.shader,
+                        unmodified from libretro/slang-shaders; each file
+                        keeps its header, and assets/shaders/README.md
+                        lists them: public domain, MIT and Unlicense only.
+
+
+MPL-2.0 — librashader (present.shader, XBOXRECOMP_ENHANCE)
+----------------------------------------------------------
+
+  librashader.dll / librashader.dylib, staged beside the executable by
+  cmake/librashader.cmake: the upstream prebuilt release, unmodified (on
+  x86-64 Windows our build of the unmodified source with only the D3D11
+  runtime, made by third_party/librashader/build-windows.sh), pinned by sha256
+  and loaded at run time, never linked. The game's code
+  stays under its own licence (MPL-2.0 applies file by file); the
+  library's source is at
+  https://github.com/SnowflakePowered/librashader/tree/librashader-v0.12.0
+  and the licence text is in LICENSES/MPL-2.0-librashader.txt, which
+  ships as shaders/LICENSE-librashader.txt beside the library.
+
+
+MIT and permissive — what our x86-64 Windows librashader.dll links
+------------------------------------------------------------------
+
+  Our build of librashader.dll (above) links statically, from the
+  Cargo.lock at the v0.12.0 tag with --no-default-features --features
+  runtime-d3d11 (build and dev dependencies are not linked). None is GPL
+  or LGPL.
+
+    C/C++ libraries
+      glslang (in glslang-sys): BSD-3-Clause and the other permissive
+        licences its LICENSE.txt lists
+      SPIRV-Cross (in spirv-cross-sys): Apache-2.0, some files under the
+        Khronos free-use licence
+      Mesa's NIR and spirv_to_dxil (in spirv-to-dxil-sys): MIT, with the
+        copyright of each file
+      llvm-mingw 20260922: libc++, libc++abi, libunwind and compiler-rt
+        (Apache-2.0 WITH LLVM-exception), the MinGW-w64 runtime
+        (permissive; a binary must carry its notices)
+      the Rust 1.99.1 standard library (MIT OR Apache-2.0)
+    MPL-2.0
+      librashader's own crates, persy, smartstring
+    Apache-2.0
+      blake3, codespan-reporting, constant_time_eq, moxcms, pxfm, rspirv,
+      spirv
+    BSD-2-Clause / BSD-3-Clause
+      arrayref / encoding_rs (with MIT)
+    Zlib
+      foldhash
+    (MIT OR Apache-2.0) AND Unicode-3.0
+      unicode-ident
+    MIT (most also Apache-2.0)
+      114 crates, among them glslang, image, naga, nom, png, rayon, regex,
+      spirv-cross2, spirv-to-dxil, windows and zune-jpeg
+
+  The texts, with every copyright, are in THIRDPARTY.txt in the release
+  zip, generated by cargo-about by third_party/librashader/build-windows.sh
+  (about.toml and about.hbs there) and staged as
+  shaders/THIRDPARTY-librashader.txt beside the library. The MinGW-w64
+  text is also LICENSES/MinGW-w64-runtime.txt.
+
+
+MIT and permissive — what upstream's macOS librashader.dylib links
+------------------------------------------------------------------
+
+  The upstream macOS dylib (above; aarch64 and x86-64) is built by its
+  release workflow with librashader-capi's default features (runtime-all:
+  OpenGL, Vulkan and Metal on macOS) from the Cargo.lock at the v0.12.0
+  tag, with Rust 1.97.0. The crate list below covers every crate in that
+  build graph for the two Apple targets; some of them (the Direct3D
+  runtimes, d3d12-descriptor-heap, the windows-* crates) only build on
+  Windows and are listed because the graph does not gate them by target. It links statically (its C++ runtime is
+  the system's libc++ dylib, imported; build and dev dependencies are not
+  linked; none is GPL or LGPL):
+
+    C/C++ libraries
+      glslang (in glslang-sys): BSD-3-Clause and the other permissive
+        licences its LICENSE.txt lists
+      SPIRV-Cross (in spirv-cross-sys): Apache-2.0, some files under the
+        Khronos free-use licence
+      the Rust 1.97.0 standard library (MIT OR Apache-2.0)
+    MPL-2.0
+      librashader's own crates, persy, smartstring
+    Apache-2.0
+      blake3, codespan-reporting, constant_time_eq, moxcms, pxfm, rspirv,
+      spirv
+    BSD-2-Clause / BSD-3-Clause
+      arrayref / encoding_rs (with MIT)
+    ISC
+      libloading
+    Zlib
+      foldhash
+    (MIT OR Apache-2.0) AND Unicode-3.0
+      unicode-ident
+    MIT (most also Apache-2.0)
+      129 crates, among them ash, glow, glslang, gpu-allocator, image, naga,
+      objc2, objc2-metal, rayon, regex, spirv-cross2 and zune-jpeg
+
+  Upstream's zip has no notices file, so the texts, with every copyright,
+  are generated from the same source and features by
+  third_party/librashader/notices-macos.sh (cargo-about 0.9.3 with
+  about.toml there), committed as third_party/librashader/THIRDPARTY-macos.txt
+  and staged as shaders/THIRDPARTY-librashader.txt beside the library.
+
+
+Permissive — the toolchain runtime in every Windows executable
+--------------------------------------------------------------
+
+  The Windows executables are built with llvm-mingw 20260922 (UCRT;
+  https://github.com/mstorsjo/llvm-mingw). Its linker adds parts of the
+  toolchain's runtime to every executable, statically:
+
+    The MinGW-w64 runtime (mingw-w64-crt, https://www.mingw-w64.org/): the
+      startup objects (crt2.o, crtbegin.o, crtend.o), libmingw32 (CRT
+      start-up, TLS support, pseudo-relocations), libmingwex (among others
+      __mingw_printf and gdtoa's floating-point conversions) and the
+      static wrappers in its UCRT import library. The mingw-w64 project's
+      own licence and the BSD, ISC-style and gdtoa notices of the parts it
+      took from elsewhere; a binary must carry them. The text, verbatim
+      from mingw-w64 (llvm-mingw installs the same file as
+      x86_64-w64-mingw32/share/mingw32/COPYING.MinGW-w64-runtime.txt), is
+      LICENSES/MinGW-w64-runtime.txt.
+    LLVM libunwind, in builds with -DXBOXRECOMP_APU_DSP=ON: the Rust std in
+      dsp56300 unwinds through it, and cmake/dsp56300.cmake links it
+      statically. In builds with the option OFF, compiler-rt's builtins
+      (libclang_rt.builtins) can take the place of the helpers that Rust's
+      compiler_builtins provides when it is ON (___chkstk_ms, 128-bit
+      division). Both are Apache-2.0 WITH LLVM-exception, and code not yet
+      relicensed from before that change is under the Legacy LLVM
+      (University of Illinois/NCSA) licence, whose copyright notice a
+      binary redistribution must carry. LICENSES/LLVM-LICENSE.txt is
+      llvm-mingw 20260922's LICENSE.TXT, verbatim, with both texts.
+
+  The C runtime itself is the system's Universal CRT (api-ms-win-crt-*),
+  imported, not linked. The executables are C only: no libc++ or libc++abi
+  is linked, and nothing in them uses winpthreads (its own licence,
+  COPYING.winpthreads.txt in llvm-mingw, is not part of the runtime text
+  above). They import no libc++.dll, libunwind.dll or libwinpthread-1.dll.
+  A game that adds C++ or POSIX-thread code changes this list: lld's
+  --verbose names every archive member a link loads.
+
+
 Derived algorithms — credited, independently implemented
 --------------------------------------------------------
 
@@ -67,12 +310,26 @@ Derived algorithms — credited, independently implemented
     NV2A register-combiner translation. Cites xemu's pgraph combiner
     implementation as a reference for the hardware's behaviour.
 
+  src/kernel/nv2a_vsh_fields.h
+    The NV2A vertex-program field table, as (word, shift, bits). Cites
+    xemu's hw/xbox/nv2a/pgraph/vsh.c as the reference for the layout.
+
+  src/kernel/nv2a_combiner.h
+    NV2A register-combiner field table and CPU evaluator. Cites xemu's
+    hw/xbox/nv2a/pgraph/glsl/psh.c as the reference for the encoding and
+    the combiner semantics.
+
+  src/kernel/nv2a_backend_common.h
+    Cube-map face selection and face stride. Cites xemu's
+    hw/xbox/nv2a/pgraph texture code (texture.c) as the reference for the
+    face order and the per-face layout.
+
   Algorithms and hardware behaviour are not themselves copyrightable, and
   these are our own implementations. They are listed here because the debt is
   real and should be visible even where no licence obligation attaches. If
-  anyone believes either file crosses from "implements the same algorithm"
-  into "copies the expression", raise an issue and we will rewrite or
-  relicense it — getting the credit right matters more to us than the licence
+  anyone believes any of these files crosses from "implements the same
+  algorithm" into "copies the expression", raise an issue and we will rewrite
+  or relicense it — getting the credit right matters more to us than the licence
   label.
 
 

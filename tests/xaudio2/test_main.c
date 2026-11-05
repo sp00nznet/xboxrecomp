@@ -109,12 +109,17 @@ static HRESULT fake_submit(const XAUDIO2_BUFFER *buffer)
 #define IXAudio2SourceVoice_GetState(source, state, ...) fake_state(state)
 #undef IXAudio2SourceVoice_SubmitSourceBuffer
 #define IXAudio2SourceVoice_SubmitSourceBuffer(source, buffer, ...) fake_submit(buffer)
+/* host_time.c is not linked: the test says whether it runs under Wine. */
+static int fake_wine;
+int xbox_HostUnderWine(void) { return fake_wine; }
 #include "../../src/apu/apu_xaudio2.c"
+#include "../../src/platform/recomp_env.c"
 
-/* xa2_init reads the buffer variables on each call. */
+/* The runtime reads the environment once; re-read it after each change. */
 static void put_env(const char *assignment)
 {
     _putenv(assignment);
+    recomp_env_reload();
 }
 
 static void reset(void)
@@ -249,6 +254,31 @@ int main(void)
             CHECK(queued_bytes[0] == c[k].want_s * 4);
             xa2_shutdown();
         }
+        max_queue = 8;
+    }
+
+    /* Under Wine the count defaults deeper (the frame thread can be
+     * preempted past four buffers there); the variable still wins. */
+    {
+        static int16_t period[256][2];
+        put_env("RECOMP_AUDIO_BUF_SAMPLES=");
+        put_env("RECOMP_AUDIO_BUF_COUNT=");
+        fake_wine = 1;
+        reset();
+        max_queue = XA2_NUM_BUFS_WINE;
+        CHECK(xa2_init() == 1);
+        CHECK(xa2_get_buffer_count() == XA2_NUM_BUFS_WINE);
+        for (UINT32 i = 0; i < (XA2_NUM_BUFS_WINE + 1) * 512 / 128; i++)
+            xa2_submit_samples(&period[0][0], 128);
+        CHECK(queue_count == XA2_NUM_BUFS_WINE);
+        xa2_shutdown();
+        put_env("RECOMP_AUDIO_BUF_COUNT=4");
+        reset();
+        max_queue = 4;
+        CHECK(xa2_init() == 1 && xa2_get_buffer_count() == 4);
+        xa2_shutdown();
+        put_env("RECOMP_AUDIO_BUF_COUNT=");
+        fake_wine = 0;
         max_queue = 8;
     }
 

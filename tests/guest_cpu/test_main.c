@@ -1,19 +1,22 @@
 /*
  * The guest CPU (kernel_guest_cpu.c, RECOMP_GUEST_LOCK=1): one guest thread
  * runs guest code at a time, handed over in FIFO order at kernel calls and
- * at loop back edges past the quantum.
+ * at a lowered spin-wait's passes.
  *
- * A title's level loader and its loader thread can add entries to one
- * global pool with a read-modify-write the console's one CPU never
- * interleaved. The cases, each ordered by events or by the lock's own waiter count rather
+ * BLiNX 2's stage loader and its loader thread add lights to one global pool
+ * with a read-modify-write the console's one CPU never interleaved. The
+ * cases, each ordered by events or by the lock's own waiter count rather
  * than run many times:
  *  - off: every call is a no-op, and two guest threads run guest code at
  *    once (the race, recorded);
  *  - off: four threads' unlocked read-modify-writes lose updates (the bug,
  *    recorded); on: none lost, with yields and kernel-call releases between
  *    the iterations;
- *  - a yield (NtYieldExecution) with three waiters serves them oldest
- *    first and the yielder last;
+ *  - a guest thread spinning on a flag another guest thread sets, with no
+ *    kernel call in the loop, ends: the lowered pass yields while a guest
+ *    thread waits (upstream's deadlock case);
+ *  - a yield with three waiters serves them oldest first and the yielder
+ *    last;
  *  - a kernel call that may block lets a waiter run, and the caller takes
  *    the CPU back only when the waiter has let go; one that returns at once
  *    switches nobody, even with a waiter queued; past the quantum (here 0)
@@ -24,6 +27,8 @@
  * A watchdog fails the test instead of hanging it.
  */
 #include "kernel.h"
+#include "kernel_pacing.h"
+#include "recomp_env.h"
 #include "xbox_memory_layout.h"
 #include "platform/host_time.h"
 
@@ -41,9 +46,15 @@ recomp_func_t recomp_lookup(uint32_t xbox_va) { (void)xbox_va; return NULL; }
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NULL; }
 
+/* As templates/runtime/recomp_types.h defines it (that header is the
+ * generated code's, and too heavy to pull in here). */
+#define RECOMP_SPIN_WAIT(va) \
+    do { __atomic_thread_fence(__ATOMIC_SEQ_CST); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWait(va); } while (0)
+
 static int failures;
 
-/* The flag is only ever accessed atomically (kernel.h). */
+/* The flag is only ever accessed atomically (kernel.h): a plain load in a
+ * polling loop may be hoisted now that it is no longer volatile. */
 static int32_t preempt_flag(void)
 {
     return (int32_t)InterlockedCompareExchange(
@@ -61,47 +72,16 @@ static void check(int ok, const char *what)
     if (!ok) failures++;
 }
 
-static void set_env(const char *name, const char *v)
-{
-#ifdef _WIN32
-    _putenv_s(name, v ? v : "");
-#else
-    if (v)
-        setenv(name, v, 1);
-    else
-        unsetenv(name);
-#endif
-    xbox_GuestCpuReloadConfig();
-}
-
 static void set_lock(const char *v)
 {
-    set_env("RECOMP_GUEST_LOCK", v);
-}
-
-/* The kernel thunk's NtYieldExecution: a hand-off whatever the quantum. */
-static void yield_cpu(void)
-{
-    if (xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 238))
-        xbox_GuestCpuAcquire();
+    recomp_env_set(RENV_GUEST_LOCK, v);
+    xbox_GuestCpuReloadConfig();
 }
 
 static void join(HANDLE t)
 {
     WaitForSingleObject(t, 20000);
     CloseHandle(t);
-}
-
-/* Wait for the guest CPU's queue to reach n waiters; 0 on timeout. */
-static int wait_waiting(int n, int ms)
-{
-    uint64_t t0 = xbox_HostNowNs();
-    while (xbox_GuestCpuWaiting() != n) {
-        if (xbox_HostNowNs() - t0 > (uint64_t)ms * 1000000ull)
-            return 0;
-        Sleep(1);
-    }
-    return 1;
 }
 
 /* Wait for a shared word to reach a value; 0 on timeout. */
@@ -158,7 +138,7 @@ static void switched_off(void)
     check(xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 1) == 0,
           "off: a release has nothing to let go of");
     xbox_GuestCpuAcquire();
-    yield_cpu();
+    xbox_GuestCpuYield(0x1000);
     check(!xbox_GuestCpuHeld() && xbox_GuestCpuEnterCallback() == 0,
           "off: acquire, yield and a callback entry are no-ops");
     xbox_GuestCpuPart();
@@ -200,7 +180,7 @@ static DWORD WINAPI rmw_thread(LPVOID p)
         /* Between two RMWs, not inside one: a yield is a preemption point,
          * and an RMW across one is the title's own bug on the console too. */
         if ((i & 15) == 15)
-            yield_cpu();
+            xbox_GuestCpuYield(0x2000);
         if ((i & 63) == 63) {               /* a kernel call */
             int held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 99);
             Sleep(0);
@@ -244,8 +224,66 @@ static void exclusion(void)
     xbox_GuestCpuStatsGet(&st, 0);
     check(on == RMW_THREADS * RMW_ITERS,
           "on: four threads' unlocked RMWs lose nothing");
-    check(st.turns > 0 && st.waits > 0,
+    check(st.yields > 0 && st.waits > 0,
           "on: the threads waited and the holder yielded to them");
+}
+
+/* ── A spin on another guest thread's flag ────────────────────────── */
+
+static volatile LONG s_flag, s_setter_ran;
+
+static DWORD WINAPI setter_thread(LPVOID p)
+{
+    (void)p;
+    xbox_GuestCpuJoin();                    /* waits: the spinner holds it */
+    InterlockedExchange(&s_flag, 1);
+    InterlockedExchange(&s_setter_ran, 1);
+    xbox_GuestCpuPart();
+    return 0;
+}
+
+static void spin_on_flag(void)
+{
+    HANDLE t;
+    uint64_t t0;
+    XboxGuestCpuStats st;
+    XboxSpinSiteStats site = {0};
+
+    set_lock("1");
+    s_flag = s_setter_ran = 0;
+    xbox_SpinStatsReset();
+    xbox_GuestCpuStatsGet(&st, 1);
+    xbox_GuestCpuJoin();
+    t = CreateThread(NULL, 0, setter_thread, NULL, 0, NULL);
+    /* The lowered loop: while (![flag]) RECOMP_SPIN_WAIT(va). Spin pacing,
+     * nothing posted: the pass calls the wait only for a waiting guest
+     * thread, and that pass hands the CPU over. */
+    t0 = xbox_HostNowNs();
+    while (!s_flag) {
+        RECOMP_SPIN_WAIT(0x00060475u);
+        if (xbox_HostNowNs() - t0 > 10000000000ull)
+            break;
+    }
+    /* Before the prints: this thread's hold is still open, and the longest
+     * closed one is the spinner's first (thread creation inside it), ended
+     * at the yield; the setter's lasted two stores. */
+    xbox_GuestCpuStatsGet(&st, 0);
+    xbox_SpinSiteStats(0x00060475u, &site);
+    check(s_flag == 1 && s_setter_ran,
+          "spin: the loop ended because its pass yielded to the setter");
+    check(xbox_GuestCpuHeld(), "spin: the spinner has the CPU back");
+    /* The site's own record, not a sample of the waiter count in the loop:
+     * the setter may queue between such a sample and the macro's read, and
+     * then the first pass yields with the sample still 0. The site counts a
+     * spin pass where the wait itself read a waiter, and a yield where that
+     * pass handed the CPU over. */
+    check(site.spin_passes >= 1 && site.spin_yields >= 1,
+          "spin: the macro saw the waiter and its pass yielded");
+    check(st.yields >= 1 && st.turns >= 2, "spin: one yield, two turns closed");
+    check(st.max_turn_kind != XBOX_GUEST_CPU_SPIN || st.max_turn_where == 0x00060475u,
+          "spin: a hold ended at a yield names the lowered loop's VA");
+    xbox_GuestCpuPart();
+    join(t);
 }
 
 /* ── FIFO ─────────────────────────────────────────────────────────── */
@@ -277,15 +315,15 @@ static void fifo(void)
     for (i = 0; i < 3; i++) {
         t[i] = CreateThread(NULL, 0, waiter_thread, (LPVOID)(intptr_t)(i + 1), 0, NULL);
         /* Each one queued before the next starts, so the order is known. */
-        queued &= wait_waiting(i + 1, 5000);
+        queued &= wait_for((volatile LONG *)&g_xbox_guest_cpu_waiters, i + 1, 5000);
     }
     check(queued, "fifo: three waiters queued in order");
-    yield_cpu();
+    xbox_GuestCpuYield(0x3000);
     i = InterlockedIncrement(&s_seq) - 1;
     s_order[i] = 9;
     check(s_order[0] == 1 && s_order[1] == 2 && s_order[2] == 3 && s_order[3] == 9,
           "fifo: a yield serves the oldest waiter first, the yielder last");
-    check(xbox_GuestCpuWaiting() == 0, "fifo: nobody left waiting");
+    check(g_xbox_guest_cpu_waiters == 0, "fifo: nobody left waiting");
     xbox_GuestCpuPart();
     for (i = 0; i < 3; i++)
         join(t[i]);
@@ -315,7 +353,7 @@ static void kernel_call(void)
     s_kc_ran = s_kc_let_go = 0;
     xbox_GuestCpuJoin();
     t = CreateThread(NULL, 0, kernel_call_waiter, NULL, 0, NULL);
-    check(wait_waiting(1, 5000),
+    check(wait_for((volatile LONG *)&g_xbox_guest_cpu_waiters, 1, 5000),
           "kernel call: the other thread waits while this one runs");
     held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 233); /* NtWaitForSingleObject */
     ran_during = wait_for(&s_kc_ran, 1, 5000);
@@ -347,16 +385,22 @@ static void short_call(void)
     XboxGuestCpuStats st;
 
     set_lock("1");
+    /* The turn starts at the join, and starting the waiter thread and
+     * seeing it queue can outlast the default 4 ms quantum on a loaded
+     * host; the call would then hand over for the quantum's sake, not for
+     * the call's. A 1 s quantum leaves only the call to decide. */
+    recomp_env_set(RENV_GUEST_QUANTUM, "1000");
+    xbox_GuestCpuReloadConfig();
     s_short_ran = 0;
     xbox_GuestCpuJoin();
     t = CreateThread(NULL, 0, short_waiter, NULL, 0, NULL);
-    check(wait_waiting(1, 5000),
+    check(wait_for((volatile LONG *)&g_xbox_guest_cpu_waiters, 1, 5000),
           "short call: a waiter is queued");
     /* KfRaiseIrql, say: returns at once. The caller barges back; the waiter
      * is still queued. */
     held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 161);
     xbox_GuestCpuAcquire();
-    check(held && xbox_GuestCpuHeld() && !s_short_ran && xbox_GuestCpuWaiting() == 1,
+    check(held && xbox_GuestCpuHeld() && !s_short_ran && g_xbox_guest_cpu_waiters == 1,
           "short call: a call that returns at once switches nobody");
     /* NtYieldExecution hands over whatever the quantum. */
     xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 238);
@@ -366,12 +410,13 @@ static void short_call(void)
     join(t);
 
     /* Quantum 0: any kernel call hands over once a thread waits. */
-    set_env("RECOMP_GUEST_QUANTUM", "0");
+    recomp_env_set(RENV_GUEST_QUANTUM, "0");
+    xbox_GuestCpuReloadConfig();
     s_short_ran = 0;
     xbox_GuestCpuStatsGet(&st, 1);
     xbox_GuestCpuJoin();
     t = CreateThread(NULL, 0, short_waiter, NULL, 0, NULL);
-    check(wait_waiting(1, 5000),
+    check(wait_for((volatile LONG *)&g_xbox_guest_cpu_waiters, 1, 5000),
           "quantum 0: a waiter is queued");
     xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 161);
     xbox_GuestCpuAcquire();
@@ -382,7 +427,8 @@ static void short_call(void)
           "quantum 0: the longest turn names the ordinal");
     xbox_GuestCpuPart();
     join(t);
-    set_env("RECOMP_GUEST_QUANTUM", NULL);
+    recomp_env_set(RENV_GUEST_QUANTUM, NULL);
+    xbox_GuestCpuReloadConfig();
 }
 
 /* ── A bridge-run callback ────────────────────────────────────────── */
@@ -421,6 +467,44 @@ static void callback(void)
     check(s_host_took == 0, "callback: a host thread's routine takes nothing");
 }
 
+/* ── A host wait outside a kernel call (XBOX_GUEST_CPU_HOST) ──────── */
+
+static volatile LONG s_hw_ran;
+
+static DWORD WINAPI host_wait_waiter(LPVOID p)
+{
+    (void)p;
+    xbox_GuestCpuJoin();
+    InterlockedExchange(&s_hw_ran, 1);
+    xbox_GuestCpuPart();
+    return 0;
+}
+
+static void host_wait(void)
+{
+    HANDLE t;
+    int held;
+
+    set_lock("1");
+    s_hw_ran = 0;
+    xbox_GuestCpuJoin();
+    t = CreateThread(NULL, 0, host_wait_waiter, NULL, 0, NULL);
+    check(wait_for((volatile LONG *)&g_xbox_guest_cpu_waiters, 1, 5000),
+          "host wait: the other thread waits while this one runs");
+    held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_HOST, 0x002E0DB0u);
+    check(held && wait_for(&s_hw_ran, 1, 5000),
+          "host wait: with a waiter the release hands over, and it runs");
+    xbox_GuestCpuAcquire();
+    check(xbox_GuestCpuHeld(), "host wait: the thread holds the CPU again after its wait");
+    join(t);
+    held = xbox_GuestCpuRelease(XBOX_GUEST_CPU_HOST, 0x002E0DB0u);
+    check(held && !xbox_GuestCpuHeld(),
+          "host wait: with no waiter the release lets go all the same");
+    xbox_GuestCpuAcquire();
+    check(xbox_GuestCpuHeld(), "host wait: and the thread takes it straight back");
+    xbox_GuestCpuPart();
+}
+
 /* ── A loop back edge past the quantum (RECOMP_BACK_EDGE) ─────────── */
 
 static volatile LONG s_be_ran;
@@ -444,12 +528,13 @@ static void back_edge(void)
     XboxGuestCpuStats st;
 
     set_lock("1");
-    set_env("RECOMP_GUEST_QUANTUM", "4");
+    recomp_env_set(RENV_GUEST_QUANTUM, "4");
+    xbox_GuestCpuReloadConfig();
     s_be_ran = 0;
     xbox_GuestCpuJoin();
     xbox_GuestCpuStatsGet(&st, 1);
     t = CreateThread(NULL, 0, back_edge_waiter, NULL, 0, NULL);
-    check(wait_waiting(1, 5000),
+    check(wait_for((volatile LONG *)&g_xbox_guest_cpu_waiters, 1, 5000),
           "back edge: the other thread waits while this one loops");
     t0 = xbox_HostNowNs();
     while (!s_be_ran && xbox_HostNowNs() - t0 < 2000000000ull) {
@@ -468,7 +553,7 @@ static void back_edge(void)
           "back edge: the turn is counted as a preemption at the edge");
     join(t);
     xbox_GuestCpuPart();
-    set_env("RECOMP_GUEST_QUANTUM", NULL);
+    recomp_env_set(RENV_GUEST_QUANTUM, NULL);
 
     /* The lock off: the flag never rises and the check is inert. */
     set_lock("0");
@@ -521,7 +606,8 @@ static void wake(void)
     int preempted = 0, flagged = 0;
 
     set_lock("1");
-    set_env("RECOMP_GUEST_QUANTUM", "1000");
+    recomp_env_set(RENV_GUEST_QUANTUM, "1000");
+    xbox_GuestCpuReloadConfig();
     s_wk_ran = 0;
     s_wk_go = 0;
     xbox_GuestCpuStatsGet(&st, 1);
@@ -562,7 +648,7 @@ static void wake(void)
             s_wk_ran = 0;
             s_bl_ran_ns = 0;
             t = CreateThread(NULL, 0, blocked_waiter, NULL, 0, NULL);
-            ok &= wait_waiting(1, 5000);
+            ok &= wait_for((volatile LONG *)&g_xbox_guest_cpu_waiters, 1, 5000);
             xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 277 /* RtlEnterCriticalSection */);
             t0 = xbox_HostNowNs();
             xbox_GuestCpuBlocked();
@@ -582,7 +668,8 @@ static void wake(void)
             printf("    (worst %.2f ms, sum %.2f ms)\n", worst / 1e6, sum / 1e6);
     }
     xbox_GuestCpuPart();
-    set_env("RECOMP_GUEST_QUANTUM", NULL);
+    recomp_env_set(RENV_GUEST_QUANTUM, NULL);
+    xbox_GuestCpuReloadConfig();
     set_lock("0");
 }
 
@@ -610,12 +697,13 @@ static void dispatch_call(void)
     int saved, held;
 
     set_lock("1");
-    set_env("RECOMP_GUEST_QUANTUM", "0");
+    recomp_env_set(RENV_GUEST_QUANTUM, "0");
+    xbox_GuestCpuReloadConfig();
     s_dp_ran = 0;
     xbox_GuestCpuJoin();
     xbox_GuestCpuStatsGet(&st, 1);
     t = CreateThread(NULL, 0, dispatch_waiter, NULL, 0, NULL);
-    check(wait_waiting(1, 5000),
+    check(wait_for((volatile LONG *)&g_xbox_guest_cpu_waiters, 1, 5000),
           "dispatch: the other thread waits while this one runs");
     g_fs_base = 0;
     saved = xbox_IrqlEnterInterrupt(DISPATCH_LEVEL);
@@ -635,7 +723,8 @@ static void dispatch_call(void)
           "dispatch: below DISPATCH the same call past the quantum hands over");
     join(t);
     xbox_GuestCpuPart();
-    set_env("RECOMP_GUEST_QUANTUM", NULL);
+    recomp_env_set(RENV_GUEST_QUANTUM, NULL);
+    xbox_GuestCpuReloadConfig();
     set_lock("0");
 }
 
@@ -656,6 +745,7 @@ int main(void)
     printf("guest_cpu\n");
     switched_off();
     exclusion();
+    spin_on_flag();
     fifo();
     kernel_call();
     short_call();
@@ -663,9 +753,11 @@ int main(void)
     wake();
     dispatch_call();
     callback();
+    host_wait();
 
-    /* The dispatch case reset the counters last, so only it and the
-     * callback case are in here. */
+    /* The dispatch case reset the counters last, so only it, the callback
+     * and the host-wait cases are in here; the spin case checked its own
+     * yield count. */
     xbox_GuestCpuStatsGet(&st, 0);
     check(st.turns > 0 && st.waits > 0 && st.releases > 0,
           "stats: turns, releases and waits were counted since the reset");

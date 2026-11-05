@@ -1,0 +1,3 @@
+#reference "crt/crt-lottes.slangp"
+warpX = "0.01"
+warpY = "0.02"

@@ -11,126 +11,115 @@
  */
 #include "keyboard_sdl.h"
 #include "keyboard.h"
-#include <stdio.h>
-#include <stdlib.h>
+#include "input_names.h"
 
-/* SDL2's keycodes are ABI-stable; the letter and digit arithmetic below
+/* SDL's keycodes are ABI-stable; the letter and digit arithmetic below
  * relies on these. */
-_Static_assert(SDLK_a == 'a' && SDLK_z == 'z' && SDLK_0 == '0' && SDLK_9 == '9',
+_Static_assert(SDLK_A == 'a' && SDLK_Z == 'z' && SDLK_0 == '0' && SDLK_9 == '9',
                "SDL letter and digit keycodes are their ASCII codes");
 _Static_assert(SDLK_RETURN == '\r' && SDLK_BACKSPACE == '\b',
                "SDL Return and Backspace keycodes are their ASCII codes");
 _Static_assert(SDLK_F12 - SDLK_F1 == 11, "SDL F1..F12 keycodes are one run");
 
+/* The keys every host names the same way: letters, digits, the F-keys, the
+ * named keys and the keypad. The sides of Shift, Ctrl and Alt and keypad
+ * Enter are left to the two callers below. */
+static int common_key(int key)
+{
+    /* SDL3's keycodes are unsigned (SDL_Keycode is Uint32). */
+    SDL_Keycode k = (SDL_Keycode)key;
+
+    if (k >= SDLK_A && k <= SDLK_Z)
+        return key - 'a' + 'A';
+    if (k >= SDLK_0 && k <= SDLK_9)
+        return key;
+    if (k >= SDLK_F1 && k <= SDLK_F12)
+        return 0x70 + (int)(k - SDLK_F1);
+    switch (key) {
+    case SDLK_RETURN:       return XBOX_VK_RETURN;
+    case SDLK_BACKSPACE:    return XBOX_VK_BACK;
+    case SDLK_TAB:          return 0x09;
+    case SDLK_ESCAPE:       return 0x1B;
+    case SDLK_SPACE:        return 0x20;
+    case SDLK_PAUSE:        return XBOX_VK_PAUSE;
+    case SDLK_CAPSLOCK:     return XBOX_VK_CAPITAL;
+    case SDLK_UP:           return XBOX_VK_UP;
+    case SDLK_DOWN:         return XBOX_VK_DOWN;
+    case SDLK_LEFT:         return XBOX_VK_LEFT;
+    case SDLK_RIGHT:        return XBOX_VK_RIGHT;
+    case SDLK_INSERT:       return 0x2D;
+    case SDLK_DELETE:       return 0x2E;
+    case SDLK_HOME:         return 0x24;
+    case SDLK_END:          return 0x23;
+    case SDLK_PAGEUP:       return 0x21;
+    case SDLK_PAGEDOWN:     return 0x22;
+    case SDLK_KP_0:         return 0x60;
+    case SDLK_KP_1:         return 0x61;
+    case SDLK_KP_2:         return XBOX_VK_NUMPAD2;
+    case SDLK_KP_3:         return 0x63;
+    case SDLK_KP_4:         return XBOX_VK_NUMPAD4;
+    case SDLK_KP_5:         return 0x65;
+    case SDLK_KP_6:         return XBOX_VK_NUMPAD6;
+    case SDLK_KP_7:         return 0x67;
+    case SDLK_KP_8:         return XBOX_VK_NUMPAD8;
+    case SDLK_KP_9:         return 0x69;
+    case SDLK_KP_MULTIPLY:  return 0x6A;
+    case SDLK_KP_PLUS:      return 0x6B;
+    case SDLK_KP_MINUS:     return 0x6D;
+    case SDLK_KP_PERIOD:    return 0x6E;
+    case SDLK_KP_DIVIDE:    return 0x6F;
+    /* The OEM keys by their US labels, as input_names.c names them. */
+    case SDLK_SEMICOLON:    return 0xBA;
+    case SDLK_EQUALS:       return 0xBB;
+    case SDLK_COMMA:        return 0xBC;
+    case SDLK_MINUS:        return 0xBD;
+    case SDLK_PERIOD:       return 0xBE;
+    case SDLK_SLASH:        return 0xBF;
+    case SDLK_GRAVE:        return 0xC0;
+    case SDLK_LEFTBRACKET:  return 0xDB;
+    case SDLK_BACKSLASH:    return 0xDC;
+    case SDLK_RIGHTBRACKET: return 0xDD;
+    case SDLK_APOSTROPHE:   return 0xDE;
+    }
+    return 0;
+}
+
 int xbox_InputSdlKeyToVk(int key)
 {
-    if (key >= SDLK_a && key <= SDLK_z)
-        return key - 'a' + 'A';
-    if (key >= SDLK_0 && key <= SDLK_9)
-        return key;
-    if (key >= SDLK_F1 && key <= SDLK_F12)
-        return XBOX_VK_F1 + (key - SDLK_F1);
     switch (key) {
-    case SDLK_RETURN:
     case SDLK_KP_ENTER:  return XBOX_VK_RETURN;   /* both, as Win32 reports */
-    case SDLK_BACKSPACE: return XBOX_VK_BACK;
     case SDLK_LSHIFT:
     case SDLK_RSHIFT:    return XBOX_VK_SHIFT;
     case SDLK_LCTRL:
     case SDLK_RCTRL:     return XBOX_VK_CONTROL;
     case SDLK_LALT:
     case SDLK_RALT:      return XBOX_VK_MENU;
-    case SDLK_UP:        return XBOX_VK_UP;
-    case SDLK_DOWN:      return XBOX_VK_DOWN;
-    case SDLK_LEFT:      return XBOX_VK_LEFT;
-    case SDLK_RIGHT:     return XBOX_VK_RIGHT;
-    case SDLK_TAB:       return XBOX_VK_TAB;
-    case SDLK_ESCAPE:    return XBOX_VK_ESCAPE;
-    case SDLK_SPACE:     return XBOX_VK_SPACE;
-    case SDLK_PAUSE:     return XBOX_VK_PAUSE;
-    case SDLK_CAPSLOCK:  return XBOX_VK_CAPITAL;
-    case SDLK_PAGEUP:    return XBOX_VK_PRIOR;
-    case SDLK_PAGEDOWN:  return XBOX_VK_NEXT;
-    case SDLK_END:       return XBOX_VK_END;
-    case SDLK_HOME:      return XBOX_VK_HOME;
-    case SDLK_INSERT:    return XBOX_VK_INSERT;
-    case SDLK_DELETE:    return XBOX_VK_DELETE;
-    /* The keypad's digits are not one run of SDL keycodes (0 comes after 9). */
-    case SDLK_KP_0:      return XBOX_VK_NUMPAD0;
-    case SDLK_KP_1:      return XBOX_VK_NUMPAD0 + 1;
-    case SDLK_KP_2:      return XBOX_VK_NUMPAD2;
-    case SDLK_KP_3:      return XBOX_VK_NUMPAD0 + 3;
-    case SDLK_KP_4:      return XBOX_VK_NUMPAD4;
-    case SDLK_KP_5:      return XBOX_VK_NUMPAD0 + 5;
-    case SDLK_KP_6:      return XBOX_VK_NUMPAD6;
-    case SDLK_KP_7:      return XBOX_VK_NUMPAD0 + 7;
-    case SDLK_KP_8:      return XBOX_VK_NUMPAD8;
-    case SDLK_KP_9:      return XBOX_VK_NUMPAD9;
-    case SDLK_KP_MULTIPLY: return XBOX_VK_MULTIPLY;
-    case SDLK_KP_PLUS:   return XBOX_VK_ADD;
-    case SDLK_KP_MINUS:  return XBOX_VK_SUBTRACT;
-    case SDLK_KP_PERIOD: return XBOX_VK_DECIMAL;
-    case SDLK_KP_DIVIDE: return XBOX_VK_DIVIDE;
-    /* Punctuation: the keycode is the character the layout puts on the
-     * key, so these are the keys that type it, as the Win32 OEM codes are
-     * on a US layout. */
-    case SDLK_SEMICOLON:    return XBOX_VK_OEM_1;
-    case SDLK_EQUALS:       return XBOX_VK_OEM_PLUS;
-    case SDLK_COMMA:        return XBOX_VK_OEM_COMMA;
-    case SDLK_MINUS:        return XBOX_VK_OEM_MINUS;
-    case SDLK_PERIOD:       return XBOX_VK_OEM_PERIOD;
-    case SDLK_SLASH:        return XBOX_VK_OEM_2;
-    case SDLK_BACKQUOTE:    return XBOX_VK_OEM_3;
-    case SDLK_LEFTBRACKET:  return XBOX_VK_OEM_4;
-    case SDLK_BACKSLASH:    return XBOX_VK_OEM_5;
-    case SDLK_RIGHTBRACKET: return XBOX_VK_OEM_6;
-    case SDLK_QUOTE:        return XBOX_VK_OEM_7;
     }
-    return 0;
+    return common_key(key);
 }
 
-int xbox_InputSdlKeyToSideVk(int key)
+int xbox_InputSdlKeyToCode(int key)
 {
     switch (key) {
-    case SDLK_LSHIFT: return XBOX_VK_LSHIFT;
-    case SDLK_RSHIFT: return XBOX_VK_RSHIFT;
-    case SDLK_LCTRL:  return XBOX_VK_LCONTROL;
-    case SDLK_RCTRL:  return XBOX_VK_RCONTROL;
-    case SDLK_LALT:   return XBOX_VK_LMENU;
-    case SDLK_RALT:   return XBOX_VK_RMENU;
+    case SDLK_KP_ENTER:  return XBOX_VK_KP_ENTER;
+    case SDLK_LSHIFT:    return XBOX_VK_LSHIFT;
+    case SDLK_RSHIFT:    return XBOX_VK_RSHIFT;
+    case SDLK_LCTRL:     return XBOX_VK_LCONTROL;
+    case SDLK_RCTRL:     return XBOX_VK_RCONTROL;
+    case SDLK_LALT:      return XBOX_VK_LMENU;
+    case SDLK_RALT:      return XBOX_VK_RMENU;
     }
-    return 0;
+    return common_key(key);
 }
 
-int xbox_InputSdlButtonToVk(int button)
+void xbox_InputSdlInit(SDL_Window *win)
 {
-    switch (button) {
-    case SDL_BUTTON_LEFT:   return XBOX_VK_LBUTTON;
-    case SDL_BUTTON_RIGHT:  return XBOX_VK_RBUTTON;
-    case SDL_BUTTON_MIDDLE: return XBOX_VK_MBUTTON;
-    case SDL_BUTTON_X1:     return XBOX_VK_XBUTTON1;
-    case SDL_BUTTON_X2:     return XBOX_VK_XBUTTON2;
-    }
-    return 0;
-}
-
-void xbox_InputSdlInit(void)
-{
-    /* SDL2 starts text input on desktop at init. The game takes no text,
-     * and on macOS text input lets the press-and-hold accent popover take a
-     * held letter (W held to walk would stop walking). */
-    SDL_StopTextInput();
-}
-
-/* RECOMP_KEY_TRACE: each key-down as it arrives, the first 40, the same
- * line the GDI window prints. */
-static void trace_down(int vk)
-{
-    static unsigned n;
-    if (getenv("RECOMP_KEY_TRACE") && n++ < 40) {
-        fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)vk);
-        fflush(stderr);
-    }
+    /* The game takes no text, and on macOS text input lets the
+     * press-and-hold accent popover take a held letter (W held to walk would
+     * stop walking). SDL3 does not start it on desktop by itself; this keeps
+     * it off should a platform or hint start it. */
+    if (win && SDL_TextInputActive(win))
+        SDL_StopTextInput(win);
 }
 
 void xbox_InputSdlEvent(const SDL_Event *ev)
@@ -138,7 +127,7 @@ void xbox_InputSdlEvent(const SDL_Event *ev)
     int vk;
 
     switch (ev->type) {
-    case SDL_KEYDOWN:
+    case SDL_EVENT_KEY_DOWN:
         /* Auto-repeat would only re-set a held key; dropping it keeps the
          * trace to real edges. */
         if (ev->key.repeat)
@@ -146,48 +135,34 @@ void xbox_InputSdlEvent(const SDL_Event *ev)
         /* Cmd+key is an app shortcut (Cmd-Tab, Cmd-H, Cmd-Q), not a game
          * key. Cmd itself releases whatever is held, which is what the
          * shortcut that follows expects; key-ups still apply below. */
-        if (ev->key.keysym.sym == SDLK_LGUI || ev->key.keysym.sym == SDLK_RGUI) {
+        if (ev->key.key == SDLK_LGUI || ev->key.key == SDLK_RGUI) {
             xbox_InputKeysClear();
             return;
         }
-        if (ev->key.keysym.mod & KMOD_GUI)
+        if (ev->key.mod & SDL_KMOD_GUI) {
+            /* Cmd+S is the menu's Save on macOS; the game never sees it. */
+            if (ev->key.key == SDLK_S)
+                xbox_InputShortcutPost('S');
             return;
-        vk = xbox_InputSdlKeyToVk(ev->key.keysym.sym);
-        if (vk) {
-            xbox_InputKeySet(vk, 1);
-            trace_down(vk);
         }
-        /* A Shift, Ctrl or Alt is both keys, the side's and either side's,
-         * as on the Win32 window, so "lshift" and "shift" both bind. */
-        vk = xbox_InputSdlKeyToSideVk(ev->key.keysym.sym);
+        /* The sided code: xbox_InputKeyEvent keeps the either-side
+         * entries and traces the edge by name. */
+        vk = xbox_InputSdlKeyToCode((int)ev->key.key);
         if (vk)
-            xbox_InputKeySet(vk, 1);
+            xbox_InputKeyEvent(vk, 1);
         return;
-    case SDL_KEYUP:
-        vk = xbox_InputSdlKeyToVk(ev->key.keysym.sym);
+    case SDL_EVENT_KEY_UP:
+        vk = xbox_InputSdlKeyToCode((int)ev->key.key);
         if (vk)
-            xbox_InputKeySet(vk, 0);
-        vk = xbox_InputSdlKeyToSideVk(ev->key.keysym.sym);
-        if (vk)
-            xbox_InputKeySet(vk, 0);
+            xbox_InputKeyEvent(vk, 0);
         return;
-    case SDL_MOUSEBUTTONDOWN:
-    case SDL_MOUSEBUTTONUP:
-        /* Mouse buttons are in the same table, for bindings that name
-         * them. SDL captures the mouse while a button is down, so the
-         * release arrives even outside the window. */
-        vk = xbox_InputSdlButtonToVk(ev->button.button);
-        if (vk)
-            xbox_InputKeySet(vk, ev->type == SDL_MOUSEBUTTONDOWN);
-        return;
-    case SDL_WINDOWEVENT:
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+    case SDL_EVENT_WINDOW_HIDDEN:
+    case SDL_EVENT_WINDOW_MINIMIZED:
         /* SDL sends keys only to the focused window, so there is no focus
          * check on the way in; on the way out a held key would stay held
          * for ever (Cmd-Tab, Mission Control, Cmd-H, Cmd-M). */
-        if (ev->window.event == SDL_WINDOWEVENT_FOCUS_LOST
-            || ev->window.event == SDL_WINDOWEVENT_HIDDEN
-            || ev->window.event == SDL_WINDOWEVENT_MINIMIZED)
-            xbox_InputKeysClear();
+        xbox_InputKeysClear();
         return;
     }
 }

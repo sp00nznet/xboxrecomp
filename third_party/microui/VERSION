@@ -1,0 +1,5 @@
+microui 2.02, unmodified
+https://github.com/rxi/microui
+commit 0850aba860959c3e75fb3e97120ca92957f9d057 (src/microui.c, src/microui.h)
+sha256 880ce7e017fe307553586c9ba8291e9d9f56cdb20bc4188df072f1e8bd9af6dd  microui.c
+sha256 9aa08e7f58c2152dbfcb4d7deb1f5d79ab1bf0c2809d87f3ff89dc34e24d0c63  microui.h

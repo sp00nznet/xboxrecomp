@@ -127,6 +127,56 @@ def test_split_translation_passes_manual_set_to_lifter():
     assert batch.translator.seen_manual == {TARGET}
 
 
+def test_wrapped_tail_jump_names_the_wrapper():
+    lifter = Lifter(func_db={TARGET: {"name": "sub_001E9100_gen", "wrapper_name": "sub_001E9100"}})
+    lifter.func_start = 0x00120000
+    lifter.func_end = 0x00120100
+
+    generated = "\n".join(lifter.lift_instruction(_tail_jump()))
+
+    assert "sub_001E9100(); return;" in generated
+    assert "sub_001E9100_gen" not in generated
+
+
+def test_wrapped_guarded_icall_arm_names_the_wrapper():
+    # A recorded indirect-call site whose one target is wrapped: the guarded
+    # arm calls the wrapper, and the fallback still reaches it through the
+    # dispatch table (which test_split_translation_declares_and_dispatches_wrapper
+    # covers).
+    from tools.recomp import test_icall_guarded as g
+    from tools.recomp.translator import FunctionTranslator
+
+    img, db = g._image(), g._db()
+    db[g.A]["name"] = f"sub_{g.A:08X}_gen"
+    db[g.A]["wrapper_name"] = f"sub_{g.A:08X}"
+    tr = FunctionTranslator(img, db, icall_sites={g.SITE: [g.A]})
+    c = tr.translate_function(g.BASE, db[g.BASE])
+
+    assert f"RECOMP_ABI_CALL(0x{g.A:08X}u, sub_{g.A:08X}); }}" in c, c
+    assert f"sub_{g.A:08X}_gen" not in c, c
+
+
+def test_wrapped_conditional_tail_names_the_wrapper():
+    compare = Instruction(0x00120000, 2, "cmp", "eax, ecx", "39c8")
+    compare.operands = [
+        Operand(type="reg", reg="eax"),
+        Operand(type="reg", reg="ecx"),
+    ]
+    jump = Instruction(
+        0x00120002, 6, "je", f"0x{TARGET:x}", "0f8400000000")
+    jump.jump_target = TARGET
+    lifter = Lifter(func_db={TARGET: {"name": "sub_001E9100_gen", "wrapper_name": "sub_001E9100"}})
+    lifter.func_start = 0x00120000
+    lifter.func_end = 0x00120100
+
+    generated, _ = lift_basic_block(
+        lifter, BasicBlock(start=0x00120000, instructions=[compare, jump]))
+    output = "\n".join(generated)
+
+    assert "sub_001E9100(); return; }" in output
+    assert "sub_001E9100_gen" not in output
+
+
 def test_wrapped_function_body_is_gen_and_calls_reach_wrapper():
     # --exclude-manual wrap: the body is emitted as sub_X_gen, while direct
     # calls, the header and the dispatch table all name the wrapper sub_X.

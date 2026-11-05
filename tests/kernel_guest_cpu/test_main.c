@@ -1,24 +1,28 @@
 /*
  * The title's threads on one host core (kernel_thread.c, xbox_GuestCpuMask
- * and xbox_GuestThreadPin, called where the bridge starts a guest thread).
+ * and xbox_GuestThreadPin, called from xbox_log_thread_role).
  *
- * A title's level loader and its loader thread can add entries to one
- * global pool with a read-modify-write that the console's one CPU never
- * interleaved; on two host cores entries are lost. The cases:
+ * One title's level loader and its loader thread add lights to one global
+ * pool with a read-modify-write that the console's one CPU never
+ * interleaved; on two host cores it lost entries and the terrain baked
+ * black. The cases:
  *  - the mask is one core, inside the process's set, and the same on every
  *    call, so a worker created from any core lands with the main thread;
  *  - unset (the default) and RECOMP_GUEST_CPUS=all are no mask at all, so
  *    stock threads are not pinned; =one is the lowest core, =<n> that core;
- *  - where the host has thread affinity, guest-main and a guest-worker both
- *    run on that one core, and a thread that does not pin itself keeps the
- *    process's mask whether it was created before the main pin or after it
- *    by the pinned thread (the kernel timer thread is made that way);
- *  - GetProcessAffinityMask stays the process's on a pinned caller.
+ *  - where the host has thread affinity, guest-main and a guest-worker,
+ *    logged with their routines, both run on that one core, and a thread
+ *    that does not pin itself keeps the process's mask whether it was
+ *    created before the main pin or after it by the pinned thread (the
+ *    kernel timer thread is made that way). The early thread logs
+ *    guest-main with no routine, as the host's main does before it starts
+ *    the device threads, and stays unpinned; the late one logs
+ *    kernel-timer;
+ *  - on Win32 the pin took: a second SetThreadAffinityMask reports the
+ *    core as the previous mask.
  */
-#ifndef _WIN32
-#define _GNU_SOURCE     /* nftw, pthread_getaffinity_np under -std=c11 */
-#endif
 #include "kernel.h"
+#include "recomp_env.h"
 #include "xbox_memory_layout.h"
 
 #include <stdio.h>
@@ -35,23 +39,9 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 static int s_fail;
 #define CHECK(c, ...) do { if (!(c)) { s_fail++; fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
-/* The tests change the environment the kernel reads its switches from. */
-static void test_setenv(const char *name, const char *v)
-{
-#ifdef _WIN32
-    _putenv_s(name, v ? v : "");
-#else
-    if (v)
-        setenv(name, v, 1);
-    else
-        unsetenv(name);
-#endif
-}
-
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
-
 static DWORD_PTR thread_mask(void)
 {
     cpu_set_t set;
@@ -87,7 +77,7 @@ static DWORD_PTR thread_mask(void)
 static DWORD WINAPI worker(LPVOID unused)
 {
     (void)unused;
-    xbox_GuestThreadPin("guest-worker");
+    xbox_log_thread_role("guest-worker", 0x00012340);
 #if defined(__linux__) || defined(_WIN32)
     s_worker_mask = thread_mask();
 #else
@@ -99,7 +89,7 @@ static DWORD WINAPI worker(LPVOID unused)
 static DWORD WINAPI early(LPVOID unused)
 {
     (void)unused;
-    /* A thread the host makes before the guest starts: not pinned. */
+    xbox_log_thread_role("guest-main", 0);
 #if defined(__linux__) || defined(_WIN32)
     s_early_mask = thread_mask();
 #else
@@ -111,7 +101,7 @@ static DWORD WINAPI early(LPVOID unused)
 static DWORD WINAPI host(LPVOID unused)
 {
     (void)unused;
-    /* A host thread (the kernel timer is made this way): not pinned. */
+    xbox_log_thread_role("kernel-timer", 0);
 #if defined(__linux__) || defined(_WIN32)
     s_host_mask = thread_mask();
 #else
@@ -133,11 +123,11 @@ int main(void)
     DWORD_PTR proc = 0, sys = 0, mask, again;
     HANDLE th;
 
-    test_setenv("RECOMP_GUEST_CPUS", NULL);
+    recomp_env_set(RENV_GUEST_CPUS, NULL);
     CHECK(xbox_GuestCpuMask() == 0, "unset, nothing is pinned (opt-in)");
-    test_setenv("RECOMP_GUEST_CPUS", "");
+    recomp_env_set(RENV_GUEST_CPUS, "");
     CHECK(xbox_GuestCpuMask() == 0, "empty, nothing is pinned");
-    test_setenv("RECOMP_GUEST_CPUS", "one");
+    recomp_env_set(RENV_GUEST_CPUS, "one");
     mask = xbox_GuestCpuMask();
     again = xbox_GuestCpuMask();
     CHECK(mask != 0, "=one is one core, got no mask");
@@ -148,7 +138,7 @@ int main(void)
           "the core is one the process may use: mask %#lx, process %#lx",
           (unsigned long)mask, (unsigned long)proc);
 
-    test_setenv("RECOMP_GUEST_CPUS", "all");
+    recomp_env_set(RENV_GUEST_CPUS, "all");
     CHECK(xbox_GuestCpuMask() == 0, "RECOMP_GUEST_CPUS=all leaves every core");
     {
         /* =<n>: the highest core of the process, or the lowest when the
@@ -157,22 +147,22 @@ int main(void)
         int hi = 0;
         while ((proc >> (hi + 1)) != 0) hi++;
         snprintf(num, sizeof num, "%d", hi);
-        test_setenv("RECOMP_GUEST_CPUS", num);
+        recomp_env_set(RENV_GUEST_CPUS, num);
         CHECK(xbox_GuestCpuMask() == ((DWORD_PTR)1 << hi),
               "RECOMP_GUEST_CPUS=%s is that core: %#lx", num,
               (unsigned long)xbox_GuestCpuMask());
-        test_setenv("RECOMP_GUEST_CPUS", "63");
+        recomp_env_set(RENV_GUEST_CPUS, "63");
         CHECK(xbox_GuestCpuMask() == mask || proc == (DWORD_PTR)-1,
               "RECOMP_GUEST_CPUS=63 falls back to the lowest core");
     }
     /* The pin cases below, with the pin asked for. */
-    test_setenv("RECOMP_GUEST_CPUS", "one");
+    recomp_env_set(RENV_GUEST_CPUS, "one");
 
     th = CreateThread(NULL, 0, early, NULL, 0, NULL);
     CHECK(th != NULL, "early thread");
     join(th);
 
-    xbox_GuestThreadPin("guest-main");
+    xbox_log_thread_role("guest-main", 0x00011000);
     th = CreateThread(NULL, 0, worker, NULL, 0, NULL);
     CHECK(th != NULL, "worker thread");
     join(th);

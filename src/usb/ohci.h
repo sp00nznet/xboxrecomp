@@ -49,6 +49,27 @@ int  xbox_OhciOwnsAddress(uint32_t xbox_va);
  * route to it) before it treats the fault as a crash. */
 int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
 
+/* How the model resolves a physical address the title handed it: a
+ * descriptor word (data = 0) or a transfer buffer of the TD at `td`
+ * (data = 1). Returns the guest address it reads. For the address
+ * resolution ctest; the model's own path is the same code. */
+uint32_t xbox_OhciResolveForTest(int data, uint32_t td, uint32_t addr);
+
+/* One root-hub pass of the pad-source hot-plug (usb_gamepad.h): plug the
+ * pads usb_gamepad_present() names, unplug the ones it lost. `reset` first
+ * empties the bus. Writes the four port status registers to `ports` and
+ * returns the plugged mask. For the pad-source ctest; needs no title. */
+uint32_t xbox_OhciHotplugForTest(int reset, uint32_t ports[4]);
+
+/* A dword register write as the guest makes it, on the controller that
+ * carries the pads; returns the register afterwards. For the pad-source
+ * ctest, to enable a port or acknowledge a change the way a driver does. */
+uint32_t xbox_OhciWriteForTest(uint32_t off, uint32_t v);
+
+/* The condition code a transfer to function address `addr` completes with
+ * when no plugged pad holds that address, or 0xFFFFFFFF when one does. */
+uint32_t xbox_OhciNoDeviceForTest(uint32_t addr);
+
 /* Report counts at exit, so a run says whether the driver ever looked. */
 void xbox_OhciReport(void);
 

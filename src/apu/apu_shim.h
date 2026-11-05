@@ -36,6 +36,60 @@
 #endif
 #endif
 
+#ifndef qatomic_inc
+#ifdef _MSC_VER
+#define qatomic_inc(ptr) _InterlockedIncrement((long volatile*)(ptr))
+#else
+#define qatomic_inc(ptr) __sync_add_and_fetch((ptr), 1)
+#endif
+#endif
+
+/* 32-bit compare-and-swap: returns the value *p held, so the swap happened
+ * when that equals old. A function rather than a macro so the width is fixed
+ * by the prototype: long is 32 bits under MSVC but not on LP64 hosts. */
+static inline uint32_t qatomic_cmpxchg32(uint32_t *p, uint32_t old, uint32_t nv)
+{
+#ifdef _MSC_VER
+    return (uint32_t)_InterlockedCompareExchange((long volatile *)p, (long)nv,
+                                                 (long)old);
+#else
+    __atomic_compare_exchange_n(p, &old, nv, 0, __ATOMIC_SEQ_CST,
+                                __ATOMIC_SEQ_CST);
+    return old;
+#endif
+}
+
+/* 32-bit acquire load, for a value a compare-and-swap loop then trusts (a
+ * no-op write is skipped on it). _InterlockedOr with 0 is MSVC's full-barrier
+ * load. */
+static inline uint32_t qatomic_load32(uint32_t *p)
+{
+#ifdef _MSC_VER
+    return (uint32_t)_InterlockedOr((long volatile *)p, 0);
+#else
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#endif
+}
+
+/* 64-bit words (vp.voice_locked). qatomic_or/and above are _InterlockedOr on
+ * a 32-bit long under MSVC and would drop the high half of the word; and
+ * qemu_shim's qatomic_read is a plain dereference, which may tear or be
+ * cached. The load is sequentially consistent, not just acquire, because
+ * the hold and voice_lock each store one word and then load the other
+ * (hold_waiting, voice_locked): only a total order makes sure one of them
+ * sees the other's store. */
+#ifndef qatomic_or64
+#ifdef _MSC_VER
+#define qatomic_or64(p, v)  _InterlockedOr64((__int64 volatile *)(p), (__int64)(v))
+#define qatomic_and64(p, v) _InterlockedAnd64((__int64 volatile *)(p), (__int64)(v))
+#define qatomic_load64(p)   ((uint64_t)_InterlockedOr64((__int64 volatile *)(p), 0))
+#else
+#define qatomic_or64(p, v)  __atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
+#define qatomic_and64(p, v) __atomic_fetch_and((p), (v), __ATOMIC_SEQ_CST)
+#define qatomic_load64(p)   __atomic_load_n((p), __ATOMIC_SEQ_CST)
+#endif
+#endif
+
 /* ============================================================
  * QEMU clock helpers (beyond what NV2A shim provides)
  * ============================================================ */
@@ -80,8 +134,31 @@ typedef void *(*QemuThreadFunc)(void *arg);
 static inline void qemu_thread_create(QemuThread *t, const char *name,
                                        void *(*func)(void *), void *arg,
                                        int mode) {
-    (void)name; (void)mode;
+    (void)mode;
     t->thread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)func, arg, 0, NULL);
+#if defined(_WIN32)
+    /* Named so the thread can be found from the Linux side under Wine, which
+     * passes the description to the task's comm (15 characters there).
+     * Looked up each time (threads are created rarely, and no shared cache
+     * to race on): Windows before 10 1607 and older Wine lack it. */
+    if (t->thread && name) {
+        typedef HRESULT (WINAPI *set_desc_fn)(HANDLE, PCWSTR);
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        set_desc_fn set_desc = k32 ? (set_desc_fn)(void (*)(void))
+                               GetProcAddress(k32, "SetThreadDescription") : NULL;
+        if (set_desc) {
+            WCHAR w[64];
+            int i;
+            for (i = 0; i < 63 && name[i]; i++) w[i] = (WCHAR)(unsigned char)name[i];
+            w[i] = 0;
+            set_desc(t->thread, w);
+        }
+    }
+#else
+    /* POSIX builds reach CreateThread through the compat shim; naming the
+     * thread there (pthread_setname_np) is a TASKS follow-up. */
+    (void)name;
+#endif
 }
 #endif
 
@@ -102,6 +179,10 @@ extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
 uint8_t *mcpx_apu_phys(uint64_t addr);
 /* Which case of mcpx_apu_phys resolved an address, for trace lines. */
 const char *mcpx_apu_phys_class(uint64_t addr);
+/* The same for sample data, which reads a named image page from the image
+ * first (see apu_core.c). */
+uint8_t *mcpx_apu_phys_data(uint64_t addr);
+const char *mcpx_apu_phys_data_class(uint64_t addr);
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
@@ -115,6 +196,17 @@ static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     (void)as;
     return *(uint8_t *)mcpx_apu_phys(addr);
+}
+
+/* Sample-data reads: a voice's PCM and ADPCM words. */
+static inline uint32_t ldl_le_data(hwaddr addr) {
+    return *(uint32_t *)mcpx_apu_phys_data(addr);
+}
+static inline uint16_t lduw_le_data(hwaddr addr) {
+    return *(uint16_t *)mcpx_apu_phys_data(addr);
+}
+static inline uint8_t ldub_data(hwaddr addr) {
+    return *(uint8_t *)mcpx_apu_phys_data(addr);
 }
 
 /* Little-endian physical memory writes */

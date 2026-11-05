@@ -577,6 +577,51 @@ void recomp_icall_not_code_log(uint32_t va);
  * to the console's rate instead. */
 uint64_t xbox_ReadTimeStampCounter(void);
 
+/* A guest busy-wait loop, lowered by tools.recomp --spin-waits: the back
+ * edge of a loop that only reads memory and branches back calls this once
+ * the condition was seen still true. In the "spin" pacing mode (the default)
+ * it does nothing and the loop spins as on the console; in "sleep" the
+ * thread blocks until the kernel signals a state change or 1 ms passes
+ * (src/kernel/kernel_pacing.h). */
+extern volatile int g_xbox_spin_sleep;
+/* Non-zero while a device interrupt waits for the one-CPU gate holder: the
+ * wait is then also the holder's safe point to run it, at any pacing
+ * (src/kernel/kernel_hal.c, xbox_IrqPost). */
+extern volatile int g_xbox_irq_pending;
+/* Non-zero while another guest thread waits for the guest CPU
+ * (RECOMP_GUEST_LOCK, src/kernel/kernel_guest_cpu.c): the pass then hands
+ * it over, the console's quantum expiry, at any pacing. */
+extern volatile int g_xbox_guest_cpu_waiters;
+/* Raised while the NV2A walker sleeps for the next kick: the pass pokes it
+ * (nv2a_kick_wake.h), at any pacing. The fence orders the loop's earlier
+ * stores (the KickOff's flush bit, a PUT) before this read of the flag, the
+ * guest half of the walker's Dekker handshake: without it a loop that
+ * leaves after one pass can miss the arm while the walker misses the store,
+ * and the kick waits out the walker's 1 ms tick. */
+extern volatile int g_xbox_kick_armed;
+/* A full barrier, store-load included: what clang and gcc emit for a seq_cst
+ * fence (mfence on x86-64, dmb ish on ARM64). cl.exe has no __atomic
+ * builtins; <intrin.h> is in from the RECOMP_ATOMIC_* block above. */
+#if defined(_MSC_VER)
+#  if defined(_M_ARM64)
+#    define RECOMP_SEQ_CST_FENCE() __dmb(_ARM64_BARRIER_ISH)
+#  else
+#    define RECOMP_SEQ_CST_FENCE() _mm_mfence()
+#  endif
+#else
+#  define RECOMP_SEQ_CST_FENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#endif
+void xbox_SpinWait(uint32_t va);
+#define RECOMP_SPIN_WAIT(va) \
+    do { RECOMP_SEQ_CST_FENCE(); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWait(va); } while (0)
+/* A site with "sleep": "kick_event" (a KickOff flush wait): as above, but it
+ * sleeps only while the walker's kick event wait is on, and otherwise passes
+ * as at "spin" pacing. Sleeping on a flush bit that a polling walker clears
+ * costs frames under Wine. */
+void xbox_SpinWaitKick(uint32_t va);
+#define RECOMP_SPIN_WAIT_KICK(va) \
+    do { RECOMP_SEQ_CST_FENCE(); if (g_xbox_spin_sleep | g_xbox_irq_pending | g_xbox_guest_cpu_waiters | g_xbox_kick_armed) xbox_SpinWaitKick(va); } while (0)
+
 /* x86 port I/O (`in`/`out`). width is 1, 2 or 4 bytes. The runtime models
  * the ports titles are known to read (the field pin at 0x80C0) and logs the
  * first access to any other. */
@@ -608,6 +653,20 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
+
+/** A mov at a constant address in the trapped APU window (0xFE800000-
+ *  0xFE82FFFF). The lifter emits these instead of MEMxx so the access calls
+ *  the APU model directly rather than taking a page fault, which costs about
+ *  51 us under Proton. xbox_memory_layout.c falls back to the plain access
+ *  when audio is off. A store is one statement, like `MEM32(a) = v;`. */
+uint32_t xbox_MmioRead(uint32_t va, int size);
+void xbox_MmioWrite(uint32_t va, uint32_t value, int size);
+#define XBOX_MMIO_R8(addr)      ((uint8_t)xbox_MmioRead((addr), 1))
+#define XBOX_MMIO_R16(addr)     ((uint16_t)xbox_MmioRead((addr), 2))
+#define XBOX_MMIO_R32(addr)     xbox_MmioRead((addr), 4)
+#define XBOX_MMIO_W8(addr, v)   xbox_MmioWrite((addr), (uint8_t)(v), 1)
+#define XBOX_MMIO_W16(addr, v)  xbox_MmioWrite((addr), (uint16_t)(v), 2)
+#define XBOX_MMIO_W32(addr, v)  xbox_MmioWrite((addr), (uint32_t)(v), 4)
 
 /** Signed memory reads. */
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
@@ -1345,6 +1404,24 @@ void xbox_GuestCpuPreempt(uint32_t va);
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
+} while(0)
+
+/* RECOMP_FALLOFF_TAIL - a body that runs off its end into code no function
+ * claims (tools/recomp/translator.py). It dispatches by address like
+ * RECOMP_ITAIL, but a miss is logged once per site: a body that falls off
+ * usually sits in a loop, and one line per pass buried every other log. */
+#define RECOMP_FALLOFF_TAIL(xbox_va) do { \
+    static int _miss_logged; \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           if (!_miss_logged) { _miss_logged = 1; \
+                                recomp_icall_fail_log(_va); } \
+           g_esp += 4; g_eax = 0; } \
 } while(0)
 
 /* ================================================================

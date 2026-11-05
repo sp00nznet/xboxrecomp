@@ -76,6 +76,21 @@ def scan_log(text):
     return out
 
 
+def where_in(bounds, starts, va):
+    """("known", name) when va is the start of a known function, ("alias",
+    name) when it falls inside one, else ("new", None). bounds is the sorted
+    (start, end, name) list and starts its first column."""
+    i = bisect.bisect_right(starts, va) - 1
+    if i < 0:
+        return "new", None
+    start, end, name = bounds[i]
+    if va == start:
+        return "known", name
+    if va < end:
+        return "alias", name
+    return "new", None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -132,9 +147,13 @@ def main(argv=None):
         if not engine.probes_as_function_body(va):
             print("  - %08X  does not read as a function body" % va)
             continue
-        i = bisect.bisect_right(starts, va) - 1
-        inside = i >= 0 and bounds[i][0] < va < bounds[i][1]
-        where = ("alias inside " + bounds[i][2]) if inside else "new function"
+        kind, name = where_in(bounds, starts, va)
+        if kind == "known":
+            # Already a function to the disassembler; a seed adds nothing.
+            # The run that missed it was built from an older analysis.
+            print("  = %08X  already a function (%s)" % (va, name))
+            continue
+        where = ("alias inside " + name) if kind == "alias" else "new function"
         print("  + %08X  %s  (%s)" % (va, where, reason))
         existing.append({"start": key, "observed": True,
                          "note": reason + "; decodes as a function body."})

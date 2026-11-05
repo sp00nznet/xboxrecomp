@@ -21,8 +21,8 @@
  * The masked tick must also leave a DPC's ack it did not write
  * (xbox_VblankArmBits with raised 0): a DPC that writes its ack once would
  * otherwise spin until the backstop.
- * First, which vblank RECOMP_VBLANK selects (xbox_VblankMode): set alone it
- * is the tick v0.14.0 had, and all of the above is the 60 Hz schedule's.
+ * First, which vblank RECOMP_VBLANK selects (xbox_VblankMode): 0 or empty
+ * is off, set alone it is the tick v0.14.0 had, and all of the above is the 60 Hz schedule's.
  */
 #include "kernel.h"
 
@@ -144,9 +144,12 @@ int main(void)
     check(xbox_VblankMode(NULL, 0) == XBOX_VBLANK_OFF
           && xbox_VblankMode(NULL, 1) == XBOX_VBLANK_OFF,
           "unset: no vblanks, whatever else is on");
-    check(xbox_VblankMode("1", 0) == XBOX_VBLANK_TICK
-          && xbox_VblankMode("", 0) == XBOX_VBLANK_TICK,
-          "RECOMP_VBLANK=1 (or empty) alone: the old tick");
+    check(xbox_VblankMode("0", 0) == XBOX_VBLANK_OFF
+          && xbox_VblankMode("0", 1) == XBOX_VBLANK_OFF
+          && xbox_VblankMode("", 1) == XBOX_VBLANK_OFF,
+          "RECOMP_VBLANK=0 (or empty): off, even with a switch that wants it");
+    check(xbox_VblankMode("1", 0) == XBOX_VBLANK_TICK,
+          "RECOMP_VBLANK=1 alone: the old tick");
     check(xbox_VblankMode("paced", 0) == XBOX_VBLANK_PACED,
           "RECOMP_VBLANK=paced: the 60 Hz schedule");
     check(xbox_VblankMode("1", 1) == XBOX_VBLANK_PACED,

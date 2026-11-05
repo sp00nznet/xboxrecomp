@@ -1,0 +1,71 @@
+# Enhancements layer (opt-in: XBOXRECOMP_ENHANCE=ON in the root CMakeLists).
+#   recomp_cfg.c   TOML-subset reader, no dependencies (C11 + libc)
+#   enhance_cfg.c  the layering: env > title config.toml > config.toml >
+#                  config.default.toml beside the executable > default
+#   enhance.c      xbox_enhance_init: the toolkit's keys into nv2a_host_opts
+#   enhance_input.c the [input] keys into src/input (keyboard and mouse),
+#                  and a mod's input state and capture
+#   enhance_actions.c host actions: the registry, [input.actions], the pad
+#                  filter and the flip tick (enhance_actions.h)
+#   mod.c          the mods: the title's table, the mod API, the frame and
+#                  batch-filter dispatch, descriptors and their settings (mod.h)
+#   hud_anchor.c   the HUD layer: a mod's HUD table, elements moved to the
+#                  wide frame's edges (hud_anchor.h)
+#   hud_capture.c  the HUD mapping capture (RECOMP_DEBUG=hud_capture,
+#                  hud_capture.h)
+#   mod_describe.c the descriptor dump (RECOMP_MODS_DESCRIBE=json)
+#   enhance_menu.c the in-game menu (menu.enabled): items, pages, Save
+#                  (enhance_menu.h)
+#   enhance_display.c the display probe behind overlay.ui_fit
+#   shader_profile.c shader profiles: the profile files, the composer (one
+#                  .slangp from a chain of presets; shader_profile.h)
+#   shader_profile_req.c a profile as the chain's request, the start's
+#                  present.profile / present.shader choice
+#   shader_profile_edit.c the Shaders page's profiles: picker, chain edits,
+#                  Save (shader_profile_edit.h)
+#   file_browser.c the in-overlay file browser's model: roots, listing, name
+#                  checks, import cap, atomic writes (file_browser.h)
+#   saves_zip.c    the Saves page's zip: a stored writer, a validating
+#                  reader, the manifest (saves_zip.h)
+#   saves_store.c  the Saves page's file work: list, export, staged import
+#                  with rollback (saves_store.h)
+#   enhance_files.c the menu's import and export texts: the export marker
+#                  and header, a config value as TOML (enhance_files.h)
+#   shader_param_kinds.c a parameter as a toggle, a choice or a slider: the
+#                  sidecar and a profile's [param_kinds] (shader_param_kinds.h)
+#   enhance_text.c menu text with input glyphs: {pad:} {key:} {mouse:}
+#                  {act:} tokens (enhance_text.h)
+#   enhance_menu_layout.c the menu's geometry for the draw, the wrap and the
+#                  hit test, pure (enhance_menu_layout.h)
+#   enhance_mod_status.c the mods' status panels and the latest device for
+#                  glyph_name (mod API version 7, enhance_mod_status.h)
+#   enhance_menu_input.c the menu's input rules: focus regions, button
+#                  owners, the pad's events, pointer and tooltip thresholds,
+#                  pure (enhance_menu_input.h)
+#   enhance_osk.c  the on-screen keyboard for a text field on a pad: grid,
+#                  model, draw and hit test (enhance_osk.h)
+# docs/runtime/config.md has the file format and the keys.
+#
+# The layer links the runtime (xbox_kernel, for nv2a_host_opts_set), never
+# the other way round: with the layer off the options stay zero (stock).
+
+add_library(xbox_enhance STATIC recomp_cfg.c enhance_cfg.c enhance.c enhance_input.c
+    enhance_actions.c mod.c hud_anchor.c hud_capture.c mod_describe.c enhance_menu.c
+    shader_profile.c shader_profile_req.c shader_profile_edit.c file_browser.c
+    shader_param_kinds.c enhance_files.c)
+target_include_directories(xbox_enhance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(xbox_enhance PUBLIC recomp_env xbox_kernel xbox_input)
+target_sources(xbox_enhance PRIVATE enhance_text.c enhance_menu_layout.c)
+target_sources(xbox_enhance PRIVATE enhance_mod_status.c enhance_menu_input.c enhance_osk.c)
+target_sources(xbox_enhance PRIVATE saves_zip.c saves_store.c)
+target_sources(xbox_enhance PRIVATE enhance_display.c)
+if(WIN32)
+    # enhance_display.c reads the SMBIOS names from the registry.
+    target_link_libraries(xbox_enhance PRIVATE advapi32)
+endif()
+# The saves zip's manifest names the toolkit that wrote it (overlay-saves).
+target_compile_definitions(xbox_enhance PRIVATE
+    XBR_TOOLKIT_VERSION="${xboxrecomp_VERSION}")
+if(NOT MSVC)
+    target_compile_options(xbox_enhance PRIVATE -Wall -Wextra)
+endif()

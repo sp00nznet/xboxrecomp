@@ -186,6 +186,39 @@ def _mem_accessor(size):
     return {1: "MEM8", 2: "MEM16", 4: "MEM32"}.get(size, "MEM32")
 
 
+# The trapped part of the APU window: registers and the voice processor. The
+# runtime makes exactly these 0x30000 bytes PAGE_NOACCESS (APU_TRAP_BYTES in
+# src/kernel/xbox_memory_layout.c) so the model sees every access; the GP and
+# EP DSP memories above stay plain RAM. Keep the two in step: a constant here
+# beyond the runtime's trap would only fall back to the plain access there,
+# but one short of it leaves a hot register on the fault path.
+APU_MMIO_TRAP_LO = 0xFE800000
+APU_MMIO_TRAP_HI = 0xFE830000
+
+
+def _mmio_direct_const(op):
+    """The guest address of a constant-address operand inside the APU trap.
+
+    DirectSound drives each voice with plain movs to fixed register addresses,
+    thousands a second in play. Each one trapped costs about 51 us under
+    Proton (Wine turns the fault into an exception and dispatches it), against
+    under 1 us of model work, so a constant address known here is called
+    straight into the model instead. Anything with a base, an index or the fs
+    prefix is not a constant and keeps the fault. None when not eligible.
+    """
+    if op.type != "mem" or op.mem_base or op.mem_index:
+        return None
+    if getattr(op, "mem_seg", None) == "fs":
+        return None
+    size = op.mem_size or 4
+    if size not in (1, 2, 4):
+        return None
+    addr = op.mem_disp & 0xFFFFFFFF
+    if addr < APU_MMIO_TRAP_LO or addr + size > APU_MMIO_TRAP_HI:
+        return None
+    return addr
+
+
 def _smem_accessor(size):
     """Return the signed MEM macro for a given operand size."""
     return {
@@ -281,6 +314,8 @@ def _operand_width(op):
         return getattr(op, "mem_size", None) or 4
     if op.type == "reg":
         return _REG_WIDTH.get(str(op.reg).lower(), 4)
+    if op.type == "expr":
+        return op.mem_size or None
     return None
 
 
@@ -292,6 +327,8 @@ def _fmt_operand_read(op):
         return _fmt_imm(op.imm)
     elif op.type == "mem":
         return _fmt_mem_read(op)
+    elif op.type == "expr":
+        return op.expr
     return "/* unknown operand */"
 
 
@@ -840,6 +877,11 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({slhs} <= 0)", desc
         if jcc in ("jg", "jnle"):
             return f"({slhs} > 0)", desc
+        # PF from the result's low byte, whatever lhs is.
+        if jcc in ("jp", "jpe"):
+            return f"RECOMP_PARITY8({lhs})", desc
+        if jcc in ("jnp", "jpo"):
+            return f"(!RECOMP_PARITY8({lhs}))", desc
         return None
 
     # ── add: a = a + b, flags from result ──
@@ -864,6 +906,11 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({slhs} <= 0)", desc
         if jcc in ("jg", "jnle"):
             return f"({slhs} > 0)", desc
+        # PF from the result's low byte, whatever lhs is.
+        if jcc in ("jp", "jpe"):
+            return f"RECOMP_PARITY8({lhs})", desc
+        if jcc in ("jnp", "jpo"):
+            return f"(!RECOMP_PARITY8({lhs}))", desc
         return None
 
     # ── adc/sbb: result-based (like add/sub but with carry) ──
@@ -906,6 +953,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({lhs} == 0)", desc
         if jcc in ("ja", "jnbe"):
             return f"({lhs} != 0)", desc
+        if jcc == "jo":
+            return "0", desc  # OF=0 after and/or/xor
+        if jcc == "jno":
+            return "1", desc
+        if jcc in ("jp", "jpe"):
+            return f"RECOMP_PARITY8({lhs})", desc
+        if jcc in ("jnp", "jpo"):
+            return f"(!RECOMP_PARITY8({lhs}))", desc
         return None
 
     # ── dec/inc: result-based, CF unchanged ──
@@ -1356,13 +1411,28 @@ def normalise_zero_test(mnemonic, ops):
     Normalising here is what makes that merge legal rather than forcing one
     through. After it the two predecessors really are the same operation on
     the same width, which is what the merge was asking for.
+
+    The same holds for every `test a, b`, not only the same-register form:
+    it is `cmp (a & b), 0`. Both leave ZF, SF and PF from the AND and clear
+    CF and OF, so every condition reads the same answer from either. One
+    title's state machine joins `cmp eax, 0` with `test esi, 0x100` in front
+    of one je; refused, the je never fired and a wait-for-input state
+    advanced every frame, freezing the player once every four. The AND is
+    carried as
+    an `expr` operand at the test's width, so the snapshot holds it in _fa
+    with _fb = 0 and the comment still names the test.
     """
-    if (mnemonic == "test" and len(ops) == 2
-            and ops[0].type == "reg" and ops[1].type == "reg"
+    if mnemonic != "test" or len(ops) != 2:
+        return mnemonic, ops
+    if (ops[0].type == "reg" and ops[1].type == "reg"
             and ops[0].reg and ops[0].reg == ops[1].reg):
         return "cmp", [ops[0], Operand(type="imm", imm=0,
                                        mem_size=ops[0].mem_size)]
-    return mnemonic, ops
+    width = _operand_width(ops[0]) or _operand_width(ops[1]) or 4
+    a, b = _fmt_operand_read(ops[0]), _fmt_operand_read(ops[1])
+    return "cmp", [Operand(type="expr", expr=f"({a}) & ({b})",
+                           expr_src=f"test {a}, {b}", mem_size=width),
+                   Operand(type="imm", imm=0, mem_size=width)]
 
 
 class Lifter:
@@ -1947,6 +2017,17 @@ class Lifter:
     def _lift_mov(self, insn, ops):
         if nops := len(ops) < 2:
             return [f"/* mov: bad operands */"]
+        # Only mov goes direct: it is the one form where a formatter call is
+        # one device access. The ALU, compare and exchange forms read their
+        # memory operand more than once (the flag snapshot re-reads after the
+        # write), which a register with side effects must not see, so they
+        # keep the fault, whose decoder reads once.
+        if (addr := _mmio_direct_const(ops[1])) is not None and ops[0].type == "reg":
+            bits = (ops[1].mem_size or 4) * 8
+            return [_fmt_set_reg(ops[0].reg, f"XBOX_MMIO_R{bits}(0x{addr:08X}u)")]
+        if (addr := _mmio_direct_const(ops[0])) is not None and ops[1].type in ("reg", "imm"):
+            bits = (ops[0].mem_size or 4) * 8
+            return [f"XBOX_MMIO_W{bits}(0x{addr:08X}u, {_fmt_operand_read(ops[1])});"]
         src = _fmt_operand_read(ops[1])
         out = [_fmt_operand_write(ops[0], src)]
         # `mov ebp, esp` establishes this function's frame. Publish it, because
@@ -2232,6 +2313,8 @@ class Lifter:
 
     def _lift_imul(self, insn, ops):
         nops = len(ops)
+        if nops == 1 and (_operand_width(ops[0]) or 4) < 4:
+            return self._lift_narrow_muldiv(ops, "imul")
         if nops == 1:
             # One operand: edx:eax = eax * ops[0]
             src = _fmt_operand_read(ops[0])
@@ -2251,9 +2334,54 @@ class Lifter:
             return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){src} * (int32_t){imm})")]
         return ["/* imul: unexpected form */"]
 
+    def _lift_narrow_muldiv(self, ops, m):
+        """The 8- and 16-bit one-operand MUL/IMUL/DIV/IDIV.
+
+        These do not touch EDX:EAX as a pair. The byte forms work on AX
+        alone: AX = AL * r/m8, or AL = AX / r/m8 with the remainder in AH, and
+        EDX is left as it was. The word forms use DX:AX and keep the upper
+        halves of both registers. Lifting them as the 32-bit form wrote the
+        high half of a 64-bit product over EDX, so code that loads DL before
+        an "imul bl" and reads it after lost the value. Auto Modellista's menu
+        auto-repeat (sub_00109670) computes "dl = delay - al * bl" that way;
+        the threshold came out as zero, and every unheld button fired a repeat
+        on every frame, so the menu scrolled and selected by itself.
+
+        The operand is read once, before any write, since it may be AL or AH.
+        """
+        src = _fmt_operand_read(ops[0])
+        signed = m in ("imul", "idiv")
+        if _operand_width(ops[0]) == 1:
+            if m in ("mul", "imul"):
+                cast = "(int32_t)(int8_t)" if signed else "(uint32_t)(uint8_t)"
+                return [f"{{ uint32_t _r = (uint32_t)({cast}LO8(eax) * {cast}({src}));",
+                        f"  SET_LO16(eax, _r); }}  /* {m} r/m8: ax = al * src */"]
+            if signed:
+                return [f"{{ int32_t _d = (int32_t)(int8_t)({src}), _n = (int32_t)(int16_t)LO16(eax);",
+                        "  int32_t _q = _n / _d, _m = _n % _d;",
+                        f"  SET_LO8(eax, (uint32_t)_q); SET_HI8(eax, (uint32_t)_m); }}  /* {m} r/m8 */"]
+            return [f"{{ uint32_t _d = (uint32_t)(uint8_t)({src}), _n = (uint32_t)LO16(eax);",
+                    "  uint32_t _q = _n / _d, _m = _n % _d;",
+                    f"  SET_LO8(eax, _q); SET_HI8(eax, _m); }}  /* {m} r/m8 */"]
+        if m in ("mul", "imul"):
+            cast = "(int32_t)(int16_t)" if signed else "(uint32_t)(uint16_t)"
+            return [f"{{ uint32_t _r = (uint32_t)({cast}LO16(eax) * {cast}({src}));",
+                    f"  SET_LO16(eax, _r); SET_LO16(edx, _r >> 16); }}  /* {m} r/m16: dx:ax = ax * src */"]
+        if signed:
+            return [f"{{ int32_t _d = (int32_t)(int16_t)({src});",
+                    "  int32_t _n = (int32_t)(((uint32_t)LO16(edx) << 16) | LO16(eax));",
+                    "  int32_t _q = _n / _d, _m = _n % _d;",
+                    f"  SET_LO16(eax, (uint32_t)_q); SET_LO16(edx, (uint32_t)_m); }}  /* {m} r/m16 */"]
+        return [f"{{ uint32_t _d = (uint32_t)(uint16_t)({src});",
+                "  uint32_t _n = ((uint32_t)LO16(edx) << 16) | LO16(eax);",
+                "  uint32_t _q = _n / _d, _m = _n % _d;",
+                f"  SET_LO16(eax, _q); SET_LO16(edx, _m); }}  /* {m} r/m16 */"]
+
     def _lift_muldiv(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
+        if (_operand_width(ops[0]) or 4) < 4:
+            return self._lift_narrow_muldiv(ops, m)
         src = _fmt_operand_read(ops[0])
         if m == "mul":
             return [
@@ -2418,10 +2546,12 @@ class Lifter:
         sx = self._SNAP_SX[size]
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
+        what = (ops[0].expr_src if ops[0].type == "expr"
+                else f"{kind} {lhs}, {rhs}")
         out = [
             f"_fa = (uint32_t)({lhs}) & {mask}; _fb = (uint32_t)({rhs}) & {mask};",
             f"_fas = (int32_t){sx}(_fa); _fbs = (int32_t){sx}(_fb);"
-            f" /* {kind} {lhs}, {rhs} ({size*8}-bit) */",
+            f" /* {what} ({size*8}-bit) */",
         ]
         # A cmp sets the carry flag too, and sbb/adc/setc/rcl read it directly
         # rather than through _fa/_fb. Leaving CF alone here let those pick up
@@ -3030,7 +3160,11 @@ class Lifter:
             step, acc = (4, "MEM32") if wide else (2, "MEM16")
             value = "eax" if wide else "LO16(eax)"
             return self._rep_compare(m, value, f"{acc}(edi)", step, False)
-        return [f"/* {m} */"]
+        # Anything else -- rep ins*/outs* (port block transfers), a rep
+        # prefix on something that is not a string op -- has no translation.
+        # A bare comment here made it vanish without a trace; the marker at
+        # least says, at run time, that it was reached.
+        return self._unimplemented(insn, m)
 
     def _rep_compare(self, m, first, second, step, uses_esi):
         """REPE/REPNE CMPS and SCAS: compare element by element.
@@ -4228,6 +4362,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
+        # setp/setnp read PF, which is how `fnstsw ax; sahf; setp al` turns
+        # C2 into a value; every setter's PF already has a jp/jnp rule.
         if (curr.mnemonic in ("sete", "setne", "setb", "setae", "setbe",
                               "seta", "setl", "setge", "setle", "setg",
                               "sets", "setns", "setp", "setnp", "setpe", "setpo", "seto", "setno")

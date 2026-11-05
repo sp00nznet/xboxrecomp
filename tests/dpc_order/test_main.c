@@ -17,7 +17,7 @@
  *    the sleep is kept for it; an unwoken sleep lasts;
  *  - (d) the model thread's own gate release never runs a queued DPC, nor
  *    does an unmarked thread's raise;
- *  - (e) RECOMP_DPC_ON_RAISE=0: the raise returns with the DPC still queued (the
+ *  - (e) dpc_on_raise=0: the raise returns with the DPC still queued (the
  *    old ordering, recorded);
  *  - (g) with RECOMP_GUEST_LOCK on, a guest thread that let the guest CPU
  *    go for its kernel call runs the routine without it, as the timer
@@ -29,25 +29,13 @@
  *    is queued once.
  */
 #include "kernel.h"
+#include "recomp_env.h"
 #include "xbox_memory_layout.h"
 #include "platform/host_time.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* The tests change the environment the kernel reads its switches from. */
-static void test_setenv(const char *name, const char *v)
-{
-#ifdef _WIN32
-    _putenv_s(name, v ? v : "");
-#else
-    if (v)
-        setenv(name, v, 1);
-    else
-        unsetenv(name);
-#endif
-}
 
 /* The DPC routine is "generated code" looked up by its guest address. */
 #define DPC_ROUTINE_VA 0x00001000u
@@ -64,6 +52,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
 extern RECOMP_TLS uint32_t g_ebp;
 extern RECOMP_TLS RecompXmm g_xmm0;
+extern uint32_t g_xbox_stack_size;
 extern ptrdiff_t g_xbox_mem_offset;
 
 #define MS 1000000ull
@@ -268,7 +257,7 @@ static void raise_holds_cpu(void)
 
     reset();
     s_dpc_held = -1;
-    test_setenv("RECOMP_GUEST_LOCK", "1");
+    recomp_env_set(RENV_GUEST_LOCK, "1");
     xbox_GuestCpuReloadConfig();
     g.mark = 1;
     g.lock = 1;
@@ -281,7 +270,7 @@ static void raise_holds_cpu(void)
           "(g) the thread let the guest CPU go for the call; the routine ran without it");
     check(g.held_after == 0, "(g) the CPU is still let go when the call returns to its bridge");
     check(g.old_ok && g.regs_ok, "(g) the raise's result and the guest's registers are intact");
-    test_setenv("RECOMP_GUEST_LOCK", "0");
+    recomp_env_set(RENV_GUEST_LOCK, "0");
     xbox_GuestCpuReloadConfig();
 }
 
@@ -374,17 +363,17 @@ static void old_ordering(void)
     HANDLE t;
 
     reset();
-    test_setenv("RECOMP_DPC_ON_RAISE", "0");
+    recomp_env_set(RENV_DPC_ON_RAISE, "0");
     xbox_IrqReloadConfig();
-    check(!xbox_DpcOnRaise(), "(e) RECOMP_DPC_ON_RAISE=0");
+    check(!xbox_DpcOnRaise(), "(e) dpc_on_raise=0");
     g.mark = 1;
     t = guest_start(&g);
     deliver();
     SetEvent(g.go);
     guest_finish(&g, t);
     check(g.runs_at_raise == 0 && g.runs_after_lower == 0,
-          "(e) RECOMP_DPC_ON_RAISE=0: the raise returns with the DPC queued (the old ordering, recorded)");
-    test_setenv("RECOMP_DPC_ON_RAISE", NULL);
+          "(e) dpc_on_raise=0: the raise returns with the DPC queued (the old ordering, recorded)");
+    recomp_env_set(RENV_DPC_ON_RAISE, NULL);
     xbox_IrqReloadConfig();
     check(xbox_DpcOnRaise(), "(e) the default is on");
     drain_on_main();
@@ -414,6 +403,7 @@ int main(void)
     int slot;
 
     g_fs_base = 0;
+    g_xbox_stack_size = 8u * 1024 * 1024;   /* worker stack slices to hand out */
     /* Guest memory where the worker stacks are, plus a page for the KDPC. */
     g_xbox_mem_offset = (ptrdiff_t)(uintptr_t)calloc(
         XBOX_WORKER_STACK_COUNT * XBOX_WORKER_STACK_SIZE + 0x10000, 1)
@@ -424,13 +414,17 @@ int main(void)
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     xbox_IrqSetHandler(XBOX_IRQ_APU, apu_isr);
     printf("dpc_order:\n");
-    check(!xbox_DispatchGateOn() && !xbox_DpcOnRaise(),
-          "by default the gate is off, and DPCs on raise with it");
-    test_setenv("RECOMP_DPC_ON_RAISE", "1");
-    xbox_IrqReloadConfig();
-    check(!xbox_DpcOnRaise(), "RECOMP_DPC_ON_RAISE=1 without the gate stays off");
-    test_setenv("RECOMP_DPC_ON_RAISE", NULL);
-    test_setenv("RECOMP_DISPATCH_GATE", "1");
+    /* A run with RECOMP_DISPATCH_GATE already set (the gate-on ctest pass)
+     * has no default to check. */
+    if (!recomp_env(RENV_DISPATCH_GATE)) {
+        check(!xbox_DispatchGateOn() && !xbox_DpcOnRaise(),
+              "by default the gate is off, and DPCs on raise with it");
+        recomp_env_set(RENV_DPC_ON_RAISE, "1");
+        xbox_IrqReloadConfig();
+        check(!xbox_DpcOnRaise(), "dpc_on_raise=1 without the gate stays off");
+        recomp_env_set(RENV_DPC_ON_RAISE, NULL);
+    }
+    recomp_env_set(RENV_DISPATCH_GATE, "1");
     xbox_IrqReloadConfig();
     check(xbox_DispatchGateOn() && xbox_DpcOnRaise(),
           "RECOMP_DISPATCH_GATE=1: DPCs on raise are on with it");

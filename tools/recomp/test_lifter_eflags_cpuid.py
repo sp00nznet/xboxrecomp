@@ -206,8 +206,15 @@ RECOMP_TLS int g_df = 0;
 RECOMP_TLS uint32_t g_eflags = 0x00000202u;
 RECOMP_TLS uint32_t g_ebp, g_seh_ebp;
 void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
-/* xbox_Cpuid reads RECOMP_CPUID_NO_SIMD; the test pins its value per build. */
-#define getenv(name) ((void)(name), (const char *)CPUID_NO_SIMD_ENV)
+/* xbox_Cpuid reads RECOMP_CPUID_NO_SIMD through the recomp_env table; the
+ * test pins its value per build. */
+enum { RENV_CPUID_NO_SIMD };
+static int recomp_env_on(int id)
+{
+    const char *v = CPUID_NO_SIMD_ENV;
+    (void)id;
+    return v && *v && *v != '0';
+}
 %(cpuid)s
 
 static uint32_t eax, ebx, ecx, edx, esi, esp, ebp;

@@ -5,7 +5,7 @@
 #ifndef XBOX_INPUT_KEYBOARD_SDL_H
 #define XBOX_INPUT_KEYBOARD_SDL_H
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,15 +15,13 @@ extern "C" {
  * key is not one the table records. Every key input_map.h has a name for
  * is recorded; a left or right modifier gives the either-side VK here. */
 int  xbox_InputSdlKeyToVk(int sdl_keycode);
-/* For a left or right Shift, Ctrl or Alt, its side-specific VK (VK_LSHIFT
- * and so on), which is recorded beside the one above; else 0. */
-int  xbox_InputSdlKeyToSideVk(int sdl_keycode);
-/* An SDL mouse button (SDL_BUTTON_LEFT ...) as its VK (VK_LBUTTON ...), or 0. */
-int  xbox_InputSdlButtonToVk(int sdl_button);
-/* Once the window exists: stop SDL's text input. */
-void xbox_InputSdlInit(void);
-/* Every event of the main loop: keys, mouse buttons, and the window events
- * that release them. Others are ignored. */
+/* The same with the sides kept: LShift/RShift, LCtrl/RCtrl, LAlt/RAlt and
+ * keypad Enter get input_names.h's own codes. The event path uses this. */
+int  xbox_InputSdlKeyToCode(int sdl_keycode);
+/* Once the window exists: stop SDL's text input on it. */
+void xbox_InputSdlInit(SDL_Window *win);
+/* Every event of the main loop: keys, and the window events that release
+ * them. Others are ignored. */
 void xbox_InputSdlEvent(const SDL_Event *ev);
 
 #ifdef __cplusplus

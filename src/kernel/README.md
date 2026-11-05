@@ -168,8 +168,48 @@ Z:\cache.dat                 → <save_dir>\cache\cache.dat
 xbox_path_init("Burnout 3 Takedown", "saves");
 ```
 
-`save_dir` defaults to `$XDG_DATA_HOME/xboxrecomp` (POSIX) or
-`%LOCALAPPDATA%\xboxrecomp` (Windows). The title's own saves,
+`save_dir` defaults to `$XDG_DATA_HOME/xboxrecomp/<title id>` (POSIX; `~/.local/share`
+without `XDG_DATA_HOME`) or `%LOCALAPPDATA%\xboxrecomp\<title id>` (Windows), so
+two games never share a `Cache`. The id is the XBE certificate's, as 8
+lower-case hex digits, which `xbox_MemoryLayoutInit` passes to
+`xbox_path_set_title_id`; before that the root is the shared
+`<base>/xboxrecomp`. Builds before the per-title root kept every game there.
+The first run with a per-title root copies the title's `UDATA/<title id>` and
+`TDATA/<title id>` from the shared root (`xbox_path_adopt_legacy_saves`). It
+copies each one only when the new root has none or an empty one (the game
+makes an empty `TDATA/<title id>` at boot), and only once: a
+`.legacy-saves` marker records it once both are in place. Each copy goes to
+`<title id>.copying.<pid>`, is flushed, then renamed, so a crash leaves no
+half save and two instances started together copy each folder once. Files
+and folders keep their times (a save's date is its folder's last write). A
+link to a file is copied as the file; a link to a folder, a junction or an
+unreadable file fails the copy, which then leaves no marker, no empty
+`UDATA` and a `.legacy-saves-failed-<UDATA|TDATA>` note. Every failure
+(a folder that cannot be made, a path too long) leaves the note, which says
+in words what happened, and a note that cannot be written is logged. The
+next run tries again while that folder in the new root is missing or empty.
+Once the player has saved into it, it is never overwritten: each run logs
+that the old saves wait in the shared root to be copied by hand, which ends
+by deleting the note. A note whose folder is gone from the shared root is
+removed. One whose whole `UDATA` or `TDATA` is missing there is kept, and
+no marker is written, so a run with the shared root back looks again. A
+folder that holds the copy, meaning every top-level entry of the shared
+root's folder with the same name and last write, counts as present, and a
+note next to it is removed. So a rename that meets another instance's copy,
+even one its game has saved into, takes it as present. A folder another
+instance's game made during the copy keeps its save and fails with the
+note. That test fails safe: a copy whose times were refused (logged), or
+whose top-level entries the winner's game changed, reads as not a copy and
+leaves a note, which tells the player to check before copying by hand. On
+Win32 the empty folder a copy replaces is deleted through a handle that
+shares nothing, so one held open elsewhere (a running instance, Explorer,
+a scanner) is left alone and the copy is retried next run. The warnings
+are only in the log and the note; the game shows nothing. Read-only files
+are copied and stay read-only. On macOS the flushes use `F_FULLFSYNC`, and
+the root is flushed before the marker. The shared root is never written.
+Caches and partition images start empty. A title sees only its own root, so
+another title's `UDATA` (a prequel's save that a game looks for to unlock a
+bonus) is not visible unless `RECOMP_HDD_DIR` points both at one folder. The title's own saves,
 `\Device\Harddisk0\Partition1\UDATA` and `...\TDATA` (where XAPI maps U: and T:),
 go to `<save_dir>/UDATA` and `<save_dir>/TDATA`, and its scratch, `...\CACHE`,
 to `<save_dir>/TitleCache`, which keeps the cache a title writes out of the
@@ -179,6 +219,13 @@ folder on a case-insensitive host. `RECOMP_SAVE_DIR=<dir>` moves just those
 three under `<dir>` (created if missing; absolute, and under Wine a DOS path
 such as `Z:\home\me\run\save`), so a scripted run can start from an empty
 save without touching the rest of the save dir.
+
+Two toolkit config keys feed `xbox_path_init` from the game's `main.c` (the
+new-game template reads both): `RECOMP_GAME_FILES=<dir>` is the extracted
+game folder (`default.xbe` and the disc files; unset, the game's built-in
+default) and `RECOMP_HDD_DIR=<dir>` is the `save_dir` above (partition
+images, saves, caches; unset, the default place). A launcher sets them so an
+installed bundle finds the owner's files without a rebuild.
 
 ## Threading
 

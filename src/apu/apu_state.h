@@ -380,9 +380,10 @@ typedef struct MCPXAPUVoiceFilter {
     uint16_t voice;
     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
     SRC_STATE *resampler;
-    /* Linear-interpolation resampler state (voice_resample): the two source
-     * samples the output sits between, the output's position in [0,1)
-     * between them, and whether they have been fetched yet. */
+    /* Linear-interpolation resampler state (voice_resample): the two newest
+     * source samples, the next output's position past rs_last (in (0,1]
+     * between them once consumed up to it), and whether they have been
+     * fetched yet. */
     float rs_last[2], rs_next[2], rs_pos;
     int   rs_have;
     sv_filter svf[2];
@@ -428,8 +429,27 @@ typedef struct MCPXAPUVPState {
     uint8_t hrtf_submix[4];
     uint8_t submix_headroom[NUM_MIXBINS];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
-    volatile uint8_t voice_locked[MCPX_HW_MAX_VOICES];
-    volatile LONG voice_spin[MCPX_HW_MAX_VOICES];   /* see voice_spin_lock */
+    /* Updated with 64-bit atomics (qatomic_or64 and friends), which need
+     * natural alignment: an unaligned 64-bit locked op splits across cache
+     * lines on x86 and faults on arm64. */
+    _Alignas(8) uint64_t voice_locked[4];
+    /* The mix's hold on a queued voice the title has locked (apu_vp.c,
+     * vp_hold_locked_voices). hold_waiting is 1 while the frame thread waits
+     * there, so voice_lock wakes it only then; it is read by the title side
+     * and written by the frame thread, with the same 64-bit atomics. The
+     * rest belong to the frame thread. */
+    _Alignas(8) uint64_t hold_waiting;
+    uint64_t hold_exempt[4];   /* locked through a whole bound: not held again until unlocked */
+    uint64_t hold_count;       /* frames that waited */
+    uint64_t hold_timeouts;    /* waits that ran out the bound */
+    uint64_t hold_max_us;      /* longest wait */
+    /* Holds that cleared after their first 1 ms wait returned in under
+     * 0.9 ms. Meant to count voice_lock's broadcast, but any early return
+     * counts: a spurious wake, the ISTS/FECTL broadcasts in apu_core.c, the
+     * apu_mixer_play signal, or SleepConditionVariableCS returning early on
+     * native Windows. So it is an upper bound on the wakes, which is why
+     * the ctest only asserts a floor (a wake that works shows up). */
+    uint64_t hold_wakes;
 
     struct {
         int current_entry;
@@ -493,6 +513,37 @@ struct MCPXAPUState {
     /* The sequencer's sample counter (what XGSCNT reads back). Resets when
      * the title writes XGSCNT; advances 48 kHz while the sequencer runs. */
     uint64_t sample_count;
+    /* Sequencer starts: bumped by every SECTL write that switches the
+     * counter off (the guest's MMIO thread). The emulated GP's lag counts
+     * from the last one. */
+    uint32_t ssl_starts;
+    /* Sequencer resets: bumped by every SECTL write of 0, the sequencer
+     * stopped whole (the guest's MMIO thread). Only these re-arm the
+     * stub's sample limit; a recovery that switches only the counter off
+     * does not. */
+    uint32_t ssl_resets;
+    /* ssl_resets + 1 when the stub's sample-limit interrupt last fired, so
+     * the zeroed state counts as not fired; the frame thread's alone. A
+     * SECTL write of 0 re-arms it by moving ssl_resets on, with no lock
+     * and no re-arm lost to the frame thread's read-check-set. */
+    uint32_t ssl_fired_at;
+    /* Set by the code that runs an emulated GP, while it runs. The sample
+     * limit then follows that GP's lag (gp_lag_cycles) instead of the stub's
+     * once-per-start tick: see mcpx_apu_ssl_tick. The frame thread's alone. */
+    bool gp_emulated;
+    /* How far the emulated GP is behind the sequencer, in GP cycles: what
+     * its frames took beyond MCPX_APU_GP_FRAME_CYCLES, less the slack of
+     * frames that took less. Zero while it keeps pace; a GP reset, a
+     * sample-limit interrupt, a sequencer start and the counter off clear
+     * it. The frame thread's alone. */
+    uint64_t gp_lag_cycles;
+    /* The sequencer start (ssl_starts + 1) the lag counts from: the tick
+     * and a GP frame clear the lag when a new start shows. The frame
+     * thread's alone. */
+    uint32_t gp_lag_start;
+    /* Sample-limit interrupts raised, either path (the DSP stats line). The
+     * frame thread's alone. */
+    uint32_t ssl_raised;
 
     int ep_frame_div;
     int sleep_acc_us;
@@ -535,6 +586,8 @@ void mcpx_apu_vp_init(MCPXAPUState *d);
 void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_vp_reset(MCPXAPUState *d);
+/* Write the VP's buffered trace lines; frame thread, after it drops d->lock. */
+void mcpx_apu_vp_trace_flush(void);
 
 /* DSP functions (stubbed) */
 void mcpx_apu_dsp_init(MCPXAPUState *d);
@@ -543,6 +596,19 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d);
 void mcpx_apu_dsp_gprst_write(uint32_t val);
+/* The boot ROM's scratch-to-P copy when GPRST/EPRST go to 3, polled in the
+ * MCPX window at mcpx (xbox_McpxHost()); the stub's, apu_dsp.c. */
+void mcpx_apu_dsp_boot_poll(MCPXAPUState *d, uint8_t *mcpx);
+
+#ifdef XBOXRECOMP_APU_DSP_DEVICE
+/* The GP and EP on the dsp56300 JIT (apu_dsp_run.c), with RECOMP_APU_DSP=1:
+ * device_on says whether the key is set; run_frame stands in for the stub's
+ * frame; run_finalize joins its worker and frees the cores. */
+bool mcpx_apu_dsp_device_on(void);
+void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
+                            float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+void mcpx_apu_dsp_run_finalize(void);
+#endif
 
 /* Monitor (host output): call after each 32-sample frame; on the last frame
  * of an EP period it adds the software mixer and test tone to frame_buf and
@@ -555,6 +621,17 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
 /* The period pace_step admitted was rendered: spend its credit. A pass that
  * renders nothing (front end trapped) spends none. */
 void mcpx_apu_pace_rendered(MCPXAPUState *d);
+
+/* The GP and EP clock at about 160 MHz: one APU frame (32 samples at
+ * 48 kHz) is about this many DSP cycles. */
+#define MCPX_APU_GP_FRAME_CYCLES 106667u
+
+/* The sequencer's sample-limit interrupt: advance the sample counter by one
+ * frame and raise SSLINTSTS when the GP has fallen SSL samples behind, or
+ * with the stub GP once per sequencer start. See apu_core.c. */
+void mcpx_apu_ssl_tick(MCPXAPUState *d);
+/* An emulated GP frame ran for `cycles` DSP cycles: account its lag. */
+void mcpx_apu_gp_frame_ran(MCPXAPUState *d, uint32_t cycles);
 
 /* Host starvation accounting (RECOMP_AUDIO_HOST; see apu_core.c). The
  * deficit is the wall clock since the baseline, in samples, less what the
@@ -583,10 +660,13 @@ extern struct McpxApuDebug g_dbg, g_dbg_cache;
 extern int g_dbg_voice_monitor;
 extern uint64_t g_dbg_muted_voices[4];
 
-/* RECOMP_APU_TRACE: idle-voice traps against the frames that ran. Traps are
- * counted under the APU lock, the rest by the frame thread. */
+/* RECOMP_APU_TRACE: idle-voice traps against interrupt deliveries. Traps are
+ * counted under the APU lock, holder_delivered by the gate holder, the rest
+ * by the frame thread. */
 typedef struct {
-    unsigned traps;             /* front-end traps latched (fe_method) */
+    unsigned traps, delivered, held_frames, forced;
+    unsigned posted;            /* found the gate held: left for its holder */
+    unsigned holder_delivered;  /* run by the gate holder at a safe point */
     unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
     unsigned fe_trapped_frames; /* frames that found FECTL trapped */
 } ApuIrqStats;

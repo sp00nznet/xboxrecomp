@@ -1,5 +1,14 @@
 # Pushbuffer Executor
 
+> **In this fork** (`posix-host/portability`) this page describes upstream's
+> v0.14.0 executor, which the fork did not take. The fork runs its own
+> executor (`nv2a_pb_scan.c`, `nv2a_pb_exec.c`) behind `nv2a_pb_state.h`, with
+> a CPU rasteriser, D3D11 and Metal: it walks from GET to PUT through the
+> title's own jumps, writes semaphore releases itself and keeps PGRAPH
+> 0x400B10 in step with the completed fence (`xbox_Nv2aPgraphFenceTick`). There
+> is no `nv2a_backend.h`, `RECOMP_PB_WALK=dma`, fixed-function transform or
+> anti-aliased surface support here.
+
 A title that statically links the XDK's Direct3D never calls the toolkit's
 D3D8 layer. It writes NV2A methods into a pushbuffer and kicks the GPU, and the
 only way to see its frames is to execute that pushbuffer. `RECOMP_PB_SCAN`
@@ -183,6 +192,29 @@ batches were cut short. Indices are 32-bit now, batches may hold 65536, and
 contiguous window); a read outside it returns no vertex and the batch is dropped.
 `SET_VERTEX_DATA_ARRAY_FORMAT` size 7
 (`3W`) reads as three components.
+
+## Draw Merging
+
+Some titles draw each particle or sprite as its own 3- or 4-vertex strip,
+thousands a frame with no method between them (BLiNX 1's snow: 18k batches a
+flip, 11k of them straight after the previous END). On a GPU back end each
+batch is a draw call, and the calls were the frame. A back end that sets
+`merge_draws` (Metal and D3D11 do; the CPU rasteriser does not) gets such a
+run as one draw: the executor holds a batch at END when only `DRAW_ARRAYS` or
+`ARRAY_ELEMENT*` came since its BEGIN and it is a triangle primitive with 3 to
+256 indices. The next BEGIN of the same primitive, its indices and END join
+it. Any other method, the walk's end or a checkpoint draws the chain first,
+as one `TRIANGLES` list of each batch converted in turn, so the triangles,
+their order, winding and provoking vertex are the batches' own. A chain of
+one is drawn as it came.
+
+No method came between the batches, so the state is theirs. Two per-draw
+rules are not state, and they turn merging off: a batch whose enabled
+texture stage samples the colour surface it draws into (the back ends copy
+the target per draw, and each batch must see the last one's pixels), and
+Hor+ (`display.aspect`), which places each batch from its own vertices. The
+draw carries `batches`, the guest batches it stands for, so counters and the
+flip log stay per guest batch. `RECOMP_DEBUG=pb_merge=0` turns it off.
 
 ## Render Back Ends
 

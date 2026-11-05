@@ -12,7 +12,7 @@
 # code; the file is printed afterwards. A batch file because Wine escapes
 # the quotes of a quoted argument as \", which cmd.exe /c can't parse.
 # Inside a distrobox, umu-run is reached through distrobox-host-exec.
-# RECOMP_* variables are passed on explicitly. Arguments are quoted (a %
+# RECOMP_* and HLSL_* variables are passed on explicitly. Arguments are quoted (a %
 # is doubled); ones holding a double quote are not supported.
 #
 # Environment: WINEPREFIX (default ~/.local/share/proton-test), PROTONPATH
@@ -32,7 +32,7 @@ printf '@echo off\r\n%s > "%s" 2>&1\r\necho proton_run_exit=%%ERRORLEVEL%%>> "%s
 
 envs=(WINEPREFIX="${WINEPREFIX:-$HOME/.local/share/proton-test}"
       PROTONPATH="${PROTONPATH:-GE-Proton}" GAMEID="${GAMEID:-umu-default}")
-while IFS= read -r kv; do envs+=("$kv"); done < <(env | grep -E '^RECOMP_' || true)
+while IFS= read -r kv; do envs+=("$kv"); done < <(env | grep -E '^(RECOMP|HLSL)_' || true)
 
 # env -C sets the directory again on the host side, since
 # distrobox-host-exec does not keep the caller's cwd.

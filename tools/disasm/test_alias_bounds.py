@@ -85,6 +85,7 @@ def _built(insns, functions, aliases, section=_Section):
     det.functions = {s: Function(start=s, end=e, name=f"sub_{s:08X}")
                      for s, e in functions}
     det._alias_entries = dict(aliases)
+    det.mid_instruction_starts = {}
     det._build_alias_entries()
     return {a: det.functions[a].end for a in aliases}
 

@@ -20,8 +20,11 @@
  */
 
 #include "apu_state.h"
+#include "apu_lockstat.h"
+#include "recomp_env.h"
 #include "apu.h"
 #include "fpconv.h"
+#include <stdarg.h>
 
 /* #define DEBUG_MCPX */
 
@@ -77,7 +80,7 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
         src_reset(d->vp.filters[v].resampler);
     }
     d->vp.filters[v].rs_have = 0;
-    d->vp.filters[v].rs_pos = 0.0f;
+    d->vp.filters[v].rs_pos = 1.0f;
 }
 
 static bool voice_should_mute(uint16_t v)
@@ -115,13 +118,40 @@ static uint32_t voice_get_mask(MCPXAPUState *d, uint16_t voice_handle,
            ctz32(mask);
 }
 
+/* The title's front-end methods (VOICE_OFF and VOICE_PAUSE, from its own
+ * thread, outside d->lock) and the frame thread's voice processing write bits
+ * of the same voice words. As a plain read-modify-write, one side could put
+ * back bits the other had just changed: the frame thread's per-frame
+ * NEW_VOICE clear restored an ACTIVE bit that VOICE_OFF had cleared, the
+ * voice played on with no idle-voice trap, and DirectSound's buffer teardown
+ * spun until its 500 ms watchdog forced the voice off (BLiNX 2 froze for
+ * 0.5 s or 1 s at a time, most often in Time Stop, which stops and restarts
+ * voices every frame). The MCPX front end and voice processor never lose
+ * each other's writes, so the masked bits change by compare-and-swap,
+ * without a lock.
+ *
+ * That makes updates of disjoint bits safe only. A caller that reads a field,
+ * computes from it and writes it back (envelope state and counters, CBO, an
+ * end-of-buffer voice_off decided from a CBO read earlier) can still lose to
+ * the other thread writing the same field in between. */
 static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
                            hwaddr offset, uint32_t mask, uint32_t val)
 {
     hwaddr voice = d->regs[NV_PAPU_VPVADDR] + voice_handle * NV_PAVS_SIZE;
-    uint32_t v = ldl_le_phys(address_space_memory, voice + offset) & ~mask;
-    stl_le_phys(address_space_memory, voice + offset,
-                v | ((val << ctz32(mask)) & mask));
+    uint32_t *word = (uint32_t *)mcpx_apu_phys(voice + offset);
+    uint32_t bits = (val << ctz32(mask)) & mask;
+    assert(((uintptr_t)word & 3) == 0);
+    uint32_t old = qatomic_load32(word);
+    for (;;) {
+        /* Most writes (the per-frame NEW_VOICE clear above all) change
+         * nothing; skip the locked instruction for those. */
+        if ((old & mask) == bits)
+            return;
+        uint32_t seen = qatomic_cmpxchg32(word, old, (old & ~mask) | bits);
+        if (seen == old)
+            return;
+        old = seen;
+    }
 }
 
 /* ============================================================
@@ -144,34 +174,48 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
-/* Per voice, as in xemu. A title's VOICE_LOCK arrives on its own thread while
- * the frame thread holds d->lock across every voice of a frame, so taking
- * d->lock here made each lock wait out the whole frame. The title only has to
- * wait while the voice processor is working on the voice it locks. */
-static void voice_spin_lock(MCPXAPUState *d, uint16_t v)
-{
-    while (InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
-        SwitchToThread();
-}
-
-static void voice_spin_unlock(MCPXAPUState *d, uint16_t v)
-{
-    InterlockedExchange(&d->vp.voice_spin[v], 0);
-}
-
+/* NV1BA0_PIO_VOICE_LOCK, and VOICE_ON/RELEASE around their own writes: a
+ * bit flip, with no d->lock.
+ *
+ * On the MCPX a PIO method is posted into the front end's FIFO (PIO_FREE
+ * counts the room left); the CPU's store never waits for the voice
+ * processor. xemu takes d->lock here and signals d->cond. Taking the lock
+ * made the title wait out the rest of the current se_frame (~80 us, 5% of
+ * the time, measured under Proton), and while the frame thread never let go
+ * of it, Burnout 3 froze on its vehicle select, blocked here at raised IRQL.
+ * So the title side stays a lock-free atomic RMW on the 64-bit word (the
+ * title thread and a DPC on the timer thread both write here).
+ *
+ * The other half of xemu's design is kept on the mix side: the VP holds a
+ * frame while a voice it is about to process is locked
+ * (vp_hold_locked_voices), so it never mixes a voice the title is
+ * mid-update on. An unlock wakes that hold, and only that: the broadcast goes
+ * out only while the frame thread is waiting in it, because a signal on
+ * every VOICE_LOCK woke the frame thread's pacing wait about 1000 times a
+ * second under Proton. It is a broadcast because d->cond can have other
+ * waiters (in tests/apu_voice_lock the idle frame thread took every signal
+ * on macOS, so the hold never saw one). A wake can be missed: voice_lock does
+ * not take d->lock, so it can land after the hold's last check of the bit
+ * and before it sleeps. The hold's 1 ms timed wait then sees the bit, so
+ * correctness never rests on the wake. */
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
+    uint64_t mask = 1ULL << (v % 64);
     assert(v < MCPX_HW_MAX_VOICES);
-    voice_spin_lock(d, v);
-    d->vp.voice_locked[v] = lock;
-    voice_spin_unlock(d, v);
-    qemu_cond_signal(&d->cond);
+    if (lock) {
+        qatomic_or64(&d->vp.voice_locked[v / 64], mask);
+    } else {
+        qatomic_and64(&d->vp.voice_locked[v / 64], ~mask);
+        if (qatomic_load64(&d->vp.hold_waiting))
+            qemu_cond_broadcast(&d->cond);
+    }
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
 {
+    uint64_t mask = 1ULL << (v % 64);
     assert(v < MCPX_HW_MAX_VOICES);
-    return d->vp.voice_locked[v] != 0;
+    return (qatomic_load64(&d->vp.voice_locked[v / 64]) & mask) != 0;
 }
 
 /* ============================================================
@@ -451,8 +495,30 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET: {
+        /* Output buffer handles index the GP FIFO table (GPFADDR, entries 0
+         * to GPFMAXSGE inclusive) and share their numbers with the inbuf
+         * handles, so writing them to VPSGEADDR overwrote voice pages (JSRF's
+         * stream ring lost its first page to its output buffer). The target
+         * table is inferred: xemu leaves this method a FIXME in vp.c. GP was
+         * chosen over EP on JSRF's evidence: it remaps handles 0-1 with
+         * GPFMAXSGE=1 (EPFMAXSGE=5). With the table unset or the handle out
+         * of range there is no entry to write, so the write is dropped,
+         * reported once in case a title needs the EP table instead. */
+        if (!d->regs[NV_PAPU_GPFADDR] ||
+            d->vp.outbuf_sge_handle > d->regs[NV_PAPU_GPFMAXSGE]) {
+            static int s_dropped_logged;
+            if (!s_dropped_logged) {
+                s_dropped_logged = 1;
+                fprintf(stderr, "[APU] outbuf SGE write dropped: handle %u, "
+                        "GPFADDR 0x%08X, GPFMAXSGE %u (reported once)\n",
+                        (unsigned)d->vp.outbuf_sge_handle,
+                        (unsigned)d->regs[NV_PAPU_GPFADDR],
+                        (unsigned)d->regs[NV_PAPU_GPFMAXSGE]);
+            }
+            break;
+        }
         hwaddr sge_address =
-            d->regs[NV_PAPU_VPSGEADDR] + d->vp.outbuf_sge_handle * 8;
+            d->regs[NV_PAPU_GPFADDR] + d->vp.outbuf_sge_handle * 8;
         stl_le_phys(address_space_memory, sge_address,
                     argument & NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET_PARAMETER);
         break;
@@ -753,13 +819,59 @@ static float voice_step_envelope(MCPXAPUState *d, uint16_t v, uint32_t reg_0,
  * (default voice_dump.raw in the working directory).
  * ============================================================ */
 
+/* Trace lines from inside the VP (voice positions, [APU-VSTAT], [APU-RING])
+ * are formatted here while the frame thread holds d->lock and written by
+ * mcpx_apu_vp_trace_flush after it lets go. Under Wine each stderr write is
+ * a slow host call: printed in place, the once-a-second VSTAT burst held the
+ * lock ~45 ms and the position bursts 2-8 ms, and every VOICE_LOCK that
+ * came in meanwhile waited them out. Only the frame thread
+ * writes and flushes, so the buffer needs no lock of its own. A full
+ * VSTAT pass over every voice is ~50 KB. */
+#define VP_TRACE_BUF (64 * 1024)
+static char s_trace_buf[VP_TRACE_BUF];
+static size_t s_trace_len;
+static unsigned s_trace_dropped;
+
+#if defined(__GNUC__)
+__attribute__((format(printf, 1, 2)))
+#endif
+static void vp_trace(const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    size_t room = sizeof(s_trace_buf) - s_trace_len;
+
+    va_start(ap, fmt);
+    n = vsnprintf(s_trace_buf + s_trace_len, room, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= room) {
+        s_trace_buf[s_trace_len] = '\0';    /* drop the partial line */
+        s_trace_dropped++;
+        return;
+    }
+    s_trace_len += (size_t)n;
+}
+
+void mcpx_apu_vp_trace_flush(void)
+{
+    if (!s_trace_len && !s_trace_dropped)
+        return;
+    if (s_trace_len)
+        fwrite(s_trace_buf, 1, s_trace_len, stderr);
+    if (s_trace_dropped)
+        fprintf(stderr, "[APU] trace lines dropped: %u\n", s_trace_dropped);
+    fflush(stderr);
+    s_trace_len = 0;
+    s_trace_dropped = 0;
+}
+
 struct VpVoiceStat {
     uint32_t frames, zc;
     double   sq;
     float    last, ea, rate;
     uint32_t addr, fmt;
-    uint16_t vol0, vol1;
-    uint8_t  bin0, bin1;
+    uint16_t vol[8];
+    uint8_t  bin[8];
     const char *cls;
 };
 static struct VpVoiceStat s_vstat[MCPX_HW_MAX_VOICES];
@@ -774,10 +886,10 @@ static unsigned s_vstat_frames, s_vstat_secs;
 static void vp_stat_init(void)
 {
     const char *e;
-    s_vstat_on = apu_env_on("RECOMP_APU_TRACE");
-    e = getenv("RECOMP_APU_VOICE_DUMP");
+    s_vstat_on = recomp_env_on(RENV_APU_TRACE);
+    e = recomp_env(RENV_APU_VOICE_DUMP);
     if (e && *e) {
-        const char *path = getenv("RECOMP_APU_VOICE_DUMP_FILE");
+        const char *path = recomp_env(RENV_APU_VOICE_DUMP_FILE);
         if (!strcmp(e, "all")) {
             /* RECOMP_APU_VOICE_DUMP=all: <file>.<voice>.raw for each voice
              * that renders anything (voice slots are not stable between
@@ -805,7 +917,7 @@ static void vp_stat_samples(uint32_t v, const float samples[][2], int n,
     if (n <= 0) return;
     if (s->frames == 0) {
         s->addr = (uint32_t)first_addr;
-        s->cls = mcpx_apu_phys_class(first_addr);
+        s->cls = mcpx_apu_phys_data_class(first_addr);
         s->fmt = fmt;
     }
     for (int i = 0; i < n; i++) {
@@ -840,7 +952,7 @@ static void vp_stat_samples(uint32_t v, const float samples[][2], int n,
     }
 }
 
-static void vp_stat_report(void)
+static void vp_stat_report(MCPXAPUState *d)
 {
     if (s_vstat_on <= 0 && s_vdump_voice == -1) return;
     if (++s_vstat_frames % 1500) return;
@@ -851,11 +963,20 @@ static void vp_stat_report(void)
         if (s_vdump_all[v]) fflush(s_vdump_all[v]);
     if (s_vstat_on <= 0) return;
     s_vstat_secs++;
+    /* Totals since init: frames the mix held for a locked voice, holds that
+     * ran out VP_HOLD_MAX_US, the longest, and holds an unlock's wake
+     * ended inside the first 1 ms wait. */
+    vp_trace("[APU-HOLD] t=%us holds=%llu timeouts=%llu max_us=%llu wakes=%llu\n",
+             s_vstat_secs, (unsigned long long)d->vp.hold_count,
+             (unsigned long long)d->vp.hold_timeouts,
+             (unsigned long long)d->vp.hold_max_us,
+             (unsigned long long)d->vp.hold_wakes);
     for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         struct VpVoiceStat *s = &s_vstat[v];
         if (!s->frames) continue;
-        fprintf(stderr, "[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
-                " rate=%.3f ea=%.2f vol=%03X/%03X bin=%u/%u addr=%08X %s"
+        vp_trace("[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
+                " rate=%.3f ea=%.2f vol=%03X/%03X/%03X/%03X/%03X/%03X/%03X/%03X"
+                " bin=%u/%u/%u/%u/%u/%u/%u/%u addr=%08X %s"
                 " frames=%u rms=%.0f zcr=%.2f\n",
                 s_vstat_secs, v, s->fmt,
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0),
@@ -863,7 +984,10 @@ static void vp_stat_report(void)
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE) >> ctz32(NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE)),
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE) >> ctz32(NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE)),
                 (unsigned)((s->fmt & NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK) >> ctz32(NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK)),
-                s->rate, s->ea, s->vol0, s->vol1, s->bin0, s->bin1, s->addr,
+                s->rate, s->ea, s->vol[0], s->vol[1], s->vol[2], s->vol[3],
+                s->vol[4], s->vol[5], s->vol[6], s->vol[7],
+                s->bin[0], s->bin[1], s->bin[2], s->bin[3],
+                s->bin[4], s->bin[5], s->bin[6], s->bin[7], s->addr,
                 s->cls ? s->cls : "?", s->frames,
                 sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames);
         s->frames = 0; s->zc = 0; s->sq = 0;
@@ -871,7 +995,7 @@ static void vp_stat_report(void)
 }
 
 /* ============================================================
- * Ring monitor (RECOMP_APU_RING)
+ * Ring monitor (RECOMP_TRACE=apu_ring)
  *
  * A title that streams compressed audio decodes it on the CPU into a looping
  * PCM buffer voice and keeps writing ahead of the play cursor. If the writer
@@ -928,7 +1052,7 @@ static uint64_t ring_hash_block(MCPXAPUState *d, uint32_t ba, uint32_t off,
         uint32_t lin = ba + off;
         uint32_t run = TARGET_PAGE_SIZE - lin % TARGET_PAGE_SIZE;
         if (run > len) run = len;
-        const uint8_t *p = mcpx_apu_phys(
+        const uint8_t *p = mcpx_apu_phys_data(
             get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, lin));
         uint32_t i = 0;
         for (; i + 8 <= run; i += 8) {
@@ -959,7 +1083,7 @@ static void ring_close_block(struct VpRing *r, uint32_t v, uint32_t frames_per_b
             r->stale_total++;
             if (s_ring_logged < 200) {
                 s_ring_logged++;
-                fprintf(stderr, "[APU-RING] stale v=%u blk=%u/%u lap=%u ms=%llu\n",
+                vp_trace("[APU-RING] stale v=%u blk=%u/%u lap=%u ms=%llu\n",
                         v, b, r->nblk, r->laps,
                         (unsigned long long)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) / 1000));
             }
@@ -980,7 +1104,7 @@ static void vp_ring_check(MCPXAPUState *d, uint32_t v, uint32_t ba,
     uint32_t fpb;
 
     if (s_ring_on < 0)
-        s_ring_on = apu_env_on("RECOMP_APU_RING");
+        s_ring_on = recomp_env_on(RENV_APU_RING);
     if (!s_ring_on || v >= MCPX_HW_MAX_VOICES || bytes < 2 * RING_BLK ||
         frame_bytes == 0 || RING_BLK % frame_bytes)
         return;
@@ -1058,7 +1182,7 @@ static void vp_ring_report(unsigned secs)
             if (r) r->entries = 0;
             continue;
         }
-        fprintf(stderr, "[APU-RING] t=%us v=%u bytes=%u entries=%u stale=%u"
+        vp_trace("[APU-RING] t=%us v=%u bytes=%u entries=%u stale=%u"
                 " stale_total=%u lead_min=%u lead_avg=%llu\n",
                 secs, v, r->bytes, r->entries, r->stale, r->stale_total,
                 r->lead_n ? r->lead_min : 0,
@@ -1211,7 +1335,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, mcpx_apu_phys(addr),
+                    memcpy(adpcm_block, mcpx_apu_phys_data(addr),
                            block_size);
                 } else {
                     linear_addr += ba;
@@ -1220,7 +1344,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                         hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
                                                    0xFFFFFFFF, linear_addr);
                         adpcm_block[word_index] =
-                            ldl_le_phys(address_space_memory, addr);
+                            ldl_le_data(addr);
                         linear_addr += 4;
                     }
                 }
@@ -1250,19 +1374,19 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 float fval;
                 switch (sample_size) {
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
-                    ival = ldub_phys(address_space_memory, addr);
+                    ival = ldub_data(addr);
                     fval = uint8_to_float((uint8_t)(ival & 0xff));
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16:
-                    ival = lduw_le_phys(address_space_memory, addr);
+                    ival = lduw_le_data(addr);
                     fval = int16_to_float((int16_t)(ival & 0xffff));
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24:
-                    ival = ldl_le_phys(address_space_memory, addr);
+                    ival = ldl_le_data(addr);
                     fval = int24_to_float(ival);
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32:
-                    ival = ldl_le_phys(address_space_memory, addr);
+                    ival = ldl_le_data(addr);
                     fval = int32_to_float(ival);
                     break;
                 default:
@@ -1286,7 +1410,12 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         vp_ring_check(d, v, ba, ebo, (uint32_t)block_size,
                       cbo - (uint32_t)sample_count, samples, sample_count);
 
-    if (cbo >= ebo) {
+    /* EBO is the last sample (inclusive): the fetch loop reads while
+     * cbo <= ebo, a stream segment sets it to its length - 1, and the ring
+     * check spans ebo + 1 samples. So the voice wraps, ends or moves to the
+     * next segment only once sample ebo has been read. Testing cbo >= ebo
+     * here dropped sample ebo whenever a fetch stopped just before it. */
+    if (cbo > ebo) {
         if (stream) {
             d->vp.ssl[v].ssl_seg += 1;
             cbo = 0;
@@ -1333,12 +1462,19 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
      * half high, 8.8 % too fast -- and drained each stream buffer faster than
      * the title filled it, which is where the periodic dropouts came from.
      *
-     * State per voice: the two source samples the output sits between
-     * (rs_last at 0, rs_next at 1) and the output's position rs_pos in
-     * [0,1). Source samples arrive from voice_get_samples in the voice's own
-     * units; a shortfall (the voice ended or its stream ran dry) returns the
-     * outputs that could be made, and a fetch failure with nothing made is
-     * passed through as it was. */
+     * State per voice: the two newest source samples (rs_last, rs_next) and
+     * the next output's position rs_pos past rs_last, in (0,1] once the
+     * samples it lies past are consumed. An output on a whole position is
+     * rs_next itself, so a voice at rate 1 never holds a sample it fetched
+     * but has not played: its frame is exactly the 32 samples it fetched in
+     * it. Burnout 3's effect returns need that: the GP rewrites a 32-sample
+     * buffer each frame and two looping voices play it back. A position kept
+     * in [0,1) held one sample ahead, so each frame began with the previous
+     * frame's sample 0 -- a step every 32 samples, heard as fizz on the
+     * engines and nitro. Source samples arrive from voice_get_samples in the
+     * voice's own units; a shortfall (the voice ended or its stream ran dry)
+     * returns the outputs that could be made, and a fetch failure with
+     * nothing made is passed through as it was. */
     MCPXAPUVoiceFilter *f = &d->vp.filters[v];
     float src[NUM_SAMPLES_PER_FRAME * 4 + 2][2];
     const int max_src = (int)(sizeof(src) / sizeof(src[0]));
@@ -1349,29 +1485,26 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
     step = 1.0f / rate;
 
     if (!f->rs_have) {
-        got = voice_get_samples(d, v, src, 2);
-        /* A first fetch that gets one sample returns no output and drops
-         * that sample: the next call fetches two afresh. A voice whose
-         * stream starts one sample at a time loses its first sample. */
-        if (got < 2) return got < 0 ? got : 0;
-        f->rs_last[0] = src[0][0]; f->rs_last[1] = src[0][1];
-        f->rs_next[0] = src[1][0]; f->rs_next[1] = src[1][1];
-        f->rs_pos = 0.0f;
+        got = voice_get_samples(d, v, src, 1);
+        if (got < 1) return got < 0 ? got : 0;
+        f->rs_last[0] = f->rs_next[0] = src[0][0];
+        f->rs_last[1] = f->rs_next[1] = src[0][1];
+        f->rs_pos = 1.0f;
         f->rs_have = 1;
     }
 
-    /* Source samples the next requested_num outputs will step past, exactly:
-     * output k sits at rs_pos + k * step, and every whole unit that position
-     * reaches before the last output is a source sample consumed. The last
-     * output's own step is left pending in rs_pos for the next call, so
-     * nothing fetched here goes unused -- fetching floor(rs_pos + n * step)
-     * instead over-read by up to one sample a frame, which was dropped: the
-     * music came out 3 % fast. A step above about 4.2 (rate below 0.24, a
-     * voice pitched more than two octaves up) wants more than the 130-frame
-     * buffer holds over 31 steps; make fewer outputs rather than lose
-     * source, so such a voice comes out short (and late) each frame. */
+    /* Source samples the next requested_num outputs need, exactly: output k
+     * sits at rs_pos + k * step and needs the sample at the next whole
+     * position, rs_next being the first. The last output's own step is left
+     * pending in rs_pos for the next call, so nothing fetched here goes
+     * unused -- over-reading by a sample a frame, as an earlier version did,
+     * dropped it: the music came out 3 % fast. A step above about 4.2 (rate
+     * below 0.24, a voice pitched more than two octaves up) wants more than
+     * the 130-frame buffer holds over 31 steps; make fewer outputs rather
+     * than lose source, so such a voice comes out short (and late) each
+     * frame. */
     for (;;) {
-        need = (int)floorf(f->rs_pos + (float)(requested_num - 1) * step);
+        need = (int)ceilf(f->rs_pos + (float)(requested_num - 1) * step) - 1;
         if (need <= max_src || requested_num <= 1) break;
         requested_num /= 2;
     }
@@ -1382,15 +1515,16 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
     if (got < 0) got = 0;
 
     for (in = 0, out = 0; out < requested_num; out++) {
-        while (f->rs_pos >= 1.0f) {
+        while (f->rs_pos > 1.0f) {
             if (in >= got) goto done;
             f->rs_last[0] = f->rs_next[0]; f->rs_last[1] = f->rs_next[1];
             f->rs_next[0] = src[in][0];    f->rs_next[1] = src[in][1];
             in++;
             f->rs_pos -= 1.0f;
         }
-        samples[out][0] = f->rs_last[0] + f->rs_pos * (f->rs_next[0] - f->rs_last[0]);
-        samples[out][1] = f->rs_last[1] + f->rs_pos * (f->rs_next[1] - f->rs_last[1]);
+        /* At rs_pos 1 this is rs_next exactly. */
+        samples[out][0] = (1.0f - f->rs_pos) * f->rs_last[0] + f->rs_pos * f->rs_next[0];
+        samples[out][1] = (1.0f - f->rs_pos) * f->rs_last[1] + f->rs_pos * f->rs_next[1];
         f->rs_pos += step;
     }
 done:
@@ -1459,6 +1593,7 @@ static void voice_process(MCPXAPUState *d,
     bool multipass = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                     NV_PAVS_VOICE_CFG_FMT_MULTIPASS) != 0;
     dbg->multipass = multipass;
+    int sample_count = 0;
 
     if (multipass) {
         /* Read from multipass bin */
@@ -1476,10 +1611,10 @@ static void voice_process(MCPXAPUState *d,
         }
     } else {
         int empty = 0;
-        for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
+        while (sample_count < NUM_SAMPLES_PER_FRAME) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-            if (!active) return;
+            if (!active) break;
             int count = voice_resample(d, v, &samples[sample_count],
                                        NUM_SAMPLES_PER_FRAME - sample_count, rate);
             if (count < 0) break;
@@ -1492,9 +1627,18 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    /* A voice that ended during the fetch (a one-shot past EBO, a
+     * non-persist stream out of packets, a VOICE_OFF from the title) still
+     * mixes what it fetched before it ended; the rest of the frame stays
+     * silent. Returning here, as this did, threw away the frame a voice
+     * ended in after fetching it: up to a frame of a one-shot's tail, sample
+     * ebo always among it, and the end of each non-persist stream were never
+     * heard. A multipass voice has no EBO and never ends during its own
+     * fetch (sample_count stays 0), so one the title turns off mid-frame
+     * still returns here, as before. */
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-    if (!active) return;
+    if (!active && sample_count == 0) return;
 
     /* Get volume bins */
     int bin[8];
@@ -1535,8 +1679,10 @@ static void voice_process(MCPXAPUState *d,
     if (s_vstat_on > 0) {
         s_vstat[v].ea = ea_value;
         s_vstat[v].rate = rate;
-        s_vstat[v].vol0 = vol[0]; s_vstat[v].vol1 = vol[1];
-        s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
+        for (int i = 0; i < 8; i++) {
+            s_vstat[v].vol[i] = vol[i];
+            s_vstat[v].bin[i] = (uint8_t)bin[i];
+        }
     }
 
     if (voice_should_mute(v)) return;
@@ -1573,7 +1719,7 @@ static void voice_process(MCPXAPUState *d,
      * on by default (xemu's), and so far checked on one title. */
     static int hrtf_on = -1;
     if (hrtf_on < 0) {
-        const char *e = getenv("RECOMP_APU_HRTF");
+        const char *e = recomp_env(RENV_APU_HRTF);
         hrtf_on = !(e && e[0] == '0');
     }
     if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf && hrtf_on) {
@@ -1654,7 +1800,7 @@ static void vp_trace_positions(MCPXAPUState *d)
             uint16_t v = (uint16_t)h;
             if (voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
-                fprintf(stderr, "[APU] voice %u pos=%u/%u\n", (unsigned)v,
+                vp_trace("[APU] voice %u pos=%u/%u\n", (unsigned)v,
                         voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
                                        NV_PAVS_VOICE_PAR_OFFSET_CBO),
                         voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT,
@@ -1665,11 +1811,114 @@ static void vp_trace_positions(MCPXAPUState *d)
     }
 }
 
+/* The longest the mix holds a frame for locked voices: 2 ms, three VP
+ * frames, plus however late the scheduler runs the frame thread again. A
+ * title updates a voice with a handful of PIO stores between
+ * VOICE_LOCK(1) and VOICE_LOCK(0), microseconds when its thread runs, so
+ * the bound only matters when that thread is preempted mid-update or never
+ * unlocks. One 1 ms poll, as in xemu, followed by yields up to the bound (a
+ * second poll would cross it), lets an update that straddles the poll
+ * finish. 2 ms is well under the device queue's low mark (half the device
+ * buffers, tens of ms), so a held frame is absorbed by the pacing slack and
+ * cannot cause an underrun on its own. Past the bound the frame mixes the
+ * voice as it stands, which is what the port did before the hold. xemu has
+ * no bound: there a voice left locked stops the whole mix. */
+#define VP_HOLD_MAX_US 2000
+
+/* xemu's voice_work_dispatch wait (hw/xbox/mcpx/apu/vp/vp.c at 36334d9,
+ * lines 1721-1738): no voice queued for this frame is processed while the
+ * title has it locked, so a voice is never mixed half-updated (new pitch
+ * with the old buffer, say). Called with d->lock held, which the wait and
+ * the yields drop, so nothing that takes the lock waits behind the hold.
+ * The title side never waits at all (voice_lock).
+ *
+ * A voice still locked when the bound runs out is exempt from the hold until
+ * the title unlocks it: a title that leaves a voice locked costs one bounded
+ * wait, not 2 ms on every frame after it (which would run the mix at a third
+ * of real time). */
+static void vp_hold_locked_voices(MCPXAPUState *d)
+{
+    VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
+    uint64_t queued[4] = { 0 }, held[4];
+    int64_t start_us = 0, now_us;
+    bool any, woke = false;
+    int waits = 0;
+
+    for (int i = 0; i < vwd->queue_len; i++) {
+        unsigned v = (unsigned)vwd->queue[i].voice;
+        queued[v / 64] |= 1ULL << (v % 64);
+    }
+
+    for (;;) {
+        any = false;
+        for (int w = 0; w < 4; w++) {
+            uint64_t locked = qatomic_load64(&d->vp.voice_locked[w]);
+            d->vp.hold_exempt[w] &= locked;
+            held[w] = locked & queued[w] & ~d->vp.hold_exempt[w];
+            any |= held[w] != 0;
+        }
+        if (!any) {
+            if (woke)
+                d->vp.hold_wakes++;
+            break;
+        }
+        if (!start_us) {
+            start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            /* Set before the next check of the bits, so an unlock either is
+             * seen by that check or sees hold_waiting and broadcasts. */
+            qatomic_or64(&d->vp.hold_waiting, 1);
+            continue;
+        }
+        now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        if (now_us - start_us >= VP_HOLD_MAX_US) {
+            for (int w = 0; w < 4; w++)
+                d->vp.hold_exempt[w] |= held[w];
+            d->vp.hold_timeouts++;
+            break;
+        }
+        if (now_us - start_us + 1000 > VP_HOLD_MAX_US) {
+            /* A 1 ms wait now would end past the bound (on a loaded Mac
+             * holds reached 3.9 ms when the bound was checked only after
+             * each wait): yield with the lock dropped for the rest of it.
+             * When nothing else can run, the yield returns at once, so the
+             * tail of the bound spins on unlock/lock; with lockstat on,
+             * each turn adds a FRAME wait sample. */
+            woke = false;
+            apu_lockstat_unlock(d, APU_LOCK_FRAME);
+            SwitchToThread();
+            apu_lockstat_lock(d, APU_LOCK_FRAME);
+        } else {
+            /* A first wait cut short usually means voice_lock's broadcast
+             * ended it: hold_wakes counts those, so a test can tell the
+             * wake works and not just the poll (apu_state.h lists what
+             * else can end the wait early). */
+            bool first = waits++ == 0;
+            apu_lockstat_hold_end(APU_LOCK_FRAME);
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+            apu_lockstat_hold_begin(APU_LOCK_FRAME);
+            woke = first && qemu_clock_get_us(QEMU_CLOCK_REALTIME) - now_us < 900;
+        }
+    }
+
+    if (start_us) {
+        uint64_t us = (uint64_t)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us);
+        qatomic_and64(&d->vp.hold_waiting, 0);
+        d->vp.hold_count++;
+        if (us > d->vp.hold_max_us)
+            d->vp.hold_max_us = us;
+    }
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
+
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
+    /* Walk the lists first and process after, as xemu does, so the hold can
+     * see every voice this frame will touch before it touches any. */
+    vwd->queue_len = 0;
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
         top = voice_list_regs[list].top;
@@ -1697,18 +1946,31 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
                         != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
                     fe_method(d, SE2FE_IDLE_VOICE, v);
+            } else if (vwd->queue_len < MCPX_HW_MAX_VOICES) {
+                vwd->queue[vwd->queue_len].voice = v;
+                vwd->queue[vwd->queue_len].list = list;
+                vwd->queue_len++;
             } else {
-                /* Process voice directly (single-threaded) */
-                voice_spin_lock(d, v);
-                voice_process(d, mixbins, d->vp.sample_buf, v, list);
-                voice_spin_unlock(d, v);
+                static int queue_full_warned;
+                if (!queue_full_warned) {
+                    queue_full_warned = 1;
+                    DPRINTF("Voice work queue full, voice %u not mixed\n", v);
+                }
             }
             d->regs[current] = d->regs[next];
         }
     }
 
+    vp_hold_locked_voices(d);
+
+    /* Process voices directly (single-threaded) */
+    for (int i = 0; i < vwd->queue_len; i++)
+        voice_process(d, mixbins, d->vp.sample_buf,
+                      (uint16_t)vwd->queue[i].voice, vwd->queue[i].list);
+    vwd->queue_len = 0;
+
     vp_trace_positions(d);
-    vp_stat_report();
+    vp_stat_report(d);
     if (s_ring_on > 0 && ++s_ring_frames % 1500 == 0)
         vp_ring_report(++s_ring_secs);
 
@@ -1770,7 +2032,8 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     memset(d->vp.ssl, 0, sizeof(d->vp.ssl));
     memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
-    memset((void *)d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
+    memset(d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
+    memset(d->vp.hold_exempt, 0, sizeof(d->vp.hold_exempt));
     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         hrtf_filter_init(&d->vp.filters[v].hrtf);
     }

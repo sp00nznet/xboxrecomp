@@ -10,12 +10,28 @@ add_library(xbox_apu STATIC
     apu_vp.c
     apu_dsp.c
     apu_mmio_hook.c
+    apu_fault_bench.c
     apu_xaudio2.c
-    apu_sdl2.c
+    apu_sdl.c
     apu_wav.c
+    apu_vclock.c
+    apu_lockstat.c
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# XBOXRECOMP_APU_DSP (top-level CMakeLists.txt): the dsp56300 JIT. PRIVATE,
+# so its header stays inside the APU; a static xbox_apu still carries the
+# archive and its system libraries to the game's link. apu_dsp_emu.c is the
+# GP/EP device on it and apu_dsp_run.c runs it each APU frame. With them in,
+# XBOXRECOMP_APU_DSP_DEVICE (PUBLIC on recomp_env, like XBOXRECOMP_APU_DSP)
+# lets RECOMP_APU_DSP=1 through the key table and makes it the run-time
+# default; RECOMP_APU_DSP=0 still plays as the stub.
+if(XBOXRECOMP_APU_DSP_TARGET)
+    target_sources(xbox_apu PRIVATE apu_dsp_emu.c apu_dsp_run.c)
+    target_link_libraries(xbox_apu PRIVATE ${XBOXRECOMP_APU_DSP_TARGET})
+    target_compile_definitions(recomp_env PUBLIC XBOXRECOMP_APU_DSP_DEVICE)
+endif()
 
 # qemu_shim.h lives in nv2a/ - shared QEMU type abstraction
 target_include_directories(xbox_apu PRIVATE
@@ -44,7 +60,7 @@ if(WIN32)
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
 else()
     # POSIX (macOS, Linux): platform layer (Win32 primitives on POSIX),
-    # SDL2 for the audio device (apu_sdl2.c) and libm
-    find_package(SDL2 REQUIRED)
-    target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
+    # SDL3 for the audio device (apu_sdl.c) and libm
+    find_package(SDL3 3.2 CONFIG REQUIRED)
+    target_link_libraries(xbox_apu PRIVATE platform SDL3::SDL3 m)
 endif()

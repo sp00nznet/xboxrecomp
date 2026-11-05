@@ -16,6 +16,7 @@
  */
 #include "kernel.h"
 #include "kernel_missing.h"
+#include "recomp_env.h"
 #include "recomp_exit_hook.h"
 
 #include <stdio.h>
@@ -122,21 +123,9 @@ static void read_file(const char *path, char *out, size_t cap)
     unix_eol(out);
 }
 
-/* Set or clear a variable; the report reads it fresh after
- * xbox_missing_reset. */
-static void set_env(const char *name, const char *v)
-{
-#if defined(_WIN32)
-    _putenv_s(name, v ? v : "");
-#else
-    if (v) setenv(name, v, 1);
-    else unsetenv(name);
-#endif
-}
-
 static void mode(const char *v)
 {
-    set_env("RECOMP_MISSING_FILES", v);
+    recomp_env_set(RENV_MISSING, v);
     xbox_missing_reset();
     g_printed = 0;
 }
@@ -153,10 +142,10 @@ static void test_tree(void)
     check(xbox_path_tree("\\Device\\Harddisk0\\Partition1\\UDATA\\x") == XBOX_TREE_USER, "UDATA is the user tree");
     check(xbox_path_tree("T:\\x") == XBOX_TREE_HDD, "T: is the HDD tree");
     check(xbox_path_tree("U:\\x") == XBOX_TREE_HDD, "U: is the HDD tree");
-    check(xbox_path_tree("Z:\\media\\a.dat") == XBOX_TREE_HDD, "Z: (no link) is the HDD tree");
+    check(xbox_path_tree("Z:\\media\\a.ipk") == XBOX_TREE_HDD, "Z: (no link) is the HDD tree");
     check(xbox_path_tree("\\Device\\Harddisk0\\Partition3") == XBOX_TREE_DEVICE, "a bare partition is a device");
     check(xbox_path_tree("\\Device\\CdRom0") == XBOX_TREE_DEVICE, "the bare CdRom0 is a device");
-    check(xbox_path_tree("gamedata.bin") == XBOX_TREE_UNKNOWN, "a relative name is unknown");
+    check(xbox_path_tree("title.bin") == XBOX_TREE_UNKNOWN, "a relative name is unknown");
     check(xbox_path_tree("Q:\\x") == XBOX_TREE_UNKNOWN, "an unmapped letter is unknown");
 
     /* Wreckless: z: linked to the game partition loads assets through it. */
@@ -177,20 +166,20 @@ static void test_default(void)
     printf("default mode\n");
     mode(NULL);
     check(xbox_missing_verbose() == 0, "the default is not verbose");
-    set_env("RECOMP_MISSING_FILES_LIST", g_list);
+    recomp_env_set(RENV_MISSING_LIST, g_list);
 
-    fail("D:\\adx\\music_TITLE.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
-    snprintf(want, sizeof want, "  [FILE] missing D:\\adx\\music_TITLE.adx -> %s" SEP "adx" SEP "music_TITLE.adx\n", g_game);
+    fail("D:\\adx\\track01.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+    snprintf(want, sizeof want, "  [FILE] missing D:\\adx\\track01.adx -> %s" SEP "adx" SEP "track01.adx\n", g_game);
     check(log_count(want) == 1, "a miss under an existing directory is named");
     check(g_printed == 1, "its first FAILED line prints");
 
     for (i = 0; i < 9; i++)
-        fail(i & 1 ? "d:\\ADX\\MUSIC_title.ADX" : "D:\\adx\\music_TITLE.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+        fail(i & 1 ? "d:\\ADX\\TRACK01.ADX" : "D:\\adx\\track01.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     check(log_count("[FILE] missing") == 1, "repeats, in any case, are named once");
     check(g_printed == 1, "repeats of a reported path print no FAILED line");
 
-    fail("d:\\media\\event\\CLIP0001.BIN", PATH_NF, READ, XBOX_FILE_OPEN, OPTS);
-    fail("d:\\media\\event\\CLIP0001.BIN", PATH_NF, READ, XBOX_FILE_OPEN, OPTS);
+    fail("d:\\media\\event\\EVCAMST0101_005.CAM", PATH_NF, READ, XBOX_FILE_OPEN, OPTS);
+    fail("d:\\media\\event\\EVCAMST0101_005.CAM", PATH_NF, READ, XBOX_FILE_OPEN, OPTS);
     check(log_count("not found") == 0, "a miss under an absent directory prints nothing");
     check(g_printed == 3, "its FAILED lines all print (it was never reported)");
 
@@ -205,10 +194,10 @@ static void test_default(void)
     fail("D:\\adx\\g.adx", NAME_NF, READ | 0x100u, XBOX_FILE_OPEN, OPTS);
     fail("D:\\adx\\h.adx", NAME_NF, READ | 0x10000u, XBOX_FILE_OPEN, OPTS);
     fail("D:\\adx\\dir", NAME_NF, READ, XBOX_FILE_OPEN, OPTS | XBOX_FILE_DIRECTORY_FILE);
-    fail("music_TITLE.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+    fail("track01.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     fail("D:\\adx\\i.adx", 0xC0000043u /* SHARING_VIOLATION */, READ, XBOX_FILE_OPEN, OPTS);
-    fail("z:\\media\\cache_a.dat", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
-    fail("U:\\0123456789AB\\SaveMeta.xbx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+    fail("z:\\media\\plcom_tex.ipk", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+    fail("U:\\13C91777168C\\SaveMeta.xbx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     fail("\\Device\\Harddisk0\\Partition1\\UDATA\\x", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     probe("D:\\adx\\probe.adx");
     {
@@ -227,27 +216,27 @@ static void test_default(void)
     recomp_exit_hook_run("window");
     xbox_missing_summary("exit");
     check(log_count("  [FILE] summary: 1 game file missing, 1 not found under absent directories, "
-                    "12 failed opens, 9 repeats not printed (RECOMP_MISSING_FILES=all lists them)\n") == 1,
+                    "12 failed opens, 9 repeats not printed (RECOMP_TRACE=missing=all lists them)\n") == 1,
           "the window exit hook prints the summary once, with the repeats left out");
 
     read_file(g_list, list, sizeof list);
-    snprintf(want, sizeof want, "high 10 D:\\adx\\music_TITLE.adx %s" SEP "adx" SEP "music_TITLE.adx\n", g_game);
-    check(strstr(list, want) != NULL, "RECOMP_MISSING_FILES_LIST: the high path with its attempts");
-    check(strstr(list, "low 2 d:\\media\\event\\CLIP0001.BIN ") != NULL, "RECOMP_MISSING_FILES_LIST: the low path");
+    snprintf(want, sizeof want, "high 10 D:\\adx\\track01.adx %s" SEP "adx" SEP "track01.adx\n", g_game);
+    check(strstr(list, want) != NULL, "missing_list: the high path with its attempts");
+    check(strstr(list, "low 2 d:\\media\\event\\EVCAMST0101_005.CAM ") != NULL, "missing_list: the low path");
     /* A second exit (POSIX firmware, then atexit) leaves the list alone. */
     fail("D:\\adx\\other.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     xbox_missing_summary("exit");
     read_file(g_list, list, sizeof list);
-    check(strstr(list, "other.adx") == NULL && strstr(list, "music_TITLE.adx ") != NULL,
-          "RECOMP_MISSING_FILES_LIST is written once, by the first summary");
+    check(strstr(list, "other.adx") == NULL && strstr(list, "track01.adx ") != NULL,
+          "missing_list is written once, by the first summary");
     /* A new run (reset) rewrites it rather than appending. */
     xbox_missing_reset();
     fail("D:\\adx\\other.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     xbox_missing_summary("exit");
     read_file(g_list, list, sizeof list);
-    check(strstr(list, "other.adx") != NULL && strstr(list, "music_TITLE.adx") == NULL,
-          "RECOMP_MISSING_FILES_LIST is rewritten, not appended");
-    set_env("RECOMP_MISSING_FILES_LIST", NULL);
+    check(strstr(list, "other.adx") != NULL && strstr(list, "track01.adx") == NULL,
+          "missing_list is rewritten, not appended");
+    recomp_env_set(RENV_MISSING_LIST, NULL);
 }
 
 static void test_complete_dump(void)
@@ -256,8 +245,8 @@ static void test_complete_dump(void)
     printf("a complete dump (probes only)\n");
     mode(NULL);
     before = log_count("[FILE] summary");
-    fail("d:\\media\\event\\CLIP0001.BIN", PATH_NF, READ, XBOX_FILE_OPEN, OPTS);
-    fail("z:\\media\\cache_b.dat", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+    fail("d:\\media\\event\\EVCAMST0101_005.CAM", PATH_NF, READ, XBOX_FILE_OPEN, OPTS);
+    fail("z:\\media\\uniform_tex.ipk", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     xbox_missing_summary("exit");
     check(log_count("[FILE] summary") == before, "no summary when no game file is missing");
 }
@@ -267,23 +256,23 @@ static void test_all(void)
     uint32_t hi, lo, at;
     int i;
 
-    printf("RECOMP_MISSING_FILES=all\n");
+    printf("RECOMP_TRACE=missing=all\n");
     mode("all");
     check(xbox_missing_verbose() == 1, "all is verbose: NtOpenFile and IoCreateFile successes print");
     for (i = 0; i < 5; i++)
-        fail("D:\\adx\\music_loop1.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+        fail("D:\\adx\\track02.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     check(g_printed == 5, "every FAILED line prints, repeats included");
-    check(log_count("[FILE] missing D:\\adx\\music_loop1.adx") == 1, "the miss is still named once");
+    check(log_count("[FILE] missing D:\\adx\\track02.adx") == 1, "the miss is still named once");
     fail("d:\\media\\se\\dsp.bin", PATH_NF, READ, XBOX_FILE_OPEN, OPTS);
     check(log_count("  [FILE] not found (no such directory) d:\\media\\se\\dsp.bin -> ") == 1,
           "a low miss is listed");
-    fail("z:\\media\\sound.dat", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
-    check(log_count("  [FILE] not found (hdd) z:\\media\\sound.dat -> ") == 1, "an HDD miss is listed");
+    fail("z:\\media\\stg0101_se.ipk", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+    check(log_count("  [FILE] not found (hdd) z:\\media\\stg0101_se.ipk -> ") == 1, "an HDD miss is listed");
     fail("\\Device\\Harddisk0\\Partition1\\TDATA\\x", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     check(log_count("  [FILE] not found (user) \\Device\\Harddisk0\\Partition1\\TDATA\\x -> ") == 1,
           "a save-tree miss is listed");
-    fail("gamedata.bin", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
-    check(log_count("  [FILE] not found (unknown) gamedata.bin -> ?\n") == 1, "a relative miss is listed as unknown");
+    fail("title.bin", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+    check(log_count("  [FILE] not found (unknown) title.bin -> ?\n") == 1, "a relative miss is listed as unknown");
     probe("D:\\adx\\maybe.adx");
     check(log_count("  [FILE] not found (game, probe) D:\\adx\\maybe.adx -> ") == 1, "a probe is listed");
     fail("D:\\adx\\create.adx", NAME_NF, READ, 2 /* FILE_CREATE */, OPTS);
@@ -302,12 +291,12 @@ static void test_off(void)
 {
     uint32_t hi, lo, at;
     int lines;
-    printf("RECOMP_MISSING_FILES=0\n");
+    printf("RECOMP_TRACE=missing=0\n");
     mode("0");
     check(xbox_missing_verbose() == 0, "0 is not verbose");
     lines = log_count("[FILE]");
-    fail("D:\\adx\\music_TITLE.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
-    fail("D:\\adx\\music_TITLE.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+    fail("D:\\adx\\track01.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+    fail("D:\\adx\\track01.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     xbox_missing_summary("exit");
     xbox_missing_counts(&hi, &lo, &at);
     check(log_count("[FILE]") == lines, "no line at all");
@@ -320,21 +309,21 @@ static void test_cap(void)
     char p[64];
     uint32_t hi;
     int i;
-    printf("the 1024-path table\n");
+    printf("the 4096-path table\n");
     mode(NULL);
-    for (i = 0; i < 1025; i++) {
+    for (i = 0; i < 4097; i++) {
         snprintf(p, sizeof p, "D:\\adx\\cap%04d.adx", i);
         fail(p, NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     }
     xbox_missing_counts(&hi, NULL, NULL);
-    check(hi == 1024, "1024 paths are named");
-    check(log_count("missing-file table full") == 1, "the 1025th is counted, and the cap said once");
-    fail("D:\\adx\\cap1024.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
+    check(hi == 4096, "4096 paths are named");
+    check(log_count("missing-file table full") == 1, "the 4097th is counted, and the cap said once");
+    fail("D:\\adx\\cap4096.adx", NAME_NF, READ, XBOX_FILE_OPEN, OPTS);
     check(log_count("missing-file table full") == 1, "... only once");
-    check(g_printed == 1026, "a path past the cap keeps printing its FAILED lines");
+    check(g_printed == 4098, "a path past the cap keeps printing its FAILED lines");
     xbox_missing_summary("exit");
-    check(log_count("1024 game files missing, 0 not found under absent directories, 1026 failed opens, "
-                    "2 past the 1024-path table\n") == 1, "the summary counts the unnamed");
+    check(log_count("4096 game files missing, 0 not found under absent directories, 4098 failed opens, "
+                    "2 past the 4096-path table\n") == 1, "the summary counts the unnamed");
 }
 
 #define THREADS 8

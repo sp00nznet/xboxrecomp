@@ -9,8 +9,11 @@
  * (not held, but held to the next edge under edge), a stopped vblank clock,
  * the 100 ms bound with and without vblanks, ONE_OR_IMMEDIATE under edge,
  * two stalls in one walk, last_flip after a timeout, a count that wraps,
- * the frame counter ownership rule with its seeding, window and hand-back,
- * and the bump of a counter word with flip pacing off and on.
+ * a walk that starts vblanks after its kick in the clock's catch-up (the
+ * grid must not shift) and one with no catch-up (the old rule), the frame
+ * counter ownership rule with its seeding, window and hand-back, and the
+ * bump of a counter word with flip pacing off and on, and the pacing mode
+ * RECOMP_FLIP_PACING selects on the host and the virtual clock.
  */
 #include "nv2a_flip_hold.h"
 
@@ -41,6 +44,25 @@ static void fresh(XboxFlipHold *h, int edge, uint32_t first)
      * from. */
     xbox_FlipHoldSwap(h, swap(1, 0));
     xbox_FlipHoldStall(h, first, 0, 1);
+}
+
+/* A walk, as the ack loop reports it: the last read of the old PUT at
+ * count bound, then the new PUT read at count at 2 ms later. behind is when
+ * the clock last raised a vblank behind its grid: none, in between (a stall
+ * the walk caught), or before the bound's read (an older one). */
+enum { BEHIND_NONE, BEHIND_CATCHUP, BEHIND_OLD };
+static uint32_t walk_put = 0x1000;
+static uint64_t walk_ns = 1000 * MS;
+
+static void walk(XboxFlipHold *h, uint32_t bound, uint32_t at, int behind)
+{
+    uint64_t stamp = behind == BEHIND_CATCHUP ? walk_ns + 11 * MS
+                   : behind == BEHIND_OLD     ? walk_ns + 9 * MS : 0;
+    walk_ns += 10 * MS;
+    xbox_FlipHoldPutRead(h, bound, walk_put, walk_ns);
+    walk_put += 0x40;
+    xbox_FlipHoldPutRead(h, at, walk_put, walk_ns + 2 * MS);
+    xbox_FlipHoldWalk(h, stamp);
 }
 
 int main(void)
@@ -167,6 +189,166 @@ int main(void)
     check(xbox_FlipHoldPoll(&h, 0xFFFFFFFFu, t, 1), "still held at 0xFFFFFFFF");
     check(!xbox_FlipHoldPoll(&h, 0, t, 1), "released at 0");
 
+    printf("flip hold: a late walk does not shift the grid\n");
+    /* A title that paces itself at interval 2 (it waits for its own even
+     * vblank, then kicks the Swap): each walk starts in the vblank the
+     * frame is due and nothing is held. One walk starts a vblank late (a
+     * host stall between the PUT store and the walker, the clock catching
+     * up behind it). Its flip must still count as the even vblank: counted
+     * as the odd one, every later frame met its stall a vblank short of
+     * the target and was held one vblank, for the rest of the run. */
+    {
+        uint32_t s, holds;
+        fresh(&h, 0, 1000);
+        for (s = 1002; s <= 1010; s += 2) {
+            walk(&h, s, s, BEHIND_NONE);
+            xbox_FlipHoldSwap(&h, swap(2, 0));
+            xbox_FlipHoldStall(&h, s, t, 1);
+        }
+        check(h.holds == 0 && h.last_flip == 1010, "self-paced: never held");
+        /* The old PUT was still read at 1012; the walk started in 1013. */
+        walk(&h, 1012, 1013, BEHIND_CATCHUP);
+        xbox_FlipHoldSwap(&h, swap(2, 0));
+        check(!xbox_FlipHoldStall(&h, 1013, t, 1) && h.last_flip == 1012,
+              "late walk: the flip is the kick's vblank, not the walk's");
+        for (s = 1014; s <= 1040; s += 2) {
+            walk(&h, s, s, BEHIND_NONE);
+            xbox_FlipHoldSwap(&h, swap(2, 0));
+            if (xbox_FlipHoldStall(&h, s, t, 1))
+                xbox_FlipHoldPoll(&h, s + 1, t + 16 * MS, 1);
+        }
+        holds = h.holds;
+        check(holds == 0, "after it: no frame is held");
+        if (holds)
+            printf("    (%u of 14 frames held a vblank)\n", holds);
+        check(h.late_walks == 1, "one late walk, the stalled one");
+    }
+    /* No catch-up: the kick is somewhere in [bound, count] and the count is
+     * kept. A title the hold paces, at interval 2 with target 1102, whose
+     * frame was kicked just after 1103 began: it flipped at 1103,
+     * so the next is held to 1105 as D3D would, not shown after one. */
+    fresh(&h, 0, 1100);
+    walk(&h, 1102, 1103, BEHIND_NONE);
+    xbox_FlipHoldSwap(&h, swap(2, 0));
+    check(!xbox_FlipHoldStall(&h, 1103, t, 1) && h.last_flip == 1103,
+          "late frame, no catch-up: the walk's count, as before");
+    walk(&h, 1103, 1104, BEHIND_NONE);
+    xbox_FlipHoldSwap(&h, swap(2, 0));
+    check(xbox_FlipHoldStall(&h, 1104, t, 1) && h.target == 1105,
+          "the next frame is held to 1105");
+    check(h.late_walks == 0, "and no late walk is counted");
+    /* A vblank raised behind the grid before the bound's read is an older
+     * stall, not this walk's. */
+    fresh(&h, 0, 1150);
+    walk(&h, 1152, 1153, BEHIND_OLD);
+    xbox_FlipHoldSwap(&h, swap(2, 0));
+    check(!xbox_FlipHoldStall(&h, 1153, t, 1) && h.last_flip == 1153,
+          "catch-up before the bound's read: the walk's count");
+    /* In the vblank clock's catch-up after a stall the ticks come a
+     * millisecond apart, so a walk a few milliseconds late is several
+     * vblanks late. A one-vblank bound left this flip at 1011 and every
+     * later frame held a vblank. */
+    {
+        uint32_t s;
+        fresh(&h, 0, 1000);
+        walk(&h, 1002, 1002, BEHIND_NONE);
+        xbox_FlipHoldSwap(&h, swap(2, 0));
+        xbox_FlipHoldStall(&h, 1002, t, 1);
+        walk(&h, 1010, 1012, BEHIND_CATCHUP);
+        xbox_FlipHoldSwap(&h, swap(2, 0));
+        check(!xbox_FlipHoldStall(&h, 1012, t, 1) && h.last_flip == 1010,
+              "catch-up: a walk two vblanks late flips on its kick's");
+        check(h.late_walks == 1 && h.late_max == 2, "counted as a late walk");
+        for (s = 1012; s <= 1030; s += 2) {
+            walk(&h, s, s, BEHIND_NONE);
+            xbox_FlipHoldSwap(&h, swap(2, 0));
+            if (xbox_FlipHoldStall(&h, s, t, 1))
+                xbox_FlipHoldPoll(&h, s + 1, t + 16 * MS, 1);
+        }
+        check(h.holds == 0, "catch-up: after it no frame is held");
+    }
+    /* A bound from before the target (a loose one, or a frame kicked early
+     * and walked late) puts the flip on the target, never ahead of it. */
+    fresh(&h, 0, 1200);
+    walk(&h, 1190, 1206, BEHIND_CATCHUP);
+    xbox_FlipHoldSwap(&h, swap(1, 0));
+    check(!xbox_FlipHoldStall(&h, 1206, t, 1) && h.last_flip == 1201,
+          "bound before the target: the flip is the target");
+    /* A bound newer than the walk's count (it cannot be) is ignored. */
+    fresh(&h, 0, 1300);
+    walk(&h, 1310, 1305, BEHIND_CATCHUP);
+    xbox_FlipHoldSwap(&h, swap(1, 0));
+    check(!xbox_FlipHoldStall(&h, 1305, t, 1) && h.last_flip == 1305,
+          "bound after the walk's count: ignored");
+    /* Used once: a second stall in the walk is measured as before. */
+    xbox_FlipHoldSwap(&h, swap(1, 0));
+    check(!xbox_FlipHoldStall(&h, 1307, t, 1) && h.last_flip == 1307,
+          "second stall in the walk: its count");
+    /* The first read of PUT bounds nothing: there was no old PUT. */
+    fresh(&h, 0, 1350);
+    xbox_FlipHoldPutRead(&h, 1352, 0x100, 50 * MS);
+    xbox_FlipHoldWalk(&h, 51 * MS);
+    xbox_FlipHoldSwap(&h, swap(2, 0));
+    check(!xbox_FlipHoldStall(&h, 1353, t, 1) && h.last_flip == 1353,
+          "no read of the old PUT: the walk's count");
+    /* The walker busy across kicks: no idle pass between two walks. The
+     * read that started the first walk saw the PUT before the second
+     * kick, so it is the bound (1600), not the idle read before it. */
+    fresh(&h, 0, 1590);
+    xbox_FlipHoldPutRead(&h, 1599, 0x200, 60 * MS);
+    xbox_FlipHoldPutRead(&h, 1600, 0x240, 61 * MS);
+    xbox_FlipHoldWalk(&h, 0);
+    xbox_FlipHoldPutRead(&h, 1603, 0x280, 65 * MS);
+    xbox_FlipHoldWalk(&h, 63 * MS);
+    xbox_FlipHoldSwap(&h, swap(2, 0));
+    check(!xbox_FlipHoldStall(&h, 1603, t, 1) && h.last_flip == 1600,
+          "back-to-back walks: the previous walk's launch read");
+    /* Held frames are unchanged: a kick that may be early holds nothing
+     * more, and the release still sets the target. */
+    fresh(&h, 0, 1400);
+    walk(&h, 1400, 1401, BEHIND_CATCHUP);
+    xbox_FlipHoldSwap(&h, swap(2, 0));
+    check(xbox_FlipHoldStall(&h, 1401, t, 1) && h.target == 1402,
+          "early frame: still held to its target");
+    check(!xbox_FlipHoldPoll(&h, 1402, t + MS, 1) && h.last_flip == 1402,
+          "released on the target");
+    /* edge: D3D pushes a late frame to the vblank after its kick. Without a
+     * catch-up that is the vblank after the walk's count, as before. */
+    fresh(&h, 1, 1500);
+    walk(&h, 1502, 1503, BEHIND_NONE);
+    xbox_FlipHoldSwap(&h, swap(2, 0));
+    check(xbox_FlipHoldStall(&h, 1503, t, 1) && h.target == 1504,
+          "edge, no catch-up: held to the vblank after the count");
+    /* With one, the vblank after the kick's bound, which is now. */
+    fresh(&h, 1, 1500);
+    walk(&h, 1502, 1503, BEHIND_CATCHUP);
+    xbox_FlipHoldSwap(&h, swap(2, 0));
+    check(!xbox_FlipHoldStall(&h, 1503, t, 1) && h.last_flip == 1503,
+          "edge, late walk: the vblank after the kick, which is now");
+    /* The next one is held to 1505, as if no walk had been late. */
+    walk(&h, 1504, 1504, BEHIND_NONE);
+    xbox_FlipHoldSwap(&h, swap(2, 0));
+    check(xbox_FlipHoldStall(&h, 1504, t, 1) && h.target == 1505,
+          "edge: the next frame is held to 1505, not 1506");
+    /* The bound across the count's wrap. */
+    fresh(&h, 0, 0xFFFFFFFDu);
+    walk(&h, 0xFFFFFFFFu, 1, BEHIND_CATCHUP);
+    xbox_FlipHoldSwap(&h, swap(2, 0));
+    check(!xbox_FlipHoldStall(&h, 1, t, 1) && h.last_flip == 0xFFFFFFFFu,
+          "late walk across the wrap: the flip is 0xFFFFFFFF");
+    check(h.late_walks == 1 && h.late_max == 2, "moved two vblanks");
+    /* No target (IMMEDIATE, or a stall inside a CALL): the flip is the
+     * kick's vblank too. */
+    fresh(&h, 0, 1700);
+    walk(&h, 1702, 1704, BEHIND_CATCHUP);
+    xbox_FlipHoldSwap(&h, swap(0, 1));
+    check(!xbox_FlipHoldStall(&h, 1704, t, 1) && h.last_flip == 1702,
+          "IMMEDIATE, late walk: the kick's vblank");
+    walk(&h, 1706, 1708, BEHIND_CATCHUP);
+    xbox_FlipHoldSwap(&h, swap(2, 0));
+    check(!xbox_FlipHoldStall(&h, 1708, t, 0) && h.last_flip == 1706,
+          "no clock, late walk: the kick's vblank");
+
     printf("frame counter ownership\n");
     {
         XboxFrameCounterWatch w;
@@ -278,6 +460,23 @@ int main(void)
               == XBOX_FRAME_COUNTER_HANDED_BACK && word == 74,
               "on: quiet 300 ms, handed back and bumped");
     }
+
+    printf("flip pacing mode (RECOMP_FLIP_PACING)\n");
+    check(xbox_FlipPacingMode(NULL, 0) == XBOX_FLIP_PACING_OFF
+          && xbox_FlipPacingMode("", 0) == XBOX_FLIP_PACING_OFF,
+          "unset, host clock: off");
+    check(xbox_FlipPacingMode(NULL, 1) == XBOX_FLIP_PACING_ON
+          && xbox_FlipPacingMode("", 1) == XBOX_FLIP_PACING_ON,
+          "unset, virtual clock: on");
+    check(xbox_FlipPacingMode("0", 0) == XBOX_FLIP_PACING_OFF
+          && xbox_FlipPacingMode("0", 1) == XBOX_FLIP_PACING_OFF,
+          "0: off, on either clock");
+    check(xbox_FlipPacingMode("edge", 0) == XBOX_FLIP_PACING_EDGE
+          && xbox_FlipPacingMode("edge", 1) == XBOX_FLIP_PACING_EDGE,
+          "edge: edge, on either clock");
+    check(xbox_FlipPacingMode("1", 0) == XBOX_FLIP_PACING_ON
+          && xbox_FlipPacingMode("yes", 1) == XBOX_FLIP_PACING_ON,
+          "anything else: on");
 
     printf("%s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

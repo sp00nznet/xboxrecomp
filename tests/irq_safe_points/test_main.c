@@ -8,7 +8,7 @@
  * many times:
  *  - the race: a holder parked half-way through a list edit; the interrupt
  *    posted meanwhile runs only at the holder's next safe point, on the
- *    holder, with the edit finished. With RECOMP_IRQ_SAFE_POINTS=0 it runs at once,
+ *    holder, with the edit finished. With irq_safe_points=0 it runs at once,
  *    beside the holder, and sees the edit half-done (the bug, recorded);
  *  - the gate's release is a safe point, taken before the gate is free;
  *  - a thread that does not hold the gate never runs a posted routine;
@@ -25,25 +25,13 @@
  *  - 100k rounds of edits and random posts leave the list intact.
  */
 #include "kernel.h"
+#include "recomp_env.h"
 #include "xbox_memory_layout.h"
 #include "platform/host_time.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* The tests change the environment the kernel reads its switches from. */
-static void test_setenv(const char *name, const char *v)
-{
-#ifdef _WIN32
-    _putenv_s(name, v ? v : "");
-#else
-    if (v)
-        setenv(name, v, 1);
-    else
-        unsetenv(name);
-#endif
-}
 
 /* Provided by the generated title; nothing here calls a guest function. */
 typedef void (*recomp_func_t)(void);
@@ -55,6 +43,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
 extern RECOMP_TLS uint32_t g_ebp, g_eflags;
 extern RECOMP_TLS RecompXmm g_xmm0;
+extern uint32_t g_xbox_stack_size;
 extern ptrdiff_t g_xbox_mem_offset;
 
 #define MS 1000000ull
@@ -164,9 +153,9 @@ static void reset_counts(void)
     xbox_IrqStatsGet(&st, 1);
 }
 
-static void set_env(const char *name, const char *v)
+static void set_env(recomp_env_id id, const char *v)
 {
-    test_setenv(name, v);
+    recomp_env_set(id, v);
     xbox_IrqReloadConfig();
 }
 
@@ -263,14 +252,14 @@ static void race_shown(void)
 
     /* Today's model: the interrupt runs beside the holder. */
     reset_counts();
-    set_env("RECOMP_IRQ_SAFE_POINTS", "0");
+    set_env(RENV_IRQ_SAFE_POINTS, "0");
     h.half_edit = 1;
     t = holder_start(&h);
     how = deliver(XBOX_IRQ_APU);
     check(how == XBOX_IRQ_UNGATED && s_runs == 1 && s_saw_canary == 1,
-          "RECOMP_IRQ_SAFE_POINTS=0: routine runs mid-edit (the bug, recorded)");
+          "irq_safe_points=0: routine runs mid-edit (the bug, recorded)");
     holder_finish(&h, t);
-    set_env("RECOMP_IRQ_SAFE_POINTS", NULL);
+    set_env(RENV_IRQ_SAFE_POINTS, NULL);
 
     /* Posted: the routine waits for the holder's safe point. */
     reset_counts();
@@ -508,7 +497,7 @@ static void wait_and_log(void)
     int how, all_posted = 1;
 
     reset_counts();
-    set_env("RECOMP_IRQ_SAFE_MS", "20");
+    set_env(RENV_IRQ_SAFE_MS, "20");
     h.release_only = 1;
     t = holder_start(&h);
     t0 = xbox_HostNowNs();
@@ -522,7 +511,7 @@ static void wait_and_log(void)
 
     /* irq_safe_force=1: beside the holder once irq_safe_ms is up. The bit
      * is still pending from above, so it is overdue at once; post anew. */
-    set_env("RECOMP_IRQ_SAFE_FORCE", "1");
+    set_env(RENV_IRQ_SAFE_FORCE, "1");
     how = deliver(XBOX_IRQ_APU);
     check(how == XBOX_IRQ_UNGATED && s_runs == 1,
           "force: an overdue post is delivered beside the holder");
@@ -536,8 +525,8 @@ static void wait_and_log(void)
     }
     check(forced_at >= 19 * MS, "force: not before irq_safe_ms");
     holder_finish(&h, t);
-    set_env("RECOMP_IRQ_SAFE_FORCE", NULL);
-    set_env("RECOMP_IRQ_SAFE_MS", NULL);
+    set_env(RENV_IRQ_SAFE_FORCE, NULL);
+    set_env(RENV_IRQ_SAFE_MS, NULL);
     printf("    (forced after %.1f ms)\n", (double)forced_at / MS);
 }
 
@@ -602,6 +591,7 @@ static void stress(void)
 int main(void)
 {
     g_fs_base = 0;
+    g_xbox_stack_size = 8u * 1024 * 1024;   /* worker stack slices to hand out */
     /* Guest memory only where the worker stacks are: a routine run from
      * PASSIVE_LEVEL (the lower window) raises to 16 there, and the raise
      * records the guest return address at its esp. */
@@ -614,14 +604,16 @@ int main(void)
     xbox_IrqSetHandler(XBOX_IRQ_OHCI, ohci_routine);
 
     printf("irq_safe_points:\n");
-    check(!xbox_DispatchGateOn() && !xbox_IrqSafePointsOn(),
-          "by default the gate is off, and safe points with it");
-    check(xbox_IrqPost(XBOX_IRQ_APU) == XBOX_IRQ_UNGATED,
-          "no gate: a post is never left pending");
-    check(xbox_DispatchGateTryEnter() && !xbox_DispatchGateOwner(),
-          "no gate: an entry succeeds and takes nothing");
-    xbox_DispatchGateLeave();
-    set_env("RECOMP_DISPATCH_GATE", "1");
+    if (!recomp_env(RENV_DISPATCH_GATE)) {
+        check(!xbox_DispatchGateOn() && !xbox_IrqSafePointsOn(),
+              "by default the gate is off, and safe points with it");
+        check(xbox_IrqPost(XBOX_IRQ_APU) == XBOX_IRQ_UNGATED,
+              "no gate: a post is never left pending");
+        check(xbox_DispatchGateTryEnter() && !xbox_DispatchGateOwner(),
+              "no gate: an entry succeeds and takes nothing");
+        xbox_DispatchGateLeave();
+    }
+    set_env(RENV_DISPATCH_GATE, "1");
     check(xbox_DispatchGateOn() && xbox_IrqSafePointsOn(),
           "RECOMP_DISPATCH_GATE=1: safe points are on with it");
     race_shown();

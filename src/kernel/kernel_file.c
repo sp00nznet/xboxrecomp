@@ -14,14 +14,21 @@
  * are identical on both; only the host syscalls differ.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
+#endif
 #include "kernel.h"
+#include "kernel_ramfs.h"
+#include "guest_det_device.h"
+#include <stdatomic.h>
+#include <stddef.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
@@ -66,6 +73,76 @@ uint32_t g_xbox_last_file_error;
 uint32_t xbox_LastFileError(void)
 {
     return g_xbox_last_file_error;
+}
+
+/* The deterministic mode's fixed file times (XBOX_DET_FILETIME). */
+static void det_file_times(LARGE_INTEGER *c, LARGE_INTEGER *a,
+                           LARGE_INTEGER *w, LARGE_INTEGER *ch)
+{
+    if (!xbox_GuestDetOn())
+        return;
+    c->QuadPart = a->QuadPart = w->QuadPart = ch->QuadPart = XBOX_DET_FILETIME;
+}
+
+/* FileFsSizeInformation in the deterministic mode (kernel_guest_det.c).
+ *
+ * The free space is the host disk's, which moves as anything on the host
+ * writes, and a title may keep it in guest memory (a global, or a value
+ * left on a stack), so two runs of the same input would differ there. The
+ * mode reports the fallback geometry instead (16 GB, half free), the same
+ * on every host and run. Returns 1 when it filled the answer. */
+static int fs_size_pinned(PXBOX_FILE_FS_SIZE_INFORMATION info)
+{
+    if (!xbox_GuestDetOn())
+        return 0;
+    info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
+    info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+    info->TotalAllocationUnits.QuadPart = 1048576;
+    info->AvailableAllocationUnits.QuadPart = 524288;
+    return 1;
+}
+
+/* FileFsVolumeInformation, shared by every backend.
+ *
+ * XAPI's GetFileInformationByHandle asks for it first (for the serial number),
+ * then FileInternalInformation, then FileNetworkOpenInformation. Without it the
+ * whole call fails, and a title that does not check takes stack garbage for the
+ * file size: Kingdom Under Fire: Heroes read 512 bytes of install_image.dds and
+ * stopped on its fatal error screen.
+ *
+ * FATX keeps no volume label, so the backends pass "" and the reply always
+ * fits; the overflow rule is NT's for a label that does not. NT's I/O manager
+ * refuses a buffer smaller than the structure itself before the file system
+ * sees it, and reports the bytes written in Information. */
+NTSTATUS xbox_FsVolumeInformation(PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FsInformation, ULONG Length, ULONG SerialNumber, const char *Label)
+{
+    PXBOX_FILE_FS_VOLUME_INFORMATION info = (PXBOX_FILE_FS_VOLUME_INFORMATION)FsInformation;
+    const ULONG fixed = (ULONG)offsetof(XBOX_FILE_FS_VOLUME_INFORMATION, VolumeLabel);
+    ULONG label_len = Label ? (ULONG)strlen(Label) : 0, room;
+    NTSTATUS st = STATUS_SUCCESS;
+
+    if (!IoStatusBlock || !FsInformation)
+        return STATUS_INVALID_PARAMETER;
+    if (Length < sizeof(XBOX_FILE_FS_VOLUME_INFORMATION)) {
+        IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+        IoStatusBlock->Information = 0;
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    memset(info, 0, fixed);
+    info->VolumeSerialNumber = SerialNumber;
+    info->VolumeLabelLength = label_len;
+    info->SupportsObjects = FALSE;
+    room = Length - fixed;
+    if (label_len > room) {
+        label_len = room;
+        st = STATUS_BUFFER_OVERFLOW;
+    }
+    if (label_len)
+        memcpy(info->VolumeLabel, Label, label_len);
+    IoStatusBlock->Status = st;
+    IoStatusBlock->Information = fixed + label_len;
+    return st;
 }
 
 #if defined(_WIN32)
@@ -235,7 +312,7 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
-NTSTATUS __stdcall xbox_NtCreateFile(
+static NTSTATUS host_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
@@ -344,6 +421,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             case ERROR_PATH_NOT_FOUND: return STATUS_OBJECT_PATH_NOT_FOUND;
             case ERROR_ACCESS_DENIED:  return STATUS_ACCESS_DENIED;
             case ERROR_ALREADY_EXISTS: return STATUS_OBJECT_NAME_COLLISION;
+            case ERROR_TOO_MANY_OPEN_FILES: return STATUS_TOO_MANY_OPENED_FILES;
             default:                   return STATUS_UNSUCCESSFUL;
         }
     }
@@ -357,7 +435,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
-NTSTATUS __stdcall xbox_NtReadFile(
+static NTSTATUS host_NtReadFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset)
@@ -398,7 +476,7 @@ NTSTATUS __stdcall xbox_NtReadFile(
     return STATUS_UNSUCCESSFUL;
 }
 
-NTSTATUS __stdcall xbox_NtWriteFile(
+static NTSTATUS host_NtWriteFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset)
@@ -435,7 +513,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     return STATUS_UNSUCCESSFUL;
 }
 
-NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
+static NTSTATUS host_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
@@ -447,7 +525,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     return STATUS_INVALID_HANDLE;
 }
 
-NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
+static NTSTATUS host_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     WCHAR win_path[MAX_PATH];
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH))
@@ -458,11 +536,10 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     return STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
-NTSTATUS __stdcall xbox_NtQueryInformationFile(
+static NTSTATUS host_NtQueryInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
 {
-    (void)Length;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
 
@@ -484,6 +561,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->LastWriteTime.LowPart   = fi.ftLastWriteTime.dwLowDateTime;
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
             info->ChangeTime = info->LastWriteTime;
+            det_file_times(&info->CreationTime, &info->LastAccessTime,
+                           &info->LastWriteTime, &info->ChangeTime);
             info->FileAttributes = fi.dwFileAttributes;
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_BASIC_INFORMATION);
@@ -515,6 +594,23 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             IoStatusBlock->Information = sizeof(XBOX_FILE_POSITION_INFORMATION);
             return STATUS_SUCCESS;
         }
+        case XboxFileInternalInformation: {
+            /* XAPI GetFileInformationByHandle's nFileIndex: the volume's own
+             * file index, as NT reports it. */
+            PXBOX_FILE_INTERNAL_INFORMATION info = (PXBOX_FILE_INTERNAL_INFORMATION)FileInformation;
+            BY_HANDLE_FILE_INFORMATION fi;
+            if (Length < sizeof(XBOX_FILE_INTERNAL_INFORMATION)) {
+                IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+                IoStatusBlock->Information = 0;
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            if (!GetFileInformationByHandle(FileHandle, &fi))
+                return STATUS_UNSUCCESSFUL;
+            info->IndexNumber.QuadPart = ((LONGLONG)fi.nFileIndexHigh << 32) | fi.nFileIndexLow;
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = sizeof(XBOX_FILE_INTERNAL_INFORMATION);
+            return STATUS_SUCCESS;
+        }
         case XboxFileNetworkOpenInformation: {
             PXBOX_FILE_NETWORK_OPEN_INFORMATION info = (PXBOX_FILE_NETWORK_OPEN_INFORMATION)FileInformation;
             BY_HANDLE_FILE_INFORMATION fi;
@@ -527,6 +623,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->LastWriteTime.LowPart   = fi.ftLastWriteTime.dwLowDateTime;
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
             info->ChangeTime = info->LastWriteTime;
+            det_file_times(&info->CreationTime, &info->LastAccessTime,
+                           &info->LastWriteTime, &info->ChangeTime);
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
             info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->FileAttributes = fi.dwFileAttributes;
@@ -541,7 +639,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
     }
 }
 
-NTSTATUS __stdcall xbox_NtSetInformationFile(
+static NTSTATUS host_NtSetInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
 {
@@ -643,19 +741,28 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     }
 }
 
-NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
+static NTSTATUS host_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
     switch (FsInformationClass) {
+        case XboxFileFsVolumeInformation: {
+            /* The host volume's serial; 0 for a handle that has none. */
+            BY_HANDLE_FILE_INFORMATION fi;
+            ULONG serial = GetFileInformationByHandle(FileHandle, &fi)
+                         ? fi.dwVolumeSerialNumber : 0;
+            return xbox_FsVolumeInformation(IoStatusBlock, FsInformation, Length,
+                                            serial, "");
+        }
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
-            if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
+            if (fs_size_pinned(info)) {
+                /* the deterministic mode's fixed answer */
+            } else if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
                 info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
@@ -678,7 +785,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     }
 }
 
-NTSTATUS __stdcall xbox_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock)
+static NTSTATUS host_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock)
 {
     FlushFileBuffers(FileHandle);
     if (IoStatusBlock) {
@@ -688,7 +795,7 @@ NTSTATUS __stdcall xbox_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BL
     return STATUS_SUCCESS;
 }
 
-NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
+static NTSTATUS host_NtQueryFullAttributesFile(
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     PXBOX_FILE_NETWORK_OPEN_INFORMATION FileInformation)
 {
@@ -714,6 +821,10 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     FileInformation->LastWriteTime.LowPart   = fad.ftLastWriteTime.dwLowDateTime;
     FileInformation->LastWriteTime.HighPart  = fad.ftLastWriteTime.dwHighDateTime;
     FileInformation->ChangeTime = FileInformation->LastWriteTime;
+    det_file_times(&FileInformation->CreationTime,
+                   &FileInformation->LastAccessTime,
+                   &FileInformation->LastWriteTime,
+                   &FileInformation->ChangeTime);
     FileInformation->EndOfFile.QuadPart = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
     FileInformation->AllocationSize.QuadPart = (FileInformation->EndOfFile.QuadPart + 4095) & ~4095LL;
     FileInformation->FileAttributes = fad.dwFileAttributes;
@@ -777,7 +888,7 @@ void xbox_dir_context_drop(HANDLE FileHandle)
     LeaveCriticalSection(&s_dir_cs);
 }
 
-NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+static NTSTATUS host_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
     XBOX_FILE_INFORMATION_CLASS FileInformationClass,
@@ -869,6 +980,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->LastWriteTime.LowPart  = ctx->find_data.ftLastWriteTime.dwLowDateTime;
     entry->LastWriteTime.HighPart = ctx->find_data.ftLastWriteTime.dwHighDateTime;
     entry->ChangeTime = entry->LastWriteTime;
+    det_file_times(&entry->CreationTime, &entry->LastAccessTime,
+                   &entry->LastWriteTime, &entry->ChangeTime);
     entry->EndOfFile.QuadPart = ((LONGLONG)ctx->find_data.nFileSizeHigh << 32) | ctx->find_data.nFileSizeLow;
     entry->AllocationSize.QuadPart = (entry->EndOfFile.QuadPart + 4095) & ~4095LL;
     entry->FileAttributes = ctx->find_data.dwFileAttributes;
@@ -888,7 +1001,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
  * the handle to do it (FileRenameInfo), which needs DELETE access, and falls
  * back to MoveFileExW on the path the handle names. Tested under Proton
  * only. */
-NTSTATUS __stdcall xbox_RenameFileByHandle(
+static NTSTATUS host_RenameFileByHandle(
     HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
 {
     WCHAR src[MAX_PATH], dst[MAX_PATH];
@@ -968,7 +1081,13 @@ static int posix_open_flags(ACCESS_MASK access, ULONG disposition)
     /* O_TRUNC / O_CREAT imply write intent */
     if ((extra & (O_TRUNC | O_CREAT)) && rw == O_RDONLY)
         rw = O_RDWR;
-    if (access & XBOX_FILE_APPEND_DATA)
+    /* Only an append-only handle appends. GENERIC_WRITE maps to
+     * FILE_GENERIC_WRITE, which carries both WRITE_DATA and APPEND_DATA, and
+     * on NT and FATX such a handle still writes at the offset it is given.
+     * O_APPEND for it sent every positioned write to the end of the file. */
+    if ((access & XBOX_FILE_APPEND_DATA)
+            && !(access & (XBOX_FILE_WRITE_DATA | XBOX_GENERIC_WRITE
+                           | XBOX_GENERIC_ALL)))
         extra |= O_APPEND;
     return rw | extra;
 }
@@ -1071,6 +1190,8 @@ static NTSTATUS errno_to_status(int e)
         case EPERM:   return STATUS_ACCESS_DENIED;
         case EEXIST:  return STATUS_OBJECT_NAME_COLLISION;
         case ENOMEM:  return STATUS_NO_MEMORY;
+        case EMFILE:
+        case ENFILE:  return STATUS_TOO_MANY_OPENED_FILES;
         default:      return STATUS_UNSUCCESSFUL;
     }
 }
@@ -1113,7 +1234,7 @@ static int posix_obj_path(PXBOX_OBJECT_ATTRIBUTES oa, char* host_path, size_t n)
     return xbox_translate_path(xbox_path, host_path, (DWORD)n) ? 1 : 0;
 }
 
-NTSTATUS __stdcall xbox_NtCreateFile(
+static NTSTATUS host_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
@@ -1180,16 +1301,35 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         g_xbox_last_file_error = no_dir ? 3u
                                : e == ENOENT ? 2u
                                : (e == EACCES || e == EPERM) ? 5u
-                               : e == EEXIST ? 80u : 0u;
+                               : e == EEXIST ? 80u
+                               : (e == EMFILE || e == ENFILE) ? 4u : 0u;
+        /* Not the title's fault, and easy to mistake for a missing file:
+         * on stderr, where a tester's log has it. */
+        if (e == EMFILE || e == ENFILE) {
+            static volatile LONG warned;
+            if (InterlockedExchange(&warned, 1) == 0) {
+                fprintf(stderr, "  [FILE] out of host file descriptors with %d "
+                        "files open (%s): raise the open-file limit\n",
+                        w32_open_file_handles(), host_path);
+                fflush(stderr);
+            }
+        }
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = st;
             IoStatusBlock->Information = 0;
         }
         return st;
     }
 
     *FileHandle = w32_open_handle(fd, host_path);
+    if (!*FileHandle) {                 /* the handle closed fd */
+        if (IoStatusBlock) {
+            IoStatusBlock->Status = STATUS_NO_MEMORY;
+            IoStatusBlock->Information = 0;
+        }
+        return STATUS_NO_MEMORY;
+    }
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -1198,7 +1338,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     return STATUS_SUCCESS;
 }
 
-NTSTATUS __stdcall xbox_NtReadFile(
+static NTSTATUS host_NtReadFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset)
@@ -1235,7 +1375,7 @@ NTSTATUS __stdcall xbox_NtReadFile(
     return STATUS_SUCCESS;
 }
 
-NTSTATUS __stdcall xbox_NtWriteFile(
+static NTSTATUS host_NtWriteFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
     PLARGE_INTEGER ByteOffset)
@@ -1268,7 +1408,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     return STATUS_SUCCESS;
 }
 
-NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
+static NTSTATUS host_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
@@ -1282,7 +1422,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     return STATUS_INVALID_HANDLE;
 }
 
-NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
+static NTSTATUS host_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
     char host_path[MAX_PATH];
     if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH))
@@ -1293,11 +1433,10 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     return STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
-NTSTATUS __stdcall xbox_NtQueryInformationFile(
+static NTSTATUS host_NtQueryInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
 {
-    (void)Length;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
 
@@ -1321,6 +1460,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             unix_to_filetime(st.st_atime, 0, &info->LastAccessTime);
             unix_to_filetime(st.st_mtime, 0, &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
+            det_file_times(&info->CreationTime, &info->LastAccessTime,
+                           &info->LastWriteTime, &info->ChangeTime);
             info->FileAttributes = mode_to_xbox_attrs(st.st_mode);
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_BASIC_INFORMATION);
@@ -1346,12 +1487,28 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             IoStatusBlock->Information = sizeof(XBOX_FILE_POSITION_INFORMATION);
             return STATUS_SUCCESS;
         }
+        case XboxFileInternalInformation: {
+            /* XAPI GetFileInformationByHandle's nFileIndex; the inode is the
+             * host's index of the file on its volume. */
+            PXBOX_FILE_INTERNAL_INFORMATION info = (PXBOX_FILE_INTERNAL_INFORMATION)FileInformation;
+            if (Length < sizeof(XBOX_FILE_INTERNAL_INFORMATION)) {
+                IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+                IoStatusBlock->Information = 0;
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            info->IndexNumber.QuadPart = (LONGLONG)st.st_ino;
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = sizeof(XBOX_FILE_INTERNAL_INFORMATION);
+            return STATUS_SUCCESS;
+        }
         case XboxFileNetworkOpenInformation: {
             PXBOX_FILE_NETWORK_OPEN_INFORMATION info = (PXBOX_FILE_NETWORK_OPEN_INFORMATION)FileInformation;
             unix_to_filetime(st.st_ctime, 0, &info->CreationTime);
             unix_to_filetime(st.st_atime, 0, &info->LastAccessTime);
             unix_to_filetime(st.st_mtime, 0, &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
+            det_file_times(&info->CreationTime, &info->LastAccessTime,
+                           &info->LastWriteTime, &info->ChangeTime);
             info->EndOfFile.QuadPart = st.st_size;
             info->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
             info->FileAttributes = mode_to_xbox_attrs(st.st_mode);
@@ -1366,7 +1523,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
     }
 }
 
-NTSTATUS __stdcall xbox_NtSetInformationFile(
+static NTSTATUS host_NtSetInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
 {
@@ -1457,7 +1614,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
  * POSIX rename() replaces an existing target, so ReplaceIfExists = FALSE is
  * checked first. The handle keeps working (the fd follows the inode), and its
  * recorded path is updated so a later delete-on-close removes the new name. */
-NTSTATUS __stdcall xbox_RenameFileByHandle(
+static NTSTATUS host_RenameFileByHandle(
     HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
 {
     char dst[MAX_PATH];
@@ -1514,15 +1671,23 @@ NTSTATUS __stdcall xbox_RenameFileByHandle(
     return STATUS_SUCCESS;
 }
 
-NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
+static NTSTATUS host_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
     switch (FsInformationClass) {
+        case XboxFileFsVolumeInformation: {
+            /* The host device number stands in for the serial: it names the
+             * volume, as the serial does, and is 0 for a handle without one. */
+            struct stat st;
+            int fd = w32_handle_fd(FileHandle);
+            ULONG serial = fd >= 0 && fstat(fd, &st) == 0 ? (ULONG)st.st_dev : 0;
+            return xbox_FsVolumeInformation(IoStatusBlock, FsInformation, Length,
+                                            serial, "");
+        }
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
@@ -1531,7 +1696,9 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
              * XBOX_SECTORS_PER_CLUSTER above. */
             info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
             info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
-            if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
+            if (fs_size_pinned(info)) {
+                /* the deterministic mode's fixed answer */
+            } else if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
                 ULONGLONG avail = (ULONGLONG)vfs.f_bavail * vfs.f_frsize;
@@ -1552,7 +1719,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     }
 }
 
-NTSTATUS __stdcall xbox_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock)
+static NTSTATUS host_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock)
 {
     int fd = w32_handle_fd(FileHandle);
     if (fd >= 0) fsync(fd);
@@ -1563,7 +1730,7 @@ NTSTATUS __stdcall xbox_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BL
     return STATUS_SUCCESS;
 }
 
-NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
+static NTSTATUS host_NtQueryFullAttributesFile(
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     PXBOX_FILE_NETWORK_OPEN_INFORMATION FileInformation)
 {
@@ -1581,6 +1748,10 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     unix_to_filetime(st.st_atime, 0, &FileInformation->LastAccessTime);
     unix_to_filetime(st.st_mtime, 0, &FileInformation->LastWriteTime);
     FileInformation->ChangeTime = FileInformation->LastWriteTime;
+    det_file_times(&FileInformation->CreationTime,
+                   &FileInformation->LastAccessTime,
+                   &FileInformation->LastWriteTime,
+                   &FileInformation->ChangeTime);
     FileInformation->EndOfFile.QuadPart = st.st_size;
     FileInformation->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
     FileInformation->FileAttributes = mode_to_xbox_attrs(st.st_mode);
@@ -1619,7 +1790,7 @@ void xbox_dir_context_drop(HANDLE FileHandle)
     LeaveCriticalSection(&s_dir_cs);
 }
 
-NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+static NTSTATUS host_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
     XBOX_FILE_INFORMATION_CLASS FileInformationClass,
@@ -1705,6 +1876,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     unix_to_filetime(st.st_atime, 0, &entry->LastAccessTime);
     unix_to_filetime(st.st_mtime, 0, &entry->LastWriteTime);
     entry->ChangeTime = entry->LastWriteTime;
+    det_file_times(&entry->CreationTime, &entry->LastAccessTime,
+                   &entry->LastWriteTime, &entry->ChangeTime);
     entry->EndOfFile.QuadPart = st.st_size;
     entry->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
     entry->FileAttributes = mode_to_xbox_attrs(st.st_mode);
@@ -1723,6 +1896,315 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 /* ======================================================================== */
 /* ====================  Platform-independent  ============================ */
 /* ======================================================================== */
+
+/* Each entry point asks the RAM cache first (kernel_ramfs.c; opt-in, off by
+ * default): with it on, the cache partition's paths and handles never reach
+ * the host filesystem. Off, xbox_ramfs_active is one load and a compare. */
+#define RAMFS_FIRST(call) do {                     \
+        if (xbox_ramfs_active()) {                  \
+            NTSTATUS ramfs_st;                      \
+            if (call) return ramfs_st;              \
+        }                                           \
+    } while (0)
+
+/* ---- the Saves page's busy guard (openspec overlay-saves, D4) ----
+ *
+ * The menu's export reads the title's save folders and its import swaps them
+ * on the host, both from the present thread while the title runs. A title
+ * writes a save as several files over several frames (BLiNX 2: SaveMeta.xbx,
+ * SaveImage.xbx, blinx2data.bin), so a copy taken mid-save is torn, and a
+ * swap under an open handle loses the write or fails on Windows. The guard
+ * keeps the handles the title holds in its saves, and when it last touched
+ * them; xbox_saves_busy is 1 while a file is open or for SAVES_QUIET_MS after.
+ *
+ * Absolute names go through xbox_path_is_save. XDeleteSaveGame opens each
+ * child relative to the save folder's handle, so a relative open under a
+ * tracked handle is tracked too. A full table only stamps: the quiet window
+ * still covers it.
+ *
+ * The title is not paused while the menu copies, so the check alone could
+ * pass just before a save starts. Every stamp also moves s_saves_gen: the
+ * menu reads xbox_saves_gen before a copy and again after it (and before
+ * the first rename of an import), and drops the copy when it moved. */
+#define SAVES_HANDLES  256
+#define SAVES_QUIET_MS 2000
+
+static struct { HANDLE h; int dir; } s_saves_h[SAVES_HANDLES];
+static int s_saves_n;
+static long long s_saves_stamp;          /* host ms of the last touch, 0 never */
+static unsigned s_saves_gen;             /* moves with each stamp */
+static atomic_flag s_saves_lock = ATOMIC_FLAG_INIT;
+
+static long long saves_now_ms(void)
+{
+#if defined(_WIN32)
+    return (long long)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
+static void saves_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_saves_lock, memory_order_acquire))
+        ;
+}
+
+static void saves_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_saves_lock, memory_order_release);
+}
+
+/* Under the lock. */
+static void saves_stamp(void)
+{
+    s_saves_stamp = saves_now_ms();
+    s_saves_gen++;
+}
+
+static int saves_find(HANDLE h)
+{
+    int i;
+    for (i = 0; i < s_saves_n; i++)
+        if (s_saves_h[i].h == h)
+            return i;
+    return -1;
+}
+
+/* Is this handle one of the title's save handles? Stamps it when it is. */
+static int saves_touch(HANDLE h)
+{
+    int hit;
+    if (!h)
+        return 0;
+    saves_lock();
+    hit = saves_find(h) >= 0;
+    if (hit)
+        saves_stamp();
+    saves_unlock();
+    return hit;
+}
+
+/* Does this name land in the saves? A relative one (as posix_obj_path and
+ * translate_obj_path join it) does when its RootDirectory is tracked. */
+static int saves_name(PXBOX_OBJECT_ATTRIBUTES oa)
+{
+    const char *path = get_xbox_path(oa);
+    int hit;
+    if (!path)
+        return 0;
+    if (oa->RootDirectory && path[0] != '\\' && !(path[0] && path[1] == ':')) {
+        saves_lock();
+        hit = saves_find(oa->RootDirectory) >= 0;
+        saves_unlock();
+        return hit;
+    }
+    return xbox_path_is_save(path);
+}
+
+static void saves_opened(PXBOX_OBJECT_ATTRIBUTES oa, HANDLE h, ULONG options)
+{
+    if (!saves_name(oa))
+        return;
+    saves_lock();
+    if (s_saves_n < SAVES_HANDLES && saves_find(h) < 0) {
+        s_saves_h[s_saves_n].h = h;
+        s_saves_h[s_saves_n].dir = (options & XBOX_FILE_DIRECTORY_FILE) != 0;
+        s_saves_n++;
+    }
+    saves_stamp();
+    saves_unlock();
+    /* RECOMP_LOG_LEVEL=3: which save handles a title holds, the one thing
+     * that keeps the Saves page busy. */
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_FILE, "save handle %p opened (%s)", (void *)h,
+             (options & XBOX_FILE_DIRECTORY_FILE) ? "folder" : "file");
+}
+
+static void saves_closed(HANDLE h)
+{
+    int i;
+    saves_lock();
+    i = saves_find(h);
+    if (i >= 0) {
+        s_saves_h[i] = s_saves_h[--s_saves_n];
+        saves_stamp();
+    }
+    saves_unlock();
+    if (i >= 0)
+        xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_FILE, "save handle %p closed", (void *)h);
+}
+
+unsigned xbox_saves_gen(void)
+{
+    unsigned g;
+    saves_lock();
+    g = s_saves_gen;
+    saves_unlock();
+    return g;
+}
+
+/* NtDuplicateObject: the copy of a save handle is one too, and with
+ * DUPLICATE_CLOSE_SOURCE the source is gone without an NtClose, which
+ * would otherwise keep the page busy for good. */
+void xbox_saves_duplicated(HANDLE src, HANDLE dup, int close_src)
+{
+    int i, dir;
+    saves_lock();
+    i = src ? saves_find(src) : -1;
+    if (i >= 0) {
+        dir = s_saves_h[i].dir;
+        if (close_src)
+            s_saves_h[i] = s_saves_h[--s_saves_n];
+        if (dup && saves_find(dup) < 0 && s_saves_n < SAVES_HANDLES) {
+            s_saves_h[s_saves_n].h = dup;
+            s_saves_h[s_saves_n].dir = dir;
+            s_saves_n++;
+        }
+        saves_stamp();
+    }
+    saves_unlock();
+}
+
+int xbox_saves_busy(void)
+{
+    int i, busy = 0;
+    saves_lock();
+    for (i = 0; i < s_saves_n && !busy; i++)
+        busy = !s_saves_h[i].dir;
+    if (!busy && s_saves_stamp)
+        busy = saves_now_ms() - s_saves_stamp < SAVES_QUIET_MS;
+    saves_unlock();
+    return busy;
+}
+
+NTSTATUS __stdcall xbox_NtCreateFile(
+    PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
+    PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess,
+    ULONG CreateDisposition, ULONG CreateOptions)
+{
+    NTSTATUS st;
+    RAMFS_FIRST(xbox_ramfs_create(FileHandle, DesiredAccess, ObjectAttributes,
+                                  IoStatusBlock, CreateDisposition, CreateOptions,
+                                  &ramfs_st));
+    st = host_NtCreateFile(FileHandle, DesiredAccess, ObjectAttributes,
+                           IoStatusBlock, AllocationSize, FileAttributes,
+                           ShareAccess, CreateDisposition, CreateOptions);
+    if (NT_SUCCESS(st) && FileHandle && ObjectAttributes)
+        saves_opened(ObjectAttributes, *FileHandle, CreateOptions);
+    return st;
+}
+
+NTSTATUS __stdcall xbox_NtReadFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset)
+{
+    RAMFS_FIRST(xbox_ramfs_read(FileHandle, Event, IoStatusBlock, Buffer, Length,
+                                ByteOffset, &ramfs_st));
+    return host_NtReadFile(FileHandle, Event, ApcRoutine, ApcContext,
+                           IoStatusBlock, Buffer, Length, ByteOffset);
+}
+
+NTSTATUS __stdcall xbox_NtWriteFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+    PLARGE_INTEGER ByteOffset)
+{
+    RAMFS_FIRST(xbox_ramfs_write(FileHandle, Event, IoStatusBlock, Buffer, Length,
+                                 ByteOffset, &ramfs_st));
+    saves_touch(FileHandle);
+    return host_NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext,
+                            IoStatusBlock, Buffer, Length, ByteOffset);
+}
+
+NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
+{
+    if (xbox_ramfs_active() && xbox_ramfs_close(Handle))
+        return STATUS_SUCCESS;
+    saves_closed(Handle);
+    return host_NtClose(Handle);
+}
+
+NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
+{
+    RAMFS_FIRST(xbox_ramfs_delete(ObjectAttributes, &ramfs_st));
+    if (ObjectAttributes && saves_name(ObjectAttributes)) {
+        saves_lock();
+        saves_stamp();
+        saves_unlock();
+    }
+    return host_NtDeleteFile(ObjectAttributes);
+}
+
+NTSTATUS __stdcall xbox_NtQueryInformationFile(
+    HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
+{
+    RAMFS_FIRST(xbox_ramfs_query_info(FileHandle, IoStatusBlock, FileInformation,
+                                      Length, FileInformationClass, &ramfs_st));
+    return host_NtQueryInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                       Length, FileInformationClass);
+}
+
+NTSTATUS __stdcall xbox_NtSetInformationFile(
+    HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
+{
+    RAMFS_FIRST(xbox_ramfs_set_info(FileHandle, IoStatusBlock, FileInformation,
+                                    Length, FileInformationClass, &ramfs_st));
+    saves_touch(FileHandle);
+    return host_NtSetInformationFile(FileHandle, IoStatusBlock, FileInformation,
+                                     Length, FileInformationClass);
+}
+
+NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
+    HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
+{
+    RAMFS_FIRST(xbox_ramfs_query_volume(FileHandle, IoStatusBlock, FsInformation,
+                                        Length, FsInformationClass, &ramfs_st));
+    return host_NtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation,
+                                             Length, FsInformationClass);
+}
+
+NTSTATUS __stdcall xbox_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock)
+{
+    RAMFS_FIRST(xbox_ramfs_flush(FileHandle, IoStatusBlock, &ramfs_st));
+    return host_NtFlushBuffersFile(FileHandle, IoStatusBlock);
+}
+
+NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
+    PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
+    PXBOX_FILE_NETWORK_OPEN_INFORMATION FileInformation)
+{
+    RAMFS_FIRST(xbox_ramfs_query_full(ObjectAttributes, FileInformation, &ramfs_st));
+    return host_NtQueryFullAttributesFile(ObjectAttributes, FileInformation);
+}
+
+NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
+    HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
+    PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
+    PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan)
+{
+    RAMFS_FIRST(xbox_ramfs_query_dir(FileHandle, IoStatusBlock, FileInformation,
+                                     Length, FileInformationClass, FileName,
+                                     RestartScan, &ramfs_st));
+    return host_NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
+                                     IoStatusBlock, FileInformation, Length,
+                                     FileInformationClass, FileName, RestartScan);
+}
+
+NTSTATUS __stdcall xbox_RenameFileByHandle(
+    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
+{
+    RAMFS_FIRST(xbox_ramfs_rename(FileHandle, NewName, ReplaceIfExists, &ramfs_st));
+    saves_touch(FileHandle);
+    return host_RenameFileByHandle(FileHandle, NewName, ReplaceIfExists);
+}
 
 NTSTATUS __stdcall xbox_NtOpenFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,

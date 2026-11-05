@@ -8,7 +8,8 @@ set(CMAKE_C_STANDARD 11)
 # layout or #189 prerequisite is needed to test directory-handle lifetime.
 add_subdirectory(../../src/platform platform)
 add_executable(kernel_directory_posix_test test_main.c
-    ../../src/kernel/kernel_file.c ../../src/kernel/kernel_path.c)
+    ../../src/kernel/kernel_file.c ../../src/kernel/kernel_ramfs.c
+    ../../src/kernel/kernel_path.c)
 target_include_directories(kernel_directory_posix_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_directory_posix_test PRIVATE platform)
 option(XBOX_DIRECTORY_ASAN "Instrument the fixture and its platform library" OFF)

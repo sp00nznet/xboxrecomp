@@ -5,14 +5,56 @@
 #define APU_XAUDIO2_H
 
 #include <stdint.h>
+#include <string.h>
 
 /* The device backend behind these functions: XAudio2 on Windows
- * (apu_xaudio2.c), SDL2 on POSIX hosts (apu_sdl2.c). Same contract. */
+ * (apu_xaudio2.c), SDL3 on POSIX hosts (apu_sdl.c). Same contract. */
 #if defined(_WIN32)
 #define XA2_BACKEND_NAME "XAudio2"
 #else
-#define XA2_BACKEND_NAME "SDL2"
+#define XA2_BACKEND_NAME "SDL3"
 #endif
+
+/* Device buffer size and count, shared by both backends; overridable with
+ * RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT. 512 x 4 is 10.7 ms a
+ * buffer and 43 ms queued at the high mark. Under Wine the APU frame thread
+ * can be preempted past that while other threads are busy (a scene load),
+ * and the voice runs dry: the default there is deeper. */
+#define XA2_BUF_SAMPLES_DEFAULT 512
+#define XA2_NUM_BUFS_DEFAULT    4
+#define XA2_NUM_BUFS_WINE       6
+
+static inline int xa2_default_buf_count(int under_wine)
+{
+    return under_wine ? XA2_NUM_BUFS_WINE : XA2_NUM_BUFS_DEFAULT;
+}
+
+/* RECOMP_AUDIO_THREAD_PRIORITY for the APU frame thread. time_critical only
+ * with tc_allowed (the audio_thread_tc debug key): the frame thread runs the
+ * title's DirectSound ISR, and with no priority inheritance on the locks it
+ * shares, that level can starve the game's own threads. *bad is set when
+ * the value is not one of the names (or time_critical without the key). */
+enum { XA2_PRIO_NORMAL, XA2_PRIO_HIGHEST, XA2_PRIO_TIME_CRITICAL };
+
+static inline int xa2_parse_priority(const char *v, int tc_allowed, int *bad)
+{
+    *bad = 0;
+    if (!v || !*v || !strcmp(v, "normal")) return XA2_PRIO_NORMAL;
+    if (!strcmp(v, "highest")) return XA2_PRIO_HIGHEST;
+    if (!strcmp(v, "time_critical")) {
+        if (tc_allowed) return XA2_PRIO_TIME_CRITICAL;
+        *bad = 1;
+        return XA2_PRIO_HIGHEST;
+    }
+    *bad = 1;
+    return XA2_PRIO_NORMAL;
+}
+
+static inline const char *xa2_priority_name(int prio)
+{
+    return prio == XA2_PRIO_TIME_CRITICAL ? "time_critical"
+         : prio == XA2_PRIO_HIGHEST       ? "highest" : "normal";
+}
 
 /* Initialize the device backend. Returns 1 on success, 0 on failure. */
 int xa2_init(void);
@@ -61,7 +103,7 @@ static inline void xa2_pacing_marks(int buf_samples, int count, int period,
 unsigned xa2_underruns(void);
 
 /* Samples the device has consumed since init: XAudio2's SamplesPlayed, or
- * on SDL2 everything queued minus what is still queued. Read against the
+ * on SDL3 everything queued minus what is still queued. Read against the
  * wall clock this is the host-side starvation measure: while the device
  * plays, it advances 48000 a second; whatever it falls behind is silence
  * the device inserted (an underrun the WAV tap, which records submissions,

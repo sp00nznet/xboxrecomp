@@ -13,7 +13,12 @@
 
 #include "kernel.h"
 #include "kernel_missing.h"
+#include "kernel_pacing.h"
+#include "recomp_env.h"
+#include "recomp_regs.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
+#include "guest_time.h"
+#include "kernel_guest_unwind.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,8 +50,8 @@ static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
 /* The current IRQL, where guest code reads it: KPCR.Irql, fs:[0x24].
  *
- * The XDK does not always ask the kernel. DirectSound's lock
- * (sub_002F4175 in Burnout 3) reads fs:[0x24] directly and skips its
+ * The XDK does not always ask the kernel. DirectSound's lock (seen in
+ * Burnout 3) reads fs:[0x24] directly and skips its
  * critical section at raised IRQL, because a DPC must never block. Nothing
  * wrote that byte, so it read 0 everywhere: DirectSound's DPC took the
  * critical section, blocked against the thread that held it, and the title
@@ -207,11 +212,11 @@ static XBOX_THREAD_LOCAL int t_irql_counted;
  * waits on itself.
  *
  * Opt-in: RECOMP_DISPATCH_GATE=1. It changes when DPCs and device interrupts
- * run, which is a scheduling change for every title, and one B3 run in a
- * few stalled at its first movie with it. Off, the gate is not there: an
- * entry is free, raises take nothing, the timer thread runs DPCs and timer
- * routines as it always did, and the device models hold their interrupts
- * off on the raised-IRQL count (xbox_IrqlBlocksInterrupts). */
+ * run, which is a scheduling change for every title, and one run of a title
+ * in a few stalled at its first movie with it. Off, the gate is not there:
+ * an entry is free, raises take nothing, the timer thread runs DPCs and
+ * timer routines as it always did, and the device models hold their
+ * interrupts off on the raised-IRQL count (xbox_IrqlBlocksInterrupts). */
 static int s_gate_on;                          /* RECOMP_DISPATCH_GATE */
 static void irq_config_once(void);
 
@@ -261,7 +266,13 @@ static int gate_try(void)
 static void gate_enter(void)
 {
     dispatch_gate_once();
-    EnterCriticalSection(&s_dispatch_gate);
+    if (xbox_ProfOn()) {
+        long long t0 = xbox_ProfNowUs();
+        EnterCriticalSection(&s_dispatch_gate);
+        xbox_ProfWait(XBOX_PROF_WAIT_GATE, xbox_ProfNowUs() - t0);
+    } else {
+        EnterCriticalSection(&s_dispatch_gate);
+    }
     gate_entered();
 }
 
@@ -326,31 +337,34 @@ void xbox_DispatchGateLeave(void)
  * results screen that never came back).
  *
  * So a busy gate makes the model post the line instead, and the holder runs
- * the routine on its own thread at its next safe point: a kernel call, or
- * the gate's release before it is let go. Those are where guest code
- * already calls into the host, outside any guest read-modify-write. A
- * serviced MMIO trap is not one: it runs inside a signal handler (POSIX) or
- * a vectored handler (Windows). A guest loop at DISPATCH that polls memory
- * for the interrupt's effect without a kernel call never reaches one; the
- * wait log below names its holder.
+ * the routine on its own thread at its next safe point: a kernel call, a
+ * spin-wait yield, or the gate's release before it is let go. Those are
+ * where guest code already calls into the host, outside any guest
+ * read-modify-write. A serviced MMIO trap is not one: it runs inside a
+ * signal handler (POSIX) or a vectored handler (Windows). A guest poll loop
+ * at DISPATCH that needs the interrupt is lowered through spin_waits.json,
+ * which makes it a yield; the wait log below names it.
  * ============================================================================ */
 
-/* A bit per XBOX_IRQ_* line. */
-static volatile LONG s_irq_pending;
+/* A bit per XBOX_IRQ_* line. An int, not a LONG, because the generated
+ * code's spin-wait macro reads it too (templates/runtime/recomp_types.h):
+ * a lowered loop yields while anything is pending, even at "spin" pacing. */
+volatile int g_xbox_irq_pending;
+#define s_irq_pending (*(volatile LONG *)&g_xbox_irq_pending)
 static void (*volatile s_irq_run[XBOX_IRQ_LINES])(void);
 static uint64_t s_irq_post_ns[XBOX_IRQ_LINES]; /* when the bit went up */
 static XBOX_THREAD_LOCAL int t_in_isr;
 static void (*s_irq_post_hook)(int line);
 static void (*s_irq_release_hook)(void);   /* tests: the lower's window */
-static int s_irq_mode;          /* RECOMP_IRQ_SAFE_POINTS, under the gate */
+static int s_irq_mode;          /* irq_safe_points, under the gate */
 static int s_irq_force;
-static int s_dpc_on;            /* RECOMP_DPC_ON_RAISE, under the gate */
+static int s_dpc_on;            /* dpc_on_raise, under the gate */
 /* A thread that runs guest code (guest-main, a spawned worker): the only
  * kind that drains queued DPCs at its raise and release (dpc_run_here). */
 static XBOX_THREAD_LOCAL int t_guest_thread;
 static XBOX_THREAD_LOCAL int t_in_dpc;
 static uint64_t s_irq_wait_ns;
-static const char *const s_irq_names[XBOX_IRQ_LINES] = { "vblank", "apu", "ohci" };
+static const char *const s_irq_names[XBOX_IRQ_LINES] = { "vblank", "apu", "ohci", "nv2a-gr" };
 
 static struct {
     volatile LONG posted[XBOX_IRQ_LINES], on_holder[XBOX_IRQ_LINES],
@@ -366,26 +380,22 @@ static uint64_t s_irq_last_log_ns;
 
 /* RECOMP_DISPATCH_GATE turns the gate on, and with it the two things that
  * need a holder: interrupts posted to it and run at its safe points
- * (RECOMP_IRQ_SAFE_POINTS=0 turns that off again), and queued DPCs drained
- * on the guest thread at its raise and release (RECOMP_DPC_ON_RAISE=0 leaves
- * them to the timer thread). Without the gate both are off whatever they
- * say: a post has nobody to run it, and a drain at a raise is only atomic
- * against the timer thread's because the gate orders the two. */
+ * (irq_safe_points=0 turns that off again), and queued DPCs drained on the
+ * guest thread at its raise and release (dpc_on_raise=0 leaves them to the
+ * timer thread). Without the gate both are off whatever they say: a post
+ * has nobody to run it, and a drain at a raise is only atomic against the
+ * timer thread's because the gate orders the two. */
 static void irq_config(void)
 {
-    const char *v;
-
-    v = getenv("RECOMP_DISPATCH_GATE");
-    s_gate_on = (v && *v) ? atoi(v) != 0 : 0;
-    v = getenv("RECOMP_IRQ_SAFE_POINTS");
-    s_irq_mode = s_gate_on && ((v && *v) ? atoi(v) != 0 : 1);
-    v = getenv("RECOMP_IRQ_SAFE_FORCE");
-    s_irq_force = (v && *v && *v != '0');
-    v = getenv("RECOMP_IRQ_SAFE_MS");
-    s_irq_wait_ns = (uint64_t)((v && *v) ? strtoul(v, NULL, 0) : 250u)
-                    * 1000000ull;
-    v = getenv("RECOMP_DPC_ON_RAISE");
-    s_dpc_on = s_gate_on && ((v && *v) ? atoi(v) != 0 : 1);
+    s_gate_on = recomp_env_int(RENV_DISPATCH_GATE, 0) != 0;
+    s_irq_mode = s_gate_on
+                 && (recomp_env(RENV_IRQ_SAFE_POINTS)
+                     ? (int)recomp_env_int(RENV_IRQ_SAFE_POINTS, 1) != 0 : 1);
+    s_irq_force = recomp_env_on(RENV_IRQ_SAFE_FORCE);
+    s_irq_wait_ns = (uint64_t)recomp_env_int(RENV_IRQ_SAFE_MS, 250) * 1000000ull;
+    s_dpc_on = s_gate_on
+               && (recomp_env(RENV_DPC_ON_RAISE)
+                   ? (int)recomp_env_int(RENV_DPC_ON_RAISE, 1) != 0 : 1);
     if (s_gate_on) {
         fprintf(stderr, "  [IRQ] one-CPU DISPATCH gate on (RECOMP_DISPATCH_GATE),"
                 " DPCs on raise %s\n", s_dpc_on ? "on" : "off");
@@ -393,11 +403,10 @@ static void irq_config(void)
     }
     if (s_gate_on && (!s_irq_mode || s_irq_force)) {
         fprintf(stderr, "  [IRQ] safe points %s%s\n",
-                s_irq_mode ? "on" : "off (RECOMP_IRQ_SAFE_POINTS=0: interrupts "
-                                    "run beside the gate holder after a "
-                                    "hold-off)",
-                s_irq_force ? ", RECOMP_IRQ_SAFE_FORCE=1: delivered beside the "
-                              "holder past RECOMP_IRQ_SAFE_MS" : "");
+                s_irq_mode ? "on" : "off (irq_safe_points=0: interrupts run "
+                                    "beside the gate holder after a hold-off)",
+                s_irq_force ? ", irq_safe_force=1: delivered beside the holder "
+                              "past irq_safe_ms" : "");
         fflush(stderr);
     }
 }
@@ -445,6 +454,11 @@ void xbox_DpcMarkGuestThread(void)
     t_guest_thread = 1;
 }
 
+int xbox_DpcIsGuestThread(void)
+{
+    return t_guest_thread;
+}
+
 void xbox_IrqSetHandler(int line, void (*run)(void))
 {
     if (line >= 0 && line < XBOX_IRQ_LINES)
@@ -471,57 +485,13 @@ static void irq_note_wait(int line, uint64_t posted_ns)
             break;
 }
 
-/* The holder's recompiled register state. A safe point at a thunk sits
- * before the bridge reads its arguments, so everything the generated code
- * keeps in these across a call is put back. g_fs_base stays: the
- * routine runs on the holder's TIB, as on the console's one CPU (a device
- * model's thread as holder: see irq_release_point). */
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_ebp;
-extern RECOMP_TLS uint32_t g_seh_ebp, g_eflags;
-extern RECOMP_TLS int g_df, g_fp_top, g_fp_cmp;
-extern RECOMP_TLS double g_fp_stack[8];
-extern RECOMP_TLS uint16_t g_fp_control_word, g_fp_cc;
-extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
-extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
-extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
-extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
-
-typedef struct {
-    uint32_t eax, ecx, edx, ebx, esi, edi, ebp, esp, seh_ebp, eflags;
-    int df, fp_top, fp_cmp;
-    double fp[8];
-    uint16_t fp_cw, fp_cc;
-    RecompXmm xmm[8];
-    RecompMmx mm[8];
-} IrqRegs;
-
-static void irq_regs_save(IrqRegs *r)
-{
-    r->eax = g_eax; r->ecx = g_ecx; r->edx = g_edx; r->ebx = g_ebx;
-    r->esi = g_esi; r->edi = g_edi; r->ebp = g_ebp; r->esp = g_esp;
-    r->seh_ebp = g_seh_ebp; r->eflags = g_eflags; r->df = g_df;
-    r->fp_top = g_fp_top; r->fp_cmp = g_fp_cmp;
-    memcpy(r->fp, g_fp_stack, sizeof r->fp);
-    r->fp_cw = g_fp_control_word; r->fp_cc = g_fp_cc;
-    r->xmm[0] = g_xmm0; r->xmm[1] = g_xmm1; r->xmm[2] = g_xmm2; r->xmm[3] = g_xmm3;
-    r->xmm[4] = g_xmm4; r->xmm[5] = g_xmm5; r->xmm[6] = g_xmm6; r->xmm[7] = g_xmm7;
-    r->mm[0] = g_mm0; r->mm[1] = g_mm1; r->mm[2] = g_mm2; r->mm[3] = g_mm3;
-    r->mm[4] = g_mm4; r->mm[5] = g_mm5; r->mm[6] = g_mm6; r->mm[7] = g_mm7;
-}
-
-static void irq_regs_restore(const IrqRegs *r)
-{
-    g_eax = r->eax; g_ecx = r->ecx; g_edx = r->edx; g_ebx = r->ebx;
-    g_esi = r->esi; g_edi = r->edi; g_ebp = r->ebp; g_esp = r->esp;
-    g_seh_ebp = r->seh_ebp; g_eflags = r->eflags; g_df = r->df;
-    g_fp_top = r->fp_top; g_fp_cmp = r->fp_cmp;
-    memcpy(g_fp_stack, r->fp, sizeof r->fp);
-    g_fp_control_word = r->fp_cw; g_fp_cc = r->fp_cc;
-    g_xmm0 = r->xmm[0]; g_xmm1 = r->xmm[1]; g_xmm2 = r->xmm[2]; g_xmm3 = r->xmm[3];
-    g_xmm4 = r->xmm[4]; g_xmm5 = r->xmm[5]; g_xmm6 = r->xmm[6]; g_xmm7 = r->xmm[7];
-    g_mm0 = r->mm[0]; g_mm1 = r->mm[1]; g_mm2 = r->mm[2]; g_mm3 = r->mm[3];
-    g_mm4 = r->mm[4]; g_mm5 = r->mm[5]; g_mm6 = r->mm[6]; g_mm7 = r->mm[7];
-}
+/* The holder's recompiled register state is saved around each routine
+ * (RecompRegs, recomp_regs.h). A safe point at a thunk sits before the
+ * bridge reads its arguments, and one at a spin-wait yield sits in the
+ * middle of a guest loop, so everything the generated code keeps in these
+ * across a call or an instruction is put back. g_fs_base stays: the routine
+ * runs on the holder's TIB, as on the console's one CPU (a device model's
+ * thread as holder: see irq_release_point). */
 
 /* Queued DPCs, run on the guest thread that owns "the processor at
  * DISPATCH". On the console a DPC queued by an ISR runs when the processor
@@ -542,24 +512,31 @@ static void irq_regs_restore(const IrqRegs *r)
  * front-end method cleared by the APU frame thread). */
 static void dpc_run_here(void)
 {
-    IrqRegs saved;
+    RecompRegs saved;
+    int host;
 
     if (!xbox_DpcPending() || !t_guest_thread || t_in_dpc || t_in_isr)
         return;
     if (!xbox_DpcOnRaise())
         return;
-    irq_regs_save(&saved);
+    host = xbox_GuestUnwindHostBegin();
+    if (!host)
+        return;
+    recomp_regs_save(&saved);
     t_in_dpc = 1;
+    xbox_GuestUnwindHold(1);            /* the registers come back below */
     /* The routines run without the guest CPU (RECOMP_GUEST_LOCK), as on the
      * timer thread: a DPC never takes it. This drain runs under the gate,
-     * and taking the CPU here could wait on a holder polling memory for
-     * this very DPC's result, while the timer thread's own drain waits for
-     * the gate: a cycle. The one-CPU gate is
+     * and taking the CPU here would wait on a holder spinning in a loop
+     * that is not lowered on this very DPC's result, while the timer
+     * thread's own drain waits for the gate: a cycle. The one-CPU gate is
      * what a DPC's body is atomic against; passive code on another thread
      * may see its intermediate state, as it may on the timer thread. */
     xbox_DpcDrainHere();
+    xbox_GuestUnwindHold(-1);
     t_in_dpc = 0;
-    irq_regs_restore(&saved);
+    recomp_regs_restore(&saved);
+    xbox_GuestUnwindHostEnd(host);
 }
 
 /* Run one posted line here, on the holder. 0 when no worker stack was free
@@ -567,13 +544,18 @@ static void dpc_run_here(void)
 static int irq_run_line(int line)
 {
     void (*run)(void) = s_irq_run[line];
-    IrqRegs saved;
-    int slot, irql;
+    RecompRegs saved;
+    int slot, irql, host;
 
     if (!run)
         return 1;                       /* nothing to run it with: dropped */
+    /* The guest is being thrown away (kernel_guest_unwind.c). */
+    host = xbox_GuestUnwindHostBegin();
+    if (!host)
+        return 1;
     slot = xbox_worker_stack_alloc();
     if (slot < 0) {
+        xbox_GuestUnwindHostEnd(host);
         static volatile LONG said;
         if (!InterlockedExchange(&said, 1)) {
             fprintf(stderr, "  [IRQ] no worker stack for the %s interrupt on "
@@ -583,17 +565,21 @@ static int irq_run_line(int line)
         return 0;
     }
     irq_note_wait(line, s_irq_post_ns[line]);
-    irq_regs_save(&saved);
+    recomp_regs_save(&saved);
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
     t_in_isr = 1;
     irql = xbox_IrqlEnterInterrupt(16);
+    /* The worker stack is the routine's: no unwind out of it. */
+    xbox_GuestUnwindHold(1);
     run();
+    xbox_GuestUnwindHold(-1);
     xbox_IrqlLeaveInterrupt(irql);
     t_in_isr = 0;
-    irq_regs_restore(&saved);
+    recomp_regs_restore(&saved);
     xbox_worker_stack_free(slot);
     InterlockedIncrement(&s_irq.on_holder[line]);
+    xbox_GuestUnwindHostEnd(host);
     return 1;
 }
 
@@ -674,7 +660,7 @@ static void irql_release_due(void)
     irq_release_point();
 }
 
-/* The holder has reached no safe point for RECOMP_IRQ_SAFE_MS with something
+/* The holder has reached no safe point for irq_safe_ms with something
  * pending: name it, and again every second while it lasts. The interrupt
  * waits; on hardware it would preempt the holder, but here that is the
  * concurrent run this whole scheme exists to prevent. */
@@ -712,9 +698,9 @@ static void irq_wait_check(uint64_t now)
         if ((unsigned long)s_holders[i].tid == tid && tid)
             fprintf(stderr, ", raised from host %p, guest ret %08X",
                     s_holders[i].ra, s_holders[i].guest_ra);
-    fprintf(stderr, "%s\n", s_irq_force ? "; RECOMP_IRQ_SAFE_FORCE delivers it"
-                                        : "; a guest loop here makes no "
-                                          "kernel call");
+    fprintf(stderr, "%s\n", s_irq_force ? "; irq_safe_force delivers it"
+                                        : "; a guest loop here wants a "
+                                          "spin_waits.json entry");
     fflush(stderr);
 }
 
@@ -808,7 +794,13 @@ void xbox_IrqReport(void)
 
     xbox_IrqStatsGet(&s, 1);
     if (!xbox_IrqSafePointsOn()) {
-        if (s.ungated[0] | s.ungated[1] | s.ungated[2]) {
+        /* nv2a-gr only once used (run_ahead): the stock line as it was. */
+        if (s.ungated[3]) {
+            fprintf(stderr, "  [IRQ] ungated ISRs beside the gate holder"
+                    " vbl/apu/ohci/nv2a-gr %ld/%ld/%ld/%ld\n",
+                    s.ungated[0], s.ungated[1], s.ungated[2], s.ungated[3]);
+            fflush(stderr);
+        } else if (s.ungated[0] | s.ungated[1] | s.ungated[2]) {
             fprintf(stderr, "  [IRQ] ungated ISRs beside the gate holder"
                     " vbl/apu/ohci %ld/%ld/%ld\n",
                     s.ungated[0], s.ungated[1], s.ungated[2]);
@@ -831,6 +823,13 @@ void xbox_IrqReport(void)
             s.ungated[0], s.ungated[1], s.ungated[2],
             s.max_wait_us[0] / 1000.0, s.max_wait_us[1] / 1000.0,
             s.max_wait_us[2] / 1000.0, s.wait_logs, s.refused);
+    /* The run-ahead's notify line (RECOMP_DEBUG=run_ahead), on its own line
+     * so the three-line one keeps its shape; only once it has been used. */
+    if (s.posted[3] | s.on_holder[3] | s.forced[3] | s.ungated[3])
+        fprintf(stderr, "  [IRQ] nv2a-gr posted %ld, run on holder %ld,"
+                " poster's retry %ld, forced %ld, ungated %ld, longest wait"
+                " %.2f ms\n", s.posted[3], s.on_holder[3], s.second_try[3],
+                s.forced[3], s.ungated[3], s.max_wait_us[3] / 1000.0);
     fflush(stderr);
 }
 
@@ -844,7 +843,8 @@ static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
                                     : (old_level >= DISPATCH_LEVEL);
     LONG d;
 
-    if (now == was)
+    (void)old_level;
+    if (now == t_irql_counted)
         return;
     /* The lower that gives the gate back is a safe point, taken while this
      * thread still holds it and is still at its level. */
@@ -883,7 +883,7 @@ static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
      * whose old level is not the level the raise set is a calling-convention
      * bug upstream of here, not a title doing something exotic. */
     if (s_trace < 0)
-        s_trace = getenv("RECOMP_IRQL_TRACE") ? 1 : 0;
+        s_trace = recomp_env(RENV_IRQL_TRACE) ? 1 : 0;
     if (s_trace && InterlockedIncrement(&s_traced) <= 20) {
         fprintf(stderr, "  [IRQL] tid %lu %s %d->%d depth=%ld\n",
                 (unsigned long)GetCurrentThreadId(),
@@ -929,11 +929,16 @@ void xbox_IrqlLeaveInterrupt(int saved)
         g_current_irql = (KIRQL)saved;
         irql_publish();
     }
+    /* Every host-run ISR and DPC ends here, on whichever thread ran it: the
+     * point where what it wrote to guest memory is done, so a sleeping spin
+     * wait (kernel_pacing.c) re-reads it. One load in spin mode. */
+    xbox_SpinWake();
 }
 
 /* Whether this thread is at DISPATCH_LEVEL or above, or holds the one-CPU
- * gate: while it is, no DPC can run, so a wait on this thread must not hand
- * the guest CPU on in the hope of one (kernel_guest_cpu.c). */
+ * gate: while it is, no DPC can run, so a spin wait here must not sleep for
+ * one (kernel_pacing.c), nor hand the guest CPU on in the hope of one
+ * (kernel_guest_cpu.c). */
 int xbox_IrqlThisThreadBlocksDpcs(void)
 {
     return t_irql_counted || t_dispatch_gate_held
@@ -943,6 +948,42 @@ int xbox_IrqlThisThreadBlocksDpcs(void)
 int xbox_IrqlCurrent(void)
 {
     return (int)g_current_irql;
+}
+
+/* A guest unwind (kernel_guest_unwind.c) jumps past every lower and gate
+ * leave between its point and the call-in: whatever the thread raised or
+ * entered since the mark is let go here, so the count of raised threads
+ * and the gate are as if each lower had run. A posted interrupt the leaves
+ * skip waits for the next holder's release point, as one posted while the
+ * gate is free does. */
+void xbox_IrqlUnwindMark(XboxIrqlMark *m)
+{
+    m->irql = (int)g_current_irql;
+    m->gate_depth = t_gate_depth;
+    m->gate_held = t_dispatch_gate_held;
+    m->counted = t_irql_counted;
+    m->in_isr = t_in_isr;
+    m->in_dpc = t_in_dpc;
+}
+
+void xbox_IrqlUnwindRestore(const XboxIrqlMark *m)
+{
+    if (t_irql_counted && !m->counted) {
+        t_irql_counted = 0;
+        InterlockedDecrement(&g_irql_raised_count);
+        irql_holder_drop();
+    }
+    t_dispatch_gate_held = m->gate_held;
+    while (t_gate_depth > m->gate_depth)
+        gate_leave_raw();
+    t_in_isr = m->in_isr;
+    t_in_dpc = m->in_dpc;
+    t_release_due = 0;
+    /* The KPCR byte only when the jump skipped a lower. */
+    if (g_current_irql != (KIRQL)m->irql) {
+        g_current_irql = (KIRQL)m->irql;
+        irql_publish();
+    }
 }
 
 /*
@@ -1043,7 +1084,6 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
  *
  * Exported as a data pointer, not a function. The Xbox kernel increments
  * this every ~1ms (approximating the Xbox tick interval).
- * Updated lazily when read, using GetTickCount.
  * ============================================================================ */
 
 volatile ULONG xbox_KeTickCount = 0;
@@ -1051,87 +1091,38 @@ volatile ULONG xbox_KeTickCount = 0;
 /* Call this periodically or on-demand to update KeTickCount */
 static void xbox_update_tick_count(void)
 {
-    xbox_KeTickCount = GetTickCount();
+    xbox_KeTickCount = xbox_GuestTickCount();
 }
 
 /* ============================================================================
- * Performance Counters
+ * Performance Counters and System Time
  *
- * Direct 1:1 mapping to Win32 QueryPerformanceCounter/Frequency.
- * Both Xbox and Windows return LARGE_INTEGER.
+ * Every clock the guest reads comes from guest_time.c, which maps them to the
+ * host (or, in deterministic mode, to the vblank count).
  * ============================================================================ */
 
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
 {
     LARGE_INTEGER counter;
-    QueryPerformanceCounter(&counter);
+    counter.QuadPart = xbox_GuestPerfCounter();
     return counter;
 }
 
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceFrequency(void)
 {
     LARGE_INTEGER freq;
-    QueryPerformanceFrequency(&freq);
+    freq.QuadPart = xbox_GuestPerfFrequency();
     return freq;
 }
 
-/* ============================================================================
- * System Time
- *
- * KeQuerySystemTime returns the current time as a FILETIME (100ns since
- * January 1, 1601). Direct Win32 mapping.
- * ============================================================================ */
-
-static LONGLONG s_time_anchor_100ns;
-static LONGLONG s_time_anchor_counts;
-static LONGLONG s_time_freq_counts;
-static INIT_ONCE s_time_once = INIT_ONCE_STATIC_INIT;
-
-static BOOL CALLBACK anchor_system_time(PINIT_ONCE once, PVOID param, PVOID *ctx)
-{
-    FILETIME ft;
-    LARGE_INTEGER f, now;
-    (void)once; (void)param; (void)ctx;
-    QueryPerformanceFrequency(&f);
-    GetSystemTimeAsFileTime(&ft);
-    QueryPerformanceCounter(&now);
-    s_time_freq_counts = f.QuadPart ? f.QuadPart : 1;
-    s_time_anchor_100ns = ((LONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-    s_time_anchor_counts = now.QuadPart;
-    return TRUE;
-}
-
+/* KeQuerySystemTime returns the current time as a FILETIME (100ns since
+ * January 1, 1601). guest_time.c says why it is anchored once and advanced
+ * by the performance counter. */
 VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
 {
-    /* Anchored once to the wall clock, advanced by the performance counter.
-     *
-     * GetSystemTimeAsFileTime alone moves in steps of about 15.6 ms, the
-     * host's scheduler tick. The console's clock is far finer, and a title
-     * that busy-waits on this -- reading it until enough time has passed --
-     * spins for the whole of each step instead of a few iterations.
-     *
-     * Measured on Shin Megami Tensei: Nine: one such wait called this
-     * **11.8 million times in two seconds**, which is most of what the
-     * title was doing at that moment, and it came out of the spin in a
-     * state where it no longer polled the gamepad.
-     *
-     * The anchor keeps the absolute value right; the counter supplies the
-     * resolution between ticks.
-     *
-     * Whole seconds and the remainder are scaled separately: scaling the
-     * whole count by 10^7 overflows after about a day at 10 MHz. */
-    LARGE_INTEGER now;
-    LONGLONG delta;
-
     if (!CurrentTime)
         return;
-
-    InitOnceExecuteOnce(&s_time_once, anchor_system_time, NULL, NULL);
-    QueryPerformanceCounter(&now);
-    delta = now.QuadPart - s_time_anchor_counts;
-    CurrentTime->QuadPart = s_time_anchor_100ns
-        + (delta / s_time_freq_counts) * 10000000LL
-        + (delta % s_time_freq_counts) * 10000000LL / s_time_freq_counts;
+    CurrentTime->QuadPart = (LONGLONG)xbox_GuestSystemTime();
 }
 
 /* ============================================================================
@@ -1156,6 +1147,8 @@ VOID __stdcall xbox_KeStallExecutionProcessor(ULONG MicroSeconds)
     do {
         QueryPerformanceCounter(&now);
     } while ((now.QuadPart - start.QuadPart) < target_counts);
+    if (xbox_ProfOn())
+        xbox_ProfWait(XBOX_PROF_WAIT_STALL, (long long)MicroSeconds);
 }
 
 /* ============================================================================
@@ -1199,6 +1192,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
     /* ExitProcess skips atexit. Guest code calls this, never from inside
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
+    xbox_kernel_summary_report("bugcheck");
     ExitProcess(BugCheckCode);
 }
 
@@ -1221,6 +1215,7 @@ VOID __stdcall xbox_KeBugCheckEx(
     /* ExitProcess skips atexit. Guest code calls this, never from inside
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
+    xbox_kernel_summary_report("bugcheck");
     ExitProcess(BugCheckCode);
 }
 
@@ -1423,7 +1418,7 @@ VOID __stdcall xbox_WRITE_PORT_BUFFER_USHORT(PUSHORT Port, PUSHORT Buffer, ULONG
 NTSTATUS __stdcall xbox_NtSetSystemTime(PLARGE_INTEGER SystemTime, PLARGE_INTEGER PreviousTime)
 {
     if (PreviousTime)
-        GetSystemTimeAsFileTime((LPFILETIME)PreviousTime);
+        PreviousTime->QuadPart = (LONGLONG)xbox_GuestSystemTimeCoarse();
 
     xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
         "NtSetSystemTime: ignored (not setting system clock)");
@@ -1542,6 +1537,39 @@ VOID __stdcall xbox_AvSetDisplayMode(
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "AvSetDisplayMode: step=%u mode=0x%X format=0x%X pitch=%u fb=0x%X",
         Step, Mode, Format, Pitch, FrameBuffer);
+}
+
+/* The frame size of an AV mode word.
+ *
+ * AvSetDisplayMode programs the encoder and CRTC for one timing, and from then
+ * on the CRTC scans the framebuffer at that timing's width and active lines,
+ * whatever rows the title drew: a title's 640x464 menu is a 640x480 frame on
+ * the TV. The word is the kernel's AV vocabulary (nxdk's hal/video.c lists the
+ * same words with the same sizes): bits 8-15 are the timing, and the timing
+ * alone fixes the frame. Field rendering is not in the word -- the same word
+ * serves a 640x480 frame and 640x240 fields; D3D reports fields by halving the
+ * pitch it passes, which the present pick reads from the surface pitch. */
+int xbox_AvModeSize(ULONG Mode, ULONG *w, ULONG *h)
+{
+    static const struct { UCHAR timing; USHORT w, h; } sizes[] = {
+        { 0x01,  640,  480 }, { 0x03,  640,  480 }, { 0x07,  640,  480 },
+        { 0x0D,  640,  480 }, { 0x0E,  640,  480 }, { 0x0F,  640,  480 },
+        { 0x02,  720,  480 }, { 0x04,  720,  480 }, { 0x08,  720,  480 },
+        { 0x05,  640,  576 }, { 0x06,  720,  576 }, { 0x10,  640,  576 },
+        { 0x0A, 1280,  720 }, { 0x0C, 1920, 1080 },
+    };
+    ULONG timing = (Mode >> 8) & 0xFF, i;
+
+    for (i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+        if (sizes[i].timing == timing) {
+            if (w) *w = sizes[i].w;
+            if (h) *h = sizes[i].h;
+            return 1;
+        }
+    }
+    if (w) *w = 0;
+    if (h) *h = 0;
+    return 0;
 }
 
 /* ============================================================================
@@ -1747,57 +1775,12 @@ VOID __stdcall xbox_DbgBreakPoint(void)
 
 ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
 {
-    /*
-     * Time since boot in NT 100ns units. GetTickCount64 is milliseconds, so
-     * scale by 10,000. Resolution is coarser than the real kernel's, but it is
-     * monotonic, which is the property callers actually depend on.
-     */
-    return (ULONGLONG)GetTickCount64() * 10000ULL;
+    /* Time since boot in NT 100ns units (guest_time.c). */
+    return (ULONGLONG)xbox_GuestInterruptTime();
 }
 
-/* ============================================================================
- * Time stamp counter
- *
- * Xbox's QueryPerformanceCounter is a bare `rdtsc`, and its
- * QueryPerformanceFrequency returns the CPU clock as a constant the title
- * compiles in: Half-Life 2's is 0x2BB5C755 (733,333,333 Hz) at 0x0059C6C7.
- * So a frame timer computes seconds as counter / 733333333.
- *
- * Returning the host's own TSC would make that division wrong by the ratio of
- * the two clocks -- a 3.5 GHz host would have the guest believe nearly five
- * seconds had passed for every real one. Scaling the host's performance
- * counter to the console's rate keeps the guest's arithmetic honest.
- *
- * Monotonic and shared by every thread, which is what a TSC is. The first
- * call establishes the origin so the counter starts near zero rather than at
- * whatever the host had been running for.
- * ========================================================================= */
-#define XBOX_TSC_HZ 733333333ull
-
-uint64_t xbox_ReadTimeStampCounter(void)
-{
-    static LARGE_INTEGER freq;
-    static LARGE_INTEGER origin;
-    LARGE_INTEGER now;
-
-    if (freq.QuadPart == 0) {
-        QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&origin);
-        if (freq.QuadPart == 0)
-            freq.QuadPart = 1;
-    }
-    QueryPerformanceCounter(&now);
-
-    {
-        uint64_t ticks = (uint64_t)(now.QuadPart - origin.QuadPart);
-        /* Split the scaling so a long run cannot overflow: whole seconds
-         * first, then the remainder. */
-        uint64_t secs = ticks / (uint64_t)freq.QuadPart;
-        uint64_t rem  = ticks % (uint64_t)freq.QuadPart;
-        return secs * XBOX_TSC_HZ
-             + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart;
-    }
-}
+/* xbox_ReadTimeStampCounter, the rdtsc helper, lives in guest_time.c with
+ * every other clock the guest reads. */
 
 /* =========================================================================
  * x86 port I/O
@@ -1852,6 +1835,8 @@ uint32_t xbox_PortIn(uint32_t port, int width)
         uint32_t n = xbox_VblankCount();
         if (!n)
             n = (uint32_t)InterlockedIncrement(&reads);
+        /* Which parity reads as odd is not verified against hardware;
+         * D3D and the XMV player only need the field to alternate. */
         v = (n & 1u) << 5;
         return v;
     }
@@ -1905,12 +1890,8 @@ void xbox_PortOut(uint32_t port, uint32_t value, int width)
  * ========================================================================= */
 void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
 {
-    static int no_simd = -1;
+    int no_simd = recomp_env_on(RENV_CPUID_NO_SIMD);
 
-    if (no_simd < 0) {
-        const char *e = getenv("RECOMP_CPUID_NO_SIMD");
-        no_simd = e && *e && *e != '0';
-    }
     (void)subleaf;
     out[0] = out[1] = out[2] = out[3] = 0;
     if (leaf > 2)

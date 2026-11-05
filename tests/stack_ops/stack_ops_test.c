@@ -4,8 +4,8 @@
  * writes the popped value, so ESP ends up equal to it; writing first and
  * incrementing after left ESP 4 bytes high. Spartan's sub_001597A0
  * (push esp; push eax; fld; frndint; fistp [esp]; pop eax; pop esp) ran that
- * in a loop, and the function's closing pops then read the wrong slots
- *. Each case below is the exact statement sequence the lifter emits
+ * in a loop, and the function's closing pops then read the wrong slots.
+ * Each case below is the exact statement sequence the lifter emits
  * for the instruction named in its comment, run over a fake guest stack.
  */
 #include "recomp_types.h"

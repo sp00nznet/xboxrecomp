@@ -12,7 +12,11 @@
  */
 
 #include "kernel.h"
+#include "guest_time.h"
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
+#include "recomp_env.h"           /* RECOMP_GUEST_CPUS, guest_priority */
+#include "platform/host_time.h"   /* xbox_HostUnderWine */
+#include "kernel_guest_unwind.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +38,8 @@ static DWORD WINAPI xbox_thread_wrapper(LPVOID lpParameter)
 {
     XBOX_THREAD_START_INFO info = *(XBOX_THREAD_START_INFO*)lpParameter;
 
+    xbox_log_thread_role("xbox-thread", 0);
+
     /* Free the start info before calling the routine - the routine may
      * never return (calling PsTerminateSystemThread instead) */
     HeapFree(GetProcessHeap(), 0, lpParameter);
@@ -41,7 +47,11 @@ static DWORD WINAPI xbox_thread_wrapper(LPVOID lpParameter)
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "Thread %u starting at %p",
         GetCurrentThreadId(), info.StartRoutine);
 
+    /* No call-in here: this creator is the native thunk table's, which no
+     * current title reaches, so a reset refuses to run past such a thread. */
+    xbox_GuestUnwindForeign(1);
     info.StartRoutine(info.StartContext);
+    xbox_GuestUnwindForeign(-1);
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "Thread %u returned normally",
         GetCurrentThreadId());
@@ -161,6 +171,13 @@ NTSTATUS __stdcall xbox_PsTerminateSystemThread(NTSTATUS ExitStatus)
  * Maps to: SleepEx (for alertable waits) or Sleep
  * ============================================================================ */
 
+/* An alertable delay in the deterministic ring: a queued APC ends it. */
+static int delay_det_alerted(void *ctx)
+{
+    (void)ctx;
+    return SleepEx(0, TRUE) == WAIT_IO_COMPLETION;
+}
+
 NTSTATUS __stdcall xbox_KeDelayExecutionThread(
     KPROCESSOR_MODE WaitMode,
     BOOLEAN Alertable,
@@ -174,8 +191,38 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         return STATUS_INVALID_PARAMETER;
 
     if (Interval->QuadPart == 0) {
-        /* Zero interval = yield the thread's time slice */
+        /* Zero interval = yield the thread's time slice; in the
+         * deterministic ring, to the next guest thread in it. */
+        if (xbox_GuestDetThread()) {
+            xbox_GuestDetYield(DET_SITE_DELAY);
+            return STATUS_SUCCESS;
+        }
         SwitchToThread();
+        return STATUS_SUCCESS;
+    }
+
+    if (xbox_GuestTimeVirtual()) {
+        /* Virtual time (guest_time.h): sleep in 1 ms host slices until the
+         * guest clock passes the due time, so the delay ends on the same
+         * vblank on every run. */
+        uint64_t due = xbox_GuestTimeDue(Interval->QuadPart);
+
+        if (xbox_GuestTimeReached(due))
+            return STATUS_SUCCESS;
+        if (xbox_GuestDetThread())
+            return xbox_GuestDetBlock(Alertable ? delay_det_alerted : NULL,
+                                      NULL, due | 1, DET_SITE_DELAY)
+                   ? STATUS_ALERTED : STATUS_SUCCESS;
+        xbox_GuestCpuBlocked();
+        while (!xbox_GuestTimeReached(due)) {
+            xbox_GuestUnwindPoint(XBOX_UNWIND_DELAY, 1);
+            if (Alertable) {
+                if (SleepEx(1, TRUE) == WAIT_IO_COMPLETION)
+                    return STATUS_ALERTED;
+            } else {
+                Sleep(1);
+            }
+        }
         return STATUS_SUCCESS;
     }
 
@@ -189,19 +236,23 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
     } else {
         /* Positive = absolute time. Calculate relative delay from now. */
         LARGE_INTEGER now;
-        GetSystemTimeAsFileTime((LPFILETIME)&now);
+        now.QuadPart = (LONGLONG)xbox_GuestSystemTimeCoarse();
         LONGLONG diff = Interval->QuadPart - now.QuadPart;
         if (diff <= 0)
             return STATUS_SUCCESS; /* Already past */
         ms = (DWORD)(diff / 10000);
     }
 
+    /* guest_sched: the call let go of the guest CPU as a short one; a
+     * real sleep blocks, so any level may run meanwhile. */
+    if (ms)
+        xbox_GuestCpuBlocked();
     if (Alertable) {
-        DWORD result = SleepEx(ms, TRUE);
+        DWORD result = xbox_GuestUnwindSleep(ms, TRUE);
         if (result == WAIT_IO_COMPLETION)
             return STATUS_ALERTED;
     } else {
-        Sleep(ms);
+        xbox_GuestUnwindSleep(ms, FALSE);
     }
 
     return STATUS_SUCCESS;
@@ -216,31 +267,98 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
 
 /*
  * Map Xbox priority increment to Win32 priority level.
- * Xbox base priorities typically range from -2 to +2 for game threads.
+ * Xbox base priorities typically range from -2 to +2 for game threads. An
+ * increment of +-16 ((HIGH_PRIORITY + 1) / 2) is the kernel's saturation:
+ * XAPI's SetThreadPriority passes it for THREAD_PRIORITY_TIME_CRITICAL and
+ * _IDLE, and KeQueryBasePriorityThread reports it back. Anything short of
+ * it only raises or lowers the base, so it stops at HIGHEST or LOWEST.
  */
 static int xbox_priority_to_win32(LONG increment)
 {
-    if (increment <= -15)       return THREAD_PRIORITY_IDLE;
+    if (increment <= -16)       return THREAD_PRIORITY_IDLE;
     else if (increment <= -2)   return THREAD_PRIORITY_LOWEST;
     else if (increment == -1)   return THREAD_PRIORITY_BELOW_NORMAL;
     else if (increment == 0)    return THREAD_PRIORITY_NORMAL;
     else if (increment == 1)    return THREAD_PRIORITY_ABOVE_NORMAL;
-    else if (increment <= 2)    return THREAD_PRIORITY_HIGHEST;
+    else if (increment < 16)    return THREAD_PRIORITY_HIGHEST;
     else                        return THREAD_PRIORITY_TIME_CRITICAL;
 }
 
 static LONG win32_priority_to_xbox(int priority)
 {
     switch (priority) {
-        case THREAD_PRIORITY_IDLE:          return -15;
+        case THREAD_PRIORITY_IDLE:          return -16;
         case THREAD_PRIORITY_LOWEST:        return -2;
         case THREAD_PRIORITY_BELOW_NORMAL:  return -1;
         case THREAD_PRIORITY_NORMAL:        return 0;
         case THREAD_PRIORITY_ABOVE_NORMAL:  return 1;
         case THREAD_PRIORITY_HIGHEST:       return 2;
-        case THREAD_PRIORITY_TIME_CRITICAL: return 15;
+        case THREAD_PRIORITY_TIME_CRITICAL: return 16;
         default:                            return 0;
     }
+}
+
+/* Set when SetThreadAffinityMask refuses the pin: the guest threads then run
+ * on every core whatever RECOMP_GUEST_CPUS says (xbox_GuestPriorityOn). */
+static volatile LONG s_guest_pin_failed;
+
+/*
+ * Whether the title's thread priorities reach its host threads and
+ * read back. Titles use priority as a lock: on the console's one
+ * CPU a time-critical thread runs alone. CRI's ADX in JSRF (and in BLiNX 2)
+ * locks by raising itself to time critical and saving its old priority in
+ * one global slot; its waits drop every lock with "while
+ * (GetThreadPriority(self) == TIME_CRITICAL) unlock()". That holds only where
+ * a time-critical thread really excludes the others: native Windows, guest
+ * threads pinned to one core, and no guest CPU lock, whose handover
+ * (RECOMP_GUEST_LOCK) is FIFO and blind to priority. Wine does not make a
+ * time-critical thread exclusive (at most a nice value, which the Linux
+ * scheduler still shares out; on the Deck every thread stayed at nice 0) and
+ * the POSIX shim only records the value, so two threads took the ADX lock
+ * at once there, one restored the other's saved priority, and a thread left
+ * time critical with the count at zero spun in that loop for good (the DJ
+ * scene's music stuck). Where priorities do not exclude, the bridges leave
+ * them alone and report 0, as every title ran before the bridges resolved them. mode is
+ * guest_priority: 0 never, 1 where honoured (default), 2 always (the A/B
+ * that reproduces the stuck DJ music).
+ */
+int xbox_GuestPriorityPolicy(long mode, int host_strict, int one_core,
+                             int guest_lock)
+{
+    if (mode == 0)
+        return 0;
+    if (mode >= 2)
+        return 1;
+    return host_strict && one_core && !guest_lock;
+}
+
+/* Read by every guest thread; atomic so the lazy fill is not a data race
+ * (each racer computes the same value). -1: not decided yet. */
+static volatile LONG s_guest_priority = -1;
+
+int xbox_GuestPriorityOn(void)
+{
+    LONG v = InterlockedCompareExchange(&s_guest_priority, -1, -1);
+
+    if (v < 0) {
+#ifdef _WIN32
+        int strict = !xbox_HostUnderWine();
+#else
+        int strict = 0;
+#endif
+        int one_core = xbox_GuestCpuMask() != 0
+            && !InterlockedCompareExchange(&s_guest_pin_failed, 0, 0);
+
+        v = xbox_GuestPriorityPolicy(recomp_env_int(RENV_GUEST_PRIORITY, 1),
+                                     strict, one_core, xbox_GuestCpuOn());
+        InterlockedExchange(&s_guest_priority, v);
+    }
+    return (int)v;
+}
+
+void xbox_GuestPriorityReloadConfig(void)
+{
+    InterlockedExchange(&s_guest_priority, -1);
 }
 
 LONG __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment)
@@ -454,13 +572,14 @@ void xbox_worker_stack_free(int slot)
  * The console has one CPU, and titles lean on it: two threads of equal
  * priority only interleave at a quantum boundary or a wait, so a short
  * read-modify-write on a shared global never sees the other thread's half.
- * A title's level load can spawn a loader thread that, with the main
- * thread, adds entries to one global pool with "slot = count; fill; count =
- * slot + 1". On two host cores the two loops run at the same time and lose
- * each other's entries. Pinning every guest thread to one core gives the
- * console's interleaving back: the host still preempts at its tick, but
- * inside a window of a few instructions that is as rare as it was on the
- * hardware.
+ * One title's level load spawns a loader thread, and both it and the main
+ * thread add lights to one global pool with "slot = count; fill; count =
+ * slot + 1". On two host cores the two loops ran at the same time and lost
+ * each other's entries, and every terrain piece baked from the mangled pool
+ * came out black. Pinning every guest thread
+ * to one core gives the console's interleaving back: the host still
+ * preempts at its tick, but inside a window of a few instructions that is
+ * as rare as it was on the hardware.
  *
  * Pinned: the main guest thread and every PsCreateSystemThreadEx worker,
  * the threads the title schedules. Not pinned: the kernel timer thread,
@@ -470,29 +589,31 @@ void xbox_worker_stack_free(int slot)
  * on the console ran between any two instructions of the thread they
  * interrupted; the gate already orders them against guest code at
  * DISPATCH_LEVEL, and putting them on the guest core would queue a DPC
- * behind a main thread spinning in its frame wait. The GPU and the audio
- * keep their cores for the same reason.
+ * behind a main thread spinning in its frame wait, the latency the
+ * DPC-on-raise work (kernel_hal.c) removed. The GPU and the audio keep
+ * their cores for the same reason.
  *
  * Opt-in, like the one-CPU gate it was made beside: RECOMP_GUEST_CPUS=one
  * pins to the lowest core the process may use, =<n> picks the core (cpu 0
  * takes most of the IRQ work on Linux). Unset or =all, the title's threads
- * go wherever the host scheduler puts them, as before.
+ * go wherever the host scheduler puts them.
  */
 DWORD_PTR xbox_GuestCpuMask(void)
 {
-    const char *mode = getenv("RECOMP_GUEST_CPUS");
+    const char *mode = recomp_env(RENV_GUEST_CPUS);
     DWORD_PTR proc = 0, sys = 0;
 
     if (!mode || !*mode || !strcmp(mode, "all"))
         return 0;
     if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc)
         return 0;
+    /* =<n>: that core, when the process may use it; =one: the lowest. */
     if (*mode >= '0' && *mode <= '9') {
         long n = strtol(mode, NULL, 10);
         if (n >= 0 && n < (long)(8 * sizeof proc) && (proc & ((DWORD_PTR)1 << n)))
             return (DWORD_PTR)1 << n;
-        fprintf(stderr, "  [KERNEL] RECOMP_GUEST_CPUS=%s: not a core the process"
-                        " may use (mask %#lx); taking the lowest\n", mode,
+        fprintf(stderr, "  [KERNEL] RECOMP_GUEST_CPUS=%s: not a core the process may"
+                        " use (mask %#lx); taking the lowest\n", mode,
                 (unsigned long)proc);
     }
     /* The lowest core the process may use: fixed, so every thread lands
@@ -511,6 +632,9 @@ void xbox_GuestThreadPin(const char *role)
     while (!((mask >> core) & 1))
         core++;
     if (!SetThreadAffinityMask(GetCurrentThread(), mask)) {
+        /* Not one core after all: priorities would not exclude. */
+        if (!InterlockedExchange(&s_guest_pin_failed, 1))
+            xbox_GuestPriorityReloadConfig();
         if (!failed) {
             failed = 1;
             fprintf(stderr, "  [KERNEL] guest threads: this host sets no thread"
@@ -523,7 +647,7 @@ void xbox_GuestThreadPin(const char *role)
         announced = 1;
         fprintf(stderr, "  [KERNEL] guest threads on one host core (cpu %d),"
                         " as on the console (RECOMP_GUEST_CPUS=%s)\n",
-                core, getenv("RECOMP_GUEST_CPUS"));
+                core, recomp_env(RENV_GUEST_CPUS));
         fflush(stderr);
     }
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "guest thread %s on cpu %d",

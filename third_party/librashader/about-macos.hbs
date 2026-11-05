@@ -1,0 +1,20 @@
+Crates
+======
+
+Every Rust crate in the build graph of upstream's librashader.dylib
+(librashader-capi with its default features, runtime-all, for
+aarch64-apple-darwin and x86_64-apple-darwin; its Cargo.lock at the v0.12.0
+tag), grouped by licence text. Some of them (the Direct3D runtimes,
+d3d12-descriptor-heap, the windows-* crates) only build on Windows; the
+graph does not gate them by target, so they are listed too. Where a crate offers a choice, the first one in the accepted list of
+xboxrecomp's third_party/librashader/about.toml is used.
+{{#each licenses}}
+
+================================================================================
+{{{name}}} ({{{id}}})
+Used by:
+{{#each used_by}}  {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+--------------------------------------------------------------------------------
+{{{text}}}
+{{/each}}

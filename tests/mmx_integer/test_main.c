@@ -198,7 +198,7 @@ int main(void)
 int main(void)
 {
     printf("no MMX intrinsics on this host: nothing to compare against, skipped\n");
-    return 0;
+    return 77; /* ctest's SKIP_RETURN_CODE, so a skip never reads as a pass */
 }
 
 #endif

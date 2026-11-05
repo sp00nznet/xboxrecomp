@@ -31,7 +31,7 @@ See the [Changelog](#changelog) for what landed and when.
 
 This is a complete toolkit for **statically recompiling original Xbox (2001-2005) games** from their retail XBE executables into native programs: Windows first, with Linux and macOS (x86-64 and arm64) hosts too.
 
-Static recompilation takes the raw x86 machine code from an Xbox binary and translates every function — every `mov`, every `jmp`, every `call` — into equivalent C source code. That C code compiles with MSVC into a native x86-64 `.exe` that runs on modern Windows; the runtime libraries also build on Linux and macOS, x86-64 or arm64, with SDL2 and OpenGL standing in for Win32 and D3D11. The game's original logic executes directly on your CPU, not through an interpreter or JIT compiler.
+Static recompilation takes the raw x86 machine code from an Xbox binary and translates every function — every `mov`, every `jmp`, every `call` — into equivalent C source code. That C code compiles with MSVC into a native x86-64 `.exe` that runs on modern Windows; the runtime libraries also build on Linux and macOS, x86-64 or arm64, with SDL3 and OpenGL standing in for Win32 and D3D11. The game's original logic executes directly on your CPU, not through an interpreter or JIT compiler.
 
 **This is the first *public* static recompilation toolkit for the original Xbox.**
 Microsoft got here first: their internal Ficl/Fission recompiler shipped Xbox
@@ -98,13 +98,14 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 | Library | Source | What It Does |
 |---------|--------|-------------|
 | **xbox_kernel** | Custom | Xbox kernel → Win32 (all 371 ordinals routed: 347 `bridge_*` functions + 24 data exports — memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus), plus the NV2A pushbuffer executor for titles that statically link the XDK's D3D |
-| **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions. On Linux/macOS a separate OpenGL 3.3 back end (SDL2 + libepoxy, `d3d8_gl.c`) |
+| **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions. On Linux/macOS a separate OpenGL 3.3 back end (SDL3 + libepoxy, `d3d8_gl.c`) |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
-| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF). Output through XAudio2 (waveOut fallback) on Windows, SDL2 elsewhere. The GP DSP doorbell ack is derived by default (`RECOMP_APU_DSP_ACK=auto`; an explicit address, or `0`/`off`, still overrides) |
+| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF). On by default (`RECOMP_AC97_READY`) on x86-64 Windows/Proton (XAudio2) and on macOS/Linux arm64 (SDL3, A64 MMIO decoder); off on x86-64 POSIX. The GP DSP doorbell ack is derived by default (`RECOMP_APU_DSP_ACK=auto`; an explicit address, or `0`/`off`, still overrides). The GP and EP run the title's DSP programs on the [dsp56300](https://github.com/xemu-project/dsp56300) JIT by default, on every target with a prebuilt archive (`XBOXRECOMP_APU_DSP`; `RECOMP_APU_DSP=0` picks the stub) |
 | **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
+| **NV2A pushbuffer executor** *(in xbox_kernel)* | Custom | One pushbuffer walker (`nv2a_pb_scan.c`) behind a backend seam (`nv2a_pb_state.h`): a CPU rasteriser on every host (vertex programs, combiners, bilinear, threaded rows), **D3D11** on Windows and **Metal** on macOS. Vertex microcode and the combiners each have one decoder (`nv2a_vsh_fields.h`, `nv2a_combiner.h`) shared by the CPU path and both shader generators (HLSL, MSL) |
 | **xbox_input** | Custom | Xbox gamepad → XInput, plus the keyboard as the port-0 pad (`RECOMP_KEYBOARD=1`) with one key map on every host |
 | **xbox_usb** | Custom | MCPX OHCI host controllers, so a title's statically linked XAPI finds a pad |
-| **xbox_video** | Custom | FMV playback: Media Foundation decode onto a D3D8 texture, plus a window on the guest framebuffer. For titles whose video is a container Windows already decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays. Linux/macOS get the framebuffer window (SDL2) but no decoder |
+| **xbox_video** | Custom | FMV playback: Media Foundation decode onto a D3D8 texture, plus a window on the guest framebuffer. For titles whose video is a container Windows already decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays |
 
 ### Building the Libraries
 
@@ -156,7 +157,7 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 │  │D3D11  │ │mixer  │ │(xemu)  │ │(xemu)│ │XInput│
 │  └───────┘ └───────┘ └────────┘ └──────┘ └─────┘│
 ├──────────────────────────────────────────────────┤
-│  Windows: D3D11/XInput/XAudio2; POSIX: SDL2/GL   │
+│  Windows: D3D11/XInput/XAudio2; POSIX: SDL3/GL   │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -164,9 +165,8 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 
 ### Prerequisites
 
-- **Windows 11/10** (D3D11 backend) — or **Linux** / **macOS**, x86-64 or arm64 (OpenGL + SDL2 backend)
-- **Linux**: `tools/linux/install_deps.sh` installs the build dependencies
-- **macOS**: `tools/macos/setup.sh` (Homebrew SDL2 + libepoxy; `--test` adds the Docker images the conformance suite needs)
+- **Windows 11/10** (D3D11 backend) — or **Linux** (OpenGL backend; `tools/linux/install_deps.sh`)
+- **macOS**: homebrew, docker `tools/macos/setup.sh` (Metal backend, or the CPU rasteriser)
 - **Python 3.10+** with `capstone` (`pip install capstone`)
 - **Visual Studio 2022** (MSVC compiler) on Windows; Clang or GCC elsewhere
 - **CMake 3.20+**
@@ -494,7 +494,13 @@ ones under Proton as ctest's emulator; its header has the commands.
 The runtime libraries (C) use:
 - MSVC (Visual Studio 2022) or MinGW-w64 on Windows; Clang or GCC on Linux/macOS
 - Windows SDK (D3D11, DXGI, XInput, XAudio2, waveOut, Media Foundation)
-- Linux/macOS: SDL2, libepoxy, pkg-config
+- Linux/macOS: SDL3 (3.2 or newer), libepoxy, pkg-config
+  - SDL3 packages: Homebrew `sdl3`, Fedora 41+, Ubuntu 25.04+, Debian 13 and
+    Arch. On Ubuntu 24.04 or Debian 12, build SDL3 from its release tarball:
+    `cmake -S SDL3-<ver> -B build && cmake --build build && cmake --install build`,
+    then point CMake at it with `SDL3_DIR` or `CMAKE_PREFIX_PATH`.
+  - SDL3 reads `SDL_AUDIO_DRIVER` and `SDL_VIDEO_DRIVER`; the runtime still
+    accepts SDL2's `SDL_AUDIODRIVER` and `SDL_VIDEODRIVER`.
 - CMake 3.20+
 - No other external dependencies — all hardware emulation code is self-contained
 
@@ -524,6 +530,9 @@ licence:
 |---|---|---|
 | the MCPX APU sources in `src/apu/` | LGPL-2.1-or-later | espes; Jannik Vogel; Matt Borgerson |
 | `src/nv2a/nv2a_regs.h` | LGPL-2.1-or-later | espes; Jannik Vogel |
+| microui in `third_party/microui/` | MIT | rxi |
+| stb in `third_party/stb/` | MIT or public domain | Sean Barrett |
+| Atkinson Hyperlegible in `third_party/fonts/` | SIL OFL 1.1 | Braille Institute of America |
 | everything else | MIT | sp00nz and contributors |
 
 The APU and the NV2A register definitions were extracted from
@@ -684,7 +693,7 @@ below was looked at twice.*
   - `RECOMP_DISPATCH_GATE=1`: a one-CPU DISPATCH gate, with DPCs at the raise
     and interrupts at safe points.
   - `RECOMP_VBLANK=paced`: a 60 Hz vblank schedule with an ack thread.
-  - `RECOMP_FLIP_PACING=1`: flips held to the guest's vblank.
+  - `RECOMP_FLIP_PACING=1`: flips held to the guest's vblank (on by default with `RECOMP_DETERMINISTIC=1`).
   - `RECOMP_GUEST_CPUS=<n>`: guest threads pinned to fewer cores.
   - The lifter's `--back-edge-yield`: loop checks for the guest CPU
     scheduler.
@@ -854,6 +863,18 @@ the Darwin mapping fix against its own regression suite before approving it.
 On Black, DirectSound waited forever for an interrupt the APU never raised.
 Most of these bugs live in shared code and would have reached any title. They
 were found on other people's machines.*
+
+> **This fork** (`posix-host/portability`) differs from v0.14.0 in a few
+> places. The pushbuffer executor is the fork's own (a CPU rasteriser, D3D11
+> and Metal behind `nv2a_pb_state.h`), so #162's fixed-function T&L,
+> anti-aliased surfaces, render back ends and `RECOMP_PB_WALK=dma` are not in
+> it, nor is `RECOMP_VSH_DUMP`. `RECOMP_MKB` is not in it either: the fork's
+> keyboard and mouse layer covers the same ground on every host. Windows
+> always reserves the guest window as one placeholder (there is no
+> `RECOMP_WIN_PLACEHOLDER`), freed contiguous memory is always reused, and
+> every knob is read through `recomp_env` (the missing-file report is
+> `RECOMP_TRACE=missing`; `RECOMP_MISSING_FILES` and
+> `RECOMP_MISSING_FILES_LIST` still work as old names).
 
 **Contributed: lifter and recompiler**
 
@@ -1189,7 +1210,7 @@ its own D3D8LTCG. All by [@sp00nznet](https://github.com/sp00nznet).*
 - The DPC queue is locked, and `KDPC.Inserted` is honoured (#155)
 - A game file the dump lacks is named once, `[FILE] missing <guest> ->
   <host>`, with a summary at exit; repeats of its FAILED line are counted,
-  not printed. `RECOMP_MISSING_FILES=all` also lists probes and every
+  not printed. `RECOMP_TRACE=missing=all` also lists probes and every
   attempt, `=0` turns it off. NtOpenFile and IoCreateFile log their failed
   opens (and, under `all`, their successes), and POSIX returns
   PATH_NOT_FOUND for a missing directory, as Win32 does
@@ -1214,9 +1235,11 @@ its own D3D8LTCG. All by [@sp00nznet](https://github.com/sp00nznet).*
   reports, near-plane clipping, bilinear filtering, and a threaded
   rasteriser (#152)
 - P8 textures sample through the stage palette (#145)
-- `RECOMP_PB_REPORT_MS` (#146); `RECOMP_FB_DUMP_FLIPS` dumps every flip for
-  recordings (#156)
-- The window title shows the XBE title, FPS and draws (#153)
+- `RECOMP_PB_REPORT_MS` (#146); `RECOMP_FB_DUMP_FLIPS=<n>` (with
+  `RECOMP_FB_DUMP`) dumps the finished frame at every nth flip that drew
+  something, up to 200 frames, for recordings (#156)
+- The window title shows the XBE title (or the name the game sets); FPS and
+  draws are added, once a second, only with `RECOMP_TRACE=title` (#153)
 
 **Held:** #162, the pushbuffer executor from the X-Men Legends split, is a
 draft and overlaps the executor that landed in #152; #128 is closed as split.
@@ -2069,8 +2092,8 @@ one title's WMV decoder as no-op comments.
   chain, without a run per level.
 - `RECOMP_WATCH_VA` — hardware watchpoint on a guest address, generalised from a
   single hardcoded one.
-- `RECOMP_PB_SCAN` / `RECOMP_PB_EXEC` — survey a title's NV2A pushbuffer and
-  execute its surface and clear methods. The survey ranks what is *not*
+- `RECOMP_TRACE=pb_scan` / `RECOMP_PB_EXEC` (on by default; `=0` turns it
+  off) — survey a title's NV2A pushbuffer and execute it. The survey ranks what is *not*
   implemented, so the remaining work is a list rather than a guess.
 - `RECOMP_FB_WINDOW` — a window on the guest framebuffer. Nothing else scans it
   out, so however much of the GPU works, none of it is observable without this.

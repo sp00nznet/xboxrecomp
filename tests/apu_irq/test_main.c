@@ -8,9 +8,9 @@
  * method on the next delivery); nothing after the resume brings it back; a
  * masked trap keeps the line low and an unarmed one does not trap.
  *
- * A trap only sets set_irq; the frame thread turns that into the line. An
- * ISTS write runs the same update, so a write of 0 (acks nothing) stands in
- * for the frame thread here. */
+ * A trap latches FETINTSTS in ISTS and sets set_irq; the frame thread turns
+ * that into the line. An ISTS write runs the same update, so a write of 0
+ * (acks nothing) stands in for the frame thread here. */
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_regs.h"

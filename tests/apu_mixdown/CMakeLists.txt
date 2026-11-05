@@ -8,16 +8,23 @@ target_include_directories(apu_mixdown_test PRIVATE ../../src ../../src/apu)
 # addresses through the kernel.
 target_link_libraries(apu_mixdown_test PRIVATE xboxrecomp)
 enable_testing()
-# Registered TWICE, on purpose. mcpx_apu_mixdown_all caches its getenv in a
-# static, so one process can only ever exercise one arm -- and an arm that
-# cannot fail is not a test. The off arm is the negative control: it must show
-# the effect bins really are discarded without this change, or the on arm
-# proves nothing.
-# The expectation is RECOMP_-prefixed so a Proton runner that forwards only
-# RECOMP_* variables into the prefix passes it on.
-add_test(NAME apu_mixdown_all COMMAND apu_mixdown_test)
-set_tests_properties(apu_mixdown_all PROPERTIES
-                     ENVIRONMENT "RECOMP_APU_MIXDOWN_ALL=1;RECOMP_TEST_MIXDOWN_EXPECT=1")
+# Registered once per mode, on purpose. mcpx_apu_mixdown_mode caches its
+# getenv in a static, so one process can only ever exercise one arm. The
+# two-bin arm is the negative control: it must show the bins above 1 really
+# are discarded without the wider mixdown, or the other arms prove nothing.
+# The expectation is RECOMP_-prefixed so tests/proton_run.sh, which forwards
+# only RECOMP_* and HLSL_* into Proton, passes it on.
+add_test(NAME apu_mixdown_staged COMMAND apu_mixdown_test)
+set_tests_properties(apu_mixdown_staged PROPERTIES
+                     ENVIRONMENT "RECOMP_DEBUG=;RECOMP_TEST_MIXDOWN_EXPECT=1")
+add_test(NAME apu_mixdown_unity COMMAND apu_mixdown_test)
+set_tests_properties(apu_mixdown_unity PROPERTIES
+                     ENVIRONMENT "RECOMP_DEBUG=apu_mixdown_all=2;RECOMP_TEST_MIXDOWN_EXPECT=2")
 add_test(NAME apu_mixdown_two_bins COMMAND apu_mixdown_test)
 set_tests_properties(apu_mixdown_two_bins PROPERTIES
-                     ENVIRONMENT "RECOMP_APU_MIXDOWN_ALL=0;RECOMP_TEST_MIXDOWN_EXPECT=0")
+                     ENVIRONMENT "RECOMP_DEBUG=apu_mixdown_all=0;RECOMP_TEST_MIXDOWN_EXPECT=0")
+
+# The stub's path under test: in a build with the APU DSP the JIT is the
+# run-time default, so every test here asks for the stub.
+get_property(_stub_tests DIRECTORY PROPERTY TESTS)
+set_property(TEST ${_stub_tests} APPEND PROPERTY ENVIRONMENT RECOMP_APU_DSP=0)

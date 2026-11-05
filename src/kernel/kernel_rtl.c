@@ -8,8 +8,10 @@
  */
 
 #include "kernel.h"
+#include "recomp_env.h"
 /* RECOMP_TLS, and the guest stack pointer the contention report walks. */
 #include "xbox_memory_layout.h"
+#include "kernel_guest_unwind.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -249,10 +251,10 @@ static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
 static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
 {
     if (g_cs_single_mode < 0) {
-        const char* mode = getenv("RECOMP_CS_MODE");
+        const char* mode = recomp_env(RENV_CS_MODE);
         g_cs_single_mode = (mode && !strcmp(mode, "single")) ? 1 : 0;
         if (g_cs_single_mode)
-            fprintf(stderr, "  [CS] RECOMP_CS_MODE=single: every guest lock "
+            fprintf(stderr, "  [CS] cs_mode=single: every guest lock "
                             "shares one recursive lock\n");
     }
     if (g_cs_single_mode) {
@@ -401,7 +403,7 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
     uint32_t va;
 
     if (enabled < 0) {
-        const char *v = getenv("RECOMP_CS_TRACE_CRT");
+        const char *v = recomp_env(RENV_CS_TRACE_CRT);
         enabled = v != NULL;
         all = v && !strcmp(v, "all");
     }
@@ -422,7 +424,7 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
         static int watch = -1;
         static uint32_t watch_va;
         if (watch < 0) {
-            const char *w = getenv("RECOMP_CS_WATCH");
+            const char *w = recomp_env(RENV_CS_WATCH);
             watch = w != NULL;
             watch_va = w ? (uint32_t)strtoul(w, NULL, 0) : 0;
         }
@@ -449,11 +451,18 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
 
 extern RECOMP_TLS uint32_t g_xbox_kernel_caller;
 
+/* RECOMP_CS_MODE=single's lock has no slot to say who holds it; the guest
+ * unwind still has to let go of this thread's recursions on it. */
+static RECOMP_TLS long t_cs_single_depth;
+
 static void xbox_cs_note_owner(CRITICAL_SECTION* cs)
 {
     XBOX_CS_SLOT* slot = xbox_cs_slot_of(cs);
-    if (!slot)
+    if (!slot) {
+        if (cs == &g_cs_single)
+            t_cs_single_depth++;
         return;
+    }
     slot->owner_site = g_xbox_kernel_caller;
     slot->owner_tid  = GetCurrentThreadId();
     slot->depth++;
@@ -462,12 +471,23 @@ static void xbox_cs_note_owner(CRITICAL_SECTION* cs)
 static void xbox_cs_clear_owner(CRITICAL_SECTION* cs)
 {
     XBOX_CS_SLOT* slot = xbox_cs_slot_of(cs);
-    if (!slot)
+    if (!slot) {
+        if (cs == &g_cs_single && t_cs_single_depth > 0)
+            t_cs_single_depth--;
         return;
+    }
     if (--slot->depth <= 0) {
         slot->depth = 0;
         slot->owner_tid = 0;
     }
+}
+
+/* The deterministic ring: the holder is another guest thread, which needs
+ * the turn to get out, so the waiter hands it on and retries each time the
+ * turn comes back. */
+static int cs_det_try(void *ctx)
+{
+    return TryEnterCriticalSection((CRITICAL_SECTION *)ctx) != 0;
 }
 
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
@@ -512,9 +532,20 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     }
     /* Contended: the holder is a guest thread that needs the CPU to leave
      * it (RECOMP_GUEST_LOCK), so tell the waiters the CPU is free now. */
-    xbox_GuestCpuBlocked();
-    EnterCriticalSection(cs);
+    if (xbox_GuestDetThread())
+        xbox_GuestDetBlock(cs_det_try, cs, 0,
+                           (uint32_t)((uintptr_t)CriticalSection
+                                      - (uintptr_t)g_xbox_mem_offset));
+    else {
+        xbox_GuestCpuBlocked();
+        EnterCriticalSection(cs);
+    }
     xbox_cs_note_owner(cs);
+    /* A reset that came while this thread waited: the lock is noted as its
+     * own, so the unwind lets go of it with the rest. */
+    xbox_GuestUnwindPoint(XBOX_UNWIND_CS,
+                          (uint32_t)((uintptr_t)CriticalSection
+                                     - (uintptr_t)g_xbox_mem_offset));
     if (g_cs_contention_reports <= 16) {
         fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",
                 GetCurrentThreadId(),
@@ -533,6 +564,54 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         xbox_cs_clear_owner(cs);
         LeaveCriticalSection(cs);
     }
+}
+
+/* The guest unwind (kernel_guest_unwind.h): a thread leaving guest code for
+ * a reset lets go of every guest lock it holds, each recursion, so the
+ * threads that outlive the jump (the boot loop, a host thread) are not left
+ * waiting on an owner that is gone. Only the owner writes its slots' owner
+ * and depth, so reading them here without the table lock is safe. */
+int xbox_RtlCsReleaseOwned(void)
+{
+    unsigned long me = GetCurrentThreadId();
+    int released = 0;
+    size_t i;
+
+    for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
+        XBOX_CS_SLOT* slot = &g_cs_table[i];
+        if (!slot->key || slot->owner_tid != me)
+            continue;
+        while (slot->owner_tid == me && slot->depth > 0) {
+            xbox_cs_clear_owner(&slot->cs);
+            LeaveCriticalSection(&slot->cs);
+            released++;
+        }
+    }
+    while (t_cs_single_depth > 0) {
+        t_cs_single_depth--;
+        LeaveCriticalSection(&g_cs_single);
+        released++;
+    }
+    return released;
+}
+
+/* The records outlive their thread when it ends holding a lock, and the
+ * host reuses thread ids: a later thread with this id would read them as
+ * its own and leave a lock it never took. Each thread clears its own at its
+ * part (the lock itself stays held, as a dead owner's does). */
+void xbox_RtlCsForgetOwned(void)
+{
+    unsigned long me = GetCurrentThreadId();
+    size_t i;
+
+    for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
+        XBOX_CS_SLOT* slot = &g_cs_table[i];
+        if (slot->key && slot->owner_tid == me) {
+            slot->depth = 0;
+            slot->owner_tid = 0;
+        }
+    }
+    t_cs_single_depth = 0;
 }
 
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)

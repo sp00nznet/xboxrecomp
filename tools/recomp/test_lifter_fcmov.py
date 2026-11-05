@@ -64,7 +64,10 @@ def test_msvc_min_idiom_moves_under_the_test_flags():
     assert "FPU: fcmove" not in body, body
     # je after `test ah, 1` is ZF = ((ah & 1) == 0).
     assert move[0].startswith("if (") and "fp_top() = fp_st1();" in move[0], move[0]
-    assert "TEST_Z" in move[0] or "== 0" in move[0], move[0]
+    # The fork lifts `test` as a cmp of (ah & 1) against 0, so ZF reads as
+    # CMP_EQ(_fa, _fb) there.
+    assert ("TEST_Z" in move[0] or "== 0" in move[0]
+            or "CMP_EQ(_fa, _fb)" in move[0]), move[0]
 
 
 def test_every_form_moves_its_source_register():

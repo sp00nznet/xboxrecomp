@@ -65,6 +65,11 @@ way to get this subtly wrong.
 | Combiner → HLSL | `src/d3d/d3d8_combiners.c`, `src/d3d/d3d8_combiners.h` |
 | Vertex microcode → HLSL | `src/nv2a/nv2a_pgraph_d3d11.c` |
 | Texture unswizzling | `src/d3d/d3d8_swizzle.h` |
+| Pushbuffer path: vertex microcode field table (one decoder) | `src/kernel/nv2a_vsh_fields.h` |
+| Pushbuffer path: combiner field table and CPU evaluator (one decoder) | `src/kernel/nv2a_combiner.h`, `src/kernel/nv2a_combiner.c` |
+| Pushbuffer path: parsers shared by both generators | `src/d3d/d3d8_vsh_parse.c`, `src/d3d/d3d8_combiners_parse.c` |
+| Pushbuffer path: HLSL (D3D11) and MSL (Metal, macOS) emitters | `src/d3d/d3d8_vsh_hlsl.c`, `src/d3d/d3d8_combiners_hlsl.c`, `src/d3d/d3d8_vsh_msl.c`, `src/d3d/d3d8_combiners_msl.c` |
+| Pushbuffer path: CPU vertex interpreter | `src/kernel/nv2a_vsh_cpu.c` |
 
 `d3d8_combiners.h` and `d3d8_swizzle.h` cite xemu as a reference for the
 hardware's behaviour; both are our own implementations. See [NOTICE](../../NOTICE).

@@ -1,0 +1,24 @@
+{"schema": 1, "api": 8, "mods": [
+  {"id": "fly", "title": "Free camera", "summary": "Fly the camera", "author": "tests", "version": "1.0", "descriptor": true, "init": "no", "enable": "fly.enabled", "settings": [
+      {"name": "enabled", "key": "fly.enabled", "kind": "enum", "label": "Free camera", "enable": true, "default": "off", "choices": ["off", "on"], "live": "restart", "value": "off", "source": "default"},
+      {"name": "speed", "key": "mods.fly.speed", "kind": "float", "label": "Speed", "help": "Fly speed", "unit": "x", "default": 1, "lo": 0.05, "hi": 20, "step": 0.05, "live": "live", "env": "RECOMP_APU_HRTF", "aliases": ["fly.old_speed"], "value": 1, "source": "default"},
+      {"name": "count", "key": "mods.fly.count", "kind": "int", "label": "Count", "default": 3, "lo": 1, "hi": 10, "live": "restart", "value": 3, "source": "default"},
+      {"name": "hud", "key": "mods.fly.hud", "kind": "enum", "label": "HUD \"while flying\"", "default": "keep", "choices": ["keep", "hide"], "live": "activate", "value": "hide", "source": "user"},
+      {"name": "smooth", "key": "mods.fly.smooth", "kind": "bool", "default": true, "live": "live", "value": true, "source": "default"}], "controls": [
+      {"id": "toggle", "kind": "action", "action": "fly.toggle", "label": "Toggle", "when": null, "defaults": ["F6"], "bindings": ["F6"], "env": "RECOMP_EXT_VMA", "source": "default"},
+      {"id": "move", "kind": "stick", "label": "Move", "when": "while flying", "defaults": ["left_stick"], "bindings": ["w", "a", "s", "d"], "aliases": ["fly.move_keys"], "source": "user"},
+      {"id": "look", "kind": "info", "label": "Mouse: look", "when": null}]},
+  {"id": "probe", "title": "Probe", "descriptor": true, "init": "yes", "settings": [
+      {"name": "a", "key": "mods.probe.a", "kind": "float", "default": 0, "lo": 0, "hi": 100, "live": "live", "env": "RECOMP_HEAP_QUARANTINE", "value": 7, "source": "env"},
+      {"name": "b", "key": "mods.probe.b", "kind": "float", "default": 0, "lo": 0, "hi": 100, "live": "live", "value": 2, "source": "user"},
+      {"name": "c", "key": "mods.probe.c", "kind": "float", "default": 0, "lo": 0, "hi": 100, "live": "live", "aliases": ["probe.old_c"], "value": 3, "source": "user_alias"},
+      {"name": "d", "key": "mods.probe.d", "kind": "float", "default": 0, "lo": 0, "hi": 100, "live": "live", "value": 4, "source": "defaults"},
+      {"name": "e", "key": "mods.probe.e", "kind": "float", "default": 0, "lo": 0, "hi": 100, "live": "live", "aliases": ["probe.old_e"], "value": 5.25, "source": "defaults_alias"},
+      {"name": "f", "key": "mods.probe.f", "kind": "float", "default": 0, "lo": 0, "hi": 100, "live": "live", "value": 0, "source": "default"},
+      {"name": "slow", "key": "mods.probe.slow", "kind": "int", "default": 2, "lo": 0, "hi": 9, "step": 1, "live": "restart", "value": 2, "source": "default"}], "controls": []},
+  {"id": "dorm", "title": "Dormant", "descriptor": true, "init": "dormant", "enable": "mods.dorm.on", "settings": [
+      {"name": "on", "key": "mods.dorm.on", "kind": "bool", "enable": true, "default": false, "live": "live", "value": false, "source": "default"}], "controls": [
+      {"id": "go", "kind": "action", "action": "dorm.go", "label": "Go", "when": null, "defaults": ["F7"], "bindings": ["F7", "NoSuchKey"], "refused": ["NoSuchKey"], "source": "user"}]},
+  {"id": "bad", "descriptor": true, "init": "failed", "reason": "setting 'x': lo 9 > hi 1"},
+  {"id": "legacy", "descriptor": false}
+], "shaders": {"active": "none", "presets": [], "active_profile": "none", "profiles": []}}

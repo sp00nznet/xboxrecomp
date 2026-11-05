@@ -12,6 +12,7 @@
  */
 
 #include <stdio.h>
+#include "recomp_env.h"
 #include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -30,7 +31,7 @@ static long trace_budget(void)
 {
     static long budget = -1;
     if (budget < 0) {
-        const char *env = getenv("RECOMP_TRACE_BUDGET");
+        const char *env = recomp_env(RENV_TRACE_BUDGET);
         budget = env ? strtol(env, NULL, 0) : 400000;
         if (budget < 0) budget = 0;
     }
@@ -100,7 +101,7 @@ static unsigned long long prof_interval(void)
 {
     static unsigned long long every;
     if (!every) {
-        const char *v = getenv("RECOMP_TRACE_PROFILE");
+        const char *v = recomp_env(RENV_TRACE_PROFILE);
         unsigned long long n = v ? strtoull(v, NULL, 0) : 0;
         every = n > 1 ? n : 20000000ull;
     }
@@ -111,7 +112,7 @@ static int prof_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
-        on = getenv("RECOMP_TRACE_PROFILE") ? 1 : 0;
+        on = recomp_env(RENV_TRACE_PROFILE) ? 1 : 0;
         if (on)
             atexit(prof_report);
     }
@@ -160,9 +161,9 @@ void recomp_trace_enter(const char *name, uint32_t va)
     /* The stack arguments too, when asked. Registers alone do not say which
      * argument arrived null, and for a function with a long argument list,
      * counting pushes back from the call site is guesswork. */
-    if (getenv("RECOMP_TRACE_ARGS")) {
+    if (recomp_env(RENV_TRACE_ARGS)) {
         const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-        int n = atoi(getenv("RECOMP_TRACE_ARGS"));
+        int n = atoi(recomp_env(RENV_TRACE_ARGS));
         int i;
 
         if (n <= 0 || n > 32)
@@ -178,7 +179,7 @@ void recomp_trace_enter(const char *name, uint32_t va)
         /* Follow the pointer arguments one level. A matrix that arrives as
          * NaN was copied from somewhere, and the object it came from is what
          * needs looking at -- the value alone says only that it is wrong. */
-        if (getenv("RECOMP_TRACE_DEREF")) {
+        if (recomp_env(RENV_TRACE_DEREF)) {
             for (i = 1; i <= n; i++) {
                 uint32_t a = *(const uint32_t *)(mem + g_esp + i * 4);
                 int k;

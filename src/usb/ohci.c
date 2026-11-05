@@ -7,12 +7,14 @@
  * that decides how the rest gets built.
  */
 #include "ohci.h"
+#include "recomp_env.h"
 #include "../platform/mmio_decode.h"
 #include "../platform/mmio_decode_a64.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
+#include "../kernel/guest_time.h"   /* the virtual clock's ms (deterministic) */
+#include "../kernel/kernel_guest_unwind.h"
 #include "usb_gamepad.h"
-#include "../input/xinput_xbox.h"   /* xbox_InputSetState: rumble */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,10 +23,11 @@
 
 /* Where the registers can be trapped. They are answered by faulting on the
  * aperture and decoding the instruction that touched it: the x86-64 decoder
- * under a Win32 VEH, or the A64 decoder under a POSIX SIGBUS/SIGSEGV
- * handler. A host with neither leaves the model off (see xbox_OhciInit). */
-#if defined(_WIN32)
-#  define OHCI_TRAP_WIN32 1
+ * under a Win32 VEH or an x86-64 Linux SIGSEGV handler, or the A64 decoder
+ * under a POSIX SIGBUS/SIGSEGV handler. A host with neither leaves the model
+ * off (see xbox_OhciInit). */
+#if defined(MMIO_DECODE_X64)
+#  define OHCI_TRAP_X64 1
 #elif defined(__aarch64__)
 #  define OHCI_TRAP_POSIX_A64 1
 #endif
@@ -135,7 +138,9 @@ static void wr32(uint32_t va, uint32_t v);
 
 /* Passes this thread will keep an interrupt back while the guest is at
  * DISPATCH_LEVEL or above. One pass is the OHCI_TICK_MS (4 ms) loop tick, so
- * this is two seconds.
+ * this is two seconds. Under RECOMP_DEBUG=deterministic a pass is one vblank
+ * step instead, so the same count is about 8.3 s of virtual time: still a
+ * bound, and a slow section is still not mistaken for a stuck one.
  *
  * It was 80 ms, on the reasoning that no real critical section lasts longer.
  * True of the hardware and false here: recompiled code under an emulated
@@ -182,12 +187,30 @@ static int s_device_hc;
  * 1-4). Which slot XAPI gives a pad is decided by its port: see OHCI_PORTS. */
 static unsigned s_ndp = OHCI_PORTS;
 static int s_npads = 1;          /* RECOMP_USB_PADS */
+static int s_npads_set;          /* ... and whether it was given */
 static int s_enabled;
 static int s_trace;
 
 static uint32_t *reg_of(OhciController *hc, uint32_t off)
 {
     return (off < OHCI_REG_MAX) ? &hc->reg[off / 4] : NULL;
+}
+
+/* Status bits change on two threads: the controller thread latches them
+ * (a done queue, a frame, a pad arriving or leaving) while the guest's own
+ * MMIO writes clear them, write-1-to-clear. A plain |= or &= on either side
+ * is a read, a gap and a write, and a bit the other thread set in that gap
+ * is lost: a dropped RHSC is a pad that arrives or leaves and nobody hears
+ * of it. Every update of HcInterruptStatus and the port-status words goes
+ * through these. */
+static void reg_set(uint32_t *r, uint32_t bits)
+{
+    __atomic_fetch_or(r, bits, __ATOMIC_SEQ_CST);
+}
+
+static void reg_clear(uint32_t *r, uint32_t bits)
+{
+    __atomic_fetch_and(r, ~bits, __ATOMIC_SEQ_CST);
 }
 
 /* ---- register semantics ------------------------------------------------ */
@@ -280,7 +303,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
                 wr32(hcca + HCCA_DONE_HEAD, 0);
             hc->reg[HcDoneHead / 4] = 0;
         }
-        *r &= ~v;                       /* write 1 to clear                 */
+        reg_clear(r, v);                /* write 1 to clear                 */
         hc->ack_seq++;
         return;
 
@@ -331,12 +354,12 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
          * reset the port again, and enumeration looped forever one step from
          * finishing. The port looked healthy the whole time: connected,
          * enabled, powered. */
-        *ps &= ~(v & 0xFFFF0000u);
+        reg_clear(ps, v & 0xFFFF0000u);
 
-        if (v & PORT_W_CCS_CLEAR_ENABLE) *ps &= ~PORT_PES;
-        if (v & PORT_W_PES_SET_ENABLE)   *ps |= (*ps & PORT_CCS) ? PORT_PES : 0;
-        if (v & PORT_W_PPS_SET_POWER)    *ps |= PORT_PPS;
-        if (v & PORT_W_CLEAR_POWER)      *ps &= ~PORT_PPS;
+        if (v & PORT_W_CCS_CLEAR_ENABLE) reg_clear(ps, PORT_PES);
+        if (v & PORT_W_PES_SET_ENABLE)   reg_set(ps, (*ps & PORT_CCS) ? PORT_PES : 0);
+        if (v & PORT_W_PPS_SET_POWER)    reg_set(ps, PORT_PPS);
+        if (v & PORT_W_CLEAR_POWER)      reg_clear(ps, PORT_PPS);
         if (v & PORT_W_PRS_SET_RESET) {
             /* Reset completes immediately -- there is no wire to settle -- so
              * PRS is never observed set. What matters is what the driver
@@ -349,9 +372,9 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
              * stack from here would overwrite the stack pointer of the thread
              * being interrupted. */
             if (*ps & PORT_CCS)
-                *ps |= PORT_PES;
-            *ps |= PORT_PRSC;
-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+                reg_set(ps, PORT_PES);
+            reg_set(ps, PORT_PRSC);
+            reg_set(&hc->reg[HcInterruptStatus / 4], INTR_RHSC);
         }
         return;
     }
@@ -405,6 +428,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 #define TD_DP_IN       2u
 #define TD_CC_NOERROR  0u
 #define TD_CC_STALL    4u
+#define TD_CC_DEVICENOTRESPONDING 5u
 #define TD_CC_DATAUNDERRUN 9u
 #define TD_ROUNDING    (1u << 18)   /* bufferRounding: a short packet is fine */
 
@@ -431,8 +455,10 @@ static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
 #define g_ctrl_len  g_ctrl_len_[pad]
 #define g_ctrl_sent g_ctrl_sent_[pad]
 
-/* Pads plugged in so far, in port order. */
-static int s_plugged_pads;
+/* The pads on the bus, bit n for pad n. Without a game's pad source they
+ * are pads 0..N-1, plugged in that order and never removed; with one they
+ * follow its present mask (ohci_hotplug). */
+static volatile uint32_t s_plugged;
 
 /* Which pad an endpoint descriptor talks to: by its function address, and
  * address 0 -- the default address a device answers before SET_ADDRESS --
@@ -441,10 +467,11 @@ static int s_plugged_pads;
  * than one at address 0. */
 static int ohci_pad_for(uint32_t ed0)
 {
-    uint32_t fa = ed0 & 0x7Fu;
+    uint32_t fa = ed0 & 0x7Fu, plugged = s_plugged;
     int d;
-    for (d = 0; d < s_plugged_pads; d++)
-        if (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0)
+    for (d = 0; d < USB_GAMEPAD_MAX; d++)
+        if ((plugged & (1u << d))
+            && (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0))
             return d;
     return -1;
 }
@@ -508,35 +535,181 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * never hands out contiguous memory that overlaps the image, so an address
  * inside it is the image. Sending that one to the window delivered the
  * descriptor where the driver never looked, and it reset the port and asked
- * again, forever. */
-static uint32_t bus_resolve(uint32_t addr)
+ * again, forever.
+ *
+ * The image therefore comes first. The contiguous allocator here does hand
+ * out physical numbers inside the image's range (its window is separate
+ * storage, so nothing collides there), and asking its page map first, as
+ * mcpx_apu_phys (apu_core.c) does, sent 0x0041A904 to the window again:
+ * Burnout 3's boot allocates 0x803E7000..0x805E7000 before XPP enumerates,
+ * so page 0x41A is "contiguous", and enumeration retried the descriptor for
+ * ever with the pad never attached. Outside the image the page map is asked
+ * next: a page the first-fit allocator handed out -- or the reserved page 0,
+ * where XPP keeps its private arena -- is the window; then the high-water
+ * mark, for a page that was contiguous memory once and has since been
+ * freed.
+ *
+ * Except a heap page the title named through MmGetPhysicalAddress
+ * (xbox_PhysRamNameMap), which is RAM even when the arena has handed out
+ * the same number: Jet Set Radio Future's XAPI reads each input report into
+ * a heap buffer at 0x010DE0CA, on a page the arena also owns, so the reports
+ * went to the window, the title's buffer never changed, and the pad looked
+ * plugged in with nothing pressed. */
+/* Which rule resolved each address, counted apart for descriptor words and
+ * data buffers so RECOMP_USB_STATS (and RECOMP_USB_TRACE at exit) show what a
+ * title leans on. Plain counters: the controller thread does almost all the
+ * resolving, and a WDH acknowledgement on the title's thread can lose one
+ * increment, which a count read by eye does not miss. */
+enum {
+    RES_IMAGE,       /* inside the loaded image                         */
+    RES_RAMNAME,     /* a heap page the title named through Mm...Address */
+    RES_PAGEMAP,     /* a live contiguous page: the window              */
+    RES_HIGHWATER,   /* freed contiguous memory below the high-water    */
+    RES_PLAIN,       /* none of the above: RAM as given                 */
+    RES_DESC_WINDOW, /* descriptor on a live contiguous page            */
+    RES_TD_BLOCK,    /* buffer in its TD's own contiguous allocation    */
+    RES_N
+};
+static const char *const s_res_name[RES_N] = {
+    "image", "ramname", "pagemap", "highwater", "plain", "desc-window",
+    "td-block"
+};
+static unsigned long s_res_desc[RES_N], s_res_data[RES_N];
+
+static uint32_t bus_resolve(uint32_t addr, unsigned long *count)
 {
+    int cls;
+    uint32_t out = addr;
+
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
-        return addr;
-    if (addr && addr < xbox_ContiguousAllocatedBytes())
-        return OHCI_CONTIG_BASE + addr;
-    return addr;
+        cls = RES_IMAGE;
+    else if (addr && addr < (64u << 20) && xbox_PhysRamNameMap()[addr >> 12])
+        cls = RES_RAMNAME;
+    else if (addr && addr < (64u << 20) && xbox_ContiguousPageMap()[addr >> 12])
+        cls = RES_PAGEMAP, out = OHCI_CONTIG_BASE + addr;
+    else if (addr && addr < xbox_ContiguousAllocatedBytes())
+        cls = RES_HIGHWATER, out = OHCI_CONTIG_BASE + addr;
+    else
+        cls = RES_PLAIN;
+    count[cls]++;
+    return out;
 }
 
+/* The controller's own structures -- the HCCA, EDs and TDs -- resolve the
+ * other way round: a live contiguous page first, then the image.
+ *
+ * The image-first rule above is for data buffers, which a class driver
+ * points at its statics. The descriptors are the host controller driver's,
+ * and XAPI's OHCD takes them from MmAllocateContiguousMemory, because the
+ * controller is a bus master that reads them by physical address. When that
+ * allocation's physical number falls inside the image (the window is
+ * separate storage here, and the arena hands such numbers out once a large
+ * image leaves it no other room), image first reads code. Jet Set Radio
+ * Future's XAPI (XDK 4134) gets its HCCA at 0x80082000 and writes
+ * HcHCCA = 0x00082000, inside an image that runs to
+ * 0x00288620: the walker read the interrupt table out of .text, found
+ * garbage EDs, never moved a transfer, and the pad never enumerated -- one
+ * root hub change, one done queue, then only start-of-frame interrupts.
+ * (The arena keeps its blocks above that image now, so the two orders
+ * agree there.)
+ *
+ * The cost: a descriptor a driver kept statically in its image, on a page
+ * the arena has also handed out, now reads the window copy. No title known
+ * here does that. The real fix is one physical space, where the window and
+ * RAM below 64 MB are the same bytes and none of these rules is needed. */
+static uint32_t bus_resolve_desc(uint32_t addr)
+{
+    if (addr && addr < (64u << 20) && xbox_ContiguousPageMap()[addr >> 12]) {
+        s_res_desc[RES_DESC_WINDOW]++;
+        return OHCI_CONTIG_BASE + addr;
+    }
+    return bus_resolve(addr, s_res_desc);
+}
+
+/* Descriptor words (HCCA, ED, TD); td_resolve below is for data buffers. */
 static uint32_t rd32(uint32_t va)
 {
-    va = bus_resolve(va);
+    va = bus_resolve_desc(va);
     if (!guest_ok(va, 4))
         return 0;
     return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
 }
 static void wr32(uint32_t va, uint32_t v)
 {
-    va = bus_resolve(va);
+    va = bus_resolve_desc(va);
     if (!guest_ok(va, 4))
         return;
     *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
 }
-static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
+
+/* 1 if both physical addresses are live pages of one contiguous allocation.
+ * Two addresses in one block end at the same place. */
+static int same_contig_block(uint32_t a, uint32_t b)
 {
-    va = bus_resolve(va);
+    const volatile uint8_t *map = xbox_ContiguousPageMap();
+    uint32_t na, nb;
+
+    if (!a || !b || a >= (64u << 20) || b >= (64u << 20)
+            || !map[a >> 12] || !map[b >> 12])
+        return 0;
+    na = xbox_ContiguousBlockSize(OHCI_CONTIG_BASE + a);
+    nb = xbox_ContiguousBlockSize(OHCI_CONTIG_BASE + b);
+    return na && nb && a + na == b + nb;
+}
+
+/* A transfer's buffer, as a guest address. One inside the TD's own
+ * contiguous allocation is the OHCD's storage: XAPI keeps each SETUP packet
+ * in the pool its TDs come from, and JSRF's sits at 0x00083FB0 beside TDs at
+ * 0x00083Fxx, inside the image range, where the image-first rule read eight
+ * bytes of .text as the request. Only the TD's own block goes to the window
+ * this way: a contiguous page elsewhere can still be the image's. Burnout 3's
+ * first GET_DESCRIPTOR reads into its .data at 0x0041A904, a page inside a
+ * block its boot allocated (0x3E7000..0x5E7000), while its TDs are at
+ * 0x025B5xxx; sending every contiguous buffer to the window brought that bug
+ * back. Any other buffer can be a class driver's static, or a heap page the
+ * title named, and takes bus_resolve's order. */
+static uint32_t td_resolve(uint32_t td, uint32_t cbp)
+{
+    if (same_contig_block(td, cbp)) {
+        s_res_data[RES_TD_BLOCK]++;
+        return OHCI_CONTIG_BASE + cbp;
+    }
+    return bus_resolve(cbp, s_res_data);
+}
+static uint8_t *td_buf(uint32_t td, uint32_t cbp, uint32_t bytes)
+{
+    uint32_t va = td_resolve(td, cbp);
     return guest_ok(va, bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
+}
+
+uint32_t xbox_OhciResolveForTest(int data, uint32_t td, uint32_t addr)
+{
+    return data ? td_resolve(td, addr) : bus_resolve_desc(addr);
+}
+
+static void ohci_print_res(void)
+{
+    int i;
+    fprintf(stderr, " resolve desc");
+    for (i = 0; i < RES_N; i++)
+        if (s_res_desc[i])
+            fprintf(stderr, " %s=%lu", s_res_name[i], s_res_desc[i]);
+    fprintf(stderr, " data");
+    for (i = 0; i < RES_N; i++)
+        if (s_res_data[i])
+            fprintf(stderr, " %s=%lu", s_res_name[i], s_res_data[i]);
+}
+
+/* What a transfer to an address no pad holds completes with; see ohci_do_td. */
+static uint32_t ohci_absent_cc(void)
+{
+    return usb_gamepad_source() ? TD_CC_DEVICENOTRESPONDING : TD_CC_NOERROR;
+}
+
+uint32_t xbox_OhciNoDeviceForTest(uint32_t addr)
+{
+    return ohci_pad_for(addr & 0x7Fu) < 0 ? ohci_absent_cc() : 0xFFFFFFFFu;
 }
 
 /* Transfer counts for RECOMP_USB_STATS: input reports served, control
@@ -555,8 +728,13 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     int      moved = 0;
     int      pad = ohci_pad_for(ed0);
 
+    /* No device at that address. Without a pad source: ignored, as it
+     * always was. With one, the address may be a pad just unplugged, and
+     * a controller whose transfer nobody answers retires it with DEVICE
+     * NOT RESPONDING and halts the endpoint; completing it as a success
+     * would hand the driver the stale buffer as a report. */
     if (pad < 0)
-        return TD_CC_NOERROR;   /* no device at that address: ignore */
+        return ohci_absent_cc();
 
     if (s_trace) {
         static unsigned n;
@@ -571,7 +749,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
         /* Eight bytes of setup, kept for the data stage that follows. */
         s_n_ctrl++;
         if (len >= 8) {
-            const uint8_t *p = guest_ptr(cbp, 8);
+            const uint8_t *p = td_buf(td, cbp, 8);
             if (!p) return TD_CC_NOERROR;
             g_setup.bmRequestType = p[0];
             g_setup.bRequest      = p[1];
@@ -623,9 +801,11 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             n = g_ctrl_len - g_ctrl_sent;
             if (n > len) n = len;
             if (n < 0) n = 0;
-            if (n > 0 && guest_ptr(cbp, (uint32_t)n))
-                memcpy(guest_ptr(cbp, (uint32_t)n),
-                       g_ctrl_buf + g_ctrl_sent, (size_t)n);
+            if (n > 0) {
+                uint8_t *d = td_buf(td, cbp, (uint32_t)n);
+                if (d)
+                    memcpy(d, g_ctrl_buf + g_ctrl_sent, (size_t)n);
+            }
             g_ctrl_sent += n;
             moved = n;
             if (s_trace && n > 0) {
@@ -639,8 +819,11 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             s_n_report++;
             int n = usb_gamepad_report(pad, rep, (int)sizeof rep);
             if (n > len) n = len;
-            if (n > 0 && guest_ptr(cbp, (uint32_t)n))
-                memcpy(guest_ptr(cbp, (uint32_t)n), rep, (size_t)n);
+            if (n > 0) {
+                uint8_t *d = td_buf(td, cbp, (uint32_t)n);
+                if (d)
+                    memcpy(d, rep, (size_t)n);
+            }
             moved = n;
         }
     } else {
@@ -655,23 +838,22 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
          * (16-bit each) -- on the interrupt OUT endpoint, or as the data of
          * a SET_REPORT (21 09) on the control pipe. Forwarded to the host
          * pad; RECOMP_RUMBLE=0 ignores it. */
-        if (len >= 6 && guest_ptr(cbp, 6u)
+        if (len >= 6 && td_buf(td, cbp, 6u)
             && (endpoint != 0 || (g_setup_pending && g_setup.bmRequestType == 0x21
                                   && g_setup.bRequest == 0x09))) {
             static int rumble = -1;
-            const uint8_t *r = (const uint8_t *)guest_ptr(cbp, 6u);
+            const uint8_t *r = td_buf(td, cbp, 6u);
             if (rumble < 0) {
-                const char *e = getenv("RECOMP_RUMBLE");
+                const char *e = recomp_env(RENV_RUMBLE);
                 rumble = !(e && *e == '0');
             }
             if (rumble && r[0] == 0x00 && r[1] >= 6) {
-                XBOX_VIBRATION v;
-                v.wLeftMotorSpeed  = (WORD)(r[2] | r[3] << 8);
-                v.wRightMotorSpeed = (WORD)(r[4] | r[5] << 8);
+                uint16_t left  = (uint16_t)(r[2] | r[3] << 8);
+                uint16_t right = (uint16_t)(r[4] | r[5] << 8);
                 if (s_trace)
                     fprintf(stderr, "  [OHCI%d] rumble pad %d left %u right %u (ep %u)\n",
-                            hc->index, pad, v.wLeftMotorSpeed, v.wRightMotorSpeed, endpoint);
-                xbox_InputSetState((DWORD)pad, &v);
+                            hc->index, pad, left, right, endpoint);
+                usb_gamepad_rumble(pad, left, right);
             }
         }
         if (endpoint == 0) {
@@ -764,7 +946,7 @@ static void ohci_publish_done(OhciController *hc, uint32_t done_head)
     if (hcca)
         wr32(hcca + HCCA_DONE_HEAD, done_head);
     hc->reg[HcDoneHead / 4] = done_head;
-    hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
+    reg_set(&hc->reg[HcInterruptStatus / 4], INTR_WDH);
 }
 
 /* Both runners add to the caller's done queue rather than publishing their
@@ -828,7 +1010,7 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
         unsigned long now;
         total += (unsigned)completed;
         if (stats < 0)
-            stats = getenv("RECOMP_USB_STATS") != NULL;
+            stats = recomp_env(RENV_USB_STATS) != NULL;
         now = (unsigned long)GetTickCount();
         if (stats && now - last >= 5000) {
             uint32_t seen[8] = {0};
@@ -841,6 +1023,7 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
                     s_n_out_other, hc->reg[HcControl / 4],
                     hc->reg[HcInterruptEnable / 4],
                     hc->reg[HcInterruptStatus / 4], xbox_IrqlRaisedCount());
+            ohci_print_res();
             {
                 uint32_t c = hc->reg[HcControlHeadED / 4] & ED_PTR_MASK;
                 int n;
@@ -895,6 +1078,7 @@ static int ohci_isr_call(int index)
     uint32_t routine, context;
     recomp_func_t fn;
     uint8_t *mem;
+    int host;
 
     if (!kinterrupt)
         return -1;                      /* nothing connected yet            */
@@ -913,11 +1097,25 @@ static int ohci_isr_call(int index)
         return -1;
     }
 
+    host = xbox_GuestUnwindHostBegin();
+    if (!host)
+        return -1;                      /* a reset is taking the guest down */
+
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = context;      /* arg 2 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
 
-    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    if (xbox_ProfOn()) {
+        void *prev = xbox_ProfBegin(XBOX_PROF_ISR_OHCI, routine);
+        int _irql = xbox_IrqlEnterInterrupt(16);
+        long long t0 = xbox_ProfNowUs();
+        fn();
+        xbox_ProfEnd(prev, xbox_ProfNowUs() - t0);
+        xbox_IrqlLeaveInterrupt(_irql);
+    } else {
+        int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql);
+    }
+    xbox_GuestUnwindHostEnd(host);
     return (int)(g_eax & 1u);
 }
 
@@ -964,7 +1162,7 @@ static void ohci_raise(OhciController *hc, uint32_t source)
     uint32_t enable = hc->reg[HcInterruptEnable / 4];
     int claimed;
 
-    hc->reg[HcInterruptStatus / 4] |= source;
+    reg_set(&hc->reg[HcInterruptStatus / 4], source);
 
     if (!(enable & INTR_MIE) || !(enable & source))
         return;
@@ -1031,6 +1229,147 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
     }
 }
 
+/* ---- pads coming and going (with a game's pad source) ------------------ */
+
+/* Which root port pad 0 sits on; pad n is on the next n along. XAPI maps
+ * root ports 3, 4, 1, 2 to controller ports 1-4, so the default (index 2)
+ * puts pad 0 on controller port 1. RECOMP_USB_PORT (0..3) picks another. */
+static unsigned ohci_first_port(void)
+{
+    const char *pspec = recomp_env(RENV_USB_PORT);
+    unsigned port = pspec ? (unsigned)atoi(pspec) : (s_ndp >= 4 ? 2u : 0u);
+    if (port >= s_ndp) port = s_ndp - 1u;
+    return port;
+}
+
+/* A pad unplugs after it has been absent this many passes (~250 ms), so a
+ * source that drops a pad for a poll or two -- a host probe, a slot being
+ * reassigned -- does not make the title see a pull and a reinsert. */
+#define OHCI_UNPLUG_PASSES 64u
+/* And the next pad arrives this many passes after the last one configured,
+ * as without a source, so the driver enumerates one device at a time. */
+#define OHCI_PLUG_SETTLE   50u
+
+static unsigned s_gone[USB_GAMEPAD_MAX];
+static unsigned s_hp_settle = OHCI_PLUG_SETTLE;
+
+static void ohci_plug(OhciController *hc, int d)
+{
+    unsigned port = (ohci_first_port() + (unsigned)d) % s_ndp;
+    usb_gamepad_detach(d);              /* enumerates from address 0 */
+    reg_set(&hc->reg[(HcRhPortStatus1 + port * 4) / 4], PORT_CCS | PORT_CSC);
+    reg_set(&hc->reg[HcInterruptStatus / 4], INTR_RHSC);
+    s_plugged |= 1u << d;
+    fprintf(stderr, "  [OHCI%d] pad %d arriving on port %u\n",
+            hc->index, d + 1, port + 1);
+    fflush(stderr);
+}
+
+/* What pulling the cable does: the port loses its device and its enable,
+ * both changes latch, and the root hub interrupt tells the driver. The pad
+ * forgets its address, and a transfer still queued to the old address gets
+ * no answer (ohci_do_td), which is how XAPI learns it is gone. */
+static void ohci_unplug(OhciController *hc, int d)
+{
+    unsigned port = (ohci_first_port() + (unsigned)d) % s_ndp;
+    uint32_t *ps = &hc->reg[(HcRhPortStatus1 + port * 4) / 4];
+    uint32_t was = __atomic_fetch_and(ps, ~(PORT_CCS | PORT_PES),
+                                      __ATOMIC_SEQ_CST);
+    s_plugged &= ~(1u << d);
+    /* PESC says the port's enable changed, so only a port that was enabled
+     * reports it: a pad pulled mid-enumeration, before the driver enabled
+     * its port, is a connect change and nothing else, as the spec has it
+     * and QEMU does. */
+    reg_set(ps, PORT_CSC | ((was & PORT_PES) ? PORT_PESC : 0));
+    reg_set(&hc->reg[HcInterruptStatus / 4], INTR_RHSC);
+    usb_gamepad_detach(d);
+    g_setup_pending_[d] = 0;
+    g_ctrl_len_[d]      = -1;
+    g_ctrl_sent_[d]     = 0;
+    s_gone[d] = 0;
+    /* The next plug waits the full settle, so the driver services this
+     * unplug's RHSC first. A source that reports the pad again on the next
+     * pass would otherwise reconnect it 4 ms later, the driver would read a
+     * port that is connected with CSC set, and the disconnect would never
+     * have happened as far as the title can tell. */
+    s_hp_settle = 0;
+    fprintf(stderr, "  [OHCI%d] pad %d removed from port %u\n",
+            hc->index, d + 1, port + 1);
+    fflush(stderr);
+}
+
+/* One controller pass: plug what the source has, unplug what it lost. */
+static void ohci_hotplug(OhciController *hc)
+{
+    uint32_t want = usb_gamepad_present();
+    uint32_t have = s_plugged;
+    int d;
+
+    /* RECOMP_USB_PADS given with a source keeps that many plugged anyway,
+     * for a run that wants the ports filled without host pads. */
+    if (s_npads_set)
+        want |= (1u << s_npads) - 1u;
+    want &= (1u << s_ndp) - 1u;         /* a pad needs a port */
+
+    for (d = 0; d < USB_GAMEPAD_MAX; d++) {
+        if (!(have & (1u << d)))
+            continue;
+        if (want & (1u << d))
+            s_gone[d] = 0;
+        else if (++s_gone[d] >= OHCI_UNPLUG_PASSES)
+            ohci_unplug(hc, d);
+    }
+
+    /* One device at the default address at a time: wait until every
+     * plugged pad is configured, then let the bus settle. */
+    have = s_plugged;
+    for (d = 0; d < USB_GAMEPAD_MAX; d++)
+        if ((have & (1u << d)) && !usb_gamepad_configured(d)) {
+            s_hp_settle = 0;
+            return;
+        }
+    if (s_hp_settle < OHCI_PLUG_SETTLE) {
+        s_hp_settle++;
+        return;
+    }
+    for (d = 0; d < USB_GAMEPAD_MAX; d++)
+        if ((want & ~have) & (1u << d)) {
+            ohci_plug(hc, d);
+            s_hp_settle = 0;
+            return;
+        }
+}
+
+uint32_t xbox_OhciWriteForTest(uint32_t off, uint32_t v)
+{
+    OhciController *hc = &s_hc[s_device_hc];
+    ohci_write(hc, off, v, 4);
+    uint32_t *r = reg_of(hc, off & ~3u);
+    return r ? *r : 0;
+}
+
+uint32_t xbox_OhciHotplugForTest(int reset, uint32_t ports[4])
+{
+    OhciController *hc = &s_hc[s_device_hc];
+    unsigned p;
+    if (reset) {
+        int d;
+        ohci_reset(hc, s_device_hc ? XBOX_OHCI1_BASE : XBOX_OHCI0_BASE,
+                   s_device_hc);
+        for (d = 0; d < USB_GAMEPAD_MAX; d++) {
+            if (s_plugged & (1u << d))
+                usb_gamepad_detach(d);
+            s_gone[d] = 0;
+        }
+        s_plugged   = 0;
+        s_hp_settle = OHCI_PLUG_SETTLE;
+    }
+    ohci_hotplug(hc);
+    for (p = 0; p < 4u; p++)
+        ports[p] = hc->reg[(HcRhPortStatus1 + p * 4) / 4];
+    return s_plugged;
+}
+
 /* The controller, running on its own thread.
  *
  * It has to be its own thread for a reason that is easy to get wrong: the
@@ -1047,9 +1386,90 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
  * the interrupt it has been waiting for. Repeat delivery and the transfer
  * lists come after that answer, not before it.
  */
-static DWORD WINAPI ohci_thread(LPVOID unused)
+/* RECOMP_DEBUG=deterministic with the guest lock (kernel_guest_det.c): a
+ * pass runs only when the guest scheduler grants one, once per vblank step
+ * with every guest thread parked, so the pads' reports, the done queue and
+ * the interrupt land at the same point of guest progress on every run, and
+ * a title's XAPI polls its pads once per frame there. On the host's 4 ms
+ * tick a pass fell anywhere in the guest's frame, and a record on the poll
+ * clock (port-0 reports) counted host time. Until the first guest join
+ * decides the mode the thread naps and does nothing (D8): a pass begun then
+ * could still run when the mode turns on, ungranted. */
+static int  s_det;                      /* this thread's passes are granted */
+static int  s_det_granted;              /* a grant is open: done owed */
+static int  s_det_started;              /* s_det_ms set by the first grant */
+static uint64_t s_det_ms;               /* the virtual ms of the last pass */
+
+/* Before a pass: the host tick, or the next grant. 0 when this round is a
+ * nap (the mode undecided) and the pass must not run. */
+static int ohci_pass_begin(void)
 {
-    /* This thread calls recompiled code, so it needs what any thread running
+    if (s_det_granted) {
+        xbox_GuestDetDeviceDone(XBOX_DET_DEV_OHCI, 1);
+        s_det_granted = 0;
+    }
+    if (!s_det) {
+        if (xbox_GuestDetUndecided()) {
+            Sleep(1);
+            return 0;
+        }
+        s_det = xbox_GuestDetOn() ? 1 : -1;     /* decided: final */
+    }
+    if (s_det > 0) {
+        xbox_GuestDetDeviceWait(XBOX_DET_DEV_OHCI);
+        s_det_granted = 1;
+        /* The clock's origin is read inside the first grant, not when the
+         * mode is decided: the nap before that can end on either side of
+         * the first vblank step, and an origin one vblank early would shift
+         * every later frame number by one between runs. */
+        if (!s_det_started) {
+            s_det_started = 1;
+            s_det_ms = xbox_GuestTimeMs();
+        }
+    } else {
+        Sleep(OHCI_TICK_MS);
+    }
+    return 1;
+}
+
+/* USB frames this pass is worth: the tick on the host clock, the virtual
+ * milliseconds since the last pass (16 or 17 a vblank) in the mode. */
+static uint32_t ohci_pass_frames(void)
+{
+    uint64_t now, d;
+
+    if (s_det <= 0)
+        return OHCI_TICK_MS;
+    now = xbox_GuestTimeMs();
+    d = now - s_det_ms;
+    s_det_ms = now;
+    return (uint32_t)d;
+}
+
+/* A pass with the controller not Operational: no frames go by. Real OHCI
+ * counts frames only while Operational, so in the mode the origin follows
+ * virtual time here; otherwise the first Operational pass would add every
+ * millisecond since the mode was decided (more than a 16-bit frame number
+ * holds on a slow boot). Passes with MIE clear still count: the controller
+ * runs then, it just does not interrupt. */
+static void ohci_pass_idle(void)
+{
+    if (s_det > 0)
+        s_det_ms = xbox_GuestTimeMs();
+}
+
+/* The thread is leaving: the scheduler stops waiting for its passes. */
+static void ohci_pass_end(void)
+{
+    s_det_granted = 0;
+    xbox_GuestDetDeviceRemove(XBOX_DET_DEV_OHCI);
+}
+
+/* The controller thread's own TIB; 0, with the thread leaving, when the
+ * heap has none. */
+static int ohci_thread_tib(void)
+{
+    /* The thread calls recompiled code, so it needs what any thread running
      * recompiled code needs: its own TIB. The guest register set is already
      * thread-local and the ISR gets a worker stack, but fs:[0] is the SEH
      * chain head and fs:[4] reaches the CRT's per-thread data -- and a guest
@@ -1057,6 +1477,22 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
      * dereferences null before it executes a line of its own body. That is
      * what killed the process here, two interrupts in, with no fault report
      * because the fault was in the runtime rather than in the title. */
+    uint32_t tib = xbox_AllocThreadTib();
+
+    if (!tib) {
+        fprintf(stderr, "  [OHCI0] no TIB for the controller thread; "
+                        "not delivering interrupts\n");
+        fflush(stderr);
+        ohci_pass_end();
+        return 0;
+    }
+    g_fs_base = tib;
+    return 1;
+}
+
+static DWORD WINAPI ohci_thread(LPVOID unused)
+{
+    xbox_log_thread_role("ohci", 0);
     unsigned waited = 0;
     int plugged = 0;
     uint32_t last_status = 0;
@@ -1065,17 +1501,19 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     int      held_off_warned = 0, held_off_forced = 0, gated = 0;
     unsigned last_ack = 0;
     unsigned first_port = 0, settle = 0;
+    int      npl = 1;              /* pads plugged without a source */
+    /* The TIB: at thread start off the virtual clock, where the mode
+     * cannot turn on, as it always was. On it, from the first pass, which
+     * the mode grants with every guest thread idle: taken at thread start
+     * it raced the main thread's first heap allocations, and its place in
+     * the heap moved every later allocation between runs. */
+    int      tib_ready = 0;
 
     (void)unused;
-    {
-        uint32_t tib = xbox_AllocThreadTib();
-        if (!tib) {
-            fprintf(stderr, "  [OHCI0] no TIB for the controller thread; "
-                            "not delivering interrupts\n");
-            fflush(stderr);
+    if (!xbox_GuestTimeVirtual()) {
+        if (!ohci_thread_tib())
             return 0;
-        }
-        g_fs_base = tib;
+        tib_ready = 1;
     }
 
     for (;;) {
@@ -1083,19 +1521,35 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         uint32_t control, enable, status;
         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
 
-        Sleep(OHCI_TICK_MS);
+        if (!ohci_pass_begin())
+            continue;
+        if (!tib_ready) {
+            if (!ohci_thread_tib())
+                return 0;
+            tib_ready = 1;
+        }
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
+            /* 6 s on the 4 ms tick; about 25 s of virtual time in the mode,
+             * where a pass is one vblank. */
+            if (++waited > 1500)
                 break;
+            ohci_pass_idle();
             continue;
         }
         if (!(enable & INTR_MIE))
             continue;
+
+        /* With a game's pad source, pads come and go with it. */
+        if (usb_gamepad_source()) {
+            if (enable & INTR_RHSC)
+                ohci_hotplug(hc);
+            goto plugged_done;
+        }
 
         /* Plug the device in once, after the driver is running and listening.
          * Presenting it earlier does not work: the driver clears the connect
@@ -1108,16 +1562,14 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * asking which port pressed Start looks at slot 0. The default is
              * root port 3 (index 2), controller port 1, when there are four;
              * RECOMP_USB_PORT (0..3) picks another. */
-            const char *pspec = getenv("RECOMP_USB_PORT");
-            unsigned port = pspec ? (unsigned)atoi(pspec) : (s_ndp >= 4 ? 2u : 0u);
-            if (port >= s_ndp) port = s_ndp - 1u;
-            hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+            unsigned port = ohci_first_port();
+            reg_set(&hc->reg[(HcRhPortStatus1 + port * 4) / 4], PORT_CCS | PORT_CSC);
+            reg_set(&hc->reg[HcInterruptStatus / 4], INTR_RHSC);
             plugged = 1;
-            s_plugged_pads = 1;
+            s_plugged = 1u;
             first_port = port;
-            fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port %u\n", waited * 20, port + 1);
+            fprintf(stderr, "  [OHCI0] operational after %u passes; device "
+                            "arriving on port %u\n", waited, port + 1);
             fflush(stderr);
         }
 
@@ -1125,19 +1577,23 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * configured, on the next port, so the driver enumerates them in
          * turn and there is only ever one device at the default address.
          * RECOMP_USB_PADS sets how many (1-4). */
-        if (plugged && s_plugged_pads < s_npads
-            && usb_gamepad_configured(s_plugged_pads - 1)) {
-            if (++settle > 50) {                 /* ~1 s after the last */
-                unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
-                hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
-                hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+        if (plugged && npl < s_npads && usb_gamepad_configured(npl - 1)) {
+            /* ~200 ms after the last on the 4 ms tick, ~830 ms of virtual
+             * time in the mode (a pass a vblank). */
+            if (++settle > 50) {
+                unsigned port = (first_port + (unsigned)npl) % s_ndp;
+                reg_set(&hc->reg[(HcRhPortStatus1 + port * 4) / 4], PORT_CCS | PORT_CSC);
+                reg_set(&hc->reg[HcInterruptStatus / 4], INTR_RHSC);
                 fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
-                        s_plugged_pads + 1, port + 1, 10);
+                        npl + 1, port + 1, 10);
                 fflush(stderr);
-                s_plugged_pads++;
+                s_plugged |= 1u << npl;
+                npl++;
                 settle = 0;
             }
         }
+
+    plugged_done:
 
         /* The frame clock.
          *
@@ -1152,17 +1608,19 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * Twenty frames a tick because a frame is 1 ms and this loop sleeps
          * 20. The count is what drivers compare; the rate is what they feel,
          * and both are closer to right this way than a counter that never
-         * moves. */
+         * moves. (The tick is 4 ms now; under RECOMP_DEBUG=deterministic a
+         * pass is a vblank, so the count moves by 16 or 17 virtual ms and
+         * StartOfFrame is raised once a vblank, not once a frame.) */
         {
             uint32_t hcca = hc->reg[HcHCCA / 4];
 
             hc->reg[HcFmNumber / 4] =
-                (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
+                (hc->reg[HcFmNumber / 4] + ohci_pass_frames()) & 0xFFFFu;
             /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
              * controller zeroes, so a dword write is what hardware does. */
             if (hcca)
                 wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
-            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
+            reg_set(&hc->reg[HcInterruptStatus / 4], INTR_SF);
         }
 
         /* Be the bus master. ControlListEnable in HcControl says the driver
@@ -1321,6 +1779,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         if (gated)
             xbox_DispatchGateLeave();
     }
+    ohci_pass_end();
     return 0;
 }
 
@@ -1332,31 +1791,33 @@ void xbox_OhciInit(void)
         return;
     done = 1;
 
-    /* Opt-in. Without a descriptor list walker behind it a driver that finds
-     * a port has nothing to enumerate, so this must not change how a title
-     * behaves until the rest of it exists. */
-    if (!getenv("RECOMP_USB"))
+    /* Opt-in per title: one that reaches its pad some other way (an XInput
+     * override, as BLiNX 2 does) must not also get a controller under its
+     * XAPI. A title whose statically linked XAPI drives these registers
+     * turns it on by default in its main.c. =0 (or empty) is off, so a
+     * default can be overridden from the environment. */
+    if (!recomp_env_on(RENV_USB))
         return;
 
     s_enabled = 1;
-    s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
+    s_trace   = recomp_env(RENV_USB_TRACE) != NULL;
     {
-        const char *hcspec = getenv("RECOMP_USB_HC");
-        const char *ndpspec = getenv("RECOMP_USB_NDP");
+        const char *hcspec = recomp_env(RENV_USB_HC);
+        const char *ndpspec = recomp_env(RENV_USB_NDP);
         s_device_hc = (hcspec && atoi(hcspec) == 1) ? 1 : 0;
-        const char *padspec = getenv("RECOMP_USB_PADS");
+        const char *padspec = recomp_env(RENV_USB_PADS);
         if (ndpspec) {
             int n = atoi(ndpspec);
             if (n >= 1 && n <= 4) s_ndp = (unsigned)n;
         }
         if (padspec) {
             int n = atoi(padspec);
-            if (n >= 1 && n <= USB_GAMEPAD_MAX) s_npads = n;
+            if (n >= 1 && n <= USB_GAMEPAD_MAX) s_npads = n, s_npads_set = 1;
         }
         if ((unsigned)s_npads > s_ndp)
             s_ndp = (unsigned)s_npads;      /* a port for every pad */
     }
-#if !defined(OHCI_TRAP_WIN32) && !defined(OHCI_TRAP_POSIX_A64)
+#if !defined(OHCI_TRAP_X64) && !defined(OHCI_TRAP_POSIX_A64)
     /* No decoder for this host's instructions, so a trapped access could not
      * be answered. Leave the aperture as plain memory -- the title then sees
      * no controller, exactly as with RECOMP_USB unset -- and say so. */
@@ -1404,14 +1865,22 @@ void xbox_OhciInit(void)
     }
 
     fprintf(stderr, "  OHCI: two controllers at 0x%08X and 0x%08X, "
-                    "%d ports each, one device on HC0 port 1\n",
-            XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
+                    "%u ports each, pads on HC%d (%s)\n",
+            XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, s_ndp, s_device_hc,
+            usb_gamepad_source() ? "the game's pad source" : "host pads");
     fflush(stderr);
 
     {
-        HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
+        HANDLE th;
+
+        /* Before the thread: in the deterministic mode a step grants it a
+         * pass from then on (a no-op otherwise). */
+        xbox_GuestDetDeviceAdd(XBOX_DET_DEV_OHCI);
+        th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
             CloseHandle(th);
+        else
+            xbox_GuestDetDeviceRemove(XBOX_DET_DEV_OHCI);
     }
 }
 
@@ -1432,7 +1901,7 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
     return hc_for(xbox_va) != NULL;
 }
 
-#if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_WIN32)
+#if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_X64)
 /* Both decoders hand over 8-byte accesses whole (ldr/str x or a d register
  * on A64, a REX.W mov on x86-64); the registers are 32-bit, so an 8-byte
  * access is two of them. */
@@ -1473,16 +1942,17 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
         fflush(stderr);
     }
     return ok;
-#elif defined(OHCI_TRAP_WIN32)
+#elif defined(OHCI_TRAP_X64)
     OhciController *hc = hc_for(xbox_va);
     int ok;
 
     if (!hc)
         return 0;
-    ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
+    ok = mmio_emulate((mmio_ctx_t *)ctx, xbox_va - hc->base, hc,
                       ohci_read_split, ohci_write_split);
     if (!ok && hc->decode_fail++ < 20) {
-        const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
+        const uint8_t *ip =
+            (const uint8_t *)(uintptr_t)MMIO_RIP((mmio_ctx_t *)ctx);
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: "
                         "%02X %02X %02X %02X %02X %02X\n",
                 hc->index, xbox_va - hc->base,
@@ -1502,6 +1972,9 @@ void xbox_OhciReport(void)
 
     if (!s_enabled)
         return;
+    fprintf(stderr, "  [OHCI] address classes:");
+    ohci_print_res();
+    fputc('\n', stderr);
     for (i = 0; i < 2; i++)
         fprintf(stderr, "  [OHCI%d] %u reads, %u writes, %u undecoded; "
                         "HcControl=%08X HcIntStatus=%08X port1=%08X\n",

@@ -1,0 +1,2 @@
+#reference "crt/crt-lottes-fast.slangp"
+CURVATURE = "0.01"

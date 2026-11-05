@@ -1,0 +1,8 @@
+Kenney Input Prompts 1.3, Creative Commons Zero 1.0 (LICENSE)
+source: https://github.com/Maaack/Kenney-Input-Prompts/tree/dd37497091c176e91ce81a14e203729ea12d8e4b
+  (a mirror of https://kenney.nl/assets/input-prompts (the pack's own download refuses scripted fetches); License.txt there names the pack and its 1.3 release)
+source archive sha256 76f1b16b853467448c1164b4307501172c47f1c3d3d0f94ed4ed702dc64a62b8
+SVGs used, sha256 ece0779af24cdc8b881594b47d812288e2bc3a67aa6bb95465bc67f6ef37d09d (glyphs_to_ttf.digest_svgs)
+LICENSE: the pack's License.txt at that commit, unchanged
+made by: uv run tools/overlay/glyphs_to_ttf.py kenney --pack <pack dir>
+glyphs: 152 (glyphs.txt)

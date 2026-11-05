@@ -23,6 +23,7 @@
  */
 #include "kernel.h"
 #include "kernel_missing.h"
+#include "recomp_env.h"
 #include "recomp_exit_hook.h"
 
 #include <stdio.h>
@@ -30,7 +31,7 @@
 #include <string.h>
 #include <ctype.h>
 
-#define SLOTS      1024
+#define SLOTS      4096
 #define GUEST_MAX  160      /* the per-attempt line's truncation */
 
 enum { MODE_UNREAD = -1, MODE_OFF = 0, MODE_DEFAULT = 1, MODE_ALL = 2 };
@@ -69,7 +70,7 @@ static volatile int s_mode = MODE_UNREAD;
 static int mode(void)
 {
     if (s_mode == MODE_UNREAD) {
-        const char *v = getenv("RECOMP_MISSING_FILES");
+        const char *v = recomp_env(RENV_MISSING);
         s_mode = !v ? MODE_DEFAULT
                : strcmp(v, "0") == 0 ? MODE_OFF
                : strcmp(v, "all") == 0 ? MODE_ALL : MODE_DEFAULT;
@@ -297,7 +298,7 @@ static void write_list(const char *path)
     FILE *f = fopen(path, "w");
     int i;
     if (!f) {
-        fprintf(stderr, "  [FILE] RECOMP_MISSING_FILES_LIST: cannot write %s\n", path);
+        fprintf(stderr, "  [FILE] missing_list: cannot write %s\n", path);
         return;
     }
     AcquireSRWLockExclusive(&s_lock);
@@ -323,7 +324,7 @@ void xbox_missing_summary(const char *why)
     /* Once, by whichever exit gets here first: on POSIX a firmware exit
      * also runs atexit, and a window close can race the main thread's
      * exit, and two "w" opens of one file would interleave. */
-    list = getenv("RECOMP_MISSING_FILES_LIST");
+    list = recomp_env(RENV_MISSING_LIST);
     if (list && *list && InterlockedExchange(&s_list_done, 1) == 0)
         write_list(list);
 
@@ -353,7 +354,7 @@ void xbox_missing_summary(const char *why)
     fprintf(stderr, "  [FILE] summary: %ld game file%s missing, %ld not found under "
             "absent directories, %ld failed open%s%s%s%s%s%s\n",
             (long)hi, hi == 1 ? "" : "s", (long)lo, (long)at, at == 1 ? "" : "s", extra,
-            m == MODE_DEFAULT && lo ? " (RECOMP_MISSING_FILES=all lists them)" : "",
+            m == MODE_DEFAULT && lo ? " (RECOMP_TRACE=missing=all lists them)" : "",
             m == MODE_ALL ? " [at " : "", m == MODE_ALL && why ? why : "",
             m == MODE_ALL ? "]" : "");
     fflush(stderr);

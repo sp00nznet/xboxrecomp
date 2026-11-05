@@ -170,7 +170,9 @@ typedef struct InputPadMap {
 
 /* The identity mapping: a pad as the Xbox pad it is shaped like, with the
  * shoulders as Black (left) and White (right) like xinput_device.c.
- * Deadzones 15%, trigger threshold 5%, an axis counts as a button at 50%. */
+ * Deadzones 15%, trigger threshold 5%, an axis counts as a button at 50%.
+ * The fork's runtime does not call it: its pads go through pad_map.c, which
+ * maps LB to White and RB to Black (the table in README.md). */
 void xbox_InputMap_PadMapDefaults(InputPadMap *m);
 
 /* Apply `m` to a raw pad. */

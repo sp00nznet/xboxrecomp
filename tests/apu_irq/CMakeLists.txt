@@ -9,3 +9,8 @@ target_include_directories(apu_irq_test PRIVATE ../../src ../../src/apu ../../sr
 target_link_libraries(apu_irq_test PRIVATE xboxrecomp)
 enable_testing()
 add_test(NAME apu_irq COMMAND apu_irq_test)
+
+# The stub's path under test: in a build with the APU DSP the JIT is the
+# run-time default, so every test here asks for the stub.
+get_property(_stub_tests DIRECTORY PROPERTY TESTS)
+set_property(TEST ${_stub_tests} APPEND PROPERTY ENVIRONMENT RECOMP_APU_DSP=0)

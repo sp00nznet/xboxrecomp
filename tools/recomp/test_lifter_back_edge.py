@@ -1,19 +1,25 @@
 """With --back-edge-yield every loop back edge calls RECOMP_BACK_EDGE, the guest
 CPU's quantum check (templates/runtime/recomp_types.h), and forward jumps do
-not; by default the edges stay bare."""
+not; a lowered spin-wait's edge keeps RECOMP_SPIN_WAIT alone; by default the
+edges stay bare."""
 
 from tools.recomp import config
+from tools.recomp.spin_waits import SpinWaitConfig, SpinWaitReport
 from tools.recomp.translator import FunctionTranslator
 
 BASE = 0x10000
+DATA = 0x20000
+D32 = DATA.to_bytes(4, "little").hex()
 
 # +0 L: dec eax ; +1 jnz L ; +3 ret        -- a counted loop
 COUNT_DOWN = "4875fdc3"
 # +0 cmp eax, 5 ; +3 jge +2 (-> +7) ; +5 nop ; nop ; +7 ret  -- forward only
 FORWARD = "83f8057d029090c3"
+# L: cmp [DATA], eax ; jl L ; ret           -- a spin-wait shape
+SPIN = f"3905{D32}7cf8c3"
 
 
-def _translate(hexcode, back_edge_yield=True):
+def _translate(hexcode, back_edge_yield=True, spin_waits=None):
     """back_edge_yield as --back-edge-yield sets it; None leaves the default."""
     image = bytes.fromhex(hexcode)
     config._install(
@@ -24,6 +30,8 @@ def _translate(hexcode, back_edge_yield=True):
     t = FunctionTranslator(image, db)
     if back_edge_yield is not None:
         t.back_edge_yield = back_edge_yield
+    if spin_waits is not None:
+        t.spin_waits = SpinWaitReport(spin_waits)
     return t.translate_function(BASE, db[BASE])
 
 
@@ -36,6 +44,12 @@ def test_a_loop_back_edge_checks_the_quantum():
 def test_a_forward_jump_does_not():
     code = _translate(FORWARD)
     assert "goto loc_00010007;" in code, code
+    assert "RECOMP_BACK_EDGE" not in code
+
+
+def test_a_lowered_spin_wait_keeps_its_own_yield():
+    code = _translate(SPIN, spin_waits=SpinWaitConfig(auto=False, sites={BASE}))
+    assert "RECOMP_SPIN_WAIT" in code
     assert "RECOMP_BACK_EDGE" not in code
 
 

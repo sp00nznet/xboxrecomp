@@ -76,7 +76,18 @@ extern size_t g_xbox_total_ram;
  * Zero means "same as RAM", which is the existing behaviour for every title
  * that does not ask. Set before xbox_MemoryLayoutInit(). */
 extern size_t g_xbox_map_size;
+/* Where the heap stops when section paging grew the map (0: the map's top).
+ * Set by xbox_MemoryLayoutInit; xbox_ReserveAlloc hands out VAs above it. */
+extern uint32_t g_xbox_heap_cap;
 void xbox_SetMapSize(size_t bytes);
+
+/* XBE section paging (xbe_sections.h): load only the preload sections at
+ * boot and the rest on the title's XeLoadSection, with the mapping grown so
+ * the heap sits above the whole image. For a title whose sections add up to
+ * more than RAM leaves for its heap (BLiNX 1). Off by default; the
+ * RECOMP_XBE_PAGING key overrides either way. Set before
+ * xbox_MemoryLayoutInit(). */
+void xbox_SetSectionPaging(int on);
 
 /* Carve a pure address-space reservation from the mapped range above RAM.
  * Returns 0 if the mapping is no larger than RAM, or if it is exhausted.
@@ -179,20 +190,51 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
  * stands down, so the count follows what was actually drawn. A counter the
  * title is seen to move itself is no longer bumped by either. */
 void xbox_Nv2aFrameCounterFlip(void);
-/* A word of the NV2A register file (offset from the register base); NULL until
- * the aperture is mapped. */
-volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
 /* Registered counters the title turned out to move itself (its vblank DPC),
- * which the toolkit has stopped bumping; for the [GPU] report. */
+ * which the toolkit has stopped bumping; for RECOMP_TRACE=pacing. */
 uint32_t xbox_Nv2aFrameCountersOwned(void);
+/* KickOff flushes acknowledged since the last call, and (if measured) the
+ * total time the title spun waiting for them. Resets both. */
+uint32_t xbox_Nv2aKickStats(uint64_t *wait_ns);
+/* The walker's event wait (nv2a_kick_wake.h). Poke: a lowered guest loop's
+ * pass; wakes the walker when it sleeps and the guest has work for it.
+ * Nudge: a vblank; wakes it when it sleeps (a held flip releases on the
+ * count). Both no-ops until the ack loop starts, and one load while the
+ * walker is awake. */
+void xbox_Nv2aKickPoke(void);
+void xbox_Nv2aKickNudge(void);
+/* Non-zero while the event wait is on: RECOMP_DEBUG=kick_event=1, the ack
+ * loop started, and it has not given up and gone back to polling. A
+ * kick-gated spin-wait site sleeps only then (xbox_SpinWaitKick). */
+int xbox_Nv2aKickEventOn(void);
+/* The [PACING] window's kick-wait line, then reset (walker thread). */
+void xbox_Nv2aKickReport(double window_s);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
+/* The whole display mode, from AvSetDisplayMode: the resolved address, the
+ * pitch, the AV mode word (its frame size through xbox_AvModeSize) and the AV
+ * format. An unknown word, or a pitch that is neither the mode's width nor
+ * half of it (a field title) in the format's pixels, records no size. Safe
+ * against a reader on another thread. Call before xbox_DisplayModeBump. */
+void xbox_SetDisplayMode(uint32_t fb_va, uint32_t pitch, uint32_t mode, uint32_t format);
+/* The display's pitch and frame size; w and h are 0 without a mode set or
+ * for an unknown word. Returns the resolved address, as the getter below.
+ * Any pointer may be NULL. */
+uint32_t xbox_GetDisplayMode(uint32_t *pitch, uint32_t *w, uint32_t *h);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */
 uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
+/* A display-mode generation: AvSetDisplayMode bumps it (on the title's
+ * thread), the walker's present pick reads it to notice a mode set even when
+ * address and pitch stay the same. 0 until the first mode set. */
+void xbox_DisplayModeBump(void);
+uint32_t xbox_DisplayModeGeneration(void);
 
 /* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
- * below 256 MB, or 0 when the arena is exhausted. */
+ * below 256 MB, or 0 when the arena is exhausted. Blocks stay off the loaded
+ * image's physical numbers while there is room elsewhere, and never take an
+ * image page the title has named (RECOMP_CONTIG_AVOID_IMAGE=0: the old
+ * bottom-up fill through the image). */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 /* The same, constrained to physical addresses [phys_lo, phys_hi] (inclusive),
  * as MmAllocateContiguousMemoryEx asks. Alignment is rounded up to a page and
@@ -201,7 +243,7 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
                                 uint32_t phys_lo, uint32_t phys_hi);
 /* Record a block the caller placed itself, so it is not handed out again. */
 void xbox_ContiguousClaim(uint32_t va, uint32_t size);
-/* Release a block (RECOMP_HEAP_RECLAIM only); 0 if va is not in the window. */
+/* Release a block; 1 if va starts one this arena handed out, else 0. */
 int xbox_ContiguousFree(uint32_t va);
 /* Bytes from va to the end of its block, 0 if va is not allocated. */
 uint32_t xbox_ContiguousBlockSize(uint32_t va);
@@ -211,21 +253,46 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
  * (or claimed). Read without the arena lock; a device model's view. */
 const volatile uint8_t *xbox_ContiguousPageMap(void);
 /* MmGetPhysicalAddress named this VA; recorded if it is a heap page below
- * 64 MB (the image and stacks are not recorded). */
+ * 64 MB (xbox_PhysRamNameMap) or an image page (xbox_PhysImageNameMap,
+ * kept apart); stacks are not recorded. */
 void xbox_PhysNoteRamName(uint32_t va);
 /* One byte per 4 KB physical page below 64 MB, nonzero while the title holds
  * a RAM name for a heap page there (see xbox_PhysNoteRamName); cleared when
  * no live heap block covers the page any more. Read without a lock; a device
  * model's view. */
 const volatile uint8_t *xbox_PhysRamNameMap(void);
+/* One byte per 4 KB physical page below 64 MB, nonzero once the title has
+ * named an image page there through MmGetPhysicalAddress. Never cleared.
+ * The arena never places a block on one (unless RECOMP_CONTIG_AVOID_IMAGE=0);
+ * the APU reads sample data from RAM for these (mcpx_apu_phys_data), for a
+ * page named after a block took it. */
+const volatile uint8_t *xbox_PhysImageNameMap(void);
+/* Host address of the MCPX window (guest 0xFE800000, the APU at +0), or NULL
+ * before the layout is up. The APU's DSP device runs its GP and EP on their
+ * pages of it (+0x30000, +0x50000), which the title writes untrapped. */
+void *xbox_McpxHost(void);
 uint32_t xbox_ContiguousInUseBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
-/* Where the mirrored fence word is (0 if none is registered or it does not
- * resolve into the contiguous window). For the pushbuffer executor. */
-uint32_t xbox_Nv2aFenceWordVa(void);
+/* The host mapping of the NV2A register aperture (guest VA 0xFD000000,
+ * 16 MB) as the title has written it, or NULL when it could not be mapped.
+ * The pushbuffer executor reads RAMHT and the context DMA objects in PRAMIN
+ * through it when a SET_CONTEXT_DMA_* method binds an object. */
+const volatile uint8_t *xbox_Nv2aAperture(void);
+
+/* Set PGRAPH 0x400B10's fence field from the completed fence (a registered
+ * fence mirror's completed word or, with none registered, the executor's
+ * last semaphore release), which XDK D3D's wait-for-idle polls. The field is
+ * five bits at the shift the executor learned from D3D's fence methods
+ * (bits 0..4 for XDK 5558), bits 2..6 until it has seen one; a moved field
+ * clears the old one's bits. A no-op while the
+ * aperture is unmapped or there is no value yet. Called by the NV2A ack loop
+ * after each pushbuffer walk; not static so tests/pgraph_fence can drive it.
+ * It reads the executor's state without a lock: call it only from the ack
+ * thread, or while the executor is idle (as the ctest does). */
+void xbox_Nv2aPgraphFenceTick(void);
 
 void xbox_MemoryLayoutShutdown(void);
 
@@ -258,6 +325,12 @@ void xbox_ProtectMirrorsForDebug(void);
  *   xbox_VehMmioFault   Win32 VEH: the PEXCEPTION_POINTERS.
  *   xbox_PosixMmioFault POSIX SIGBUS/SIGSEGV handler: its ucontext_t * and
  *                       si_addr. Always 0 on a host with no decoder. */
+/* A constant-address mov into the trapped APU window, from generated code
+ * (XBOX_MMIO_R and _W): the APU model when the access would fault and be
+ * serviced, else the plain guest access at that width. size is 1, 2 or 4. */
+uint32_t xbox_MmioRead(uint32_t va, int size);
+void xbox_MmioWrite(uint32_t va, uint32_t value, int size);
+
 #if defined(_WIN32)
 int xbox_VehMmioFault(void *exception_pointers);
 #else
@@ -497,8 +570,9 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * Letting the ordinary heap serve the whole mapped range keeps every
  * allocation inside one allocator the guest already understands.
  */
-#define XBOX_HEAP_TOP       ((uint32_t)(g_xbox_map_size ? g_xbox_map_size \
-                                                        : g_xbox_total_ram))
+#define XBOX_HEAP_TOP       ((uint32_t)(g_xbox_heap_cap ? g_xbox_heap_cap \
+                                    : g_xbox_map_size ? g_xbox_map_size \
+                                                      : g_xbox_total_ram))
 
 /** No static mirror/guard region. RAM mirror is handled via file mapping
  *  views that alias the same physical pages as the base 64 MB region. */
@@ -540,6 +614,26 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
  * Off by default; it changes which address later allocations get.
  */
 int xbox_HeapReclaimEnabled(void);
+
+/**
+ * Set the guest protection (NtProtectVirtualMemory, MmSetAddressProtect) of
+ * the 4 KB guest pages over [va, va + size). Each host page gets the most
+ * permissive protection of the guest pages in it, so on a host with larger
+ * pages a protected page never takes its neighbours with it. Only the base
+ * protection counts (no cache flags, no execute, write-copy as read/write).
+ * *old_protect gets the first page's previous guest protection. Returns 0 if
+ * the host refused.
+ */
+int xbox_GuestProtect(uint32_t va, uint32_t size, uint32_t xbox_protect,
+                      uint32_t *old_protect);
+
+/**
+ * Make the guest pages over [va, va + size) read/write again, as freed or
+ * decommitted memory is on the console. The heap and the contiguous arena
+ * call it when a block is freed. Costs nothing until a title has taken
+ * access away somewhere.
+ */
+void xbox_GuestUnprotect(uint32_t va, uint32_t size);
 
 /**
  * Get the file mapping handle for the Xbox memory region.

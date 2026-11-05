@@ -25,6 +25,7 @@
  * in an answer nobody has established.
  */
 #include "xbox_memory_layout.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -130,6 +131,11 @@ int main(int argc, char **argv)
      * output is discarded when they do -- leaving a crash with no indication
      * of which check reached it. */
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* Audio defaults on where the host traps MMIO (arm64, x86-64 Linux), and the
+     * MCPX aperture is left PROT_NONE for the trap. This test checks plain
+     * mappings, so it runs without it. */
+    recomp_env_set(RENV_AC97_READY, NULL);
 
     const char *path = argc > 1 ? argv[1] : "tools/conformance/test.xbe";
     size_t n = 0;
@@ -263,7 +269,7 @@ int main(int argc, char **argv)
      * that traps page zero by clobbering the TIB is not a fix.
      */
     {
-        setenv("RECOMP_TRAP_NULL", "1", 1);
+        recomp_env_set(RENV_TRAP_NULL, "1");
         BOOL trapped = xbox_MemoryLayoutInit(xbe, n);
         check(trapped, "init succeeds with RECOMP_TRAP_NULL set",
               "the guard must not cost the run");
@@ -290,7 +296,7 @@ int main(int argc, char **argv)
 
             xbox_MemoryLayoutShutdown();
         }
-        unsetenv("RECOMP_TRAP_NULL");
+        recomp_env_set(RENV_TRAP_NULL, NULL);
     }
 
     /*
@@ -339,6 +345,82 @@ int main(int argc, char **argv)
             }
         }
         free(big);
+    }
+
+    /*
+     * 7. A 128 MB map (devkit RAM) keeps the contiguous window and leaves
+     *    other mappings alone.
+     *
+     * At 128 MB the 28 mirrors reach guest 0xE8000000, past the span that
+     * stops at the contiguous window. The mirror loop used to free each slot
+     * before mapping it, inside the span or not. Linux places mappings
+     * top-down, so the range above a fresh span is whatever was mapped
+     * before it, and BLiNX 2 lost a thread's stack that way. The same
+     * placement put the span right under the neighbour that the contiguous
+     * window then collided with. The sentinel is mapped before init, so on
+     * Linux it sits in that range above the span.
+     */
+    {
+        unsigned char *sentinel = mmap(NULL, (size_t)host_page,
+                                       PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (sentinel != MAP_FAILED)
+            sentinel[0] = 0x5A;
+        xbox_SetMapSize((size_t)128 << 20);
+        BOOL ok7 = xbox_MemoryLayoutInit(xbe, n);
+        check(ok7, "init succeeds with a 128 MB map", NULL);
+        if (ok7) {
+            unsigned char *b7 = (unsigned char *)xbox_GetMemoryBase();
+            unsigned char got = 0;
+            check(read_byte_in_child(b7 + 0x80000000u, &got),
+                  "128 MB: the contiguous window at 0x80000000 is mapped",
+                  "the span left no room above it for the window");
+            if (sentinel != MAP_FAILED) {
+                got = 0;
+                check(read_byte_in_child(sentinel, &got) && got == 0x5A,
+                      "128 MB: a mapping made before init survives it",
+                      "the mirror loop freed a range outside the span");
+            }
+            xbox_MemoryLayoutShutdown();
+        }
+        xbox_SetMapSize(0);
+        if (sentinel != MAP_FAILED)
+            munmap(sentinel, (size_t)host_page);
+    }
+
+    /*
+     * 8. Section paging grows the map but stops the heap where RAM ends, and
+     *    a pure reservation comes from above that, never over a heap block.
+     *
+     * With the heap and xbox_ReserveAlloc both reaching the top of a grown
+     * map, a large MEM_RESERVE in a fragmented heap was granted at
+     * 0x04000000 -- inside the heap, over live blocks.
+     */
+    {
+        xbox_SetSectionPaging(1);
+        BOOL ok8 = xbox_MemoryLayoutInit(xbe, n);
+        check(ok8, "init succeeds with section paging", NULL);
+        if (ok8) {
+            char d[160];
+            uint32_t hi = 0, blk, res;
+            snprintf(d, sizeof d, "map %zu MB, RAM %zu MB, heap top 0x%08X",
+                     g_xbox_map_size >> 20, g_xbox_total_ram >> 20,
+                     (uint32_t)XBOX_HEAP_TOP);
+            check(g_xbox_map_size > g_xbox_total_ram, "paging: the map grew past RAM", d);
+            check(XBOX_HEAP_TOP > g_xbox_total_ram && XBOX_HEAP_TOP < g_xbox_map_size,
+                  "paging: the heap stops below the top of the map", d);
+            while ((blk = xbox_HeapAlloc(0x100000, 0x1000)) != 0)
+                if (blk + 0x100000 > hi) hi = blk + 0x100000;
+            res = xbox_ReserveAlloc(0x400000, 0x1000);
+            snprintf(d, sizeof d, "heap blocks end 0x%08X, reserve 0x%08X, heap top 0x%08X",
+                     hi, res, (uint32_t)XBOX_HEAP_TOP);
+            check(hi <= XBOX_HEAP_TOP, "paging: no heap block past the heap top", d);
+            check(res && res >= XBOX_HEAP_TOP && res + 0x400000 <= g_xbox_map_size,
+                  "paging: a reservation lands above the heap", d);
+            xbox_MemoryLayoutShutdown();
+        }
+        xbox_SetSectionPaging(0);
+        xbox_SetMapSize(0);
     }
 
     printf("\n%d failure(s)\n", failures);

@@ -11,7 +11,9 @@
 #if !defined(_WIN32)
 
 /* Enable memfd_create, MAP_FIXED_NOREPLACE, timegm. Must precede all #includes. */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /* Darwin: exposes memset_s, its explicit_bzero equivalent. */
 #define __STDC_WANT_LIB_EXT1__ 1
 
@@ -29,6 +31,8 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <limits.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -55,7 +59,6 @@ LONG InterlockedIncrement(volatile LONG *p)        { return __atomic_add_fetch(p
 LONG InterlockedDecrement(volatile LONG *p)        { return __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
-
 LONG InterlockedAnd(volatile LONG *p, LONG v)      { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
 LONG InterlockedOr(volatile LONG *p, LONG v)       { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
 
@@ -267,6 +270,11 @@ typedef struct w32_object {
     /* event */
     int             signaled;
     int             manual_reset;
+    unsigned        set_gen;        /* SetEvent/PulseEvent count */
+    int             release_on_set; /* see w32_event_release_on_set */
+    /* An abort event of w32_wait_abortable: the object its thread waits on
+     * now (a reference held), whose waiters a set must wake. */
+    struct w32_object *abort_wait;
 
     /* semaphore */
     long            sem_count;
@@ -330,6 +338,104 @@ DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 
+/* Live fd-backed file handles.
+ *
+ * A file HANDLE is a pointer to its w32_object, and the guest can hand back
+ * anything: a title that ignores a failed open passes INVALID_HANDLE_VALUE
+ * on to NtQueryInformationFile, and the bridge lets synthetic values such as
+ * 0xDEAD0001 through untouched. Reading o->kind off either one faulted
+ * (BLiNX 2 on a first boot, at 0xFFFFFFFFFFFFFFFF). So the w32_handle_*
+ * helpers look the pointer up here first and only then dereference it.
+ * Open addressing on the pointer value; the lookup never touches the object. */
+#define FILES_TOMB ((w32_object *)(uintptr_t)1)
+
+static pthread_mutex_t s_files_lock = PTHREAD_MUTEX_INITIALIZER;
+static w32_object    **s_files;
+static size_t          s_files_cap;    /* a power of two, or 0 */
+static size_t          s_files_used;   /* live entries plus tombstones */
+static size_t          s_files_live;
+
+static size_t files_hash(const void *p)
+{
+    uint64_t h = (uint64_t)(uintptr_t)p >> 4;
+    h ^= h >> 31;
+    h *= 0x9E3779B97F4A7C15ull;
+    h ^= h >> 29;
+    return (size_t)h;
+}
+
+/* The slot holding o, or SIZE_MAX. Caller holds s_files_lock. */
+static size_t files_find(const void *o)
+{
+    size_t i, n;
+    if (!s_files_cap || o == FILES_TOMB) return SIZE_MAX;
+    for (i = files_hash(o) & (s_files_cap - 1), n = 0; n < s_files_cap;
+         i = (i + 1) & (s_files_cap - 1), n++) {
+        if (s_files[i] == NULL) return SIZE_MAX;
+        if (s_files[i] == o) return i;
+    }
+    return SIZE_MAX;
+}
+
+static int files_insert(w32_object *o)
+{
+    size_t i;
+    pthread_mutex_lock(&s_files_lock);
+    if ((s_files_used + 1) * 2 > s_files_cap) {
+        /* Grow, or rebuild at the same size to drop tombstones. */
+        size_t cap = s_files_cap ? s_files_cap : 64;
+        while ((s_files_live + 1) * 4 > cap) cap *= 2;
+        w32_object **t = (w32_object **)calloc(cap, sizeof *t);
+        if (!t) { pthread_mutex_unlock(&s_files_lock); return 0; }
+        for (size_t k = 0; k < s_files_cap; k++) {
+            w32_object *e = s_files[k];
+            if (!e || e == FILES_TOMB) continue;
+            for (i = files_hash(e) & (cap - 1); t[i]; i = (i + 1) & (cap - 1)) {}
+            t[i] = e;
+        }
+        free(s_files);
+        s_files = t;
+        s_files_cap = cap;
+        s_files_used = s_files_live;
+    }
+    for (i = files_hash(o) & (s_files_cap - 1);
+         s_files[i] && s_files[i] != FILES_TOMB; i = (i + 1) & (s_files_cap - 1)) {}
+    if (!s_files[i]) s_files_used++;
+    s_files[i] = o;
+    s_files_live++;
+    pthread_mutex_unlock(&s_files_lock);
+    return 1;
+}
+
+static void files_remove(w32_object *o)
+{
+    size_t i;
+    pthread_mutex_lock(&s_files_lock);
+    i = files_find(o);
+    if (i != SIZE_MAX) {
+        s_files[i] = FILES_TOMB;
+        s_files_live--;
+    }
+    pthread_mutex_unlock(&s_files_lock);
+}
+
+/* h as a live file object, or NULL. Caller holds s_files_lock. */
+static w32_object *files_lookup(HANDLE h)
+{
+    if (!h || h == INVALID_HANDLE_VALUE || h == PSEUDO_CURRENT_THREAD)
+        return NULL;
+    return files_find(h) != SIZE_MAX ? (w32_object *)h : NULL;
+}
+
+int w32_open_file_handles(void)
+{
+    int n;
+    pthread_mutex_lock(&s_files_lock);
+    n = (int)s_files_live;
+    pthread_mutex_unlock(&s_files_lock);
+    return n;
+}
+
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
@@ -346,6 +452,7 @@ static void obj_release(w32_object *o)
     if (InterlockedDecrement(&o->refcount) > 0)
         return;
     if (o->kind == K_FILE) {
+        files_remove(o);
         if (o->fd >= 0) close(o->fd);
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
@@ -365,31 +472,106 @@ HANDLE w32_open_handle(int fd, const char *host_path)
     w32_object *o = obj_alloc(K_FILE);
     o->fd        = fd;
     o->file_path = host_path ? strdup(host_path) : NULL;
+    if (!files_insert(o)) {
+        /* Unregistered, no helper would ever accept it: fail the open.
+         * The release closes the fd. */
+        obj_release(o);
+        return NULL;
+    }
     return (HANDLE)o;
 }
 
 int w32_handle_fd(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    return (o && o->kind == K_FILE) ? o->fd : -1;
+    w32_object *o;
+    int fd;
+    pthread_mutex_lock(&s_files_lock);
+    o  = files_lookup(h);
+    fd = o ? o->fd : -1;
+    pthread_mutex_unlock(&s_files_lock);
+    return fd;
 }
 
 const char *w32_handle_path(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    return (o && o->kind == K_FILE) ? o->file_path : NULL;
+    w32_object *o;
+    const char *p;
+    pthread_mutex_lock(&s_files_lock);
+    o = files_lookup(h);
+    p = o ? o->file_path : NULL;
+    pthread_mutex_unlock(&s_files_lock);
+    return p;
 }
 
 void w32_handle_set_path(HANDLE h, const char *host_path)
 {
-    w32_object *o = (w32_object *)h;
-    char *old;
+    w32_object *o;
+    char *old = NULL;
 
-    if (!o || o->kind != K_FILE)
-        return;
-    old = o->file_path;
-    o->file_path = host_path ? strdup(host_path) : NULL;
+    pthread_mutex_lock(&s_files_lock);
+    o = files_lookup(h);
+    if (o) {
+        old = o->file_path;
+        o->file_path = host_path ? strdup(host_path) : NULL;
+    }
+    pthread_mutex_unlock(&s_files_lock);
     free(old);
+}
+
+/* Raise the soft open-file limit to the hard one, at most W32_FD_LIMIT_CAP.
+ *
+ * A title may keep a file open for every entry of its Z: cache, as the
+ * console's kernel has no per-process limit. BLiNX 2 keeps one per cache
+ * file, 363 for a full cache. macOS gives an app launched from Finder a soft
+ * limit of 256, so a first boot failed its 247th open (EMFILE). There the
+ * hard limit is usually RLIM_INFINITY, which setrlimit may refuse for
+ * RLIMIT_NOFILE and which the kernel caps at kern.maxfilesperproc anyway, so
+ * the target is that, then OPEN_MAX if even that is refused. Linux hard
+ * limits from systemd run from 524288 to about 2^30 in containers, and the
+ * raised limit reaches every child too, where select() (FD_SETSIZE) and fd
+ * sweeps up to the limit break or crawl. A title needs a few hundred, so the
+ * target is capped. Returns 1 when the limit changed, 0 when it was already
+ * there, -1 on failure; *after is the limit in force, read back. */
+#define W32_FD_LIMIT_CAP 65536
+
+int w32_raise_fd_limit(unsigned long long *before, unsigned long long *after)
+{
+    struct rlimit rl;
+    rlim_t was, want;
+
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return -1;
+    was = rl.rlim_cur;
+    if (before) *before = (unsigned long long)was;
+    if (after)  *after  = (unsigned long long)was;
+    want = rl.rlim_max;
+    if (want == RLIM_INFINITY || want > W32_FD_LIMIT_CAP)
+        want = W32_FD_LIMIT_CAP;
+#if defined(__APPLE__)
+    {
+        int per_proc = 0;
+        size_t len = sizeof per_proc;
+        if (sysctlbyname("kern.maxfilesperproc", &per_proc, &len, NULL, 0) == 0
+                && per_proc > 0 && (rlim_t)per_proc < want)
+            want = (rlim_t)per_proc;
+    }
+#endif
+    if (want <= was)
+        return 0;
+    rl.rlim_cur = want;
+    if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+#if defined(__APPLE__)
+        rl.rlim_cur = OPEN_MAX < rl.rlim_max ? OPEN_MAX : rl.rlim_max;
+        if (rl.rlim_cur <= was || setrlimit(RLIMIT_NOFILE, &rl) != 0)
+            return -1;
+#else
+        return -1;
+#endif
+    }
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return -1;
+    if (after) *after = (unsigned long long)rl.rlim_cur;
+    return rl.rlim_cur > was ? 1 : -1;
 }
 
 BOOL CloseHandle(HANDLE h)
@@ -466,11 +648,21 @@ static int waitable_due(w32_object *o)
     return 1;
 }
 
+/* w32_wait_abortable's: the abort event is set. Read without its lock;
+ * the set wakes the waiter through the waited object's lock (SetEvent). */
+static int abort_set(w32_object *ab)
+{
+    return ab && __atomic_load_n(&ab->signaled, __ATOMIC_ACQUIRE);
+}
+
+#define W32_WAIT_ABORTED 0xFFFF0001u
+
 /*
  * Wait on a single object. The object lock must NOT be held.
- * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT.
+ * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT, or W32_WAIT_ABORTED once ab (an
+ * event, or NULL) is set.
  */
-static DWORD wait_single(w32_object *o, DWORD ms)
+static DWORD wait_single(w32_object *o, DWORD ms, w32_object *ab)
 {
     struct timespec ts;
     int timed = (ms != INFINITE);
@@ -478,11 +670,15 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
     pthread_mutex_lock(&o->lock);
     DWORD result = WAIT_OBJECT_0;
+    unsigned gen0 = o->set_gen;
 
     for (;;) {
         int ready = 0;
         switch (o->kind) {
-        case K_EVENT:  ready = o->signaled; break;
+        case K_EVENT:
+            ready = o->signaled ||
+                    (o->release_on_set && o->manual_reset && o->set_gen != gen0);
+            break;
         case K_THREAD: ready = o->exited;   break;
         case K_SEM:    ready = (o->sem_count > 0); break;
         case K_MUTEX:
@@ -492,6 +688,7 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         default:       ready = 1; break;
         }
         if (ready) break;
+        if (abort_set(ab)) { result = W32_WAIT_ABORTED; break; }
 
         /* An armed timer has its own deadline. Waiting on the caller's alone
          * would sleep straight past the due time, so take whichever comes
@@ -529,7 +726,7 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
-    return wait_single((w32_object *)h, ms);
+    return wait_single((w32_object *)h, ms, NULL);
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
@@ -548,12 +745,45 @@ DWORD WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL waitAll, D
     return WaitForMultipleObjectsEx(count, handles, waitAll, ms, FALSE);
 }
 
-DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
-                               DWORD ms, BOOL alertable)
+/* The set generation of a manual-reset event marked by
+ * w32_event_release_on_set, or 0 when h is anything else. */
+static int marked_event_gen(HANDLE h, unsigned *gen)
+{
+    w32_object *o = (w32_object *)h;
+    int marked;
+    if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
+        return 0;
+    if (o->kind != K_EVENT) return 0;
+    pthread_mutex_lock(&o->lock);
+    marked = o->release_on_set && o->manual_reset;
+    *gen = o->set_gen;
+    pthread_mutex_unlock(&o->lock);
+    return marked;
+}
+
+/* One poll of handle i: ready now, or (marked events) set at any point since
+ * the wait began. The poll runs every millisecond, and a set followed by a
+ * reset inside one gap would otherwise be lost, as wait_single's generation
+ * check prevents for a single-object wait. */
+static int multi_ready(HANDLE h, int marked, unsigned gen0)
+{
+    unsigned gen;
+    if (WaitForSingleObject(h, 0) == WAIT_OBJECT_0) return 1;
+    return marked && marked_event_gen(h, &gen) && gen != gen0;
+}
+
+static DWORD wait_multi(DWORD count, const HANDLE *handles, BOOL waitAll,
+                        DWORD ms, BOOL alertable, w32_object *ab)
 {
     struct timespec ts;
     int timed = (ms != INFINITE);
+    /* MAXIMUM_WAIT_OBJECTS; handles past it just go without the snapshot. */
+    unsigned gen0[64];
+    int marked[64];
+    DWORD snap = count < 64 ? count : 64;
     if (timed) deadline_from_ms(ms, &ts);
+    for (DWORD i = 0; i < snap; i++)
+        marked[i] = marked_event_gen(handles[i], &gen0[i]);
 
     for (;;) {
         if (alertable && drain_apcs() > 0)
@@ -562,11 +792,13 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
         if (waitAll) {
             DWORD got = 0;
             for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) got++;
+                if (multi_ready(handles[i], i < snap && marked[i],
+                                i < snap ? gen0[i] : 0)) got++;
             if (got == count) return WAIT_OBJECT_0;
         } else {
             for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0)
+                if (multi_ready(handles[i], i < snap && marked[i],
+                                i < snap ? gen0[i] : 0))
                     return WAIT_OBJECT_0 + i;
         }
 
@@ -577,8 +809,51 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
                 (now.tv_sec == ts.tv_sec && now.tv_nsec >= ts.tv_nsec))
                 return WAIT_TIMEOUT;
         }
+        if (abort_set(ab))
+            return WAIT_OBJECT_0 + count;
         usleep(1000);
     }
+}
+
+DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
+                               DWORD ms, BOOL alertable)
+{
+    return wait_multi(count, handles, waitAll, ms, alertable, NULL);
+}
+
+/* A wait that also ends, as index count, when abort_ev is set: what Win32
+ * gives by adding the event to a WaitAny, for a WaitAll too. The single
+ * object waits on its condition variable as before; the event's set wakes
+ * it through abort_wait. */
+DWORD w32_wait_abortable(HANDLE abort_ev, DWORD count, const HANDLE *handles,
+                         BOOL waitAll, DWORD ms, BOOL alertable)
+{
+    w32_object *ab = (w32_object *)abort_ev, *o;
+    DWORD r;
+
+    if (!ab || ab->kind != K_EVENT)
+        ab = NULL;
+    if (count != 1)
+        return wait_multi(count, handles, waitAll, ms, alertable, ab);
+    if (alertable && drain_apcs() > 0)
+        return WAIT_IO_COMPLETION;
+    if (abort_set(ab))
+        return WAIT_OBJECT_0 + 1;
+    o = (w32_object *)handles[0];
+    if (!o || handles[0] == PSEUDO_CURRENT_THREAD || handles[0] == PSEUDO_CURRENT_PROCESS)
+        return WAIT_OBJECT_0;
+    if (!ab)
+        return wait_single(o, ms, NULL);
+    pthread_mutex_lock(&ab->lock);
+    InterlockedIncrement(&o->refcount);
+    ab->abort_wait = o;
+    pthread_mutex_unlock(&ab->lock);
+    r = wait_single(o, ms, ab);
+    pthread_mutex_lock(&ab->lock);
+    ab->abort_wait = NULL;
+    pthread_mutex_unlock(&ab->lock);
+    obj_release(o);
+    return r == W32_WAIT_ABORTED ? WAIT_OBJECT_0 + 1 : r;
 }
 
 /* ===================================================================== */
@@ -604,8 +879,17 @@ BOOL SetEvent(HANDLE h)
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
-    o->signaled = 1;
+    __atomic_store_n(&o->signaled, 1, __ATOMIC_RELEASE);
+    o->set_gen++;
     pthread_cond_broadcast(&o->cond);
+    /* An abort event: its thread re-reads it under the lock of the object
+     * it waits on, so wake that one's waiters too. */
+    if (o->abort_wait) {
+        w32_object *t = o->abort_wait;
+        pthread_mutex_lock(&t->lock);
+        pthread_cond_broadcast(&t->cond);
+        pthread_mutex_unlock(&t->lock);
+    }
     pthread_mutex_unlock(&o->lock);
     return TRUE;
 }
@@ -620,12 +904,32 @@ BOOL ResetEvent(HANDLE h)
     return TRUE;
 }
 
+/* Win32 and the NT kernel release every waiter of a manual-reset event when
+ * it is set, there and then. Here a waiter only wakes from the condition
+ * variable later and re-reads `signaled`, so a reset in between -- by the
+ * first waiter to run, typically -- sends the others back to sleep with the
+ * set lost. XDK D3D's BlockUntilVerticalBlank does exactly that: it writes 0
+ * to the vblank event's SignalState before each wait, so of two threads
+ * waiting on vblank one runs every frame and the other never does (JSRF's
+ * CRI file server thread). Marked events count a set that happened during the
+ * wait as satisfying it, as the kernel does. Opt-in per event so the shared
+ * shim's behaviour changes only where the kernel layer asks for it. */
+void w32_event_release_on_set(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    if (!o || o->kind != K_EVENT) return;
+    pthread_mutex_lock(&o->lock);
+    o->release_on_set = 1;
+    pthread_mutex_unlock(&o->lock);
+}
+
 BOOL PulseEvent(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
+    o->set_gen++;
     pthread_cond_broadcast(&o->cond);
     o->signaled = 0;
     pthread_mutex_unlock(&o->lock);
@@ -1172,18 +1476,42 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem)
 /* Virtual memory                                                        */
 /* ===================================================================== */
 
+/* The guest's PAGE_EXECUTE* requests map without PROT_EXEC. Static
+ * recompilation never runs guest bytes: the title's code is host code in the
+ * executable, and nothing here generates code at run time. Asking for exec
+ * only costs: Apple silicon refuses a writable+executable mapping without
+ * MAP_JIT (macOS and iOS alike), so a guest PAGE_EXECUTE_READWRITE used to
+ * come back NULL. The read/write sense is kept; on x86 an executable page is
+ * always readable, so PAGE_EXECUTE alone is read-only. Logged once. */
+static void exec_dropped(DWORD protect)
+{
+    static int said;
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "[win32_compat] guest asked for executable memory "
+                "(protect 0x%02X); mapped without execute, since recompiled "
+                "code never runs guest pages (logged once)\n",
+                (unsigned)(protect & 0xFF));
+}
+
 static int prot_from_page(DWORD protect)
 {
     switch (protect & 0xFF) {
     case PAGE_NOACCESS:          return PROT_NONE;
     case PAGE_READONLY:          return PROT_READ;
     case PAGE_READWRITE:         return PROT_READ | PROT_WRITE;
-    case PAGE_EXECUTE:           return PROT_EXEC;
-    case PAGE_EXECUTE_READ:      return PROT_READ | PROT_EXEC;
-    case PAGE_EXECUTE_READWRITE: return PROT_READ | PROT_WRITE | PROT_EXEC;
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:      exec_dropped(protect); return PROT_READ;
+    case PAGE_EXECUTE_READWRITE: exec_dropped(protect); return PROT_READ | PROT_WRITE;
     default:                     return PROT_READ | PROT_WRITE;
     }
 }
+
+/* Length registry, defined with the view helpers below. Win32 frees by address
+ * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
+ * documented to take size 0 -- so the length has to be recoverable here or
+ * munmap cannot be called at all. */
+void view_register(void *addr, size_t len);
+size_t view_take(const void *addr);
 
 #if defined(__APPLE__)
 /* Darwin has no MAP_FIXED_NOREPLACE, and the two mmap options are both wrong
@@ -1538,7 +1866,7 @@ BOOL FlushFileBuffers(HANDLE h)
 
 /* ===================================================================== */
 /* Keyboard + window helpers -- stubs. Real keyboard polling will come   */
-/* via SDL_GetKeyboardState when main.c gets its SDL2 port.              */
+/* via SDL_GetKeyboardState when main.c gets its SDL port.              */
 /* ===================================================================== */
 
 SHORT GetAsyncKeyState(int vKey)          { (void)vKey; return 0; }
@@ -1563,7 +1891,7 @@ BOOL    PeekMessageA(LPMSG m, HWND w, UINT a, UINT b, UINT f)
 BOOL    TranslateMessage(const MSG *m) { (void)m; return TRUE; }
 LRESULT DispatchMessageA(const MSG *m) { (void)m; return 0; }
 
-/* XInput stub: real gamepad is wired through input_compat (SDL2). */
+/* XInput stub: real gamepad is wired through input_compat (SDL). */
 DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
 { (void)idx; if (state) memset(state, 0, sizeof(*state)); return ERROR_DEVICE_NOT_CONNECTED; }
 

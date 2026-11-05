@@ -1,0 +1,114 @@
+# cmake -DMODE=native|mingw -DTK_ROOT= -DFIXTURE= -DWORK= -DGEN= -P check.cmake
+#
+# Two copies of the fixture under WORK, in folders of different lengths and
+# each with its toolkit beside it, configured and built a second apart. The
+# outputs must be byte-equal and must not name either folder.
+
+if(MODE STREQUAL "mingw")
+    if(DEFINED ENV{LLVM_MINGW_ROOT})
+        set(_cc "$ENV{LLVM_MINGW_ROOT}/bin/x86_64-w64-mingw32-clang")
+    else()
+        find_program(_cc x86_64-w64-mingw32-clang)
+    endif()
+    if(NOT _cc OR NOT EXISTS "${_cc}")
+        # The test's SKIP_REGULAR_EXPRESSION matches this line: cmake older
+        # than 3.29 (sniper has 3.25) has no cmake_language(EXIT).
+        message("no llvm-mingw (set LLVM_MINGW_ROOT): skipped")
+        return()
+    endif()
+    set(_cfg -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=x86_64
+             -DCMAKE_C_COMPILER=${_cc})
+    set(_files repro_game.exe repro_game.pdb)
+else()
+    set(_cfg "")
+    set(_files repro_game)
+endif()
+
+file(REMOVE_RECURSE "${WORK}")
+set(_sums "")
+foreach(copy a bbbbbbbb)
+    set(root "${WORK}/${copy}/game")
+    set(tk "${WORK}/${copy}-tk")
+    file(COPY "${FIXTURE}/game/" DESTINATION "${root}")
+    file(COPY "${FIXTURE}/tk/" DESTINATION "${tk}")
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -S "${root}" -B "${root}/build" -G "${GEN}"
+                -DCMAKE_BUILD_TYPE=Release -DTK_ROOT=${TK_ROOT} -DFAKE_TK=${tk} ${_cfg}
+        RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+    if(rc)
+        message(FATAL_ERROR "configure ${copy}: ${out}")
+    endif()
+    execute_process(COMMAND ${CMAKE_COMMAND} --build "${root}/build"
+        RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+    if(rc)
+        message(FATAL_ERROR "build ${copy}: ${out}")
+    endif()
+    foreach(f IN LISTS _files)
+        set(p "${root}/build/${f}")
+        if(NOT EXISTS "${p}")
+            message(FATAL_ERROR "${copy}: no ${f}")
+        endif()
+        file(SHA256 "${p}" h)
+        list(APPEND _sums "${copy}:${f}:${h}")
+        # Neither the folder nor the toolkit beside it may reach the bytes.
+        file(STRINGS "${p}" leak REGEX "${WORK}")
+        if(leak)
+            message(FATAL_ERROR "${copy}/${f} names its folder: ${leak}")
+        endif()
+    endforeach()
+    # The second copy links at a later second: a timestamp would show.
+    execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 1.1)
+endforeach()
+
+foreach(f IN LISTS _files)
+    set(seen "")
+    foreach(s IN LISTS _sums)
+        if(s MATCHES "^[^:]+:${f}:(.*)$")
+            list(APPEND seen "${CMAKE_MATCH_1}")
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES seen)
+    list(LENGTH seen n)
+    if(NOT n EQUAL 1)
+        message(FATAL_ERROR "${f} differs between the two builds: ${_sums}")
+    endif()
+endforeach()
+
+if(MODE STREQUAL "mingw")
+    # The CodeView record (RSDS, GUID, age, PDB name) in each exe: the GUID
+    # must be set, equal, and the one the PDB carries, or a debugger and
+    # dbghelp would reject the PDB beside the exe.
+    set(_guids "")
+    foreach(copy a bbbbbbbb)
+        set(b "${WORK}/${copy}/game/build")
+        file(READ "${b}/repro_game.exe" hex HEX)
+        string(FIND "${hex}" "52534453" at)
+        if(at LESS 0)
+            message(FATAL_ERROR "${copy}: no CodeView record in the exe")
+        endif()
+        math(EXPR at "${at} + 8")
+        string(SUBSTRING "${hex}" ${at} 32 guid)
+        if(guid MATCHES "^0+$")
+            message(FATAL_ERROR "${copy}: zero PDB GUID")
+        endif()
+        file(READ "${b}/repro_game.pdb" phex HEX)
+        string(FIND "${phex}" "${guid}" pat)
+        if(pat LESS 0)
+            message(FATAL_ERROR "${copy}: the PDB does not carry the exe's GUID ${guid}")
+        endif()
+        # The name only, so dbghelp looks beside the exe.
+        math(EXPR nat "${at} + 40")
+        string(SUBSTRING "${hex}" ${nat} 30 name)
+        if(NOT name STREQUAL "726570726f5f67616d652e70646200")
+            message(FATAL_ERROR "${copy}: the exe names its PDB by a path (${name})")
+        endif()
+        list(APPEND _guids "${guid}")
+    endforeach()
+    list(REMOVE_DUPLICATES _guids)
+    list(LENGTH _guids n)
+    if(NOT n EQUAL 1)
+        message(FATAL_ERROR "PDB GUIDs differ: ${_guids}")
+    endif()
+    message("PDB GUID ${_guids}")
+endif()
+message("equal: ${_sums}")

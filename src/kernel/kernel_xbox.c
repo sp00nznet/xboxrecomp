@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include "kernel_language.h"
 #include <string.h>
 #include <time.h>
 
@@ -57,6 +58,35 @@ UCHAR xbox_SignatureKey[16]           = {0};
 UCHAR xbox_LANKey[16]                 = {0};
 UCHAR xbox_AlternateSignatureKeys[16][16] = {{0}};
 
+/* A title signs its saves with these keys (XCalculateSignature mixes the
+ * signature key with the title's; "noroam" saves add the HD key), so a save
+ * moves between hosts only when they match. Every build leaves them zero;
+ * the saves zip records which set made it (openspec overlay-saves, D1). */
+const char *xbox_saves_keys_id(void)
+{
+    static char id[17];
+    static const char hex[] = "0123456789abcdef";
+    XBOX_SHA_CONTEXT sha;
+    UCHAR d[20];
+    int i, zero = 1;
+    for (i = 0; i < 16; i++)
+        if (xbox_HDKey[i] || xbox_SignatureKey[i])
+            zero = 0;
+    if (zero)
+        return "zero";
+    xbox_XcSHAInit(&sha);
+    xbox_XcSHAUpdate(&sha, (const UCHAR *)"xbr-saves-keys", 14);
+    xbox_XcSHAUpdate(&sha, xbox_HDKey, 16);
+    xbox_XcSHAUpdate(&sha, xbox_SignatureKey, 16);
+    xbox_XcSHAFinal(&sha, d);
+    for (i = 0; i < 8; i++) {
+        id[2 * i] = hex[d[i] >> 4];
+        id[2 * i + 1] = hex[d[i] & 15];
+    }
+    id[16] = '\0';
+    return id;
+}
+
 /* Public key data for Xbox Live signature verification - not needed */
 UCHAR xbox_XePublicKeyData[284] = {0};
 
@@ -79,7 +109,9 @@ XBOX_LAUNCH_DATA_PAGE* xbox_LaunchDataPage = &g_launch_data_page;
  * XeLoadSection/XeUnloadSection manage on-demand loading of XBE sections.
  * On Xbox, some sections are demand-paged from disc. In our recompilation,
  * the entire executable is loaded into memory, so these are reference-counting
- * no-ops.
+ * no-ops. Recompiled code never reaches them: ordinals 327/328 go through
+ * bridge_XeSection (kernel_bridge.c), which is where section paging
+ * (xbe_sections.c) lives -- change that path, not this one.
  * ============================================================================ */
 
 NTSTATUS __stdcall xbox_XeLoadSection(PXBE_SECTION_HEADER Section)
@@ -121,7 +153,7 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  * SMBus. For recompilation, we return sensible defaults:
  *   - Region: North America
  *   - Video: NTSC, widescreen+HDTV enabled
- *   - Language: English
+ *   - Language: system.language, English by default (kernel_language.h)
  *   - Audio: Stereo, Dolby Digital
  *   - DVD Region: Region 1 (North America)
  *   - Time zone: the host's
@@ -211,9 +243,9 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     switch (ValueIndex) {
     case XC_LANGUAGE:
-        /* English = 1 */
+        /* system.language; English (1) unless set (kernel_language.h). */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 1;
+            *(PULONG)Value = xbox_Language();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -312,7 +344,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         memcpy(blk + 0x1C, &s_tz.dlt_date, 4);
         memcpy(blk + 0x28, &s_tz.std_bias, 4);
         memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
-        { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
+        { ULONG v = xbox_Language(); memcpy(blk + 0x30, &v, 4); }         /* XC_LANGUAGE */
         { ULONG v = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV; memcpy(blk + 0x34, &v, 4); }
         /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
         { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */

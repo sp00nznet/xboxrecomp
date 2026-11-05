@@ -19,6 +19,7 @@
  */
 
 #include <stdio.h>
+#include "recomp_env.h"
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
 
@@ -185,14 +186,14 @@ void recomp_icall_not_code_log(uint32_t va)
 void recomp_unimpl(const char *text, uint32_t va)
 {
     static int printed;
-    const char *trap = getenv("RECOMP_UNIMPL_TRAP");
+    const char *trap = recomp_env(RENV_UNIMPL_TRAP);
     int stop = trap && *trap && *trap != '0';
 
     if (printed < 50 || stop) {
         printed++;
         fprintf(stderr,
                 "[UNIMPL] untranslated instruction REACHED: `%s` at 0x%08X"
-                " (a no-op; set RECOMP_UNIMPL_TRAP=1 to stop here)\n",
+                " (a no-op; set RECOMP_DEBUG=unimpl_trap to stop here)\n",
                 text, va);
         fflush(stderr);
     }

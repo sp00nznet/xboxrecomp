@@ -11,11 +11,10 @@
  *
  * The toolkit raises no GPU interrupts, so none of that runs, and a
  * FLIP_STALL used to end at once: a title that does not pace itself on the
- * CPU flipped as fast as the executor could draw (hundreds per second in a
- * simple menu) while its vblank ran at 60. The walker now holds after a
- * FLIP_STALL until the guest's vblank count allows the flip (nv2a_pb_exec.c
- * arms it, the ack loop in xbox_memory_layout.c holds the next walk, the
- * DMA_GET advance and the PFB flush ack).
+ * CPU flipped as fast as the backend presented (hundreds per second on
+ * Metal, the display's 90 Hz on a 90 Hz panel) while its vblank ran at 60. The walker now holds after a FLIP_STALL until
+ * the guest's vblank count allows the flip (nv2a_pb_exec.c arms it, the ack
+ * loop in xbox_memory_layout.c holds the next walk and the KickOff ack).
  *
  * The rule here is pure: counts and times come in as arguments, so
  * tests/flip_hold drives it without a kernel.
@@ -27,7 +26,34 @@
  * interval per frame (one that waits for two vblanks itself) is never held,
  * and a late frame on a slow backend is not pushed to the next vblank.
  * The hold is opt-in: RECOMP_FLIP_PACING=1 turns it on, =edge with D3D's
- * rule for A/B runs; unset, flips complete at once as before.
+ * rule for A/B runs; unset, flips complete at once as before, except in
+ * the deterministic mode, where unset means on (xbox_FlipPacingMode).
+ *
+ * The count a stall is measured at is the vblank the walk began in. After
+ * a host stall that can be vblanks after the one the title kicked in: the
+ * stall lands between the KickOff's PUT store and the walker seeing it, and
+ * the vblank clock then catches up one vblank per millisecond, so a walk a
+ * few milliseconds late is several vblanks late. A late frame's flip was
+ * taken as that later vblank, so a title that paces itself (it waits for
+ * its own vblank, then swaps) reached every later stall one vblank short of
+ * the target. Held one vblank each frame, it kept its 30 fps, and nothing
+ * pulled the two grids back together until another stall happened to.
+ *
+ * So the ack loop reports every read of PUT with the count it read just
+ * before it (xbox_FlipHoldPutRead). The count of the last read that still
+ * saw the old PUT is a lower bound on the kick's vblank. A walk takes that
+ * bound only when the clock raised a vblank behind its grid after that
+ * read (xbox_FlipHoldWalk): the stall that made the walk late. A frame that
+ * is then not held is taken to have flipped at the bound, or on its target
+ * if that is later. A walk with no catch-up keeps the walk's count, so a
+ * title the hold paces, and edge mode, see the rule as it was: the kick is
+ * somewhere between the bound and the count, and only a stall justifies
+ * taking the early end. Two gaps remain, both the old behaviour: a walker
+ * delayed on its own while the clock kept time, and a short stall (5 to
+ * 20 ms) that ends less than XBOX_VBLANK_BEHIND_NS after an edge, so no
+ * vblank of its catch-up is raised far enough behind to be stamped. Either
+ * can still leave a walk a vblank late and the grid shifted until the next
+ * stall. The stalls seen in practice stop the whole process for longer.
  */
 #ifndef NV2A_FLIP_HOLD_H
 #define NV2A_FLIP_HOLD_H
@@ -52,19 +78,57 @@ typedef struct {
     /* The vblank the previous flip was released on. */
     int      have_last;
     uint32_t last_flip;
+    /* The ack loop's latest read of PUT (value, the count read before it,
+     * host time), and the latest read that saw the PUT before that: the
+     * lower bound on the kick that moved it. */
+    int      have_pass, have_bound;
+    uint32_t pass_put, pass_vbl, bound_vbl;
+    uint64_t pass_ns, bound_ns;
+    /* This walk's kick bound, when a catch-up made the walk late. */
+    int      have_kick;
+    uint32_t kick_count;
     /* A pending hold. */
     int      held;
     uint32_t target;
     uint32_t stall_count;
     uint64_t held_since_ns;
-    /* Statistics, for the [GPU] report; the caller resets them. */
+    /* Statistics, for RECOMP_TRACE=pacing; the caller resets them. */
     uint32_t holds, timeouts, clock_stops, nonop, iv[4];
+    /* Frames whose flip a late walk's bound moved before the walk's count,
+     * and the most vblanks one was moved: one per stall that hit a walk. */
+    uint32_t late_walks, late_max;
     uint64_t held_ns;
 } XboxFlipHold;
+
+/* Pacing modes (RECOMP_FLIP_PACING). */
+#define XBOX_FLIP_PACING_OFF  0
+#define XBOX_FLIP_PACING_ON   1
+#define XBOX_FLIP_PACING_EDGE 2
+
+/* The pacing mode env selects: 0 off, edge D3D's rule, anything else on.
+ * Unset or empty is off, or on when virtual_clock (the deterministic
+ * mode), where the hold is what lets a vblank in while a title keeps the
+ * GPU busy (nv2a_pb_exec_flip_pacing). */
+int xbox_FlipPacingMode(const char *env, int virtual_clock);
 
 /* A NO_OPERATION parameter. Returns 1 when it is the swap (software method
  * 1) and was recorded, 0 for anything else, which changes nothing. */
 int xbox_FlipHoldSwap(XboxFlipHold *h, uint32_t param);
+
+/* The ack loop read PUT as put at host time now_ns, with vbl the vblank
+ * count it read before it (an acquire fence between the two). Every read
+ * that can start a walk reports here. */
+void xbox_FlipHoldPutRead(XboxFlipHold *h, uint32_t vbl, uint32_t put,
+                          uint64_t now_ns);
+
+/* A walk begins. behind_ns is the host time of the
+ * last vblank the clock raised behind its grid (xbox_VblankBehindNs, 0 for
+ * none). When that came after the bound's read, the walk may be late, and
+ * the next stall in it takes its flip from the bound. Its own walk only:
+ * the next walk decides again. The bound never puts a flip before its
+ * target; a loose one (the walker busy across several kicks) only counts a
+ * late frame as on its target, so the next frame is held a vblank less. */
+void xbox_FlipHoldWalk(XboxFlipHold *h, uint64_t behind_ns);
 
 /* A FLIP_STALL, with the vblank count sampled when the walk that reached it
  * began (a stall reached late in a walk is not taken for a new frame).

@@ -10,7 +10,8 @@
  * size (or borderless fullscreen) without stretching the picture.
  *
  * Opt-in with RECOMP_D3D_PRESENT=1; anything that fails falls back to GDI.
- * Linear filtering, RECOMP_PRESENT_FILTER=point for sharp pixels;
+ * Linear filtering, RECOMP_PRESENT_FILTER=point (or nearest) for sharp
+ * pixels when the enhancements layer is built;
  * RECOMP_PRESENT_VSYNC=0 presents without waiting for the display, as the
  * SDL window does.
  */
@@ -25,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gpu_present.h"
+#include "recomp_env.h"
 
 static ID3D11Device             *s_dev;
 static ID3D11DeviceContext      *s_ctx;
@@ -52,8 +54,7 @@ int gpu_present_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("RECOMP_D3D_PRESENT");
-        on = e && *e && *e != '0';
+        on = recomp_env_on(RENV_D3D_PRESENT);
     }
     return on;
 }
@@ -99,7 +100,14 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
     D3D11_SAMPLER_DESC smp;
     ID3DBlob *vsb, *psb;
     HRESULT hr;
-    const char *v = getenv("RECOMP_PRESENT_VSYNC"), *f = getenv("RECOMP_PRESENT_FILTER");
+    const char *v = recomp_env(RENV_PRESENT_VSYNC);
+#ifdef RECOMP_ENV_HAVE_ENHANCE_KEYS
+    /* The enhancements layer owns RECOMP_PRESENT_FILTER (nearest, linear,
+     * integer); point, nearest and integer all mean sharp pixels here. */
+    const char *f = recomp_env(RENV_PRESENT_FILTER);
+#else
+    const char *f = NULL;
+#endif
 
     if (v && v[0] == '0')
         s_vsync = 0;
@@ -139,8 +147,8 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     ZeroMemory(&smp, sizeof smp);
-    smp.Filter = (f && (f[0] == 'p' || f[0] == 'P')) ? D3D11_FILTER_MIN_MAG_MIP_POINT
-                                                     : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    smp.Filter = (f && strchr("pPnNiI", f[0]) && f[0]) ? D3D11_FILTER_MIN_MAG_MIP_POINT
+                                                       : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     smp.MaxLOD = D3D11_FLOAT32_MAX;
     vsb = compile("vs", "vs_4_0");

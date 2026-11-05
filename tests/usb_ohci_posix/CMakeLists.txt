@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(usb_ohci_posix_test C)
 # The OHCI register model behind a real POSIX fault: a PROT_NONE aperture, a
-# SIGBUS/SIGSEGV handler and the A64 decoder. Needs a POSIX arm64 host;
-# elsewhere the model stays off by design and the test exits 77 (skipped).
+# SIGBUS/SIGSEGV handler and the host's decoder (A64, or x86-64 on Linux).
+# Needs a POSIX arm64 or x86-64 Linux host; elsewhere the model stays off by
+# design and the test exits 77 (skipped).
 if(WIN32)
     message(FATAL_ERROR "This regression covers the POSIX trap path")
 endif()
@@ -26,3 +27,4 @@ target_link_libraries(usb_ohci_posix_test PRIVATE xboxrecomp)
 enable_testing()
 add_test(NAME usb_ohci_posix_test COMMAND usb_ohci_posix_test ${TEST_XBE})
 set_tests_properties(usb_ohci_posix_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME usb_ohci_posix_off COMMAND usb_ohci_posix_test ${TEST_XBE} off)

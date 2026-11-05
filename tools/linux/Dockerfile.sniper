@@ -1,0 +1,17 @@
+# Linux x86-64 builds against the Steam Linux Runtime 3.0 (sniper) SDK, so
+# the binaries run on SteamOS, Bazzite and any distro with Steam (glibc 2.31).
+# Run only as `docker build --output` with the source as the build context
+# (tools/linux/sniper.sh); no bind mounts.
+FROM registry.gitlab.steamos.cloud/steamrt/sniper/sdk@sha256:9ae8083ee9ae6298361a62f289e62f0a2b0779d23fc8c276304157f0c06010c5 AS build
+ARG JOBS=8
+ARG CTEST=1
+COPY . /src
+WORKDIR /src
+RUN mkdir -p /out && date +%s > /out/t0 \
+ && { cmake -S . -B /b -G Ninja -DCMAKE_BUILD_TYPE=Release -DXBOXRECOMP_ENHANCE=ON > /out/root.cfg.log 2>&1; echo "cfg=$?" >> /out/status.txt; } \
+ && { cmake --build /b -j "$JOBS" -- -k 0 > /out/root.build.log 2>&1; echo "build=$?" >> /out/status.txt; } \
+ && date +%s > /out/t1 \
+ && { [ "$CTEST" != 1 ] || { SDL_AUDIO_DRIVER=dummy SDL_VIDEO_DRIVER=dummy SDL_AUDIODRIVER=dummy SDL_VIDEODRIVER=dummy JOBS="$JOBS" bash tests/posix_ctest.sh /out/ctest > /out/ctest.txt 2>&1; echo "ctest=$?" >> /out/status.txt; }; } \
+ && date +%s > /out/t2; true
+FROM scratch
+COPY --from=build /out /

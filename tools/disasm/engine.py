@@ -19,6 +19,7 @@ from capstone.x86_const import (
 from capstone import x86_const
 
 from . import config
+from ..recomp.disasm import disasm_lazily
 from .loader import BinaryImage, SectionInfo
 
 
@@ -117,6 +118,9 @@ class DisasmEngine:
 
         # Instruction cache: address -> Instruction
         self.instructions: Dict[int, Instruction] = {}
+        # probes_as_callback_body's decodes, shared by every probe on this
+        # image (Disassembler._stream); read-only to the probes.
+        self._probe_decodes: Dict[int, object] = {}
 
         # Sorted address list (built lazily for range queries)
         self._sorted_addrs: Optional[List[int]] = None
@@ -495,7 +499,7 @@ class DisasmEngine:
 
         added = 0
         overlaps = set()
-        for cs_insn in self._cs.disasm(data[offset:], addr):
+        for cs_insn in disasm_lazily(self._cs, data[offset:], addr):
             if cs_insn.address >= file_end:
                 break
             if cs_insn.address != addr and cs_insn.address in self.instructions:
@@ -550,7 +554,7 @@ class DisasmEngine:
             return None
 
         count = 0
-        for decoded in self._cs.disasm(data, addr):
+        for decoded in disasm_lazily(self._cs, data, addr):
             count += 1
             if count > max_insns:
                 return None
@@ -631,7 +635,7 @@ class DisasmEngine:
             limit = resume + len(data)
             start = resume
             resume = None
-            for decoded in self._cs.disasm(data, start):
+            for decoded in disasm_lazily(self._cs, data, start):
                 count += 1
                 mnemonic = decoded.mnemonic.lower()
                 if mnemonic == "int3":
@@ -712,7 +716,7 @@ class DisasmEngine:
             # writer defines only its own flags: inc and dec leave CF.
             pending = {"AF", "CF", "OF", "PF", "SF", "ZF"}
             flag = lambda kind, name: getattr(x86_const, f"X86_EFLAGS_{kind}_{name}")
-            for insn in self._cs.disasm(raw[addr - lower:], addr):
+            for insn in disasm_lazily(self._cs, raw[addr - lower:], addr):
                 if (X86_REG_EFLAGS in insn.regs_read
                         and (not insn.eflags or any(
                             insn.eflags & flag("TEST", f) for f in pending))):
@@ -730,7 +734,8 @@ class DisasmEngine:
         while True:
             decoded = decoder.disassemble_cfg(
                 raw, lower, upper, entries,
-                stop_mnemonics=("int3", "int", "ud2", "hlt", "iret", "iretd"))
+                stop_mnemonics=("int3", "int", "ud2", "hlt", "iret", "iretd"),
+                cache=self._probe_decodes)
             arms = set()
             for insn in decoded:
                 if not insn.is_jump or insn.jump_target is not None:

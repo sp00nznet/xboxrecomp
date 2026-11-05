@@ -1,0 +1,21 @@
+# The sniper SDK's headers and libraries as a sysroot, for a native clang on
+# the Mac to target x86_64-linux-gnu without emulation (design D4's
+# alternative). Absolute symlinks become relative so the tree works where it
+# lands. FLTK's Fl -> FL alias goes: the Mac's case-insensitive disk cannot
+# hold both. Run only as `docker build --output` (tools/linux/sysroot.sh).
+FROM registry.gitlab.steamos.cloud/steamrt/sniper/sdk@sha256:9ae8083ee9ae6298361a62f289e62f0a2b0779d23fc8c276304157f0c06010c5 AS build
+RUN set -e; mkdir -p /sysroot/usr/lib /sysroot/usr/share \
+ && cp -a /usr/include /sysroot/usr/ \
+ && cp -a /usr/lib/x86_64-linux-gnu /usr/lib/gcc /sysroot/usr/lib/ \
+ && cp -a /usr/share/pkgconfig /sysroot/usr/share/ \
+ && if [ -d /lib/x86_64-linux-gnu ] && [ ! -L /lib ]; then mkdir -p /sysroot/lib && cp -a /lib/x86_64-linux-gnu /sysroot/lib/; fi \
+ && if [ -d /lib64 ] && [ ! -L /lib64 ]; then cp -a /lib64 /sysroot/; fi \
+ && find /sysroot -type l -lname '/*' | while read -r l; do \
+      t=$(readlink "$l"); \
+      ln -sfn "$(realpath -m --relative-to="$(dirname "$l")" "/sysroot$t")" "$l"; \
+    done \
+ && rm -rf /sysroot/usr/lib/x86_64-linux-gnu/dri /sysroot/usr/lib/x86_64-linux-gnu/gconv \
+ && rm -f /sysroot/usr/include/Fl \
+ && ls /usr/lib/gcc/x86_64-linux-gnu > /sysroot/GCC_VERSIONS
+FROM scratch
+COPY --from=build /sysroot /

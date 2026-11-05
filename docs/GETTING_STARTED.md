@@ -23,9 +23,9 @@ analysis half, and reports of what breaks on the OpenGL path are welcome.
 - **CMake 3.20+**
 - A C compiler: **Visual Studio 2022** (MSVC, C/C++ desktop workload) on
   Windows; GCC or Clang elsewhere
-- **Linux**: `bash tools/linux/install_deps.sh` installs SDL2, libepoxy,
+- **Linux**: `bash tools/linux/install_deps.sh` installs SDL3, libepoxy,
   OpenSSL and ffmpeg for the OpenGL backend (apt/pacman/dnf, needs sudo)
-- **macOS**: `brew install sdl2 libepoxy`
+- **macOS**: `brew install sdl3 libepoxy`
 - An original Xbox game disc image (ISO/XISO) — you must own the game
 
 > **On the `py -3` in every command below.** That is the Windows Python

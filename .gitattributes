@@ -1,3 +1,14 @@
-# Shell scripts must stay LF: a CRLF checkout breaks the shebang on Linux
-# ("bad interpreter: /usr/bin/env bash^M").
-*.sh text eol=lf
+# Line endings that must survive a Windows checkout (Git for Windows'
+# default core.autocrlf=true). Shell scripts break on Linux with a CRLF
+# shebang ("bad interpreter: /usr/bin/env bash^M"), and a game's package
+# step refuses a bundle whose launchers, Python, TOML or env files carry
+# CRLF (xboxrecomp-cli package/lib.py LF_ONLY): those files run or are
+# read on Linux and macOS too. The shaders ship in every bundle beside them.
+*.sh       text eol=lf
+*.py       text eol=lf
+*.in       text eol=lf
+*.toml     text eol=lf
+*.env      text eol=lf
+*.default  text eol=lf
+*.slang    text eol=lf
+*.slangp   text eol=lf

@@ -1,0 +1,18 @@
+Crates
+======
+
+Every Rust crate linked into librashader.dll (librashader-capi with
+--no-default-features --features runtime-d3d11, its Cargo.lock at the
+v0.12.0 tag), grouped by licence text. Where a crate offers a choice, the
+first one in the accepted list of xboxrecomp's
+third_party/librashader/about.toml is used.
+{{#each licenses}}
+
+================================================================================
+{{{name}}} ({{{id}}})
+Used by:
+{{#each used_by}}  {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+--------------------------------------------------------------------------------
+{{{text}}}
+{{/each}}

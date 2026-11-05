@@ -6,7 +6,7 @@
  * CMake split picks this file on POSIX.
  *
  * This is the FIRST cut of the real OpenGL backend:
- *   - SDL2 window + GL 3.3 core context
+ *   - SDL3 window + GL 3.3 core context
  *   - All Xbox D3D8 COM interfaces wired up (every vtable slot has a body)
  *   - Real Clear, Present, BeginScene/EndScene, viewport, scissor
  *   - Render-state caching with a small "apply" path for depth/blend/cull/etc.
@@ -24,8 +24,9 @@
 #include "d3d8_xbox.h"
 #include "d3d8_fvf.h"
 
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include <epoxy/gl.h>
+#include "platform/sdl_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -553,7 +554,7 @@ static HRESULT __stdcall dev_Present(IDirect3DDevice8 *s, const RECT *src, const
      * but leaves the process running until the game's loop notices. */
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) {
+        if (ev.type == SDL_EVENT_QUIT) {
             fprintf(stderr, "[d3d8_gl] window close requested\n");
         }
     }
@@ -976,7 +977,8 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     if (!pp || !pPP) return D3DERR_INVALIDCALL;
 
     /* Initialise SDL video + GL 3.3 core context. Default SIGINT/SIGTERM
-     * stay: SDL's own handlers only post an SDL_QUIT. */
+     * stay: SDL's own handlers only post an SDL_EVENT_QUIT. */
+    xbox_sdl_env_compat();
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_InitSubSystem(SDL_INIT_VIDEO);
 
@@ -992,10 +994,8 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,  24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    g.window = SDL_CreateWindow(g_window_title,
-                                SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-                                g.backbuf_w, g.backbuf_h,
-                                SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
+    g.window = SDL_CreateWindow(g_window_title, g.backbuf_w, g.backbuf_h,
+                                SDL_WINDOW_OPENGL);
     if (!g.window) {
         fprintf(stderr, "[d3d8_gl] SDL_CreateWindow failed: %s\n", SDL_GetError());
         return D3DERR_INVALIDCALL;
