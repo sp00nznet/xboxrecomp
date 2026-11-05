@@ -10,7 +10,8 @@
  *             Esc closes and the held key stays the host's to its release
  *   mods      a toggle through on_enable runs at the next xbox_mod_frame;
  *             a mod without on_enable is "applies at restart"; a mod's
- *             item on its sub-list
+ *             item on its sub-list; a switch's help on the Mods list and
+ *             its Enabled row (test_mods_toggle_help)
  *   capture   a key, a held pad chord, a refusal (a key the guest uses),
  *             Esc cancels, menu.open cannot be cleared
  *   save      config.toml gets only the changed keys: the binding as an
@@ -755,6 +756,42 @@ static void test_mods_desc_toggle(void)
     xbox_mod_frame();
     CHECK(pending_has("dmod.enabled", "\"on\""));
     CHECK(pending_has("mods.dmod", NULL));
+    open_menu();
+}
+
+/* A mod's switch shows its enable setting's help as the tooltip, on the
+ * Mods list and on the mod page's Enabled row; a switch with no help (the
+ * descriptor mod above) keeps an empty one. */
+#define HM_HELP "Diagonals run as fast as straight ahead."
+static const struct xbox_mod_setting k_hm_set[] = {
+    { "enable", "hmod.enable", NULL, NULL, "Help mod", HM_HELP, NULL,
+      XBOX_SET_ENUM, ENHANCE_LIVE, XBOX_SET_ENABLE, 0, 0, 0, 0, k_dm_offon },
+};
+static const struct xbox_mod_desc k_hm_desc = {
+    XBOX_MOD_DESC_VERSION, sizeof(struct xbox_mod_desc),
+    "Help mod", "About the help mod.", NULL, NULL, k_hm_set, 1, NULL, 0
+};
+static const struct xbox_mod k_hm = { "hmod", dm_init, NULL, &k_hm_desc };
+static const struct xbox_mod *const k_hmods[] = { &k_hm, &k_dm, NULL };
+
+static int row_index(const char *label);
+
+static void test_mods_toggle_help(void)
+{
+    start_with(ARMED, k_hmods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Mods"));
+    CHECK(!strcmp(enhance_menu_row_help(row_index("Help mod")), HM_HELP));
+    CHECK(!strcmp(enhance_menu_row_help(row_index("Descriptor mod")), ""));
+    CHECK(enhance_menu_select_row("Help mod"));
+    tap(0x0D);
+    CHECK(row_value("Enabled") != NULL);
+    CHECK(!strcmp(enhance_menu_row_help(row_index("Enabled")), HM_HELP));
+    tap(0x08);
+    CHECK(enhance_menu_select_row("Descriptor mod"));
+    tap(0x0D);
+    CHECK(row_value("Enabled") != NULL);
+    CHECK(!strcmp(enhance_menu_row_help(row_index("Enabled")), ""));
     open_menu();
 }
 
@@ -5443,6 +5480,7 @@ int main(int argc, char **argv)
     test_navigate();
     test_mods();
     test_mods_desc_toggle();
+    test_mods_toggle_help();
     test_capture_and_save();
     test_capture_duplicate();
     test_capture_owned();

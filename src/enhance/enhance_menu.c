@@ -738,9 +738,13 @@ static void build_slots(void)
         slot_add(t, PAGE_MODS, m);
         if (s_nslot) {
             struct slot *ts = &s_slot[s_nslot - 1];
+            const struct xbox_mod_desc *d = xbox_mod_desc_of(m);
             ts->toggle = 1;
-            /* The switch is the enable setting: name its variable when that
+            /* The switch is the enable setting: its help is the switch's
+             * tooltip (toggle_help), and its variable is named when that
              * forces it, as the setting rows do (D5). */
+            if (e >= 0 && d && (uint32_t)e < d->n_settings)
+                ts->help = d->settings[e].help;
             if (e >= 0 && xbox_mod_setting_forced(m, (uint32_t)e)) {
                 ts->env = 1;
                 ts->envname = xbox_mod_setting_env(m, (uint32_t)e);
@@ -1481,6 +1485,20 @@ static int toggle_slot(int m)
     return -1;
 }
 
+/* A mod's switch carries its enable setting's help (a descriptor mod's
+ * XBOX_SET_ENABLE row) onto the Mods list and the Enabled row, as any
+ * other slot row does; a mod with none keeps an empty help. */
+static void toggle_help(struct row *r, int m)
+{
+    int t = toggle_slot(m);
+    const struct slot *s;
+    if (!r || t < 0)
+        return;
+    s = &s_slot[t];
+    if (s->help || s->it->help)
+        snprintf(r->help, sizeof r->help, "%s", s->help ? s->help : s->it->help);
+}
+
 static void slot_row(const char *key)
 {
     int i = slot_find(key);
@@ -1797,6 +1815,7 @@ static void detail_rows(int m)
         r = row_add(R_SLOT, t, 1, "Enabled");
         if (r)
             snprintf(r->value, sizeof r->value, "%s", s_slot[t].cur);
+        toggle_help(r, m);
     }
     if (!d) {
         slot_rows(PAGE_MODS, m);
@@ -2458,6 +2477,7 @@ static void build_rows(void)
             struct row *r = row_add(R_MOD, m, 1, mod_title(m));
             if (r)
                 snprintf(r->value, sizeof r->value, "%s", xbox_mod_state_name(xbox_mod_state(m)));
+            toggle_help(r, m);
         }
         if (!s_nrow)
             info("No mods in this build", "");
