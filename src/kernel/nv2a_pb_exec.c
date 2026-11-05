@@ -47,6 +47,7 @@
 #include "nv2a_fb_ring.h"
 #include "nv2a_combiner.h"
 #include "nv2a_pb_state.h"
+#include "nv2a_2d.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_opts_at.h"
 #include "nv2a_tex_pack.h"
@@ -158,48 +159,89 @@ static uint32_t dma_resolve(uint32_t offset)
  * 31:12) plus the adjust (word 0, bits 31:20); its limit is word 1. RAMHT
  * is searched rather than hashed: the hash takes the channel id, which this
  * runtime does not model, and handles are unique in XDK D3D's one channel.
- * The table is 4 to 32 KB and is read once per bind. Returns 0 when the
- * aperture is unmapped or the handle is not there (a title that never built
- * RAMHT); the caller then keeps the bare offset with no limit. */
+ * The table is 4 to 32 KB. Returns 0 when the aperture is unmapped or the
+ * handle is not there (a title that never built RAMHT); the caller then
+ * keeps the bare offset with no limit.
+ *
+ * Quantum Redshift rebinds its 2D objects and their context DMAs on every
+ * frame copy, so a scan per bind is a few thousand aperture reads each
+ * time. A found handle's RAMHT slot is kept (s_ramht_slot, by handle's low
+ * bits); the next lookup reads that slot first and takes it when it still
+ * names the handle, validly, under the same PFIFO_RAMHT. The instance words
+ * are read again every time, so a rewritten object is never served stale,
+ * and a slot that moved or was cleared falls back to the scan. Misses are
+ * not kept: an entry may be added at any time. */
 #define NV2A_PFIFO_RAMHT  0x002210u
 #define NV2A_PRAMIN       0x700000u
 #define NV2A_PRAMIN_SIZE  0x100000u
 
 struct ctxdma_hit { uint32_t ramht_off, inst, w0, w1, w2; };
 
+#define NV2A_RAMHT_SLOTS 16u
+static struct { uint32_t handle, ramht, off; int used; } s_ramht_slot[NV2A_RAMHT_SLOTS];
+static uint64_t s_ramht_scans, s_ramht_hits;
+
+#define AP32(off) (*(const volatile uint32_t *)(ap + (off)))
+/* The RAMHT entry at PRAMIN offset off, when it names handle validly. */
+static int ramht_entry(const volatile uint8_t *ap, uint32_t off, uint32_t handle,
+                       uint32_t *base, uint32_t *limit, struct ctxdma_hit *hit)
+{
+    uint32_t ctx, inst;
+
+    if (off + 8 > NV2A_PRAMIN_SIZE || AP32(NV2A_PRAMIN + off) != handle)
+        return 0;
+    ctx = AP32(NV2A_PRAMIN + off + 4);
+    if (!(ctx & 0x80000000u))                        /* not valid */
+        return 0;
+    inst = (ctx & 0xFFFFu) << 4;
+    if (inst + 12 > NV2A_PRAMIN_SIZE)
+        return 0;
+    hit->ramht_off = off;
+    hit->inst = inst;
+    hit->w0 = AP32(NV2A_PRAMIN + inst);
+    hit->w1 = AP32(NV2A_PRAMIN + inst + 4);
+    hit->w2 = AP32(NV2A_PRAMIN + inst + 8);
+    *base = (hit->w2 & 0xFFFFF000u) | (hit->w0 >> 20);
+    *limit = hit->w1;
+    return 1;
+}
+
 static int ctxdma_lookup(uint32_t handle, uint32_t *base, uint32_t *limit,
                          struct ctxdma_hit *hit, uint32_t *ramht_reg)
 {
     const volatile uint8_t *ap = xbox_Nv2aAperture();
-    uint32_t ramht, rbase, size, i, ctx, inst;
+    uint32_t ramht, rbase, size, i;
+    unsigned k = handle & (NV2A_RAMHT_SLOTS - 1u);
 
     *ramht_reg = 0;
     if (!ap)
         return 0;
-#define AP32(off) (*(const volatile uint32_t *)(ap + (off)))
     ramht = *ramht_reg = AP32(NV2A_PFIFO_RAMHT);
-    rbase = ((ramht >> 4) & 0x1Fu) << 12;            /* BASE_ADDRESS [8:4] */
-    size = 0x1000u << ((ramht >> 16) & 0x3u);        /* SIZE [17:16]: 4-32 KB */
-    for (i = 0; i + 8 <= size && rbase + i + 8 <= NV2A_PRAMIN_SIZE; i += 8) {
-        if (AP32(NV2A_PRAMIN + rbase + i) != handle)
-            continue;
-        ctx = AP32(NV2A_PRAMIN + rbase + i + 4);
-        if (!(ctx & 0x80000000u))                    /* not valid */
-            continue;
-        inst = (ctx & 0xFFFFu) << 4;
-        if (inst + 12 > NV2A_PRAMIN_SIZE)
-            continue;
-        hit->ramht_off = rbase + i;
-        hit->inst = inst;
-        hit->w0 = AP32(NV2A_PRAMIN + inst);
-        hit->w1 = AP32(NV2A_PRAMIN + inst + 4);
-        hit->w2 = AP32(NV2A_PRAMIN + inst + 8);
-        *base = (hit->w2 & 0xFFFFF000u) | (hit->w0 >> 20);
-        *limit = hit->w1;
+    if (s_ramht_slot[k].used && s_ramht_slot[k].handle == handle
+            && s_ramht_slot[k].ramht == ramht
+            && ramht_entry(ap, s_ramht_slot[k].off, handle, base, limit, hit)) {
+        s_ramht_hits++;
         return 1;
     }
-#undef AP32
+    s_ramht_scans++;
+    rbase = ((ramht >> 4) & 0x1Fu) << 12;            /* BASE_ADDRESS [8:4] */
+    size = 0x1000u << ((ramht >> 16) & 0x3u);        /* SIZE [17:16]: 4-32 KB */
+    for (i = 0; i + 8 <= size; i += 8)
+        if (ramht_entry(ap, rbase + i, handle, base, limit, hit)) {
+            s_ramht_slot[k].used = 1;
+            s_ramht_slot[k].handle = handle;
+            s_ramht_slot[k].ramht = ramht;
+            s_ramht_slot[k].off = rbase + i;
+            return 1;
+        }
     return 0;
+}
+#undef AP32
+
+void nv2a_pb_ramht_stats(uint64_t *scans, uint64_t *hits)
+{
+    *scans = s_ramht_scans;
+    *hits = s_ramht_hits;
 }
 
 /* One bound offset object (semaphore, report), resolved when it is bound,
@@ -1798,10 +1840,9 @@ static void raster_triangle(const float a[2], const float b[2],
 static struct { uint32_t lo, hi, seq; } s_surf_wr[SURF_WR_MAX];
 static uint32_t s_surf_wr_seq;
 
-static void surf_mark_written(void)
+/* [lo, hi) written now, by a draw, a clear or a 2D blit. */
+static void surf_mark_range(uint32_t lo, uint32_t hi)
 {
-    uint32_t lo = s_gpu.color_offset ? dma_resolve(s_gpu.color_offset) : 0;
-    uint32_t hi = lo + (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch;
     int i, victim = 0;
 
     if (!lo || hi <= lo)
@@ -1822,6 +1863,13 @@ static void surf_mark_written(void)
     s_surf_wr[victim].lo = lo;
     s_surf_wr[victim].hi = hi;
     s_surf_wr[victim].seq = s_surf_wr_seq;
+}
+
+static void surf_mark_written(void)
+{
+    uint32_t lo = s_gpu.color_offset ? dma_resolve(s_gpu.color_offset) : 0;
+
+    surf_mark_range(lo, lo + (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch);
 }
 
 /* The latest write sequence number overlapping [lo, hi), 0 if none. */
@@ -7051,6 +7099,142 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
     }
     return 0;
 }
+/* ---- the 2D engine: NV062 surfaces and NV09F image blits (nv2a_2d.h) ----
+ *
+ * Every method off subchannel 0 used to be counted unhandled, which was
+ * right while no title used anything but Kelvin there. Quantum Redshift
+ * copies its 640x480 R5G6B5 back buffer to a second surface with
+ * IMAGE_BLIT mid-frame, then draws its lens raindrops sampling that copy;
+ * with no copy they sampled an empty buffer and drew as black discs.
+ * The class on each subchannel comes from its SET_OBJECT,
+ * the instance found through RAMHT as for a context DMA; a subchannel no
+ * SET_OBJECT reached takes XDK D3D's fixed layout (nv2a_2d_class). The two surfaces are offsets in
+ * the context DMA objects SET_CONTEXT_DMA_IMAGE_SOURCE / _DESTIN bind
+ * (ctxdma_bind; base 0, no limit when RAMHT does not hold them). */
+static struct nv2a_2d     s_2d;
+static struct ctxdma_bind s_2d_src_bind, s_2d_dst_bind;
+static uint64_t           s_blits, s_blits_refused;
+
+static void twod_refuse(const char *why, const struct nv2a_pb_blit *b)
+{
+    static int said;
+
+    s_blits_refused++;
+    if (said++ < 8)
+        fprintf(stderr, "  [GPU] 2D blit refused (%s): %ux%u fmt 0x%X op %u, 0x%08X pitch %u"
+                " -> 0x%08X pitch %u\n", why, b->w, b->h, b->format, b->operation,
+                b->src_offset, b->src_pitch, b->dst_offset, b->dst_pitch);
+}
+
+/* Whether [a, a + n) lies in guest memory: the 64 MB from 0, or the
+ * contiguous window over it (dma_resolve returns either). */
+static int guest_span_ok(uint32_t a, uint64_t n)
+{
+    if (a >= XBOX_CONTIG_BASE)
+        return (uint64_t)a + n <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    return (uint64_t)a + n <= XBOX_CONTIG_SIZE;
+}
+
+void nv2a_pb_blit_guest(const struct nv2a_pb_blit *b)
+{
+    uint64_t dx = nv2a_2d_extent(b->out_x, b->out_y, b->w, b->h, b->dst_pitch, b->bpp);
+    uint32_t lo = b->dst + b->out_y * b->dst_pitch;
+
+    nv2a_2d_copy((uint8_t *)xbox_GetMemoryOffset(), b, s_2d.beta);
+    /* The CPU texture cache rechecks a texture over these bytes at its
+     * next bind, as after a draw into them. */
+    surf_mark_range(lo, (uint32_t)(b->dst + dx));
+}
+
+static void twod_blit(void)
+{
+    struct nv2a_pb_blit b;
+    uint64_t sx, dx;
+    uint32_t sbase = 0, dbase = 0;
+
+    if (!nv2a_2d_blit(&s_2d, s_2d.src_offset, s_2d.dst_offset, &b)) {
+        twod_refuse("colour format has no size", &b);
+        return;
+    }
+    sx = nv2a_2d_extent(b.in_x, b.in_y, b.w, b.h, b.src_pitch, b.bpp);
+    dx = nv2a_2d_extent(b.out_x, b.out_y, b.w, b.h, b.dst_pitch, b.bpp);
+    if (sx > XBOX_CONTIG_SIZE || dx > XBOX_CONTIG_SIZE) {
+        twod_refuse("larger than memory", &b);
+        return;
+    }
+    /* Past a bound object's limit the GPU raises a DMA protection error
+     * and copies nothing (ctxdma_place says why, once). */
+    if (!ctxdma_place(&s_2d_src_bind, "2D blit source", s_2d.src_offset, (uint32_t)sx, &sbase)
+        || !ctxdma_place(&s_2d_dst_bind, "2D blit destination", s_2d.dst_offset,
+                         (uint32_t)dx, &dbase)) {
+        s_blits_refused++;
+        return;
+    }
+    b.src_offset = sbase;
+    b.dst_offset = dbase;
+    b.src = dma_resolve(sbase);
+    b.dst = dma_resolve(dbase);
+    if (!guest_span_ok(b.src, sx) || !guest_span_ok(b.dst, dx)) {
+        twod_refuse("outside guest memory", &b);
+        return;
+    }
+    if (surface_write_refused(b.dst, (uint32_t)dx, "blit into")) {
+        s_blits_refused++;
+        return;
+    }
+    if (b.operation != NV09F_OP_SRCCOPY && b.operation != NV09F_OP_BLEND_AND) {
+        twod_refuse("unknown operation", &b);
+        return;
+    }
+    s_blits++;
+    {
+        static int said;
+        if (said++ < 4)
+            fprintf(stderr, "  [GPU] 2D blit %ux%u fmt 0x%X op %u: 0x%08X (%u,%u) pitch %u ->"
+                    " 0x%08X (%u,%u) pitch %u, flip %u\n", b.w, b.h, b.format, b.operation,
+                    b.src_offset, b.in_x, b.in_y, b.src_pitch, b.dst_offset, b.out_x,
+                    b.out_y, b.dst_pitch, s_gpu.flips);
+    }
+    if (s_backend->on_blit)
+        s_backend->on_blit(&b);
+    else
+        nv2a_pb_blit_guest(&b);
+}
+
+/* A method on subchannel subch != 0; 0 when no 2D object takes it. */
+static int twod_method(uint32_t subch, uint32_t method, uint32_t param)
+{
+    uint32_t cls;
+    int r;
+
+    if (method == NV2A_SET_OBJECT) {
+        struct ctxdma_hit hit;
+        uint32_t base, limit, ramht, c = 0;
+        static int said;
+        /* A graphics object's first instance word holds its class in
+         * bits 7:0 (xemu: NV_PGRAPH_CTX_SWITCH1_GRCLASS). */
+        if (ctxdma_lookup(param, &base, &limit, &hit, &ramht))
+            c = hit.w0 & 0xFFu;
+        nv2a_2d_bind(&s_2d, subch, param, c);
+        if (said++ < 8)
+            fprintf(stderr, "  [GPU] subchannel %u: object 0x%08X, class 0x%02X%s\n", subch,
+                    param, nv2a_2d_class(&s_2d, subch),
+                    c ? "" : " (not in RAMHT: its methods go unhandled)");
+        return 1;
+    }
+    cls = nv2a_2d_class(&s_2d, subch);
+    r = nv2a_2d_method(&s_2d, cls, method, param);
+    if (!r)
+        return 0;
+    if (cls == NV2A_CLASS_SURFACES_2D && method == NV062_SET_CONTEXT_DMA_IMAGE_SOURCE)
+        ctxdma_bind(&s_2d_src_bind, "2D blit source", param);
+    else if (cls == NV2A_CLASS_SURFACES_2D && method == NV062_SET_CONTEXT_DMA_IMAGE_DESTIN)
+        ctxdma_bind(&s_2d_dst_bind, "2D blit destination", param);
+    if (r == 2)
+        twod_blit();
+    return 1;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -7186,11 +7370,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     s_gpu.flips, method, param);
         }
     }
-    if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+    if (subch != 0) {          /* Kelvin is on 0; the 2D objects elsewhere */
         if (method == NV_FENCE_REF_METHOD) {
             s_fence_ref = param;
             s_fence_ref_next = 1;
         }
+        if (twod_method(subch, method, param))
+            return;
         note_unhandled(method, param);
         return;
     }

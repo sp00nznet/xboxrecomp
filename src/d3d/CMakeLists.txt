@@ -108,6 +108,9 @@ if(NOT WIN32)
     # And the semaphore release's context DMA base (RAMHT/PRAMIN lookup).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_semaphore
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_semaphore)
+    # And the 2D engine's surfaces and image blits (nv2a_2d.c).
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_image_blit
+                     ${CMAKE_CURRENT_BINARY_DIR}/pb_image_blit)
     # And PGRAPH 0x400B10 from the executor's releases or a fence mirror.
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pgraph_fence
                      ${CMAKE_CURRENT_BINARY_DIR}/pgraph_fence)

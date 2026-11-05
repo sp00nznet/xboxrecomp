@@ -224,3 +224,49 @@ int nv2a_aspect_flat(const uint32_t prog[][4], uint32_t start, float c[][4], con
         *w = w0;
     return count != 0;
 }
+
+uint32_t nv2a_aspect_uv_sample(const uint32_t prog[][4], uint32_t start, float c[][4],
+                               const float *vf, unsigned nf4, const int *slot, uint32_t count,
+                               unsigned stage, float (*xy)[2], float (*uv)[2], uint32_t max)
+{
+    float in[NV2A_VSH_INPUTS][4];
+    Nv2aVshOut out;
+    uint32_t step, j, n = 0;
+    unsigned k;
+    int kp = -1, kt = -1;
+
+    if (!count || !max || stage > 3)
+        return 0;
+    for (k = 0; k < nf4; k++) {
+        if (slot[k] == 0)
+            kp = (int)k;
+        if (slot[k] == 9 + (int)stage)
+            kt = (int)k;
+    }
+    if (!prog && (kp < 0 || kt < 0))
+        return 0;
+    step = count > max ? count / max : 1;
+    for (j = 0; j < count && n < max; j += step, n++) {
+        const float *v = vf + (size_t)j * nf4 * 4u;
+        if (!prog) {
+            xy[n][0] = v[(size_t)kp * 4u];
+            xy[n][1] = v[(size_t)kp * 4u + 1];
+            uv[n][0] = v[(size_t)kt * 4u];
+            uv[n][1] = v[(size_t)kt * 4u + 1];
+            continue;
+        }
+        memset(in, 0, sizeof in);
+        for (k = 0; k < nf4; k++)
+            if (slot[k] >= 0 && slot[k] < NV2A_VSH_INPUTS)
+                memcpy(in[slot[k]], v + (size_t)k * 4u, 16);
+        nv2a_vsh_run((const uint32_t (*)[4])prog, start, (float (*)[4])c, 0,
+                     (const float (*)[4])in, &out);
+        if (!out.ok)
+            return 0;
+        xy[n][0] = out.o[NV2A_VSH_O_POS][0];
+        xy[n][1] = out.o[NV2A_VSH_O_POS][1];
+        uv[n][0] = out.o[NV2A_VSH_O_T0 + stage][0];
+        uv[n][1] = out.o[NV2A_VSH_O_T0 + stage][1];
+    }
+    return n;
+}

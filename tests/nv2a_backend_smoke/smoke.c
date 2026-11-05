@@ -36,6 +36,20 @@
  * "noalias" the same cases run under rt_alias_check=0 and the first must
  * fail, which shows the cases catch the stale target.
  *
+ * Then the 2D engine's blits (Metal): a whole blit out of a target
+ * makes a twin at the destination that samples the source's image, and a
+ * second blit refills that twin rather than making another; the twin is a
+ * copy for the Hor+ rule in its blit's flip only, and not once drawn into;
+ * a twin made with every slot taken evicts the least recently used target,
+ * written back first; a target over the destination is written back and
+ * retired; a partial blit with no twin runs in guest memory from the
+ * source written back, and keeps what a target over the destination held
+ * outside its rectangle; a target or a source drawn in part keeps the
+ * guest bytes it never drew (32-bit targets are seeded from them); an
+ * R5G6B5 twin is written back packed; a destination pitch wider than the
+ * source's stays on the GPU; and at render.scale 2 under 16:9 a whole blit
+ * copies the pads, a partial one its guest columns only.
+ *
  * Scenes:
  *   clear_quad   colour clear + a solid quad (pre-transformed, INLINE_ARRAY)
  *   checker      + a swizzled A8R8G8B8 checker, stage 0, wrap addressing
@@ -96,6 +110,8 @@ unsigned nv2a_pb_metal_msl_version(void);
 const uint8_t *nv2a_pb_metal_host_pixels(uint32_t offset, uint32_t *hw, uint32_t *hh);
 int nv2a_pb_metal_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
                         uint32_t *sw, uint32_t *sh);
+void nv2a_pb_metal_blit_stats(uint64_t *gpu, uint64_t *guest, unsigned *targets);
+int nv2a_pb_metal_copy_state(uint32_t offset);
 #endif
 
 /* The kernel library expects these from the title's generated code. */
@@ -822,6 +838,282 @@ static int alias_cases(const struct nv2a_pb_backend *b)
                && px_at(RTT1 + 32u * 256u, 256, 2, 2) == 0xFF0000FFu
                && nv2a_pb_metal_writebacks() == n0 + 2,
                "overlapping target: the old one written back, then seeded");
+    nv2a_pb_set_backend(NULL);
+    return f;
+}
+
+/* ---- the 2D engine ----------------------------------------------------------- */
+
+#define BL_A   0x02A00000u   /* 64x64 sources and destinations, pitch 256 */
+#define BL_B   0x02A10000u
+#define BL_C   0x02A20000u
+#define BL_D   0x02A30000u
+#define BL_D2  0x02A40000u
+#define BL_E   0x02A50000u   /* render.scale 2 under 16:9: 64x48, padded */
+#define BL_F   0x02A60000u
+#define BL_G   0x02A70000u   /* drawn in part: 64x64, pitch 256 */
+#define BL_H   0x02A74000u
+#define BL_I   0x02A78000u
+#define BL_J   0x02A7C000u
+#define BL_FILL 0x02B00000u  /* RT_MAX (16) 64x64 fillers, 16 KB apart */
+#define BL_K   0x02B40000u   /* R5G6B5: 64x64, pitch 128 */
+#define BL_L   0x02B44000u
+#define BL_M   0x02B48000u
+#define BL_N   0x02B50000u   /* a wider destination: 64x64, pitch 512 */
+#define BL_N2  0x02B58000u
+#define BL_PITCH 256u
+#define BL_PAT 0xFFFF00FFu  /* guest bytes no backend wrote */
+
+/* An NV09F SRCCOPY of w x h A8R8G8B8 pixels at (sx, sy) of src to (dx, dy)
+ * of dst, on XDK D3D's subchannels (3 surfaces, 2 blit) with no RAMHT:
+ * the DMA objects are the bare offsets. */
+static void blit2df(uint32_t fmt, uint32_t sp, uint32_t dp, uint32_t src, uint32_t dst,
+                    uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h)
+{
+    nv2a_pb_exec_method(3, 0x0184, 0x11u);
+    nv2a_pb_exec_method(3, 0x0188, 0x12u);
+    nv2a_pb_exec_method(3, 0x0300, fmt);
+    nv2a_pb_exec_method(3, 0x0304, (dp << 16) | sp);
+    nv2a_pb_exec_method(3, 0x0308, src);
+    nv2a_pb_exec_method(3, 0x030C, dst);
+    nv2a_pb_exec_method(2, 0x02FC, 3u);                    /* SRCCOPY */
+    nv2a_pb_exec_method(2, 0x0300, (sy << 16) | sx);
+    nv2a_pb_exec_method(2, 0x0304, (dy << 16) | dx);
+    nv2a_pb_exec_method(2, 0x0308, (h << 16) | w);
+}
+
+static void blit2d(uint32_t src, uint32_t dst, uint32_t sx, uint32_t sy, uint32_t dx,
+                   uint32_t dy, uint32_t w, uint32_t h)
+{
+    blit2df(0xAu, BL_PITCH, BL_PITCH, src, dst, sx, sy, dx, dy, w, h);   /* LE_A8R8G8B8 */
+}
+
+/* surf with a clear for a 64x64 R5G6B5 surface at pitch 128 (the clear
+ * value in the surface's format). */
+static void clear16(uint32_t buf, uint32_t rgb565)
+{
+    M(0x0200, 64u << 16);
+    M(0x0204, 64u << 16);
+    M(0x0208, 0x00000123u);
+    M(0x020C, 128u);
+    M(0x0210, buf);
+    M(0x0214, 0x02400000u);
+    M(0x0304, 0);
+    M(0x1B0C, 0);
+    M(0x1D90, rgb565);
+    M(0x1D94, 0xF0);
+}
+
+static uint16_t px16(uint32_t buf, uint32_t x, uint32_t y)
+{
+    return ((const uint16_t *)guest(buf))[y * 64u + x];
+}
+
+static void guest_fill(uint32_t buf, uint32_t h, uint32_t argb)
+{
+    uint32_t i;
+    for (i = 0; i < 64u * h; i++)
+        ((uint32_t *)guest(buf))[i] = argb;
+}
+
+/* A quad of colour argb drawn into the target at buf (64 x h), no clear. */
+static void draw_into(uint32_t buf, uint32_t h, uint32_t argb)
+{
+    const uint32_t c[4] = {argb, argb, argb, argb};
+    int a;
+    surf(buf, 64, h, 0, 0);
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+    quad_uv(0.0f, 0.0f, 8.0f, 8.0f, c, NULL);
+}
+
+/* The host texel (hx, hy) of the target at offset, 0 when there is none. */
+static uint32_t host_px(uint32_t offset, uint32_t hx, uint32_t hy)
+{
+    uint32_t hw = 0, hh = 0;
+    const uint8_t *p = nv2a_pb_metal_host_pixels(offset, &hw, &hh);
+    if (!p || hx >= hw || hy >= hh)
+        return 0;
+    return *(const uint32_t *)(p + ((size_t)hy * hw + hx) * 4u) | 0xFF000000u;
+}
+
+static int blit_check(int ok, const char *what)
+{
+    fprintf(stderr, "[backend-smoke] blit: %-62s %s\n", what, ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+/* Returns the failures. */
+static int blit_cases(const struct nv2a_pb_backend *b)
+{
+    uint64_t g0, q0, g1, q1, w0;
+    unsigned t0, t1, i;
+    int f = 0;
+
+    nv2a_pb_set_backend(b);
+
+    /* Twin made, sampled, refilled. The guest bytes under the source stay
+     * magenta (lazy write-back), so the red can only come from the GPU. */
+    guest_fill(BL_A, 64, BL_PAT);
+    guest_fill(BL_B, 64, BL_PAT);
+    surf(BL_A, 64, 64, 1, 0xFFFF0000u);
+    nv2a_pb_metal_blit_stats(&g0, &q0, &t0);
+    blit2d(BL_A, BL_B, 0, 0, 0, 0, 64, 64);
+    nv2a_pb_metal_blit_stats(&g1, &q1, &t1);
+    f += blit_check(g1 == g0 + 1 && q1 == q0 && t1 == t0 + 1
+                    && nv2a_pb_metal_copy_state(BL_B) == 1,
+                    "whole blit from a target: a twin, a copy in this flip");
+    f += blit_check(sample_rtt(b, BL_B) == 0xFFFF0000u
+                    && px_at(BL_A, BL_PITCH, 5, 5) == BL_PAT,
+                    "the twin samples the source's image, no write-back");
+    f += blit_check(nv2a_pb_metal_copy_state(BL_B) == 2,
+                    "after the flip the twin is no longer this flip's copy");
+    surf(BL_A, 64, 64, 1, 0xFF00FF00u);
+    nv2a_pb_metal_blit_stats(&g0, &q0, &t0);
+    blit2d(BL_A, BL_B, 0, 0, 0, 0, 64, 64);
+    nv2a_pb_metal_blit_stats(&g1, &q1, &t1);
+    f += blit_check(g1 == g0 + 1 && t1 == t0 && nv2a_pb_metal_copy_state(BL_B) == 1
+                    && sample_rtt(b, BL_B) == 0xFF00FF00u,
+                    "a second blit refills the twin, no new target");
+    blit2d(BL_A, BL_B, 0, 0, 0, 0, 64, 64);
+    draw_into(BL_B, 64, 0xFF0000FFu);
+    f += blit_check(nv2a_pb_metal_copy_state(BL_B) == 0,
+                    "a draw into the twin ends its copy");
+    flip_buf0();
+
+    /* A target over the destination: written back, then retired. */
+    guest_fill(BL_C, 64, BL_PAT);
+    surf(BL_C + 32u * BL_PITCH, 64, 32, 1, 0xFF0000FFu);
+    w0 = nv2a_pb_metal_writebacks();
+    blit2d(BL_A, BL_C, 0, 0, 0, 0, 64, 64);
+    f += blit_check(nv2a_pb_metal_copy_state(BL_C + 32u * BL_PITCH) == -1
+                    && px_at(BL_C + 32u * BL_PITCH, BL_PITCH, 5, 5) == 0xFF0000FFu
+                    && nv2a_pb_metal_writebacks() == w0 + 1
+                    && nv2a_pb_metal_copy_state(BL_C) == 1,
+                    "a target over the destination is written back and retired");
+    flip_buf0();
+
+    /* Every slot taken by fillers drawn in order, the source drawn last:
+     * the twin evicts the oldest filler left, written back first. */
+    for (i = 0; i < 16; i++)
+        surf(BL_FILL + i * 0x4000u, 64, 64, 1, 0xFF000000u | (i * 0x0F0F0Fu + 0x101010u));
+    surf(BL_A, 64, 64, 1, 0xFFFF0000u);      /* evicts filler 0 */
+    guest_fill(BL_D, 64, BL_PAT);
+    w0 = nv2a_pb_metal_writebacks();
+    blit2d(BL_A, BL_D, 0, 0, 0, 0, 64, 64);  /* evicts filler 1 */
+    f += blit_check(nv2a_pb_metal_copy_state(BL_FILL + 0x4000u) == -1
+                    && px_at(BL_FILL + 0x4000u, BL_PITCH, 9, 9)
+                           == (0xFF000000u | (0x0F0F0Fu + 0x101010u))
+                    && nv2a_pb_metal_writebacks() >= w0 + 1
+                    && nv2a_pb_metal_copy_state(BL_D) == 1,
+                    "the twin evicts the oldest target, written back first");
+    flip_buf0();
+
+    /* Partial blit, no twin: guest memory, from the source written back. */
+    guest_fill(BL_A, 64, BL_PAT);
+    guest_fill(BL_D2, 64, BL_PAT);
+    surf(BL_A, 64, 64, 1, 0xFFFF0000u);
+    nv2a_pb_metal_blit_stats(&g0, &q0, &t0);
+    blit2d(BL_A, BL_D2, 8, 8, 4, 4, 16, 16);
+    nv2a_pb_metal_blit_stats(&g1, &q1, &t1);
+    f += blit_check(g1 == g0 && q1 == q0 + 1 && px_at(BL_D2, BL_PITCH, 4, 4) == 0xFFFF0000u
+                    && px_at(BL_D2, BL_PITCH, 19, 19) == 0xFFFF0000u
+                    && px_at(BL_D2, BL_PITCH, 20, 20) == BL_PAT
+                    && px_at(BL_D2, BL_PITCH, 0, 0) == BL_PAT,
+                    "partial blit, no twin: the source written back, then copied");
+    /* Into a target of another size: it is written back and retired, so
+     * the rectangle lands in what it held. */
+    surf(BL_D2, 64, 32, 1, 0xFF00FF00u);
+    blit2d(BL_A, BL_D2, 8, 8, 4, 4, 16, 16);
+    f += blit_check(nv2a_pb_metal_copy_state(BL_D2) == -1
+                    && px_at(BL_D2, BL_PITCH, 4, 4) == 0xFFFF0000u
+                    && px_at(BL_D2, BL_PITCH, 30, 10) == 0xFF00FF00u
+                    && px_at(BL_D2, BL_PITCH, 0, 0) == 0xFF00FF00u,
+                    "partial blit over a target keeps the rest of what it held");
+    flip_buf0();
+
+    /* A target drawn in part (a corner of an atlas) under a guest blit's
+     * destination, and a source drawn in part: the guest bytes neither
+     * drew are kept (a 32-bit target starts from them, rt_seed). */
+    guest_fill(BL_G, 64, BL_PAT);
+    draw_into(BL_G, 64, 0xFF0000FFu);
+    guest_fill(BL_H, 64, 0xFF123456u);
+    blit2d(BL_H, BL_G, 0, 0, 40, 40, 8, 8);
+    f += blit_check(nv2a_pb_metal_copy_state(BL_G) == -1
+                    && px_at(BL_G, BL_PITCH, 20, 20) == BL_PAT
+                    && px_at(BL_G, BL_PITCH, 41, 41) == 0xFF123456u,
+                    "a target drawn in part keeps the guest bytes it never drew");
+    guest_fill(BL_I, 64, BL_PAT);
+    guest_fill(BL_J, 64, BL_PAT);
+    draw_into(BL_I, 64, 0xFFFF0000u);
+    blit2d(BL_I, BL_J, 0, 0, 0, 0, 4, 4);
+    f += blit_check(px_at(BL_J, BL_PITCH, 1, 1) == 0xFFFF0000u
+                    && px_at(BL_J, BL_PITCH, 5, 5) == BL_PAT
+                    && px_at(BL_I, BL_PITCH, 30, 30) == BL_PAT,
+                    "a source drawn in part keeps the guest bytes it never drew");
+    flip_buf0();
+
+    /* R5G6B5: a twin of a 16-bit target, then a guest blit out of it packs
+     * the written-back pixels as R5G6B5. */
+    guest_fill(BL_K, 32, BL_PAT);
+    guest_fill(BL_L, 32, BL_PAT);
+    guest_fill(BL_M, 32, BL_PAT);
+    clear16(BL_K, 0xF800u);
+    blit2df(0x4u, 128, 128, BL_K, BL_L, 0, 0, 0, 0, 64, 64);   /* LE_R5G6B5 */
+    f += blit_check(nv2a_pb_metal_copy_state(BL_L) == 1
+                    && (host_px(BL_L, 5, 5) & 0xFFFFFFu) >= 0xF80000u
+                    && (host_px(BL_L, 5, 5) & 0xFFFFu) == 0,
+                    "R5G6B5: a whole blit from a 16-bit target makes a twin");
+    blit2df(0x4u, 128, 128, BL_L, BL_M, 0, 0, 0, 0, 8, 8);
+    f += blit_check(px16(BL_L, 2, 2) == 0xF800u && px16(BL_M, 2, 2) == 0xF800u
+                    && px16(BL_M, 9, 2) != 0xF800u,
+                    "R5G6B5: the twin written back packed, then copied");
+    flip_buf0();
+
+    /* A destination pitch wider than the source's: still a twin, at the
+     * destination's pitch, and written back at it. */
+    guest_fill(BL_N, 128, BL_PAT);
+    guest_fill(BL_N2, 64, BL_PAT);
+    surf(BL_A, 64, 64, 1, 0xFFFF0000u);
+    blit2df(0xAu, BL_PITCH, 512, BL_A, BL_N, 0, 0, 0, 0, 64, 64);
+    f += blit_check(nv2a_pb_metal_copy_state(BL_N) == 1 && host_px(BL_N, 5, 5) == 0xFFFF0000u,
+                    "dst pitch 512 > src pitch 256: a twin on the GPU");
+    blit2df(0xAu, 512, BL_PITCH, BL_N, BL_N2, 0, 0, 0, 0, 8, 8);
+    f += blit_check(px_at(BL_N, 512, 2, 3) == 0xFFFF0000u
+                    && px_at(BL_N, 512, 66, 3) == BL_PAT
+                    && px_at(BL_N2, BL_PITCH, 2, 3) == 0xFFFF0000u,
+                    "dst pitch 512: the twin written back at its own pitch");
+    flip_buf0();
+
+    /* render.scale 2 under 16:9: a 64x48 target has an 11-column pad a
+     * side (172 x 96 host texels). */
+    {
+        struct nv2a_host_opts o;
+        memset(&o, 0, sizeof o);
+        o.render_scale = 2;
+        o.aspect_w = 16;
+        o.aspect_h = 9;
+        nv2a_host_opts_set(&o);
+        surf(BL_E, 64, 48, 1, 0xFFFF0000u);
+        blit2d(BL_E, BL_F, 0, 0, 0, 0, 64, 48);
+        f += blit_check(host_px(BL_F, 1, 1) == 0xFFFF0000u
+                        && host_px(BL_F, 170, 94) == 0xFFFF0000u
+                        && host_px(BL_F, (11 + 32) * 2, 48) == 0xFFFF0000u,
+                        "scale 2, 16:9: a whole blit copies the pads");
+        surf(BL_E, 64, 48, 1, 0xFF00FF00u);
+        blit2d(BL_E, BL_F, 0, 0, 0, 0, 16, 16);
+        f += blit_check(host_px(BL_F, 1, 1) == 0xFFFF0000u
+                        && host_px(BL_F, (11 + 4) * 2, 8) == 0xFF00FF00u
+                        && host_px(BL_F, (11 + 20) * 2, 8) == 0xFFFF0000u,
+                        "scale 2, 16:9: a partial blit copies guest columns only");
+        b->sync_guest(BL_F, BL_PITCH, 64, 48);
+        f += blit_check(px_at(BL_F, BL_PITCH, 4, 4) == 0xFF00FF00u
+                        && px_at(BL_F, BL_PITCH, 40, 40) == 0xFFFF0000u,
+                        "scale 2, 16:9: the twin writes back its guest columns");
+        flip_buf0();
+        memset(&o, 0, sizeof o);
+        nv2a_host_opts_set(&o);
+    }
     nv2a_pb_set_backend(NULL);
     return f;
 }
@@ -2062,6 +2354,10 @@ int main(int argc, char **argv)
         f = alias_cases(gpu);
         if (f)
             fprintf(stderr, "[backend-smoke] FAIL: %d render-target ownership checks\n", f);
+        failures += f;
+        f = blit_cases(gpu);
+        if (f)
+            fprintf(stderr, "[backend-smoke] FAIL: %d 2D blit checks\n", f);
         failures += f;
     }
 #endif

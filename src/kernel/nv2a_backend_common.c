@@ -5,6 +5,7 @@
 #include "nv2a_backend_common.h"
 #include "nv2a_tex_pack.h"
 
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -1490,6 +1491,40 @@ void nv2a_downscale_box32(const uint8_t *src, uint32_t src_pitch, uint32_t w, ui
     }
 }
 
+uint32_t nv2a_surf_pack_row(uint32_t format, const uint8_t *in, uint32_t w, uint8_t *out)
+{
+    uint32_t f = format & 0xFu, x, c;
+
+    switch (f) {
+    case 0x1: case 0x2: case 0x3:
+        for (x = 0; x < w; x++) {
+            uint16_t p;
+            memcpy(&c, in + (size_t)x * 4u, 4);
+            p = f == 0x3
+                ? (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x1F))
+                : (uint16_t)((f == 0x2 ? 0x8000u : 0u) | ((c >> 9) & 0x7C00)
+                             | ((c >> 6) & 0x03E0) | ((c >> 3) & 0x1F));
+            memcpy(out + (size_t)x * 2u, &p, 2);
+        }
+        return 2;
+    case 0x4: case 0x5: case 0x6: case 0x7:
+        for (x = 0; x < w; x++) {
+            uint32_t a;
+            memcpy(&c, in + (size_t)x * 4u, 4);
+            a = f == 0x4 ? 0u : f == 0x5 ? 0xFFu : (f == 0x7 ? 0x80u : 0u) | (c >> 25);
+            c = (c & 0x00FFFFFFu) | (a << 24);
+            memcpy(out + (size_t)x * 4u, &c, 4);
+        }
+        return 4;
+    case 0x8: case 0xC:
+        if (out != in)
+            memcpy(out, in, (size_t)w * 4u);
+        return 4;
+    default:
+        return 0;
+    }
+}
+
 void nv2a_bump_trace(const struct nv2a_pb_vsh *v, const struct nv2a_stage st[4],
                      uint32_t flip)
 {
@@ -1710,3 +1745,35 @@ int nv2a_batch_filter_ask(const struct nv2a_pb_draw *d, const struct nv2a_pb_gpu
     return fn(&b) != 0;
 }
 #endif
+
+int nv2a_aspect_uv_tracks(const float (*xy)[2], const float (*uv)[2], uint32_t n, float su,
+                          float sv, uint32_t w, uint32_t h)
+{
+    float lo[2], hi[2], dlo[2], dhi[2], sum[2] = {0, 0};
+    uint32_t i, a;
+
+    if (!n)
+        return 0;
+    for (i = 0; i < n; i++) {
+        float d[2];
+        d[0] = uv[i][0] * su - xy[i][0];
+        d[1] = uv[i][1] * sv - xy[i][1];
+        if (!isfinite(d[0]) || !isfinite(d[1]))
+            return 0;
+        for (a = 0; a < 2; a++) {
+            if (!i || xy[i][a] < lo[a]) lo[a] = xy[i][a];
+            if (!i || xy[i][a] > hi[a]) hi[a] = xy[i][a];
+            if (!i || d[a] < dlo[a]) dlo[a] = d[a];
+            if (!i || d[a] > dhi[a]) dhi[a] = d[a];
+            sum[a] += d[a];
+        }
+    }
+    for (a = 0; a < 2; a++) {
+        float frame = (float)(a ? h : w);
+        if (dhi[a] - dlo[a] > (hi[a] - lo[a]) / 8.0f + 2.0f)
+            return 0;
+        if (fabsf(sum[a] / (float)n) > frame / 16.0f)
+            return 0;
+    }
+    return 1;
+}

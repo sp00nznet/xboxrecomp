@@ -48,6 +48,7 @@
 #include "d3d8_swizzle.h"
 #include "nv2a_basic_hlsl.h"
 #include "nv2a_pb_state.h"
+#include "nv2a_2d.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
@@ -263,6 +264,9 @@ typedef struct {
     uint32_t                bar_flip[2]; /* hor+ band bars per third (nv2a_aspect_bar_mark) */
     uint32_t                zeta;       /* the zeta offset of its last depth draw ... */
     int                     has_zeta;   /* ... once it has had one (Metal's rt->dt) */
+    int                     copy;       /* made by a 2D blit (d3d11_on_blit), not drawn since */
+    uint32_t                copy_flip;  /* the flip of the blit that last filled it */
+    int                     full;       /* every pixel set since made or grown (blit_retire) */
 } RenderTarget;
 
 typedef struct nv2a_stage Stage;
@@ -787,6 +791,7 @@ static void rt_release(RenderTarget *rt)
  * A/B: RECOMP_DEBUG=rt_alias_check=0. */
 static uint64_t s_stale_drops, s_retired, s_evict_lost;
 static uint64_t s_grows, s_partial_clears;   /* rt_grow, clear_region (as Metal's) */
+static uint64_t s_blits_gpu, s_blits_guest;   /* d3d11_on_blit */
 
 static int alias_check_on(void)
 {
@@ -881,6 +886,7 @@ static int rt_grow(RenderTarget *rt, UINT w, UINT h)
     rt->hh = hh;
     rt->pad = pad;
     rt->n = n;
+    rt->full = 0;   /* the new area is black, not the guest's */
     if (alias_check_on() && rt->pitch)
         nv2a_rt_own_reset(&rt->own, (const uint8_t *)xbox_GetMemoryOffset(),
                           rt->addr, rt->pitch, h, (uint32_t)s_presents);
@@ -910,6 +916,7 @@ static RenderTarget *surface(void)
             if (rt->fmt != g->format)
                 s_rt_gen++;
             rt->fmt = g->format;
+            rt->copy = 0;
             nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
             return rt;
         }
@@ -938,6 +945,7 @@ static RenderTarget *surface(void)
             if (rt->fmt != g->format)
                 s_rt_gen++;
             rt->fmt = g->format;
+            rt->copy = 0;
             nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
             return rt;
         }
@@ -1005,6 +1013,7 @@ static RenderTarget *surface(void)
     free_rt->pitch = g->pitch;
     free_rt->fmt = g->format;
     free_rt->last_use = s_tick;
+    free_rt->full = 0;
     if (alias_check_on() && free_rt->pitch)
         nv2a_rt_own_reset(&free_rt->own, (const uint8_t *)xbox_GetMemoryOffset(),
                           free_rt->addr, free_rt->pitch, h, (uint32_t)s_presents);
@@ -1190,6 +1199,7 @@ static void clear_region(RenderTarget *rt, const struct nv2a_pb_gpu *g, const fl
         return;
     x0 = b[0]; y0 = b[1]; x1 = b[2]; y1 = b[3];
     if ((x0 == 0 && y0 == 0 && x1 == rt->w && y1 == rt->h) || !s_ctx1) {
+        rt->full = 1;
         static int said;
         if (!s_ctx1 && !said++ && !(x0 == 0 && y0 == 0 && x1 == rt->w && y1 == rt->h))
             fprintf(stderr, LOGP "no D3D 11.1 context: a partial clear clears the"
@@ -2485,7 +2495,66 @@ struct aspect_batch {
     float lo_x, hi_x;
     int vary_z;         /* a program's 2D batch off one oPos.z (nv2a_aspect_gate) */
     int post_tex;       /* a full-width 2D pass whose picture nv2a_aspect_place_tex dropped */
+    /* The batch, for the copy test (aspect_copy_tracks): any batch. */
+    const struct nv2a_pb_draw *draw;
+    uint32_t draw_lo, draw_count;
 };
+
+/* Hor+: whether stage k of hp's 2D batch reads src as a frame copy where
+ * the batch lies, as metal_on_draw's aspect_copy_tracks: src is padded, a
+ * blit filled it in this flip and nothing has drawn into it since, and the
+ * batch's texcoords track its screen position (nv2a_aspect_uv_tracks). A
+ * copy from an earlier flip is a still frame (BLiNX 2's display-buffer
+ * copies). NV2A_ASPECT_UV_MAX vertices, spread over the batch, are
+ * gathered for it. */
+static int aspect_copy_tracks(const struct aspect_batch *hp, const struct nv2a_pb_vsh *v,
+                              const RenderTarget *src, const Stage *t, unsigned k)
+{
+    float vf[NV2A_ASPECT_UV_MAX * NV2A_VS_MAX_INPUTS * 4];
+    float xy[NV2A_ASPECT_UV_MAX][2], uv[NV2A_ASPECT_UV_MAX][2];
+    int slot[NV2A_VS_MAX_INPUTS];
+    const struct nv2a_pb_draw *d = hp->draw;
+    uint32_t n = 0, step, j, m;
+    unsigned nf4 = 0, i;
+    int norm, ok;
+
+    if (!src->copy || !src->pad || src->copy_flip != (uint32_t)s_presents || !d
+            || !hp->draw_count)
+        return 0;
+    if (d->program) {
+        if (!hp->vs)
+            return 0;
+        for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
+            if (hp->vs->inputs & (1u << i))
+                slot[nf4++] = (int)i;
+    } else {
+        slot[nf4++] = 0;
+        slot[nf4++] = 9 + (int)k;
+    }
+    step = hp->draw_count > NV2A_ASPECT_UV_MAX ? hp->draw_count / NV2A_ASPECT_UV_MAX : 1;
+    for (j = 0; j < hp->draw_count && n < NV2A_ASPECT_UV_MAX; j += step, n++)
+        for (i = 0; i < nf4; i++)
+            vtx_input(d, v, (unsigned)slot[i], hp->draw_lo + j, vf + ((size_t)n * nf4 + i) * 4u);
+    m = nv2a_aspect_uv_sample(d->program ? (const uint32_t (*)[4])v->prog : NULL, v->start,
+                              (float (*)[4])(uintptr_t)v->c, vf, nf4, slot, n, k, xy, uv,
+                              NV2A_ASPECT_UV_MAX);
+    /* A swizzled texture's coordinates are normalised, a linear one's are
+     * texels (the NV2A's rect textures). */
+    norm = nv2a_tex_size_from_format(t->color);
+    ok = nv2a_aspect_uv_tracks((const float (*)[2])xy, (const float (*)[2])uv, m,
+                               norm ? (float)t->width : 1.0f, norm ? (float)t->height : 1.0f,
+                               src->w, src->h);
+    if (aspect_trace() && m) {
+        static int said;
+        if (said++ < 64)
+            fprintf(stderr, LOGP "aspect: vs %08X stage %u reads copy 0x%08X: %u verts,"
+                    " xy (%.1f,%.1f) uv (%.3f,%.3f), xy (%.1f,%.1f) uv (%.3f,%.3f): %s\n",
+                    hp->vs ? hp->vs->hash : 0u, k, src->offset, hp->draw_count, xy[0][0],
+                    xy[0][1], uv[0][0], uv[0][1], xy[m - 1][0], xy[m - 1][1], uv[m - 1][0],
+                    uv[m - 1][1], ok ? "tracks, stretched" : "does not track");
+    }
+    return ok;
+}
 
 /* Whether hp's batch is a full-width screen quad (nv2a_aspect_screen_quad;
  * quad: the stages allow one), which marks its third on rt as holding a
@@ -2624,7 +2693,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
     hp->place = NV2A_PLACE_CENTRE;
     hp->post_tex = 0;
     if (s_cur && s_cur->pad) {
-        int guest_tex = 0, flat_rt = 0, padded_rt = 0;
+        int guest_tex = 0, flat_rt = 0, padded_rt = 0, copy_rt = 0;
         for (n = 0; n < 4; n++) {
             if (s_stage[n].mode && s_stage[n].mode != 4 && !s_stage_rt[n]
                 && nv2a_aspect_picture(s_stage[n].width, s_cur->w, bump_src >> n & 1))
@@ -2654,6 +2723,11 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
                                       nv2a_aspect_place_tex(guest_tex, padded_rt), flat_rt,
                                       s_cur->w == s_cur->h ? NV2A_MOVIE_BLACK
                                                            : nv2a_host_opts()->movie_mode);
+        if (hp->two_d && hp->place == NV2A_PLACE_CENTRE)
+            for (n = 0; n < 4 && !copy_rt; n++)
+                copy_rt = s_stage_rt[n]
+                          && aspect_copy_tracks(hp, v, s_stage_rt[n], &s_stage[n], (unsigned)n);
+        hp->place = nv2a_aspect_place_copy(hp->place, hp->two_d, copy_rt);
         hp->post_tex = hp->two_d && hp->full_w && guest_tex && padded_rt;
     }
     if (s_cur && nv2a_snap_2d_on(s_cur->n)) {
@@ -3722,6 +3796,10 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         /* not due: count the batch so the gate's cadence holds */
         nv2a_aspect_scan(&vs->hp, NULL, 0, NULL, NULL, 0, NULL, 0, NULL, &lo_x, &hi_x);
     }
+    hp.draw = d;
+    hp.vs = vs;
+    hp.draw_lo = lo;
+    hp.draw_count = count;
     if (have_x)
         hp.full_w = nv2a_aspect_full(lo_x, hi_x, tris ? (const float (*)[2])hxy : NULL,
                                      tris ? idx : NULL, nidx / 3u, rt->w, rt->h, &wide);
@@ -5642,6 +5720,10 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_draws_bconst,
                 nv2a_pb_gpu_state()->blend_color_writes,
                 nv2a_pb_gpu_state()->blend_color);
+    if ((s_presents == 1 || (s_presents % 300) == 0) && (s_blits_gpu || s_blits_guest))
+        fprintf(stderr, LOGP "present #%llu: 2D blits %llu target copies, %llu in guest"
+                " memory\n", (unsigned long long)s_presents, (unsigned long long)s_blits_gpu,
+                (unsigned long long)s_blits_guest);
 }
 
 /* render.scale changed at this flip: every target and depth buffer was made
@@ -5977,6 +6059,292 @@ static int d3d11_merge_placed(int program)
     return nv2a_merge_placed(program, v->depth_enable, &vs->hp, rt);
 }
 
+/* ---- the 2D engine ---------------------------------------------------------- */
+
+/* nv2a_pb_backend.on_blit, as metal_on_blit. A blit out of a render target
+ * copies the target's texture, pads and render scale included, into a
+ * target at the destination (the "twin": the source's geometry, made on
+ * first use, kept while each blit refills it), which a later draw samples
+ * like any target (rt_texture). Quantum Redshift copies its 640x480 R5G6B5
+ * back buffer each frame and refracts the copy through its lens raindrops,
+ * which drew as black discs. Anything else (a guest-memory
+ * source, a partial copy with no twin to land in, another destination
+ * pitch for a partial copy, BLEND_AND) runs in guest memory. This backend
+ * writes nothing back anywhere else, so the guest bytes under a target are
+ * whatever was there before it was drawn. Here the source rectangle is
+ * written back first, so the guest copy holds the frame, and a target over
+ * the destination is written back before it is retired when it is full:
+ * a clear covered it, or a blit from a full target made it. Targets start
+ * black, never seeded from guest memory, so a target drawn only in part
+ * (a sprite atlas's corner) would write that black over the rest of the
+ * guest surface; such a target is dropped as surface() drops one, its
+ * pixels lost and the guest's kept (blit_write_back: one synchronous
+ * staging readback each, on this path only). The texture cache rehashes
+ * the destination. */
+static void blit_tex_stale(uint32_t addr, uint32_t bytes)
+{
+    uint32_t n = tex_cache_n(), lo = addr & 0x07FFFFFFu, hi = lo + bytes, i;
+    for (i = 0; i < n; i++) {
+        TexEntry *c = &s_tc[i];
+        uint32_t clo = c->offset & 0x07FFFFFFu;
+        /* No extent is kept: the largest the entry could span, a 32-bit
+         * texture with its mips, rehashes a few too many at worst. */
+        uint64_t cb = c->pitch ? (uint64_t)c->pitch * c->height
+                               : (uint64_t)c->width * c->height * 4u * (c->levels > 1 ? 2u : 1u);
+        if (c->live && clo < hi && lo < clo + cb)
+            c->gen = nv2a_pb_gpu_state()->flips - 1u;
+    }
+    s_tc_gen++;   /* setup_pixel's stage memo goes through tex_bind again */
+}
+
+static uint64_t s_blit_writebacks;   /* blit_write_back */
+
+/* The x, y, w x h guest pixels of rt into its guest surface at rt->pitch,
+ * as Metal's write_back and write_back_scaled: each n x n host block
+ * averaged under render.scale, the Hor+ pads left out, packed to the
+ * target's format with its constant bits (nv2a_surf_pack_row). 0 when the
+ * format has no encoding there or the rectangle is not inside rt (rt is
+ * left as it is). Maps a staging copy: the GPU is waited on. */
+static int blit_write_back(RenderTarget *rt, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    static uint32_t *row;
+    static uint32_t row_cap;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_BOX bx;
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11Texture2D *st = NULL;
+    uint32_t n = rt->n ? rt->n : 1, r;
+    uint32_t bpp = nv2a_surf_color_bytes(rt->fmt);
+    uint8_t *dst = (uint8_t *)xbox_GetMemoryOffset() + rt->addr;
+    int ok = 0;
+
+    if (!rt->tex || !w || !h || x + w > rt->w || y + h > rt->h
+            || !nv2a_surf_pack_row(rt->fmt, NULL, 0, NULL)
+            || rt->pitch < rt->w * bpp || (rt->pad + rt->w) * n > rt->hw || rt->h * n > rt->hh)
+        return 0;
+    if (row_cap < w) {
+        uint32_t *nr = (uint32_t *)realloc(row, (size_t)w * 4u);
+        if (!nr)
+            return 0;
+        row = nr;
+        row_cap = w;
+    }
+    ID3D11Texture2D_GetDesc(rt->tex, &td);
+    td.Width = w * n;
+    td.Height = h * n;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.SampleDesc.Count = 1;
+    td.SampleDesc.Quality = 0;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
+        return 0;
+    bx.left = (rt->pad + x) * n;   /* hor+: the guest columns, centred */
+    bx.top = y * n;
+    bx.front = 0;
+    bx.right = bx.left + w * n;
+    bx.bottom = bx.top + h * n;
+    bx.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)st, 0, 0, 0, 0,
+                                              (ID3D11Resource *)rt->tex, 0, &bx);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0,
+                                          &m))) {
+        for (r = 0; r < h; r++) {
+            const uint8_t *in = (const uint8_t *)m.pData + (size_t)r * n * m.RowPitch;
+            if (n > 1) {
+                nv2a_downscale_box32(in, m.RowPitch, w, 1, n, (uint8_t *)row, w * 4u);
+                in = (const uint8_t *)row;
+            }
+            nv2a_surf_pack_row(rt->fmt, in, w,
+                               dst + (size_t)(y + r) * rt->pitch + (size_t)x * bpp);
+        }
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+        ok = 1;
+    }
+    ID3D11Texture2D_Release(st);
+    if (!ok)
+        return 0;
+    blit_tex_stale(rt->addr + y * rt->pitch, rt->pitch * h);
+    if (alias_check_on())
+        nv2a_rt_own_reset(&rt->own, (const uint8_t *)xbox_GetMemoryOffset(), rt->addr,
+                          rt->pitch, rt->h, (uint32_t)s_presents);
+    s_blit_writebacks++;
+    return 1;
+}
+
+static uint64_t s_blit_dropped;   /* blit_retire: not full, nothing written back */
+
+/* A target in the way of a blit, released: its pixels written to guest
+ * memory first when it is full, unless the title rewrote them (then its
+ * bytes win). One drawn only in part is dropped with nothing written: its
+ * undrawn pixels are black, not the guest's (blit_write_back's comment).
+ * Not gated by rt_alias_check as surface()'s overlap rule is: nothing more
+ * is lost here than there, and a target left over the destination would
+ * hide the blit's result from every later sample and flip. */
+static void blit_retire(RenderTarget *rt, const char *why)
+{
+    if (rt_drop_if_stale(rt, why))
+        return;
+    if (rt->full)
+        blit_write_back(rt, 0, 0, rt->w, rt->h);
+    else if (rt->last_draw && s_blit_dropped++ < 20)
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target drawn in part, its pixels"
+                " lost (%s): a 2D blit writes over it\n", rt->offset, rt->w, rt->h, why);
+    if (s_retired++ < 20)
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target retired (%s): a 2D blit"
+                " writes over it\n", rt->offset, rt->w, rt->h, why);
+    rt_release(rt);
+    s_sc_init = 0;   /* the state shadow may name the released view */
+}
+
+static int blit_gpu(const struct nv2a_pb_blit *b, RenderTarget *src)
+{
+    RenderTarget *dst = NULL, *free_rt = NULL, *lru = NULL;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_BOX box3;
+    uint32_t box[6];
+    int i, whole;
+
+    /* The source rectangle names the target's pixels only at its pitch. The
+     * destination may have another (a copy into a wider surface): the twin
+     * takes the destination's pitch, so its guest span and any write-back
+     * are the blit's. */
+    if (b->operation != NV09F_OP_SRCCOPY || b->src_pitch != src->pitch
+            || b->dst_pitch < src->w * b->bpp || b->bpp != nv2a_surf_color_bytes(src->fmt)
+            || nv2a_rt_overlap(b->src, src->pitch * src->h, b->dst, b->dst_pitch * src->h)
+            || !nv2a_2d_host_box(b, src->w, src->h, src->pad, src->n, src->hw, src->hh, box))
+        return 0;
+    whole = !b->in_x && !b->in_y && !b->out_x && !b->out_y && b->w == src->w && b->h == src->h;
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (rt->tex && !((rt->addr ^ b->dst) & 0x07FFFFFFu) && rt->w == src->w
+                && rt->h == src->h && rt->hw == src->hw && rt->hh == src->hh
+                && rt->pad == src->pad && rt->n == src->n && rt->pitch == b->dst_pitch
+                && rt->fmt == src->fmt && !rt_drop_if_stale(rt, "blit")) {
+            dst = rt;
+            break;
+        }
+    }
+    /* A partial copy lands in what the destination held: with no twin to
+     * hold that, guest memory has it. */
+    if (!dst && !whole)
+        return 0;
+    /* No two live targets share memory (surface()'s rule): what else lies
+     * over the destination is written back, then retired. */
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (rt != dst && rt != src && rt->tex
+                && nv2a_rt_overlap(rt->addr, rt->pitch * rt->h, b->dst, b->dst_pitch * src->h))
+            blit_retire(rt, "overlap");
+    }
+    if (!dst) {
+        for (i = 0; i < RT_MAX; i++) {
+            RenderTarget *rt = &s_rt[i];
+            if (!rt->tex && !free_rt)
+                free_rt = rt;
+            if (rt != src && (!lru || rt->last_use < lru->last_use))
+                lru = rt;
+        }
+        if (!free_rt) {
+            free_rt = lru;
+            blit_retire(free_rt, "evict");
+        }
+        ID3D11Texture2D_GetDesc(src->tex, &td);
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &free_rt->tex)))
+            return 0;
+        if (FAILED(ID3D11Device_CreateRenderTargetView(
+                    s_dev, (ID3D11Resource *)free_rt->tex, NULL, &free_rt->rtv))) {
+            ID3D11Texture2D_Release(free_rt->tex);
+            free_rt->tex = NULL;
+            return 0;
+        }
+        s_rt_gen++;
+        dst = free_rt;
+        dst->offset = b->dst_offset;
+        dst->addr = b->dst;
+        dst->w = src->w;
+        dst->h = src->h;
+        dst->hw = src->hw;
+        dst->hh = src->hh;
+        dst->pad = src->pad;
+        dst->n = src->n;
+        dst->pitch = b->dst_pitch;
+        dst->fmt = src->fmt;
+        dst->full = src->full;   /* a whole copy: as covered as its source */
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host), the 2D"
+                " blit copy of 0x%08X\n", dst->offset, dst->w, dst->h, dst->hw, dst->hh,
+                src->offset);
+    }
+    box3.left = box[0];
+    box3.top = box[1];
+    box3.right = box[0] + box[4];
+    box3.bottom = box[1] + box[5];
+    box3.front = 0;
+    box3.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)dst->tex, 0, box[2],
+                                              box[3], 0, (ID3D11Resource *)src->tex, 0, &box3);
+    s_tick++;
+    dst->last_use = s_tick;
+    dst->last_draw = ++s_seq;
+    dst->copy = 1;
+    dst->copy_flip = (uint32_t)s_presents;
+    /* Not marked drawn: the twin owns its guest bytes as of now, and a title
+     * write after the blit, in this flip or later, makes it stale, so a
+     * write-back never lands over that write (as Metal's rt_own_reset). */
+    if (alias_check_on() && dst->pitch)
+        nv2a_rt_own_reset(&dst->own, (const uint8_t *)xbox_GetMemoryOffset(), dst->addr,
+                          dst->pitch, dst->h, (uint32_t)s_presents);
+    return 1;
+}
+
+static void d3d11_on_blit(const struct nv2a_pb_blit *b)
+{
+    RenderTarget *src = NULL;
+    uint64_t span = (uint64_t)(b->out_y + b->h) * b->dst_pitch;
+    int i;
+
+    if (!init()) {
+        nv2a_pb_blit_guest(b);
+        return;
+    }
+    for (i = 0; i < RT_MAX && !src; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (rt->tex && !((rt->addr ^ b->src) & 0x07FFFFFFu) && !rt_drop_if_stale(rt, "blit"))
+            src = rt;
+    }
+    if (src && blit_gpu(b, src)) {
+        s_blits_gpu++;
+        return;
+    }
+    /* The rectangle the blit reads, not the whole target: the rest of a
+     * target drawn in part is black, not the guest's. Read at another pitch,
+     * the blit's bytes are not one rectangle of the target: the whole of a
+     * full one, else nothing. */
+    if (src && !(b->src_pitch == src->pitch
+                     ? blit_write_back(src, b->in_x, b->in_y, b->w, b->h)
+                     : src->full && blit_write_back(src, 0, 0, src->w, src->h)))
+        src = NULL;   /* the guest bytes are all there is (the log says so) */
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (rt->tex && rt != src
+                && nv2a_rt_overlap(rt->addr, rt->pitch * rt->h, b->dst, (uint32_t)span))
+            blit_retire(rt, "overlap");   /* a partial blit keeps the rest */
+    }
+    nv2a_pb_blit_guest(b);
+    blit_tex_stale(b->dst, (uint32_t)span);
+    s_blits_guest++;
+    {
+        static int said;
+        if (!said++)
+            fprintf(stderr, LOGP "2D blit 0x%08X -> 0x%08X %ux%u in guest memory%s\n",
+                    b->src_offset, b->dst_offset, b->w, b->h,
+                    src ? " (the source target written back)" : "");
+    }
+}
+
 static const struct nv2a_pb_backend s_d3d11_backend = {
     d3d11_on_clear,
     d3d11_on_zclear,
@@ -5990,6 +6358,7 @@ static const struct nv2a_pb_backend s_d3d11_backend = {
     NULL,               /* sync_guest */
     1,                  /* merge_draws */
     d3d11_merge_placed,
+    d3d11_on_blit,
 };
 
 /* For tests/d3d11_backend_smoke: the size of the target at a colour offset
@@ -6060,6 +6429,44 @@ uint32_t nv2a_pb_d3d11_pixel(uint32_t offset, int x, int y)
         if (s_rt[i].tex && s_rt[i].offset == offset)
             return read_pixel(&s_rt[i], x, y);
     return 0xDEADBEEFu;
+}
+
+/* For tests/d3d11_backend_smoke: the host texel (hx, hy) of the target at a
+ * colour offset, pads included, or 0xDEADBEEF when there is none. */
+uint32_t nv2a_pb_d3d11_host_pixel(uint32_t offset, uint32_t hx, uint32_t hy)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++)
+        if (s_rt[i].tex && s_rt[i].offset == offset)
+            return hx < s_rt[i].hw && hy < s_rt[i].hh ? read_tex_pixel(s_rt[i].tex, hx, hy)
+                                                       : 0xDEADBEEFu;
+    return 0xDEADBEEFu;
+}
+
+/* For tests/d3d11_backend_smoke: blits copied on the GPU and in guest
+ * memory, targets written back by a blit, and the live targets. */
+void nv2a_pb_d3d11_blit_stats(uint64_t *gpu, uint64_t *guest, uint64_t *writebacks,
+                              unsigned *targets)
+{
+    int i;
+    *gpu = s_blits_gpu;
+    *guest = s_blits_guest;
+    *writebacks = s_blit_writebacks;
+    *targets = 0;
+    for (i = 0; i < RT_MAX; i++)
+        *targets += s_rt[i].tex != NULL;
+}
+
+/* For tests/d3d11_backend_smoke: the target at a colour offset as the Hor+
+ * copy rule sees it: -1 none, 0 not a blit copy (or drawn into since), 1
+ * a copy a blit filled this flip, 2 one from an earlier flip. */
+int nv2a_pb_d3d11_copy_state(uint32_t offset)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++)
+        if (s_rt[i].tex && s_rt[i].offset == offset)
+            return !s_rt[i].copy ? 0 : s_rt[i].copy_flip == (uint32_t)s_presents ? 1 : 2;
+    return -1;
 }
 
 const struct nv2a_pb_backend *nv2a_pb_d3d11_backend(void)

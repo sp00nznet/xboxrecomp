@@ -1640,6 +1640,36 @@ static inline int nv2a_aspect_place_tex(int guest_tex, int padded_rt)
     return guest_tex && !padded_rt;
 }
 
+/* Hor+: the placement of a 2D batch that samples a frame copy (copy_rt: a
+ * padded render target a 2D-engine blit made and nothing has drawn into
+ * since). Such a batch is a lens effect over the frame, not HUD art:
+ * Quantum Redshift's raindrops refract the copy of the back buffer each one
+ * lies over. Centred, its texture reads were the copy's guest
+ * columns while the frame under it spans the pads, and every drop was
+ * scissored to the 4:3 centre. Stretched, it covers the wide frame and
+ * reads the whole padded copy, so a drop at guest x sits where it reads:
+ * each drop is (w + 2 pad) / w wider (1.33x at 16:9) and the drops reach
+ * the wings. The HUD never samples a blit copy and keeps its placement. */
+static inline int nv2a_aspect_place_copy(int place, int two_d, int copy_rt)
+{
+    return place == NV2A_PLACE_CENTRE && two_d && copy_rt ? NV2A_PLACE_STRETCH : place;
+}
+
+/* Whether a 2D batch reads a frame copy where it lies: each of its n
+ * sampled vertices (screen xy, that stage's texcoord uv) maps to guest
+ * pixels by about the identity. su, sv take uv to guest texels (1 for a
+ * linear texture's texel coordinates, its size for a swizzled one's
+ * normalised ones). The offset uv * s - xy may drift across the batch by
+ * an eighth of the batch's extent plus 2 pixels (a drop magnifies what it
+ * lies over a little), and its mean stays within a sixteenth of the w x h
+ * frame (a refraction shifts it a little). Quantum Redshift's raindrops do.
+ * A batch that lays the copy elsewhere or at another scale
+ * (a picture in picture, a mirror, a blur pass into a smaller target)
+ * reads pixels the stretch would not move with it, and keeps its place.
+ * 0 for no vertices. */
+int nv2a_aspect_uv_tracks(const float (*xy)[2], const float (*uv)[2], uint32_t n, float su,
+                          float sv, uint32_t w, uint32_t h);
+
 /* Whether a batch's stages take nv2a_uv_snap's 2D form: the batch is 2D
  * (pass-through, or a program on one screen layer, nv2a_aspect_scan), so
  * its mapping is affine and textured 3D is left alone, and it is centred,
@@ -1788,6 +1818,17 @@ static inline int nv2a_aspect_quad_span(float lo_x, float hi_x, uint32_t w)
 int nv2a_aspect_screen_quad(const uint32_t prog[][4], uint32_t start, float c[][4],
                             const float *vf, unsigned nf4, const int *slot, uint32_t count,
                             float (*xy)[2], float *lo, float *hi);
+
+/* Up to max of a batch's count vertices, spread evenly: their screen xy
+ * and stage's texcoord (s, t) into uv, for nv2a_aspect_uv_tracks. prog
+ * NULL is a pass-through batch, read straight from vf (position in input
+ * 0, the texcoord in 9 + stage); otherwise the program runs on each. The
+ * number sampled, 0 when the stage has no texcoord input or the program
+ * fails. */
+#define NV2A_ASPECT_UV_MAX 32u
+uint32_t nv2a_aspect_uv_sample(const uint32_t prog[][4], uint32_t start, float c[][4],
+                               const float *vf, unsigned nf4, const int *slot, uint32_t count,
+                               unsigned stage, float (*xy)[2], float (*uv)[2], uint32_t max);
 
 /* The thirds of a w x h frame a letterbox band lies in (nv2a_aspect_third). */
 #define NV2A_BAND_TOP 1u
@@ -2048,6 +2089,18 @@ void nv2a_upscale_nearest32(const uint8_t *src, uint32_t src_pitch, uint32_t w, 
                             unsigned n, uint8_t *dst, uint32_t dst_pitch);
 void nv2a_downscale_box32(const uint8_t *src, uint32_t src_pitch, uint32_t w, uint32_t h,
                           unsigned n, uint8_t *dst, uint32_t dst_pitch);
+
+/* w BGRA8 host pixels (every target's texture format) as a row of guest
+ * surface in SET_SURFACE_FORMAT's colour format: R5G6B5; X1R5G5B5 with X 0
+ * (Z1R5G5B5) or 1 (O1R5G5B5); the X8R8G8B8 pair with the alpha byte 0 (Z)
+ * or 0xFF (O); X1A7R8G8B8 with X 0 or 1 over the top 7 bits of the host
+ * alpha, the layout xemu's clear gives them; A8R8G8B8 and A8B8G8R8 as they
+ * are. The constant bits are what the title reads back from such a
+ * surface, not what the host drew. in and out may be the same buffer for
+ * the 32-bit formats. The bytes written a pixel (2 or 4), 0 when the
+ * format has no encoding here (out untouched); w 0 with NULL buffers asks
+ * only that. */
+uint32_t nv2a_surf_pack_row(uint32_t format, const uint8_t *in, uint32_t w, uint8_t *out);
 
 /* ------------------------------------------------------------------------ */
 /* Batch filter (enhancements layer only)                                    */

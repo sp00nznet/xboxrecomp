@@ -1058,6 +1058,17 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 |---|---|---|---|---|---|---|
 | src/kernel/nv2a_pb_exec.c | - | s_sema_bind | file_static | reset | pgraph | ctxdma bindings read from guest instance memory |
 | src/kernel/nv2a_pb_exec.c | - | s_report_bind | file_static | reset | pgraph | ctxdma bindings read from guest instance memory |
+| src/kernel/nv2a_pb_exec.c | - | s_2d | file_static | reset | pgraph | 2D engine object binds and NV062/NV09F state set by the guest stream |
+| src/kernel/nv2a_pb_exec.c | - | s_2d_src_bind | file_static | reset | pgraph | ctxdma bindings read from guest instance memory |
+| src/kernel/nv2a_pb_exec.c | - | s_2d_dst_bind | file_static | reset | pgraph | ctxdma bindings read from guest instance memory |
+| src/kernel/nv2a_pb_exec.c | - | s_ramht_slot | file_static | reset | pgraph | RAMHT handle cache: offsets into the guest's hash table |
+| src/kernel/nv2a_pb_exec.c | - | s_blits | file_static | keep | - | stats counter |
+| src/kernel/nv2a_pb_exec.c | - | s_blits_refused | file_static | keep | - | stats counter |
+| src/kernel/nv2a_pb_exec.c | - | s_ramht_scans | file_static | keep | - | stats counter |
+| src/kernel/nv2a_pb_exec.c | - | s_ramht_hits | file_static | keep | - | stats counter |
+| src/kernel/nv2a_pb_exec.c | twod_refuse | said | local_static | keep | - | log-once guard |
+| src/kernel/nv2a_pb_exec.c | twod_blit | said | local_static | keep | - | log-once guard |
+| src/kernel/nv2a_pb_exec.c | twod_method | said | local_static | keep | - | log-once guard |
 | src/kernel/nv2a_pb_exec.c | surface_write_refused | said | local_static | keep | - | log-once guard |
 | src/kernel/nv2a_pb_exec.c | - | s_gpu | file_static | reset | pgraph | PGRAPH register shadow plus counters; keep counters monotonic |
 | src/kernel/nv2a_pb_exec.c | - | s_inline_overflow | file_static | keep | - | stats totals |
@@ -1677,6 +1688,14 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_retired | file_static | keep | - | stats counter |
 | src/d3d/nv2a_pb_d3d11.c | - | s_evict_lost | file_static | keep | - | stats counter |
 | src/d3d/nv2a_pb_d3d11.c | - | s_grows | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_d3d11.c | - | s_blits_gpu | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_d3d11.c | - | s_blits_guest | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_d3d11.c | - | s_blit_writebacks | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_d3d11.c | - | s_blit_dropped | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_d3d11.c | blit_write_back | row | local_static | keep | - | row scratch buffer, refilled per write-back |
+| src/d3d/nv2a_pb_d3d11.c | blit_write_back | row_cap | local_static | keep | - | row scratch buffer, refilled per write-back |
+| src/d3d/nv2a_pb_d3d11.c | aspect_copy_tracks | said | local_static | keep | - | log-once guard |
+| src/d3d/nv2a_pb_d3d11.c | d3d11_on_blit | said | local_static | keep | - | log-once guard |
 | src/d3d/nv2a_pb_d3d11.c | - | s_partial_clears | file_static | keep | - | stats counter |
 | src/d3d/nv2a_pb_d3d11.c | alias_check_on | on | local_static | keep | - | cached env read |
 | src/d3d/nv2a_pb_d3d11.c | rt_drop_if_stale | said | local_static | keep | - | log-once guard |
@@ -1931,6 +1950,10 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_retired | file_static | keep | - | stats counter |
 | src/d3d/nv2a_pb_metal.m | - | s_evict_lost | file_static | keep | - | stats counter |
 | src/d3d/nv2a_pb_metal.m | - | s_grows | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_metal.m | - | s_blits_gpu | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_metal.m | - | s_blits_guest | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_metal.m | aspect_copy_tracks | said | local_static | keep | - | log-once guard |
+| src/d3d/nv2a_pb_metal.m | metal_on_blit | said | local_static | keep | - | log-once guard |
 | src/d3d/nv2a_pb_metal.m | - | s_partial_clears | file_static | keep | - | stats counter |
 | src/d3d/nv2a_pb_metal.m | - | s_vis | file_static | keep | - | host visibility result buffer |
 | src/d3d/nv2a_pb_metal.m | - | s_occ_q | file_static | reset | renderer.metal | query counting on the open pass |

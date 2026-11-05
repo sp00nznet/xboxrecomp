@@ -320,6 +320,34 @@ struct nv2a_pb_draw {
                                       * anchors count guest batches */
 };
 
+/* One 2D-engine blit (NV09F IMAGE_BLIT through NV062 CONTEXT_SURFACES_2D,
+ * nv2a_2d.h): copy w x h pixels at (in_x, in_y) of the source surface to
+ * (out_x, out_y) of the destination. src and dst are the guest addresses of
+ * each surface's first pixel (the DMA object's base plus its offset,
+ * through nv2a_pb_dma_resolve); src_offset and dst_offset are those DMA
+ * offsets before resolving, as a SET_SURFACE_COLOR_OFFSET would name the
+ * same memory. */
+struct nv2a_pb_blit {
+    uint32_t src, dst;
+    uint32_t src_offset, dst_offset;
+    uint32_t src_pitch, dst_pitch;
+    uint32_t format;      /* NV062_SET_COLOR_FORMAT */
+    uint32_t bpp;         /* 1, 2 or 4 */
+    uint32_t operation;   /* NV09F_OP_SRCCOPY or NV09F_OP_BLEND_AND */
+    uint32_t in_x, in_y, out_x, out_y, w, h;
+};
+
+/* The blit in guest memory, as the CPU rasteriser has it: the rows copied,
+ * the destination marked as written for the CPU texture cache. A GPU
+ * backend whose on_blit cannot serve a blit calls this (after writing the
+ * source back if it holds it), then drops what it caches over the
+ * destination. Walker thread only. */
+void nv2a_pb_blit_guest(const struct nv2a_pb_blit *b);
+
+/* Context DMA and object lookups so far: full RAMHT scans, and lookups the
+ * kept slot answered (nv2a_pb_exec.c, ctxdma_lookup). For tests. */
+void nv2a_pb_ramht_stats(uint64_t *scans, uint64_t *hits);
+
 /* The backend's events. A NULL member ignores that event.
  *
  * on_clear / on_zclear: NV097_CLEAR_SURFACE, with its parameter (colour mask
@@ -380,6 +408,13 @@ struct nv2a_pb_backend {
      * fixed-function batches never merge under Hor+ or snap_2d. Walker
      * thread, at the batch's END. */
     int  (*merge_placed)(int program);
+    /* on_blit (optional; NULL: nv2a_pb_blit_guest): a 2D-engine blit, in
+     * pushbuffer order with the draws. A backend that renders into its own
+     * targets copies on the GPU when the source is one of them (the
+     * guest bytes under it are stale) and leaves the destination bound as
+     * a target holding the copy; otherwise it calls nv2a_pb_blit_guest.
+     * The backend owns the whole blit: the executor writes nothing. */
+    void (*on_blit)(const struct nv2a_pb_blit *b);
 };
 
 /* Route the executor's events to `backend`. NULL restores the CPU rasteriser.

@@ -83,6 +83,7 @@
 #include <unistd.h>
 
 #include "nv2a_pb_state.h"
+#include "nv2a_2d.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
@@ -244,6 +245,8 @@ typedef struct {
     int            presented;  /* ever picked by present_target */
     struct nv2a_rt_own own;    /* is the guest memory under it still its own */
     uint32_t       bar_flip[2]; /* hor+ band bars per third (nv2a_aspect_bar_mark) */
+    int            copy;       /* made by a 2D blit (metal_on_blit), not drawn since */
+    uint32_t       copy_flip;  /* the flip of the blit that last filled it */
 } RenderTarget;
 
 static RenderTarget  s_rt[RT_MAX];
@@ -253,6 +256,7 @@ static DepthTarget   s_dt[DT_MAX];
 static uint64_t      s_tick;
 static uint64_t      s_zclears, s_draws_z, s_rtt_binds, s_self_copies;
 static uint64_t      s_stale_drops, s_retired, s_evict_lost;
+static uint64_t      s_blits_gpu, s_blits_guest;   /* metal_on_blit */
 static uint64_t      s_grows, s_partial_clears;   /* rt_grow, metal_on_clear */
 
 /* Visibility tests (see "Visibility tests" below): the slot counting on the
@@ -787,6 +791,7 @@ static RenderTarget *surface(void)
                 break;
             rt->last_use = s_tick;
             rt->fmt = g->format;
+            rt->copy = 0;
             return rt;
         }
     }
@@ -812,6 +817,7 @@ static RenderTarget *surface(void)
                 || rt_grow(rt, rt->w > w ? rt->w : w, rt->h > h ? rt->h : h)) {
             rt->last_use = s_tick;
             rt->fmt = g->format;
+            rt->copy = 0;
             return rt;
         }
         break;
@@ -2082,6 +2088,44 @@ static int aspect_trace(void)
     return on;
 }
 
+/* Hor+: whether stage k of a 2D batch reads src as a frame copy where the
+ * batch lies (nv2a_aspect_place_copy): src is padded, a blit filled it in
+ * this flip and nothing has drawn into it since, and the batch's texcoords
+ * track its screen position (nv2a_aspect_uv_tracks). A copy from an
+ * earlier flip is a still frame: BLiNX 2 copies its back buffer to the
+ * display buffer at a few flips (764, 890, 892, 3959 and 3971 of its
+ * golden), and that copy must not make a later HUD batch over it a lens. */
+static int aspect_copy_tracks(const RenderTarget *src, const Stage *t, unsigned k,
+                              const uint32_t (*prog)[4], uint32_t start, float (*c)[4],
+                              const float *vf, unsigned nf4, const int *slot, uint32_t count,
+                              uint32_t hash)
+{
+    float xy[NV2A_ASPECT_UV_MAX][2], uv[NV2A_ASPECT_UV_MAX][2];
+    uint32_t n;
+    int norm, ok;
+
+    if (!src->copy || !src->pad || src->copy_flip != (uint32_t)s_presents)
+        return 0;
+    n = nv2a_aspect_uv_sample(prog, start, c, vf, nf4, slot, count, k, xy, uv,
+                              NV2A_ASPECT_UV_MAX);
+    /* A swizzled texture's coordinates are normalised, a linear one's are
+     * texels (the NV2A's rect textures). */
+    norm = nv2a_tex_size_from_format(t->color);
+    ok = nv2a_aspect_uv_tracks((const float (*)[2])xy, (const float (*)[2])uv, n,
+                               norm ? (float)t->width : 1.0f, norm ? (float)t->height : 1.0f,
+                               src->w, src->h);
+    if (aspect_trace() && n) {
+        static int said;
+        if (said++ < 64)
+            fprintf(stderr, LOGP "aspect: vs %08X stage %u reads copy 0x%08X: %u verts,"
+                    " xy (%.1f,%.1f) uv (%.3f,%.3f), xy (%.1f,%.1f) uv (%.3f,%.3f): %s\n",
+                    hash, k, src->offset, count, xy[0][0], xy[0][1], uv[0][0], uv[0][1],
+                    xy[n - 1][0], xy[n - 1][1], uv[n - 1][0], uv[n - 1][1],
+                    ok ? "tracks, stretched" : "does not track");
+    }
+    return ok;
+}
+
 static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
                        float hi_x, const RenderTarget *rt, int place, int lift, int wide)
 {
@@ -2454,6 +2498,17 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                                             rt->w == rt->h ? NV2A_MOVIE_BLACK
                                                            : nv2a_host_opts()->movie_mode)
                         : NV2A_PLACE_CENTRE;
+        if (rt->pad && two_d && place == NV2A_PLACE_CENTRE) {
+            int copy_rt = 0;
+            for (k = 0; k < 4 && !copy_rt; k++)
+                copy_rt = srcs[k]
+                          && aspect_copy_tracks(srcs[k], &s_stage[k], k,
+                                                d->program ? (const uint32_t (*)[4])v->prog
+                                                           : NULL,
+                                                v->start, (float (*)[4])(uintptr_t)v->c, vf,
+                                                nf4, slot, count, ve ? ve->hash : 0);
+            place = nv2a_aspect_place_copy(place, two_d, copy_rt);
+        }
         if (nv2a_snap_2d_on(rt->n)) {
             /* render.snap_2d: a centred 2D batch samples guest textures at
              * its guest pixels' 1x points (nv2a_uv_snap), as setup_pixel. */
@@ -2622,17 +2677,50 @@ static void present_extent(RenderTarget *rt, uint32_t *w, uint32_t *h)
 
 static uint32_t s_shown_w, s_shown_h;   /* the last flip's present extent */
 
+/* One row of rt's BGRA8 pixels into a 16-bit guest row: in the target's
+ * X1R5G5B5 or R5G6B5 format with its constant bits (nv2a_surf_pack_row),
+ * R5G6B5 for any other format seen at a 16-bit pitch. */
+static void pack16(const RenderTarget *rt, const uint32_t *row, uint16_t *o, uint32_t w)
+{
+    uint32_t f = rt->fmt & 0xFu, x;
+
+    if (f == 0x1 || f == 0x2 || f == 0x3) {
+        nv2a_surf_pack_row(f, (const uint8_t *)row, w, (uint8_t *)o);
+        return;
+    }
+    for (x = 0; x < w; x++) {
+        uint32_t c = row[x];
+        o[x] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x001F));
+    }
+}
+
+/* The X8R8G8B8 and X1A7R8G8B8 formats' constant alpha bits over the w x h
+ * 32-bit guest pixels just written at dst (nv2a_surf_pack_row, in place):
+ * the host alpha is what the combiners made, the guest's what the surface
+ * stores. */
+static void fix32(const RenderTarget *rt, uint8_t *dst, uint32_t pitch, uint32_t h)
+{
+    uint32_t f = rt->fmt & 0xFu, y;
+
+    if (f < 0x4 || f > 0x7)
+        return;
+    for (y = 0; y < h; y++)
+        nv2a_surf_pack_row(f, dst + (size_t)y * pitch, rt->w, dst + (size_t)y * pitch);
+}
+
 /* rt's pixels into the guest surface at `addr`, `pitch` bytes a row: 32-bit
- * as they are (BGRA8 is X8R8G8B8's byte order), 16-bit as R5G6B5. Runs after
- * the wait, on the executor's thread. */
+ * as they are (BGRA8 is X8R8G8B8's byte order) but for the constant alpha
+ * bits (fix32), 16-bit packed by pack16. Runs after the wait, on the
+ * executor's thread. */
 static void write_back(RenderTarget *rt, uint32_t addr, uint32_t pitch)
 {
     uint8_t *dst = (uint8_t *)xbox_GetMemoryOffset() + addr;
-    uint32_t bpp = pitch / rt->w, w = rt->w, y, x;
+    uint32_t bpp = pitch / rt->w, w = rt->w, y;
 
     if (bpp >= 4) {
         [rt->tex getBytes:dst bytesPerRow:pitch fromRegion:MTLRegionMake2D(0, 0, w, rt->h)
               mipmapLevel:0];
+        fix32(rt, dst, pitch, rt->h);
     } else if (bpp == 2) {
         static uint32_t *row;
         static uint32_t row_cap;
@@ -2647,11 +2735,7 @@ static void write_back(RenderTarget *rt, uint32_t addr, uint32_t pitch)
             uint16_t *o = (uint16_t *)(dst + (size_t)y * pitch);
             [rt->tex getBytes:row bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, y, w, 1)
                   mipmapLevel:0];
-            for (x = 0; x < w; x++) {
-                uint32_t c = row[x];
-                o[x] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0)
-                                  | ((c >> 3) & 0x001F));
-            }
+            pack16(rt, row, o, w);
         }
     } else {
         return;
@@ -2682,16 +2766,17 @@ static const uint8_t *host_readback(RenderTarget *rt)
 
 /* write_back for a scaled rt: the host pixels (host_readback) averaged over
  * each n x n block, so the guest -- RECOMP_FB_DUMP, fb_dump_at, the title --
- * sees a w x h frame at its pitch, 32-bit or R5G6B5 as write_back writes. */
+ * sees a w x h frame at its pitch, packed as write_back packs. */
 static void write_back_scaled(RenderTarget *rt, const uint8_t *px, uint32_t addr,
                               uint32_t pitch)
 {
     uint8_t *dst = (uint8_t *)xbox_GetMemoryOffset() + addr;
-    uint32_t bpp = pitch / rt->w, w = rt->w, n = rt->n, y, x;
+    uint32_t bpp = pitch / rt->w, w = rt->w, n = rt->n, y;
 
     px += (size_t)rt->pad * n * 4u;   /* hor+: the guest columns, centred */
     if (bpp >= 4) {
         nv2a_downscale_box32(px, rt->hw * 4u, w, rt->h, n, dst, pitch);
+        fix32(rt, dst, pitch, rt->h);
     } else if (bpp == 2) {
         static uint32_t *row;
         static uint32_t row_cap;
@@ -2706,11 +2791,7 @@ static void write_back_scaled(RenderTarget *rt, const uint8_t *px, uint32_t addr
             uint16_t *o = (uint16_t *)(dst + (size_t)y * pitch);
             nv2a_downscale_box32(px + (size_t)y * n * rt->hw * 4u, rt->hw * 4u, w, 1, n,
                                  (uint8_t *)row, w * 4u);
-            for (x = 0; x < w; x++) {
-                uint32_t c = row[x];
-                o[x] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0)
-                                  | ((c >> 3) & 0x001F));
-            }
+            pack16(rt, row, o, w);
         }
     } else {
         return;
@@ -2813,6 +2894,30 @@ static void metal_sync_guest(uint32_t offset, uint32_t pitch, uint32_t w, uint32
  * (hw x hh BGRA8, tightly packed) of the target at a colour offset, read
  * back now, so a test can box-filter them itself. */
 uint64_t nv2a_pb_metal_writebacks(void) { return s_writebacks; }
+
+/* For tests/nv2a_backend_smoke: blits copied on the GPU and in guest memory,
+ * and the live targets. */
+void nv2a_pb_metal_blit_stats(uint64_t *gpu, uint64_t *guest, unsigned *targets)
+{
+    int i;
+    *gpu = s_blits_gpu;
+    *guest = s_blits_guest;
+    *targets = 0;
+    for (i = 0; i < RT_MAX; i++)
+        *targets += s_rt[i].tex != nil;
+}
+
+/* For tests/nv2a_backend_smoke: the target at a colour offset as the Hor+
+ * copy rule sees it: -1 none, 0 not a blit copy (or drawn into since), 1
+ * a copy a blit filled this flip, 2 one from an earlier flip. */
+int nv2a_pb_metal_copy_state(uint32_t offset)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++)
+        if (s_rt[i].tex && s_rt[i].offset == offset)
+            return !s_rt[i].copy ? 0 : s_rt[i].copy_flip == (uint32_t)s_presents ? 1 : 2;
+    return -1;
+}
 
 /* For tests/nv2a_backend_smoke: the MSL version the runtime shaders
  * compile at (major << 16 | minor), as the compile options report it: with
@@ -3723,6 +3828,10 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_window_presents,
                 s_layer ? "CAMetalLayer slots" : "texture readback",
                 (unsigned long long)s_flushes, (unsigned long long)s_report_commits);
+    if ((s_presents == 1 || (s_presents % 300) == 0) && (s_blits_gpu || s_blits_guest))
+        fprintf(stderr, LOGP "present #%llu: 2D blits %llu target copies, %llu in guest"
+                " memory\n", (unsigned long long)s_presents, (unsigned long long)s_blits_gpu,
+                (unsigned long long)s_blits_guest);
     if (!always && rt && addr && pitch)
         guard_flip(addr, pitch * rt->h);
     if (!pitch || !addr || layer) {
@@ -3841,6 +3950,169 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
         scale_drop();
 }
 
+/* ---- the 2D engine ---------------------------------------------------------- */
+
+/* nv2a_pb_backend.on_blit. A blit out of a render target copies the
+ * target's texture, pads and render scale included, into a target at the
+ * destination (the "twin": the source's geometry, made on first use, kept
+ * while each blit refills it), which a later draw samples like any target
+ * (rt_texture). The guest bytes under the source are stale while it is
+ * drawn into, so a guest copy would hand the next pass an old frame; and
+ * under Hor+ the wings exist only on the GPU. Quantum Redshift copies its
+ * 640x480 R5G6B5 back buffer each frame and refracts the copy through its
+ * lens raindrops, which drew black with no copy at all. Anything
+ * else (a guest-memory source, a partial copy with no twin to land in,
+ * BLEND_AND) runs in guest memory: the source is written back first, the
+ * targets over the destination are written back and retired, and the
+ * texture cache rehashes the destination. */
+
+static RenderTarget *blit_source(const struct nv2a_pb_blit *b)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (rt->tex && !((rt->addr ^ b->src) & 0x07FFFFFFu) && !rt_drop_if_stale(rt, "blit"))
+            return rt;
+    }
+    return NULL;
+}
+
+static int blit_gpu(const struct nv2a_pb_blit *b, RenderTarget *src)
+{
+    RenderTarget *dst = NULL, *free_rt = NULL, *lru = NULL;
+    id<MTLBlitCommandEncoder> e;
+    uint32_t box[6];
+    int i, whole;
+
+    /* The source rectangle names the target's pixels only at its pitch. The
+     * destination may have another (a copy into a wider surface): the twin
+     * takes the destination's pitch, so its guest span and any write-back
+     * are the blit's. */
+    if (b->operation != NV09F_OP_SRCCOPY || b->src_pitch != src->pitch
+            || b->dst_pitch < src->w * b->bpp || b->bpp != nv2a_surf_color_bytes(src->fmt)
+            || nv2a_rt_overlap(b->src, src->pitch * src->h, b->dst, b->dst_pitch * src->h)
+            || !nv2a_2d_host_box(b, src->w, src->h, src->pad, src->n, src->hw, src->hh, box))
+        return 0;
+    whole = !b->in_x && !b->in_y && !b->out_x && !b->out_y && b->w == src->w && b->h == src->h;
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (rt->tex && !((rt->addr ^ b->dst) & 0x07FFFFFFu) && rt->w == src->w
+                && rt->h == src->h && rt->hw == src->hw && rt->hh == src->hh
+                && rt->pad == src->pad && rt->n == src->n && rt->pitch == b->dst_pitch
+                && rt->fmt == src->fmt && !rt_drop_if_stale(rt, "blit")) {
+            dst = rt;
+            break;
+        }
+    }
+    /* A partial copy lands in what the destination held: with no twin to
+     * hold that, guest memory has it. */
+    if (!dst && !whole)
+        return 0;
+    /* No two live targets share memory (surface()'s rule): what else lies
+     * over the destination is written back, then retired. */
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        if (rt == dst || rt == src || !rt->tex
+                || !nv2a_rt_overlap(rt->addr, rt->pitch * rt->h, b->dst, b->dst_pitch * src->h))
+            continue;
+        if (!rt_drop_if_stale(rt, "overlap")) {
+            rt_sync(rt, rt->pitch);
+            rt_free(rt);
+        }
+    }
+    if (!dst) {
+        for (i = 0; i < RT_MAX; i++) {
+            RenderTarget *rt = &s_rt[i];
+            if (!rt->tex && !free_rt)
+                free_rt = rt;
+            if (rt != src && (!lru || rt->last_use < lru->last_use))
+                lru = rt;
+        }
+        if (!free_rt) {
+            free_rt = lru;
+            if (!rt_drop_if_stale(free_rt, "evict")) {
+                rt_sync(free_rt, free_rt->pitch);
+                rt_free(free_rt);
+            }
+        }
+        free_rt->tex = rt_texture_new(src->hw, src->hh);
+        if (!free_rt->tex)
+            return 0;
+        dst = free_rt;
+        dst->offset = b->dst_offset;
+        dst->addr = b->dst;
+        dst->w = src->w;
+        dst->h = src->h;
+        dst->hw = src->hw;
+        dst->hh = src->hh;
+        dst->pad = src->pad;
+        dst->n = src->n;
+        dst->pitch = b->dst_pitch;
+        dst->fmt = src->fmt;
+        fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target (%ux%u host), the 2D"
+                " blit copy of 0x%08X\n", dst->offset, dst->w, dst->h, dst->hw, dst->hh,
+                src->offset);
+    }
+    end_encoder();
+    ensure_cmd();
+    e = [s_cmd blitCommandEncoder];
+    [e copyFromTexture:src->tex sourceSlice:0 sourceLevel:0
+          sourceOrigin:MTLOriginMake(box[0], box[1], 0)
+            sourceSize:MTLSizeMake(box[4], box[5], 1)
+             toTexture:dst->tex destinationSlice:0 destinationLevel:0
+     destinationOrigin:MTLOriginMake(box[2], box[3], 0)];
+    [e endEncoding];
+    s_tick++;
+    dst->last_use = s_tick;
+    dst->dirty = 1;   /* the copy is on the GPU only: an eviction writes it back */
+    dst->copy = 1;
+    dst->copy_flip = (uint32_t)s_presents;
+    rt_own_reset(dst);
+    return 1;
+}
+
+static void metal_on_blit(const struct nv2a_pb_blit *b)
+{
+    RenderTarget *src;
+    uint64_t span = (uint64_t)(b->out_y + b->h) * b->dst_pitch;
+    int i;
+
+    guard_open();
+    if (!init()) {
+        nv2a_pb_blit_guest(b);
+        return;
+    }
+    @autoreleasepool {
+        src = blit_source(b);
+        if (src && blit_gpu(b, src)) {
+            s_blits_gpu++;
+            return;
+        }
+        if (src)
+            rt_sync(src, src->pitch);
+        for (i = 0; i < RT_MAX; i++) {
+            RenderTarget *rt = &s_rt[i];
+            if (rt == src || !rt->tex
+                    || !nv2a_rt_overlap(rt->addr, rt->pitch * rt->h, b->dst, (uint32_t)span))
+                continue;
+            if (!rt_drop_if_stale(rt, "overlap")) {
+                rt_sync(rt, rt->pitch);   /* a partial blit keeps the rest */
+                rt_free(rt);
+            }
+        }
+        nv2a_pb_blit_guest(b);
+        tex_cache_stale(b->dst, (uint32_t)span);
+        s_blits_guest++;
+        {
+            static int said;
+            if (!said++)
+                fprintf(stderr, LOGP "2D blit 0x%08X -> 0x%08X %ux%u in guest memory%s\n",
+                        b->src_offset, b->dst_offset, b->w, b->h,
+                        src ? " (the source target written back)" : "");
+        }
+    }
+}
+
 /* ---- registration ---------------------------------------------------------- */
 
 /* Under Hor+ or render.snap_2d, at a batch's END: whether the walker may
@@ -3885,6 +4157,7 @@ static const struct nv2a_pb_backend s_metal_backend = {
     metal_sync_guest,
     1,                  /* merge_draws */
     metal_merge_placed,
+    metal_on_blit,
 };
 
 const struct nv2a_pb_backend *nv2a_pb_metal_backend(void)
