@@ -151,7 +151,15 @@ def _wrap_failure(path, missing, calls=()):
         "game's fingerprint command names both releases.",
         f"{path} needs {n} function{'s' if n != 1 else ''} this XBE's "
         f"analysis does not give it, so the link would fail:"]
-    lines += [f"  sub_{addr:08X}_gen: 0x{addr:08X} is {why}"
+    # By port name too, when the manual file used one (--names): the map
+    # entry is then the thing to check.
+    from . import manual_scan
+    by_va = {va: n for n, va in (manual_scan.NAMES or {}).items()}
+
+    def named(addr):
+        return f" (XBR_GEN({by_va[addr]}))" if addr in by_va else ""
+
+    lines += [f"  sub_{addr:08X}_gen{named(addr)}: 0x{addr:08X} is {why}"
               for addr, why in missing]
     lines += [f"  sub_{addr:08X}: used, but 0x{addr:08X} is not a function "
               f"in this XBE's analysis" for addr in calls]
@@ -356,6 +364,13 @@ def main():
                              "spin_waits.json (every candidate) to -o. Without "
                              "it nothing is matched and the output is "
                              "unchanged")
+    parser.add_argument("--names", metavar="JSON",
+                        help="The port's names for this release, {name: va}: "
+                             "--exclude-manual resolves XBR_FN(name), "
+                             "XBR_GEN(name) and XBR_VA(name) through it and "
+                             "drops #if XBR_HAVE(name) blocks for names it "
+                             "lacks (the game's CLI writes it with "
+                             "gen/recomp_names.h)")
 
     args = parser.parse_args()
 
@@ -368,6 +383,9 @@ def main():
             print(f"ERROR: --spin-waits {args.spin_waits}: {e}", file=sys.stderr)
             sys.exit(1)
     # Reset on every CLI invocation, including one with no manual file.
+    from . import manual_scan
+    manual_scan.NAMES, manual_scan.HAVE = (
+        manual_scan.load_names_have(args.names) if args.names else (None, None))
     from . import translator as translator_module
     from .manual_scan import entry_hooks
     translator_module.ENTRY_HOOKS = (entry_hooks(args.exclude_manual)
