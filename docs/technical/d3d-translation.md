@@ -1,5 +1,7 @@
 # D3D8 to D3D11 Translation
 
+> Part of the [Documentation Index](../INDEX.md)
+
 How to bridge the Xbox's modified Direct3D 8 API to modern DirectX 11 for rendering recompiled game code.
 
 ## Overview

@@ -1,5 +1,7 @@
 # Getting Started with Xbox Static Recompilation
 
+> Part of the [Documentation Index](INDEX.md)
+
 This guide walks you through recompiling your first Xbox game, from extracting the XBE to getting the game running on Windows.
 
 ## What You Need

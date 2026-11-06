@@ -1,5 +1,7 @@
 # Conformance Testing
 
+> Part of the [Documentation Index](../INDEX.md)
+
 The unit tests in `tools/recomp/test_lifter_*.py` compare the lifter's **output
 text** against an expected string. That catches a rewrite that changes the
 emitted form, and it catches nothing else. It cannot tell you whether the C it

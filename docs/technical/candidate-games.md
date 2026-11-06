@@ -1,5 +1,7 @@
 # Candidate Games for Xbox Static Recompilation
 
+> Part of the [Documentation Index](../INDEX.md)
+
 This document provides guidance on selecting Xbox games as targets for the static recompilation toolkit. Games are tiered by estimated difficulty based on their technical characteristics.
 
 ## Selection Criteria

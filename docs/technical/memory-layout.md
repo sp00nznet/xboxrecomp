@@ -1,5 +1,7 @@
 # Memory Layout Reproduction
 
+> Part of the [Documentation Index](../INDEX.md)
+
 How to map Xbox memory at its original virtual addresses on Windows so that recompiled code with hardcoded addresses works unmodified.
 
 ## The Problem

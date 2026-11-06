@@ -1,5 +1,7 @@
 # Reuniting Burnout 3 with xboxrecomp
 
+> Part of the [Documentation Index](../INDEX.md)
+
 Burnout 3 was the first static recompilation of an original Xbox title with no
 prior recompiler to lean on. The core of xboxrecomp was written while getting it
 to boot, then extracted into a reusable toolkit and hardened against Halo,

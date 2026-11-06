@@ -1,5 +1,7 @@
 # xemu GDB Debugging for Xbox Recompilation
 
+> Part of the [Documentation Index](../INDEX.md)
+
 Using xemu's built-in GDB stub as a reference debugger to discover runtime
 game state for static recompilation projects.
 

@@ -1,5 +1,7 @@
 # Adopting the Crimson Skies Findings — Plan and Status
 
+> Part of the [Documentation Index](../INDEX.md)
+
 Working plan for folding everything learned from Microsoft's own recompiler into
 xboxrecomp. Source analysis: [ms-fusion-recompiler.md](ms-fusion-recompiler.md)
 and [ms-fusion-codegen-teardown.md](ms-fusion-codegen-teardown.md).

@@ -1,5 +1,7 @@
 # Using xboxrecomp for Decompilation
 
+> Part of the [Documentation Index](INDEX.md)
+
 This is a different job from the rest of the toolkit. [GETTING_STARTED.md](GETTING_STARTED.md)
 is about turning an Xbox binary into a native `.exe` that runs. This is about
 splitting one into per-function assembly you can decompile by hand, matching the

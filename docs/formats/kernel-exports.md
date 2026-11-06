@@ -1,5 +1,7 @@
 # Xbox Kernel Exports
 
+> Part of the [Documentation Index](../INDEX.md)
+
 The Xbox kernel (`xboxkrnl.exe`) exports up to 366 functions and data objects. Games import a subset of these via the kernel thunk table in the XBE header. This document covers the most commonly imported exports (~147 that a typical game uses), organized by category.
 
 Each entry shows: **ordinal**, function prototype, description, and suggested Win32 replacement.

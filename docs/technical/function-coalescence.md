@@ -1,5 +1,7 @@
 # Recovering a function split into false entries
 
+> Part of the [Documentation Index](../INDEX.md)
+
 The detector can split one function at an interior branch target. Translating
 the pieces separately can lose a comparison before a conditional branch or
 turn a local loop into recursive host calls. When independent analysis has

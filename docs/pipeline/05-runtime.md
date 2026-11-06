@@ -1,5 +1,7 @@
 # Step 5: Building the Runtime
 
+> Part of the [Documentation Index](../INDEX.md)
+
 ## Overview
 
 The lifted C code from Step 4 is just one piece of the puzzle. It expects to run in an environment that mimics the original Xbox: memory at specific addresses, kernel functions available for calling, a D3D8 graphics device, and input from Xbox controllers. The runtime provides all of this.

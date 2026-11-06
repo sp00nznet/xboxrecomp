@@ -1,5 +1,7 @@
 # Step 4: x86 to C Lifting
 
+> Part of the [Documentation Index](../INDEX.md)
+
 ## Overview
 
 This is the core of the static recompiler. The lifter takes each x86 instruction from the disassembly output and translates it to equivalent C code. The result is a massive C codebase that, when compiled with a native compiler (MSVC or GCC), produces a Windows executable that behaves identically to the original Xbox code.

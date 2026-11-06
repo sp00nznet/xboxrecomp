@@ -1,5 +1,7 @@
 # The Register Model
 
+> Part of the [Documentation Index](../INDEX.md)
+
 How global registers enable correct static recompilation of x86 Xbox code to C.
 
 ## The Problem

@@ -1,5 +1,7 @@
 # Step 2: Disassembly and Function Detection
 
+> Part of the [Documentation Index](../INDEX.md)
+
 ## Why a Custom Disassembler?
 
 Tools like IDA Pro and Ghidra are excellent for interactive reverse engineering, but they are not designed for pipeline automation. The static recompiler needs structured, machine-readable output -- JSON files containing every function boundary, every cross-reference, and every string location. This output feeds directly into the lifter (Step 4) which translates x86 instructions to C code.

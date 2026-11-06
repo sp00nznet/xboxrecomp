@@ -1,5 +1,7 @@
 # Getting the Guest XBE Out of a BC Package (SVOD)
 
+> Part of the [Documentation Index](../INDEX.md)
+
 [ms-fusion-corpus.md](ms-fusion-corpus.md) §5 notes that Microsoft's byte-dense address map is a
 coverage oracle for our own function detection, and `tools/fusion/coverage_oracle.py` implements
 the grading. It takes two arguments:

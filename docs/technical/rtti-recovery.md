@@ -1,5 +1,7 @@
 # MSVC RTTI Recovery
 
+> Part of the [Documentation Index](../INDEX.md)
+
 `py -3 -m tools.rtti <xbe>` — recovers C++ class names, vtables, virtual method
 addresses and the inheritance graph from a title's MSVC RTTI, and emits the
 method addresses as `tools.disasm --seed-functions` input.

@@ -1,5 +1,7 @@
 # Step 3: Function Identification
 
+> Part of the [Documentation Index](../INDEX.md)
+
 ## Why Identify Functions?
 
 A typical Xbox game produces tens of thousands of recompiled functions. Burnout 3 has 22,095 functions in its .text section -- a mix of game code, C runtime (CRT), RenderWare engine, and XDK library code all baked together with no clear boundaries.

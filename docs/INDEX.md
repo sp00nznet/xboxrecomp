@@ -11,6 +11,7 @@ stuck in.
 - [Getting Started](GETTING_STARTED.md) — End-to-end walkthrough from XBE to a running title
 - [Decompilation Guide](DECOMP.md) — Using the toolkit as a function splitter instead: one byte-exact `.s` per function, with signatures and the call graph
 - [Runtime Implementation Guide](runtime/README.md) — The four pillars every title needs: memory layout, kernel, graphics, input
+- [Environment Variables](runtime/environment-variables.md) — Every `RECOMP_*` switch: default, effect, and the source file that reads it
 - [Contributing](../CONTRIBUTING.md) — Setup, where to focus, code style, how to submit
 
 ## Pipeline Guides

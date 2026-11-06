@@ -1,5 +1,7 @@
 # Microsoft's Own Xbox Static Recompiler (Ficl / Fission)
 
+> Part of the [Documentation Index](../INDEX.md)
+
 White-room analysis of a shipped Microsoft Xbox backward-compatibility package, done
 to compare Microsoft's production static recompiler against this project's design.
 

@@ -1,5 +1,7 @@
 # Lessons Learned
 
+> Part of the [Documentation Index](../INDEX.md)
+
 Battle-tested advice from building the first Xbox static recompilation, based on 29 sessions of development on Burnout 3: Takedown.
 
 ## Things That Worked Well

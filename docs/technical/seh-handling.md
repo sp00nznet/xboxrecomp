@@ -1,5 +1,7 @@
 # SEH and Exception Handling
 
+> Part of the [Documentation Index](../INDEX.md)
+
 Structured Exception Handling in statically recompiled Xbox code, and our own use of Vectored Exception Handlers.
 
 ## Background: SEH on Xbox

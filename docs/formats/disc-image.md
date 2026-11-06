@@ -1,5 +1,7 @@
 # Xbox Disc Images
 
+> Part of the [Documentation Index](../INDEX.md)
+
 This document covers the Xbox disc image formats and how to extract game files for use with the recompilation toolkit.
 
 ## XISO Format

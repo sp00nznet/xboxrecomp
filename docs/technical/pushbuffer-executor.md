@@ -1,5 +1,7 @@
 # Pushbuffer Executor
 
+> Part of the [Documentation Index](../INDEX.md)
+
 A title that statically links the XDK's Direct3D never calls the toolkit's
 D3D8 layer. It writes NV2A methods into a pushbuffer and kicks the GPU, and the
 only way to see its frames is to execute that pushbuffer. `RECOMP_PB_SCAN`

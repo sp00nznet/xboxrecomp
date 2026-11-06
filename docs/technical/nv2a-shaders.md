@@ -1,5 +1,7 @@
 # NV2A Shader Translation
 
+> Part of the [Documentation Index](../INDEX.md)
+
 Xbox games do not ship HLSL. They configure the NV2A's fixed-function combiner
 pipeline, or upload raw vertex-shader microcode. Both have to become something
 D3D11 or OpenGL will accept, and both are translated at runtime and cached.

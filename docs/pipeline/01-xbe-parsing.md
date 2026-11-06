@@ -1,5 +1,7 @@
 # Step 1: Extracting and Parsing XBE Files
 
+> Part of the [Documentation Index](../INDEX.md)
+
 ## What is an XBE File?
 
 An XBE (Xbox Executable) is the native executable format for the original Microsoft Xbox (2001). It is analogous to PE (Portable Executable) on Windows or ELF on Linux. Every game shipped as a disc image containing one or more XBE files, with `default.xbe` being the primary game executable.

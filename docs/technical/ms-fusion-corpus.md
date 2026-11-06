@@ -1,5 +1,7 @@
 # Ficl/Fission Across Four Titles — a Corpus
 
+> Part of the [Documentation Index](../INDEX.md)
+
 White-room analysis of **all four** Microsoft Xbox backward-compatibility packages released
 to date, extending the single-title teardown in [ms-fusion-recompiler.md](ms-fusion-recompiler.md)
 into a corpus. The point of a corpus is to separate *what the recompiler does* (constant across

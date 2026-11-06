@@ -1,5 +1,7 @@
 # XBE File Format Reference
 
+> Part of the [Documentation Index](../INDEX.md)
+
 The XBE (Xbox Executable) format is the native executable format for the original Microsoft Xbox console. It is analogous to Windows PE (Portable Executable) but with Xbox-specific extensions for kernel thunks, digital signatures, and section management.
 
 Reference: https://xboxdevwiki.net/Xbe

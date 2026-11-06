@@ -1,5 +1,7 @@
 # xboxrecomp Gap Analysis vs xemu
 
+> Part of the [Documentation Index](../INDEX.md)
+
 Comprehensive comparison of what xemu implements vs what xboxrecomp provides.
 Prioritized by impact on Blood Wake and Wreckless (both launch-era titles).
 

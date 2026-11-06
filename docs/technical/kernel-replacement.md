@@ -1,5 +1,7 @@
 # Xbox Kernel Replacement
 
+> Part of the [Documentation Index](../INDEX.md)
+
 Mapping 147 Xbox kernel imports to Windows equivalents for recompiled game code.
 
 ## How Xbox Kernel Imports Work

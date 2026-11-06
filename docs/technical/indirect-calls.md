@@ -1,5 +1,7 @@
 # Indirect Call Dispatch
 
+> Part of the [Documentation Index](../INDEX.md)
+
 The hardest problem in static recompilation: resolving function pointers and vtable calls at runtime.
 
 ## What Are Indirect Calls?

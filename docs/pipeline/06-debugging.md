@@ -1,5 +1,7 @@
 # Step 6: Iterative Debugging
 
+> Part of the [Documentation Index](../INDEX.md)
+
 ## The Reality
 
 The game will crash. Constantly. The first boot attempt will fail within milliseconds. You will fix one crash, and the next instruction will crash differently. This is normal and expected.

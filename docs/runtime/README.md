@@ -1,5 +1,7 @@
 # Runtime Implementation Guide
 
+> Part of the [Documentation Index](../INDEX.md)
+
 The recompiled C code needs a host environment to run. This directory documents the four major runtime subsystems you need to build for each game.
 
 ## The Four Pillars

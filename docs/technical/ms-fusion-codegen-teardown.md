@@ -1,5 +1,7 @@
 # Ficl/Fission Codegen Teardown — and What It Means For Us
 
+> Part of the [Documentation Index](../INDEX.md)
+
 Companion to [ms-fusion-recompiler.md](ms-fusion-recompiler.md), which covers the shipped
 package layout, the build pipeline, and the HLE boundary. This document is the **codegen
 teardown**: what the two translators actually emit, established with IDA Professional 9.1
