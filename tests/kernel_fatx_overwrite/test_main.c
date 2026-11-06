@@ -266,6 +266,68 @@ static void test_dir_search(void)
     check(fresh == SEARCHES, "each new search starts in its own directory", d);
 }
 
+/* XAPI SetEndOfFile on a handle opened only to read.
+ *
+ * A title loading its saves opens each slot with GENERIC_READ and FILE_OPEN,
+ * reads it, and calls SetEndOfFile at the end of what it read. On the Xbox the
+ * I/O manager refuses that (STATUS_ACCESS_DENIED: setting the end of file or
+ * the allocation needs FILE_WRITE_DATA) and the file is not touched. Here the
+ * host call ran, failed with err=5 and printed a warning per slot loaded, and
+ * the status was STATUS_UNSUCCESSFUL. */
+static void test_read_only_eof(const unsigned char *buf)
+{
+    XBOX_ANSI_STRING name;
+    XBOX_OBJECT_ATTRIBUTES oa;
+    XBOX_IO_STATUS_BLOCK ios;
+    XBOX_FILE_END_OF_FILE_INFORMATION alloc;
+    unsigned char got[4096];
+    static unsigned char rd[3588];
+    LARGE_INTEGER zero;
+    NTSTATUS st;
+    HANDLE h = NULL;
+    long n;
+    char d[96];
+    int same, i;
+
+    printf("\nSetEndOfFile on a read-only handle (a save being loaded)\n");
+    st = open_file("z:\\slot00", XBOX_FILE_OVERWRITE_IF, 0x60, &h);
+    check(st == 0 && h, "create z:\\slot00", NULL);
+    if (st) return;
+    write_at(h, buf, 3588, 0);
+    xbox_NtClose(h);
+
+    name.Length = (USHORT)strlen("z:\\slot00");
+    name.MaximumLength = (USHORT)(name.Length + 1);
+    name.Buffer = (PCHAR)"z:\\slot00";
+    oa.RootDirectory = NULL;
+    oa.ObjectName = &name;
+    oa.Attributes = 0x40;
+    /* what XAPI CreateFile(GENERIC_READ, OPEN_EXISTING) asks for */
+    st = xbox_NtCreateFile(&h, 0x80100080u, &oa, &ios, NULL, 0x80, 1,
+                           XBOX_FILE_OPEN, 0x60);
+    check(st == 0 && h, "open it to read (GENERIC_READ, FILE_OPEN)", NULL);
+    if (st) return;
+    zero.QuadPart = 0;
+    xbox_NtReadFile(h, NULL, NULL, NULL, &ios, rd, sizeof rd, &zero);
+    check(query_pos(h) == 0, "position query", NULL);
+    st = set_eof(h, 3588);
+    snprintf(d, sizeof d, "status 0x%08X", (unsigned)st);
+    check(st == STATUS_ACCESS_DENIED, "set end of file: STATUS_ACCESS_DENIED", d);
+    alloc.EndOfFile.QuadPart = 0;
+    st = xbox_NtSetInformationFile(h, &ios, &alloc, sizeof alloc,
+                                   XboxFileAllocationInformation);
+    snprintf(d, sizeof d, "status 0x%08X", (unsigned)st);
+    check(st == STATUS_ACCESS_DENIED, "set allocation to 0: STATUS_ACCESS_DENIED", d);
+    xbox_NtClose(h);
+
+    n = host_file("slot00", got, sizeof got);
+    same = n == 3588;
+    for (i = 0; same && i < 3588; i++)
+        if (got[i] != buf[i]) same = 0;
+    snprintf(d, sizeof d, "%ld bytes", n);
+    check(same, "the slot keeps its 3588 bytes", d);
+}
+
 /* Where Partition1's UDATA and TDATA go: RECOMP_SAVE_DIR, the save dir, or
  * the game dir when saves are only there. */
 static void test_save_dir(const char *root)
@@ -420,6 +482,7 @@ int main(int argc, char **argv)
     st = open_file("z:\\missing.dat", XBOX_FILE_OVERWRITE, 0x60, &h);
     check(st != 0, "FILE_OVERWRITE of a missing file fails", NULL);
 
+    test_read_only_eof(buf);
     test_save_dir(root);
 
 done:
