@@ -7,3 +7,13 @@ if(NOT WIN32)
     target_link_libraries(nv2a-vsh-test PRIVATE m)
 endif()
 add_test(NAME nv2a-vsh-epilogue COMMAND nv2a-vsh-test)
+
+# The decoded runner against the field() loop, on random programs.
+add_executable(nv2a-vsh-decoded-test nv2a_vsh_decoded_test.c)
+target_include_directories(nv2a-vsh-decoded-test PRIVATE ../../src/kernel)
+if(MSVC)
+    target_compile_definitions(nv2a-vsh-decoded-test PRIVATE _CRT_SECURE_NO_WARNINGS)
+elseif(NOT WIN32)
+    target_link_libraries(nv2a-vsh-decoded-test PRIVATE m)
+endif()
+add_test(NAME nv2a-vsh-decoded COMMAND nv2a-vsh-decoded-test)
