@@ -150,6 +150,7 @@ _PREAMBLE = """/* generated -- both sides, same inputs, compared */
 RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
 RECOMP_TLS uint32_t g_seh_ebp, g_ebp;
 RECOMP_TLS int g_df;   /* EFLAGS.DF: the direction the string ops walk */
+RECOMP_TLS uint32_t g_eflags;
 RECOMP_TLS double g_fp_stack[8]; RECOMP_TLS int g_fp_top;
 RECOMP_TLS uint16_t g_fp_control_word = 0x027F; RECOMP_TLS uint32_t g_mxcsr = 0x1F80; RECOMP_TLS int g_fp_cmp; RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 RECOMP_TLS RecompXmm g_xmm0,g_xmm1,g_xmm2,g_xmm3,g_xmm4,g_xmm5,g_xmm6,g_xmm7;

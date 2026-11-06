@@ -1457,6 +1457,11 @@ class Lifter:
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
+        # Set per-function by translator: the call, ret and jump addresses
+        # where the flags must be in g_eflags, and the calls whose returned
+        # flags are read (FunctionTranslator._flag_boundaries).
+        self.flag_publish_sites = frozenset()
+        self.flag_live_returns = frozenset()
         self.publishes_ebp = False  # Set per-function: has a real frame
         self.trace_exit_name = None  # Set per-function when traced
         self.force_return_value = None   # Set per-function by --force-return
@@ -4178,9 +4183,9 @@ def publish_flags(state, note="flags for pushfd"):
 
     Each flag comes from the condition a jcc on it would use (_make_condition),
     so the image and the branches agree, and a flag with no rule keeps the bit
-    g_eflags held. Only pushfd calls it: the flags stay lazy everywhere else,
-    and code that never pushes them pays nothing. A boundary that has to carry
-    the flags too (a call, a ret) can call it with its own note.
+    g_eflags held. pushfd calls it, and so do the calls, rets and tail jumps
+    whose far side reads the flags (FunctionTranslator._flag_boundaries), so
+    flags a callee returns in reach the caller's jcc.
     """
     if not state or state[0] == "eflags":
         return []
@@ -4230,8 +4235,15 @@ def lift_basic_block(lifter, bb, flag_state=None):
     while i < len(insns):
         curr = insns[i]
 
+        if curr.address in lifter.flag_publish_sites:
+            stmts.extend(publish_flags(
+                (last_flag_setter, last_flag_ops) if last_flag_setter else None,
+                "flags across call boundary"))
+
         # Try cmp/test + jcc pattern first (2-instruction match)
-        match = try_match_cmp_jcc(insns, i, lifter=lifter)
+        match = (None if i + 1 < len(insns)
+                 and insns[i + 1].address in lifter.flag_publish_sites
+                 else try_match_cmp_jcc(insns, i, lifter=lifter))
         if match:
             stmt, consumed = match
             flag_insn = insns[i]
@@ -4451,6 +4463,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # Additional flag-setting instructions
             last_flag_setter, last_flag_ops = normalise_zero_test(
                 curr.mnemonic, list(curr.operands))
+        elif curr.is_call:
+            last_flag_setter, last_flag_ops = "eflags", []
+            if lifter.needs_cf and curr.address in lifter.flag_live_returns:
+                stmts.append("_cf = g_eflags & 1u; /* callee carry */")
         elif curr.mnemonic in _EFLAGS_PRESERVE:
             pass  # These don't affect EFLAGS
         elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",

@@ -249,14 +249,16 @@ extern RECOMP_TLS uint32_t g_ebp;
  * memmove's overlapping case is the same instruction and the same bug.
  */
 extern RECOMP_TLS int g_df;
-extern RECOMP_TLS uint32_t g_eflags; /* EFLAGS image: pushfd, popfd */
+extern RECOMP_TLS uint32_t g_eflags; /* EFLAGS image: pushfd, popfd, calls */
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
 /* EFLAGS as pushfd and popfd see it.
  *
  * The arithmetic flags are lazy: a jcc rebuilds them from the instruction
- * that set them, and the lifter writes them into g_eflags only right before
- * a pushfd (publish_flags in lifter.py), so code without one pays nothing.
+ * that set them, and the lifter writes them into g_eflags (publish_flags in
+ * lifter.py) right before a pushfd, and before a call, a ret or a tail jump
+ * whose other side reads them, so a callee that returns its answer in ZF or
+ * CF reaches its caller.
  * The rest of the word lives in g_eflags too: popfd loads it, masked to the
  * bits a P3 lets ring 0 write (CF PF AF ZF SF TF IF DF OF IOPL NT AC ID),
  * with bit 1 always set. The ID bit (21) round-trips, which is how code

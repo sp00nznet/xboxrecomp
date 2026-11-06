@@ -153,6 +153,7 @@ class Disassembler:
     def __init__(self):
         self._cs = Cs(CS_ARCH_X86, CS_MODE_32)
         self._cs.detail = True
+        self._lite = Cs(CS_ARCH_X86, CS_MODE_32)
         _init_reg_names(self._cs)
 
     def _decode_instruction(self, cs_insn):
@@ -248,6 +249,26 @@ class Disassembler:
                 decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
         return [decoded[a] for a in sorted(decoded)]
+
+    def scan_function(self, raw_bytes, start_va, end_va):
+        """A linear decode with mnemonics, operand text and direct targets
+        only: several times faster than disassemble_function, for a pass
+        over every function that needs no operand detail."""
+        size = end_va - start_va
+        if size <= 0 or size > len(raw_bytes):
+            return []
+        out = []
+        for address, length, mnemonic, op_str in self._lite.disasm_lite(
+                raw_bytes[:size], start_va):
+            insn = Instruction(address=address, size=length, mnemonic=mnemonic,
+                               op_str=op_str, bytes_hex="")
+            if (insn.is_call or insn.is_branch) and op_str.startswith("0x"):
+                if insn.is_call:
+                    insn.call_target = int(op_str, 16)
+                else:
+                    insn.jump_target = int(op_str, 16)
+            out.append(insn)
+        return out
 
     def disassemble_cfg(self, raw_bytes, start_va, end_va, entry_points,
                         stop_addresses=None, stop_mnemonics=()):
