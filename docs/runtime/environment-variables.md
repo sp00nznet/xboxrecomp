@@ -55,6 +55,7 @@ Opt-ins that change how the kernel layer behaves. Each fixes a class of titles; 
 |---|---|---|---|
 | `RECOMP_SAVE_DIR=<dir>` | off | Root for the title's `UDATA`, `TDATA` and cache folders; created if missing. Absolute. Saves left in the game folder are then not used. | `kernel_path.c` |
 | `RECOMP_HEAP_RECLAIM` | off | Gives freed guest heap back. | `xbox_memory_layout.c` |
+| `RECOMP_HEAP_SPLIT=0` | on | Hands a freed heap block over whole on reuse instead of splitting one with 64 KB or more to spare. | `xbox_memory_layout.c` |
 | `RECOMP_EXT_VMA` | off | Extended virtual-memory areas above the mirrors. | `guest_vmem.c`, `xbox_memory_layout.c` |
 | `RECOMP_CONTIG_AVOID_IMAGE=1` | off | Keeps contiguous allocations out of the image range. | `xbox_memory_layout.c` |
 | `RECOMP_WIN_PLACEHOLDER` | off | Reserves the guest window with placeholders on Windows hosts where fixed bases are taken. | `xbox_memory_layout.c` |

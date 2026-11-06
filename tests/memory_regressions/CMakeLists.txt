@@ -13,6 +13,7 @@ set(XBE ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
 # One process per mode: the switches are read once and cached, so they cannot be
 # flipped inside a run.
 add_test(NAME memory_regressions_default COMMAND memory_regressions_test default ${XBE})
+add_test(NAME memory_regressions_heap_split_off COMMAND memory_regressions_test heap-split-off ${XBE})
 add_test(NAME memory_regressions_heap_reclaim COMMAND memory_regressions_test heap-reclaim ${XBE})
 add_test(NAME memory_regressions_contig_avoid_image COMMAND memory_regressions_test contig-avoid-image ${XBE})
 add_test(NAME memory_regressions_ext_vma COMMAND memory_regressions_test ext-vma ${XBE})
