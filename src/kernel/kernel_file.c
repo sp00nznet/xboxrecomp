@@ -371,17 +371,20 @@ NTSTATUS __stdcall xbox_NtCreateFile(
          * build that decision was invisible. */
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
                  "NtCreateFile FAILED: %S (err=%u)", win_path, err);
+        NTSTATUS st;
+        switch (err) {
+            case ERROR_FILE_NOT_FOUND: st = STATUS_OBJECT_NAME_NOT_FOUND; break;
+            case ERROR_PATH_NOT_FOUND: st = STATUS_OBJECT_PATH_NOT_FOUND; break;
+            case ERROR_ACCESS_DENIED:  st = STATUS_ACCESS_DENIED; break;
+            case ERROR_ALREADY_EXISTS: st = STATUS_OBJECT_NAME_COLLISION; break;
+            case ERROR_TOO_MANY_OPEN_FILES: st = STATUS_TOO_MANY_OPENED_FILES; break;
+            default:                   st = STATUS_UNSUCCESSFUL; break;
+        }
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = st;
             IoStatusBlock->Information = 0;
         }
-        switch (err) {
-            case ERROR_FILE_NOT_FOUND: return STATUS_OBJECT_NAME_NOT_FOUND;
-            case ERROR_PATH_NOT_FOUND: return STATUS_OBJECT_PATH_NOT_FOUND;
-            case ERROR_ACCESS_DENIED:  return STATUS_ACCESS_DENIED;
-            case ERROR_ALREADY_EXISTS: return STATUS_OBJECT_NAME_COLLISION;
-            default:                   return STATUS_UNSUCCESSFUL;
-        }
+        return st;
     }
 
     *FileHandle = h;
@@ -1130,6 +1133,8 @@ static NTSTATUS errno_to_status(int e)
         case EPERM:   return STATUS_ACCESS_DENIED;
         case EEXIST:  return STATUS_OBJECT_NAME_COLLISION;
         case ENOMEM:  return STATUS_NO_MEMORY;
+        case EMFILE:
+        case ENFILE:  return STATUS_TOO_MANY_OPENED_FILES;
         default:      return STATUS_UNSUCCESSFUL;
     }
 }
@@ -1239,10 +1244,21 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         g_xbox_last_file_error = no_dir ? 3u
                                : e == ENOENT ? 2u
                                : (e == EACCES || e == EPERM) ? 5u
-                               : e == EEXIST ? 80u : 0u;
+                               : e == EEXIST ? 80u
+                               : (e == EMFILE || e == ENFILE) ? 4u : 0u;
+        /* Not the title's fault, and easy to mistake for a missing file:
+         * on stderr, where a tester's log has it. */
+        if (e == EMFILE || e == ENFILE) {
+            static volatile LONG warned;
+            if (InterlockedExchange(&warned, 1) == 0) {
+                fprintf(stderr, "  [FILE] out of host file descriptors (%s): "
+                        "raise the open-file limit\n", host_path);
+                fflush(stderr);
+            }
+        }
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = st;
             IoStatusBlock->Information = 0;
         }
         return st;

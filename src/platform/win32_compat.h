@@ -131,6 +131,8 @@ int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
 /* After a rename: later path-based operations on h follow the file. */
 void        w32_handle_set_path(HANDLE h, const char *host_path);
+/* Raise the soft RLIMIT_NOFILE as far as the host allows; see the .c. */
+int         w32_raise_fd_limit(unsigned long long *before, unsigned long long *after);
 
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);

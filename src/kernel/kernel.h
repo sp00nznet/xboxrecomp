@@ -141,6 +141,9 @@ enum {
 #ifndef STATUS_NOT_SUPPORTED
 #define STATUS_NOT_SUPPORTED            ((NTSTATUS)0xC00000BBL)
 #endif
+#ifndef STATUS_TOO_MANY_OPENED_FILES
+#define STATUS_TOO_MANY_OPENED_FILES    ((NTSTATUS)0xC000011FL)
+#endif
 #ifndef STATUS_INTERNAL_ERROR
 #define STATUS_INTERNAL_ERROR           ((NTSTATUS)0xC00000E5L)
 #endif
@@ -1277,10 +1280,10 @@ uint32_t xbox_VblankCount(void);
 /* cpuid for lifted code (kernel_hal.c): the Xbox's Pentium III. Also declared
  * in templates/runtime/recomp_types.h for generated code. */
 void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
-/* RECOMP_VBLANK's mode (kernel_bridge.c): off when unset; the tick v0.14.0
- * had when set; the 60 Hz schedule with the vblank-ack thread when it is
- * "paced" or paced_wanted (the gate or the flip hold is on). Pure,
- * for tests/vblank_ack. */
+/* RECOMP_VBLANK's mode (kernel_bridge.c): off when unset, empty or "0",
+ * even with paced_wanted; the 60 Hz schedule with the vblank-ack thread when
+ * it is "paced" or paced_wanted (the gate or the flip hold is on); otherwise
+ * the tick v0.14.0 had. Pure, for tests/vblank_ack. */
 enum { XBOX_VBLANK_OFF, XBOX_VBLANK_TICK, XBOX_VBLANK_PACED };
 int xbox_VblankMode(const char *env, int paced_wanted);
 

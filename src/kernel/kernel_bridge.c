@@ -3006,7 +3006,10 @@ static void kernel_vblank_arm(int raised)
 }
 
 
-/* RECOMP_VBLANK: unset, no vblanks. Set, the tick v0.14.0 had: a vblank
+/* RECOMP_VBLANK: unset, empty or 0, no vblanks: 0 is off as it is for
+ * RECOMP_FLIP_PACING and RECOMP_DISPATCH_GATE, so an A/B run's
+ * RECOMP_VBLANK=0 does not quietly get the 60 Hz schedule a title's other
+ * switches ask for. Any other value, the tick v0.14.0 had: a vblank
  * at most every 16 ms on GetTickCount64, checked on the timer thread's
  * 10 ms Sleep (about 50 Hz), raised with no regard for the enable registers
  * and acked by the nv2a-ack thread's passes. RECOMP_VBLANK=paced, or the
@@ -3020,7 +3023,7 @@ static void kernel_vblank_arm(int raised)
  * before. */
 int xbox_VblankMode(const char *env, int paced_wanted)
 {
-    if (!env)
+    if (!env || !*env || !strcmp(env, "0"))
         return XBOX_VBLANK_OFF;
     if (paced_wanted || !strcmp(env, "paced"))
         return XBOX_VBLANK_PACED;
