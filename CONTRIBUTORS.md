@@ -265,6 +265,22 @@ direction.
   of SSE2 scalar ops. All of them were found with `tools/recomp/fpdiff.py`, which
   runs a snippet lifted and on the CPU and compares the two.
 
+*v0.17.0 — #197 split into its parts, and the flag cost answered (#276-#280, #309-#311)*
+- **Flags across calls, at +0.07% instead of +32.7% (#311)** — a helper that
+  answers in ZF or CF lost them at the call. #197 published flags at every
+  boundary and made generated C a third larger; this version publishes only
+  where the far side reads them: 86 sites in 45 of DOA2U's 15,339 functions.
+- **Narrow immediates read at full width (#278)**, **OF and PF with no rule
+  after `adc`, `sbb`, `neg` and shifts by one (#276)**, **unmasked shift
+  counts, narrow `mul` writing EDX, and `fnsave` (#277)** — each checked
+  against the CPU through fpdiff's new integer harness, nearly 3 million
+  vectors for the flag consumers alone.
+- **Dead bytes lifted as code (#279)** — a table after a tail jump became a
+  `jo` on `_flags`.
+- **A stale general-purpose EBP across calls (#280)**, found in a DOA3
+  geometry helper.
+- **A lone switch arm before a null slot (#310)** and **`wbinvd` (#309)**.
+
 ### DarthSidious666 — [@DarthSidious666](https://github.com/DarthSidious666)
 - **Implemented the missing `tools/abi_analysis` (#6)** — the pipeline had a
   hole in it: `tools.recomp` looked for `abi_functions.json`, warned when it
@@ -427,6 +443,16 @@ direction.
 - **`test_unmangled_names_are_rejected` asserted a fact about Windows (#61)** —
   `onexit` is a Microsoft CRT name and free everywhere else, so the negative
   control demanded a compile failure that could not happen off MSVC.
+
+*v0.17.0*
+- **POSIX HANDLEs as table indices (#241)** — a handle was the object pointer,
+  so `KeWaitForSingleObject`'s cast of a guest KEVENT locked a mutex inside
+  guest memory and Burnout 3 faulted before its title screen. Making handles
+  checkable then exposed two silent bugs: priority calls that never did
+  anything, and a multiple-object wait that timed out on a bad handle instead
+  of failing.
+- **`RECOMP_RASTER_THREADS` on POSIX (#242)** — documented, and silently one
+  thread: 110 → 278 Mpx/s on an M4.
 
 ### GTTeancum — [@GTTeancum](https://github.com/GTTeancum)
 Fourteen fixes in two days, found by driving a real title through the pipeline
@@ -785,6 +811,15 @@ DirectSound and USB stack. Developed with Claude Code.
   Making the walk opt-in came from its own Burnout 3 run, which found D3D's
   fence wait sleeping on an interrupt the runtime never raises.
 
+*v0.17.0*
+- **Case-insensitive file names on POSIX (#248)**, **read-only truncation
+  denied (#245)**, **delete logging (#246)** and **`RECOMP_WAIT_LOG` (#247)**.
+- **Texture filtering in the CPU rasteriser (#253)** and **strip winding
+  (#249)**, both opt-in, with costs measured per path.
+- **The conformance suite skipped silently on Visual Studio 18 (#250)**, and
+  **every `RECOMP_*` switch on one page (#251)**: 51 had been undocumented.
+- **`movsx` from `bp`/`sp` pinned by a test (#244).**
+
 ### Vlad Yanhursky — [@vyanhursky](https://github.com/vyanhursky)
 Five fixes extracted from a *Def Jam* bring-up fork, each with a fixture that
 fails on the old code and a real-CPU conformance case where one applies.
@@ -833,6 +868,18 @@ fails on the old code and a real-CPU conformance case where one applies.
   adopter, checked byte for byte against v0.14.0 over 224k states.
 - **The `g_eflags` gap in the interrupt snapshot**, from the #186/#192 test
   notes, is fixed in v0.15.0.
+
+*v0.17.0*
+- **The disasm step went from 516 s to 92 s on Def Jam (#255, fixing #254)**
+  — v0.14.0's callback probes re-decoded every gap from scratch, 25 million
+  Capstone decodes; output is byte-identical.
+- **Def Jam's audio clicks and holes (#261, #264)** — a shared page read as
+  RAM played stray bytes (386-422 clicks in 330 s, now 1), and DirectSound's
+  own sequencer restart left about 1,300 one-slice silences (now 1).
+- **Executor speed-ups (#272, #273, #274)** — vertex programs decoded once,
+  constant uploads off the general dispatch, combiner shaders compiled once
+  per text.
+- **The README's ports table (#256).**
 
 ### Leonardo Valdes Arteaga — [@eolandro](https://github.com/eolandro)
 - **The runtime did not build with GCC on Linux (#172)** — the VEH code
@@ -902,6 +949,13 @@ split from one fork into topic PRs with an index (#184).
   - the CLEAR_RECT rule in #212 and #222, each tested on Burnout 3 and
     BLiNX 2 before suggesting it.
 
+*v0.17.0*
+- **The gap sweep cut alias bodies apart (#262)** — a vtable-only method lost
+  three of its four switch arms, and loop tails became calls.
+- **`RECOMP_VBLANK=0` gave the paced schedule (#263)** with the dispatch gate
+  on, and a Finder-launched macOS title ran out of file descriptors at its
+  ~247th open.
+
 ### nworkers — [@nworkers](https://github.com/nworkers)
 Found on *Jet Set Radio Future*.
 
@@ -939,6 +993,11 @@ Found while bringing up *Black* (Criterion, XDK 5849).
   raw-input mouse movement becomes stick deflection, WASD and buttons merge on
   top of a real pad, and F9 toggles capture.
 
+*v0.17.0*
+- **The MMX and SSE float helpers as intrinsics (#258)** and **`RECOMP_CS_MODE=guest`
+  (#260)**, both split out of #222, the second with the review's three notes
+  fixed by keeping the classification in the lock's own bytes.
+
 ### Koen Hendriks — [@koenhendriks](https://github.com/koenhendriks)
 Found while bringing up *SSX 3* (PAL); see
 [SSX3-recomp](https://github.com/koenhendriks/SSX3-recomp).
@@ -971,6 +1030,15 @@ Found while bringing up *SSX 3* (PAL); see
   - volume changes ramp across the frame;
   - HRTF.
 
+*v0.17.0*
+- **The `tools.diff` family (#288, #293, #295, #296, #290, #289)** — trace
+  comparison, a deterministic fuzzer against Unicorn, record decoders, local
+  replay capture, register provenance and VA resolution — and the runtime
+  rings that feed it (#302, #303).
+- **Three kernel answers that were wrong (#291, #292, #294)** — the bare
+  `\Device\CdRom0`, a directory opened without the directory flag, and DVD
+  SCSI commands that reported success over the title's own heap bytes.
+
 ### Madiyar — [@kaskabayev](https://github.com/kaskabayev)
 - **XDK register constants cut `.text` functions (#234).** D3D's NV2A
   constants equal `.text` addresses, and the immediate-reference pass took
@@ -989,6 +1057,44 @@ Found on *SSX 3* (PAL) on Linux.
   failed with `STATUS_OBJECT_PATH_NOT_FOUND` and the game said "Unable to
   save". Came with a cross-platform test that fails 3 of 9 checks without
   the fix.
+
+### Tzeentchnet — [@Tzeentchnet](https://github.com/Tzeentchnet)
+- **Reported that `XC_VIDEO` sat in the wrong half-word (#301)** — XAPI reads
+  `raw >> 16 & 0x5F`, so every title saw 0. The report came with the EEPROM
+  bit layout, two independent sources and the policy questions to settle
+  first; the fix followed it directly.
+- **Extra thunks that weren't ordinals (#297)**, **mono HRTF voices copied
+  to both channels (#298)**, and **torn framebuffer snapshots (#300)**.
+- **SDL controllers that couldn't hotplug (#305)**, **a pre-snapshot backend
+  readback (#285)**, and **`XBOXRECOMP_BUILD_D3D8` (#304)** for embedders
+  without libepoxy.
+- **`PMADDWD` overflow (#284)**, **the MMX test on ARM64 (#283)** and **the
+  unimplemented-instruction report's wording (#299)**.
+
+### maxiumpro — [@maxiumpro](https://github.com/maxiumpro)
+Found on *Kung Fu Chaos*; see
+[kungfuchaos-recomp](https://github.com/maxiumpro/kungfuchaos-recomp).
+
+- **Thread priorities never took effect (#267)** — `Ke{Set,Query}BasePriorityThread`
+  passed the guest object's address to Windows as a thread handle, so every
+  call failed.
+- **Kung Fu Chaos in the ports table (#271).**
+
+### Raajik — [@Raajik](https://github.com/Raajik)
+Found bringing up *SSX On Tour* on Linux.
+
+- **`NtSetTimerEx` never armed the timer (#265)** — it returned success, so
+  the game's 60 Hz frame clock never ticked, saves never finished and the
+  intro stayed on its first frame. Synchronization timers now auto-reset, and
+  the POSIX shim honours a timer's period.
+
+### Silas Godoy — [@sigods](https://github.com/sigods)
+- **Trapped MMIO on Linux x86-64 (#252)** — #191 decoded faults only on
+  arm64, so a title there saw no USB controller and no APU. Found on *Otogi*.
+
+### christianbemerson — [@christianbemerson](https://github.com/christianbemerson)
+- **A guest `isatty` replaced libc's (#281)**, crashing Linux startup.
+- **`RECOMP_FULLSCREEN` in the SDL presenter (#282).**
 
 ---
 

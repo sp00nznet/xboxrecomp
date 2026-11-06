@@ -22,7 +22,7 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 ### Recent Changes
 
-**Current version: v0.16.0 — _"Small Print"_ (October 2026).**
+**Current version: v0.17.0 — _"Empty Promises"_ (November 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
@@ -476,7 +476,7 @@ definitions — they are the real proof for the shift, flag and x87 work, and
 each is paired with a negative control that feeds the harness the pre-fix
 expression and requires it to fail. They need a C compiler on `PATH`, and
 **skip rather than fail without one**, so check the skip count: a clean run is
-936 passed / 0 skipped. If clang is installed but not on `PATH`:
+988 passed / 1 skipped (a POSIX-only test). If clang is installed but not on `PATH`:
 
 ```bash
 export PATH="/c/Program Files/LLVM/bin:$PATH"   # Git Bash
@@ -594,6 +594,222 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.17.0 — *"Empty Promises"* (November 2026)
+
+*Fifty-five PRs, and the thread through most of them is a call that said yes
+and did nothing. `NtSetTimerEx` returned success without arming a timer, so
+SSX On Tour's 60 Hz frame clock never ticked. `KeSetBasePriorityThread`
+handed a guest address to the host as a thread handle, so no title's thread
+priority was ever applied. `RECOMP_RASTER_THREADS` was documented and did
+nothing on POSIX, and `XC_VIDEO` promised widescreen and HDTV in a half-word
+XAPI never reads, so every title saw 0. Each one reported success, which is
+why none of them was found by looking for errors.*
+
+**Contributed: lifter**
+
+- **Flags no longer vanish at a call.** A helper that answers in ZF or CF
+  (`cmp eax, ecx; ret`, then `je` in the caller) lost them at the call: the
+  reader got the never-assigned `_flags` fallback. #197 fixed it by publishing
+  flags at every call and ret, which made generated C 32.7% larger. This
+  version finds only the boundaries whose far side reads the flags: on Dead or
+  Alive 2 Ultimate, 86 publish sites in 45 functions and +0.07% source. It
+  replaces #197 —
+  *[@NoRain211](https://github.com/NoRain211)* (#311)
+- **Narrow immediates are read at the destination's width.** `adc ax, -1`
+  added 0xFFFFFFFF, so the carry landed in bit 32 while CF was read from bit
+  16 —
+  *[@NoRain211](https://github.com/NoRain211)* (#278)
+- **OF and PF have rules after `adc`, `sbb`, `neg` and shifts by one**, and
+  narrow `sub` compares at its own width. `sub al, bl; jl` with al = 0x80 did
+  not branch, and `jo`/`jp` after these setters read the never-taken
+  `_flags`. 2,977,924 fpdiff vectors now cover every jcc and setcc after each
+  setter —
+  *[@NoRain211](https://github.com/NoRain211)* (#276)
+- **Shift counts are masked to 5 bits, narrow `mul`/`imul` write only their
+  own halves, and `fnsave`/`frstor` are lifted.** `shl al, 32` gave 0 where
+  the CPU leaves 1, and `mul bl` zeroed EDX —
+  *[@NoRain211](https://github.com/NoRain211)* (#277)
+- **Only blocks the CFG reaches are lifted.** Inline tables after a tail jump
+  decoded as instructions, and a table byte became a `jo` on `_flags` —
+  *[@NoRain211](https://github.com/NoRain211)* (#279)
+- **Frame-pointer-omitted EBP survives a call.** Only frame owners published
+  `ebp`, so a helper reading its caller's general-purpose EBP got a stale
+  value; in DOA3 a geometry helper saved a stale frame this way —
+  *[@NoRain211](https://github.com/NoRain211)* (#280)
+- **A lone switch arm followed by a null slot is a switch.** DOA2U's record
+  lookup lifted as an indirect tail jump to an arm with no entry of its own,
+  so the arm was unreachable —
+  *[@NoRain211](https://github.com/NoRain211)* (#310)
+- **`wbinvd` is a no-op**, not `RECOMP_UNIMPL`: guest memory is host memory —
+  *[@NoRain211](https://github.com/NoRain211)* (#309)
+- **`isatty` is a reserved name.** A guest function called `isatty` replaced
+  libc's on Linux, and startup crashed in `log_pump_start()` —
+  *[@christianbemerson](https://github.com/christianbemerson)* (#281)
+- **The unimplemented-instruction report says what is emitted**: a
+  `RECOMP_UNIMPL` call that can report or trap, not a "no-op comment" —
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#299)
+- **`movsx` from `bp` and `sp` is pinned by a test**; a regression there
+  turns a Bink IDCT's negative values positive —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#244)
+
+**Contributed: disassembler**
+
+- **The disasm step is 5.6× faster on a large title.** v0.14.0's callback
+  probes built a new decoder per gap: 46,514 probes and 25 million Capstone
+  decodes on Def Jam: Fight for NY. They now share one cached decoder, and
+  the step goes from 516 s to 92 s with byte-identical output (#254) —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#255)
+- **The gap sweep leaves alias bodies whole.** v0.16.0's past-padding sweep
+  saw a vtable-only method's body as a gap and cut it at one of its own switch
+  arms; three of four arms fell outside, and the dispatch missed at run time
+  with the frame still on the stack. Out-of-line loop tails turned each `jcc`
+  into a call the same way —
+  *[@apexJCL](https://github.com/apexJCL)* (#262)
+
+**Contributed: kernel**
+
+- **`NtSetTimerEx` arms the timer**, and synchronization timers auto-reset.
+  It returned success and did nothing, so SSX On Tour's frame clock never
+  ticked: its "Saving..." screen waited forever and the intro movie stayed on
+  its first frame. The POSIX shim now honours the period too —
+  *[@Raajik](https://github.com/Raajik)* (#265)
+- **`Ke{Set,Query}BasePriorityThread` act on the host thread.** They passed
+  the guest object's address as a Windows `HANDLE`, so every call failed and
+  no priority was ever applied. Found on Kung Fu Chaos —
+  *[@maxiumpro](https://github.com/maxiumpro)* (#267)
+- **POSIX HANDLEs are table indices, not object pointers.**
+  `KeWaitForSingleObject` casts a guest KEVENT to a handle, and POSIX locked a
+  mutex inside guest memory: Burnout 3 faulted there before its title screen.
+  A bad handle now fails as on Win32, an invalid one in a multiple-object wait
+  fails instead of timing out forever, and five path calls normalise
+  separators. Three regressions now run off Windows —
+  *[@dplewis](https://github.com/dplewis)* (#241)
+- **The bare `\Device\CdRom0` opens**, for a title querying the volume
+  itself; it failed with "path not found" —
+  *[@MattSG](https://github.com/MattSG)* (#291)
+- **`NtCreateFile` opens an existing directory** when the title passes
+  neither directory flag, as NT does; Win32 refused it with access denied —
+  *[@MattSG](https://github.com/MattSG)* (#292)
+- **DVD SCSI pass-through answers every command.** Only MODE SENSE did; the
+  rest reported success while the title read whatever its heap held in
+  `DataBuffer`. They now report GOOD with zeroed data —
+  *[@MattSG](https://github.com/MattSG)* (#294)
+- **`recomp_diff`**, a register checkpoint ring and a trace-event ring with an
+  address filter, dumped in the layout `tools.diff` reads —
+  *[@MattSG](https://github.com/MattSG)* (#302, #303)
+- **Extra thunks must be valid ordinals.** Any high-bit word near the thunk
+  table was rewritten as a kernel import —
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#297)
+- **`RECOMP_VBLANK=0` and empty mean off.** With the dispatch gate on, `0`
+  quietly gave the paced schedule, the opposite of what it asked for. **This
+  changes behaviour:** anyone who set `RECOMP_VBLANK=0` to get vblanks should
+  use `1`. The POSIX open-file limit is also raised: a Finder-launched macOS
+  title failed its ~247th open and carried on with `INVALID_HANDLE_VALUE` —
+  *[@apexJCL](https://github.com/apexJCL)* (#263)
+- **`RECOMP_CS_MODE=guest`** runs critical sections in the guest's own bytes,
+  split from #222 with the review's three notes fixed —
+  *[@LeandroSSB](https://github.com/LeandroSSB)* (#260)
+- **File names match ignoring case on POSIX**, as the Xbox file systems do —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#248)
+- **Truncating a read-only handle is denied** instead of reaching the host —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#245)
+- **Every file delete is logged**, and **`RECOMP_WAIT_LOG`** reports long or
+  timed-out waits —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#246, #247)
+
+**Contributed: devices, audio and video**
+
+- **Trapped MMIO on Linux x86-64.** #191 decoded faults only on arm64, so a
+  title there saw no USB controller and no APU. Otogi now boots with both —
+  *[@sigods](https://github.com/sigods)* (#252)
+- **A named heap page is RAM only for the named block.** Def Jam's mix buffer
+  shared a page with a named heap block, so its last 28 frames played stray
+  RAM on every lap: 386-422 clicks in 330 s, now 1 —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#261)
+- **The APU holds its frame while DirectSound restarts the sequencer.** Each
+  43 ms sample-limit restart left a one-slice hole of silence: about 1,300 in
+  Def Jam's 330 s opening, now 1 —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#264)
+- **Mono HRTF voices keep their two channels**; the filtered left was copied
+  to both —
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#298)
+- **`RECOMP_RASTER_THREADS` works on POSIX**, where it was documented and
+  silently did nothing: 110 → 278 Mpx/s on four threads on an M4 —
+  *[@dplewis](https://github.com/dplewis)* (#242)
+- **Vertex programs are decoded once per upload** (420 → 215 ns a vertex
+  under MSVC), **transform constants skip the general dispatch** (7.1 → 2.3
+  ns a word), and **combiner shaders compile once per HLSL text**: one Def Jam
+  scene had 212 states but 10 texts —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#272, #273, #274)
+- **`RECOMP_TEX_BILINEAR` and `RECOMP_TEX_ANISO`**, opt-in filtering in the
+  CPU rasteriser, and **`RECOMP_STRIP_ALT_WINDING`**, which keeps a strip's
+  winding as hardware does —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#253, #249)
+- **Framebuffer snapshots are locked**; two quick flips could reuse a buffer
+  mid-copy and tear it —
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#300)
+- **Backends can read back before the frame snapshot**, so a dump no longer
+  shows the previous frame —
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#285)
+- **SDL controllers hotplug.** One connected after start could never fill a
+  port —
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#305)
+- **`RECOMP_FULLSCREEN` works in the SDL presenter** —
+  *[@christianbemerson](https://github.com/christianbemerson)* (#282)
+- **`PMADDWD`'s overflow is defined** in the scalar helper —
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#284)
+- **The MMX and SSE float helpers use intrinsics** on x86-64, checked against
+  the scalar reference over 3.39 M comparisons —
+  *[@LeandroSSB](https://github.com/LeandroSSB)* (#258)
+
+**Contributed: tools, build and docs**
+
+- **`tools.diff`, `tools.diff.fuzz`, its record decoders, `tools.capture`,
+  `tools.provenance` and `tools.resolve`**: compare oracle and recompiled
+  traces, fuzz an adapter against Unicorn, build a local replay case from an
+  XBE, trace where a register's value came from, and map a guest VA to its
+  function —
+  *[@MattSG](https://github.com/MattSG)* (#288, #295, #296, #293, #290, #289)
+- **The conformance suite finds Visual Studio 18.** It looked only under
+  `2022`, and on newer installs the compiled tests skipped silently —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#250)
+- **Every `RECOMP_*` switch on one page**,
+  `docs/runtime/environment-variables.md`; 51 were undocumented —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#251)
+- **`XBOXRECOMP_BUILD_D3D8=OFF`** lets an embedding project skip the bundled
+  D3D8 layer and its libepoxy dependency —
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#304)
+- **The MMX integer test builds on ARM64** and reports a skip as a skip,
+  not a pass —
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#283)
+- **"Projects Using This Toolkit" is a table of ports**, community ports
+  included —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#256), with Kung Fu Chaos
+  added —
+  *[@maxiumpro](https://github.com/maxiumpro)* (#271)
+
+**Maintainer**
+
+- **`XC_VIDEO` flags are the raw high-word EEPROM bits.** XAPI reads
+  `raw >> 16 & 0x5F`, so the low-half-word "widescreen | HDTV" reached every
+  title as 0. Titles now see NTSC 4:3 480i at 60 Hz, the modes they saw
+  before. Reported, with the bit layout and its sources, by
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#301)
+- At merge: #241 gained a `sys/stat.h` include for Linux, and #258's
+  `XBOXRECOMP_BUILD_TESTS` defaults on only in a top-level build. The
+  environment-variables page lists this release's new switches.
+
+**Held**, with reasons on each PR:
+- #275, which needs a rebase over #279.
+- #266, #268, #269 and #270, competing APU and heap designs.
+- #286, still a draft; #308, to be split.
+- #222, #231 and #209, as before.
+
+**Testing**
+
+- A clean run is now **988 passed / 1 skipped** (the skip is a POSIX-only test on Windows), up from 936, plus
+  6,368 conformance vectors with no mismatches on an AMD host.
 
 ### v0.16.0 — *"Small Print"* (October 2026)
 
