@@ -4450,6 +4450,50 @@ int xbox_PhysRamNamedAt(uint32_t pa)
     return named;
 }
 
+/* A heap page's physical number in the first RAM mirror.
+ *
+ * The record above cannot settle one case: a live heap block the title named
+ * and a live window buffer on the same physical numbers. Whichever copy the
+ * APU picks, one of the two plays the other's bytes. In Def Jam: Fight for NY
+ * the music stream is a window buffer; a string table 21 KB larger (a
+ * translation) moved a named heap page over its numbers, and the stream read
+ * RAM for those pages: about 1,300 one-slice gaps a minute in the opening
+ * scene, heard as crackling.
+ *
+ * So the heap is not given those numbers at all. A heap page below 64 MB is
+ * named va + the RAM size, which is where the first mirror shows the same
+ * bytes; the console's memory controller wraps such an address back onto the
+ * page too. The window keeps every number below 64 MB to itself, and each
+ * device reads the right copy without a guess: the APU wraps the alias
+ * (mcpx_apu_phys), and the NV2A executor and the OHCI, finding it above the
+ * window's high-water mark, read it as a guest address in the mirror. With no
+ * first mirror (a map too large for one) or RECOMP_PHYS_RAM_ALIAS=0 the name
+ * is the identity and the record above decides, as before. */
+uint32_t xbox_PhysRamAlias(void)
+{
+    static int alias = -1;
+    if (alias < 0) {
+        const char *e = getenv("RECOMP_PHYS_RAM_ALIAS");
+        alias = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+        if (alias)
+            fprintf(stderr, "  Physical names: heap pages below 64 MB alias"
+                            " into the first RAM mirror\n");
+    }
+    return alias && g_mirror_views[0] && g_memory_size >= XBOX_CONTIG_SIZE &&
+           g_memory_size <= 2u * XBOX_CONTIG_SIZE ? (uint32_t)g_memory_size : 0;
+}
+
+uint32_t xbox_PhysRamName(uint32_t va)
+{
+    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE) {
+        uint32_t alias = xbox_PhysRamAlias();
+        if (alias)
+            return va + alias;
+        xbox_PhysNoteRamName(va);
+    }
+    return va;
+}
+
 /* Heap block m is free (and merged with any free neighbours): its pages name
  * nothing now, except an edge page it shares with a live block. Index order is
  * address order, so the blocks that can share an edge page are the nearest
