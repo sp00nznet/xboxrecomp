@@ -1,0 +1,19 @@
+{
+  "calls": [],
+  "code": "90",
+  "entry_eip": 4096,
+  "memory": [],
+  "name": "nop",
+  "state": {
+    "eax": 0,
+    "ebp": 0,
+    "ebx": 0,
+    "ecx": 0,
+    "edi": 0,
+    "edx": 0,
+    "eflags": 514,
+    "esi": 0,
+    "esp": 0
+  },
+  "stop": {"instructions": 1}
+}
