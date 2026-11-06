@@ -116,6 +116,17 @@ cmake --build build --config Release
 
 This produces the static libraries in the table above, plus the `platform` layer they share, in `build/src/*/Release/` (`build/src/*/` with a single-config generator). Link your game project against `xboxrecomp` (umbrella target) or individual libraries.
 
+On POSIX, a project that uses the NV2A pushbuffer executor directly can omit
+the bundled OpenGL D3D8 layer and its libepoxy dependency:
+
+```bash
+cmake -S . -B build -DXBOXRECOMP_BUILD_D3D8=OFF
+```
+
+When embedding xboxrecomp with `add_subdirectory`, a parent may instead define
+its own `xbox_d3d8` target before adding the toolkit. The default remains the
+bundled D3D11 implementation on Windows and OpenGL implementation on POSIX.
+
 **This repo builds libraries only — there is no game `.exe` here, and building it will never produce one.** The executable is built by *your* game project, which lives in its own directory and links these libraries. Start it by copying [`templates/new-game/`](templates/new-game/): it has the `CMakeLists.txt` that produces the `.exe` and the `main.c` that boots the guest. See [Getting Started, Step 6](docs/GETTING_STARTED.md#step-6-create-your-game-project).
 
 ### Integration Pattern

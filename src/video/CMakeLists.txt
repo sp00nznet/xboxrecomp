@@ -10,7 +10,10 @@ target_include_directories(xbox_video PUBLIC
 )
 # xbox_input: the windows record keys in its key table (keyboard.c).
 # xbox_nv2a: the window scans out the PVIDEO overlay (nv2a_mmio_hook.c).
-target_link_libraries(xbox_video PUBLIC xbox_d3d8 xbox_input xbox_nv2a)
+target_link_libraries(xbox_video PUBLIC xbox_input xbox_nv2a)
+if(TARGET xbox_d3d8)
+    target_link_libraries(xbox_video PUBLIC xbox_d3d8)
+endif()
 if(WIN32)
     # gpu_present.c: the framebuffer window's D3D11 presenter.
     target_sources(xbox_video PRIVATE gpu_present.c)
