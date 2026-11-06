@@ -43,7 +43,19 @@ static uint32_t s_tot_calls;
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+
+/* One word to the executor. SET_TRANSFORM_CONSTANT words, the bulk of a
+ * skinning title's stream, take the executor's short path (see
+ * nv2a_pb_exec_constant_word). */
+static void exec_word(uint32_t subch, uint32_t method, uint32_t param)
+{
+    if (subch == 0 && method >= 0x0B80u && method < 0x0C00u
+            && nv2a_pb_exec_constant_word(method, param))
+        return;
+    nv2a_pb_exec_method(subch, method, param);
+}
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
 
@@ -287,7 +299,7 @@ static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
          * acts. Keeping them on one decode means they can never
          * disagree about what the stream said. */
         if (s_exec_enabled)
-            nv2a_pb_exec_method(s_pend_subch, m, param);
+            exec_word(s_pend_subch, m, param);
         s_get = (s_get + 4) & PB_PHYS_MASK;
         s_pend_i++;
         s_pend_left--;
@@ -512,8 +524,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
                 if (s_exec_enabled)
-                    nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
+                    exec_word(subch, m, *(const uint32_t *)(mem + va));
                 va += 4;
                 words++;
             }

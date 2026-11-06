@@ -46,6 +46,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (method == s_title_moves_get_at)
         s_get_reg = s_title_get;
 }
+/* The executor's constant short path: declined, so every word reaches the
+ * recorder above. */
+int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+{
+    (void)method; (void)param;
+    return 0;
+}
 void nv2a_pb_exec_report(void) {}
 void xbox_Nv2aAckBusyBits(void) {}
 void nv2a_pb_exec_walk_begin(void) {}       /* the flip hold's vblank sample */

@@ -3752,10 +3752,34 @@ static void flip_hold_report(void)
     h->held_ns = 0;
 }
 
+static int s_exec_inited;
+
+/* SET_TRANSFORM_CONSTANT(i), 0x0B80..0x0BFC on the 3D subchannel, without
+ * the general dispatch. A title that skins or animates on the GPU uploads
+ * these by the hundred thousand a frame -- most of its pushbuffer words --
+ * and each one went through every early check in nv2a_pb_exec_method and the
+ * whole range ladder of its default case before reaching the constant store.
+ * The dispatcher does exactly three things with such a word: its one-time
+ * setup, the register file, and nv2a_vsh_constant_word. This does the last
+ * two, and leaves the word to the dispatcher (returns 0) until the setup has
+ * run. RECOMP_PB_CONST_FAST=0 sends every word through the dispatcher. */
+int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PB_CONST_FAST");
+        on = !(e && e[0] == '0');
+    }
+    if (!on || !s_exec_inited)
+        return 0;
+    s_reg[(method & 0x1FFCu) / 4] = param;
+    nv2a_vsh_constant_word(param);
+    return 1;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
-    static int inited;
-
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
      * held 0xFF000000 at times, which put the write outside guest memory). */
@@ -3764,8 +3788,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         *(volatile uint32_t *)(mem + s_sem_va) = param;
         return;
     }
-    if (!inited) {
-        inited = 1;
+    if (!s_exec_inited) {
+        s_exec_inited = 1;
         s_gpu.aa_sx = s_gpu.aa_sy = 1.0f;
         /* Stencil state as the hardware resets it: GL_ALWAYS, masks 0xFF,
          * GL_KEEP, until the title says otherwise. */
