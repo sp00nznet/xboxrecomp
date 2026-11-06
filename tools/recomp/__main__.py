@@ -163,14 +163,14 @@ def list_categories(translator):
 
 
 def _report_unimplemented(stats):
-    """List the mnemonics that were emitted as TODO comments.
+    """List the mnemonics emitted with RECOMP_UNIMPL runtime markers.
 
-    An unimplemented instruction is not a build error -- it is a comment, and
-    the generated function keeps running with whatever the destination already
-    held. That is the worst kind of failure: it looks like it worked. Wreckless
-    booted for weeks with `bsf eax, ecx` translated to nothing, which made the
-    CRT heap's free-list bitmap scan return its own argument and hand out the
-    address of an empty list head.
+    An unimplemented instruction is not a build error. Its effects remain a
+    no-op, but the generated function calls RECOMP_UNIMPL with the instruction
+    and guest address before it continues. The runtime can therefore report or
+    trap the omission. Wreckless booted for weeks with `bsf eax, ecx`
+    translated to nothing, which made the CRT heap's free-list bitmap scan
+    return its own argument and hand out the address of an empty list head.
 
     Sorted by count, with one example address each so the caller can go and
     look at it.
@@ -179,7 +179,8 @@ def _report_unimplemented(stats):
     if not unimplemented:
         return
     total = sum(len(a) for a in unimplemented.values())
-    print(f"{total} instruction(s) unimplemented, emitted as no-op comments "
+    print(f"{total} instruction(s) unimplemented, emitted as RECOMP_UNIMPL "
+          f"runtime calls "
           f"({len(unimplemented)} distinct mnemonics):", file=sys.stderr)
     ranked = sorted(unimplemented.items(),
                     key=lambda kv: (-len(kv[1]), kv[0]))

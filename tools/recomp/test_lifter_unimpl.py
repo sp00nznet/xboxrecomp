@@ -23,8 +23,11 @@ The third is the negative control: without it a change that put RECOMP_UNIMPL
 on every unhandled mnemonic including the deliberate ones would pass the first
 two and flood the [UNIMPL] log with `prefetch`.
 """
+import contextlib
+import io
 import unittest
 
+from .__main__ import _report_unimplemented
 from .disasm import Instruction, Operand
 from .lifter import Lifter
 
@@ -82,6 +85,35 @@ class UnimplementedMarkerTest(unittest.TestCase):
         self.assertNotIn("RECOMP_UNIMPL", out)
         self.assertNotIn("TODO", out)
         self.assertEqual(lifter.unimplemented, {})
+
+
+class UnimplementedReportTest(unittest.TestCase):
+
+    def test_summary_describes_runtime_calls(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            _report_unimplemented({
+                "unimplemented": {
+                    "daa": [0x12340, 0x12350],
+                    "hlt": [0xABCDEF],
+                },
+            })
+
+        report = stderr.getvalue()
+        self.assertIn(
+            "3 instruction(s) unimplemented, emitted as RECOMP_UNIMPL "
+            "runtime calls (2 distinct mnemonics):",
+            report,
+        )
+        self.assertNotIn("no-op comments", report)
+        self.assertIn("2  daa", report)
+        self.assertIn("1  hlt", report)
+
+    def test_empty_summary_is_silent(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            _report_unimplemented({})
+        self.assertEqual(stderr.getvalue(), "")
 
 
 if __name__ == "__main__":
