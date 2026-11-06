@@ -1773,6 +1773,22 @@ static int batch_is_ffp(void)
  * wrong rather than dark. */
 #define NV_LIGHTS 8
 
+/* RECOMP_STRIP_ALT_WINDING, off by default: emit every odd triangle of a
+ * triangle strip with its first two vertices swapped, so all of a strip's
+ * triangles wind the same way, as a strip does on hardware. Left alone the
+ * executor emits (i, i+1, i+2) for every i, so a back end that culls or lights
+ * two-sided from the winding drops or back-lights every second triangle. */
+static int strip_alt_winding(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_STRIP_ALT_WINDING");
+        on = e && strcmp(e, "0") != 0;
+    }
+    return on;
+}
+
 /* RECOMP_FFP_FLIP_NORMALS: a compatibility option, off by default. See
  * lit_color(). */
 static int ffp_flip_normals(void)
@@ -3048,8 +3064,12 @@ static void raster_batch_program(void)
             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < n; i++)
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+        for (i = 0; i + 2 < n; i++) {
+            if ((i & 1) && strip_alt_winding())
+                raster_xf_clipped(&s_xf[i+1], &s_xf[i], &s_xf[i+2]);
+            else
+                raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+        }
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -3116,9 +3136,14 @@ static void raster_batch(void)
                            vertex_color(s_gpu.idx[i]));
         break;
     case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < s_gpu.idx_count; i++)
-            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
-                           vertex_color(s_gpu.idx[i]));
+        for (i = 0; i + 2 < s_gpu.idx_count; i++) {
+            if ((i & 1) && strip_alt_winding())
+                raster_indexed(s_gpu.idx[i+1], s_gpu.idx[i], s_gpu.idx[i+2],
+                               vertex_color(s_gpu.idx[i]));
+            else
+                raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                               vertex_color(s_gpu.idx[i]));
+        }
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:

@@ -234,6 +234,7 @@ when it matters rather than adding callbacks.
 | `RECOMP_PB_EXEC_VERBOSE` | per-batch trace |
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
+| `RECOMP_STRIP_ALT_WINDING` | emit every odd triangle of a triangle strip with its first two vertices swapped, so all of a strip's triangles wind the same way, as a strip does on hardware. Off by default: the executor emits `(i, i+1, i+2)` for every `i`. A back end that culls, or lights two-sided, from the winding drops or back-lights every second strip triangle without it |
 
 ## The DMA Walk Is Opt-In
 

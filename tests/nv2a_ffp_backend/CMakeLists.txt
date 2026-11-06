@@ -21,3 +21,7 @@ add_test(NAME nv2a-present-sync COMMAND nv2a-present-sync-test
          "${CMAKE_CURRENT_BINARY_DIR}/nv2a-present-sync-")
 set_tests_properties(nv2a-present-sync PROPERTIES ENVIRONMENT
     "RECOMP_FB_DUMP_FLIPS=1;RECOMP_FB_DUMP=${CMAKE_CURRENT_BINARY_DIR}/nv2a-present-sync-")
+# Triangle strips alternate their winding only with RECOMP_STRIP_ALT_WINDING; the same test
+# checks the unchanged order without it (the test above) and the swapped one with it.
+add_test(NAME nv2a-ffp-backend-strip-winding COMMAND nv2a-ffp-backend-test)
+set_tests_properties(nv2a-ffp-backend-strip-winding PROPERTIES ENVIRONMENT "RECOMP_STRIP_ALT_WINDING=1")
