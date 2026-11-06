@@ -5181,6 +5181,27 @@ static void bridge_NtDeviceIoControlFile(void)
             return;
         }
 
+        /* Any other command sent as IOCTL_SCSI_PASS_THROUGH_DIRECT (READ DVD
+         * STRUCTURE, INQUIRY, ...) is answered the same way: the drive reports
+         * GOOD and the DataBuffer holds defined bytes, not what the title's
+         * heap happened to contain. There is no disc to describe, so the
+         * contents are zero. */
+        if (ioctl == 0x4D014u && in_va && in_len >= 44) {
+            uint32_t data_va  = BRIDGE_MEM32(in_va + 20);
+            uint32_t data_len = BRIDGE_MEM32(in_va + 12);
+            uint32_t i;
+
+            fprintf(stderr, "  [FILE] DVD SCSI command 0x%02X, %u bytes "
+                            "-> zeroed\n", BRIDGE_MEM8(in_va + 28), data_len);
+            if (data_va)
+                for (i = 0; i < data_len; i++)
+                    BRIDGE_MEM8(data_va + i) = 0;
+            BRIDGE_MEM8(in_va + 2) = 0;              /* ScsiStatus = GOOD */
+            bridge_write_iostatus(ios_va, 0, in_len);
+            g_eax = 0;
+            return;
+        }
+
         fprintf(stderr, "  [FILE] DVD device IOCTL 0x%X (in=%u out=%u) "
                         "-> STATUS_SUCCESS\n", ioctl, in_len, out_len);
         if (out_va && out_len) {
