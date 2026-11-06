@@ -57,15 +57,34 @@ _COD_PROC = re.compile(r"^(\S+)\s+PROC\b")
 _COD_ENDP = re.compile(r"^(\S+)\s+ENDP\b")
 
 
+_VS_MAJOR = {"2017": 15, "2019": 16, "2022": 17}
+
+
 def _find_vcvars():
-    for root in (os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-                 os.environ.get("ProgramFiles", r"C:\Program Files")):
-        for ed in ("Community", "Professional", "Enterprise", "BuildTools"):
-            p = os.path.join(root, "Microsoft Visual Studio", "2022", ed,
-                             "VC", "Auxiliary", "Build", "vcvars32.bat")
-            if os.path.exists(p):
-                return p
-    return None
+    """vcvars32.bat of an installed Visual Studio, or None.
+
+    2022 is preferred (it is what this was written against); otherwise the
+    newest other install wins. Older releases name their folder by year, newer
+    ones by major version ("18"), so a lookup of "2022" alone reports "no
+    32-bit toolchain" on a machine that has a perfectly good one.
+    """
+    roots = (os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+             os.environ.get("ProgramFiles", r"C:\Program Files"))
+    editions = ("Community", "Professional", "Enterprise", "BuildTools")
+    found = []
+    for ri, root in enumerate(roots):
+        base = os.path.join(root, "Microsoft Visual Studio")
+        try:
+            versions = [v for v in os.listdir(base) if v.isdigit()]
+        except OSError:
+            continue
+        for v in versions:
+            major = _VS_MAJOR.get(v, int(v))
+            for ei, ed in enumerate(editions):
+                p = os.path.join(base, v, ed, "VC", "Auxiliary", "Build", "vcvars32.bat")
+                if os.path.exists(p):
+                    found.append(((v != "2022", -major, ri, ei), p))
+    return min(found)[1] if found else None
 
 
 def _cl(vcvars, workdir, args):
@@ -267,7 +286,7 @@ def main_with_args(argv, allow_container=True):
 
     if not backend:
         print("ERROR: no 32-bit x86 toolchain. Either a 32-bit MSVC "
-              "(vcvars32.bat under Visual Studio 2022), or Docker running so a "
+              "(vcvars32.bat under Visual Studio), or Docker running so a "
               "linux/386 container can supply the CPU.", file=sys.stderr)
         return 2
 
