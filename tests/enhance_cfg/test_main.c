@@ -1069,6 +1069,10 @@ int nv2a_overlay_stats(void) { return s_ovl_stats > 0; }
 /* The menu (tests/enhance_menu has it): enhance.c starts it. */
 void enhance_menu_start(void);
 void enhance_menu_start(void) {}
+/* enhance_menu.c's item lookup for a mod's link setting: none here. */
+struct enhance_item;
+const struct enhance_item *enhance_menu_toolkit_item(const char *key);
+const struct enhance_item *enhance_menu_toolkit_item(const char *key) { (void)key; return 0; }
 void nv2a_overlay_toast(const char *fmt, ...) { (void)fmt; }
 DWORD xbox_InputLastState(DWORD port, XBOX_INPUT_STATE *st)
 {

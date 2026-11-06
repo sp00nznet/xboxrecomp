@@ -95,10 +95,10 @@ static char s_key[MOD_MAX][80];             /* "mods.<name>" */
 
 enum {
     SRC_ENV = 0, SRC_USER, SRC_USER_ALIAS, SRC_DEFAULTS, SRC_DEFAULTS_ALIAS,
-    SRC_DEFAULT, SRC_MENU
+    SRC_DEFAULT, SRC_MENU, SRC_LINK
 };
 static const char *const s_src_name[] = {
-    "env", "user", "user_alias", "defaults", "defaults_alias", "default", "menu"
+    "env", "user", "user_alias", "defaults", "defaults_alias", "default", "menu", "link"
 };
 
 struct set_rt {
@@ -109,6 +109,8 @@ struct set_rt {
     int pending;                /* on_setting queued for the next frame */
     int env;                    /* recomp_env id, or -1 */
     char key[KEY_MAX];          /* the full key */
+    /* A LINK's toolkit item: the value is the item's, never cur or want. */
+    const struct enhance_item *link;
 };
 
 struct ctl_rt {
@@ -978,8 +980,20 @@ static int desc_check(struct mod_rt *r, const struct xbox_mod *m)
         for (j = 0; j < i; j++)
             if (!strcmp(d->settings[j].name, s->name))
                 REFUSE("setting '%s' declared twice", s->name);
-        if (s->kind > XBOX_SET_ENUM)
+        if (s->kind > XBOX_SET_LINK)
             REFUSE("setting '%s': unknown kind %u", s->name, s->kind);
+        if (s->kind == XBOX_SET_LINK) {
+            /* The item keeps its own env row, key history and switch. */
+            if (d->version < 2)
+                REFUSE("link setting '%s' needs descriptor version 2", s->name);
+            if (!s->key || !enhance_menu_toolkit_item(s->key))
+                REFUSE("link setting '%s': no toolkit item %s", s->name,
+                       s->key ? s->key : "(no key)");
+            if (s->env || s->aliases || (s->flags & XBOX_SET_ENABLE))
+                REFUSE("link setting '%s': env, aliases and the enable flag are the item's",
+                       s->name);
+            continue;
+        }
         if (s->live != ENHANCE_LIVE && s->live != ENHANCE_LIVE_ACTIVATE &&
             s->live != ENHANCE_LIVE_RESTART)
             REFUSE("setting '%s': live class %u is not live, activate or restart",
@@ -1202,6 +1216,15 @@ static void setting_resolve(int i, uint32_t k)
     double v = s->def;
     int nh, h, bad = 0, done = 0;
 
+    if (s->kind == XBOX_SET_LINK) {
+        /* Nothing to read: the item resolved its own key at start. */
+        snprintf(r->key, KEY_MAX, "%s", s->key);
+        r->link = enhance_menu_toolkit_item(s->key);
+        r->env = -1;
+        r->src = SRC_LINK;
+        r->forced = r->pending = 0;
+        return;
+    }
     if (s->key)
         snprintf(r->key, KEY_MAX, "%s", s->key);
     else
@@ -1478,11 +1501,65 @@ static int mod_of(const struct xbox_mod_desc *desc)
     return -1;
 }
 
+/* A LINK's item as a number: a toggle 0/1, a text choice its index, a
+ * numeric choice or a range its number (enhance_menu_toolkit_item gives
+ * only items with a get and a set). */
+static double link_number(const struct enhance_item *it)
+{
+    char b[128];
+    const char *v = it->get(it, b, sizeof b);
+
+    if (!v)
+        return 0;
+    if (it->kind == ENHANCE_ITEM_TOGGLE)
+        return !strcmp(v, "true") || !strcmp(v, "on");
+    if (it->kind == ENHANCE_ITEM_CHOICE && !(it->flags & ENHANCE_ITEM_NUMERIC)) {
+        for (int c = 0; it->choices && it->choices[c]; c++)
+            if (!strcmp(it->choices[c], v))
+                return c;
+        return 0;
+    }
+    return atof(v);
+}
+
+/* The menu's spelling of v for the item's set; refused when its env row
+ * forces the item, as the item's own row is. */
+static void link_set(const struct enhance_item *it, double v)
+{
+    char b[64];
+    int n = 0;
+
+    if (enhance_cfg_source_of(it->key) == ENHANCE_SRC_ENV)
+        return;
+    if (it->kind == ENHANCE_ITEM_TOGGLE) {
+        snprintf(b, sizeof b, "%s", v != 0 ? "true" : "false");
+    } else if (it->kind == ENHANCE_ITEM_CHOICE && !(it->flags & ENHANCE_ITEM_NUMERIC)) {
+        while (it->choices && it->choices[n])
+            n++;
+        if (!(v >= 0 && v < n))
+            return;
+        snprintf(b, sizeof b, "%s", it->choices[(int)v]);
+    } else if (it->kind == ENHANCE_ITEM_CHOICE) {
+        snprintf(b, sizeof b, "%lld", (long long)v);
+    } else {
+        /* A range as the item's own row moves it: lo..hi, on lo + k * step. */
+        if (it->kind == ENHANCE_ITEM_RANGE) {
+            if (it->step > 0)
+                v = it->lo + floor((v - it->lo) / it->step + 0.5) * it->step;
+            v = v < it->lo ? it->lo : v > it->hi ? it->hi : v;
+        }
+        xbox_mod_num_text(b, sizeof b, v);
+    }
+    it->set(it, b);
+}
+
 static double api_setting(const struct xbox_mod_desc *desc, uint32_t idx)
 {
     int i = mod_of(desc);
     if (i < 0 || idx >= s_mod[i].d.n_settings)
         return 0;
+    if (s_mod[i].set[idx].link)
+        return link_number(s_mod[i].set[idx].link);
     return ld_val(&s_mod[i].set[idx].cur);
 }
 
@@ -2098,7 +2175,10 @@ static void set_at_parse(void)
             for (int i = 0; i < s_count && !ok; i++)
                 for (uint32_t k = 0; s_mod[i].valid && k < s_mod[i].d.n_settings && !ok; k++) {
                     const char *key = s_mod[i].set[k].key;
-                    if (strlen(key) != kn || strncmp(key, colon + 1, kn))
+                    /* A link is the toolkit item's: its set from this
+                     * thread would leave the menu's copy stale. */
+                    if (s_mod[i].d.settings[k].kind == XBOX_SET_LINK || strlen(key) != kn
+                        || strncmp(key, colon + 1, kn))
                         continue;
                     s_set_at[s_nset_at] = (struct set_at){
                         (uint32_t)strtoul(p, NULL, 10), i, k,
@@ -2330,6 +2410,8 @@ double xbox_mod_setting_stock(int i, uint32_t idx)
 
     if (!r)
         return 0;
+    if (r->link)
+        return link_number(r->link);   /* the mod owns no stock */
     s = &s_mod[i].d.settings[idx];
     /* The defaults file's row as setting_resolve reads it (its key, then
      * its aliases), without the user files and the env: what Reset and a
@@ -2358,6 +2440,8 @@ const char *xbox_mod_fail_reason(int i)
 double xbox_mod_setting_value(int i, uint32_t idx)
 {
     const struct set_rt *r = set_of(i, idx);
+    if (r && r->link)
+        return link_number(r->link);
     return r ? ld_val(&r->want) : 0;
 }
 
@@ -2370,6 +2454,8 @@ const char *xbox_mod_setting_source(int i, uint32_t idx)
 int xbox_mod_setting_forced(int i, uint32_t idx)
 {
     const struct set_rt *r = set_of(i, idx);
+    if (r && r->link)
+        return enhance_cfg_source_of(r->key) == ENHANCE_SRC_ENV;
     return r && r->forced;
 }
 
@@ -2393,6 +2479,10 @@ double xbox_mod_setting_set(int i, uint32_t idx, double v)
 
     if (!r)
         return 0;
+    if (r->link) {
+        link_set(r->link, v);
+        return link_number(r->link);
+    }
     if (r->forced)
         return ld_val(&r->want);
     s = &s_mod[i].d.settings[idx];

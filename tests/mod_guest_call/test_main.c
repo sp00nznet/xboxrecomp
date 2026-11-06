@@ -83,6 +83,10 @@ int nv2a_overlay_stats(void) { return 0; }
 void nv2a_overlay_toast(const char *fmt, ...) { (void)fmt; }
 void enhance_menu_start(void);
 void enhance_menu_start(void) {}
+/* enhance_menu.c's item lookup for a mod's link setting: none here. */
+struct enhance_item;
+const struct enhance_item *enhance_menu_toolkit_item(const char *key);
+const struct enhance_item *enhance_menu_toolkit_item(const char *key) { (void)key; return 0; }
 static struct nv2a_pb_present s_present = { 0x00C00000u, 640, 480, 2560, 0 };
 const struct nv2a_pb_present *nv2a_pb_present_state(void) { return &s_present; }
 

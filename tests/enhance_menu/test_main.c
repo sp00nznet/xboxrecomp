@@ -1318,6 +1318,115 @@ static void test_detail_rows(void)
     open_menu();
 }
 
+/* ---- 3c. a link setting: a toolkit item's row on a mod's page ---------- */
+
+static const struct xbox_mod_setting k_lk_set[] = {
+    { "enable", "lmod.enable", NULL, NULL, "Enabled", NULL, NULL,
+      XBOX_SET_BOOL, ENHANCE_LIVE, XBOX_SET_ENABLE, 1, 0, 0, 0, NULL },
+    { "square", "input.pad_square_left", NULL, NULL, NULL, "Linked help", NULL,
+      XBOX_SET_LINK, 0, 0, 0, 0, 0, 0, NULL },
+};
+static const struct xbox_mod_desc k_lk_desc = {
+    XBOX_MOD_DESC_VERSION, sizeof(struct xbox_mod_desc), "Link mod", NULL, NULL, "1",
+    k_lk_set, 2, NULL, 0
+};
+static const struct xbox_mod_api *s_lk_api;
+static int lk_init(const struct xbox_mod_api *api)
+{
+    s_lk_api = api;
+    return api->on_enable(bm_enable, NULL) ? 0 : -1;
+}
+static const struct xbox_mod k_lk = { "lmod", lk_init, NULL, &k_lk_desc };
+static const struct xbox_mod *const k_lkmods[] = { &k_lk, NULL };
+
+/* The row is the item's own slot: one value on both pages, one staged
+ * key, one line in the file. */
+/* The page index the tab strip names name, -1 for none. */
+static int page_of(const char *name)
+{
+    for (int p = 0; p < enhance_menu_page_count(); p++)
+        if (!strcmp(enhance_menu_page_name(p), name))
+            return p;
+    return -1;
+}
+
+static void test_link_row(void)
+{
+    xbox_pad_setup ps;
+    const char *f;
+    int i;
+
+    start_with(ARMED, k_lkmods);
+    open_menu();
+    open_detail("Link mod");
+    /* Under Settings, after Enabled, with the item's label and the
+     * mod's help. */
+    CHECK(row_index("Settings") > row_index("Enabled"));
+    CHECK(row_value("Square left stick") && !strcmp(s_val, "false"));
+    i = row_index("Square left stick");
+    CHECK(i > row_index("Settings") && !strcmp(enhance_menu_row_help(i), "Linked help"));
+    CHECK(s_lk_api->setting(&k_lk_desc, 1) == 0);
+
+    CHECK(enhance_menu_select_row("Square left stick"));
+    tap(0x27);
+    CHECK(row_value("Square left stick") && !strcmp(s_val, "true"));
+    xbox_InputPadSetup(&ps);
+    CHECK(ps.square_left && !ps.square_right);
+    CHECK(s_lk_api->setting(&k_lk_desc, 1) == 1);
+    CHECK(pending_has("input.pad_square_left", "true"));
+    CHECK(!pending_any("mods.lmod.square"));
+    CHECK(enhance_menu_unsaved() == 1);
+    /* Both tabs carry the unsaved dot: the change shows on both. */
+    CHECK(enhance_menu_page_unsaved(page_of("Mods")));
+    CHECK(enhance_menu_page_unsaved(page_of("Controls")));
+    /* Controls shows it, as changed there. */
+    CHECK(enhance_menu_set_page("Controls"));
+    CHECK(row_value("Square left stick") && !strcmp(s_val, "true"));
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "pad_square_left = true") != NULL);
+    CHECK(strstr(strstr(f, "pad_square_left") + 1, "pad_square_left") == NULL);
+    CHECK(strstr(f, "lmod.square") == NULL && strstr(f, "[mods]") == NULL);
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(!enhance_menu_page_unsaved(page_of("Mods")));
+    CHECK(!enhance_menu_page_unsaved(page_of("Controls")));
+
+    /* Off on Controls: the mod's page and the mod follow. */
+    CHECK(enhance_menu_select_row("Square left stick"));
+    tap(0x27);
+    CHECK(s_lk_api->setting(&k_lk_desc, 1) == 0);
+    CHECK(enhance_menu_set_page("Mods"));
+    open_detail("Link mod");
+    CHECK(row_value("Square left stick") && !strcmp(s_val, "false"));
+    /* Reset this mod leaves the item alone: it is the toolkit's. */
+    CHECK(enhance_menu_select_row("Square left stick"));
+    tap(0x27);
+    CHECK(row_value("Square left stick") && !strcmp(s_val, "true"));
+    CHECK(enhance_menu_select_row("Reset this mod"));
+    tap(0x0D);
+    CHECK(row_value("Square left stick") && !strcmp(s_val, "true"));
+    tap(VK_F5);
+    open_menu();
+
+    /* Forced by its env row: read-only on the mod's page too. */
+    set_env("RECOMP_INPUT_PAD_SQUARE_LEFT", "0");
+    start_with(ARMED, k_lkmods);
+    open_menu();
+    open_detail("Link mod");
+    CHECK(enhance_menu_select_row("Square left stick"));
+    tap(0x27);
+    CHECK(row_value("Square left stick") && !strcmp(s_val, "false"));
+    CHECK(!strncmp(enhance_menu_status(), "Set by ", 7));
+    CHECK(xbox_mod_setting_forced(0, 1));
+    /* The mod's own set is refused the same way. */
+    CHECK(xbox_mod_setting_set(0, 1, 1) == 0);
+    xbox_InputPadSetup(&ps);
+    CHECK(!ps.square_left);
+    set_env("RECOMP_INPUT_PAD_SQUARE_LEFT", NULL);
+    open_menu();
+    remove("config/config.toml");
+}
+
 /* About wraps at the word that no longer fits, at any panel width: the
  * lines put back together are the summary, and a narrower panel takes
  * more of them. */
@@ -5494,6 +5603,7 @@ int main(int argc, char **argv)
     test_controls_groups();
     test_mouse();
     test_sticks();
+    test_link_row();
     test_snapshot();
     test_shaders();
     test_param_kinds();

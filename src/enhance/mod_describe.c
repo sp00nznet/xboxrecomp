@@ -113,7 +113,7 @@ static void jlist(FILE *f, const char *const *v, int n)
     fputc(']', f);
 }
 
-static const char *const s_kind[] = { "bool", "int", "float", "enum" };
+static const char *const s_kind[] = { "bool", "int", "float", "enum", "link" };
 static const char *const s_ctl_kind[] = { "action", "button", "stick", "info" };
 
 static const char *live_name(int live)
@@ -134,10 +134,49 @@ static void jvalue(FILE *f, const struct xbox_mod_setting *s, double v)
         jnum(f, v);
 }
 
+/* A link: its key, the label and help the page shows (the item's where the
+ * mod gives none), the item's live class and its value in the item's form
+ * (a toggle a bool, a text choice its text, else a number). */
+static void link_setting(FILE *f, int i, uint32_t k, const struct xbox_mod_setting *s)
+{
+    const struct enhance_item *it = enhance_menu_toolkit_item(s->key);
+    double v = xbox_mod_setting_value(i, k);
+    int first = 1;
+
+    fputs("\n      {", f);
+    jkey(f, &first, "name");
+    jstr(f, s->name);
+    jkey(f, &first, "key");
+    jstr(f, xbox_mod_setting_key(i, k));
+    jkey(f, &first, "kind");
+    jstr(f, s_kind[XBOX_SET_LINK]);
+    jopt_str(f, &first, "label", s->label ? s->label : it->label);
+    jopt_str(f, &first, "help", s->help ? s->help : it->help);
+    jkey(f, &first, "live");
+    jstr(f, live_name((int)it->live));
+    jkey(f, &first, "value");
+    if (it->kind == ENHANCE_ITEM_TOGGLE)
+        fputs(v ? "true" : "false", f);
+    /* link_number gives an index inside the list (0 for a text not in
+     * it), so only an empty list needs the guard. */
+    else if (it->kind == ENHANCE_ITEM_CHOICE && !(it->flags & ENHANCE_ITEM_NUMERIC) && it->choices
+             && it->choices[0])
+        jstr(f, it->choices[(int)v]);
+    else
+        jnum(f, v);
+    jkey(f, &first, "source");
+    jstr(f, xbox_mod_setting_source(i, k));
+    fputc('}', f);
+}
+
 static void setting(FILE *f, int i, uint32_t k, const struct xbox_mod_setting *s)
 {
     int first = 1;
 
+    if (s->kind == XBOX_SET_LINK) {
+        link_setting(f, i, k, s);
+        return;
+    }
     fputs("\n      {", f);
     jkey(f, &first, "name");
     jstr(f, s->name);

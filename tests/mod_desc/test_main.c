@@ -85,6 +85,66 @@ int nv2a_overlay_stats(void) { return 0; }
 void nv2a_overlay_toast(const char *fmt, ...) { (void)fmt; }
 void enhance_menu_start(void);
 void enhance_menu_start(void) {}
+/* Two toolkit items a link setting can name (enhance_menu.c is not linked
+ * here): a toggle and a text choice, each backed by an int. */
+static int s_knob, s_mode, s_knob_sets;
+static const char *const k_modes[] = { "a", "b", "c", NULL };
+static void knob_set(const struct enhance_item *it, const char *v)
+{
+    (void)it;
+    s_knob = !strcmp(v, "true");
+    s_knob_sets++;
+}
+static const char *knob_get(const struct enhance_item *it, char *b, size_t n)
+{
+    (void)it;
+    snprintf(b, n, "%s", s_knob ? "true" : "false");
+    return b;
+}
+static void mode_set(const struct enhance_item *it, const char *v)
+{
+    (void)it;
+    for (int c = 0; k_modes[c]; c++)
+        if (!strcmp(k_modes[c], v))
+            s_mode = c;
+}
+static const char *mode_get(const struct enhance_item *it, char *b, size_t n)
+{
+    (void)it;
+    snprintf(b, n, "%s", k_modes[s_mode]);
+    return b;
+}
+static const struct enhance_item k_knob = {
+    "test.knob", "Knob", "Controls", ENHANCE_ITEM_TOGGLE, NULL, 0, 0, 0, NULL, knob_set,
+    knob_get, ENHANCE_LIVE, 0, "false", NULL, "The knob's own help" };
+static const struct enhance_item k_mode = {
+    "test.mode", "Mode", "Controls", ENHANCE_ITEM_CHOICE, k_modes, 0, 0, 0, NULL, mode_set,
+    mode_get, ENHANCE_LIVE, 0, "a", NULL, NULL };
+/* A range 0..10 by 2, and the text its set was handed. */
+static double s_level;
+static char s_level_text[32];
+static void level_set(const struct enhance_item *it, const char *v)
+{
+    (void)it;
+    snprintf(s_level_text, sizeof s_level_text, "%s", v);
+    s_level = atof(v);
+}
+static const char *level_get(const struct enhance_item *it, char *b, size_t n)
+{
+    (void)it;
+    snprintf(b, n, "%g", s_level);
+    return b;
+}
+static const struct enhance_item k_level = {
+    "test.level", "Level", "Controls", ENHANCE_ITEM_RANGE, NULL, 0, 10, 2, NULL, level_set,
+    level_get, ENHANCE_LIVE, 0, "0", NULL, NULL };
+const struct enhance_item *enhance_menu_toolkit_item(const char *key)
+{
+    return !strcmp(key, "test.knob")    ? &k_knob
+           : !strcmp(key, "test.mode")  ? &k_mode
+           : !strcmp(key, "test.level") ? &k_level
+                                        : NULL;
+}
 
 static uint8_t s_guest[64];
 ptrdiff_t xbox_GetMemoryOffset(void);
@@ -343,6 +403,25 @@ static const struct xbox_mod_control k_bad_ctl_dup[] = {
 static const struct xbox_mod_control k_bad_ctl_kind[] = {
     { "x", NULL, NULL, NULL, 7, NULL, NULL, NULL },
 };
+static const struct xbox_mod_setting k_bad_link[] = {
+    { "x", "test.none", NULL, NULL, NULL, NULL, NULL, XBOX_SET_LINK, 0, 0, 0, 0, 0, 0, NULL },
+};
+static const struct xbox_mod_setting k_bad_link_env[] = {
+    { "x", "test.knob", "RECOMP_HEAP_QUARANTINE", NULL, NULL, NULL, NULL, XBOX_SET_LINK, 0, 0,
+      0, 0, 0, 0, NULL },
+};
+static const char *const k_old_keys[] = { "test.old_knob", NULL };
+static const struct xbox_mod_setting k_bad_link_alias[] = {
+    { "x", "test.knob", NULL, k_old_keys, NULL, NULL, NULL, XBOX_SET_LINK, 0, 0, 0, 0, 0, 0,
+      NULL },
+};
+static const struct xbox_mod_setting k_bad_link_enable[] = {
+    { "x", "test.knob", NULL, NULL, NULL, NULL, NULL, XBOX_SET_LINK, 0, XBOX_SET_ENABLE, 0, 0,
+      0, 0, NULL },
+};
+static const struct xbox_mod_setting k_v1_link[] = {
+    { "x", "test.knob", NULL, NULL, NULL, NULL, NULL, XBOX_SET_LINK, 0, 0, 0, 0, 0, 0, NULL },
+};
 #define BAD_DESC(set, nset, ctl, nctl) { XBOX_MOD_DESC_VERSION, \
     sizeof(struct xbox_mod_desc), NULL, NULL, NULL, NULL, set, nset, ctl, nctl }
 static const struct xbox_mod_desc k_d_lohi = BAD_DESC(k_bad_lohi, 1, NULL, 0);
@@ -355,6 +434,13 @@ static const struct xbox_mod_desc k_d_ctl_dup = BAD_DESC(NULL, 0, k_bad_ctl_dup,
 static const struct xbox_mod_desc k_d_ctl_kind = BAD_DESC(NULL, 0, k_bad_ctl_kind, 1);
 static const struct xbox_mod_desc k_d_keylen = BAD_DESC(k_bad_keylen, 1, NULL, 0);
 static const struct xbox_mod_desc k_d_ctl_keylen = BAD_DESC(NULL, 0, k_bad_ctl_keylen, 1);
+static const struct xbox_mod_desc k_d_link = BAD_DESC(k_bad_link, 1, NULL, 0);
+static const struct xbox_mod_desc k_d_link_env = BAD_DESC(k_bad_link_env, 1, NULL, 0);
+static const struct xbox_mod_desc k_d_link_alias = BAD_DESC(k_bad_link_alias, 1, NULL, 0);
+static const struct xbox_mod_desc k_d_link_enable = BAD_DESC(k_bad_link_enable, 1, NULL, 0);
+/* Version 1 knew no links: the literal 1, as a mod built then wrote it. */
+static const struct xbox_mod_desc k_d_link_v1 = { 1u, sizeof(struct xbox_mod_desc), NULL, NULL,
+    NULL, NULL, k_v1_link, 1, NULL, 0 };
 static const struct xbox_mod_desc k_d_ver0 = { 0, sizeof(struct xbox_mod_desc),
     NULL, NULL, NULL, NULL, NULL, 0, NULL, 0 };
 static const struct xbox_mod_desc k_d_tiny = { XBOX_MOD_DESC_VERSION, 4,
@@ -455,10 +541,15 @@ static void test_refusals(void)
     static const struct xbox_mod b10 = { "b10", bad_init, NULL, &k_d_tiny };
     static const struct xbox_mod b11 = { "b11", bad_init, NULL, &k_d_keylen };
     static const struct xbox_mod b12 = { "b12", bad_init, NULL, &k_d_ctl_keylen };
+    static const struct xbox_mod b13 = { "b13", bad_init, NULL, &k_d_link };
+    static const struct xbox_mod b14 = { "b14", bad_init, NULL, &k_d_link_env };
+    static const struct xbox_mod b15 = { "b15", bad_init, NULL, &k_d_link_alias };
+    static const struct xbox_mod b16 = { "b16", bad_init, NULL, &k_d_link_enable };
+    static const struct xbox_mod b17 = { "b17", bad_init, NULL, &k_d_link_v1 };
     static const struct xbox_mod shortd = { "short", quiet_init, NULL, &k_d_short };
     static const struct xbox_mod *const mods[] = {
-        &b1, &b2, &b3, &b4, &b5, &b6, &b7, &b8, &b9, &b10, &b11, &b12, &m_legacy, &shortd,
-        NULL };
+        &b1, &b2, &b3, &b4, &b5, &b6, &b7, &b8, &b9, &b10, &b11, &b12, &b13, &b14, &b15, &b16,
+        &b17, &m_legacy, &shortd, NULL };
     static const struct { const char *name, *reason; } want[] = {
         { "b1", "setting 'x': lo 9 > hi 1" },
         { "b2", "setting 'x' declared twice" },
@@ -473,6 +564,11 @@ static void test_refusals(void)
         { "b11", "setting 'x': its key is 64 bytes or longer" },
         { "b12", "control 'a_control_id_long_enough_to_pass_sixty_four_bytes': its key is 64 "
                  "bytes or longer" },
+        { "b13", "link setting 'x': no toolkit item test.none" },
+        { "b14", "link setting 'x': env, aliases and the enable flag are the item's" },
+        { "b15", "link setting 'x': env, aliases and the enable flag are the item's" },
+        { "b16", "link setting 'x': env, aliases and the enable flag are the item's" },
+        { "b17", "link setting 'x' needs descriptor version 2" },
     };
     const char *out;
     char line[256];
@@ -689,6 +785,129 @@ static void test_set_and_callback(void)
     CHECK(s_api->control_action(&k_fly_desc, 99) == -1);
     CHECK(!strcmp(xbox_mod_setting_source(fly, 99), "default"));
     CHECK(xbox_mod_setting_key(fly, 99) == NULL);
+}
+
+/* ---- 3b. link settings (XBOX_SET_LINK): the item's value, no copy ------ */
+
+static const struct xbox_mod_setting k_link_set[] = {
+    { "knob", "test.knob", NULL, NULL, NULL, NULL, NULL, XBOX_SET_LINK, 0, 0, 0, 0, 0, 0, NULL },
+    { "mode", "test.mode", NULL, NULL, "Mode here", "Its help here", NULL, XBOX_SET_LINK, 0, 0,
+      0, 0, 0, 0, NULL },
+    { "own", NULL, NULL, NULL, NULL, NULL, NULL, XBOX_SET_BOOL, ENHANCE_LIVE, 0, 0, 0, 0, 0,
+      NULL },
+    { "level", "test.level", NULL, NULL, NULL, NULL, NULL, XBOX_SET_LINK, 0, 0, 0, 0, 0, 0,
+      NULL },
+};
+static const struct xbox_mod_desc k_link_desc = {
+    XBOX_MOD_DESC_VERSION, sizeof(struct xbox_mod_desc), "Linker", NULL, NULL, NULL,
+    k_link_set, 4, NULL, 0
+};
+static double s_link_init;
+static int link_init(const struct xbox_mod_api *api)
+{
+    s_api = api;
+    s_link_init = api->setting(&k_link_desc, 0);
+    api->on_setting(&k_link_desc, fly_setting, NULL);
+    return 0;
+}
+static const struct xbox_mod m_link = { "linker", link_init, NULL, &k_link_desc };
+
+static void test_link(void)
+{
+    static const struct xbox_mod *const mods[] = { &m_link, NULL };
+    const char *out;
+    char *got;
+    int i;
+
+    s_knob = 1;
+    s_mode = 2;
+    s_knob_sets = 0;
+    out = start(NULL, NULL, mods);
+    i = index_of("linker");
+    CHECK(xbox_mod_state(i) == XBOX_MOD_ON);
+    CHECK(xbox_mod_desc_of(i) != NULL);
+    CHECK(s_link_init == 1);
+    CHECK(s_knob_sets == 0);        /* the start sets nothing */
+    CHECK(!strcmp(xbox_mod_setting_key(i, 0), "test.knob"));
+    CHECK(!strcmp(xbox_mod_setting_source(i, 0), "link"));
+    CHECK(xbox_mod_setting_env(i, 0) == NULL && !xbox_mod_setting_forced(i, 0));
+    CHECK(xbox_mod_setting_value(i, 1) == 2);
+    CHECK(xbox_mod_setting_stock(i, 0) == 1);
+    /* The item moves elsewhere (its own page): the mod reads it now. */
+    s_knob = 0;
+    CHECK(s_api->setting(&k_link_desc, 0) == 0);
+    CHECK(xbox_mod_setting_value(i, 0) == 0);
+    /* A set goes to the item's set, in its spelling; no callback. */
+    s_cb_n = 0;
+    CHECK(xbox_mod_setting_set(i, 0, 1) == 1);
+    CHECK(s_knob == 1 && s_knob_sets == 1);
+    CHECK(xbox_mod_setting_set(i, 1, 0) == 0 && s_mode == 0);
+    CHECK(xbox_mod_setting_set(i, 1, 7) == 0 && s_mode == 0);   /* no choice 7 */
+    xbox_mod_frame();
+    CHECK(s_cb_n == 0);
+    CHECK(!strcmp(xbox_mod_setting_source(i, 0), "link"));
+    /* The mod's own setting beside them is as before. */
+    CHECK(!strcmp(xbox_mod_setting_key(i, 2), "mods.linker.own"));
+    CHECK(xbox_mod_setting_set(i, 2, 1) == 1);
+    xbox_mod_frame();
+    CHECK(s_cb_n == 1 && s_cb_idx == 2);
+    LACKS(out, "[MOD] linker");     /* no line of its own: nothing to resolve */
+    /* A range link: clamped to lo..hi and snapped to the step, as the
+     * item's own row moves it, and read back as its number. */
+    s_level = 4;
+    CHECK(xbox_mod_setting_value(i, 3) == 4 && s_api->setting(&k_link_desc, 3) == 4);
+    CHECK(xbox_mod_setting_set(i, 3, 5.2) == 6 && !strcmp(s_level_text, "6"));
+    CHECK(xbox_mod_setting_set(i, 3, 99) == 10);
+    CHECK(xbox_mod_setting_set(i, 3, -3) == 0);
+
+    /* The dump: kind link, the label and help shown, the item's value. */
+    xbox_mod_register_table(mods);
+    capture_begin();
+    xbox_mod_init_describe();
+    CHECK(xbox_mod_describe_write("link.json") == 0);
+    capture_end();
+    got = read_all("link.json");
+    CHECK(got != NULL);
+    if (got) {
+        HAS(got, "{\"name\": \"knob\", \"key\": \"test.knob\", \"kind\": \"link\", "
+                 "\"label\": \"Knob\", \"help\": \"The knob's own help\", \"live\": \"live\", "
+                 "\"value\": true, \"source\": \"link\"}");
+        HAS(got, "{\"name\": \"mode\", \"key\": \"test.mode\", \"kind\": \"link\", "
+                 "\"label\": \"Mode here\", \"help\": \"Its help here\", \"live\": \"live\", "
+                 "\"value\": \"a\", \"source\": \"link\"}");
+    }
+    free(got);
+}
+
+/* ---- 3c. a version 1 descriptor, written with the literal 1 ----------- */
+
+static const struct xbox_mod_setting k_v1_set[] = {
+    { "on", NULL, NULL, NULL, NULL, NULL, NULL, XBOX_SET_BOOL, ENHANCE_LIVE, XBOX_SET_ENABLE, 0,
+      0, 0, 0, NULL },
+    { "speed", NULL, NULL, NULL, NULL, NULL, NULL, XBOX_SET_INT, ENHANCE_LIVE, 0, 3, 1, 9, 1,
+      NULL },
+};
+static const struct xbox_mod_desc k_v1_desc = {
+    1u, sizeof(struct xbox_mod_desc), "Old", NULL, NULL, NULL, k_v1_set, 2, NULL, 0
+};
+static int v1_init(const struct xbox_mod_api *api)
+{
+    s_api = api;
+    return 0;
+}
+static const struct xbox_mod m_v1 = { "oldmod", v1_init, NULL, &k_v1_desc };
+
+static void test_v1_desc(void)
+{
+    static const struct xbox_mod *const mods[] = { &m_v1, NULL };
+    int i;
+
+    start("[mods]\n\"oldmod.on\" = true\n\"oldmod.speed\" = 7\n", NULL, mods);
+    i = index_of("oldmod");
+    CHECK(xbox_mod_state(i) == XBOX_MOD_ON);
+    CHECK(s_api->setting(&k_v1_desc, 1) == 7);
+    CHECK(!strcmp(xbox_mod_setting_source(i, 1), "user"));
+    CHECK(xbox_mod_setting_set(i, 1, 12) == 9);
 }
 
 /* ---- 4. the init rule, the enable line, the ACTION controls ----------- */
@@ -1084,6 +1303,8 @@ int main(void)
     test_refusals();
     test_precedence();
     test_set_and_callback();
+    test_link();
+    test_v1_desc();
     test_init_rule();
     test_set_at();
     test_unknown_keys();

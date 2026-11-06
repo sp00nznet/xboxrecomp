@@ -1477,7 +1477,8 @@ The pages are Render, Shaders, Pack, Game (a title's own items, from
   - **Settings**, one row per descriptor setting: a toggle, a choice or a
     slider by `step`, with its `unit` after the value and its live class
     (below). A row an environment variable forces is dimmed with "set by
-    `RECOMP_...`" and never saved;
+    `RECOMP_...`" and never saved. A link setting's row is its toolkit
+    item's own row (below);
   - the items the mod added with `menu_add` (a v2 mod has only these);
   - **Reset this mod**: stages the mod's settings, action bindings and
     captured controls back to the stock: the defaults file's value, else the descriptor's
@@ -2323,7 +2324,7 @@ this way (`mods.<name>.*`), since its code never ran to read them.
 ### The descriptor (v3)
 
 A mod can say what it is and what it reads as const data, `desc` in
-`struct xbox_mod` (`struct xbox_mod_desc`, descriptor version 1). The
+`struct xbox_mod` (`struct xbox_mod_desc`, descriptor version 2). The
 toolkit reads it before any `init`, so the Mods page and the dump can
 describe a mod that is off or was never inited, without running its code.
 `desc` is a source contract for mods linked into the game, not a plugin
@@ -2428,6 +2429,37 @@ gave no `on_enable` gets one line, and turning it on applies at restart:
 Otherwise it is not inited. The menu's change to a setting is clamped and
 snapped the same way, stored at once, and reaches the mod through
 `on_setting` at the next frame. A `restart` setting only records it.
+
+**Link settings (descriptor version 2).** A setting of kind
+`XBOX_SET_LINK` puts a toolkit menu item on the mod's page. Its `key` is
+the item's (`input.pad_square_left`); `label` and `help` NULL take the
+item's. The row is the item's own: the same value on both pages, one
+staged change, and Save writes the item's key once. An env row that
+forces the item makes both rows read-only. The mod stores nothing:
+`api->setting` reads the item now (a toggle 0 or 1, a choice its index,
+a numeric choice or a range its number), `on_setting` is never called
+for it, and Reset this mod leaves it alone. Its source name is `link`.
+A change from the mod (`xbox_mod_setting_set`) is clamped and snapped as
+the item's row does it; `RECOMP_DEBUG=mod_set_at` does not take a link's
+key. `api->setting` calls the item's get, so link only items whose get is
+safe from any thread. Both tabs carry the unsaved dot while the row is
+unsaved. A key that names no toolkit item with a get and a set, a link
+with `env`, `aliases` or `XBOX_SET_ENABLE`, or a link in a version 1
+descriptor refuses the descriptor:
+
+```
+[MOD] fdm: descriptor refused: link setting 'square_left': no toolkit item input.pad_sqare_left; left out
+```
+
+```c
+    { "square_left", "input.pad_square_left", NULL, NULL, NULL, NULL, NULL,
+      XBOX_SET_LINK, 0, 0, 0, 0, 0, 0, NULL },
+```
+
+The structs are unchanged, so version 1 descriptors read as before. A
+toolkit before version 2 refuses the kind ("unknown kind 4"), so a mod
+that must build against one puts the row under
+`#if XBOX_MOD_DESC_VERSION >= 2`.
 
 **Controls.** An ACTION control is registered before `init` as the host
 action `<id>.<control id>`, with its defaults, aliases (full keys, such
@@ -2554,6 +2586,9 @@ Schema 1. Fields are only added; one removed or changed in meaning bumps
 - `value` and `default`: a bool as `true`/`false`, an enum as its choice,
   a number in the C locale's shortest round-trip form.
 - `live`: `live`, `activate` or `restart`.
+- A `link` setting has `name`, `key`, `kind`, the `label` and `help` the
+  page shows, the item's `live`, `value` in the item's form and `source`
+  `link`; no `default` or range.
 - `bindings`: an action's texts as the config gives them. `refused`, only
   when nonempty, lists those of them that would never fire at a start: an
   input name the game does not know, an input another action holds, or a

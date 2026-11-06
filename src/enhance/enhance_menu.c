@@ -545,6 +545,16 @@ static struct slot *slot_add(const struct enhance_item *it, int page, int mod)
     return s;
 }
 
+/* A mod's XBOX_SET_LINK row reads and sets the item through these two, so
+ * an item without them cannot be linked. */
+const struct enhance_item *enhance_menu_toolkit_item(const char *key)
+{
+    for (int i = 0; key && i < N_ITEMS; i++)
+        if (!strcmp(k_items[i].key, key))
+            return k_items[i].get && k_items[i].set ? &k_items[i] : NULL;
+    return NULL;
+}
+
 static void mod_toggle_set(const struct enhance_item *it, const char *v)
 {
     xbox_mod_set_enabled((int)(intptr_t)it->user, on_text(v));
@@ -659,7 +669,9 @@ static void dset_slots(int m)
         const struct xbox_mod_setting *st = &d->settings[k];
         struct enhance_item *it;
         struct slot *s;
-        if ((st->flags & XBOX_SET_ENABLE) || !xbox_mod_setting_key(m, k))
+        /* A link's row is its toolkit item's own slot (detail_rows). */
+        if ((st->flags & XBOX_SET_ENABLE) || st->kind == XBOX_SET_LINK ||
+            !xbox_mod_setting_key(m, k))
             continue;
         if (s_nset >= DSET_MAX) {
             fprintf(stderr, LOGP "menu: more than %d mod settings; %s not listed\n", DSET_MAX,
@@ -1476,6 +1488,14 @@ static int slot_find(const char *key)
     return -1;
 }
 
+/* The toolkit item's slot a link names, -1 when it has none. */
+static int link_slot(const char *key)
+{
+    int i = key ? slot_find(key) : -1;
+    return i >= 0 && s_slot[i].mod < 0 && enhance_menu_toolkit_item(key) == s_slot[i].it ? i
+                                                                                   : -1;
+}
+
 /* Mod m's Enabled toggle slot, whichever key it carries. */
 static int toggle_slot(int m)
 {
@@ -1835,19 +1855,23 @@ static void detail_rows(int m)
         header("Settings");
     for (uint32_t k = 0; k < d->n_settings; k++) {
         const struct xbox_mod_setting *ds = &d->settings[k];
-        int i = dset_slot(m, k);
+        int link = ds->kind == XBOX_SET_LINK;
+        int i = !link ? dset_slot(m, k) : ok ? link_slot(ds->key) : -1;
+        const char *help;
         if (ds->flags & XBOX_SET_ENABLE)
             continue;
         if (i < 0) {
             unavailable(ds->label ? ds->label : ds->name, ds->help);
             continue;
         }
-        r = row_add(R_SLOT, i, 1, s_slot[i].it->label);
+        /* A link shows the item's own slot under the mod's label and help:
+         * a change here is the change on the item's page. */
+        r = row_add(R_SLOT, i, 1, link && ds->label ? ds->label : s_slot[i].it->label);
         if (!r)
             continue;
         snprintf(r->value, sizeof r->value, "%s", s_slot[i].cur);
-        snprintf(r->help, sizeof r->help, "%s",
-                 s_slot[i].help ? s_slot[i].help : s_slot[i].it->help ? s_slot[i].it->help : "");
+        help = link && ds->help ? ds->help : s_slot[i].help ? s_slot[i].help : s_slot[i].it->help;
+        snprintf(r->help, sizeof r->help, "%s", help ? help : "");
     }
     slot_rows(PAGE_MODS, m);
     if (ok)
@@ -2709,7 +2733,7 @@ static int rewrite_is_stock(const char *key, const char *value)
         for (uint32_t k = 0; d && k < d->n_settings; k++) {
             const char *full = xbox_mod_setting_key(m, k);
             char lit[VAL_MAX * 4];
-            if (!full || strcmp(full, key))
+            if (!full || strcmp(full, key) || d->settings[k].kind == XBOX_SET_LINK)
                 continue;
             return xbox_mod_setting_literal(m, k, xbox_mod_setting_stock(m, k), lit, sizeof lit)
                    && !strcmp(lit, value);
@@ -4974,7 +4998,24 @@ static int row_state(const struct row *r)
     }
 }
 
-/* A section's tab carries the unsaved dot while anything on it is. */
+/* Whether a running mod's link row shows an unsaved toolkit slot. */
+static int link_unsaved(void)
+{
+    for (int m = 0; m < xbox_mod_count(); m++) {
+        const struct xbox_mod_desc *d = xbox_mod_desc_of(m);
+        if (!d || xbox_mod_state(m) == XBOX_MOD_FAILED)
+            continue;
+        for (uint32_t k = 0; k < d->n_settings; k++) {
+            int i = d->settings[k].kind == XBOX_SET_LINK ? link_slot(d->settings[k].key) : -1;
+            if (i >= 0 && slot_saveable(&s_slot[i]) && slot_unsaved(&s_slot[i]))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* A section's tab carries the unsaved dot while anything on it is; a
+ * linked slot also dots Mods, where its row is too. */
 static int page_unsaved(int p)
 {
     for (int i = 0; i < s_nslot; i++)
@@ -4985,7 +5026,7 @@ static int page_unsaved(int p)
             if (binds_dirty(id))
                 return 1;
     if (p == PAGE_MODS)
-        return ctl_dirty(-1) > 0;
+        return ctl_dirty(-1) > 0 || link_unsaved();
     if (p == PAGE_SHADERS)
         return nv2a_present_chain_overrides_dirty() + shader_edit_unsaved() > 0;
     return 0;
@@ -7436,6 +7477,11 @@ const char *enhance_menu_page_name(int page)
 }
 
 int enhance_menu_page(void) { return s_page; }
+
+int enhance_menu_page_unsaved(int page)
+{
+    return page >= 0 && page < PAGE_COUNT && page_unsaved(page);
+}
 
 int enhance_menu_page_shown(int page)
 {

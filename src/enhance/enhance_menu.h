@@ -95,6 +95,11 @@ struct enhance_item {
  * no key or label. */
 int enhance_menu_add(const struct enhance_item *it);
 
+/* The toolkit's own item with this key (its built-in table, not a title's
+ * or a mod's) that has a get and a set, or NULL: what a mod's
+ * XBOX_SET_LINK setting names (mod.h). */
+const struct enhance_item *enhance_menu_toolkit_item(const char *key);
+
 /* The intro line shown under a section's tabs ("Game": what the title's
  * options are about). A title calls it from its init, as for its items;
  * text is kept, not copied. Returns 0 for an unknown section. */
@@ -147,6 +152,8 @@ int  enhance_menu_page(void);
 int  enhance_menu_set_page(const char *name);   /* 1 when found and shown */
 /* 0 for a page left out of the tab strip (Shaders, where none can run). */
 int  enhance_menu_page_shown(int page);
+/* 1 while the page's tab carries the unsaved dot. */
+int  enhance_menu_page_unsaved(int page);
 int  enhance_menu_rows(void);
 int  enhance_menu_selected(void);
 /* Row i's label and value text (value "" for none); 0 when i is out of

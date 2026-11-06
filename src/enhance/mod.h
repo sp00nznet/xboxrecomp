@@ -147,25 +147,45 @@ struct xbox_mod {
  * control id, lo > hi, an enum with no choices, an unknown kind or a second
  * XBOX_SET_ENABLE fails the mod (XBOX_MOD_FAILED, one [MOD] line). Text is
  * UTF-8. The toolkit reads only the fields inside `size`, so fields can be
- * appended. */
-#define XBOX_MOD_DESC_VERSION 1u
+ * appended.
+ *
+ * Version 2 adds the kind XBOX_SET_LINK; the structs are unchanged, so a
+ * version 1 descriptor reads as before. A toolkit before it refuses the
+ * kind (unknown kind): a mod that must build against one puts its link
+ * rows under #if XBOX_MOD_DESC_VERSION >= 2. */
+#define XBOX_MOD_DESC_VERSION 2u
 
 enum {
     XBOX_SET_BOOL = 0,
     XBOX_SET_INT,
     XBOX_SET_FLOAT,
-    XBOX_SET_ENUM
+    XBOX_SET_ENUM,
+    /* v2: a row on the mod's page for a toolkit menu item, `key` being
+     * the item's ("input.pad_square_left"). The row is that item's own:
+     * one value, shown the same on both pages, saved once under the
+     * item's key. label and help NULL take the item's; env, aliases and
+     * XBOX_SET_ENABLE are refused, the other fields ignored. A key that
+     * names no toolkit item (enhance_menu_toolkit_item) refuses the
+     * descriptor, and so does a LINK in a version 1 descriptor. The
+     * toolkit keeps no value for it: setting reads the item now (a toggle
+     * 0/1, a choice its index, a numeric choice or a range its number), a
+     * change is clamped and snapped as the item's own row does it,
+     * on_setting is never called for it, the mod's Reset leaves it alone
+     * and RECOMP_DEBUG=mod_set_at does not take its key. */
+    XBOX_SET_LINK
 };
 #define XBOX_SET_ENABLE 0x1u    /* flags: this setting is the mod's switch */
 
-/* A setting the toolkit owns: it resolves the value (env row, then the
- * user files' key then aliases, then config.default.toml's key then
- * aliases, then def), clamps it to lo..hi and snaps it to lo + k * step
- * (each change logged "[MOD] <id>.<name>: <value> -> <used>"), and the mod
- * reads it with api->setting. Bool is 0/1, an enum the choice's index. */
+/* A setting the toolkit owns (all but a LINK): it resolves the value (env
+ * row, then the user files' key then aliases, then config.default.toml's
+ * key then aliases, then def), clamps it to lo..hi and snaps it to
+ * lo + k * step (each change logged "[MOD] <id>.<name>: <value> -> <used>"),
+ * and the mod reads it with api->setting. Bool is 0/1, an enum the
+ * choice's index. */
 struct xbox_mod_setting {
     const char *name;           /* "speed": key mods."<id>.speed" */
-    const char *key;            /* NULL, or the full key ("camera.free_speed") */
+    const char *key;            /* NULL, or the full key ("camera.free_speed");
+                                   LINK: the toolkit item's */
     const char *env;            /* NULL, or a recomp_env row name ("RECOMP_...") */
     const char *const *aliases; /* retired full keys, NULL-terminated, or NULL */
     const char *label, *help, *unit;
@@ -305,10 +325,13 @@ struct xbox_mod_api {
      * The descriptor (struct xbox_mod_desc above); desc is the mod's own. */
 
     /* Setting idx's value now: a relaxed atomic load, any thread. Bool
-     * 0/1, an enum the choice's index. 0 for a bad desc or idx. The
-     * values it reads stay valid until process exit: shutdown frees
-     * nothing, and only a re-init (the tests) frees them, so a callback
-     * still in flight at shutdown reads safely. */
+     * 0/1, an enum the choice's index. 0 for a bad desc or idx. A LINK
+     * calls its item's get instead, so it is only as thread-safe as that
+     * get (input.pad_square_left's reads the pad setup, safe from any
+     * thread); link only items whose get is. The values it reads stay
+     * valid until process exit: shutdown frees nothing, and only a re-init
+     * (the tests) frees them, so a callback still in flight at shutdown
+     * reads safely. */
     double (*setting)(const struct xbox_mod_desc *desc, uint32_t idx);
     /* Init only. fn(idx, value, user) after the menu changes a setting,
      * from the next xbox_mod_frame on the guest's thread (as on_enable).
@@ -585,14 +608,16 @@ double xbox_mod_setting_stock(int i, uint32_t idx);
 int xbox_mod_setting_literal(int i, uint32_t idx, double v, char *out, size_t n);
 double xbox_mod_setting_value(int i, uint32_t idx);
 /* The precedence row the value came from: "env", "user", "user_alias",
- * "defaults", "defaults_alias", "default" (or "menu" once set live). */
+ * "defaults", "defaults_alias", "default" (or "menu" once set live);
+ * "link" for a LINK setting. */
 const char *xbox_mod_setting_source(int i, uint32_t idx);
 int xbox_mod_setting_forced(int i, uint32_t idx);   /* env-set: read-only */
 const char *xbox_mod_setting_key(int i, uint32_t idx);   /* the full key */
 /* The menu's change (any thread): clamped and snapped as at load, stored,
  * and the mod's on_setting queued for the next xbox_mod_frame (a RESTART
  * setting only records it). The enable setting switches the mod as
- * xbox_mod_set_enabled does. Returns the value stored; refused (the old
+ * xbox_mod_set_enabled does. A LINK sets its item through the item's set,
+ * and nothing is queued. Returns the value stored; refused (the old
  * value) when env forces it. */
 double xbox_mod_setting_set(int i, uint32_t idx, double v);
 /* What the init rule did this run, as the dump spells it: "yes",
