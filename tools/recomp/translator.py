@@ -2546,6 +2546,22 @@ class FunctionTranslator:
                         and block.last_insn.mnemonic == "int3"
                         and block.last_insn.address not in debug_slide_int3s):
                     block.successors = []
+        # Linear decoding also sees inline tables and padding after returns.
+        # Only executable CFG edges (including the computed-edge census) can
+        # make those blocks part of this function. Immediate code addresses
+        # stay too: an intra-function register jmp may reach them by a goto
+        # the CFG could not prove (_lift_jmp).
+        by_start = {block.start: block for block in blocks}
+        reachable = set()
+        pending = [start, *imm_refs]
+        while pending:
+            address = pending.pop()
+            if address in reachable or address not in by_start:
+                continue
+            reachable.add(address)
+            pending.extend(by_start[address].successors)
+        blocks = [block for block in blocks if block.start in reachable]
+        instructions = [insn for block in blocks for insn in block.instructions]
         return instructions, blocks
 
     def entry_stub(self, addr, name):
