@@ -3802,7 +3802,9 @@ static int g_heap_alloc_count = 0;
  * in bump order, so index order is address order and coalescing is a
  * neighbour check. */
 #define XBOX_HEAP_MAX_BLOCKS 65536
-static struct { uint32_t addr; uint32_t size; uint8_t free; }
+/* `named`: MmGetPhysicalAddress was given an address inside this live block
+ * (xbox_PhysNoteRamName); cleared whenever the block is handed out or freed. */
+static struct { uint32_t addr; uint32_t size; uint8_t free; uint8_t named; }
     g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
 
@@ -3839,7 +3841,7 @@ static int heap_insert_free(int at, uint32_t addr, uint32_t size)
     }
     g_heap_blocks[at].addr = addr;
     g_heap_blocks[at].size = size;
-    g_heap_blocks[at].free = 1;
+    g_heap_blocks[at].free = 1; g_heap_blocks[at].named = 0;
     return 1;
 }
 
@@ -3865,7 +3867,7 @@ static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
             i++;        /* the taken piece moved up one slot */
         g_heap_blocks[i].addr = start;
         g_heap_blocks[i].size = size;
-        g_heap_blocks[i].free = 0;
+        g_heap_blocks[i].free = 0; g_heap_blocks[i].named = 0;
         if (back && !heap_insert_free(i + 1, start + size, back))
             g_heap_blocks[i].size += back;   /* table full: keep it attached */
         memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
@@ -4371,10 +4373,68 @@ uint32_t xbox_ContiguousInUseBytes(void)
  * most one pass of one voice. */
 static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
 
+/* The heap block holding `va`, live or free, or -1 when none does. Index
+ * order is address order (empty slots keep the address they had), so the
+ * search finds the last slot starting at or below `va` and steps back over
+ * empty ones. Caller holds g_heap_lock (shared is enough). */
+static int heap_block_at(uint32_t va)
+{
+    int lo = 0, hi = g_heap_block_count - 1, at = -1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (g_heap_blocks[mid].addr <= va) {
+            at = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    for (; at >= 0; at--) {
+        if (!g_heap_blocks[at].size)
+            continue;
+        return (uint64_t)va < (uint64_t)g_heap_blocks[at].addr + g_heap_blocks[at].size ? at : -1;
+    }
+    return -1;
+}
+
 void xbox_PhysNoteRamName(uint32_t va)
 {
-    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
+    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE) {
+        int i;
         g_phys_ram_named[va / CONTIG_PAGE] = 1;
+        /* The block too: a page can hold the end of a window buffer and the
+         * start of a heap block the title named, and only the block says
+         * which bytes the name covers (xbox_PhysRamNamedAt). A byte store
+         * under the shared lock: nothing moves the table meanwhile. */
+        AcquireSRWLockShared(&g_heap_lock);
+        i = heap_block_at(va);
+        if (i >= 0 && !g_heap_blocks[i].free)
+            g_heap_blocks[i].named = 1;
+        ReleaseSRWLockShared(&g_heap_lock);
+    }
+}
+
+/* Whether physical byte `pa` is RAM the title named, at byte precision.
+ *
+ * The page map says a heap page was named; a page is 4 KB and is shared.
+ * Def Jam: Fight for NY's six-channel mix buffer is a window allocation
+ * whose last 344 bytes share their physical page with a heap block that
+ * starts after them and that the title named (MmGetPhysicalAddress), so the
+ * page map sent those bytes to RAM: the last 28 frames of every lap of the
+ * buffer played whatever RAM held there, a click 20 times a second in the
+ * opening scene. Here a named page only counts for the bytes inside a live
+ * block that was named. Bytes the heap table does not place in a block keep
+ * the page's answer, as before. */
+int xbox_PhysRamNamedAt(uint32_t pa)
+{
+    int i, named;
+    if (pa >= XBOX_CONTIG_SIZE || !g_phys_ram_named[pa / CONTIG_PAGE])
+        return 0;
+    AcquireSRWLockShared(&g_heap_lock);
+    i = heap_block_at(pa);
+    named = i < 0 || (!g_heap_blocks[i].free && g_heap_blocks[i].named);
+    ReleaseSRWLockShared(&g_heap_lock);
+    return named;
 }
 
 /* Heap block m is free (and merged with any free neighbours): its pages name
@@ -4469,7 +4529,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
             if (g_heap_blocks[i].addr & (alignment - 1)) {
                 continue;   /* wrong alignment for this request */
             }
-            g_heap_blocks[i].free = 0;
+            g_heap_blocks[i].free = 0; g_heap_blocks[i].named = 0;
             result = g_heap_blocks[i].addr;
             memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
             return result;
@@ -4523,7 +4583,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     if (g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
         g_heap_blocks[g_heap_block_count].addr = result;
         g_heap_blocks[g_heap_block_count].size = size;
-        g_heap_blocks[g_heap_block_count].free = 0;
+        g_heap_blocks[g_heap_block_count].free = 0; g_heap_blocks[g_heap_block_count].named = 0;
         g_heap_block_count++;
     }
 
@@ -4593,7 +4653,7 @@ void xbox_HeapFree(uint32_t xbox_va)
         if (g_heap_blocks[i].addr != xbox_va || g_heap_blocks[i].free) {
             continue;
         }
-        g_heap_blocks[i].free = 1;
+        g_heap_blocks[i].free = 1; g_heap_blocks[i].named = 0;
         if (++matched % 512 == 0) {
             fprintf(stderr, "  [HEAP] frees=%d matched=%d blocks=%d\n",
                     frees, matched, g_heap_block_count);

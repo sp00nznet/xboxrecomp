@@ -113,7 +113,7 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * from the window, effects played whatever the window held there (white
      * noise) and the stream played zeros. Only heap pages are recorded, so
      * the voice-array case below still holds for the image. */
-    if (xbox_PhysRamNameMap()[a >> 12])
+    if (xbox_PhysRamNamedAt(a))
         return g_apu_ram_ptr + a;
     /* A page the contiguous allocator handed out is the window, even where
      * it overlaps the image's physical range: an image whose BSS runs past
@@ -144,7 +144,7 @@ const char *mcpx_apu_phys_class(uint64_t addr)
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     if (a >= (64u << 20))
         return a < apu_mapped_ram() ? "ram" : "wrap";
-    if (xbox_PhysRamNameMap()[a >> 12])
+    if (xbox_PhysRamNamedAt(a))
         return "named";
     if (xbox_ContiguousPageMap()[a >> 12])
         return "win";

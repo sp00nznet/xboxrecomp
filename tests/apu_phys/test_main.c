@@ -9,8 +9,10 @@
  *
  * Checked: a window page nobody named from RAM stays the window (a title's
  * DirectSound voice array lives there); once MmGetPhysicalAddress names the
- * page from a heap address it is RAM, and a later window name of the same
- * number does not undo that (D3D names its window pages constantly); freeing
+ * page from a heap address it is RAM, for the bytes of the heap block that was
+ * named (another block's bytes on the same page stay the window), and a later
+ * window name of the same number does not undo that (D3D names its window
+ * pages constantly); freeing
  * the heap block gives the page back to the window, except a page the freed
  * block shares with a live neighbour, which goes back once that neighbour is
  * freed too. Only heap pages are recorded: an image or stack page is never
@@ -110,6 +112,13 @@ int main(int argc, char **argv)
     check(side(a + 0x10) == 0 && side(a + 0x2FF0) == 0,
           "a page named from the heap reads RAM");
     check(side(c + 0x1800) == 1, "a page nobody named still reads the window");
+    /* b's page is c's first page too. Only b was named, so c's bytes there
+     * are the window's: a window buffer's tail that shares its last page
+     * with a heap block the title named (Def Jam: Fight for NY's mix buffer)
+     * read RAM for that page and clicked once a lap. */
+    check((b & ~0xFFFu) == (c & ~0xFFFu), "b and c share a page (test layout)");
+    check(side(b + 0x10) == 0, "a named block's bytes on a shared page read RAM");
+    check(side(c + 0x10) == 1, "an unnamed block's bytes on that page read the window");
 
     xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)(XBOX_CONTIG_BASE + a));
     check(side(a + 0x10) == 0, "a window name of the same number keeps RAM");

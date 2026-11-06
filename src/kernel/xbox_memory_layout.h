@@ -218,6 +218,9 @@ void xbox_PhysNoteRamName(uint32_t va);
  * no live heap block covers the page any more. Read without a lock; a device
  * model's view. */
 const volatile uint8_t *xbox_PhysRamNameMap(void);
+/* Whether physical byte `pa` lies in a live heap block the title named:
+ * the page map refined to the block (see xbox_PhysRamNamedAt). */
+int xbox_PhysRamNamedAt(uint32_t pa);
 uint32_t xbox_ContiguousInUseBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
