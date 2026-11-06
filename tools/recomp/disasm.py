@@ -150,11 +150,48 @@ def _parse_operand(cs, cs_op, insn_obj):
 class Disassembler:
     """Capstone-based x86-32 disassembler."""
 
-    def __init__(self):
+    def __init__(self, cache_cfg_decodes=False):
         self._cs = Cs(CS_ARCH_X86, CS_MODE_32)
         self._cs.detail = True
         self._lite = Cs(CS_ARCH_X86, CS_MODE_32)
         _init_reg_names(self._cs)
+        # disassemble_cfg only: (address, the 15 bytes there) -> Instruction or
+        # None. An x86 instruction is at most 15 bytes and decodes the same
+        # whatever follows it, so the key fixes the result. Callers that keep
+        # one decoder for many CFGs over the same image (the sweep's callback
+        # probes) decode each instruction once. The instructions are shared:
+        # with the cache on, callers must not modify them.
+        self._cfg_cache = {} if cache_cfg_decodes else None
+
+    def _cfg_decode_at(self, raw_bytes, offset, address):
+        """One instruction at raw_bytes[offset], or None where Capstone
+        decodes none, through the cache."""
+        window = bytes(raw_bytes[offset:offset + 15])
+        key = (address, window)
+        cache = self._cfg_cache
+        if key in cache:
+            return cache[key]
+        insn = None
+        for cs_insn in self._cs.disasm(window, address, 1):
+            insn = self._decode_instruction(cs_insn)
+        cache[key] = insn
+        return insn
+
+    def _cfg_stream(self, raw_bytes, offset, size, entry):
+        """Instructions from `entry` up to the end of raw_bytes[:size], the way
+        Capstone's disasm walks them: it stops at the first undecodable byte."""
+        if self._cfg_cache is None:
+            for cs_insn in self._cs.disasm(raw_bytes[offset:size], entry):
+                yield self._decode_instruction(cs_insn)
+            return
+        address = entry
+        while offset < size:
+            insn = self._cfg_decode_at(raw_bytes, offset, address)
+            if insn is None or offset + insn.size > size:
+                return
+            yield insn
+            offset += insn.size
+            address += insn.size
 
     def _decode_instruction(self, cs_insn):
         """Convert one Capstone instruction into the translator model."""
@@ -285,12 +322,11 @@ class Disassembler:
             if not (start_va <= entry < end_va) or entry in decoded:
                 continue
             offset = entry - start_va
-            for cs_insn in self._cs.disasm(raw_bytes[offset:size], entry):
-                if cs_insn.address != entry and cs_insn.address in stop_addresses:
+            for insn in self._cfg_stream(raw_bytes, offset, size, entry):
+                if insn.address != entry and insn.address in stop_addresses:
                     break
-                if cs_insn.address >= end_va or cs_insn.address in decoded:
+                if insn.address >= end_va or insn.address in decoded:
                     break
-                insn = self._decode_instruction(cs_insn)
                 decoded[insn.address] = insn
 
                 if (insn.is_cond_jump and insn.jump_target is not None

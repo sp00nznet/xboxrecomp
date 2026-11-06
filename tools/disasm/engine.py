@@ -723,7 +723,12 @@ class DisasmEngine:
                         for kind in ("MODIFY", "SET", "RESET", "UNDEFINED"))}
                 if not pending or insn.mnemonic in ("call", "jmp", "ret", "retn"):
                     break
-        decoder = Disassembler()
+        # One decoder for every probe: the sweep probes tens of thousands of
+        # gaps, often the same bytes again, and each probe re-decodes its gap
+        # whenever a switch adds arms. The probe only reads the instructions.
+        decoder = self.__dict__.get("_probe_decoder")
+        if decoder is None:
+            decoder = self._probe_decoder = Disassembler(cache_cfg_decodes=True)
         entries = {addr}
         tables = {}
         indirect_tails = set()
