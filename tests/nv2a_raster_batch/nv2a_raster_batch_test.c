@@ -23,6 +23,13 @@
 #include <string.h>
 #include "nv2a_backend.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
+#endif
+
 #define W 256
 #define H 256
 #define COLOR_AT 0x10000u
@@ -53,6 +60,8 @@ uint32_t xbox_Nv2aFrameCountersOwned(void) { return 0; }
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset) { (void)offset; return NULL; }
 
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern int nv2a_raster_pool_size(void);
+extern int nv2a_raster_last_workers(void);
 static void m(uint32_t method, uint32_t param) { nv2a_pb_exec_method(0, method, param); }
 static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 static void mf(uint32_t method, float f) { m(method, f2u(f)); }
@@ -96,17 +105,135 @@ static void put_vertex(uint32_t n, float x, float y, uint32_t c)
     memcpy(s_mem + DIFF_AT + 4u * n, &c, 4);
 }
 
+/* A deadline, so a pool that never finishes a batch says so.
+ *
+ * The failure this guards is a deadlock, not a wrong answer: a worker that
+ * waits without re-checking the generation counter misses the broadcast, the
+ * pending count never reaches zero, and the dispatching thread waits on the
+ * join forever. Left to itself the test would hang and report nothing, and the
+ * run would only fail by whatever timeout ctest applies. Name the stage it
+ * died in instead.
+ *
+ * Generous on purpose -- the whole test is milliseconds, so seconds of slack
+ * cost nothing and a loaded machine will not trip it. */
+#define WATCHDOG_SECS 30
+static const char *volatile s_stage = "starting up";
+static volatile int s_finished;
+
+static void watchdog_fail(void)
+{
+    fprintf(stderr, "\nFAIL -- timed out after %d s during: %s\n",
+            WATCHDOG_SECS, s_stage);
+    fprintf(stderr, "        the raster pool never finished a batch; a worker "
+                    "that misses the\n        broadcast leaves pending above "
+                    "zero and the join never returns\n");
+    fflush(stderr);
+    _exit(1);
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI watchdog(LPVOID arg)
+{
+    int i;
+    (void)arg;
+    for (i = 0; i < WATCHDOG_SECS * 10 && !s_finished; i++)
+        Sleep(100);
+    if (!s_finished) watchdog_fail();
+    return 0;
+}
+#else
+static void *watchdog(void *arg)
+{
+    int i;
+    (void)arg;
+    for (i = 0; i < WATCHDOG_SECS * 10 && !s_finished; i++)
+        usleep(100000);
+    if (!s_finished) watchdog_fail();
+    return NULL;
+}
+#endif
+
+static void watchdog_start(void)
+{
+#if defined(_WIN32)
+    CloseHandle(CreateThread(NULL, 0, watchdog, NULL, 0, NULL));
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, watchdog, NULL) == 0)
+        pthread_detach(t);
+#endif
+}
+
+/* The surface, back to "nothing drawn". */
+static void clear_surface(void)
+{
+    memset(s_mem + COLOR_AT, 0, (size_t)W * H * 4);
+}
+
+/* Vertices for quads [from, to), two same-wound triangles each, starting at
+ * vertex `from * 6` so a batch can draw any run of them. */
+static void emit_quads(int from, int to)
+{
+    uint32_t v = (uint32_t)from * 6u;
+    int i;
+    for (i = from; i < to; i++) {
+        put_vertex(v++, (float)qx0[i], (float)qy0[i], qc[i]);
+        put_vertex(v++, (float)qx1[i], (float)qy0[i], qc[i]);
+        put_vertex(v++, (float)qx1[i], (float)qy1[i], qc[i]);
+        put_vertex(v++, (float)qx0[i], (float)qy0[i], qc[i]);
+        put_vertex(v++, (float)qx1[i], (float)qy1[i], qc[i]);
+        put_vertex(v++, (float)qx0[i], (float)qy1[i], qc[i]);
+    }
+}
+
+/* One batch: BEGIN, DRAW_ARRAYS of at most 240 vertices, END. */
+static void draw_quads(int from, int to)
+{
+    uint32_t v0 = (uint32_t)from * 6u, nv = (uint32_t)(to - from) * 6u, start;
+    m(0x17FC, 5);                            /* BEGIN_END: triangles */
+    for (start = 0; start < nv; start += 240)
+        m(0x1810, ((nv - start > 240 ? 240 : nv - start) - 1) << 24
+                  | (v0 + start));
+    m(0x17FC, 0);
+}
+
+/* Every pixel is the colour of the last quad of [0, nq) drawn over it, and
+ * nothing is written outside them. Returns wrong pixels; *drawn is coverage. */
+static int verify(int nq, int *drawn)
+{
+    int x, y, i, bad = 0;
+    *drawn = 0;
+    for (y = 0; y < H; y++) {
+        for (x = 0; x < W; x++) {
+            uint32_t want = 0, got;
+            memcpy(&got, s_mem + COLOR_AT + 4u * (uint32_t)(y * W + x), 4);
+            for (i = 0; i < nq; i++)
+                if (x >= qx0[i] && x < qx1[i] && y >= qy0[i] && y < qy1[i])
+                    want = qc[i];
+            if (want)
+                (*drawn)++;
+            if (want ? !close_rgb(got, want) : (got & 0xFFFFFFu) != 0) {
+                if (bad++ < 8)
+                    printf("  pixel %d,%d: got %08X want %08X\n", x, y, got, want);
+            }
+        }
+    }
+    return bad;
+}
+
 int main(void)
 {
     static const float I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
     uint32_t n = 0, start;
-    int i, x, y, bad = 0, drawn = 0;
+    int i, x, y, bad = 0, drawn = 0, pool = 0, workers = 0;
 
 #ifdef _WIN32
     _putenv("RECOMP_RASTER_THREADS=4");
 #else
     setenv("RECOMP_RASTER_THREADS", "4", 1);
 #endif
+
+    watchdog_start();
 
     m(0x0208, 0x0008);                       /* SET_SURFACE_FORMAT: A8R8G8B8, no AA */
     m(0x0200, (uint32_t)W << 16);            /* CLIP_HORIZONTAL */
@@ -124,42 +251,92 @@ int main(void)
         qx0[i] = (int)(lcg() % (W - w)); qy0[i] = (int)(lcg() % (H - h));
         qx1[i] = qx0[i] + w; qy1[i] = qy0[i] + h;
         qc[i] = colour(i);
-        put_vertex(n++, (float)qx0[i], (float)qy0[i], qc[i]);
-        put_vertex(n++, (float)qx1[i], (float)qy0[i], qc[i]);
-        put_vertex(n++, (float)qx1[i], (float)qy1[i], qc[i]);
-        put_vertex(n++, (float)qx0[i], (float)qy0[i], qc[i]);
-        put_vertex(n++, (float)qx1[i], (float)qy1[i], qc[i]);
-        put_vertex(n++, (float)qx0[i], (float)qy1[i], qc[i]);
     }
+    emit_quads(0, QUADS);
     m(0x1720, POS_AT);  m(0x1760, 2 | (3 << 4) | (12 << 8));       /* attr 0: float3 */
     m(0x172C, DIFF_AT); m(0x176C, 0 | (4 << 4) | (4 << 8));        /* attr 3: D3DCOLOR */
 
-    /* One batch: BEGIN, several DRAW_ARRAYS of at most 256 vertices, END. */
-    m(0x17FC, 5);                            /* BEGIN_END: triangles */
-    for (start = 0; start < n; start += 240)
-        m(0x1810, ((n - start > 240 ? 240 : n - start) - 1) << 24 | start);
-    m(0x17FC, 0);
+    /* ── one batch ──────────────────────────────────────────────────── */
+    s_stage = "the first batch";
+    clear_surface();
+    draw_quads(0, QUADS);
+    pool = nv2a_raster_pool_size();
+    workers = nv2a_raster_last_workers();
+    bad = verify(QUADS, &drawn);
 
-    for (y = 0; y < H; y++) {
-        for (x = 0; x < W; x++) {
-            uint32_t want = 0, got;
-            memcpy(&got, s_mem + COLOR_AT + 4u * (uint32_t)(y * W + x), 4);
-            for (i = 0; i < QUADS; i++)
-                if (x >= qx0[i] && x < qx1[i] && y >= qy0[i] && y < qy1[i])
-                    want = qc[i];
-            if (want)
-                drawn++;
-            if (want ? !close_rgb(got, want) : (got & 0xFFFFFFu) != 0) {
-                if (bad++ < 8)
-                    printf("  pixel %d,%d: got %08X want %08X\n", x, y, got, want);
-            }
-        }
-    }
     printf("%d of %d covered pixels checked, %d wrong\n", drawn, W * H, bad);
+
+    printf("pool of %d, %d worker(s) drew this batch\n", pool, workers);
+
+    if (pool != 4) {
+        printf("FAIL -- asked for 4 raster threads, got a pool of %d\n", pool);
+        return 1;
+    }
+    if (pool > 1 && workers < 2) {
+        printf("FAIL -- a pool of %d but the batch drew on one worker: the "
+               "row ordering was never at risk\n", pool);
+        return 1;
+    }
+
     if (bad || drawn < 8192) {
         printf("FAIL\n");
         return 1;
     }
+
+    /* ── the pool, used again ───────────────────────────────────────────
+     *
+     * Workers wait on a generation counter rather than a plain signal,
+     * because a batch that starts and finishes before a worker reaches its
+     * wait would lose one and hang the join. That only ever matters on a
+     * later batch, so one batch proves none of it. The same quads in the same
+     * order over three batches must draw the same picture, and the pool must
+     * still be splitting rows by the last of them. */
+    s_stage = "three batches over the same pool";
+    clear_surface();
+    draw_quads(0, QUADS / 3);
+    draw_quads(QUADS / 3, 2 * QUADS / 3);
+    draw_quads(2 * QUADS / 3, QUADS);
+    workers = nv2a_raster_last_workers();
+    bad = verify(QUADS, &drawn);
+    printf("three batches: %d covered pixels, %d wrong, %d worker(s) on the "
+           "last\n", drawn, bad, workers);
+    if (bad) {
+        printf("FAIL -- the pool draws a different picture when reused\n");
+        return 1;
+    }
+    if (pool > 1 && workers < 2) {
+        printf("FAIL -- the pool stopped splitting rows after the first "
+               "batch\n");
+        return 1;
+    }
+
+    /* ── below the threshold ────────────────────────────────────────────
+     *
+     * Waking workers costs more than it saves for a small batch, so under
+     * NV_RASTER_MT_MIN_PIXELS the caller draws every row itself. A real frame
+     * is mostly these -- thousands of small triangles -- and that path had no
+     * cover at all: it has to be both serial and right. */
+    qx0[0] =  8; qy0[0] =  8; qx1[0] =  48; qy1[0] =  48; qc[0] = colour(3);
+    qx0[1] = 32; qy0[1] = 32; qx1[1] =  72; qy1[1] =  72; qc[1] = colour(9);
+    s_stage = "a batch below the multithreading threshold";
+    emit_quads(0, 2);
+    clear_surface();
+    draw_quads(0, 2);                        /* 2 x 40x40 = 3200 px < 8192 */
+    workers = nv2a_raster_last_workers();
+    bad = verify(2, &drawn);
+    printf("small batch: %d covered pixels, %d wrong, %d worker(s)\n",
+           drawn, bad, workers);
+    if (bad) {
+        printf("FAIL -- a batch below the threshold draws wrong\n");
+        return 1;
+    }
+    if (workers != 1) {
+        printf("FAIL -- a batch of %d pixels woke %d workers; under "
+               "NV_RASTER_MT_MIN_PIXELS the caller draws it\n", drawn, workers);
+        return 1;
+    }
+
+    s_finished = 1;
     printf("PASS\n");
     return 0;
 }

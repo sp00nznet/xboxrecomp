@@ -34,6 +34,10 @@
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 #include "nv2a_flip_hold.h"
 #include "platform/host_time.h"   /* xbox_HostNowNs */
+#if !defined(_WIN32)
+#include <pthread.h>              /* the raster worker pool */
+#include <unistd.h>               /* sysconf(_SC_NPROCESSORS_ONLN) */
+#endif
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
@@ -2754,16 +2758,6 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
 #define NV_RASTER_MAX_THREADS 16
 #define NV_RASTER_MT_MIN_PIXELS 8192
 
-#if defined(_WIN32)
-static struct {
-    int n;                                  /* threads incl. the caller */
-    HANDLE start[NV_RASTER_MAX_THREADS], done;
-    volatile LONG pending;
-    const XfTri *tris;
-    int ntris;
-    XfCount cnt[NV_RASTER_MAX_THREADS];
-} s_pool;
-
 /* Worker k owns the rows y with y % n == k, for every triangle of the run,
  * in submission order. Each pixel therefore sees its triangles in the order
  * the title drew them, whichever thread draws it. */
@@ -2776,6 +2770,22 @@ static void xf_rows_owned(const XfTri *tris, int ntris, int k, int n,
         xf_rows(&tris[i], y0, n, cnt);
     }
 }
+
+/* Workers that actually drew in the most recent batch, and the configured
+ * pool size. Diagnostics, and the only way a test can tell a pool that ran
+ * from a pool that was merely created -- tests/nv2a_raster_posix_pool. */
+static int s_raster_last_workers = 1;
+int nv2a_raster_last_workers(void) { return s_raster_last_workers; }
+
+#if defined(_WIN32)
+static struct {
+    int n;                                  /* threads incl. the caller */
+    HANDLE start[NV_RASTER_MAX_THREADS], done;
+    volatile LONG pending;
+    const XfTri *tris;
+    int ntris;
+    XfCount cnt[NV_RASTER_MAX_THREADS];
+} s_pool;
 
 static DWORD WINAPI raster_worker(LPVOID arg)
 {
@@ -2838,22 +2848,137 @@ static void xf_rows_parallel(const XfTri *T, int ntris, long px,
         total->pixels += mine.pixels;
         total->zpass += mine.zpass;
     }
-    for (k = 0; k < n - 1; k++) {
-        total->depth_fail += s_pool.cnt[k].depth_fail;
-        total->pixels += s_pool.cnt[k].pixels;
-        total->zpass += s_pool.cnt[k].zpass;
+    {
+        int ran = 1;                          /* the caller always draws */
+        for (k = 0; k < n - 1; k++) {
+            if (s_pool.cnt[k].pixels) ran++;
+            total->depth_fail += s_pool.cnt[k].depth_fail;
+            total->pixels += s_pool.cnt[k].pixels;
+            total->zpass += s_pool.cnt[k].zpass;
+        }
+        s_raster_last_workers = ran;
     }
 }
 #else
+/* The same pool on pthreads. One mutex and two conditions rather than a
+ * per-worker event: a generation counter, bumped under the lock, is what a
+ * worker waits on, so a batch that starts and finishes before a worker reaches
+ * its wait is still seen -- a plain signal there would be lost and the batch
+ * would hang on the join. */
+static struct {
+    int n;                                  /* threads incl. the caller */
+    pthread_mutex_t lock;
+    pthread_cond_t start, done;
+    unsigned long generation;
+    int pending;
+    const XfTri *tris;
+    int ntris;
+    XfCount cnt[NV_RASTER_MAX_THREADS];
+} s_pool;
+
+static void *raster_worker(void *arg)
+{
+    int k = (int)(intptr_t)arg;
+    unsigned long seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&s_pool.lock);
+        while (s_pool.generation == seen)
+            pthread_cond_wait(&s_pool.start, &s_pool.lock);
+        seen = s_pool.generation;
+        pthread_mutex_unlock(&s_pool.lock);
+
+        memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
+        xf_rows_owned(s_pool.tris, s_pool.ntris, k, s_pool.n, &s_pool.cnt[k]);
+
+        pthread_mutex_lock(&s_pool.lock);
+        if (--s_pool.pending == 0)
+            pthread_cond_signal(&s_pool.done);
+        pthread_mutex_unlock(&s_pool.lock);
+    }
+    return NULL;
+}
+
+static int raster_pool_size(void)
+{
+    static int init;
+    if (!init) {
+        const char *e = getenv("RECOMP_RASTER_THREADS");
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        int n, k;
+        init = 1;
+        /* Same policy as the Windows branch: leave a few cores for the title
+         * and the host unless the variable says otherwise. */
+        n = e ? atoi(e) : (int)(cpus > 0 ? cpus : 1) - 4;
+        if (n < 1) n = 1;
+        if (n > NV_RASTER_MAX_THREADS) n = NV_RASTER_MAX_THREADS;
+        s_pool.n = n;
+        if (n > 1) {
+            pthread_mutex_init(&s_pool.lock, NULL);
+            pthread_cond_init(&s_pool.start, NULL);
+            pthread_cond_init(&s_pool.done, NULL);
+            for (k = 0; k < n - 1; k++) {
+                pthread_t t;
+                if (pthread_create(&t, NULL, raster_worker,
+                                   (void *)(intptr_t)k) != 0) {
+                    /* Short pool rather than no drawing: the rows this worker
+                     * would have owned must still be drawn by someone, so fall
+                     * back to the size that did start. */
+                    s_pool.n = k + 1;
+                    break;
+                }
+                pthread_detach(t);
+            }
+        }
+    }
+    return s_pool.n;
+}
+
 static void xf_rows_parallel(const XfTri *T, int ntris, long px,
                              XfCount *total)
 {
-    int k;
-    (void)px;
-    for (k = 0; k < ntris; k++)
-        xf_rows(&T[k], T[k].miny, 1, total);
+    int n = raster_pool_size(), k;
+
+    if (n <= 1 || px < NV_RASTER_MT_MIN_PIXELS) {
+        s_raster_last_workers = 1;
+        for (k = 0; k < ntris; k++)
+            xf_rows(&T[k], T[k].miny, 1, total);
+        return;
+    }
+
+    pthread_mutex_lock(&s_pool.lock);
+    s_pool.tris = T;
+    s_pool.ntris = ntris;
+    s_pool.pending = n - 1;
+    s_pool.generation++;
+    pthread_cond_broadcast(&s_pool.start);
+    pthread_mutex_unlock(&s_pool.lock);
+
+    {
+        XfCount mine = {0, 0, 0};
+        xf_rows_owned(T, ntris, n - 1, n, &mine);   /* the caller's share */
+        pthread_mutex_lock(&s_pool.lock);
+        while (s_pool.pending != 0)
+            pthread_cond_wait(&s_pool.done, &s_pool.lock);
+        pthread_mutex_unlock(&s_pool.lock);
+        total->depth_fail += mine.depth_fail;
+        total->pixels += mine.pixels;
+        total->zpass += mine.zpass;
+    }
+
+    {
+        int ran = 1;                          /* the caller always draws */
+        for (k = 0; k < n - 1; k++) {
+            if (s_pool.cnt[k].pixels) ran++;
+            total->depth_fail += s_pool.cnt[k].depth_fail;
+            total->pixels += s_pool.cnt[k].pixels;
+            total->zpass += s_pool.cnt[k].zpass;
+        }
+        s_raster_last_workers = ran;
+    }
 }
 #endif
+
+int nv2a_raster_pool_size(void) { return raster_pool_size(); }
 
 /* Triangles waiting for the end of their batch.
  *
