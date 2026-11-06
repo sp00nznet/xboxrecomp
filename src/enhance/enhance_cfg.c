@@ -48,6 +48,20 @@ static int s_builtin_bound;
 static recomp_cfg *s_file[ENHANCE_FILES];
 /* Per file entry: bit 0 read by a lookup, bit 1 type warning printed. */
 static unsigned char *s_flags[ENHANCE_FILES];
+/* The path each slot is read from, set even when the file is absent, so a
+ * writer's first Save can bring the new file in (enhance_cfg_patch). */
+static char s_path[ENHANCE_FILES][CFG_PATH_MAX];
+/* Copies a refresh replaced, with their flags. A caller may hold a string
+ * or a file pointer from a lookup (the header lets it keep the values), and
+ * a stray reader during a swap then marks the old flags, never freed
+ * memory; so both live until enhance_cfg_shutdown, one pair per Save, a
+ * few KB each. */
+typedef struct {
+    recomp_cfg *cfg;
+    unsigned char *flags;
+} Retired;
+static Retired *s_retired;
+static size_t s_n_retired, s_cap_retired;
 /* The file a writer (the menu's Save) targets; empty under none. */
 static char s_user_path[CFG_PATH_MAX];
 static char s_user_dir[CFG_PATH_MAX];   /* enhance_cfg_user_dir */
@@ -149,12 +163,21 @@ static void env_bad(Bind *b, const char *v, const char *want)
 void enhance_cfg_shutdown(void)
 {
     int i;
+    size_t r;
     for (i = 0; i < ENHANCE_FILES; i++) {
         recomp_cfg_free(s_file[i]);
         s_file[i] = NULL;
         free(s_flags[i]);
         s_flags[i] = NULL;
+        s_path[i][0] = 0;
     }
+    for (r = 0; r < s_n_retired; r++) {
+        recomp_cfg_free(s_retired[r].cfg);
+        free(s_retired[r].flags);
+    }
+    free(s_retired);
+    s_retired = NULL;
+    s_n_retired = s_cap_retired = 0;
     s_user_path[0] = 0;
     s_user_dir[0] = 0;
 }
@@ -173,6 +196,7 @@ static int load_slot(int i, const char *path, int optional)
 {
     char err[512];
     recomp_cfg *c;
+    snprintf(s_path[i], sizeof s_path[i], "%s", path);
     if (optional && !file_exists(path))
         return 0;
     c = recomp_cfg_load_file(path, err, sizeof err);
@@ -388,6 +412,83 @@ env_lines:
                     recomp_env_name(s_binds[i].id));
     }
     return bad ? -1 : loaded;
+}
+
+static int grow_retired(void)
+{
+    size_t cap = s_cap_retired ? s_cap_retired * 2 : 8;
+    Retired *r = (Retired *)realloc(s_retired, cap * sizeof *r);
+    if (!r)
+        return 0;
+    s_retired = r;
+    s_cap_retired = cap;
+    return 1;
+}
+
+/* Read slot `i` again from its file after a write, keeping what the old
+ * copy recorded per key (read, type warning printed): a key the run read
+ * stays read, so the unused-key report does not turn on it. A file that no
+ * longer parses keeps the old copy (the write itself parsed the text, so
+ * only a hand edit in between gets here). 1 when the copy was replaced. */
+static int refresh_slot(int i)
+{
+    char err[512];
+    recomp_cfg *c, *old = s_file[i];
+    unsigned char *fl;
+    size_t k;
+    if (!file_exists(s_path[i]))
+        return 0;
+    c = recomp_cfg_load_file(s_path[i], err, sizeof err);
+    if (!c) {
+        fprintf(stderr, "[ENHANCE] config error: %s (kept as loaded)\n", err);
+        return 0;
+    }
+    fl = (unsigned char *)calloc(recomp_cfg_count(c) + 1, 1);
+    if (!fl || (old && s_n_retired == s_cap_retired && !grow_retired())) {
+        fprintf(stderr, "[ENHANCE] config: out of memory re-reading %s (kept as loaded)\n",
+                s_path[i]);
+        free(fl);
+        recomp_cfg_free(c);
+        return 0;
+    }
+    for (k = 0; old && s_flags[i] && k < recomp_cfg_count(old); k++) {
+        long j = recomp_cfg_find(c, recomp_cfg_key_at(old, k));
+        if (j >= 0)
+            fl[j] = s_flags[i][k];
+    }
+    if (old) {
+        s_retired[s_n_retired].cfg = old;
+        s_retired[s_n_retired].flags = s_flags[i];
+        s_n_retired++;
+    } else {
+        free(s_flags[i]);
+    }
+    s_file[i] = c;
+    s_flags[i] = fl;
+    return 1;
+}
+
+int enhance_cfg_patch(const char *path, const char *const *keys,
+                      const char *const *values, size_t n, char *err, size_t errlen)
+{
+    int rc = recomp_cfg_patch(path, keys, values, n, err, errlen), i;
+    size_t k;
+    if (rc < 0 || !path || !n)
+        return rc;
+    /* The defaults ship read-only and are never a writer's target. */
+    for (i = 0; i < SLOT_DEFAULTS; i++) {
+        if (!s_path[i][0] || strcmp(s_path[i], path) || !refresh_slot(i))
+            continue;
+        /* A key the writer just set is in use, though the old copy never
+         * held it: a first Save of a mod's key (config.toml starts as a
+         * header) must not list it under the Mods page's unknown keys. */
+        for (k = 0; k < n; k++) {
+            long j = values[k] ? recomp_cfg_find(s_file[i], keys[k]) : -1;
+            if (j >= 0)
+                s_flags[i][j] |= 1;
+        }
+    }
+    return rc;
 }
 
 const char *enhance_cfg_user_path(void)

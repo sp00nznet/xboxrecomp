@@ -814,7 +814,7 @@ int shader_edit_delete(char *msg, size_t n)
                 continue;
             }
             names = 1;
-            if (l < 2 && path && recomp_cfg_patch(path, keys, vals, 1, err, sizeof err) >= 0)
+            if (l < 2 && path && enhance_cfg_patch(path, keys, vals, 1, err, sizeof err) >= 0)
                 continue;
             if (l < 2)
                 fprintf(stderr, LOGP "menu: removing present.profile from %s failed: %s\n",

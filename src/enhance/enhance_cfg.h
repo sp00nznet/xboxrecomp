@@ -32,7 +32,9 @@
  *
  * Call enhance_cfg_init once at startup, then read the keys during module
  * init (one thread) and keep the values: a lookup records that the key was
- * read, for enhance_cfg_report_unused.
+ * read, for enhance_cfg_report_unused. After start, lookups and writes
+ * (enhance_cfg_patch, which swaps a file's copy) run on one thread at a
+ * time: the in-game menu's, under nv2a_overlay_menu_trylock.
  */
 #ifndef ENHANCE_CFG_H
 #define ENHANCE_CFG_H
@@ -137,6 +139,21 @@ const recomp_cfg *enhance_cfg_file(int i);
  * this does not mark keys read. */
 const char *enhance_cfg_user_path(void);
 const recomp_cfg *enhance_cfg_defaults(void);
+
+/* recomp_cfg_patch on `path` (same arguments and result), then, when `path`
+ * is a user file the layers read (the title file, config.toml or the
+ * RECOMP_CONFIG file), its loaded copy is read again, so every later lookup
+ * and a live reload (enhance_input_reload) see what was saved; one written
+ * for the first time joins the layers. The match is the exact string the
+ * layers loaded: pass enhance_cfg_user_path() or recomp_cfg_name() of an
+ * enhance_cfg_file(). The environment still answers before the files: a
+ * key RECOMP_* forces keeps the forced value after a Save. A key the run
+ * read stays read, and so does each key written with a value. Pointers
+ * earlier lookups returned stay valid (to the old values) until
+ * enhance_cfg_shutdown. Every writer of a user file goes through this,
+ * never recomp_cfg_patch alone. */
+int enhance_cfg_patch(const char *path, const char *const *keys,
+                      const char *const *values, size_t n, char *err, size_t errlen);
 
 /* The per-game user folder, <root>/config, whatever file the layers read
  * (a per-title file lives elsewhere; shader profiles do not follow it), or

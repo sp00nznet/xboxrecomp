@@ -2869,6 +2869,10 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/enhance_cfg.c | - | s_n_code_defs | file_static | keep | - | code default count |
 | src/enhance/enhance_cfg.c | - | s_file | file_static | keep | - | parsed config files (defaults, user) |
 | src/enhance/enhance_cfg.c | - | s_flags | file_static | keep | - | per-entry read/warned bits for typo report |
+| src/enhance/enhance_cfg.c | - | s_path | file_static | keep | - | each slot's file path, for the refresh after a write (enhance_cfg_patch) |
+| src/enhance/enhance_cfg.c | - | s_retired | file_static | keep | - | copies a refresh replaced, freed at enhance_cfg_shutdown |
+| src/enhance/enhance_cfg.c | - | s_n_retired | file_static | keep | - | retired copy count |
+| src/enhance/enhance_cfg.c | - | s_cap_retired | file_static | keep | - | retired list capacity |
 | src/enhance/enhance_cfg.c | - | s_user_path | file_static | keep | - | user config path the menu Save writes |
 | src/enhance/enhance_cfg.c | - | s_user_dir | file_static | keep | - | user config directory |
 | src/enhance/enhance_cfg.c | - | s_owner | file_static | keep | - | mod ids for naming stray key owners |

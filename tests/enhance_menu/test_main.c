@@ -1081,11 +1081,9 @@ static void test_sticks(void)
     CHECK(strstr(f, "pad_square_right") == NULL);
     open_menu();
 
-    /* The input layer reads its knobs from the files as loaded, which Save
-     * leaves alone: a reload over the re-read file keeps the stick, and so
-     * does the next start. */
+    /* Save updates the loaded copy the input layer reads its knobs from:
+     * a reload keeps the stick, and so does the next start. */
     capture_begin();
-    enhance_cfg_init(".", NULL);
     enhance_input_reload();
     capture_end();
     xbox_InputPadSetup(&ps);
@@ -1105,6 +1103,64 @@ static void test_sticks(void)
     xbox_InputPadSetup(&ps);
     CHECK(xbox_PadSetupIsIdentity(&ps));
     open_menu();
+}
+
+/* ---- 6c. a reload after Save ---------------------------------------------- */
+
+/* enhance_input_reload reads the loaded copy of the files, not the disk:
+ * Save keeps that copy in step, so a reload brings back the saved values,
+ * not the ones from the start, while a key the environment forces still
+ * reads the forced value over the file's. */
+static void test_save_then_reload(void)
+{
+    xbox_pad_setup ps;
+    xbox_mouse_opts mo;
+    const char *f;
+
+    set_env("RECOMP_INPUT_PAD_SQUARE_RIGHT", "false");
+    start_with(ARMED "[input]\npad_square_right = true\n", NULL);
+    xbox_InputPadSetup(&ps);
+    CHECK(!ps.square_left && !ps.square_right);
+    open_menu();
+    CHECK(enhance_menu_set_page("Controls"));
+    CHECK(!strcmp(row_value("Square right stick"), "false"));
+    CHECK(enhance_menu_select_row("Square left stick"));
+    tap(0x27);
+    CHECK(enhance_menu_select_row("Capture"));
+    tap(0x27);
+    tap(0x27);
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "pad_square_left = true") != NULL);
+    CHECK(strstr(f, "mouse_capture = \"click\"") != NULL);
+    CHECK(strstr(f, "pad_square_right = true") != NULL);
+    open_menu();
+
+    /* No re-read of the file: the saved values come from the copy. */
+    capture_begin();
+    enhance_input_reload();
+    capture_end();
+    xbox_InputPadSetup(&ps);
+    CHECK(ps.square_left);
+    CHECK(!ps.square_right);    /* the environment over the file */
+    xbox_InputMouseGetOpts(&mo);
+    CHECK(mo.capture == XBOX_MOUSE_CAPTURE_CLICK);
+    CHECK(enhance_cfg_bool("input.pad_square_left", 0) == 1);
+    CHECK(enhance_cfg_source_of("input.pad_square_left") == ENHANCE_SRC_FILE);
+    CHECK(enhance_cfg_bool("input.pad_square_right", 1) == 0);
+    CHECK(enhance_cfg_source_of("input.pad_square_right") == ENHANCE_SRC_ENV);
+
+    /* The environment gone, the file's value decides at the next reload. */
+    set_env("RECOMP_INPUT_PAD_SQUARE_RIGHT", NULL);
+    capture_begin();
+    enhance_input_reload();
+    capture_end();
+    xbox_InputPadSetup(&ps);
+    CHECK(ps.square_left && ps.square_right);
+
+    /* Back to stock for the tests after. */
+    remove("config/config.toml");
+    start_with(ARMED, NULL);
 }
 
 /* ---- 7. the miss snapshot ------------------------------------------------- */
@@ -5732,6 +5788,7 @@ int main(int argc, char **argv)
     test_controls_groups();
     test_mouse();
     test_sticks();
+    test_save_then_reload();
     test_link_row();
     test_snapshot();
     test_shaders();

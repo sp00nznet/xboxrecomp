@@ -1522,8 +1522,12 @@ The pages are Render, Shaders, Pack, Game (a title's own items, from
   comment line right above a removed key stays (it may be the table's).
   The file is flushed to the disk before it replaces the old one, and a
   `config.toml` that is a symlink is written at its target. The log says
-  `[ENHANCE] menu: saved 2 keys to ./config/config.toml`. Under
-  `RECOMP_CONFIG=none` Save is off. "Reset to defaults" asks once, then
+  `[ENHANCE] menu: saved 2 keys to ./config/config.toml`. The run's
+  loaded copy of the file follows the Save: later lookups in the run, and
+  a reload (`enhance_input_reload`), read the saved values, not the ones
+  from the start; a key an environment variable forces keeps the forced
+  value.
+  Under `RECOMP_CONFIG=none` Save is off. "Reset to defaults" asks once, then
   puts every item and binding back to its default; Save keeps that. A
   mod setting or action read from a retired key in the player's file is
   moved to its current key by the first Save, even one with no change.
@@ -1753,7 +1757,10 @@ enhance_cfg_report_unused();                     /* after the modules' init */
 
 A settings writer (the in-game menu) writes only the keys whose value
 differs from `enhance_cfg_defaults()` to `enhance_cfg_user_path()`, so the
-player's file stays a list of changes. `enhance_cfg_source_of(key)` says
+player's file stays a list of changes. Every writer of a user file uses
+`enhance_cfg_patch` (never `recomp_cfg_patch` alone): it writes the file
+and updates the run's loaded copy of it, so later lookups see the new
+values. `enhance_cfg_source_of(key)` says
 `ENHANCE_SRC_DEFAULTS` for a value from the defaults file.
 
 `xbox_enhance_init` does not report unused keys itself: the title calls

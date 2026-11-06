@@ -1286,6 +1286,7 @@ static void test_live_rebuild(void)
     /* A rebuild that moves a held binding's bit: the old bit does not stay
      * down, and the held input reads as up until let go and pressed. */
     {
+        char txt[4][ENHANCE_ACTION_TEXT];
         int id;
         start(ARMED "[input.actions]\nmenu.open = [\"F8\", \"paddle1\"]\n");
         id = enhance_action_find("menu.open");
@@ -1293,8 +1294,16 @@ static void test_live_rebuild(void)
         poll0();
         CHECK(enhance_action_down(id));
         CHECK(menu_fires() == 1);
-        write_file("config/config.toml", ARMED "[input.actions]\nmenu.open = [\"paddle1\"]\n");
+        CHECK(enhance_action_bindings(id, txt, 4) == 2);
+        /* Through the writer, as the menu's Save goes, so the reload reads
+         * the new list from the loaded copy. */
+        {
+            const char *k = "input.actions.menu.open", *v = "[\"paddle1\"]";
+            char err[256];
+            CHECK(enhance_cfg_patch(enhance_cfg_user_path(), &k, &v, 1, err, sizeof err) == 0);
+        }
         enhance_input_reload();
+        CHECK(enhance_action_bindings(id, txt, 4) == 1 && !strcmp(txt[0], "paddle1"));
         CHECK(!enhance_action_down(id));
         poll0();
         CHECK(!enhance_action_down(id));

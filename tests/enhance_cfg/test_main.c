@@ -2085,6 +2085,95 @@ static void test_input_pad(void)
     (void)id;
 }
 
+/* enhance_cfg_patch: a write to a user file also updates its
+ * loaded copy, so later lookups read the saved value; the environment
+ * still answers first, a read key stays read, a pointer from before stays
+ * valid, and a file written for the first time joins the layers. */
+static void test_patch(void)
+{
+    const char *keys[2], *vals[2], *old_filter, *out;
+    char err[256];
+
+    config_reset_env();
+    remove_defaults();
+    MKDIR("ecfg_pat");
+    MKDIR("ecfg_pat/config");
+    remove("ecfg_pat/config/config.toml");
+    write_file("ecfg_pat/config/config.toml",
+               "[render]\nscale = 2\n[present]\nfilter = \"linear\"\n");
+    recomp_env_set(RENV_RENDER_SCALE, "3");
+    CHECK(enhance_cfg_init("ecfg_pat", NULL) == 1);
+    CHECK(enhance_cfg_int("render.scale", 1) == 3);
+    old_filter = enhance_cfg_string("present.filter", "x");
+    CHECK(!strcmp(old_filter, "linear"));
+
+    /* Both keys written; render.scale stays the environment's. */
+    keys[0] = "render.scale";   vals[0] = "4";
+    keys[1] = "present.filter"; vals[1] = "\"nearest\"";
+    CHECK(enhance_cfg_patch(enhance_cfg_user_path(), keys, vals, 2, err, sizeof err) == 0);
+    CHECK(enhance_cfg_int("render.scale", 1) == 3);
+    CHECK(enhance_cfg_source_of("render.scale") == ENHANCE_SRC_ENV);
+    CHECK(!strcmp(enhance_cfg_string("present.filter", "x"), "nearest"));
+    CHECK(!strcmp(old_filter, "linear"));      /* the old copy is kept */
+    recomp_env_set(RENV_RENDER_SCALE, NULL);
+    CHECK(enhance_cfg_int("render.scale", 1) == 4);
+    CHECK(enhance_cfg_source_of("render.scale") == ENHANCE_SRC_FILE);
+
+    /* A removal reaches the copy too, and the read marks carry over: a
+     * key read before the write is not reported as unused after it. */
+    vals[1] = NULL;
+    CHECK(enhance_cfg_patch(enhance_cfg_user_path(), keys + 1, vals + 1, 1, err,
+                            sizeof err) == 0);
+    CHECK(!strcmp(enhance_cfg_string("present.filter", "x"), "x"));
+    capture_begin();
+    CHECK(enhance_cfg_report_unused() == 0);
+    out = capture_end();
+    CHECK(out[0] == 0);
+
+    /* A key left out for a [table] changes neither the file nor the copy. */
+    keys[0] = "render";   vals[0] = "1";
+    CHECK(enhance_cfg_patch(enhance_cfg_user_path(), keys, vals, 1, err, sizeof err) != 0);
+    CHECK(enhance_cfg_int("render.scale", 1) == 4);
+
+    /* A key written for the first time is in use: a mod's key saved into
+     * a header-only config.toml is no unknown key of the mod. */
+    write_file("ecfg_pat/config/config.toml", "# header only\n");
+    CHECK(enhance_cfg_init("ecfg_pat", NULL) == 1);
+    enhance_cfg_owner_add(NULL);
+    enhance_cfg_owner_add("fx");
+    keys[0] = "fx.glow"; vals[0] = "true";
+    CHECK(enhance_cfg_patch(enhance_cfg_user_path(), keys, vals, 1, err, sizeof err) == 0);
+    CHECK(enhance_cfg_file(1) && recomp_cfg_find(enhance_cfg_file(1), "fx.glow") >= 0);
+    CHECK(enhance_cfg_unused_of("fx", keys + 1, 1) == 0);
+
+    /* A user file absent at init (its folder made later, as the menu's
+     * Save does) joins the layers once written. */
+    remove("ecfg_pat/config/config.toml");
+    RMDIR("ecfg_pat/config");
+    CHECK(enhance_cfg_init("ecfg_pat", NULL) == 0);
+    CHECK(enhance_cfg_file(1) == NULL);
+    MKDIR("ecfg_pat/config");
+    /* In the same write, so the copy with no old one to carry marks from
+     * marks the owned key read too. */
+    keys[0] = "render.scale"; vals[0] = "2";
+    keys[1] = "fx.glow";      vals[1] = "true";
+    CHECK(enhance_cfg_patch(enhance_cfg_user_path(), keys, vals, 2, err, sizeof err) == 0);
+    CHECK(enhance_cfg_file(1) != NULL);
+    CHECK(enhance_cfg_int("render.scale", 1) == 2);
+    CHECK(enhance_cfg_unused_of("fx", &out, 1) == 0);
+    enhance_cfg_owner_add(NULL);
+
+    /* A path the layers do not read is written and nothing else moves. */
+    keys[0] = "render.scale"; vals[0] = "5";
+    CHECK(enhance_cfg_patch("ecfg_pat/other.toml", keys, vals, 1, err, sizeof err) == 0);
+    CHECK(enhance_cfg_int("render.scale", 1) == 2);
+    enhance_cfg_shutdown();
+    remove("ecfg_pat/other.toml");
+    remove("ecfg_pat/config/config.toml");
+    RMDIR("ecfg_pat/config");
+    RMDIR("ecfg_pat");
+}
+
 /* A stray key names the mod it belongs to (mod-settings B.11): the
  * longest id that prefixes it, under mods., input.controls. or
  * input.actions. or at the mod's own prefix, at the same boundary as
@@ -2149,6 +2238,7 @@ int main(void)
     test_input_pad();
     test_exe_dir();
     test_owners();
+    test_patch();
     printf("enhance_cfg: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;
 }

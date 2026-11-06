@@ -3039,7 +3039,7 @@ static int save(void)
     }
     renamed = s_rw_staged;
     mkdir_parent(path);
-    rc = recomp_cfg_patch(path, keys, vals, (size_t)n, err, sizeof err);
+    rc = enhance_cfg_patch(path, keys, vals, (size_t)n, err, sizeof err);
     if (rc < 0) {
         status("Save failed: %s", err);
         fprintf(stderr, LOGP "menu: save to %s failed: %s\n", path, err);
@@ -3093,7 +3093,7 @@ static void layout_key_write(const char *key, const char *value, const char *wha
         return;
     recomp_cfg_quote(value, q, sizeof q);
     mkdir_parent(path);
-    if (recomp_cfg_patch(path, &key, &val, 1, err, sizeof err) != 0) {
+    if (enhance_cfg_patch(path, &key, &val, 1, err, sizeof err) != 0) {
         fprintf(stderr, LOGP "menu: keeping %s in %s failed: %s\n", key, path, err);
         status("%s not kept: %s", what, err);
     }

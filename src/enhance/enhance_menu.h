@@ -12,7 +12,8 @@
  * group), a title's (enhance_menu_add, on the Game page) and a mod's
  * (mod.h menu_add, on the mod's sub-page). Each item persists to its
  * config key through Save, which writes the differences only
- * (recomp_cfg_patch on enhance_cfg_user_path): a value equal to the
+ * (enhance_cfg_patch on enhance_cfg_user_path, which also updates the
+ * loaded copy later lookups read): a value equal to the
  * defaults file's, or to the item's code default when the defaults file
  * has none, removes the key.
  *
