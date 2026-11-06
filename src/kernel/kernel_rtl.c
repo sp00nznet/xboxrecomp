@@ -566,6 +566,28 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     }
 }
 
+/* The same shadow as Enter and Leave: a title pairs TryEnter with a plain
+ * Leave, and other threads take the section with a plain Enter. A table of
+ * its own kept the TryEnter's host lock held for good (Leave let go of a
+ * shadow it never took) and excluded no one who used Enter. In Quantum
+ * Redshift the first thread to TryEnter the music manager's section kept
+ * it, so the audio worker sub_000DF660, which only services the music
+ * streams when its TryEnter succeeds, never read past their headers.
+ */
+BOOLEAN __stdcall xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
+{
+    CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    /* No shadow (a full table): unprotected, as Enter treats it. */
+    if (!cs)
+        return TRUE;
+    if (!TryEnterCriticalSection(cs))
+        return FALSE;
+    InterlockedIncrement(&g_cs_enters);
+    crt_lock_trace("take", CriticalSection);
+    xbox_cs_note_owner(cs);
+    return TRUE;
+}
+
 /* The guest unwind (kernel_guest_unwind.h): a thread leaving guest code for
  * a reset lets go of every guest lock it holds, each recursion, so the
  * threads that outlive the jump (the boot loop, a host thread) are not left

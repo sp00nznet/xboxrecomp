@@ -139,7 +139,7 @@ signal.
 | `bridge_KeDelayExecutionThread` 2660 | 2666 `bridge_user_apc_wait` (delivers APCs at once), then 2669 `xbox_KeDelayExecutionThread` (kernel_thread.c:176) | the return (eax) | before APC delivery at 2666 and after 2669 | no (timer only) |
 | `bridge_NtYieldExecution` 2700 | kernel_thread.c:420 | eax | after | no |
 | `bridge_RtlEnterCriticalSection` 2183 (and `…AndRegion` 8274) | kernel_rtl.c:525/530 | `xbox_cs_note_owner` (owner recorded) | before note_owner; the acquired CS must then be released | **C** (ownership) |
-| `bridge_RtlTryEnterCriticalSection` 8288 | none (try) | — | — | — |
+| `bridge_RtlTryEnterCriticalSection` | none: kernel_rtl.c `xbox_RtlTryEnterCriticalSection` never waits | `xbox_cs_note_owner` on success (the Enter/Leave shadow) | — | no (no wait) |
 | `bridge_ExAcquireReadWriteLock*` 8717/8724 | maps to a guest-side lock or sync wait | eax | after | per object |
 | `bridge_IoSynchronousDeviceIoControlRequest` 7070 | device dispatch, no host wait found | — | — | — |
 

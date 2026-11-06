@@ -199,9 +199,6 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/kernel_bridge.c | bridge_RtlRaiseException | raise_count | local_static | keep | - | exception log counter |
 | src/kernel/kernel_bridge.c | bridge_sched_resume_unknown | said | local_static | keep | - | log-once guard |
 | src/kernel/kernel_bridge.c | bridge_NtDuplicateObject | logged | local_static | keep | - | log budget |
-| src/kernel/kernel_bridge.c | - | g_try_cs | file_static | reset | kernel | host CS per guest critical section; may be held |
-| src/kernel/kernel_bridge.c | - | g_try_cs_guard | file_static | keep | - | host lock for the try-CS table |
-| src/kernel/kernel_bridge.c | - | g_try_cs_guard_ready | once | keep | - | no rerun: host lock init only |
 | src/kernel/kernel_bridge.c | bridge_XboxEEPROMKey | eeprom_va | local_static | reset | kernel | EEPROM key VA in the guest heap, which is cleared |
 | src/kernel/kernel_bridge.c | - | g_ke_shadow | file_static | reset | kernel | guest Ke object VAs to host handles; close them |
 | src/kernel/kernel_bridge.c | - | g_ke_shadow_cs | file_static | keep | - | host lock for the Ke shadow table |
@@ -3256,7 +3253,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 - kernel_rtl.c: `g_cs_single` (RECOMP_CS_MODE=single) is one recursive lock an exiting thread may hold. It needs a new lock and a rerun of `g_cs_single_once`.
 - kernel_rtl.c: the `g_cs_table` entries of held sections are abandoned, not deleted.
 - kernel_sync.c: `g_timer_queue` timers call guest DPCs on host timer-queue threads. Delete them with a blocking wait before band 7 clears the KTIMERs.
-- kernel_bridge.c: `g_try_cs`, `g_ke_shadow` and `s_handle_table` hold host CS/handles keyed by guest VA, possibly held by exited threads; the timer and vbl-ack threads keep running, so empty `g_timers`/`g_dpc_queue` while they are paused.
+- kernel_bridge.c: `g_ke_shadow` and `s_handle_table` hold host CS/handles keyed by guest VA, possibly held by exited threads; the timer and vbl-ack threads keep running, so empty `g_timers`/`g_dpc_queue` while they are paused.
 - kernel_bridge.c: `eeprom_va` and the launch page live in the guest heap (re-made after its reset); the band 9 split must leave out `xbox_DpcMarkGuestThread`/`guest_cpu_join` (host thread state).
 - xbox_memory_layout.c: band 7 must skip the NV2A/MCPX/flash apertures (APU NOACCESS, AC97 read-only), lift `g_guest_prot` restrictions first, and rewrite the fake PE page at 0x80010000 (inside the contig window).
 - xbox_memory_layout.c: frame/fence/counter mirrors are game registrations (no re-register, only bump state resets); `s_watchdog_*` point into the boot thread TLS, valid because that thread is reused.
