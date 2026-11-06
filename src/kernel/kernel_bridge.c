@@ -8945,16 +8945,22 @@ static void bridge_NtCreateIoCompletion(void)
 /* --- NtCreateTimer (ordinal 194, 3 args = 12 bytes)
  * NTSTATUS NtCreateTimer(PHANDLE TimerHandle, POBJECT_ATTRIBUTES
  *                        ObjectAttributes, TIMER_TYPE TimerType);
- * Creates a manual-reset waitable timer and hands its token out through the
- * handle table, matching the NtCreateEvent/NtCreateMutant pattern. */
+ * Creates a waitable timer of the asked type and hands its token out through
+ * the handle table, matching the NtCreateEvent/NtCreateMutant pattern. */
 static void bridge_NtCreateTimer(void)
 {
     HANDLE h;
 
     (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
 
-    h = CreateWaitableTimerW(NULL, TRUE, NULL);
+    if (STACK_ARG(0) && !bridge_buf_ok(STACK_ARG(0), 4, "NtCreateTimer")) {
+        g_eax = 0xC0000005u;                /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+    /* TimerType 0 = NotificationTimer (stays signalled), 1 =
+     * SynchronizationTimer (released waiter resets it): XAPI's
+     * CreateWaitableTimer(bManualReset = FALSE) asks for the second. */
+    h = CreateWaitableTimerW(NULL, STACK_ARG(2) == 0, NULL);
     if (!h) {
         fprintf(stderr, "  [KERNEL] NtCreateTimer: CreateWaitableTimerW failed (error %u)\n",
                 GetLastError());
@@ -9114,17 +9120,43 @@ static void bridge_NtSetIoCompletion(void)
 }
 
 /* --- NtSetTimerEx (ordinal 229, 8 args = 32 bytes) --- */
+/* NTSTATUS NtSetTimerEx(HANDLE TimerHandle, PLARGE_INTEGER DueTime,
+ *                       PTIMER_APC_ROUTINE TimerApcRoutine, KPROCESSOR_MODE
+ *                       ApcMode, PVOID TimerContext, BOOLEAN WakeTimer,
+ *                       LONG Period, PBOOLEAN PreviousState);
+ * XAPI's SetWaitableTimer. It used to succeed without arming anything, so a
+ * title clocked by a waitable timer never ticked: SSX On Tour's 60 Hz frame
+ * clock thread (guest 0x00222E71) waits on one and re-arms it each time,
+ * and the "Saving..." screen waits on that clock for its 3 s minimum, so
+ * every save hung. A timer APC is not delivered (none seen yet). */
 static void bridge_NtSetTimerEx(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
-    (void)STACK_ARG(5);
-    (void)STACK_ARG(6);
-    (void)STACK_ARG(7);
-    g_eax = 0;
+    HANDLE   h       = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t due_va  = STACK_ARG(1);
+    uint32_t apc     = STACK_ARG(2);
+    LONG     period  = (LONG)STACK_ARG(6);
+    uint32_t prev_va = STACK_ARG(7);
+    LARGE_INTEGER due;
+
+    if (!h) {
+        g_eax = 0xC0000008u;                /* STATUS_INVALID_HANDLE */
+        return;
+    }
+    if (!bridge_buf_ok(due_va, 8, "NtSetTimerEx")
+            || (prev_va && !bridge_buf_ok(prev_va, 1, "NtSetTimerEx"))) {
+        g_eax = 0xC0000005u;                /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+    due.QuadPart = (LONGLONG)((uint64_t)BRIDGE_MEM32(due_va)
+                              | ((uint64_t)BRIDGE_MEM32(due_va + 4) << 32));
+    if (apc) {
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, "  [KERNEL] NtSetTimerEx: timer APC 0x%08X not delivered\n", apc);
+    }
+    if (prev_va)                    /* the prior state is not tracked: "was not signalled" */
+        BRIDGE_MEM8(prev_va) = 0;
+    g_eax = SetWaitableTimer(h, &due, period, NULL, NULL, FALSE) ? 0 : 0xC000000Du;
 }
 
 /* --- NtSignalAndWaitForSingleObjectEx (ordinal 230, 5 args = 20 bytes) --- */

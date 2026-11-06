@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.20)
+project(win32_waitable_timer_posix_test C)
+# The POSIX waitable timer in the Win32 shim: one-shot, periodic, cancel.
+if(WIN32)
+    message(FATAL_ERROR "This regression covers the POSIX shim; Windows has the real timers")
+endif()
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../../src/platform platform)
+add_executable(win32_waitable_timer_posix_test test_main.c)
+target_link_libraries(win32_waitable_timer_posix_test PRIVATE platform m)
+enable_testing()
+add_test(NAME win32_waitable_timer_posix_test COMMAND win32_waitable_timer_posix_test)

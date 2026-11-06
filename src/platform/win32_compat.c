@@ -303,6 +303,7 @@ typedef struct w32_object {
     struct timespec waitable_due_time;
     int             waitable_triggered;
     int             waitable_armed;
+    LONG            waitable_period_ms;   /* > 0: re-arms itself after each expiry */
 
     /* file mapping / fd-backed file handle */
     int             fd;
@@ -514,7 +515,21 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         switch (o->kind) {
         case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
         case K_WAITABLE_TIMER:
-            if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
+            if (!o->waitable_manual_reset && o->waitable_period_ms > 0) {
+                /* Periodic synchronization timer: the next expiry is one
+                 * period after the last due time (on the grid, catching up
+                 * if the waiter was late), and it stays armed. */
+                struct timespec now;
+                clock_gettime(CLOCK_REALTIME, &now);
+                do {
+                    long long ns = o->waitable_due_time.tv_nsec + (long long)o->waitable_period_ms * 1000000LL;
+                    o->waitable_due_time.tv_sec += (time_t)(ns / 1000000000LL);
+                    o->waitable_due_time.tv_nsec = (long)(ns % 1000000000LL);
+                } while (!timespec_before(&now, &o->waitable_due_time));
+                o->waitable_triggered = 0;
+            } else if (!o->waitable_manual_reset) {
+                o->waitable_triggered = 0; o->waitable_armed = 0;
+            }
             break;
         case K_SEM:   o->sem_count--; break;
         case K_MUTEX: o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion++; break;
@@ -1099,8 +1114,9 @@ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
     if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
     pthread_mutex_lock(&o->lock);
     /* Win32 100ns units: negative is relative to now, positive is an absolute
-     * FILETIME. ponytail: period is ignored -- one-shot only, revisit if a
-     * title actually arms a repeating timer. */
+     * FILETIME. A period re-arms a synchronization timer as its waiter takes
+     * each expiry (wait_single); a periodic manual-reset timer stays
+     * signalled after the first expiry, which is the same to a waiter. */
     if (dueTime->QuadPart <= 0) {
         clock_gettime(CLOCK_REALTIME, &o->waitable_due_time);
         LONGLONG ns = -dueTime->QuadPart * 100LL;
@@ -1116,7 +1132,7 @@ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
         o->waitable_due_time.tv_sec  = (time_t)(unix100ns / 10000000LL);
         o->waitable_due_time.tv_nsec = (long)((unix100ns % 10000000LL) * 100LL);
     }
-    (void)period;
+    o->waitable_period_ms = period > 0 ? period : 0;
     o->waitable_armed = 1;
     o->waitable_triggered = 0;
     pthread_mutex_unlock(&o->lock);
@@ -1131,6 +1147,7 @@ BOOL CancelWaitableTimer(HANDLE h)
     pthread_mutex_lock(&o->lock);
     o->waitable_triggered = 0;
     o->waitable_armed = 0;
+    o->waitable_period_ms = 0;
     pthread_mutex_unlock(&o->lock);
     return TRUE;
 }
