@@ -131,6 +131,9 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/kernel_bridge.c | - | s_thobj_refs | file_static | reset | kernel | guest thread objects carved from contiguous memory |
 | src/kernel/kernel_bridge.c | - | s_thobj_count | file_static | reset | kernel | guest thread objects carved from contiguous memory |
 | src/kernel/kernel_bridge.c | - | s_thobj_end_ev | file_static | reset | kernel | guest thread objects carved from contiguous memory |
+| src/kernel/kernel_bridge.c | - | s_thobj_start_ev | file_static | reset | kernel | guest thread objects carved from contiguous memory |
+| src/kernel/kernel_bridge.c | - | s_thobj_hold | file_static | reset | kernel | guest thread objects carved from contiguous memory |
+| src/kernel/kernel_bridge.c | - | s_thobj_gated | file_static | reset | kernel | guest thread objects carved from contiguous memory |
 | src/kernel/kernel_bridge.c | - | s_token_thobj | file_static | reset | kernel | guest thread objects carved from contiguous memory |
 | src/kernel/kernel_bridge.c | - | s_thobj_lock | file_static | keep | - | host lock for thread objects |
 | src/kernel/kernel_bridge.c | - | g_thread_obj_va | tls | reset | kernel | this thread's guest thread object VA |

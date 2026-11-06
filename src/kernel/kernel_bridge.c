@@ -651,6 +651,9 @@ static uint32_t s_thobj_va[THOBJ_MAX];     /* 0 = slot never carved */
 static LONG     s_thobj_refs[THOBJ_MAX];   /* 0 = free */
 static uint32_t s_thobj_count;             /* slots carved so far */
 static HANDLE   s_thobj_end_ev[THOBJ_MAX]; /* deterministic mode: set at the end */
+static HANDLE   s_thobj_start_ev[THOBJ_MAX]; /* created suspended: set at its start */
+static LONG     s_thobj_hold[THOBJ_MAX];   /* its suspend count until then */
+static uint8_t  s_thobj_gated[THOBJ_MAX];  /* its thread waits at the gate */
 static uint32_t s_token_thobj[16384];      /* token index -> object VA */
 static volatile LONG s_thobj_lock;
 static RECOMP_TLS uint32_t g_thread_obj_va;
@@ -700,6 +703,8 @@ static uint32_t thobj_alloc(void)
     if (i < s_thobj_count) {
         va = s_thobj_va[i];
         s_thobj_refs[i] = 1;
+        s_thobj_hold[i] = 0;
+        s_thobj_gated[i] = 0;
         if (xbox_GuestDetOn()) {
             if (!s_thobj_end_ev[i])
                 s_thobj_end_ev[i] = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -789,6 +794,96 @@ static HANDLE thobj_det_wait_handle(uint32_t va)
         h = s_thobj_end_ev[s];
     thobj_unlock();
     return h;
+}
+
+/* CreateSuspended without guest_sched or the deterministic ring, which
+ * count it themselves: the host thread starts at once but waits at this
+ * gate, before it joins the guest CPU, until a resume brings the count to 0.
+ * Ignoring the flag let the thread run ahead of its creator. Quantum
+ * Redshift's Bink thread setup (sub_00175460) creates sub_001753F0
+ * suspended and only then stores the event and mutex it waits on; started
+ * early, the thread waited on the heap's leftover words as handles and
+ * faulted in pthread_mutex_lock. The guest lock alone does not
+ * close it: the creator lets the guest CPU go at its CreateMutex call. */
+static void thobj_gate_arm(uint32_t va)
+{
+    int s;
+
+    thobj_lock();
+    s = thobj_slot(va);
+    if (s >= 0 && s_thobj_refs[s] > 0) {
+        if (!s_thobj_start_ev[s])
+            s_thobj_start_ev[s] = CreateEventA(NULL, TRUE, FALSE, NULL);
+        else
+            ResetEvent(s_thobj_start_ev[s]);
+        if (s_thobj_start_ev[s]) {
+            s_thobj_hold[s] = 1;
+            s_thobj_gated[s] = 1;
+        } else {
+            fprintf(stderr, "  [KERNEL] thread 0x%08X created suspended has"
+                            " no start gate (no event); it runs at once\n", va);
+        }
+    }
+    thobj_unlock();
+}
+
+/* A suspend (delta 1) or resume (-1) of a thread still at its gate: 1 with
+ * *prev the count before, or 0 when the gate does not hold it (never armed,
+ * or already open), for the caller's own path. */
+static int thobj_gate_count(uint32_t va, int delta, ULONG *prev)
+{
+    HANDLE open = NULL;
+    int s, handled = 0;
+
+    thobj_lock();
+    s = thobj_slot(va);
+    if (s >= 0 && s_thobj_refs[s] > 0 && s_thobj_hold[s] > 0) {
+        if (prev)
+            *prev = (ULONG)s_thobj_hold[s];
+        s_thobj_hold[s] += delta > 0 ? 1 : -1;
+        if (s_thobj_hold[s] == 0)
+            open = s_thobj_start_ev[s];
+        handled = 1;
+    }
+    thobj_unlock();
+    if (open)
+        SetEvent(open);
+    return handled;
+}
+
+/* On the new thread, before it joins: wait while the gate holds it. The
+ * wait ends on a reset as well, which unwinds the thread from here. */
+static void thobj_gate_wait(uint32_t va)
+{
+    HANDLE ev = NULL;
+    int s;
+
+    thobj_lock();
+    s = thobj_slot(va);
+    if (s >= 0 && s_thobj_gated[s]) {
+        s_thobj_gated[s] = 0;
+        ev = s_thobj_start_ev[s];
+    }
+    thobj_unlock();
+    if (ev)
+        xbox_GuestUnwindWait(1, &ev, FALSE, INFINITE, FALSE);
+}
+
+static uint32_t thobj_from_token(uint32_t token);
+
+/* The thread object a suspend or resume names: a handle token, or the
+ * object itself for the Ke forms. 0 for anything else. */
+static uint32_t thobj_target(uint32_t arg)
+{
+    uint32_t obj = thobj_from_token(arg);
+
+    if (!obj) {
+        thobj_lock();
+        if (thobj_slot(arg) >= 0)
+            obj = arg;
+        thobj_unlock();
+    }
+    return obj;
 }
 
 /* A worker's end: its stack back to the pool, then its object signalled. */
@@ -900,6 +995,7 @@ static void bridge_thread_body(void *p)
 {
     struct bridge_thread_body *b = (struct bridge_thread_body *)p;
 
+    thobj_gate_wait(g_thread_obj_va);
     guest_cpu_join();
     bridge_run_thread_inline(b->fn, b->ctx1, b->ctx2);
 }
@@ -1058,9 +1154,9 @@ static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
     /* CreateSuspended: the host thread starts at once, as it always has;
      * with guest_sched the guest CPU holds it at its join until the title
      * resumes it (JSRF's ADX spinner sub_0013B180 must not run before its
-     * lock resumes it). Off, the flag stays ignored. */
-    if (suspended && obj)
-        xbox_GuestSchedSuspend(obj, 1, NULL);
+     * lock resumes it). Off, the thread waits at its start gate instead. */
+    if (suspended && obj && !xbox_GuestSchedSuspend(obj, 1, NULL))
+        thobj_gate_arm(obj);
 
     /* Before the thread can run: its first GetCurrentThreadId may come before
      * the creator has seen the id at all. */
@@ -6481,10 +6577,11 @@ static int bridge_sched_self_suspend(int self, ULONG *prev)
     return 0;
 }
 
-/* A resume the guest CPU cannot tie to a guest thread goes to the host. If
- * it was meant for a thread created suspended, that thread stays held at its
- * join (and says so after 5 s); name the handle once so the hang has a
- * cause in the log. */
+/* A resume the guest CPU cannot tie to a guest thread goes to the host.
+ * Under guest_sched, if it was meant for a thread created suspended, that
+ * thread stays held at its join (and says so after 5 s); name the handle
+ * once so the hang has a cause in the log. Without guest_sched the start
+ * gate (thobj_gate_count) has taken every resume it could tie to one. */
 static void bridge_sched_resume_unknown(uint32_t arg, int self)
 {
     static volatile LONG said;
@@ -6502,7 +6599,8 @@ static void bridge_NtSuspendThread(void)
     uint32_t obj = bridge_sched_target(STACK_ARG(0), &self);
     ULONG prev = 0;
 
-    if (obj && xbox_GuestSchedSuspend(obj, 1, &prev)) {
+    if ((obj && xbox_GuestSchedSuspend(obj, 1, &prev))
+            || thobj_gate_count(thobj_target(STACK_ARG(0)), 1, &prev)) {
         if (count_va)
             BRIDGE_MEM32(count_va) = prev;
         g_eax = 0;
@@ -6526,7 +6624,8 @@ static void bridge_NtResumeThread(void)
     uint32_t obj = bridge_sched_target(STACK_ARG(0), &self);
     ULONG prev = 0;
 
-    if (obj && xbox_GuestSchedSuspend(obj, -1, &prev)) {
+    if ((obj && xbox_GuestSchedSuspend(obj, -1, &prev))
+            || thobj_gate_count(thobj_target(STACK_ARG(0)), -1, &prev)) {
         if (STACK_ARG(1))
             BRIDGE_MEM32(STACK_ARG(1)) = prev;
         g_eax = 0;
@@ -9409,7 +9508,8 @@ static void bridge_KeResumeThread(void)
     ULONG prev = 0;
     HANDLE hThread;
 
-    if (obj && xbox_GuestSchedSuspend(obj, -1, &prev)) {
+    if ((obj && xbox_GuestSchedSuspend(obj, -1, &prev))
+            || thobj_gate_count(thobj_target(STACK_ARG(0)), -1, &prev)) {
         g_eax = prev;
         return;
     }
@@ -9433,7 +9533,8 @@ static void bridge_KeSuspendThread(void)
     ULONG prev = 0;
     HANDLE hThread;
 
-    if (obj && xbox_GuestSchedSuspend(obj, 1, &prev)) {
+    if ((obj && xbox_GuestSchedSuspend(obj, 1, &prev))
+            || thobj_gate_count(thobj_target(STACK_ARG(0)), 1, &prev)) {
         g_eax = prev;
         return;
     }
