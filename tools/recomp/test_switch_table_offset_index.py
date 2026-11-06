@@ -72,7 +72,26 @@ def test_arms_below_the_base():
                          "negative-index table")
 
 
+def _single_arm_image(after):
+    """jmp [eax*4 + TABLE]; table [arm, after]; arm: mov eax, 1; ret."""
+    code = b"\xFF\x24\x85" + TABLE.to_bytes(4, "little")
+    code += b"\x90" * (TABLE - BASE - len(code))
+    code += ARMS[0].to_bytes(4, "little") + after.to_bytes(4, "little")
+    code += b"\x90" * (ARMS[0] - BASE - len(code))
+    return code + b"\xB8\x01\x00\x00\x00\xC3"
+
+
+def test_single_arm_ended_by_null_slot():
+    # A null slot right after the one in-function arm closes a real table.
+    code = _translate(_single_arm_image(0))
+    assert "switch: 1 entries" in code, code
+    assert f"goto loc_{ARMS[0]:08X};" in code, code
+    # Any other word after a lone arm is still too weak to call a switch.
+    assert "switch:" not in _translate(_single_arm_image(0x01010000))
+
+
 if __name__ == "__main__":
     test_index_starts_at_one()
     test_arms_below_the_base()
+    test_single_arm_ended_by_null_slot()
     print("ok")

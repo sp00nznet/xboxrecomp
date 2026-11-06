@@ -2740,8 +2740,13 @@ class Lifter:
         # and sprintf silently produced the wrong string.
         inside = self._leading_arms(targets)
         # Two arms is the smallest thing worth calling a switch; one is more
-        # likely a coincidence than a jump table.
-        if len(inside) >= 2:
+        # likely a coincidence than a jump table -- unless a null slot ends
+        # the table right after it. DOA2U's record lookup (0x00292970)
+        # dispatches through a byte index table into [0x002929B2, 0]; lifted
+        # as an indirect tail jump, its one live arm was unreachable.
+        if len(inside) >= 2 or (
+                len(inside) == 1 and len(targets) == 1 and
+                self._table_word(table_va + 4) == 0):
             return inside
         if table_va in self.jump_table_targets:
             # A census entry is authoritative (see _authoritative_jump_tables);
@@ -2771,6 +2776,13 @@ class Lifter:
         if len(below) >= 2:
             return below
         return []
+
+    def _table_word(self, va):
+        """The 32-bit word at va in the XBE, or None outside the image."""
+        offset = va_to_file_offset(va) if self.xbe_data else None
+        if offset is None or offset + 4 > len(self.xbe_data):
+            return None
+        return struct.unpack_from('<I', self.xbe_data, offset)[0]
 
     def _leading_arms(self, targets):
         """Entries up to the first one outside the current function."""
