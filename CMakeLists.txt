@@ -91,3 +91,24 @@ if(UNIX AND NOT APPLE)
 else()
     target_link_libraries(xboxrecomp INTERFACE ${XBOXRECOMP_LIBS})
 endif()
+
+# ── C regression tests ────────────────────────────────────────
+#
+# The tests under tests/ are self-contained CMake projects that can also be
+# built alone; listing them here puts them under the root build's ctest, so
+# one `cmake --build && ctest` covers them alongside whatever else a
+# workspace builds. The Python side (lifter unit tests, conformance) stays
+# with pytest -- see CONTRIBUTING.md.
+# Off when a game pulls the toolkit in with add_subdirectory.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(_xbr_tests_default ON)
+else()
+    set(_xbr_tests_default OFF)
+endif()
+option(XBOXRECOMP_BUILD_TESTS "Build the C regression tests" ${_xbr_tests_default})
+if(XBOXRECOMP_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests/mmx_helpers)
+    add_subdirectory(tests/xmm_helpers)
+endif()
+
