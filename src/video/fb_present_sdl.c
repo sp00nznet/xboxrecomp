@@ -46,10 +46,9 @@
 
 #include "video_player.h"
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
+#include "xinput_xbox.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
-extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
-extern int  xbox_InputAnyOpen(void);
 
 #define FB_W 640u
 #define FB_H 480u

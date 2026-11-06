@@ -185,35 +185,97 @@ static DWORD g_packet[XBOX_MAX_CONTROLLERS];
  * (src/video/fb_present_sdl.c). The pump already updates the controllers,
  * and SDL_GameControllerUpdate pumps events itself, which on macOS must only
  * happen on the main thread; so then this side only reads them. */
-static volatile int g_main_pump;
+static SDL_atomic_t g_main_pump;
 
 void xbox_InputSetMainPump(int on)
 {
-    g_main_pump = on;
+    SDL_AtomicSet(&g_main_pump, on);
+}
+
+static void update_controllers(void)
+{
+    if (!SDL_AtomicGet(&g_main_pump))
+        SDL_GameControllerUpdate();
+}
+
+static int controller_is_open_locked(SDL_JoystickID instance_id)
+{
+    for (int slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
+        if (g_pads[slot]) {
+            SDL_Joystick *joystick = SDL_GameControllerGetJoystick(g_pads[slot]);
+            if (joystick && SDL_JoystickInstanceID(joystick) == instance_id)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static void refresh_controllers_locked(void)
+{
+    int count;
+
+    for (int slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
+        if (g_pads[slot] && !SDL_GameControllerGetAttached(g_pads[slot])) {
+            SDL_GameControllerClose(g_pads[slot]);
+            g_pads[slot] = NULL;
+            g_controller_connected[slot] = FALSE;
+        }
+    }
+
+    count = SDL_NumJoysticks();
+    for (int i = 0; i < count; i++) {
+        SDL_GameController *controller;
+        SDL_JoystickID instance_id;
+        int slot;
+
+        if (!SDL_IsGameController(i))
+            continue;
+        instance_id = SDL_JoystickGetDeviceInstanceID(i);
+        if (instance_id < 0 || controller_is_open_locked(instance_id))
+            continue;
+        for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
+            if (!g_pads[slot])
+                break;
+        if (slot == XBOX_MAX_CONTROLLERS)
+            break;
+        controller = SDL_GameControllerOpen(i);
+        if (controller) {
+            g_pads[slot] = controller;
+            g_controller_connected[slot] = TRUE;
+        }
+    }
+}
+
+static SDL_GameController *controller_for_port_locked(DWORD port)
+{
+    SDL_GameController *controller = g_pads[port];
+
+    if (!controller || !SDL_GameControllerGetAttached(controller)) {
+        refresh_controllers_locked();
+        controller = g_pads[port];
+    }
+    g_controller_connected[port] =
+        controller && SDL_GameControllerGetAttached(controller);
+    return g_controller_connected[port] ? controller : NULL;
 }
 
 /* Whether any controller is open: SDL must stay up for it at shutdown. */
 int xbox_InputAnyOpen(void)
 {
-    for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
-        if (g_pads[i])
-            return 1;
-    return 0;
-}
+    int any = 0;
 
-/* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
-static void open_controllers(void)
-{
-    int slot = 0;
-    for (int i = 0; i < SDL_NumJoysticks() && slot < XBOX_MAX_CONTROLLERS; i++) {
-        if (!SDL_IsGameController(i))
-            continue;
-        if (!g_pads[slot]) {
-            g_pads[slot] = SDL_GameControllerOpen(i);
-            g_controller_connected[slot] = (g_pads[slot] != NULL);
+    update_controllers();
+    SDL_LockJoysticks();
+    for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
+        if (g_pads[i] && !SDL_GameControllerGetAttached(g_pads[i])) {
+            SDL_GameControllerClose(g_pads[i]);
+            g_pads[i] = NULL;
+            g_controller_connected[i] = FALSE;
         }
-        slot++;
+        any |= g_pads[i] != NULL;
     }
+    SDL_UnlockJoysticks();
+    return any;
 }
 
 void xbox_InputInit(void)
@@ -223,7 +285,9 @@ void xbox_InputInit(void)
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
-    open_controllers();
+    SDL_LockJoysticks();
+    refresh_controllers_locked();
+    SDL_UnlockJoysticks();
 }
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
@@ -231,17 +295,15 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    SDL_GameController *c = g_pads[dwPort];
-    if (!c || !SDL_GameControllerGetAttached(c)) {
-        g_controller_connected[dwPort] = FALSE;
+    update_controllers();
+    SDL_LockJoysticks();
+    SDL_GameController *c = controller_for_port_locked(dwPort);
+    if (!c) {
+        SDL_UnlockJoysticks();
         if (dwPort == 0 && xbox_InputKeyboardPoll(pState))
             return ERROR_SUCCESS;
         return ERROR_DEVICE_NOT_CONNECTED;
     }
-
-    if (!g_main_pump)
-        SDL_GameControllerUpdate();
-    g_controller_connected[dwPort] = TRUE;
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
     pState->dwPacketNumber = ++g_packet[dwPort];
@@ -284,6 +346,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
     pState->Gamepad.sThumbRY =
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
+    SDL_UnlockJoysticks();
 
     if (dwPort == 0)
         keyboard_merge(pState);
@@ -295,20 +358,33 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    SDL_GameController *c = g_pads[dwPort];
-    if (!c) return ERROR_DEVICE_NOT_CONNECTED;
+    update_controllers();
+    SDL_LockJoysticks();
+    SDL_GameController *c = controller_for_port_locked(dwPort);
+    if (!c) {
+        SDL_UnlockJoysticks();
+        return ERROR_DEVICE_NOT_CONNECTED;
+    }
 
     /* SDL rumble needs a duration; refresh for ~1s on each call (the game
      * polls vibration continuously). */
     SDL_GameControllerRumble(c, pVibration->wLeftMotorSpeed,
                              pVibration->wRightMotorSpeed, 1000);
+    SDL_UnlockJoysticks();
     return ERROR_SUCCESS;
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
-    if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
-    return g_controller_connected[dwPort];
+    BOOL connected;
+
+    if (dwPort >= XBOX_MAX_CONTROLLERS)
+        return FALSE;
+    update_controllers();
+    SDL_LockJoysticks();
+    connected = controller_for_port_locked(dwPort) != NULL;
+    SDL_UnlockJoysticks();
+    return connected;
 }
 
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
@@ -316,13 +392,19 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     (void)dwFlags;
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
-    if (!g_pads[dwPort])
+
+    update_controllers();
+    SDL_LockJoysticks();
+    if (!controller_for_port_locked(dwPort)) {
+        SDL_UnlockJoysticks();
         return ERROR_DEVICE_NOT_CONNECTED;
+    }
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
     pCaps->Type    = 1;   /* XINPUT_DEVTYPE_GAMEPAD */
     pCaps->SubType = 1;   /* XINPUT_DEVSUBTYPE_GAMEPAD */
     pCaps->Flags   = 0;
+    SDL_UnlockJoysticks();
     return ERROR_SUCCESS;
 }
 
