@@ -316,6 +316,11 @@ Wreckless did exactly this and reached its main loop with no renderer set up.
   `RECOMP_PB_EXEC=1` actually consumes the pushbuffer.
 - `RECOMP_WATCHDOG_SECS=N` dumps registers, PUT/GET and the guest stack when
   the title stops making progress -- it names the wait.
+- `RECOMP_WAIT_LOG=1` prints one `[WAIT]` line to stderr for each
+  single-object wait (`NtWaitForSingleObject`, `NtWaitForSingleObjectEx`,
+  `KeWaitForSingleObject`) that timed out or lasted 500 ms or more, with the
+  thread id, handle, timeout and result. It changes no wait; it shows which
+  handle a stalled thread keeps waiting on.
 - `RECOMP_WATCH=<va>` names the guest code that writes a value (a callback
   table slot, a "ready" flag); `RECOMP_UNIMPL_TRAP=1` stops at the first
   untranslated instruction that is actually reached.

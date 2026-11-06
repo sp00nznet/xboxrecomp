@@ -15,6 +15,9 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -194,13 +197,43 @@ static NTSTATUS xbox_wait_result_to_ntstatus(DWORD result, ULONG count)
     }
 }
 
+/*
+ * RECOMP_WAIT_LOG=1: a debug aid, off by default. Logs each single-object wait
+ * that timed out or lasted at least 500 ms, with the thread, handle, timeout and
+ * result. It changes no wait's behaviour; it only adds a stderr line after the
+ * wait. Use it to see what a title is blocked on.
+ */
+static int wait_log_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_WAIT_LOG");
+        on = e && strcmp(e, "0") != 0;
+    }
+    return on;
+}
+
+static void wait_log(const char *who, HANDLE h, DWORD ms, DWORD result,
+                     ULONGLONG t0)
+{
+    ULONGLONG waited = GetTickCount64() - t0;
+    if (result != WAIT_TIMEOUT && waited < 500)
+        return;
+    fprintf(stderr, "  [WAIT] %s tid=%lu handle=%p timeout=%lu ms result=%lu waited=%llu ms\n",
+            who, (unsigned long)GetCurrentThreadId(), (void *)h,
+            (unsigned long)ms, (unsigned long)result, (unsigned long long)waited);
+}
+
 NTSTATUS __stdcall xbox_NtWaitForSingleObject(
     HANDLE Handle,
     BOOLEAN Alertable,
     PLARGE_INTEGER Timeout)
 {
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    ULONGLONG t0 = wait_log_on() ? GetTickCount64() : 0;
     DWORD result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    if (wait_log_on())
+        wait_log("NtWaitForSingleObject", Handle, ms, result, t0);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -220,7 +253,10 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
      */
     (void)WaitMode;
 
+    ULONGLONG t0 = wait_log_on() ? GetTickCount64() : 0;
     result = WaitForSingleObjectEx(Handle, ms, Alertable);
+    if (wait_log_on())
+        wait_log("NtWaitForSingleObjectEx", Handle, ms, result, t0);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
@@ -259,7 +295,10 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
 
     HANDLE hObject = (HANDLE)Object;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    ULONGLONG t0 = wait_log_on() ? GetTickCount64() : 0;
     DWORD result = WaitForSingleObjectEx(hObject, ms, Alertable);
+    if (wait_log_on())
+        wait_log("KeWaitForSingleObject", hObject, ms, result, t0);
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
