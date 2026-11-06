@@ -2608,6 +2608,8 @@ class Lifter:
             # function, returned, then called the frameless sub_001DEC07, which
             # inherited a long-dead frame of ~0xA6 and wrote [ebp-0xa2] and
             # [ebp-0xa0] onto Xbox VA 4 and 6: exactly the fs:[4] corruption.
+            # EBP is also a general register in frame-pointer-omitted code, so
+            # its current local value is published even without a frame.
             if self.publishes_ebp:
                 lines.append("g_ebp = ebp; /* frame stays current across calls */")
                 lines.append("g_seh_ebp = ebp;")
@@ -2698,7 +2700,8 @@ class Lifter:
             # callback invoked through a stack argument -- is read four bytes
             # low and dispatches through the wrong slot.
             site = insn.address
-            head = (f"{{ uint32_t _icall_target = {target}; "
+            publish = "g_ebp = ebp; g_seh_ebp = ebp; " if self.publishes_ebp else ""
+            head = (publish + f"{{ uint32_t _icall_target = {target}; "
                     f"PUSH32(esp, 0x{ret_va:08X}u); ")
             fallback = (f"{safe_at_macro}(_icall_target, _icall_esp, "
                         f"0x{site:08X}u); }}")
@@ -2722,7 +2725,9 @@ class Lifter:
         # If this function IS __SEH_prolog or __SEH_epilog, bridge ebp
         # so the caller can read back the frame pointer.
         prefix = ""
-        if self.func_start in self.SEH_HELPERS:
+        if self.publishes_ebp:
+            prefix = "g_ebp = ebp; g_seh_ebp = ebp; "
+        elif self.func_start in self.SEH_HELPERS:
             prefix = "g_seh_ebp = ebp; "
         # Exit trace, for functions that return with a register the caller
         # relied on holding something else. Entry tracing alone cannot show

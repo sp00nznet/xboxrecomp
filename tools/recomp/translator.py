@@ -2736,7 +2736,8 @@ class FunctionTranslator:
                 and not (start <= insn.jump_target < end))
             for insn in instructions
         )
-        if has_tail_jump or fallthrough_target is not None:
+        if (has_tail_jump or fallthrough_target is not None
+                or any(insn.mnemonic == "call" for insn in instructions)):
             used_regs.add("ebp")
 
 
@@ -2933,7 +2934,9 @@ class FunctionTranslator:
         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
         # idiom MSVC emits for odd trailing elements.
         self.lifter.needs_cf = has_carry
-        self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
+        # EBP is also a general register in frame-pointer-omitted code, so any
+        # function that uses it or calls out publishes it, not only frame owners.
+        self.lifter.publishes_ebp = "ebp" in used_regs
 
         # SSE and MMX are architectural state, declared globally by the
         # runtime exactly like the GPRs and the x87 stack. Declaring either
