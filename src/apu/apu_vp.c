@@ -1418,6 +1418,7 @@ static void voice_process(MCPXAPUState *d,
     bool stereo = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                  NV_PAVS_VOICE_CFG_FMT_STEREO) != 0;
     unsigned int channels = stereo ? 2 : 1;
+    unsigned int output_channels = channels;
     bool paused = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                  NV_PAVS_VOICE_PAR_STATE_PAUSED) != 0;
 
@@ -1582,6 +1583,7 @@ static void voice_process(MCPXAPUState *d,
                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
         if (hrtf_handle != HRTF_NULL_HANDLE) {
             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
+            output_channels = 2;
         }
     }
 
@@ -1605,7 +1607,8 @@ static void voice_process(MCPXAPUState *d,
         float step = (g - g0) / NUM_SAMPLES_PER_FRAME;
         f->gain_prev[b] = g;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            mixbins[bin[b]][i] += (g0 + step * (i + 1)) * samples[i][b % channels];
+            mixbins[bin[b]][i] +=
+                (g0 + step * (i + 1)) * samples[i][b % output_channels];
         }
     }
     d->vp.filters[v].gain_valid = true;

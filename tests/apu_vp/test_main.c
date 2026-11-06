@@ -9,6 +9,9 @@
  *     a whole frame of voices, so a title's lock waited out the frame.
  *   - gain_*: a volume change stepped at the frame boundary instead of
  *     ramping across the frame.
+ *   - mono_hrtf_*: a mono 3D voice was filtered into two HRTF channels, but
+ *     the bin mixer still selected channels using the one-channel source
+ *     format and copied the left result into every bin.
  *
  * Run with: ctest --test-dir <build> */
 #include "../../src/apu/apu_vp.c"
@@ -205,6 +208,55 @@ static void gain_ramps_across_a_frame(void)
     }
 }
 
+static void mono_hrtf_keeps_binaural_channels(void)
+{
+    static MCPXAPUState d;
+    static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    const uint16_t v = 0;
+    const uint32_t vola_binaural =
+        0xFFFFFFFFu &
+        ~NV_PAVS_VOICE_TAR_VOLA_VOLUME0 &
+        ~NV_PAVS_VOICE_TAR_VOLA_VOLUME1;
+    HrtfFilter *hrtf;
+
+    memset(s_ram, 0, RAM_SIZE);
+    memset(&d, 0, sizeof(d));
+    memset(mixbins, 0, sizeof(mixbins));
+    d.regs[NV_PAPU_VPVADDR] = VOICE_BASE;
+    d.vp.hrtf_submix[0] = 6;
+    d.vp.hrtf_submix[1] = 7;
+    d.vp.hrtf_submix[2] = 8;
+    d.vp.hrtf_submix[3] = 9;
+
+    set_voice_reg(v, NV_PAVS_VOICE_CFG_FMT,
+                  NV_PAVS_VOICE_CFG_FMT_MULTIPASS | (20u << 16));
+    set_voice_reg(v, NV_PAVS_VOICE_PAR_STATE,
+                  NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+    set_voice_reg(v, NV_PAVS_VOICE_CFG_HRTF_TARGET, 0);
+    set_voice_reg(v, NV_PAVS_VOICE_TAR_VOLA, vola_binaural);
+    set_voice_reg(v, NV_PAVS_VOICE_TAR_VOLB, 0xFFFFFFFFu);
+    set_voice_reg(v, NV_PAVS_VOICE_TAR_VOLC, 0xFFFFFFFFu);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+        mixbins[20][i] = 1.0f;
+
+    hrtf = &d.vp.filters[v].hrtf;
+    hrtf->ch[0].hrir_coeff_cur[0] = 1.0f;
+    hrtf->ch[0].hrir_coeff_tar[0] = 1.0f;
+    hrtf->ch[1].hrir_coeff_cur[0] = -1.0f;
+    hrtf->ch[1].hrir_coeff_tar[0] = -1.0f;
+
+    voice_process(&d, mixbins, d.vp.sample_buf, v, 0);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        if (fabsf(mixbins[6][i] - 1.0f) > 1e-6f ||
+            fabsf(mixbins[7][i] + 1.0f) > 1e-6f) {
+            CHECK(0,
+                  "mono HRTF sample %d routed left/right as %f/%f, expected 1/-1",
+                  i, mixbins[6][i], mixbins[7][i]);
+            break;
+        }
+    }
+}
+
 int main(void)
 {
     s_ram = (uint8_t *)calloc(1, RAM_SIZE);
@@ -214,6 +266,7 @@ int main(void)
     adpcm_wide_block_decodes();
     adpcm_whole_field_fits();
     gain_ramps_across_a_frame();
+    mono_hrtf_keeps_binaural_channels();
 
     free(s_ram);
     if (s_failures) {
@@ -222,6 +275,6 @@ int main(void)
     }
     puts("PASS: every ADPCM block count the descriptor can name decodes, "
          "VOICE_LOCK waits only for its own voice, and volume "
-         "changes ramp across a frame.");
+         "changes ramp across a frame; mono HRTF keeps both output channels.");
     return 0;
 }
