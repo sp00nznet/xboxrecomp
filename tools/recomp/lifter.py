@@ -284,6 +284,18 @@ def _operand_width(op):
     return None
 
 
+def _narrow_source(ops):
+    """An arithmetic source at the destination's width.
+
+    The disassembler sign-extends a narrow immediate to 32 bits, so
+    "adc ax, -1" arrives as 0xFFFFFFFF and its carry lands in the wrong bit."""
+    src = _fmt_operand_read(ops[1])
+    width = _operand_width(ops[0]) or 4
+    if ops[1].type == "imm" and width < 4:
+        return f"(({src}) & 0x{(1 << width * 8) - 1:X}u)"
+    return src
+
+
 def _fmt_operand_read(op):
     """Format reading any operand type."""
     if op.type == "reg":
@@ -2101,7 +2113,7 @@ class Lifter:
             return [f"/* {m}: bad operands */"]
         c_op = {"add": "+", "sub": "-", "and": "&", "or": "|", "xor": "^"}[m]
         dst = _fmt_operand_read(ops[0])
-        src = _fmt_operand_read(ops[1])
+        src = _narrow_source(ops)
         # XOR reg, reg → zero
         if m == "xor" and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             out = ["_cf = 0; /* xor clears CF */"] if self.needs_cf else []
@@ -2167,7 +2179,7 @@ class Lifter:
         if len(ops) < 2:
             return ["/* sbb: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        src = _fmt_operand_read(ops[1])
+        src = _narrow_source(ops)
         # sbb reg, reg is a common idiom: result is 0 or 0xFFFFFFFF depending on CF
         if ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
             return [_fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0")
@@ -2184,7 +2196,7 @@ class Lifter:
         if len(ops) < 2:
             return ["/* adc: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        src = _fmt_operand_read(ops[1])
+        src = _narrow_source(ops)
         w = (_operand_width(ops[0]) or 4) * 8
         return ["{ uint64_t _t = (uint64_t)(%s) + (uint64_t)(%s) + (uint64_t)_cf;"
                 " _cf = (int)((_t >> %d) & 1); %s }  /* adc */"

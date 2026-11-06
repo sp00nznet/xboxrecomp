@@ -1,4 +1,5 @@
-"""Differential FP/SIMD checks: lifted C against the same bytes on the CPU.
+"""Differential checks of x87, SSE, MMX and integer flag semantics: lifted C
+against the same bytes on the CPU.
 
     python -m tools.recomp.fpdiff --out <scratch-dir> [-k substring]
         [--include <dir> --prelude <file>]
@@ -9,6 +10,10 @@ FunctionTranslator emits for the same bytes, from identical inputs. eax, the
 x87 stack, every XMM lane and the scratch buffer are compared exactly, except
 that two NaNs always match and the transcendentals carry a tolerance. No game
 bytes or addresses are involved.
+
+The integer cases (int_*, join_*) put every flag consumer after each setter
+at each width, directly and across a join of two paths that set the flags
+differently, and skip the conditions Intel leaves undefined.
 
 By default the lifted side builds against templates/runtime. A project with
 its own recomp_types.h passes that directory as --include, and a --prelude
@@ -308,6 +313,90 @@ def cases():
     add("movd_gpr", mmx + ["movd ecx, mm1", "mov eax, ecx", "emms"], "sse")
     add("movq_reg", mmx + ["movq mm0, mm1"] + keep, "sse")
     add("movntq_store", mmx + ["movntq qword ptr [eax+32], mm1", "emms"], "sse")
+
+    # Integer flags: [0] a, [4] path selector / carry-in, [16] b; the
+    # destination is stored to [32]. Each setter is followed directly by every
+    # consumer, as compilers emit it.
+    load = ["mov edx, dword ptr [eax]", "mov ebx, dword ptr [eax+16]",
+            "mov esi, dword ptr [eax+4]"]
+    regs = {1: ("dl", "bl"), 2: ("dx", "bx"), 4: ("edx", "ebx")}
+    no_of = ("o", "no", "l", "ge", "le", "g")    # read OF
+
+    def branch(cc):
+        return [f"j{cc} taken", "mov ecx, 0", "jmp done", "taken: mov ecx, 1",
+                "done: mov dword ptr [eax+32], edx", "mov eax, ecx"]
+
+    def setter(op, d, s):
+        """The instructions, and the conditions Intel leaves undefined."""
+        if op in ("inc", "dec", "neg"):
+            # inc/dec keep CF: give it a known value first.
+            return ["cmp esi, ebx", f"{op} {d}"], ()
+        if op in ("adc", "sbb"):
+            return ["shr esi, 1", f"{op} {d}, {s}"], ()
+        if op.endswith("_m1"):
+            # A narrow immediate, which the disassembler sign-extends to 32 bits.
+            return ["shr esi, 1", f"{op[:-3]} {d}, -1"], ()
+        if op.endswith("_1") or op.endswith("_4"):
+            name, count = op.split("_")
+            return [f"{name} {d}, {count}"], (no_of if count != "1" else ())
+        if op == "imul":
+            return [f"imul {d}, {s}"], tuple(c for c in CC16
+                                              if c not in ("o", "no", "b", "ae"))
+        if op == "cmp_imm":
+            return [f"cmp {d}, 1"], ()
+        if op == "test_self":
+            return [f"test {d}, {d}"], ()
+        return [f"{op} {d}, {s}"], ()
+
+    ops = ("cmp", "test", "add", "sub", "and", "or", "xor", "adc", "sbb",
+           "inc", "dec", "neg", "shl_1", "shr_1", "sar_1", "shl_4", "shr_4",
+           "sar_4", "imul", "cmp_imm", "test_self",
+           "add_m1", "sub_m1", "adc_m1", "sbb_m1")
+    for op in ops:
+        for width, (d, s) in regs.items():
+            if op == "imul" and width == 1:
+                continue
+            asm, undefined = setter(op, d, s)
+            for cc in CC16:
+                if cc in undefined:
+                    continue
+                add(f"int_{op}{width * 8}_j{cc}", load + asm + branch(cc), "sse")
+                add(f"int_{op}{width * 8}_set{cc}", load + asm
+                    + [f"set{cc} cl", "movzx ecx, cl",
+                       "mov dword ptr [eax+32], edx", "mov eax, ecx"], "sse")
+    # The operands change before the branch reads the flags.
+    for op in ("cmp", "test", "add", "sub", "and", "inc", "neg", "sbb"):
+        for width, (d, s) in regs.items():
+            asm, undefined = setter(op, d, s)
+            for cc in CC16:
+                if cc not in undefined:
+                    add(f"int_{op}{width * 8}_clobber_j{cc}", load + asm
+                        + ["mov edx, 0x5a5a5a5a", "mov ebx, 0xa5a5a5a5"]
+                        + branch(cc), "sse")
+
+    # Joins: two paths set the flags differently and one jcc reads them.
+    joins = {
+        "cmp32_cmp8": (["cmp edx, ebx"], ["cmp dl, bl"]),
+        "cmp32_cmp16": (["cmp edx, ebx"], ["cmp dx, bx"]),
+        "cmp16_cmp8": (["cmp dx, bx"], ["cmp dl, bl"]),
+        "cmp32_cmp8imm": (["cmp edx, ebx"], ["cmp dl, 1"]),
+        "test32_test8": (["test edx, ebx"], ["test dl, bl"]),
+        "test32_test16": (["test edx, ebx"], ["test dx, bx"]),
+        "cmp32_sub32": (["cmp edx, ebx"], ["sub edx, ebx"]),
+        "sub32_add32": (["sub edx, ebx"], ["add edx, ebx"]),
+        "sub32_dec32": (["sub edx, ebx"], ["dec edx"]),
+        "and32_or32": (["and edx, ebx"], ["or edx, ebx"]),
+        "cmp32_test32": (["cmp edx, ebx"], ["test edx, ebx"]),
+        "add8_add32": (["add dl, bl"], ["add edx, ebx"]),
+    }
+    for name, (one, other) in joins.items():
+        for cc in CC16:
+            add(f"join_{name}_j{cc}", load + ["test esi, 1", "jz other"] + one
+                + ["jmp join", "other: nop"] + other + ["join: nop"] + branch(cc),
+                "sse")
+    for c in out:
+        if c["name"].startswith(("int_", "join_")):
+            c["data"] = "int"
     return out
 
 
@@ -321,6 +410,19 @@ def _f32(x):
 def inputs(kind, random_count=96):
     """64-byte scratch images, the same for every case of a kind."""
     rng = random.Random(0xF9D1FF)
+    if kind == "int":
+        # Edges of every operand width; each pair once down each join path.
+        edges = [0, 1, 2, 0x3F, 0x40, 0x7E, 0x7F, 0x80, 0x81, 0xFE, 0xFF, 0x100,
+                 0x7FFF, 0x8000, 0x8001, 0xFFFF, 0x10000, 0x7FFFFFFF,
+                 0x80000000, 0x80000001, 0xFFFFFF80, 0xFFFF8000, 0xFFFFFFFF,
+                 0x12345678]
+        rows = [(a, sel, b) for a in edges for b in edges for sel in (0, 1)]
+        for _ in range(random_count * 2):
+            pick = rng.choice((8, 16, 32))
+            rows.append((rng.getrandbits(pick), rng.getrandbits(32),
+                         rng.getrandbits(pick)))
+        return [struct.pack("<4I", a, sel, 0, 0) + struct.pack("<4I", b, 0, 0, 0)
+                + bytes(32) for a, sel, b in rows]
     if kind == "fpu":
         edges = [0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 1.5, 2.5, -2.5, 3.0, 0.1,
                  -7.75, 10.5, 1e-310, -1e-310, 2.0 ** -1074, 2.0 ** -1022,
@@ -456,17 +558,18 @@ def source(prepared, prelude=None):
         out.append(f"static void lif_{c['name']}(void) {{\n{pro}\n"
                    "    g_esp = (uint32_t)(uintptr_t)(g_guest_stack + sizeof(g_guest_stack) / 2);\n"
                    f"    fn_{c['name']}();\n{epi}\n}}")
-    for kind in ("fpu", "sse"):
+    for data in sorted({c.get("data", c["kind"]) for c, _, _ in prepared}):
         rows = ",\n".join("{" + ",".join(f"0x{v:02x}" for v in row) + "}"
-                          for row in inputs(kind))
-        out.append(f"static const unsigned char input_{kind}[][64] = {{\n{rows}\n}};")
+                          for row in inputs(data))
+        out.append(f"static const unsigned char input_{data}[][64] = {{\n{rows}\n}};")
     body = ["int main(void) {", "    int vec, shown, fails, runs; g_scratch_ptr = g_scratch;"]
     for c, _, unsup in prepared:
         name, kind, fpu = c["name"], c["kind"], int(c["kind"] == "fpu")
+        data = c.get("data", kind)
         body.append(f"""    shown = 0; fails = 0; unsupported = 0; runs = 0; g_exact = {c['exact']};
-    for (vec = 0; vec < (int)(sizeof input_{kind} / 64); ++vec) {{
+    for (vec = 0; vec < (int)(sizeof input_{data} / 64); ++vec) {{
         double a, b;
-        memcpy(saved, input_{kind}[vec], 64); memcpy(g_scratch, saved, 64);
+        memcpy(saved, input_{data}[vec], 64); memcpy(g_scratch, saved, 64);
         memcpy(&a, saved, 8); memcpy(&b, saved + 16, 8);
         if (!({c['domain']})) continue;
         runs++;

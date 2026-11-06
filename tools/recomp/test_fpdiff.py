@@ -30,6 +30,10 @@ CASES = (
     # SSE conversions under MXCSR, rcp/rsqrt estimates, SSE2 scalar doubles.
     "cvts", "cvtt", "cvtps", "cvtpi", "rcp", "rsqrt", "addsd", "subsd",
     "mulsd", "divsd", "minsd", "maxsd", "sqrtsd", "comisd", "ucomisd",
+    # A narrow immediate's carry, zero and sign after add, sub, adc and sbb.
+    *(f"int_{op}_m1{width}_{form}{cc}" for op in ("add", "sub", "adc", "sbb")
+      for width in (8, 16) for form in ("j", "set")
+      for cc in ("b", "ae", "e", "ne", "s", "ns")),
 )
 
 
