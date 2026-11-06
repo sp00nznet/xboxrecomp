@@ -5553,16 +5553,31 @@ static void bridge_KeDisconnectInterrupt(void)
 /* KeQueryBasePriorityThread (ordinal 124, 1 arg). The implementation has
  * existed in kernel_thread.c all along; only the bridge wrapper was
  * missing, so the thunk fell through to the fallback and returned 0. */
+/* The host thread behind a guest thread object: the KE shadow holds one for
+ * every spawned worker, and the calling thread's own object is itself. The
+ * object VA used to be passed on as if it were a host handle, so
+ * Get/SetThreadPriority failed on every call and no title's priorities ever
+ * took effect -- Kung Fu Chaos raises its loader thread, and without that the
+ * order between it and the main thread on the way out of GET READY was free
+ * to differ from the console's. */
+static HANDLE bridge_thread_host(uint32_t obj)
+{
+    HANDLE h = ke_shadow_lookup(obj);
+    if (!h && obj && obj == g_thread_obj_va)
+        h = GetCurrentThread();
+    return h;
+}
+
 static void bridge_KeQueryBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeQueryBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+    HANDLE h = bridge_thread_host(STACK_ARG(0));
+    g_eax = h ? (uint32_t)xbox_KeQueryBasePriorityThread(h) : 0;
 }
 
 static void bridge_KeSetBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
+    HANDLE h = bridge_thread_host(STACK_ARG(0));
+    g_eax = h ? (uint32_t)xbox_KeSetBasePriorityThread(h, (LONG)STACK_ARG(1)) : 0;
 }
 
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */
