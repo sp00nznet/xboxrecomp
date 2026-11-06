@@ -619,6 +619,69 @@ static void stall_fallback_case(void)
     free(d);
 }
 
+/* ---- the frame decision ----
+ * DirectSound's SSL service routine stops the sequencer and starts it again
+ * (SECTL 0x07, then 0x0F a few hundred microseconds later). A frame that
+ * reads SECTL inside that gap must not be played as a silent slice: it is
+ * held, like a trapped front end. A sequencer that stays off past the hold,
+ * or that never rendered, gets lightweight frames as before. */
+#define SECTL_ON  0x0Fu
+#define SECTL_OFF 0x07u
+
+static void frame_kind_case(void)
+{
+    MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(*d));
+    int light = 0, held = 0, render = 0;
+    int64_t t;
+
+    if (!d) { failures++; return; }
+    d->regs[NV_PAPU_SECTL] = SECTL_OFF;
+    CHECK("off before the VP ever rendered: lightweight",
+          mcpx_apu_frame_kind(d, 0) == APU_FRAME_LIGHT);
+    d->regs[NV_PAPU_SECTL] = SECTL_ON;
+    CHECK("sequencer on: render", mcpx_apu_frame_kind(d, 100) == APU_FRAME_RENDER);
+
+    d->regs[NV_PAPU_SECTL] = SECTL_OFF;
+    CHECK("off after rendering: held", mcpx_apu_frame_kind(d, 1000) == APU_FRAME_HELD);
+    CHECK("still off 300 us later: held", mcpx_apu_frame_kind(d, 1300) == APU_FRAME_HELD);
+    d->regs[NV_PAPU_SECTL] = SECTL_ON;
+    CHECK("on again: render", mcpx_apu_frame_kind(d, 1400) == APU_FRAME_RENDER);
+
+    d->regs[NV_PAPU_SECTL] = SECTL_OFF;
+    CHECK("a new stop is held from its own start",
+          mcpx_apu_frame_kind(d, 10000) == APU_FRAME_HELD &&
+          mcpx_apu_frame_kind(d, 14999) == APU_FRAME_HELD);
+    CHECK("off past the hold: lightweight",
+          mcpx_apu_frame_kind(d, 15000) == APU_FRAME_LIGHT);
+    CHECK("and stays lightweight, not held again",
+          mcpx_apu_frame_kind(d, 15100) == APU_FRAME_LIGHT &&
+          mcpx_apu_frame_kind(d, 90000) == APU_FRAME_LIGHT);
+
+    d->regs[NV_PAPU_SECTL] = SECTL_ON;
+    d->regs[NV_PAPU_FECTL] = NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
+    CHECK("front end trapped: trapped", mcpx_apu_frame_kind(d, 100000) == APU_FRAME_TRAPPED);
+    d->regs[NV_PAPU_FECTL] = 0;
+    CHECK("front end free: render", mcpx_apu_frame_kind(d, 100100) == APU_FRAME_RENDER);
+
+    /* Ten seconds of the opening scene's pattern: a frame every 0.67 ms, the
+     * sequencer off for 300 us every 43 ms, and a held frame asking again
+     * every 100 us. No frame is played as a lightweight (silent) slice. */
+    for (t = 200000; t < 10200000; ) {
+        int64_t phase = (t - 200000) % 43000;
+        d->regs[NV_PAPU_SECTL] = phase >= 21000 && phase < 21300 ? SECTL_OFF : SECTL_ON;
+        int k = mcpx_apu_frame_kind(d, t);
+        if (k == APU_FRAME_RENDER) { render++; t += 667; }
+        else if (k == APU_FRAME_HELD) { held++; t += 100; }
+        else { light++; t += 667; }
+    }
+    printf("frame kind: 10 s with SSL stops: %d rendered, %d held passes,"
+           " %d lightweight\n", render, held, light);
+    CHECK("SSL stops: the slice waits instead of playing silent", light == 0);
+    CHECK("SSL stops: frames were held", held > 0);
+    CHECK("SSL stops: the frames all render", render > 14900);
+    free(d);
+}
+
 /* ---- the switches ----
  * The reader against what the ctest set: on with =1, off unset or =0. */
 static void switch_case(void)
@@ -704,6 +767,7 @@ int main(int argc, char **argv)
     trapped_case();
     stall_fallback_case();
     starve_case();
+    frame_kind_case();
     switch_case();
     voice_trace_case();                      /* last: they redirect stderr */
     ring_case();

@@ -1090,6 +1090,50 @@ static void se_frame(MCPXAPUState *d)
     mcpx_debug_end_frame();
 }
 
+/* What the frame thread does with the next frame.
+ *
+ * DirectSound's sample-limit service routine (XDK 5849, each SSL, 2048
+ * samples) stops the sequencer and starts it again: SECTL 0x07, then 0x0F
+ * 150-400 us later, every 43 ms. Hardware loses no slice to that. This thread
+ * reads SECTL once per 32-sample frame, and a frame that read it inside the
+ * gap took the lightweight branch, which plays the slice as silence: about
+ * 1,300 holes of one slice of digital zero per 330 s in Def Jam: Fight for
+ * NY's opening scene. A sequencer that was rendering and reads off is now held
+ * like a trapped front end -- no frame, a wait for the title's next SECTL write
+ * -- for up to APU_SEQ_HOLD_US. One that stays off longer (the title stopped
+ * it) gets lightweight frames as before, so the software mixer and the test
+ * tone keep running, and is not held again until the VP has rendered. */
+#define APU_SEQ_HOLD_US 5000
+
+int mcpx_apu_frame_kind(MCPXAPUState *d, int64_t now_us)
+{
+    int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                            NV_PAPU_SECTL_XCNTMODE);
+    uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+
+    if (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF) {
+        if (!d->seq_ran || g_test_tone.active)
+            return APU_FRAME_LIGHT;
+        if (!d->seq_off) {
+            d->seq_off = true;
+            d->seq_off_us = now_us;
+        }
+        if (now_us - d->seq_off_us < APU_SEQ_HOLD_US)
+            return APU_FRAME_HELD;
+        d->seq_ran = false;
+        return APU_FRAME_LIGHT;
+    }
+    d->seq_off = false;
+    if (g_test_tone.active)
+        return APU_FRAME_LIGHT;
+    /* A bit test, so HALTED (0x80, a subset of TRAPPED's 0xE0) counts
+     * too: xemu's frame thread idles in both modes. */
+    if (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+        return APU_FRAME_TRAPPED;
+    d->seq_ran = true;
+    return APU_FRAME_RENDER;
+}
+
 /* ============================================================
  * APU frame thread (background processing)
  * ============================================================ */
@@ -1152,22 +1196,13 @@ static void *mcpx_apu_frame_thread(void *arg)
          * sub_002F805E polling the same doorbell it was acked on at init. */
         mcpx_apu_dsp_ack_poll(d);
 
-        int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
-                                NV_PAPU_SECTL_XCNTMODE);
-        uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+        int kind = mcpx_apu_frame_kind(d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
+        bool fe_trapped = kind == APU_FRAME_TRAPPED;
+        bool seq_held = kind == APU_FRAME_HELD;
 
-        /* A bit test, so HALTED (0x80, a subset of TRAPPED's 0xE0) counts
-         * too: xemu's frame thread idles in both modes. */
-        bool fe_trapped = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !g_test_tone.active;
+        hs_trap(fe_trapped || seq_held);
 
-        hs_trap(fe_trapped);
-
-        if (apu_active && !g_test_tone.active) {
+        if (kind == APU_FRAME_RENDER) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
         } else if (fe_trapped) {
@@ -1185,6 +1220,10 @@ static void *mcpx_apu_frame_thread(void *arg)
              * zero in streamed music every few seconds). The interrupt is
              * delivered below; the wait is after it. */
             apu_irq_stats.fe_trapped_frames++;
+        } else if (seq_held) {
+            /* The sequencer is stopped for the moment (DirectSound's SSL
+             * service routine; mcpx_apu_frame_kind): no frame, as for a
+             * trapped front end. The wait is below. */
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
@@ -1246,6 +1285,11 @@ static void *mcpx_apu_frame_thread(void *arg)
             /* Still trapped after the delivery (held off at raised IRQL, or
              * cleared from a DPC): give the title a millisecond with the lock
              * dropped rather than spinning on it. */
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+        } else if (seq_held &&
+                   GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                            NV_PAPU_SECTL_XCNTMODE) == NV_PAPU_SECTL_XCNTMODE_OFF) {
+            /* The SECTL write that starts it again signals d->cond. */
             qemu_cond_timedwait(&d->cond, &d->lock, 1);
         }
     }
