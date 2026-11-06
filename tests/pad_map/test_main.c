@@ -726,10 +726,64 @@ static void test_square(void)
         CHECK(x == sx * 32767 && y == sy * 32767, "diagonal %d,%d: %d,%d", sx, sy, x, y);
     }
 
-    /* Half deflection on the diagonal: the radius becomes the larger axis. */
-    x = 11585; y = 11585;
+    /* Rim only: inside 0.7 of full the stick keeps its true
+     * length, so drift and a partial tilt are not stretched; BLiNX 1's 0.4
+     * deadzone is what drift at 0.35 must stay under. */
+    {
+        static const struct { double r; double lo, hi; } in[] = {
+            { 0.35, 0.349, 0.351 },     /* drift near a diagonal */
+            { 0.40, 0.399, 0.401 },     /* the game's deadzone edge */
+            { 0.50, 0.499, 0.501 },     /* half tilt */
+            { 0.70, 0.699, 0.701 },     /* the blend starts here */
+        };
+        for (size_t i = 0; i < sizeof in / sizeof in[0]; i++)
+            for (int deg = 0; deg < 360; deg += 15) {
+                double rad = deg * 3.14159265358979323846 / 180, len;
+                x = (SHORT)lround(in[i].r * 32767 * cos(rad));
+                y = (SHORT)lround(in[i].r * 32767 * sin(rad));
+                xbox_InputSquareStick(&x, &y);
+                len = sqrt((double)x * x + (double)y * y) / 32767;
+                CHECK(len >= in[i].lo && len <= in[i].hi, "r %.2f at %d deg: length %.4f",
+                      in[i].r, deg, len);
+            }
+    }
+    x = 11585; y = 11585;                            /* half, on the diagonal */
     xbox_InputSquareStick(&x, &y);
-    CHECK(x == 16384 && y == 16384, "half diagonal: %d,%d", x, y);
+    CHECK(x == 11585 && y == 11585, "half diagonal: %d,%d", x, y);
+
+    /* Past 0.7 the stretch grows with the length, never shrinks it, and
+     * the output length rises monotonically along the diagonal up to the
+     * corner (23170, the last step, included). */
+    {
+        double prev = 0;
+        int mono = 1;
+        for (int v = 0; v <= 23170; v = v < 23170 && v + 37 > 23170 ? 23170 : v + 37) {
+            double len;
+            x = (SHORT)v; y = (SHORT)v;
+            xbox_InputSquareStick(&x, &y);
+            len = sqrt((double)x * x + (double)y * y);
+            mono &= x == y && len >= prev && x >= v;
+            prev = len;
+        }
+        CHECK(mono, "the diagonal is not monotonic up to the corner");
+    }
+
+    /* The blend's shape, pinned: smoothstep from 0.7 to full, as
+     * 1 + (sqrt 2 - 1) * t at 45 degrees and the per-angle k elsewhere. */
+    {
+        static const SHORT pin[][4] = {
+            { 16220, 16220, 16220, 16220 },  /* r 0.70 at 45: the blend's start */
+            { 18536, 18536, 20527, 20527 },  /* r 0.80 at 45 */
+            { 19694, 19694, 23772, 23772 },  /* r 0.85 at 45 */
+            { 27245, 11285, 28908, 11974 },  /* r 0.90 at 22.5 */
+        };
+        for (size_t i = 0; i < sizeof pin / sizeof pin[0]; i++) {
+            x = pin[i][0]; y = pin[i][1];
+            xbox_InputSquareStick(&x, &y);
+            CHECK(abs(x - pin[i][2]) <= 1 && abs(y - pin[i][3]) <= 1,
+                  "%d,%d: %d,%d want %d,%d", pin[i][0], pin[i][1], x, y, pin[i][2], pin[i][3]);
+        }
+    }
 
     /* 30 degrees on the unit circle: the angle is kept, the larger axis
      * reaches full, and nothing leaves int16. */
@@ -737,24 +791,26 @@ static void test_square(void)
     xbox_InputSquareStick(&x, &y);
     CHECK(x == 32767 && abs(y - 18917) <= 1, "30 degrees: %d,%d", x, y);
 
-    /* Every point of the round gate: max(|x|,|y|) == min(r, 32767) within
-     * rounding, the angle within rounding, and k never below 1. */
+    /* Every point of the round gate: the signs and the angle are kept, the
+     * stretch is never below 1, at most the full circle-to-square k, and
+     * nothing overflows (clamp16; -32768 included). On the rim
+     * (r >= 32767) max(|x|,|y|) is the full 32767 or the axis already
+     * past it. */
     for (int a = -32768; a <= 32767; a += 191)
         for (int b = -32768; b <= 32767; b += 211) {
-            double r = sqrt((double)a * a + (double)b * b), mx, want;
+            double r = sqrt((double)a * a + (double)b * b), mx, ma, full;
             x = (SHORT)a; y = (SHORT)b;
             xbox_InputSquareStick(&x, &y);
             mx = abs(x) > abs(y) ? abs(x) : abs(y);
-            want = r > 32767 ? 32767 : r;
-            if (abs(a) > abs(b) ? abs(a) : abs(b)) {
-                double ma = abs(a) > abs(b) ? abs(a) : abs(b);
-                if (want < ma) want = ma;   /* k >= 1: never shrinks */
-            }
-            bad += fabs(mx - want) > 1
+            ma = abs(a) > abs(b) ? abs(a) : abs(b);
+            full = r > 32767 ? 32767 : r;
+            if (full < ma) full = ma;
+            bad += mx < ma - 0.5 || mx > full + 1
+                || (r >= 32767 && fabs(mx - full) > 1)
                 || ((a < 0) != (x < 0) && a) || ((b < 0) != (y < 0) && b)
                 || fabs((double)x * b - (double)y * a) > 1.5 * (fabs(a) + fabs(b) + 1);
         }
-    CHECK(!bad, "%d gate points off the square or off their angle", bad);
+    CHECK(!bad, "%d gate points off their angle, shrunk or past the square", bad);
 
     /* In the setup: off is the identity and changes nothing; on is not, and
      * runs after the RECOMP_PAD_DEADZONE rescale (radial, so the diagonal
@@ -789,6 +845,13 @@ static void test_square(void)
     xbox_PadRawXInput(&xi, 0, &raw);
     xbox_PadSetupApply(&s, &raw, &g);
     CHECK(g.sThumbLX == 0 && g.sThumbLY == 0, "inside the deadzone: %d,%d", g.sThumbLX, g.sThumbLY);
+    /* The rescale keeps full at full, so the rim, measured after it,
+     * still takes a full diagonal to the corner. */
+    xi.sThumbLX = 23170; xi.sThumbLY = -23170;
+    xbox_PadRawXInput(&xi, 0, &raw);
+    xbox_PadSetupApply(&s, &raw, &g);
+    CHECK(g.sThumbLX == 32767 && g.sThumbLY == -32767, "deadzone, full diagonal: %d,%d",
+          g.sThumbLX, g.sThumbLY);
     xbox_InputSetDeadzone(0);
 }
 

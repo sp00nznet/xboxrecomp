@@ -69,18 +69,30 @@ static SHORT clamp16(double v)
     return (SHORT)(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
 }
 
+/* A square gate does not move the stick: near the centre it reads the true
+ * position and only lets the stick go further at the corners. So only the
+ * rim is stretched: k blends in as k' = 1 + (k - 1) * t, t a smoothstep of
+ * the length from SQUARE_RIM_LO to full, and a full diagonal still reads the
+ * corner. Smoothstep's zero slope at SQUARE_RIM_LO joins the identity
+ * without a kink. The cost is a steep band: at 45 degrees the output length
+ * moves up to about 3x as fast as the input, near 0.87 of full. */
+#define SQUARE_RIM_LO 0.7
+
 void xbox_InputSquareStick(SHORT *x, SHORT *y)
 {
     double fx = *x, fy = *y;
     double mx = fabs(fx) > fabs(fy) ? fabs(fx) : fabs(fy);
-    double m = sqrt(fx * fx + fy * fy), k;
+    double m = sqrt(fx * fx + fy * fy), k, t;
     if (mx == 0)
         return;
     if (m > 32767)
         m = 32767;
     k = m / mx;
-    if (k <= 1)
+    t = (m / 32767.0 - SQUARE_RIM_LO) / (1.0 - SQUARE_RIM_LO);
+    if (k <= 1 || t <= 0)
         return;
+    if (t < 1)
+        k = 1 + (k - 1) * t * t * (3 - 2 * t);
     *x = clamp16(fx * k);
     *y = clamp16(fy * k);
 }

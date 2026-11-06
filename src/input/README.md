@@ -153,9 +153,14 @@ and fails if the table below and the code disagree. Regenerate it with
   that drift.
 - A modern pad's gate is round, the Duke's was square: its diagonal read
   about (32767, 32767). `input.pad_square_left` / `_right` (enhancements,
-  default off) stretch a host stick along its angle by
-  `max(1, min(|v|, 32767) / max(|x|, |y|))`, so a round diagonal reaches
-  the corner again; cardinals, the deadzone and -32768 are unchanged.
+  default off) stretch a host stick along its angle toward the square, so
+  a round diagonal reaches the corner again. Only the rim is stretched:
+  with `k = min(|v|, 32767) / max(|x|, |y|)` the scale is
+  `1 + (k - 1) · smoothstep(0.7, 1, |v| / 32767)`, so under 0.7 of full
+  (drift, a half tilt, a game's 0.4 deadzone) the stick keeps its true
+  length, as a real square gate reads it near the centre. It runs after
+  `RECOMP_PAD_DEADZONE`, whose rescale keeps full at full. Cardinals and
+  -32768 are unchanged.
   `_left` also keeps ramped left-stick keys' diagonal at the corner
   (not with the walk key held).
 - SDL's stick Y points down and is inverted as `-1 - v`, so -32768 and

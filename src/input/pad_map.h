@@ -128,12 +128,12 @@ void xbox_PadMapSdl(const XBOX_HOST_SDL_GAMEPAD *in, XBOX_GAMEPAD *out);
  * unchanged). dz <= 0 is the identity. */
 void xbox_InputApplyDeadzone(SHORT *x, SHORT *y, int dz);
 
-/* Circle to square: scales (x, y) by k = max(1, min(|v|, 32767) / max(|x|,
- * |y|)), keeping the angle, so a full diagonal of a round host gate reads
- * about (32767, 32767) the way the Duke's square gate did. Titles that take
- * the length of a per-axis clamped stick (BLiNX's run speed) only reach full
- * speed on a diagonal from there. k never drops below 1, so cardinals, the
- * deadzone and -32768 pass through unchanged; the result clamps to int16. */
+/* Circle to square, at the rim only: with k = min(|v|, 32767) / max(|x|,
+ * |y|) and t a smoothstep of min(|v|, 32767) / 32767 from 0.7 to 1, scales
+ * (x, y) by max(1, 1 + (k - 1) * t), keeping the angle, so a full diagonal
+ * of a round host gate reads about (32767, 32767) the way the Duke's square
+ * gate did, and a stick under 0.7 of full keeps its true length. Cardinals,
+ * the centre and -32768 pass through unchanged; the result clamps to int16. */
 void xbox_InputSquareStick(SHORT *x, SHORT *y);
 
 /* The deadzone the helpers apply: RECOMP_PAD_DEADZONE (0..32767, default 0),
