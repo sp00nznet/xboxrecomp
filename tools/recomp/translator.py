@@ -2872,7 +2872,7 @@ class FunctionTranslator:
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg", "inc", "dec", "sahf", "fcomi",
+                                 "lock cmpxchg", "inc", "dec", "imul", "mul", "sahf", "fcomi",
                                  "fcomip", "fcompi", "fucomi", "fucomip", "fucompi")
                or insn.mnemonic.removeprefix("lock ") in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):

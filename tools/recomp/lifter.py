@@ -359,7 +359,7 @@ COND_MAP = {
 # Instructions that set arithmetic flags (primary set, fully handled)
 FLAG_SETTERS = frozenset({
     "cmp", "test", "sub", "add", "and", "or", "xor",
-    "inc", "dec", "neg", "shl", "shr", "sar", "imul", "adc", "sbb",
+    "inc", "dec", "neg", "shl", "shr", "sar", "imul", "mul", "adc", "sbb",
     "comiss", "comisd", "ucomiss", "ucomisd",  # SSE float compare
 })
 
@@ -422,7 +422,7 @@ _EFLAGS_SETTERS = frozenset({
 
 # Instructions with undefined/unpredictable flags (clear tracking)
 _FLAGS_UNDEFINED = frozenset({
-    "mul", "div", "idiv",  # Flags partially undefined
+    "div", "idiv",  # Flags partially undefined
     "rdtsc",               # Special instructions
     # popfd is in neither set. It REPLACES every flag with whatever was
     # pushed, so the last comparison is gone, but the new flags are known at
@@ -826,6 +826,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"RECOMP_PARITY8(({lhs}) & ({rhs}))", desc
         if jcc == "jnp":
             return f"(!RECOMP_PARITY8(({lhs}) & ({rhs})))", desc
+        return None
+
+    # ── mul/imul: _fa holds CF = OF, "the product did not fit" ──
+    if flag_setter in ("imul", "mul"):
+        if jcc in ("jo", "jb", "jnae", "jc"):
+            return "(_fa != 0)", desc
+        if jcc in ("jno", "jae", "jnb", "jnc"):
+            return "(_fa == 0)", desc
         return None
 
     # ── PF, OF and the signed conditions of the result snapshot setters ──
@@ -2307,33 +2315,39 @@ class Lifter:
     def _lift_imul(self, insn, ops):
         nops = len(ops)
         if nops == 1:
-            # One operand: edx:eax = eax * ops[0]
-            src = _fmt_operand_read(ops[0])
-            return [
-                f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
-            ]
-        elif nops == 2:
-            # Two operand: dst = dst * src
-            dst = _fmt_operand_read(ops[0])
-            src = _fmt_operand_read(ops[1])
-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} * (int32_t){src})")]
-        elif nops == 3:
-            # Three operand: dst = src1 * imm
-            src = _fmt_operand_read(ops[1])
-            imm = _fmt_operand_read(ops[2])
-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){src} * (int32_t){imm})")]
+            return self._lift_product(ops, signed=True)
+        elif nops in (2, 3):
+            # dst = dst * src, or dst = src * imm
+            a, b = _fmt_operand_read(ops[nops - 2]), _fmt_operand_read(ops[nops - 1])
+            sx = self._SNAP_SX.get(_operand_width(ops[0]) or 4, "(int32_t)")
+            return [f"_fa = ((int64_t){sx}({a}) * (int64_t){sx}({b})"
+                    f" != (int64_t){sx}((uint32_t)({a}) * (uint32_t)({b})));",
+                    _fmt_operand_write(ops[0], f"(uint32_t)((int32_t){a} * (int32_t){b})")]
         return ["/* imul: unexpected form */"]
+
+    def _lift_product(self, ops, signed):
+        width = (_operand_width(ops[0]) or 4) * 8
+        src = _fmt_operand_read(ops[0])
+        narrow = f"{'int' if signed else 'uint'}{width}_t"
+        wide = "int64_t" if signed else "uint64_t"
+        overflow = (f"_r != ({wide})({narrow})_r" if signed
+                    else f"(_r >> {width}) != 0")
+        if width == 8:
+            write = "SET_LO16(eax, _r);"
+        elif width == 16:
+            write = "SET_LO16(eax, _r); SET_LO16(edx, (uint64_t)_r >> 16);"
+        else:
+            write = "eax = (uint32_t)_r; edx = (uint32_t)((uint64_t)_r >> 32);"
+        carry = " _cf = (int)_fa;" if self.needs_cf else ""
+        return [f"{{ {wide} _r = ({wide})({narrow})eax * ({wide})({narrow})({src});",
+                f"  _fa = ({overflow});{carry} {write} }}"]
 
     def _lift_muldiv(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
         src = _fmt_operand_read(ops[0])
         if m == "mul":
-            return [
-                f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",
-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
-            ]
+            return self._lift_product(ops, signed=False)
         elif m == "div":
             return [
                 f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
@@ -2352,14 +2366,15 @@ class Lifter:
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        cnt = _fmt_operand_read(ops[1])
+        cnt = f"(({_fmt_operand_read(ops[1])}) & 31u)"
         out = []
         if self.needs_cf:
             w = (_operand_width(ops[0]) or 4) * 8
-            # CF is the last bit shifted out; a zero count leaves CF alone.
-            bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
-            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}"))
+            # Counts beyond a narrow operand have undefined CF, but the C
+            # must stay defined. A masked zero preserves the incoming carry.
+            bit = f"(({cnt}) - 1) & 31u" if c_op == ">>" else f"({w} - ({cnt})) & 31u"
+            out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({dst}) >> ({bit})) & 1u);")
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)({dst}) {c_op} {cnt}"))
         out.append(self._result_snapshot(ops, "shift"))
         return out
 
@@ -2399,7 +2414,7 @@ class Lifter:
         signed = f"(int32_t)(int{width}_t)({dst})"
         out = []
         if self.needs_cf:
-            out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed}) >> (({cnt}) - 1)) & 1);")
+            out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed}) >> ((({cnt}) - 1) & 31u)) & 1);")
         out.append(_fmt_operand_write(ops[0], f"(uint32_t)(({signed}) >> {cnt})"))
         out.append(self._result_snapshot(ops, "sar"))
         return out
@@ -3774,6 +3789,12 @@ class Lifter:
         """Basic FPU instruction translation using double locals."""
         # FPU is complex. We translate common patterns to double operations.
         # Full accuracy would require an x87 stack emulator.
+
+        if m in ("fnsave", "frstor") and ops and ops[0].type == "mem":
+            # Capstone reports this aggregate operand as a dword. The 66
+            # prefix, not mem_size, selects the 14-byte environment.
+            short_env = int(bytes.fromhex(insn.bytes_hex).split(b"\xdd", 1)[0].find(b"\x66") >= 0)
+            return [f"recomp_{m}({_fmt_mem(ops[0])}, {short_env});"]
 
         if m == "fld":
             if len(ops) >= 1:

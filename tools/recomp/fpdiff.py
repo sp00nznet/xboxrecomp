@@ -374,6 +374,46 @@ def cases():
                         + ["mov edx, 0x5a5a5a5a", "mov ebx, 0xa5a5a5a5"]
                         + branch(cc), "sse")
 
+    # Masked shift counts, narrow implicit products, and x87 save/restore.
+    for op in ("shl", "shr", "sar", "rol", "ror"):
+        for width, (d, _) in regs.items():
+            for count in (0, 1, 7, 8, 15, 16, 31, 32, 33, 63, 255):
+                for form in ("imm", "cl"):
+                    operand = str(count) if form == "imm" else "cl"
+                    add(f"intops_{op}{width * 8}_{form}{count}", load
+                        + [f"mov ecx, {count}", f"{op} {d}, {operand}",
+                           "mov dword ptr [eax+32], edx", "mov eax, 0"], "sse")
+    for op in ("shl", "shr", "sar"):
+        for width, (d, _) in regs.items():
+            for count in (0, 1, 31, 32, 33, 255):
+                if op != "sar" and (count & 31) >= width * 8:
+                    continue  # CF is undefined at or above the operand width.
+                for form in ("imm", "cl"):
+                    operand = str(count) if form == "imm" else "cl"
+                    add(f"intops_carry_{op}{width * 8}_{form}{count}", load
+                        + [f"mov ecx, {count}", "stc", f"{op} {d}, {operand}",
+                           "setc cl", "movzx ecx, cl", "mov dword ptr [eax+32], edx",
+                           "mov dword ptr [eax+36], ecx", "mov eax, 0"], "sse")
+    for op in ("mul", "imul"):
+        for width, src in ((8, "bl"), (16, "bx"), (32, "ebx")):
+            for source in (src, {8: "byte", 16: "word", 32: "dword"}[width]
+                           + " ptr [esi+16]"):
+                form = "reg" if source == src else "mem"
+                add(f"intops_{op}{width}_{form}",
+                    ["mov esi, eax", "mov ebx, dword ptr [esi+16]",
+                     "mov eax, dword ptr [esi]", "mov edx, 0xa5a55a5a",
+                     f"{op} {source}", "seto cl", "setc ch",
+                     "mov dword ptr [esi+32], eax",
+                     "mov dword ptr [esi+36], edx",
+                     "mov word ptr [esi+40], cx", "mov eax, 0"], "sse")
+    for action in ("reset", "restore"):
+        asm = ["sub esp, 108"] + two + ["ftst", "fnsave [esp]"]
+        if action == "restore":
+            asm += ["fld1", "fld1", "fld1", "fchs", "ftst", "frstor [esp]"]
+        asm += ["fnstcw word ptr [eax+32]", "fnstsw word ptr [eax+36]",
+                "and word ptr [eax+36], 0x7f00", "add esp, 108"]
+        add(f"intops_fnsave_{action}", asm)
+
     # Joins: two paths set the flags differently and one jcc reads them.
     joins = {
         "cmp32_cmp8": (["cmp edx, ebx"], ["cmp dl, bl"]),
@@ -396,7 +436,7 @@ def cases():
                 + ["jmp join", "other: nop"] + other + ["join: nop"] + branch(cc),
                 "sse")
     for c in out:
-        if c["name"].startswith(("int_", "join_")):
+        if c["name"].startswith(("int_", "join_", "intops_")) and c["kind"] != "fpu":
             c["data"] = "int"
     return out
 

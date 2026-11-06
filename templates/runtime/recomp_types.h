@@ -619,6 +619,48 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
 #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
 
+/* FSAVE's protected-mode image. Only state represented by the double-stack
+ * model is restored: CW, TOP, condition codes and eight registers.
+ * Tags, exception bits and the instruction/data pointers are not modeled; the
+ * image holds zeros there until the x87 environment is tracked. */
+static inline void recomp_fnsave(uint32_t address, int short_env) {
+    unsigned stride = short_env ? 2u : 4u;
+    unsigned env = 7u * stride;
+    unsigned i;
+    for (i = 0; i < env; ++i) MEM8(address + i) = 0;
+    MEM16(address) = g_fp_control_word;
+    MEM16(address + stride) = (uint16_t)((g_fp_top << 11) | g_fp_cc);
+    for (i = 0; i < 8; ++i) {
+        uint64_t mant;
+        uint16_t se = recomp_f80_store(g_fp_stack[(g_fp_top + i) & 7u], &mant);
+        uint32_t slot = address + env + 10u * i;
+        MEM32(slot) = (uint32_t)mant;
+        MEM32(slot + 4) = (uint32_t)(mant >> 32);
+        MEM16(slot + 8) = se;
+    }
+    g_fp_control_word = 0x037fu;
+    g_fp_top = 0;
+    g_fp_cc = 0;
+    g_fp_cmp = 0;
+}
+
+static inline void recomp_frstor(uint32_t address, int short_env) {
+    unsigned stride = short_env ? 2u : 4u;
+    unsigned env = 7u * stride;
+    unsigned i;
+    uint16_t status = MEM16(address + stride);
+    g_fp_control_word = MEM16(address);
+    g_fp_top = (status >> 11) & 7u;
+    g_fp_cc = status & 0x4700u;
+    g_fp_cmp = (g_fp_cc & 0x0400u) ? 2 : (g_fp_cc & 0x4000u) ? 0
+        : (g_fp_cc & 0x0100u) ? -1 : 1;
+    for (i = 0; i < 8; ++i) {
+        uint32_t slot = address + env + 10u * i;
+        uint64_t mant = ((uint64_t)MEM32(slot + 4) << 32) | MEM32(slot);
+        g_fp_stack[(g_fp_top + i) & 7u] = recomp_f80_load(mant, MEM16(slot + 8));
+    }
+}
+
 /* ================================================================
  * SSE / XMM register state
  *
