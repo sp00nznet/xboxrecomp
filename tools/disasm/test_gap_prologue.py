@@ -79,6 +79,7 @@ def _detector(insns, functions, prologues):
     det.image = _Image()
     det.functions = {f.start: f for f in functions}
     det._candidates = {}
+    det._alias_entries = {}
     det.added = []
     det._add_candidate = lambda addr, conf, why: det.added.append((addr, why))
     return det

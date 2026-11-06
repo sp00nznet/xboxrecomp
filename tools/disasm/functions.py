@@ -463,12 +463,14 @@ class FunctionDetector:
         return added
 
     def _gap_prologue_sweep(self, past_padding_only: bool) -> bool:
-        bounds = sorted((f.start, f.end) for f in self.functions.values())
-        starts = [b[0] for b in bounds]
+        bodies = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bodies]
+        covered = self._merged_ranges(bodies + self._gap_alias_bodies(bodies))
+        covered_starts = [r[0] for r in covered]
 
         def in_a_gap(addr: int) -> bool:
-            i = bisect.bisect_right(starts, addr) - 1
-            return not (i >= 0 and addr < bounds[i][1])
+            i = bisect.bisect_right(covered_starts, addr) - 1
+            return not (i >= 0 and addr < covered[i][1])
 
         added = False
         for insn in list(self.engine.instructions.values()):
@@ -482,7 +484,8 @@ class FunctionDetector:
                 if padded == nxt or padded % 16:
                     continue
                 nxt, past_padding = padded, True
-            if nxt in self._candidates or nxt in self.functions:
+            if (nxt in self._candidates or nxt in self.functions
+                    or nxt in self._alias_entries):
                 continue
             section = self.image.get_section_at_va(nxt)
             if section is None or not section.executable:
@@ -513,6 +516,50 @@ class FunctionDetector:
                                 "gap_prologue")
             added = True
         return added
+
+    def _gap_alias_bodies(self, bodies) -> List[Tuple[int, int]]:
+        """The code each alias in a gap owns, measured as its own body.
+
+        A method reached only through a table is an alias here, not a
+        function, so its bytes look like a gap. Swept as a start, a title's
+        vtable method that opens with `sub esp` after a ret and padding was
+        then cut at a weak immediate-reference start on one of its own
+        switch arms: three of its four arms fell outside the body, the
+        dispatch became an indirect tail jump that missed at run time, and
+        the method returned with its frame still on the stack. Out-of-line
+        tails that only an alias reaches by a jcc were split off the same
+        way, so each jcc became a call.
+
+        An alias's measured body counts as covered. It is measured to its
+        own ret, not to the next start, so a real function past the alias's
+        padding is still found. A gap alias that tail jumps forward within
+        its gap covers the target too: the sweep leaves that target to be
+        lifted inline through the alias, as before the sweep existed, and
+        any call, table word or immediate naming it still makes it a start.
+        """
+        body_starts = [b[0] for b in bodies]
+        out = []
+        for addr, end in self._alias_entries.items():
+            if addr in self.functions:
+                continue
+            i = bisect.bisect_right(body_starts, addr) - 1
+            if i >= 0 and addr < bodies[i][1]:
+                continue                    # inside a body: already covered
+            j = bisect.bisect_right(body_starts, addr)
+            if j < len(body_starts):
+                end = min(end, body_starts[j])
+            out.append((addr, self._find_function_end(addr, end, end)))
+        return out
+
+    @staticmethod
+    def _merged_ranges(ranges) -> List[Tuple[int, int]]:
+        merged: List[Tuple[int, int]] = []
+        for lo, hi in sorted(ranges):
+            if merged and lo < merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+        return merged
 
     def _closed_body_in_gap(self, addr: int, starts) -> bool:
         """ret, padding, then a closed CFG: the evidence _pass_cc_boundaries
