@@ -488,7 +488,9 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     WCHAR win_path[MAX_PATH];
     if (!translate_obj_path(ObjectAttributes, win_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
-    XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %S", win_path);
+    /* Deletes are rare, and the ones that matter remove saves: always in the
+     * log (XBOX_TRACE is compiled out of release builds). */
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE, "delete %S", win_path);
     if (DeleteFileW(win_path))    return STATUS_SUCCESS;
     if (RemoveDirectoryW(win_path)) return STATUS_SUCCESS;
     return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -662,6 +664,12 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             FILE_DISPOSITION_INFO fdi;
             fdi.DeleteFile = info->DeleteFile;
+            if (info->DeleteFile) {
+                WCHAR p[MAX_PATH];
+                if (!GetFinalPathNameByHandleW(FileHandle, p, MAX_PATH, 0))
+                    wcscpy_s(p, MAX_PATH, L"(handle)");
+                xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE, "delete %S", p);
+            }
             if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi)))
                 xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
                          "SetFileDispositionInfo failed: err=%u", GetLastError());
@@ -1338,7 +1346,7 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     char host_path[MAX_PATH];
     if (!posix_obj_path(ObjectAttributes, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
-    XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %s", host_path);
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE, "delete %s", host_path);
     if (unlink(host_path) == 0) return STATUS_SUCCESS;
     if (rmdir(host_path)  == 0) return STATUS_SUCCESS;
     return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -1482,7 +1490,10 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
              * matches NT "delete on close" semantics exactly. */
             if (info->DeleteFile) {
                 const char* p = w32_handle_path(FileHandle);
-                if (p) unlink(p);
+                if (p) {
+                    xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE, "delete %s", p);
+                    unlink(p);
+                }
             }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
