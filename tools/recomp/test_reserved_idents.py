@@ -120,6 +120,31 @@ class ReservedIdentTest(unittest.TestCase):
                     f"need to be in the reserved set -- or the headers this "
                     f"test includes no longer match a generated TU")
 
+
+    def test_posix_isatty_is_mangled(self):
+        """A guest isatty must not shadow the host libc function."""
+        if os.name != "posix":
+            self.skipTest("POSIX-only host symbol")
+
+        ident = _func_ident(ADDR, "isatty")
+        self.assertEqual(ident, f"isatty_{ADDR:08X}")
+
+        # Negative control: the original declaration conflicts
+        # with the POSIX function declared by unistd.h.
+        rc, _ = _compile(
+            "#include <unistd.h>\n"
+            "void isatty(void) {}\n"
+        )
+        self.assertNotEqual(rc, 0)
+
+        # Mangled guest and real host function coexist.
+        rc, err = _compile(
+            "#include <unistd.h>\n"
+            f"void {ident}(void) {{}}\n"
+            "int host_isatty(void) { return isatty(-1); }\n"
+        )
+        self.assertEqual(rc, 0, err)
+
     def test_ordinary_names_are_left_alone(self):
         """Mangling is not free: it shows up in every trace and backtrace."""
         for name in ("MyGameFunc", "sub_00401000", "CPlayer__Update",

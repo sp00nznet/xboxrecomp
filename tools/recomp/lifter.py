@@ -97,6 +97,8 @@ _FUNC_RESERVED_IDENT = frozenset({
     "atoll", "llabs", "lldiv", "strtof", "strtold", "strtoll", "strtoull",
     # <setjmp.h>
     "longjmp", "setjmp",
+    # POSIX libc: avoid shadowing the host isatty() function.
+    "isatty",
     # Host Win32 API export names (data/win32_api_names.txt) so a guest
     # function named like a linked import does not collide at link time.
 }) | _WIN32_EXPORTS
