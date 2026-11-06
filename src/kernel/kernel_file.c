@@ -278,6 +278,14 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         }
     }
 
+    /* An existing directory opens without FILE_DIRECTORY_FILE too, but Win32
+     * only allows that with backup semantics. */
+    if (!(CreateOptions & (XBOX_FILE_DIRECTORY_FILE | XBOX_FILE_NON_DIRECTORY_FILE))) {
+        DWORD existing = GetFileAttributesW(win_path);
+        if (existing != INVALID_FILE_ATTRIBUTES && (existing & FILE_ATTRIBUTE_DIRECTORY))
+            CreateOptions |= XBOX_FILE_DIRECTORY_FILE;
+    }
+
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
