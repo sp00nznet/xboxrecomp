@@ -25,6 +25,7 @@ set(KERNEL_SOURCES
     guest_vmem.c
     icall_feedback.c
     recomp_trace.c
+    recomp_diff.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
     nv2a_flip_hold.c
