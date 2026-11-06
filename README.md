@@ -429,6 +429,7 @@ Missing a project, or is a row out of date? Open a pull request that edits this 
 | Dead or Alive Xtreme Beach Volleyball | [@NoRain211](https://github.com/NoRain211) | [NoRain211/doaxvb-re](https://github.com/NoRain211/doaxvb-re) | v0.5 (fork) | Windows, macOS, Linux | Playable |
 | Def Jam: Fight for NY | [@vyanhursky](https://github.com/vyanhursky) | [vyanhursky/DefJamFFNY-recomp](https://github.com/vyanhursky/DefJamFFNY-recomp) | v0.16.0 (fork) | Windows, macOS, Linux / Steam Deck | Playable |
 | Jet Set Radio Future | [@andeecollard](https://github.com/andeecollard) | [andeecollard/jsrf-recomp](https://github.com/andeecollard/jsrf-recomp) | v0.8.0 (fork) | macOS (Apple Silicon); Windows experimental | Playable |
+| Kung Fu Chaos | [@maxiumpro](https://github.com/maxiumpro) | [maxiumpro/kungfuchaos-recomp](https://github.com/maxiumpro/kungfuchaos-recomp) | fork | Windows | Playable |
 | Mortal Kombat: Deadly Alliance | [@FOTLabs](https://github.com/FOTLabs) | [FOTLabs/mkda-nx](https://github.com/FOTLabs/mkda-nx) | v0.12.0 (fork) | Nintendo Switch | Playable |
 | SSX 3 | [@koenhendriks](https://github.com/koenhendriks) | [koenhendriks/SSX3-recomp](https://github.com/koenhendriks/SSX3-recomp) | v0.13.1 (fork) | Windows, Linux | Playable |
 | SSX 3 | [@bertibertig](https://github.com/bertibertig) | [bertibertig/SSX3-Recomp](https://github.com/bertibertig/SSX3-Recomp) | v0.14.0 (fork) | Linux; Windows experimental | Playable |
