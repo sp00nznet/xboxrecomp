@@ -13,10 +13,18 @@ void *recomp_lookup(ULONG a) { (void)a; abort(); }
 void *recomp_lookup_manual(ULONG a) { (void)a; abort(); }
 static uint8_t *mem;
 static guest_fn query, close_guest, map_status;
+/* A live search, on either backend. The two DIR_CONTEXTs in kernel_file.c
+ * do not share field names -- Windows keeps a FindFirstFile HANDLE, POSIX a
+ * DIR* -- but "this slot is in use" is the same question. */
 static unsigned active_searches(void) {
     unsigned count = 0;
     for (unsigned i = 0; i < MAX_DIR_CONTEXTS; i++)
-        if (s_dir_contexts[i].find_handle && s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+#if defined(_WIN32)
+        if (s_dir_contexts[i].find_handle
+                && s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+#else
+        if (s_dir_contexts[i].dir != NULL)
+#endif
             count++;
     return count;
 }

@@ -243,6 +243,11 @@ static LONG win32_priority_to_xbox(int priority)
     }
 }
 
+/* Thread is the *resolved host handle* for the guest thread object, not the
+ * object itself: the Xbox API takes a PKTHREAD, and the bridge turns it into a
+ * handle (thobj_handle_from_object) before calling here, because a KTHREAD
+ * address is not something the host can act on. NULL when it did not resolve,
+ * which the shim answers with a normal priority rather than a fault. */
 LONG __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment)
 {
     HANDLE hThread = (HANDLE)Thread;
@@ -262,6 +267,7 @@ LONG __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment)
     return previous;
 }
 
+/* Thread as in xbox_KeSetBasePriorityThread: already a host handle. */
 LONG __stdcall xbox_KeQueryBasePriorityThread(PVOID Thread)
 {
     HANDLE hThread = (HANDLE)Thread;

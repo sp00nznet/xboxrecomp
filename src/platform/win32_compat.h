@@ -169,6 +169,11 @@ DWORD  GetCurrentThreadId(void);
 HANDLE GetCurrentThread(void);
 HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);
+BOOL   CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa);
+BOOL   RemoveDirectoryA(LPCSTR path);
+DWORD  GetTempPathA(DWORD buflen, LPSTR buf);
+DWORD  GetFileAttributesA(LPCSTR path);
+BOOL   DeleteFileA(LPCSTR path);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
 /* Linux: pthread_setaffinity_np on the thread; a new thread gets the
@@ -250,6 +255,9 @@ unsigned int _clearfp(void);   /* clear pending FPU exception flags */
 #define FILE_SHARE_READ          0x00000001u
 #define FILE_SHARE_WRITE         0x00000002u
 #define FILE_SHARE_DELETE        0x00000004u
+
+#define FILE_LIST_DIRECTORY           0x0001u
+#define FILE_FLAG_BACKUP_SEMANTICS    0x02000000u
 #define CREATE_NEW               1
 #define CREATE_ALWAYS            2
 #define OPEN_EXISTING            3
@@ -259,6 +267,7 @@ unsigned int _clearfp(void);   /* clear pending FPU exception flags */
 #define FILE_ATTRIBUTE_HIDDEN    0x00000002u
 #define FILE_ATTRIBUTE_SYSTEM    0x00000004u
 #define FILE_ATTRIBUTE_DIRECTORY 0x00000010u
+#define INVALID_FILE_ATTRIBUTES       ((DWORD)-1)
 #define FILE_ATTRIBUTE_ARCHIVE   0x00000020u
 #define FILE_ATTRIBUTE_NORMAL    0x00000080u
 #define INVALID_FILE_SIZE        0xFFFFFFFFu
@@ -400,6 +409,7 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_CALL_NOT_IMPLEMENTED    120u
 #define ERROR_INSUFFICIENT_BUFFER     122u
 #define ERROR_ALREADY_EXISTS          183u
+#define ERROR_DIR_NOT_EMPTY           145u
 #define ERROR_MORE_DATA               234u
 #define ERROR_NOT_OWNER               288u
 #define ERROR_MR_MID_NOT_FOUND        317u

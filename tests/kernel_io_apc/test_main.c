@@ -137,7 +137,12 @@ int main(void)
     GetTempPathA(sizeof dir, dir);
     strcat(dir, "xr_io_apc");
     CreateDirectoryA(dir, NULL);
-    snprintf(file, sizeof file, "%s\\apc.bin", dir);
+    /* A forward slash, which Win32 takes as readily as a backslash. fopen is
+     * the C library, not the shim, so nothing normalises a separator for it:
+     * with a backslash the file landed beside the directory as
+     * "xr_io_apc\\apc.bin" rather than in it, and the open under test then
+     * correctly found nothing. One spelling for every caller here. */
+    snprintf(file, sizeof file, "%s/apc.bin", dir);
     f = fopen(file, "wb");
     if (!f) {
         printf("cannot create %s\n", file);

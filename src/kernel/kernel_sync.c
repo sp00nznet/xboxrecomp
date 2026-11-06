@@ -293,6 +293,12 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
     (void)WaitReason;
     (void)WaitMode;
 
+    /* Object is the host handle the bridge resolved for the dispatcher object
+     * (ke_guest_event / ke_shadow / a handle token), not the guest KEVENT
+     * address. An unresolved object arrives as a value the shim does not know,
+     * and the wait fails with STATUS_UNSUCCESSFUL -- which is what a title sees
+     * on Win32 for a handle that is not one, and what BlockOnTime-style loops
+     * are written against. It must not be dereferenced to find that out. */
     HANDLE hObject = (HANDLE)Object;
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
     ULONGLONG t0 = wait_log_on() ? GetTickCount64() : 0;

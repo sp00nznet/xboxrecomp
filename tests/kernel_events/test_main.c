@@ -170,7 +170,13 @@ int main(int argc, char **argv)
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
+
+#if defined(_WIN32)
     _putenv_s("RECOMP_TITLE_KEVENTS", on ? "1" : "");
+#else
+    if (on) setenv("RECOMP_TITLE_KEVENTS", "1", 1);
+    else    unsetenv("RECOMP_TITLE_KEVENTS");
+#endif
 
     xbe = load_file(path, &xbe_len);
     if (!xbe) {

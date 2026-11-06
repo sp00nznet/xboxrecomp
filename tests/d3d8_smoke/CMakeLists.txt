@@ -1,3 +1,4 @@
+cmake_minimum_required(VERSION 3.20)
 # d3d8_smoke - offline smoke test for the pure xbox_d3d8 format layer.
 # Compiles the real d3d8_resources.c + d3d8_swizzle.h with lightweight device
 # accessor stubs so the format tables, predicates, swizzle classification and

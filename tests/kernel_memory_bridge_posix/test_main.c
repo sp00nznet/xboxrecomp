@@ -61,11 +61,13 @@ enum { ORD_MMALLOC = 165, ORD_MMALLOCEX = 166, ORD_MMFREE = 171,
        ORD_NTCREATE = 190, ORD_NTFREE = 199, ORD_NTSETINFO = 226,
        ORD_KEWAIT = 159, ORD_NTDUP = 197, ORD_NTWAIT = 233, ORD_OBREF = 246,
        ORD_OBDEREF = 250, ORD_PSCREATE = 255, ORD_PSTERM = 258,
-       ORD_NTWRITE = 236, ORD_NTQUERYINFO = 211 };
+       ORD_NTWRITE = 236, ORD_NTQUERYINFO = 211,
+       ORD_KEQUERYPRIO = 124, ORD_KESETPRIO = 143 };
 static const uint32_t ORDS[] = { ORD_MMALLOC, ORD_MMALLOCEX, ORD_MMFREE,
     ORD_MMQUERYSIZE, ORD_NTALLOC, ORD_NTCLOSE, ORD_NTCREATE, ORD_NTFREE,
     ORD_NTSETINFO, ORD_KEWAIT, ORD_NTDUP, ORD_NTWAIT, ORD_OBREF, ORD_OBDEREF,
-    ORD_PSCREATE, ORD_PSTERM, ORD_NTWRITE, ORD_NTQUERYINFO };
+    ORD_PSCREATE, ORD_PSTERM, ORD_NTWRITE, ORD_NTQUERYINFO,
+    ORD_KEQUERYPRIO, ORD_KESETPRIO };
 #define NORDS (sizeof ORDS / sizeof ORDS[0])
 
 static uint32_t g_thunks, g_stack, g_scratch;
@@ -394,6 +396,21 @@ static void test_threads(void)
     st = CALL(ORD_NTWAIT, h, 0, zero);
     snprintf(d, sizeof d, "status 0x%08X", st);
     check(st == 0x102, "NtWaitForSingleObject times out while it runs", d);
+
+    /* Thread priority, through the guest thread object the title holds.
+     *
+     * Ke*BasePriorityThread take a PKTHREAD, not a handle. The bridge passed
+     * XBOX_TO_NATIVE(object) -- a native pointer into guest memory -- and the
+     * implementation cast it straight to a HANDLE, so every call landed on a
+     * value that was never a thread handle: the set did nothing and the query
+     * answered 0 whatever had been asked for. Done while the thread still
+     * runs, because a terminated thread has no priority to carry. */
+    {
+        LONG prev = (LONG)CALL(ORD_KESETPRIO, obj, (uint32_t)2);
+        LONG got  = (LONG)CALL(ORD_KEQUERYPRIO, obj);
+        snprintf(d, sizeof d, "set returned %d, query returned %d", prev, got);
+        check(got == 2, "KeSetBasePriorityThread reaches the thread", d);
+    }
 
     g_worker_go = 1;
     st = CALL(ORD_NTWAIT, h, 0, 0);
