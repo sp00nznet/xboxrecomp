@@ -564,6 +564,70 @@ static void test_layers(void)
         CHECK(enhance_cfg_lookup("nope") == NULL);
     }
 
+    /* A game's code default replaces the caller's, under the env and the
+     * files, and answers for a value that does not convert. */
+    CHECK(enhance_cfg_set_code_default("render.missing", "9"));
+    CHECK(enhance_cfg_int("render.missing", 7) == 9);
+    CHECK(enhance_cfg_source_of("render.missing") == ENHANCE_SRC_DEFAULT);
+    CHECK(!strcmp(enhance_cfg_code_default("render.missing"), "9"));
+    CHECK(enhance_cfg_set_code_default("render.scale", "3"));
+    CHECK(enhance_cfg_int("render.scale", 1) == 2);             /* the file wins */
+    CHECK(enhance_cfg_set_code_default("display.badtype", "code"));
+    CHECK(!strcmp(enhance_cfg_string("display.badtype", "dflt"), "code"));
+    CHECK(enhance_cfg_set_code_default("game.mode", "free"));
+    CHECK(enhance_cfg_choice("game.missing", modes, 0) == 0);    /* another key */
+    CHECK(enhance_cfg_set_code_default("game.missing", "nochoice"));
+    CHECK(enhance_cfg_choice("game.missing", modes, 0) == 0);    /* not a choice */
+    CHECK(enhance_cfg_set_code_default("game.missing", "free"));
+    CHECK(enhance_cfg_choice("game.missing", modes, 0) == 2);
+    CHECK(enhance_cfg_set_code_default("render.flag", "true"));
+    CHECK(enhance_cfg_bool("render.flag", 0) == 1);
+    CHECK(enhance_cfg_set_code_default("render.flag", "on"));     /* not a file bool */
+    CHECK(enhance_cfg_bool("render.flag", 0) == 0);
+    CHECK(enhance_cfg_set_code_default("render.flag", "1"));
+    CHECK(enhance_cfg_bool("render.flag", 0) == 0);
+    CHECK(enhance_cfg_set_code_default("render.missing", "0x2"));  /* a C literal */
+    CHECK(enhance_cfg_int("render.missing", 7) == 2);
+    CHECK(enhance_cfg_set_code_default("render.missing", "2x"));
+    CHECK(enhance_cfg_int("render.missing", 7) == 7);
+    {
+        /* The env beats the code default; an env value that is not a
+         * choice falls back to it, not to the caller's default. */
+        static const char *const pacing[] = { "spin", "sleep", NULL };
+        int v = -1;
+        CHECK(enhance_cfg_set_code_default("present.pacing", "spin"));
+        CHECK(enhance_cfg_code_default_choice("present.pacing", pacing, &v) && v == 0);
+        CHECK(enhance_cfg_choice("present.pacing", pacing, 1) == 0);
+        recomp_env_set(RENV_PRESENT_PACING, "sleep");
+        CHECK(enhance_cfg_choice("present.pacing", pacing, 1) == 1);
+        CHECK(enhance_cfg_source_of("present.pacing") == ENHANCE_SRC_ENV);
+        recomp_env_set(RENV_PRESENT_PACING, "fast");
+        CHECK(enhance_cfg_choice("present.pacing", pacing, 1) == 0);
+        recomp_env_set(RENV_PRESENT_PACING, NULL);
+        CHECK(enhance_cfg_set_code_default("present.pacing", NULL));
+        /* The same through a game key's binding, and for a string. */
+        CHECK(enhance_cfg_bind_env("game.missing", RENV_LOG_LEVEL));
+        CHECK(enhance_cfg_set_code_default("game.missing", "fast"));
+        recomp_env_set(RENV_LOG_LEVEL, "free");
+        CHECK(enhance_cfg_choice("game.missing", modes, 0) == 2);
+        CHECK(!strcmp(enhance_cfg_string("game.missing", "dflt"), "free"));
+        recomp_env_set(RENV_LOG_LEVEL, "bogus");
+        CHECK(enhance_cfg_choice("game.missing", modes, 0) == 1);
+        recomp_env_set(RENV_LOG_LEVEL, NULL);
+    }
+    CHECK(enhance_cfg_set_code_default("render.ratio", "0.5"));
+    CHECK(enhance_cfg_float("render.ratio", 1.0) == 0.5);
+    CHECK(enhance_cfg_set_code_default("render.missing", NULL));
+    CHECK(enhance_cfg_code_default("render.missing") == NULL);
+    CHECK(enhance_cfg_int("render.missing", 7) == 7);
+    CHECK(enhance_cfg_set_code_default(NULL, "x") == 0);
+    {
+        const char *k[] = { "render.scale", "display.badtype", "game.mode", "game.missing",
+                            "render.flag", "render.ratio", "render.missing" };
+        for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
+            CHECK(enhance_cfg_set_code_default(k[i], NULL));
+    }
+
     /* game.mode stands for a game key: unbound, the file answers; bound, env wins. */
     CHECK(enhance_cfg_choice("game.mode", modes, 0) == 1);
     CHECK(enhance_cfg_bind_env("game.mode", RENV_LOG_LEVEL));   /* any config id */
@@ -684,6 +748,14 @@ static void test_config_files(void)
     CHECK(enhance_cfg_file(0) == NULL && enhance_cfg_file(1) == NULL);
     CHECK(!is_dir("ecfg_lay/config") && !exists("ecfg_lay/config.toml"));
     CHECK(enhance_cfg_user_path() && !strcmp(enhance_cfg_user_path(), "ecfg_lay/config/config.toml"));
+    /* config.default.toml beats a game's code default. */
+    CHECK(enhance_cfg_set_code_default("present.filter", "linear"));
+    CHECK(enhance_cfg_set_code_default("render.scale", "3"));
+    CHECK(enhance_cfg_choice("present.filter", filters, 0) == 2);
+    CHECK(enhance_cfg_int("render.scale", 1) == 2);
+    CHECK(enhance_cfg_set_code_default("present.filter", NULL));
+    CHECK(enhance_cfg_set_code_default("render.scale", NULL));
+
     /* What a writer compares against. */
     d = enhance_cfg_defaults();
     CHECK(recomp_cfg_int(d, "render.scale", 0) == 2);

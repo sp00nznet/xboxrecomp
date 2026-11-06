@@ -494,10 +494,67 @@ static int page_by_name(const char *name, int def)
     return def;
 }
 
+/* The game's code default for the key (enhance_cfg_set_code_default, e.g.
+ * present.pacing per build) as text in the item's own spelling, formatted
+ * as cfg_value formats a value: 0 when none is set or it does not convert
+ * for the item's kind, as the typed lookups then ignore it too. */
+static int code_def_text(const struct enhance_item *it, const char *key, char *out, size_t n)
+{
+    long long i;
+    double d;
+    int c;
+    switch (it->kind) {
+    case ENHANCE_ITEM_TOGGLE:
+        if (!enhance_cfg_code_default_bool(key, &c))
+            return 0;
+        snprintf(out, n, "%s", c ? "true" : "false");
+        return 1;
+    case ENHANCE_ITEM_CHOICE:
+        if (it->flags & ENHANCE_ITEM_NUMERIC) {
+            if (!enhance_cfg_code_default_int(key, &i))
+                return 0;
+            snprintf(out, n, "%lld", i);
+        } else {
+            if (!enhance_cfg_code_default_choice(key, it->choices, &c))
+                return 0;
+            snprintf(out, n, "%s", it->choices[c]);
+        }
+        return 1;
+    case ENHANCE_ITEM_RANGE:
+        if (!enhance_cfg_code_default_float(key, &d))
+            return 0;
+        snprintf(out, n, "%g", d);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* The item's code default as text: the game's (code_def_text), else the
+ * descriptor's. 0 when neither has one. */
+static int item_def(const struct enhance_item *it, const char *key, char *out, size_t n)
+{
+    if (code_def_text(it, key, out, n))
+        return 1;
+    if (!it->def)
+        return 0;
+    snprintf(out, n, "%s", it->def);
+    return 1;
+}
+
 /* The value as the config has it, as text in the item's own spelling. */
 static void cfg_value(const struct enhance_item *it, const char *key, char *out, size_t n)
 {
-    const char *def = it->def ? it->def : "";
+    char def[128];
+    if (!item_def(it, key, def, sizeof def))
+        def[0] = 0;
+    /* A choice read as a string takes any text: with no tier set, the
+     * default is the checked one, as slot_stock has it. */
+    if (it->kind == ENHANCE_ITEM_CHOICE && !(it->flags & ENHANCE_ITEM_NUMERIC)
+        && enhance_cfg_source_of(key) == ENHANCE_SRC_DEFAULT) {
+        snprintf(out, n, "%s", def);
+        return;
+    }
     switch (it->kind) {
     case ENHANCE_ITEM_TOGGLE:
         snprintf(out, n, "%s", enhance_cfg_bool(key, on_text(def)) ? "true" : "false");
@@ -775,8 +832,9 @@ static int slot_saveable(const struct slot *s)
         && s->it->kind != ENHANCE_ITEM_INFO && s->it->kind != ENHANCE_ITEM_ACTION;
 }
 
-/* The stock value: the defaults file's, else the item's code default. 0
- * when neither has one. */
+/* The stock value: the defaults file's, else the code default (item_def;
+ * a descriptor mod's settings and switch keep the descriptor's). 0 when
+ * neither has one. */
 static double enable_stock(int m, int e, const char *key);
 
 static int slot_stock(const struct slot *s, char *out, size_t n)
@@ -812,10 +870,7 @@ static int slot_stock(const struct slot *s, char *out, size_t n)
             break;
         }
     }
-    if (!it->def)
-        return 0;
-    snprintf(out, n, "%s", it->def);
-    return 1;
+    return item_def(it, s->key, out, n);
 }
 
 static void slot_set(struct slot *s, const char *v)

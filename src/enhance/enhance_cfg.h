@@ -12,7 +12,8 @@
  *   4. <exe dir>/config.default.toml, the defaults shipped with the build
  *      (on Apple platforms <exe dir>/../Resources/ when absent beside the
  *      executable); read, never written
- *   5. the caller's default
+ *   5. the game's code default (enhance_cfg_set_code_default), else the
+ *      caller's default
  *
  * `root` is the user data root (a bundle's data folder, the working
  * directory of a developer run), not the executable's directory: the
@@ -76,7 +77,38 @@ double enhance_cfg_float(const char *key, double def);
 int enhance_cfg_bool(const char *key, int def);   /* env: 1/0 true/false yes/no on/off */
 int enhance_cfg_choice(const char *key, const char *const *choices, int def);
 
-/* Where `key`'s value comes from, for the init log line of a module. */
+/* A game's own code default for a key, replacing the caller's default
+ * (tier 5) on every typed lookup of `key`, including the fallback for an
+ * env or file value that does not convert, and the in-game menu's stock
+ * value. For a default that differs per build, e.g. present.pacing spins
+ * in a game's Windows build:
+ *   #ifdef _WIN32
+ *   enhance_cfg_set_code_default("present.pacing", "spin");
+ *   #endif
+ * Call it before xbox_enhance_init only: the layer reads its keys there,
+ * and the menu builds its rows from them. enhance_cfg_init keeps the table.
+ * `value` is spelt as the config file would spell it: a choice's name,
+ * true or false, a whole number, a number. One that does not convert to a
+ * lookup's type is ignored there, and by the menu. It does not apply to a
+ * descriptor mod's settings or switch, which keep the descriptor's
+ * default. NULL removes the key's entry. Returns 0 when the table is full
+ * or the key or value is too long. Single-threaded, like the lookups. */
+int enhance_cfg_set_code_default(const char *key, const char *value);
+
+/* The value enhance_cfg_set_code_default gave `key`, or NULL. The pointer
+ * stays valid until the next enhance_cfg_set_code_default call. */
+const char *enhance_cfg_code_default(const char *key);
+
+/* The code default parsed as the typed lookups parse it: 1 and *out set
+ * when `key` has one that converts (a bool: true or false), else 0 and
+ * *out untouched. */
+int enhance_cfg_code_default_bool(const char *key, int *out);
+int enhance_cfg_code_default_int(const char *key, long long *out);
+int enhance_cfg_code_default_float(const char *key, double *out);
+int enhance_cfg_code_default_choice(const char *key, const char *const *choices, int *out);
+
+/* Where `key`'s value comes from, for the init log line of a module. A
+ * code default counts as ENHANCE_SRC_DEFAULT. */
 enhance_cfg_source enhance_cfg_source_of(const char *key);
 
 /* The file that holds `key` (title file first), or NULL, and the key counts

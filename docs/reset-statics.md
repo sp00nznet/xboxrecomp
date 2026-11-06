@@ -2846,6 +2846,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/enhance_cfg.c | - | s_binds | file_static | keep | - | env-to-config key bindings |
 | src/enhance/enhance_cfg.c | - | s_n_binds | file_static | keep | - | binding count |
 | src/enhance/enhance_cfg.c | - | s_builtin_bound | file_static | keep | - | built-in bindings registered flag |
+| src/enhance/enhance_cfg.c | - | s_code_defs | file_static | keep | - | a game's code defaults (enhance_cfg_set_code_default), set once before init |
+| src/enhance/enhance_cfg.c | - | s_n_code_defs | file_static | keep | - | code default count |
 | src/enhance/enhance_cfg.c | - | s_file | file_static | keep | - | parsed config files (defaults, user) |
 | src/enhance/enhance_cfg.c | - | s_flags | file_static | keep | - | per-entry read/warned bits for typo report |
 | src/enhance/enhance_cfg.c | - | s_user_path | file_static | keep | - | user config path the menu Save writes |

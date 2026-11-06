@@ -67,6 +67,7 @@
 #include "pad_map.h"
 #include "pointer.h"
 #include "recomp_env.h"
+#include "recomp_exe_dir.h"
 #include "shader_param_kinds.h"
 #include "shader_profile_edit.h"
 #include "text_input.h"
@@ -2883,6 +2884,132 @@ static int row_at(const char *label)
 #define ST_F ENHANCE_ROW_FORCED
 static int state_of(const char *label) { return enhance_menu_row_state(row_at(label)); }
 
+/* A game's code default (enhance_cfg_set_code_default) is the menu's stock:
+ * present.pacing set to spin, as a Windows build does. Sleep, then, is a
+ * change that is saved and survives the next start; spin and Reset go back
+ * to it and drop the key. */
+static void test_code_default(void)
+{
+    const char *f;
+    CHECK(enhance_cfg_set_code_default("present.pacing", "spin"));
+    start_with(ARMED, k_mods);
+    CHECK(s_pacing == 0);                       /* the init applied it */
+    open_menu();
+    CHECK(row_value("Frame pacing") && !strcmp(row_value("Frame pacing"), "spin"));
+    CHECK(!(state_of("Frame pacing") & (ST_U | ST_N)));
+    CHECK(enhance_menu_select_row("Frame pacing"));
+    tap(0x27);
+    CHECK(!strcmp(row_value("Frame pacing"), "sleep"));
+    CHECK(s_pacing == 1);
+    CHECK(state_of("Frame pacing") & ST_N);
+    {
+        const char *keys[4], *vals[4];
+        int n = enhance_menu_pending(keys, vals, 4);
+        CHECK(n == 1 && !strcmp(keys[0], "present.pacing") && !strcmp(vals[0], "\"sleep\""));
+    }
+    tap(VK_F5);
+    CHECK(strstr(enhance_menu_status(), "Saved 1 change") != NULL);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "pacing = \"sleep\"") != NULL);
+    open_menu();
+
+    /* The next start sleeps; back to spin drops the key. */
+    start_with(read_file("config/config.toml"), k_mods);
+    CHECK(s_pacing == 1);
+    open_menu();
+    CHECK(!strcmp(row_value("Frame pacing"), "sleep"));
+    CHECK(enhance_menu_select_row("Frame pacing"));
+    tap(0x25);
+    CHECK(!strcmp(row_value("Frame pacing"), "spin"));
+    tap(VK_F5);
+    CHECK(strstr(read_file("config/config.toml"), "pacing") == NULL);
+    open_menu();
+
+    /* Reset to defaults goes to the code default, not the item's sleep. */
+    start_with(ARMED "[present]\npacing = \"sleep\"\n", k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Files"));
+    CHECK(enhance_menu_select_row("Reset to defaults"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Reset everything? A / Enter: yes"));
+    tap(0x0D);
+    CHECK(enhance_menu_set_page("Render"));
+    CHECK(!strcmp(row_value("Frame pacing"), "spin"));
+    CHECK(s_pacing == 0);
+    tap(VK_F5);
+    CHECK(strstr(read_file("config/config.toml"), "pacing") == NULL);
+    open_menu();
+
+    CHECK(enhance_cfg_set_code_default("present.pacing", NULL));
+    start_with(ARMED, k_mods);
+    CHECK(s_pacing == 1);                       /* the toolkit's sleep again */
+}
+
+/* A bool code default: true or false only, as the file spells it. Reset
+ * goes back to it, not to the item's own false. */
+static void test_code_default_bool(void)
+{
+    CHECK(enhance_cfg_set_code_default("present.fullscreen", "true"));
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(row_value("Fullscreen") && !strcmp(row_value("Fullscreen"), "true"));
+    CHECK(!(state_of("Fullscreen") & (ST_U | ST_N)));
+    CHECK(enhance_menu_select_row("Fullscreen"));
+    tap(0x0D);
+    CHECK(!strcmp(row_value("Fullscreen"), "false"));
+    CHECK(state_of("Fullscreen") & ST_N);
+    tap(VK_F5);
+    CHECK(strstr(read_file("config/config.toml"), "fullscreen = false") != NULL);
+    CHECK(enhance_menu_set_page("Files"));
+    CHECK(enhance_menu_select_row("Reset to defaults"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Reset everything? A / Enter: yes"));
+    tap(0x0D);
+    CHECK(enhance_menu_set_page("Render"));
+    CHECK(!strcmp(row_value("Fullscreen"), "true"));
+    tap(VK_F5);
+    CHECK(strstr(read_file("config/config.toml"), "fullscreen") == NULL);
+    open_menu();
+
+    /* "on" is the menu's spelling, not the file's: ignored, as the lookup
+     * ignores it. */
+    CHECK(enhance_cfg_set_code_default("present.fullscreen", "on"));
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(!strcmp(row_value("Fullscreen"), "false"));
+    CHECK(!(state_of("Fullscreen") & ST_N));
+    open_menu();
+    CHECK(enhance_cfg_set_code_default("present.fullscreen", NULL));
+    start_with(ARMED, k_mods);
+}
+
+/* config.default.toml beats a game's code default, in the stock value too. */
+static void test_code_default_under_defaults(void)
+{
+    char path[4096];
+    snprintf(path, sizeof path, "%s/config.default.toml", recomp_exe_dir());
+    write_file(path, "[present]\npacing = \"sleep\"\n");
+    CHECK(enhance_cfg_set_code_default("present.pacing", "spin"));
+    start_with(ARMED, k_mods);
+    CHECK(s_pacing == 1);
+    open_menu();
+    CHECK(!strcmp(row_value("Frame pacing"), "sleep"));
+    CHECK(!(state_of("Frame pacing") & ST_N));
+    CHECK(enhance_menu_select_row("Frame pacing"));
+    tap(0x25);
+    CHECK(!strcmp(row_value("Frame pacing"), "spin"));
+    CHECK(state_of("Frame pacing") & ST_N);
+    {
+        const char *keys[4], *vals[4];
+        int n = enhance_menu_pending(keys, vals, 4);
+        CHECK(n == 1 && !strcmp(keys[0], "present.pacing") && !strcmp(vals[0], "\"spin\""));
+    }
+    enhance_menu_revert();
+    open_menu();
+    CHECK(enhance_cfg_set_code_default("present.pacing", NULL));
+    remove(path);
+}
+
 /* D10 cases 1-7: "unsaved" is against the saved value, "non-default"
  * against stock, and an env-forced row is neither changeable nor unsaved. */
 static void test_badges(void)
@@ -5591,6 +5718,8 @@ int main(int argc, char **argv)
     test_mods_desc_toggle();
     test_mods_toggle_help();
     test_capture_and_save();
+    test_code_default();
+    test_code_default_under_defaults();
     test_capture_duplicate();
     test_capture_owned();
     test_detail_rows();
@@ -5613,6 +5742,8 @@ int main(int argc, char **argv)
     test_profiles_early();
     test_profiles_long_error();
     test_pages();
+    /* After the pinned pages: it moves the host options gen they show. */
+    test_code_default_bool();
     test_save_deep();   /* after the pins: its Save moves the Debug page's options gen */
     test_save_tables();
     test_stage_row();

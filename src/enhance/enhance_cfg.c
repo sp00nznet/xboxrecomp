@@ -30,7 +30,18 @@ typedef struct {
     int warned;
 } Bind;
 
+#define ENHANCE_MAX_CODE_DEFS 16
+
+typedef struct {
+    char key[64];
+    char value[64];
+} CodeDef;
+
 static Bind s_binds[ENHANCE_MAX_BINDS];
+/* enhance_cfg_set_code_default; not cleared by enhance_cfg_shutdown, as a
+ * game sets it before the init that reloads the files. */
+static CodeDef s_code_defs[ENHANCE_MAX_CODE_DEFS];
+static int s_n_code_defs;
 static int s_n_binds;
 static int s_builtin_bound;
 
@@ -435,6 +446,119 @@ static void file_bad(int f, const char *key, const char *want)
             recomp_cfg_name(s_file[f]), recomp_cfg_line(s_file[f], key), key, want);
 }
 
+/* ── code defaults ─────────────────────────────────────────────────── */
+
+int enhance_cfg_set_code_default(const char *key, const char *value)
+{
+    int i;
+    if (!key || strlen(key) >= sizeof s_code_defs[0].key
+        || (value && strlen(value) >= sizeof s_code_defs[0].value))
+        return 0;
+    for (i = 0; i < s_n_code_defs; i++)
+        if (!strcmp(s_code_defs[i].key, key))
+            break;
+    if (!value) {
+        if (i < s_n_code_defs)
+            s_code_defs[i] = s_code_defs[--s_n_code_defs];
+        return 1;
+    }
+    if (i == s_n_code_defs) {
+        if (s_n_code_defs == ENHANCE_MAX_CODE_DEFS)
+            return 0;
+        s_n_code_defs++;
+        snprintf(s_code_defs[i].key, sizeof s_code_defs[i].key, "%s", key);
+    }
+    snprintf(s_code_defs[i].value, sizeof s_code_defs[i].value, "%s", value);
+    return 1;
+}
+
+const char *enhance_cfg_code_default(const char *key)
+{
+    int i;
+    for (i = 0; key && i < s_n_code_defs; i++)
+        if (!strcmp(s_code_defs[i].key, key))
+            return s_code_defs[i].value;
+    return NULL;
+}
+
+/* The code default parsed as a file value of the type would be: a bool is
+ * true or false, an integer a whole C literal (as the env tier reads one),
+ * a choice one of its names. 1 when `key` has one that converts. */
+int enhance_cfg_code_default_bool(const char *key, int *out)
+{
+    const char *c = enhance_cfg_code_default(key);
+    if (c && (!strcmp(c, "true") || !strcmp(c, "false"))) {
+        *out = c[0] == 't';
+        return 1;
+    }
+    return 0;
+}
+
+int enhance_cfg_code_default_int(const char *key, long long *out)
+{
+    const char *c = enhance_cfg_code_default(key);
+    char *end;
+    long long n;
+    if (!c)
+        return 0;
+    errno = 0;
+    n = strtoll(c, &end, 0);
+    if (end == c || *end || errno == ERANGE)
+        return 0;
+    *out = n;
+    return 1;
+}
+
+int enhance_cfg_code_default_float(const char *key, double *out)
+{
+    const char *c = enhance_cfg_code_default(key);
+    return c && recomp_cfg_parse_double(c, out);
+}
+
+int enhance_cfg_code_default_choice(const char *key, const char *const *choices, int *out)
+{
+    const char *c = enhance_cfg_code_default(key);
+    int i;
+    for (i = 0; c && choices && choices[i]; i++)
+        if (!strcmp(choices[i], c)) {
+            *out = i;
+            return 1;
+        }
+    return 0;
+}
+
+/* The caller's default, replaced by the game's code default when one is
+ * set and converts. */
+static const char *def_string(const char *key, const char *def)
+{
+    const char *c = enhance_cfg_code_default(key);
+    return c ? c : def;
+}
+
+static long long def_int(const char *key, long long def)
+{
+    enhance_cfg_code_default_int(key, &def);
+    return def;
+}
+
+static double def_float(const char *key, double def)
+{
+    enhance_cfg_code_default_float(key, &def);
+    return def;
+}
+
+static int def_bool(const char *key, int def)
+{
+    enhance_cfg_code_default_bool(key, &def);
+    return def;
+}
+
+static int def_choice(const char *key, const char *const *choices, int def)
+{
+    enhance_cfg_code_default_choice(key, choices, &def);
+    return def;
+}
+
 /* ── lookups ───────────────────────────────────────────────────────── */
 
 const char *enhance_cfg_string(const char *key, const char *def)
@@ -443,6 +567,7 @@ const char *enhance_cfg_string(const char *key, const char *def)
     recomp_cfg_type t;
     const char *v = env_of(key, &b);
     int f;
+    def = def_string(key, def);
     if (v)
         return v;
     f = file_of(key, &t);
@@ -461,6 +586,7 @@ long long enhance_cfg_int(const char *key, long long def)
     recomp_cfg_type t;
     const char *v = env_of(key, &b);
     int f;
+    def = def_int(key, def);
     if (v) {
         char *end;
         long long n;
@@ -486,6 +612,7 @@ double enhance_cfg_float(const char *key, double def)
     recomp_cfg_type t;
     const char *v = env_of(key, &b);
     int f;
+    def = def_float(key, def);
     if (v) {
         double d;
         if (recomp_cfg_parse_double(v, &d))
@@ -516,6 +643,7 @@ int enhance_cfg_bool(const char *key, int def)
     recomp_cfg_type t;
     const char *v = env_of(key, &b);
     int f;
+    def = def_bool(key, def);
     if (v) {
         if (word_is(v, "1") || word_is(v, "true") || word_is(v, "yes") || word_is(v, "on"))
             return 1;
@@ -542,6 +670,7 @@ int enhance_cfg_choice(const char *key, const char *const *choices, int def)
     size_t n = 0;
     int i, f;
 
+    def = def_choice(key, choices, def);
     want[0] = 0;
     for (i = 0; choices && choices[i] && n + 1 < sizeof want; i++) {
         int w = snprintf(want + n, sizeof want - n, "%s%s", i ? "|" : "one of ", choices[i]);

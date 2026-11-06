@@ -35,7 +35,22 @@ For a key, the first of these that has a value wins:
 | 2 | `<root>/<title>/config.toml`, the per-title file | `file` |
 | 3 | `<root>/config/config.toml`, the file shared by all titles | `file` |
 | 4 | `config.default.toml` beside the executable | `defaults` |
-| 5 | the default that the module passes in | `default` |
+| 5 | the game's code default for the key (`enhance_cfg_set_code_default`), else the default that the module passes in | `default` |
+
+A game sets a code default with `enhance_cfg_set_code_default(key, value)`
+(`enhance_cfg.h`) before `xbox_enhance_init`, for a default that differs
+from the toolkit's, for example one per build:
+
+```c
+#ifdef _WIN32
+    enhance_cfg_set_code_default("present.pacing", "spin");
+#endif
+```
+
+It is spelt as the file would spell it. It answers whenever tier 5 does,
+including for an env or file value that does not convert, and it is the
+stock value of the in-game menu, so its Save, row reset and Reset to
+defaults compare against it.
 
 `RECOMP_CONFIG=<path>` replaces tiers 2 and 3 with that one file; the
 defaults file is still read under it. `RECOMP_CONFIG=none` reads no file at
@@ -585,7 +600,9 @@ same requests at given flips, to check a switch without the menu.
   core as it holds the console's CPU. Set it with `[present]`
   `pacing = "spin"` in the player's `config.toml`, or
   `RECOMP_PRESENT_PACING=spin`; a title's `config.default.toml` can ship
-  either, and its value wins over this default. Without the layer the
+  either, and its value wins over this default, and a game can change the
+  default itself with `enhance_cfg_set_code_default` (see
+  [Two files and the environment](#two-files-and-the-environment)). Without the layer the
   kernel stays at `spin`. The frames are the
   guest's own either way; what can move is when the loop sees its exit,
   by up to the wake latency. Without lowered loops the key changes nothing.

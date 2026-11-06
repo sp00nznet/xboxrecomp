@@ -13,9 +13,10 @@
  *   render.scale        1..4, internal resolution factor (Metal, D3D11)
  *   present.filter      nearest | linear | integer
  *   present.fullscreen  borderless desktop fullscreen at start
- *   present.pacing      sleep (default) | spin (stock, the console-original
- *                       timing): how lowered guest spin waits wait
- *                       (kernel_pacing.h)
+ *   present.pacing      sleep (the toolkit's default; a game may set its
+ *                       own with enhance_cfg_set_code_default) | spin
+ *                       (stock, the console-original timing): how lowered
+ *                       guest spin waits wait (kernel_pacing.h)
  *   display.aspect      4:3 (stock) or a wider W:H: Hor+ (Metal, D3D11)
  *   display.movie       black | fit | fill: full-screen movies with a wide aspect
  *
