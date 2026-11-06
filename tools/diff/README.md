@@ -12,3 +12,9 @@ given `XBOXRECOMP_DIFF_CASE` / `XBOXRECOMP_DIFF_OUT`), or the optional Unicorn
 runner (`--run-oracle`, needs `pip install unicorn`; it is imported lazily and
 never substituted if missing). Use the Python unit tests for the comparator:
 `py -3 -m pytest tools/diff`.
+
+`python -m tools.diff.fuzz --seed 1 --cases 10 --recomp-command "<adapter>"`
+generates deterministic bounded x86 cases from a seed, runs each on the Unicorn
+oracle (`pip install unicorn`) and, if an adapter command is given, compares its
+checkpoints (`XBOXRECOMP_DIFF_CASE` / `XBOXRECOMP_DIFF_OUT`) and saves the first
+failing case. Same seed, same cases.
