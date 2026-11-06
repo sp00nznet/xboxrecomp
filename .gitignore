@@ -37,3 +37,6 @@ bin/
 *.obj
 *.exe
 tools/split/output/
+
+# tools.capture output holds extracted game bytes
+cases/local/
