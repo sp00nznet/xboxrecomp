@@ -35,6 +35,7 @@
 #include "d3d8_internal.h"
 #include "d3d8_combiners.h"
 #include <d3dcompiler.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -77,6 +78,38 @@ typedef struct CombinerCacheEntry {
 
 static CombinerCacheEntry g_cache[COMBINER_CACHE_SIZE];
 static uint32_t g_frame_counter = 0;
+
+/* The entry the last lookup returned. The parsed state changes only when it
+ * is dirty and the cache only during a lookup, so until the next dirty draw
+ * that lookup would return this entry again; d3d8_combiners_prepare_draw
+ * reuses it instead of hashing and comparing the whole state on every draw. */
+static CombinerCacheEntry *g_last_entry = NULL;
+
+/* ================================================================
+ * Compiled Shaders by HLSL Text
+ *
+ * The state cache is keyed by the whole NV2ACombinerState, constant colours
+ * (c0, c1, final_c0, final_c1) included, but the generated HLSL does not
+ * contain them: it reads them from the constant buffer by index. So every
+ * new constant colour made a new state, and a new D3DCompile at O3 of a text
+ * already compiled -- a stall during play whenever a title fades or tints
+ * with a combiner constant. This table holds one shader per distinct text
+ * and its own reference to it, so a state-cache eviction cannot release a
+ * shader another state shares. RECOMP_PS_TEXT_CACHE=0 compiles every state.
+ * ================================================================ */
+
+#define COMBINER_TEXT_MAX 256
+
+typedef struct CombinerTextEntry {
+    uint32_t            hash;
+    int                 len;
+    char               *text;
+    ID3D11PixelShader  *shader;
+} CombinerTextEntry;
+
+static CombinerTextEntry g_texts[COMBINER_TEXT_MAX];
+static int      g_ntexts = 0;
+static unsigned g_text_compiles = 0, g_text_reuses = 0;
 
 /* ================================================================
  * Hashing
@@ -807,10 +840,33 @@ static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state
     HRESULT hr;
     int len;
 
+    static int text_cache = -1;
+    uint32_t text_hash = 0;
+    int k;
+
     len = d3d8_combiners_generate_hlsl(state, hlsl, sizeof(hlsl));
     if (len < 0) {
         fprintf(stderr, "NV2A combiners: HLSL generation failed (buffer overflow)\n");
         return NULL;
+    }
+
+    if (text_cache < 0) {
+        char e[4] = {0};
+        GetEnvironmentVariableA("RECOMP_PS_TEXT_CACHE", e, sizeof(e));
+        text_cache = e[0] != '0';
+    }
+    if (text_cache) {
+        text_hash = fnv1a_hash(hlsl, (size_t)len);
+        for (k = 0; k < g_ntexts; k++) {
+            CombinerTextEntry *t = &g_texts[k];
+            if (t->hash == text_hash && t->len == len
+                    && memcmp(t->text, hlsl, (size_t)len) == 0) {
+                /* The caller owns one reference, as for a new shader. */
+                ID3D11PixelShader_AddRef(t->shader);
+                g_text_reuses++;
+                return t->shader;
+            }
+        }
     }
 
     hr = D3DCompile(hlsl, (SIZE_T)len, "ps_combiner",
@@ -840,6 +896,21 @@ static ID3D11PixelShader *compile_combiner_shader(const NV2ACombinerState *state
         return NULL;
     }
 
+    g_text_compiles++;
+    if (text_cache && g_ntexts < COMBINER_TEXT_MAX) {
+        char *copy = (char *)malloc((size_t)len);
+        if (copy) {
+            CombinerTextEntry *t = &g_texts[g_ntexts++];
+            memcpy(copy, hlsl, (size_t)len);
+            t->hash = text_hash;
+            t->len = len;
+            t->text = copy;
+            t->shader = ps;
+            ID3D11PixelShader_AddRef(ps);
+        }
+    }
+    fprintf(stderr, "NV2A combiners: compiled pixel shader %u; %u states"
+            " reused an already compiled text\n", g_text_compiles, g_text_reuses);
     return ps;
 }
 
@@ -864,12 +935,14 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
             memcpy(&entry->state, state, sizeof(NV2ACombinerState));
             entry->shader = ps;
             entry->last_used_frame = g_frame_counter;
+            g_last_entry = entry;
             return ps;
         }
 
         if (entry->hash == hash && combiner_state_equal(&entry->state, state)) {
             /* Cache hit */
             entry->last_used_frame = g_frame_counter;
+            g_last_entry = entry;
             return entry->shader;
         }
     }
@@ -903,6 +976,7 @@ ID3D11PixelShader *d3d8_combiners_get_shader(const NV2ACombinerState *state)
         memcpy(&entry->state, state, sizeof(NV2ACombinerState));
         entry->shader = ps;
         entry->last_used_frame = g_frame_counter;
+        g_last_entry = entry;
         return ps;
     }
 }
@@ -921,6 +995,7 @@ HRESULT d3d8_combiners_init(void)
     g_ps_token = 0;
     g_dirty = TRUE;
     g_frame_counter = 0;
+    g_last_entry = NULL;
 
     /* Create the PS constant buffer for combiner shaders.
      * Size must match NV2APSConstants, rounded up to 16-byte alignment. */
@@ -954,6 +1029,14 @@ void d3d8_combiners_shutdown(void)
         }
     }
     memset(g_cache, 0, sizeof(g_cache));
+    g_last_entry = NULL;
+
+    for (i = 0; i < g_ntexts; i++) {
+        ID3D11PixelShader_Release(g_texts[i].shader);
+        free(g_texts[i].text);
+    }
+    memset(g_texts, 0, sizeof(g_texts));
+    g_ntexts = 0;
 
     if (g_combiner_cb) {
         ID3D11Buffer_Release(g_combiner_cb);
@@ -1008,10 +1091,17 @@ BOOL d3d8_combiners_prepare_draw(void)
     if (g_dirty) {
         d3d8_combiners_parse_token(g_ps_token, rs, &g_combiner_state);
         g_dirty = FALSE;
+        g_last_entry = NULL;
     }
 
-    /* Get or compile the pixel shader for this combiner state */
-    ps = d3d8_combiners_get_shader(&g_combiner_state);
+    /* Get or compile the pixel shader for this combiner state. Unchanged
+     * since the last draw, it is the entry that draw's lookup returned. */
+    if (g_last_entry) {
+        g_last_entry->last_used_frame = g_frame_counter;
+        ps = g_last_entry->shader;
+    } else {
+        ps = d3d8_combiners_get_shader(&g_combiner_state);
+    }
     if (!ps) {
         fprintf(stderr, "NV2A combiners: Failed to get shader, "
                 "falling back to FFP\n");
