@@ -56,8 +56,28 @@ int main(void)
         r[(RECOMP_DIFF_RING - 1) * 10] != RECOMP_DIFF_RING + 5) { puts("FAIL wrapped order"); ok = 0; }
     free(r);
 
+    /* Trace events: seven-u32 records, with the memory filter applied to
+     * READ/WRITE only. */
+    recomp_diff_trace_reset();
+    recomp_diff_trace_set_memory_filter(0x1000, 0x2000);
+    recomp_diff_trace_event(RECOMP_DIFF_TRACE_WRITE, 0x400, 0x1800, 7, 8);
+    recomp_diff_trace_event(RECOMP_DIFF_TRACE_WRITE, 0x404, 0x3000, 0, 0);  /* filtered */
+    recomp_diff_trace_event(3, 0x408, 0x3000, 1, 2);                        /* not memory */
+    if (recomp_diff_trace_dump(path) != 2) { puts("FAIL trace count"); ok = 0; }
+    r = NULL;
+    {
+        FILE *f = fopen(path, "rb");
+        uint8_t raw[56];
+        if (!f || fread(raw, 1, 56, f) != 56) { puts("FAIL trace read"); ok = 0; }
+        else if (raw[0] != 1 || raw[8] != 0x00 || raw[9] != 0x04 || raw[12] != 6 ||
+                 raw[16] != 0x00 || raw[17] != 0x18 || raw[28] != 2 || raw[40] != 3) {
+            puts("FAIL trace fields"); ok = 0;
+        }
+        if (f) fclose(f);
+    }
+
     DeleteFileA(path);
     if (!ok) return 1;
-    puts("PASS: checkpoint ring records, dumps little-endian, and wraps");
+    puts("PASS: checkpoint and trace rings record, dump little-endian, and wrap");
     return 0;
 }

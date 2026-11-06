@@ -1,6 +1,6 @@
 # Checkpoint ring
 
-Synthetic registers only; no game assets. Checks record fields, the little-endian dump layout read by `tools/diff/checkpoint_decode.py`, and ring wrap.
+Synthetic registers only; no game assets. Checks record fields (checkpoints and trace events, including the READ/WRITE address filter), the little-endian dump layout read by `tools/diff/checkpoint_decode.py`, and ring wrap.
 
 ```powershell
 cmake -S tests/recomp_diff -B build/recomp-diff -A x64

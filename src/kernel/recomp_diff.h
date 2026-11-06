@@ -28,6 +28,20 @@ int recomp_diff_checkpoint_dump(const char *path);
 /* Forgets all records and restarts the sequence at 1. */
 void recomp_diff_checkpoint_reset(void);
 
+/* Trace events: same ring idea, 28-byte records (sequence thread eip type
+ * arg0 arg1 arg2, seven u32) as tools/diff/trace_decode.py reads. `type` is
+ * the caller's; READ and WRITE events (arg0 = guest address) can be limited
+ * to one address window with recomp_diff_trace_set_memory_filter. */
+#define RECOMP_DIFF_TRACE_READ  5u
+#define RECOMP_DIFF_TRACE_WRITE 6u
+
+void recomp_diff_trace_event(uint32_t type, uint32_t eip,
+                             uint32_t arg0, uint32_t arg1, uint32_t arg2);
+/* begin >= end disables the filter. */
+void recomp_diff_trace_set_memory_filter(uint32_t begin, uint32_t end);
+int recomp_diff_trace_dump(const char *path);
+void recomp_diff_trace_reset(void);
+
 #ifdef __cplusplus
 }
 #endif
