@@ -386,6 +386,7 @@ def cases():
         "sub32_add32": (["sub edx, ebx"], ["add edx, ebx"]),
         "sub32_dec32": (["sub edx, ebx"], ["dec edx"]),
         "and32_or32": (["and edx, ebx"], ["or edx, ebx"]),
+        "or32_two_dests": (["mov ecx, edx", "or ecx, ebx"], ["or edx, ebx"]),
         "cmp32_test32": (["cmp edx, ebx"], ["test edx, ebx"]),
         "add8_add32": (["add dl, bl"], ["add edx, ebx"]),
     }

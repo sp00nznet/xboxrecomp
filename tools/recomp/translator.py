@@ -1814,6 +1814,10 @@ class FunctionTranslator:
     _CARRY_CC = frozenset({
         "b", "nae", "c", "ae", "nb", "nc", "be", "na", "a", "nbe",
     })
+    # shl's OF is the result's sign XOR the carry out, so these read _cf too.
+    _OF_CC = frozenset({
+        "o", "no", "l", "nge", "ge", "nl", "le", "ng", "g", "nle",
+    })
 
     @staticmethod
     def _function_needs_cf(instructions):
@@ -1843,6 +1847,8 @@ class FunctionTranslator:
                          or last_setter in ("inc", "dec")
                          or last_setter in BT_MODIFY
                          or last_setter == "rep-compare")):
+                return True
+            if cc in FunctionTranslator._OF_CC and last_setter in ("shl", "sal"):
                 return True
             if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m

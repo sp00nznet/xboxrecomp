@@ -101,3 +101,29 @@ def test_a_join_with_an_unknown_predecessor_is_not_guessed():
     from tools.recomp.translator import _edge_flag_plan
     assert _edge_flag_plan(None, set(), {}) is None
     assert _edge_flag_plan(None, {1, 2}, {1: ('cmp', []), 2: None}) is None
+
+
+def test_mixed_width_compares_join_on_each_edge():
+    # DOA3's "is this fighter in move list N" check reaches its jne from a
+    # cmp al,1 and a cmp ecx,eax; the fallback made the stage wall clamp
+    # skip both fighters every frame. js needs each compare's own sign bit.
+    # test ecx,ecx; jz narrow; cmp ecx,eax; jmp join; narrow: cmp al,1;
+    # join: jcc +1; inc eax; ret
+    code = translate(bytes.fromhex('85c9740439c1eb023c01' + '7501' + '40c3'))
+    assert code.count('_jf_0001000A = (CMP_NE(_fa, _fb)) ? 1 : 0;') == 2, code
+    assert 'if (_flags' not in code, code
+    code = translate(bytes.fromhex('85c9740439c1eb023c01' + '7801' + '40c3'))
+    assert '(uint32_t)(_fas) - (uint32_t)(_fbs)) >> 31' in code, code
+    assert '(uint8_t)(_fas) - (uint8_t)(_fbs)) >> 7' in code, code
+    assert 'if (_flags' not in code, code
+
+
+def test_ors_into_different_registers_join_on_each_edge():
+    # DOA3's title input ORs a pad mask into ecx on one path and edx on the
+    # other, then branches on ZF; the fallback acted on an unpressed START.
+    # test ecx,ecx; jz other; mov ecx,edx; or ecx,ebx; jmp join;
+    # other: or edx,ebx; join: jcc +1; inc eax; ret
+    for jcc, cond in (('74', '(_fa == 0)'), ('75', '(_fa != 0)')):
+        code = translate(bytes.fromhex('85c9740689d109d9eb0209da' + jcc + '0140c3'))
+        assert code.count(f'_jf_0001000C = ({cond}) ? 1 : 0;') == 2, code
+        assert 'if (_flags' not in code, code
