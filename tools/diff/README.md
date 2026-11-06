@@ -18,3 +18,10 @@ generates deterministic bounded x86 cases from a seed, runs each on the Unicorn
 oracle (`pip install unicorn`) and, if an adapter command is given, compares its
 checkpoints (`XBOXRECOMP_DIFF_CASE` / `XBOXRECOMP_DIFF_OUT`) and saves the first
 failing case. Same seed, same cases.
+
+Raw binary records, little-endian, no header, for whatever emits them:
+`python -m tools.diff.checkpoint_decode FILE` reads 40-byte records
+(`sequence eip eax ebx ecx edx esi edi esp eflags`, ten u32) and prints JSON;
+`python -m tools.diff.trace_decode FILE` reads 28-byte records
+(`sequence thread eip type arg0 arg1 arg2`, seven u32) and prints one line each.
+A file that is not a whole number of records is an error.
