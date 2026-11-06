@@ -41,6 +41,110 @@ static void input_src(const NV2ACombinerInput *in, int alpha_portion,
         snprintf(out, n, "x%d.%s", reg, in->alpha_rep ? "aaa" : "rgb");
 }
 
+/* The texture shader's dot-product family, as xemu's psh.c: the input
+ * texel as a vector by SET_DOT_RGBMAPPING (1 is D3D's (x - 128) / 127, 2
+ * GL's, 3 two's complement; 0 and the HILO mappings read it unsigned), and
+ * remapCubeTo2D, which a cube-reading mode over a 2D texture samples at. */
+static const char s_dot_helpers[] =
+    "float3 nv2a_dotmap(float4 c, int m) {\n"
+    "    float3 x = c.rgb * 255.0;\n"
+    "    if (m == 1) return (x - 128.0) / 127.0;\n"
+    "    if (m == 2) return x >= 128.0 ? (x - 255.5) / 127.5 : (x + 0.5) / 127.5;\n"
+    "    if (m == 3) return x >= 128.0 ? (x - 256.0) / 127.0 : x / 127.0;\n"
+    "    return c.rgb;\n"
+    "}\n"
+    "float2 nv2a_cube_2d(float3 c) {\n"
+    "    float3 a = abs(c);\n"
+    "    if (a.x > a.y && a.x > a.z) return float2(c.x > 0.0 ? -c.z : c.z, c.y) / a.x;\n"
+    "    if (a.y > a.x && a.y > a.z) return float2(c.x, c.y > 0.0 ? -c.z : c.z) / a.y;\n"
+    "    return float2(c.z > 0.0 ? c.x : -c.x, c.y) / a.z;\n"
+    "}\n";
+
+/* Stage i's texel at the 2D coordinate `uv`, scaled as a 2D stage's (no
+ * snap: a dependent read's coordinate is no rectangle's). */
+static int emit_dot_2d(const NV2ACombinerState *state, int i, const char *uv,
+                       char *buf, int bufsize, int off)
+{
+    if (state->rt_offset)
+        EMIT("        x%d = tex%d.Sample(samp%d, (%s) * tex_scale[%d].xy"
+             " + float2(tex_scale[%d].w, 0.0));\n", 8 + i, i, i, uv, i, i);
+    else
+        EMIT("        x%d = tex%d.Sample(samp%d, (%s) * tex_scale[%d].xy);\n",
+             8 + i, i, i, uv, i);
+    return off;
+}
+
+/* Stage i's texel at the 3D vector `v`: the cube map, or its 2D stand-in. */
+static int emit_dot_cube(const NV2ACombinerState *state, int i, const char *v,
+                         char *buf, int bufsize, int off)
+{
+    char uv[64];
+    if (state->tex_cube[i]) {
+        EMIT("        x%d = tex%d.Sample(samp%d, %s);\n", 8 + i, i, i, v);
+        return off;
+    }
+    snprintf(uv, sizeof uv, "nv2a_cube_2d(%s)", v);
+    return emit_dot_2d(state, i, uv, buf, bufsize, off);
+}
+
+/* A dot-product stage (mode 8 and up), as xemu's psh.c. Each one but BRDF,
+ * DPNDNT and SPEC_CONST makes dp<i>, its coordinate dotted with its input
+ * texel; the last stage of the chain reads at the vector the dots make. */
+static int emit_dot_stage(const NV2ACombinerState *state, int i, int m,
+                          char *buf, int bufsize, int off)
+{
+    int in = state->tex_input[i];
+    if (m != NV2A_TEXMODE_BRDF && m != NV2A_TEXMODE_DPNDNT_AR && m != NV2A_TEXMODE_DPNDNT_GB
+            && m != NV2A_TEXMODE_DOT_RFLCT_SPEC_CONST)
+        EMIT("    dp%d = dot(i.tc%d.xyz, nv2a_dotmap(x%d, %d));\n",
+             i, i, 8 + in, state->dot_map[i]);
+    if (!nv2a_texmode_samples(m)) {
+        EMIT("    x%d = 0;\n", 8 + i);
+        return off;
+    }
+    EMIT("    {\n");
+    switch (m) {
+    case NV2A_TEXMODE_DOT_ST:
+        off = emit_dot_2d(state, i, i == 2 ? "float2(dp1, dp2)" : "float2(dp2, dp3)",
+                          buf, bufsize, off);
+        break;
+    case NV2A_TEXMODE_DOT_RFLCT_DIFF:
+        /* the normal's third component is stage 3's dot, by its own input
+         * and mapping */
+        EMIT("        float3 nrm = float3(dp1, dp2, dot(i.tc3.xyz, nv2a_dotmap(x%d, %d)));\n",
+             8 + state->tex_input[3], state->dot_map[3]);
+        off = emit_dot_cube(state, i, "nrm", buf, bufsize, off);
+        break;
+    case NV2A_TEXMODE_DOT_RFLCT_SPEC:
+        /* the eye vector is the q of stages 1-3, reflected about the normal */
+        EMIT("        float3 nrm = float3(dp1, dp2, dp3);\n"
+             "        float3 eye = float3(i.tc1.w, i.tc2.w, i.tc3.w);\n"
+             "        float3 rv = 2.0 * nrm * dot(nrm, eye) / dot(nrm, nrm) - eye;\n");
+        off = emit_dot_cube(state, i, "rv", buf, bufsize, off);
+        break;
+    case NV2A_TEXMODE_DOT_STR_3D:
+        /* volume textures are bound as their first slice */
+        off = emit_dot_2d(state, i, "float2(dp1, dp2)", buf, bufsize, off);
+        break;
+    case NV2A_TEXMODE_DOT_STR_CUBE:
+        off = emit_dot_cube(state, i, "float3(dp1, dp2, dp3)", buf, bufsize, off);
+        break;
+    case NV2A_TEXMODE_DPNDNT_AR:
+    case NV2A_TEXMODE_DPNDNT_GB: {
+        char uv[16];
+        snprintf(uv, sizeof uv, "x%d.%s", 8 + in, m == NV2A_TEXMODE_DPNDNT_AR ? "ar" : "gb");
+        off = emit_dot_2d(state, i, uv, buf, bufsize, off);
+        break;
+    }
+    default:
+        break;
+    }
+    if (off < 0)
+        return off;
+    EMIT("    }\n");
+    return off;
+}
+
 static const char s_rc_helpers[] =
     "float rc_map(float x, int m) {\n"
     "    if (m == 0) return max(x, 0.0);\n"
@@ -79,11 +183,13 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
         int m = (int)state->tex_mode[i];
         if (m == NV2A_TEXMODE_NONE || m == NV2A_TEXMODE_PASSTHRU
-                || m == NV2A_TEXMODE_CLIPPLANE)
+                || m == NV2A_TEXMODE_CLIPPLANE
+                || (NV2A_TEXMODE_DOT_ON(state, i) && !nv2a_texmode_samples(m)))
             continue;
         EMIT("%s tex%d : register(t%d);\n",
              m == NV2A_TEXMODE_3D ? "Texture3D" :
-             m == NV2A_TEXMODE_CUBEMAP ? "TextureCube" : "Texture2D", i, i);
+             nv2a_texmode_cube_decl(m, state->bump_on && state->tex_cube[i])
+                 ? "TextureCube" : "Texture2D", i, i);
         EMIT("SamplerState samp%d : register(s%d);\n", i, i);
     }
 
@@ -117,6 +223,11 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             EMIT("%s", D3D8_HLSL_CLIP_KILLS);
             break;
         }
+    for (i = 0; i < NV2A_MAX_TEXTURES; i++)
+        if (NV2A_TEXMODE_DOT_ON(state, i)) {
+            EMIT("%s", s_dot_helpers);
+            break;
+        }
 
     EMIT("float4 main(PS_IN i) : SV_Target {\n");
     for (k = 0; k < 16; k++)
@@ -127,6 +238,11 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         EMIT("    x3 = fog_color;\n");
     EMIT("    x4 = i.d0;\n");
     EMIT("    x5 = i.d1;\n");
+    for (i = 0; i < NV2A_MAX_TEXTURES; i++)
+        if (NV2A_TEXMODE_DOT_ON(state, i)) {
+            EMIT("    float dp1 = 0.0, dp2 = 0.0, dp3 = 0.0;\n");
+            break;
+        }
 
     /* ---- Texture stages ---- */
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
@@ -142,7 +258,10 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             EMIT("    x%d = saturate(i.tc%d);\n", 8 + i, i);
             continue;
         }
-        if (m == NV2A_TEXMODE_3D || m == NV2A_TEXMODE_CUBEMAP) {
+        if (NV2A_TEXMODE_DOT_ON(state, i)) {
+            if ((off = emit_dot_stage(state, i, m, buf, bufsize, off)) < 0)
+                return -1;
+        } else if (m == NV2A_TEXMODE_3D || m == NV2A_TEXMODE_CUBEMAP) {
             EMIT("    x%d = tex%d.Sample(samp%d, i.tc%d.xyz);\n", 8 + i, i, i, i);
         } else if (state->bump_on && (m == NV2A_TEXMODE_BUMPENVMAP
                                       || m == NV2A_TEXMODE_BUMPENVMAP_LUM)) {
@@ -211,8 +330,11 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             }
             EMIT("    }\n");
         }
-        EMIT("    if (alpha_only[%d] == 2u) x%d.a = 1.0;\n"
-             "    else if (alpha_only[%d] != 0u) x%d.rgb = 1.0;\n", i, 8 + i, i, 8 + i);
+        /* A dot stage that reads no texture (DOTPRODUCT, DOT_ZW, BRDF,
+         * SPEC_CONST) holds 0, not a texel: no format fix-up applies. */
+        if (!NV2A_TEXMODE_DOT_ON(state, i) || nv2a_texmode_samples(m))
+            EMIT("    if (alpha_only[%d] == 2u) x%d.a = 1.0;\n"
+                 "    else if (alpha_only[%d] != 0u) x%d.rgb = 1.0;\n", i, 8 + i, i, 8 + i);
     }
     EMIT("    x12.a = x8.a;\n");
 

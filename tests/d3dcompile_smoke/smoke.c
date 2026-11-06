@@ -16,7 +16,9 @@
  *   6. an input layout built from NV2A attribute formats
  *      (d3d8_vsh_nv2a_input_layout) matches each program's signature;
  *   7. the backend's basic pixel shader compiles, stock and with
- *      render.snap_2d's gradient sampling (nv2a_basic_hlsl.h).
+ *      render.snap_2d's gradient sampling (nv2a_basic_hlsl.h);
+ *   8. the texture shader's dot-product and cube-map states
+ *      (dot_cases.h) compile, with and without rt_offset.
  *
  * Exit code 0 only if every step passed. Output goes to stdout and, because
  * Proton drops a GUI process's stdio, also to the file named by
@@ -35,6 +37,7 @@
 #include "d3d8_vsh.h"
 #include "d3d8_combiners.h"
 #include "nv2a_basic_hlsl.h"
+#include "../d3d8_hlsl_split/dot_cases.h"   /* k_dot_cases, text-checked by d3d8_hlsl_split */
 
 typedef HRESULT (WINAPI *PFN_D3DCOMPILE)(LPCVOID, SIZE_T, LPCSTR,
     const D3D_SHADER_MACRO *, ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT,
@@ -278,6 +281,72 @@ static void compile_combiner(void)
     compile("combiner_fog", hlsl, "ps_5_0");
 }
 
+static void compile_dot(void)
+{
+    static NV2ACombinerState st;
+    static char hlsl[256 * 1024];
+    uint32_t seen[DOT_NCASE * 2], bins[DOT_NCASE * 2], base[DOT_NCASE];
+    char what[64];
+    int i, off, n, nseen = 0, nbins = 0, nbase = 0, distinct = 0, base_distinct = 0;
+    int nt0 = 0, want;
+
+    for (i = 0; i < DOT_NCASE; i++)
+        for (off = 0; off < 2; off++) {
+            dot_case_state(i, off, &st);
+            snprintf(what, sizeof what, "%s%s", k_dot_cases[i].name, off ? "-rt-offset" : "");
+            n = d3d8_combiners_generate_hlsl(&st, hlsl, (int)sizeof hlsl);
+            if (n <= 0) {
+                say("FAIL %s: no HLSL\n", what);
+                s_fail++;
+                continue;
+            }
+            if (dot_text_seen(seen, nseen, dot_text_hash(hlsl))) {
+                say("FAIL %s: the same HLSL as an earlier case\n", what);
+                s_fail++;
+            }
+            seen[nseen++] = dot_text_hash(hlsl);
+            {
+                ID3DBlob *code = NULL;
+                const uint8_t *p;
+                uint32_t h = 2166136261u;
+                SIZE_T k, len;
+
+                if (!compile_keep(what, hlsl, "ps_5_0", &code))
+                    continue;
+                p = (const uint8_t *)ID3D10Blob_GetBufferPointer(code);
+                len = ID3D10Blob_GetBufferSize(code);
+                for (k = 0; k < len; k++)
+                    h = (h ^ p[k]) * 16777619u;
+                ID3D10Blob_Release(code);
+                distinct += !dot_text_seen(bins, nbins, h);
+                bins[nbins++] = h;
+                if (!off) {
+                    if (!dot_text_seen(base, nbase, h))
+                        base_distinct++;
+                    else if (dot_case_t0_only(i))
+                        say("     %s: the bytecode of an earlier t0-only case\n", what);
+                    else
+                        say("FAIL %s: the same bytecode as an earlier case\n", what);
+                    base[nbase++] = h;
+                }
+            }
+        }
+    /* D3DCompile strips a texture shader the combiners never read, and every
+     * case then compiles to one constant shader: each case must keep its own
+     * code. Cases that sample t0 alone may share one (dot_case_t0_only), and
+     * an rt_offset variant may match its base case. */
+    for (i = 0; i < DOT_NCASE; i++)
+        nt0 += dot_case_t0_only(i);
+    want = DOT_NCASE - (nt0 > 1 ? nt0 - 1 : 0);
+    say("     dot cases: %d of %d compiled to distinct bytecode, %d of %d base cases"
+        " (want %d)\n", distinct, nbins, base_distinct, nbase, want);
+    if (base_distinct < want) {
+        say("FAIL dot cases: %d base cases compiled to distinct bytecode, want %d\n",
+            base_distinct, want);
+        s_fail++;
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *logpath = recomp_env(RENV_STDIO_LOG);
@@ -342,6 +411,7 @@ int main(int argc, char **argv)
     compile("trivial_vs", k_vs, "vs_5_0");
     compile("trivial_ps", k_ps, "ps_5_0");
     compile_combiner();
+    compile_dot();
     compile("nv2a_ps_diffuse", NV2A_HLSL_PS_BASIC, "ps_5_0");
     compile("nv2a_ps_diffuse_snap", NV2A_HLSL_PS_BASIC_SNAP, "ps_5_0");
     for (i = 1; i < argc; i++)

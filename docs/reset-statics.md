@@ -1725,13 +1725,14 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_texels_cap | file_static | keep | - | scratch buffer capacity |
 | src/d3d/nv2a_pb_d3d11.c | - | s_black_srv | file_static | keep | - | fixed black texture view |
 | src/d3d/nv2a_pb_d3d11.c | - | s_magenta_srv | file_static | keep | - | fixed magenta texture view |
+| src/d3d/nv2a_pb_d3d11.c | - | s_black_cube_srv | file_static | keep | - | fixed black cube texture view |
 | src/d3d/nv2a_pb_d3d11.c | no_mips | off | local_static | keep | - | cached env read |
 | src/d3d/nv2a_pb_d3d11.c | - | s_stage_gen | file_static | keep | - | monotonic stage-decode gen; bump, never zero |
 | src/d3d/nv2a_pb_d3d11.c | build_stages | memo | local_static | reset | renderer.d3d11 | keyed on tex-regs gen/contig; both rewind at reset |
 | src/d3d/nv2a_pb_d3d11.c | build_stages | said | local_static | keep | - | log-once guard table |
 | src/d3d/nv2a_pb_d3d11.c | - | s_tc_gen | file_static | keep | - | monotonic tex-cache gen; drop path bumps it |
 | src/d3d/nv2a_pb_d3d11.c | - | s_tex_last | file_static | reset | renderer.d3d11 | points into s_tc |
-| src/d3d/nv2a_pb_d3d11.c | tex_bind | said | local_static | keep | - | log-once guard table |
+| src/d3d/nv2a_pb_d3d11.c | tex_bind_body | said | local_static | keep | - | log-once guard table |
 | src/d3d/nv2a_pb_d3d11.c | - | s_smp | file_static | keep | - | sampler states keyed by sampler state |
 | src/d3d/nv2a_pb_d3d11.c | - | s_smp_n | file_static | keep | - | sampler cache fill count |
 | src/d3d/nv2a_pb_d3d11.c | - | s_smp_last | file_static | keep | - | per-stage index into kept sampler cache, key-checked |
@@ -1986,11 +1987,12 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_texels_cap | file_static | keep | - | scratch buffer capacity |
 | src/d3d/nv2a_pb_metal.m | - | s_black | file_static | keep | - | fixed black texture |
 | src/d3d/nv2a_pb_metal.m | - | s_magenta | file_static | keep | - | fixed magenta texture |
+| src/d3d/nv2a_pb_metal.m | - | s_black_cube | file_static | keep | - | fixed black cube texture |
 | src/d3d/nv2a_pb_metal.m | no_mips | off | local_static | keep | - | cached env read |
 | src/d3d/nv2a_pb_metal.m | memo_on | on | local_static | keep | - | cached env read |
 | src/d3d/nv2a_pb_metal.m | build_stages | memo | local_static | reset | renderer.metal | keyed on tex-regs gen/contig; both rewind at reset |
 | src/d3d/nv2a_pb_metal.m | tex_upload_body | said | local_static | keep | - | log-once guard |
-| src/d3d/nv2a_pb_metal.m | tex_bind | said | local_static | keep | - | log-once guard table |
+| src/d3d/nv2a_pb_metal.m | tex_bind_body | said | local_static | keep | - | log-once guard table |
 | src/d3d/nv2a_pb_metal.m | border_colour | said | local_static | keep | - | log-once guard |
 | src/d3d/nv2a_pb_metal.m | - | s_smp | file_static | keep | - | sampler states keyed by sampler state |
 | src/d3d/nv2a_pb_metal.m | - | s_smp_n | file_static | keep | - | sampler cache fill count |
@@ -2009,10 +2011,11 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | vs_cache | memo | local_static | reset | renderer.metal | keyed on prog_dwords/start; pgraph counter rewinds at reset |
 | src/d3d/nv2a_pb_metal.m | - | s_fs | file_static | keep | - | FS functions keyed by combiner-state content |
 | src/d3d/nv2a_pb_metal.m | - | s_fs_n | file_static | keep | - | FS cache fill count |
+| src/d3d/nv2a_pb_metal.m | - | s_fs_comb | file_static | keep | - | set by fs_select before every batch's binds |
 | src/d3d/nv2a_pb_metal.m | fs_basic | tried | local_static | keep | - | snap FS built once |
 | src/d3d/nv2a_pb_metal.m | fs_basic | fn | local_static | keep | - | snap FS from fixed source |
-| src/d3d/nv2a_pb_metal.m | fs_select | msl | local_static | keep | - | scratch MSL buffer |
-| src/d3d/nv2a_pb_metal.m | fs_select | memo | local_static | keep | - | keyed by combiner register content, kept s_fs |
+| src/d3d/nv2a_pb_metal.m | fs_select_body | msl | local_static | keep | - | scratch MSL buffer |
+| src/d3d/nv2a_pb_metal.m | fs_select_body | memo | local_static | keep | - | keyed by combiner register content, kept s_fs |
 | src/d3d/nv2a_pb_metal.m | - | s_dss | file_static | keep | - | depth-stencil states keyed by state key |
 | src/d3d/nv2a_pb_metal.m | - | s_dss_n | file_static | keep | - | DSS cache fill count |
 | src/d3d/nv2a_pb_metal.m | - | s_self | file_static | reset | renderer.metal | self-sample copy of a guest frame target |

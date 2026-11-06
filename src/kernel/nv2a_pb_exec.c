@@ -2824,6 +2824,7 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 #define NV097_SET_COMBINER_COLOR_OCW_M      0x1E40
 #define NV097_SET_COMBINER_CONTROL_M        0x1E60
 #define NV097_SET_SHADER_STAGE_PROGRAM_M    0x1E70
+#define NV097_SET_DOT_RGBMAPPING_M          0x1E74
 #define NV097_SET_SHADER_OTHER_STAGE_INPUT_M 0x1E78
 #define NV097_SET_POLY_OFFSET_FILL_ENABLE_M 0x0338
 #define NV097_SET_POLYGON_OFFSET_SCALE_FACTOR_M 0x0384
@@ -2984,6 +2985,8 @@ static int vsh_method(uint32_t method, uint32_t param)
         s_vsh.shader_prog = param; s_vsh.shader_set = 1; return 1;
     case NV097_SET_SHADER_OTHER_STAGE_INPUT_M:
         s_vsh.other_stage_input = param; return 1;
+    case NV097_SET_DOT_RGBMAPPING_M:
+        s_vsh.dot_rgbmapping = param; return 1;
     case NV097_SET_FOG_ENABLE_M:        s_vsh.fog_enable = param != 0;  return 1;
     case NV097_SET_FOG_COLOR_M:         s_vsh.fog_color = param;        return 1;
     case NV097_SET_ALPHA_TEST_ENABLE_M: s_vsh.atest_enable = param != 0; return 1;

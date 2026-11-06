@@ -193,6 +193,10 @@ struct nv2a_pb_vsh {
                                          * a dependent read (BUMPENVMAP, ...)
                                          * takes its input from: stage 2 in
                                          * bits 16-19, stage 3 in 20-23 */
+    uint32_t dot_rgbmapping;            /* SET_DOT_RGBMAPPING: how the dot-product
+                                         * modes read their input texel, 3 bits
+                                         * per stage, stage 1 in bits 0-2,
+                                         * stage 2 in 4-6, stage 3 in 8-10 */
     uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE: per stage
                                          * and component, kill at >= 0 (1) or < 0 */
     int      rc_set, shader_set, fog_enable, atest_enable;

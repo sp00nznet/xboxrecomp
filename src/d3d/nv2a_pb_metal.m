@@ -1206,6 +1206,7 @@ static Stage s_stage[4];
 #define TEX_CACHE 512   /* array bound; entries in use: tex_cache_n() */
 typedef struct {
     uint32_t       offset, color, width, height, pitch, palette, levels;
+    int            cube;        /* six faces in a cube texture (nv2a_stage_cube_bind) */
     uint32_t       bytes;       /* nv2a_tex_extent, for tex_cache_stale */
     uint32_t       gen, used;
     uint32_t       pack_gen;    /* nv2a_tex_pack_gen() it was uploaded under */
@@ -1250,7 +1251,7 @@ static void tex_cache_stale(uint32_t addr, uint32_t bytes)
 
 static uint32_t      *s_texels;
 static size_t         s_texels_cap;
-static id<MTLTexture> s_black, s_magenta;
+static id<MTLTexture> s_black, s_magenta, s_black_cube;
 
 static id<MTLTexture> solid_texture(uint32_t argb)
 {
@@ -1260,6 +1261,19 @@ static id<MTLTexture> solid_texture(uint32_t argb)
     id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
     [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&argb
          bytesPerRow:4];
+    return t;
+}
+
+/* A 1x1 cube map of argb: the fallback of a stage bound as a cube. */
+static id<MTLTexture> solid_cube(uint32_t argb)
+{
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        textureCubeDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm size:1 mipmapped:NO];
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+    uint32_t f;
+    for (f = 0; f < 6; f++)
+        [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:f withBytes:&argb
+             bytesPerRow:4 bytesPerImage:4];
     return t;
 }
 
@@ -1316,6 +1330,27 @@ static void build_stages(void)
     }
 }
 
+/* nv2a_stage.cube_rt for this draw's stages, against the live targets: a
+ * cube whose faces lie under one is read as 2D (nv2a_stage_cube_bind), as
+ * the D3D11 backend does, so the key, the shader and the bind agree. Set
+ * every draw: the targets move without the stage registers. */
+static void stages_cube_rt(void)
+{
+    int n, i;
+    for (n = 0; n < 4; n++) {
+        Stage *t = &s_stage[n];
+        t->cube_rt = 0;
+        for (i = 0; t->cube && i < RT_MAX && !t->cube_rt; i++)
+            /* Only a live target: one the title has since overwritten
+             * (a level's cube loaded over a menu's leftover target) is
+             * dropped here, as rt_texture drops one at its own address,
+             * or the cube would read 2D until the target was evicted. */
+            t->cube_rt = s_rt[i].tex
+                         && nv2a_stage_cube_over_rt(t, s_rt[i].addr, s_rt[i].pitch * s_rt[i].h)
+                         && !rt_drop_if_stale(&s_rt[i], "cube");
+    }
+}
+
 static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
 {
     uint64_t h = nv2a_tex_hash(mem + t->offset, bytes, NV2A_TEX_HASH_SEED);
@@ -1356,46 +1391,91 @@ static id<MTLTexture> tex_make(uint32_t width, uint32_t height, uint32_t levels,
     return tex;
 }
 
+/* A cube map of `size` square faces from src: six faces of A8R8G8B8 texels,
+ * each with its `levels` levels, in the NV2A's face order (+X -X +Y -Y +Z
+ * -Z, Metal's slices 0-5). */
+static id<MTLTexture> tex_make_cube(uint32_t size, uint32_t levels, const uint32_t *src)
+{
+    MTLTextureDescriptor *td;
+    id<MTLTexture> tex;
+    const uint8_t *p = (const uint8_t *)src;
+    uint32_t f, l;
+    td = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                               size:size
+                                                          mipmapped:levels > 1];
+    if (levels > 1)
+        td.mipmapLevelCount = levels;
+    td.usage = MTLTextureUsageShaderRead;
+    tex = [s_dev newTextureWithDescriptor:td];
+    if (!tex)
+        return nil;
+    for (f = 0; f < 6; f++)
+        for (l = 0; l < levels; l++) {
+            uint32_t w = nv2a_tex_level_dim(size, l);
+            [tex replaceRegion:MTLRegionMake2D(0, 0, w, w) mipmapLevel:l slice:f withBytes:p
+                   bytesPerRow:w * 4u bytesPerImage:w * w * 4u];
+            p += (size_t)w * w * 4u;
+        }
+    return tex;
+}
+
 /* `hash` is the entry's texel hash: with a texture pack loaded
  * (enhancements, textures.pack) an entry it holds is uploaded from the
  * pack's texels at the pack's size instead of the guest's. If the device
  * refuses a texture of the entry's size, the guest texels go up instead:
  * the pack only ever adds detail, never a black texture. */
-static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash);
+static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube);
 
-static id<MTLTexture> tex_upload(const Stage *t, uint64_t hash)
+static id<MTLTexture> tex_upload(const Stage *t, uint64_t hash, int cube)
 {
     uint64_t t0 = prof_now();
-    id<MTLTexture> tex = tex_upload_body(t, hash);
+    id<MTLTexture> tex = tex_upload_body(t, hash, cube);
     s_sh_flip.tex_ns += prof_now() - t0;
     s_sh_flip.tex++;
     return tex;
 }
 
-/* The guest texels of t into s_texels, or 0 when it cannot grow. */
-static int tex_decode_guest(const Stage *t)
+/* The guest texels of t into s_texels, or 0 when it cannot grow: `faces`
+ * of them (6 for a cube map), each nv2a_stage_face_stride on from the
+ * last, packed one after another. */
+static int tex_decode_guest(const Stage *t, uint32_t faces)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
     const uint32_t *pal = NULL;
-    if (n > s_texels_cap) {
-        uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
+    uint32_t f, stride = faces > 1 ? nv2a_stage_face_stride(t) : 0;
+    if (n * faces > s_texels_cap) {
+        uint32_t *p = (uint32_t *)realloc(s_texels, n * faces * 4);
         if (!p)
             return 0;
         s_texels = p;
-        s_texels_cap = n;
+        s_texels_cap = n * faces;
     }
     if (t->color == NV2A_TEX_P8)
         pal = (const uint32_t *)(mem + t->palette);
-    nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
-                    t->levels, pal, pal ? t->pal_len : 0, s_texels);
+    for (f = 0; f < faces; f++)
+        nv2a_tex_decode(mem + t->offset + f * stride, t->color, t->width, t->height, t->pitch,
+                        t->levels, pal, pal ? t->pal_len : 0, s_texels + n * f);
     return 1;
 }
 
-static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash)
+static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
 {
     id<MTLTexture> tex = nil;
 
+    if (cube) {
+        /* No pack entry is a cube map: the six faces go up from the guest.
+         * tex_dump writes face 0, the first texels decoded. */
+        if (!tex_decode_guest(t, 6))
+            return nil;
+        if (nv2a_tex_dump_on())
+            nv2a_tex_dump_upload(t, hash, s_texels);
+        if (!(tex = tex_make_cube(t->width, t->levels, s_texels)))
+            return nil;
+        s_tex_uploads++;
+        nv2a_stats_add(NV2A_STAT_TEX_UPLOADS, 1);
+        return tex;
+    }
     if (nv2a_tex_pack_count()) {
         struct nv2a_tex_pack_entry *pe = nv2a_tex_pack_find(hash, t->width, t->height);
         const uint32_t *src = NULL;
@@ -1416,10 +1496,10 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash)
          * pack's: under a hit they are decoded for it alone, once. */
         else if (nv2a_tex_dump_on())
             nv2a_tex_dump_upload(t, hash, nv2a_tex_dump_wants(t, hash)
-                                          && tex_decode_guest(t) ? s_texels : NULL);
+                                          && tex_decode_guest(t, 1) ? s_texels : NULL);
     }
     if (!tex) {
-        if (!tex_decode_guest(t))
+        if (!tex_decode_guest(t, 1))
             return nil;
         if (nv2a_tex_dump_on())
             nv2a_tex_dump_upload(t, hash, s_texels);
@@ -1432,7 +1512,18 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash)
     return tex;
 }
 
-static id<MTLTexture> tex_bind(const Stage *t)
+/* `cube`: t goes up as a cube map (nv2a_stage_cube_bind), its six faces
+ * hashed and decoded together; tex_bind's fallbacks are 2D, so such a
+ * stage gets s_black_cube for them. */
+static id<MTLTexture> tex_bind_body(const Stage *t, int cube);
+
+static id<MTLTexture> tex_bind(const Stage *t, int cube)
+{
+    id<MTLTexture> tex = tex_bind_body(t, cube);
+    return cube && tex.textureType != MTLTextureTypeCube ? s_black_cube : tex;
+}
+
+static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -1440,7 +1531,8 @@ static id<MTLTexture> tex_bind(const Stage *t)
     TexEntry *e = NULL, *victim = &s_tc[0];
 
     if (t->valid && (uint64_t)t->width * t->height <= TEX_MAX_TEXELS)
-        bytes = nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
+        bytes = cube ? nv2a_stage_cube_extent(t)
+                     : nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
     /* The guest bytes are about to be hashed and decoded: a render target
      * over them that rt_texture did not bind (another format, no_rtt, an
      * evicted name) is written back first, so the decode sees what was
@@ -1501,7 +1593,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
                 && c->pitch == t->pitch && c->palette == t->palette
-                && c->levels == t->levels) {
+                && c->levels == t->levels && c->cube == cube) {
             e = c;
             break;
         }
@@ -1517,7 +1609,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
             s_tex_rehash++;
             e->gen = g->flips;
             if (h != e->hash || e->pack_gen != pg) {
-                id<MTLTexture> nt = tex_upload(t, h);
+                id<MTLTexture> nt = tex_upload(t, h, cube);
                 s_tex_changed++;
                 /* The hash moves only with the texels: a failed upload keeps
                  * the old texture and is tried again next flip. */
@@ -1536,7 +1628,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
         [e->tex release];
         e->tex = nil;
         e->live = 0;
-        nt = tex_upload(t, h);
+        nt = tex_upload(t, h, cube);
         if (!nt)
             return s_black;
         e->offset = t->offset;
@@ -1546,6 +1638,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->pitch = t->pitch;
         e->palette = t->palette;
         e->levels = t->levels;
+        e->cube = cube;
         e->bytes = bytes;
         e->gen = g->flips;
         e->hash = h;
@@ -1848,11 +1941,27 @@ static id<MTLFunction> fs_basic(void)
     return fn ? fn : s_fs_basic;
 }
 
+/* fs_select returned the combiners' function: only that one declares
+ * cube maps, so only then does a stage bind one (nv2a_stage_cube_bind). A
+ * batch that falls back to fs_basic (no MSL, a compile failure, FS_MAX)
+ * samples face 0 as 2D, as before. */
+static int s_fs_comb;
+
+static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v);
+
 /* The fragment function for the batch: its register combiners when they
  * are programmed (v->rc_set and a stage count), else fs_basic. As the D3D11
- * setup_pixel, only 2D textures are bound, so every sampling mode is passed
- * to the combiners as 2D. */
+ * setup_pixel, the texture shader's modes are nv2a_stage_ps_mode's: cube
+ * maps where a stage binds one, the dot-product family, BUMPENVMAP, and 2D
+ * for every other sampling mode. */
 static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
+{
+    id<MTLFunction> fn = fs_select_body(v);
+    s_fs_comb = fn != s_fs_basic && fn != fs_basic();
+    return fn;
+}
+
+static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v)
 {
     static char msl[65536];
     static struct { int valid; uint32_t r[38]; id<MTLFunction> fn; } memo;
@@ -1864,14 +1973,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
 
     if (!(v->rc_set && (v->rc_ctl & 0xFF)))
         return fs_basic();
-    for (n = 0; n < 4; n++) {
-        /* As D3D11: BUMPENVMAP(_LUMINANCE) from stage 1 on, reading the
-         * stage OTHER_STAGE_INPUT names. */
-        uint32_t m = nv2a_stage_ps_mode(&s_stage[n], n);
-        if (m == 6 || m == 7)
-            inputs |= (uint32_t)nv2a_stage_input(n, v->other_stage_input) << (4 * n);
-        modes |= m << (5 * n);
-    }
+    nv2a_ps_stage_key(s_stage, v->other_stage_input, v->dot_rgbmapping, &modes, &inputs);
     memcpy(key, v->rc_cicw, 32);
     memcpy(key + 8, v->rc_aicw, 32);
     memcpy(key + 16, v->rc_cocw, 32);
@@ -1894,8 +1996,11 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
     st.rect_snap = (int)(key[36] & 1u);   /* nv2a_snap_uv; in the hash via st */
     st.rt_offset = (int)(key[36] >> 1 & 1u);   /* hor+: tex_scale.w, nv2a_aspect_place */
     st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
-    for (n = 0; n < 4; n++)
+    for (n = 0; n < 4; n++) {
         st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
+        st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
+        st.tex_cube[n] = (int)((inputs >> (28 + n)) & 1u);
+    }
     st.bump_on = 1;
     hash = fnv(&st, sizeof st);
     if (!s_fs && !(s_fs = (FsEntry *)calloc(FS_MAX, sizeof *s_fs)))
@@ -2280,6 +2385,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             return;
         }
         build_stages();
+        stages_cube_rt();
         bump_src = nv2a_bump_sources(s_stage, v->rc_set && (v->rc_ctl & 0xFF),
                                      v->other_stage_input);
         {
@@ -2432,7 +2538,16 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 if (!t->mode || t->mode == 4)
                     continue;
                 textured = 1;
-                if ((src = rt_texture(t, rt)) != NULL) {
+                /* A cube map's faces are decoded from guest memory: one
+                 * over a live target is not bound as a cube (cube_rt).
+                 * Only the combiners' shader declares one (s_fs_comb);
+                 * fs_basic samples face 0. A dot stage that reads no
+                 * texture keeps the black one: nothing to decode. */
+                if (s_fs_comb && !nv2a_texmode_samples((int)nv2a_stage_ps_mode(t, k))) {
+                    continue;
+                } else if (s_fs_comb && nv2a_stage_cube_bind(t, nv2a_stage_ps_mode(t, k))) {
+                    stex[k] = tex_bind(t, 1);
+                } else if ((src = rt_texture(t, rt)) != NULL) {
                     stex[k] = src->tex;
                     nv2a_ps_consts_rt(&mpc.b, k, t, src->w, src->h);
                     if (nv2a_rt_no_alpha(nv2a_tex_linear_twin(t->color)))
@@ -2445,7 +2560,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     s_rtt_binds++;
                     nv2a_tex_dump_rt(t);
                 } else {
-                    stex[k] = tex_bind(t);
+                    stex[k] = tex_bind(t, 0);
                     if (nv2a_aspect_picture(t->width, rt->w, bump_src >> k & 1))
                         guest_tex = 1;
                 }
@@ -4166,6 +4281,7 @@ const struct nv2a_pb_backend *nv2a_pb_metal_backend(void)
         @autoreleasepool {
             s_black = solid_texture(0xFF000000u);
             s_magenta = solid_texture(NV2A_TEX_MAGENTA);
+            s_black_cube = solid_cube(0xFF000000u);
         }
     }
     return &s_metal_backend;

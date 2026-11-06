@@ -1677,8 +1677,9 @@ static int blend_color(float bf[4])
  * level 0 only, for A/B.
  *
  * ponytail: DXT is decoded rather than uploaded as BC1-3; a texture
- * rewritten between two batches of one flip is not seen; cube maps and 3D
- * textures are face/slice 0 only. */
+ * rewritten between two batches of one flip is not seen; 3D textures are
+ * slice 0 only, and so is a cube map but where nv2a_stage_cube_bind binds
+ * all six faces (CUBEMAP and the cube-reading dot-product modes). */
 
 static Stage s_stage[4];
 /* What each stage's SRV came from, for the batch trace. */
@@ -1689,6 +1690,7 @@ static RenderTarget *s_stage_rt[4];
 #define TEX_CACHE 512   /* array bound; entries in use: tex_cache_n() */
 typedef struct {
     uint32_t offset, color, width, height, pitch, palette, levels;
+    int      cube;          /* six faces in a cube texture (nv2a_stage_cube_bind) */
     uint32_t gen, used;
     uint32_t pack_gen;      /* nv2a_tex_pack_gen() it was uploaded under */
     uint64_t hash;
@@ -1696,7 +1698,7 @@ typedef struct {
     /* What tex holds: the guest size, or a pack entry's (textures.pack);
      * a re-upload of another size or format makes a new texture. */
     uint32_t tex_w, tex_h, tex_levels;
-    int      tex_bc3;
+    int      tex_bc3, tex_cube;
     ID3D11Texture2D          *tex;
     ID3D11ShaderResourceView *srv;
 } TexEntry;
@@ -1723,9 +1725,9 @@ static uint32_t  s_tc_clock;
 #define TC_HINTS 2048
 static uint16_t  s_tc_hint[TC_HINTS];
 
-static uint32_t tc_slot(const Stage *t)
+static uint32_t tc_slot(const Stage *t, int cube)
 {
-    uint32_t h = t->offset * 0x9E3779B1u;
+    uint32_t h = (t->offset + (uint32_t)cube) * 0x9E3779B1u;
     h ^= (t->color + (t->width << 8) + (t->height << 20)) * 0x85EBCA77u;
     h ^= (t->pitch ^ t->palette ^ (t->levels << 27)) * 0xC2B2AE3Du;
     return (h >> 16) & (TC_HINTS - 1);
@@ -1734,6 +1736,7 @@ static uint32_t *s_texels;
 static size_t    s_texels_cap;
 static ID3D11ShaderResourceView *s_black_srv;   /* too large: (0,0,0,1) */
 static ID3D11ShaderResourceView *s_magenta_srv; /* format not decoded */
+static ID3D11ShaderResourceView *s_black_cube_srv; /* a cube stage's fallback */
 
 static int no_mips(void)
 {
@@ -1798,11 +1801,35 @@ static void build_stages(void)
     }
 }
 
-/* Bytes of guest memory the texture occupies; 0 if it cannot be decoded. */
-static uint32_t tex_extent(const Stage *t)
+/* nv2a_stage.cube_rt for this draw's stages, against the live targets: a
+ * cube whose faces lie under one is read as 2D (nv2a_stage_cube_bind), as
+ * the Metal backend does, so the key, the shader and the bind agree. Set
+ * every draw: the targets move without the stage registers. */
+static void stages_cube_rt(void)
+{
+    int n, i;
+    for (n = 0; n < 4; n++) {
+        Stage *t = &s_stage[n];
+        t->cube_rt = 0;
+        for (i = 0; t->cube && i < RT_MAX && !t->cube_rt; i++)
+            /* Only a live target: one the title has since overwritten
+             * (a level's cube loaded over a menu's leftover target) is
+             * dropped here, as rt_texture drops one at its own address,
+             * or the cube would read 2D until the target was evicted. */
+            t->cube_rt = s_rt[i].tex
+                         && nv2a_stage_cube_over_rt(t, s_rt[i].addr, s_rt[i].pitch * s_rt[i].h)
+                         && !rt_drop_if_stale(&s_rt[i], "cube");
+    }
+}
+
+/* Bytes of guest memory the texture occupies (all six faces of a cube
+ * map); 0 if it cannot be decoded. */
+static uint32_t tex_extent(const Stage *t, int cube)
 {
     if (!t->valid || (uint64_t)t->width * t->height > TEX_MAX_TEXELS)
         return 0;
+    if (cube)
+        return nv2a_stage_cube_extent(t);
     return nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
 }
 
@@ -1812,25 +1839,28 @@ static uint64_t tex_hash(const uint8_t *p, uint32_t n)
 }
 
 /* The whole texture into s_texels (A8R8G8B8): level 0 (width x height),
- * then each further level packed after it. */
-static int decode_texture(const Stage *t)
+ * then each further level packed after it; `faces` of them (6 for a cube
+ * map), each nv2a_stage_face_stride on from the last, one after another. */
+static int decode_texture(const Stage *t, uint32_t faces)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset() + t->offset;
     size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
     const uint32_t *pal = NULL;
+    uint32_t f, stride = faces > 1 ? nv2a_stage_face_stride(t) : 0;
 
-    if (n > s_texels_cap) {
-        uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
+    if (n * faces > s_texels_cap) {
+        uint32_t *p = (uint32_t *)realloc(s_texels, n * faces * 4);
         if (!p)
             return 0;
         s_texels = p;
-        s_texels_cap = n;
+        s_texels_cap = n * faces;
     }
     if (t->color == NV2A_TEX_P8)
         pal = (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset()
                                  + t->palette);
-    nv2a_tex_decode(mem, t->color, t->width, t->height, t->pitch, t->levels,
-                    pal, pal ? t->pal_len : 0, s_texels);
+    for (f = 0; f < faces; f++)
+        nv2a_tex_decode(mem + f * stride, t->color, t->width, t->height, t->pitch, t->levels,
+                        pal, pal ? t->pal_len : 0, s_texels + n * f);
     return 1;
 }
 
@@ -1838,19 +1868,23 @@ static int decode_texture(const Stage *t)
  * released, so a refusal leaves e as it was. `bc3`: BC3 blocks (a pack
  * entry's payload, XRTP_FLAG_BC3) rather than A8R8G8B8 texels. */
 static int tex_alloc(TexEntry *e, uint32_t width, uint32_t height, uint32_t levels,
-                     int bc3)
+                     int bc3, int cube)
 {
     D3D11_TEXTURE2D_DESC td;
     ID3D11Texture2D *tex = NULL;
     ID3D11ShaderResourceView *srv = NULL;
     if (e->tex && e->tex_w == width && e->tex_h == height && e->tex_levels == levels
-            && e->tex_bc3 == bc3)
+            && e->tex_bc3 == bc3 && e->tex_cube == cube)
         return 1;
     memset(&td, 0, sizeof td);
     td.Width = width;
     td.Height = height;
     td.MipLevels = levels;
-    td.ArraySize = 1;
+    /* A cube map: six array slices in the NV2A's face order (+X -X +Y -Y
+     * +Z -Z, D3D's), viewed as a TEXTURECUBE (the default view of a
+     * TEXTURECUBE resource). */
+    td.ArraySize = cube ? 6 : 1;
+    td.MiscFlags = cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
     td.Format = bc3 ? DXGI_FORMAT_BC3_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
@@ -1871,6 +1905,7 @@ static int tex_alloc(TexEntry *e, uint32_t width, uint32_t height, uint32_t leve
     e->tex_h = height;
     e->tex_levels = levels;
     e->tex_bc3 = bc3;
+    e->tex_cube = cube;
     return 1;
 }
 
@@ -1891,8 +1926,30 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
     const uint32_t *src = NULL;
     const uint8_t *p;
     uint32_t width = t->width, height = t->height, levels = t->levels;
-    uint32_t l;
+    uint32_t l, f;
     int bc3 = 0;
+    if (e->cube) {
+        /* No pack entry is a cube map: the six faces go up from the guest.
+         * tex_dump writes face 0, the first texels decoded. */
+        if (!decode_texture(t, 6) || !tex_alloc(e, width, height, levels, 0, 1))
+            return 0;
+        if (nv2a_tex_dump_on())
+            nv2a_tex_dump_upload(t, hash, s_texels);
+        p = (const uint8_t *)s_texels;
+        for (f = 0; f < 6; f++)
+            for (l = 0; l < levels; l++) {
+                uint32_t w = nv2a_tex_level_dim(width, l), h = nv2a_tex_level_dim(height, l);
+                ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex,
+                                                      l + f * levels,
+                                                      NULL, p, w * 4u, 0);
+                p += (size_t)w * h * 4u;
+            }
+        s_tex_uploads++;
+        nv2a_stats_add(NV2A_STAT_TEX_UPLOADS, 1);
+        if (levels > 1)
+            s_tex_mip_uploads++;
+        return 1;
+    }
     if (nv2a_tex_pack_count()) {
         struct nv2a_tex_pack_entry *pe = nv2a_tex_pack_find(hash, t->width, t->height);
         if (pe && (src = nv2a_tex_pack_texels(pe)) != NULL) {
@@ -1904,7 +1961,7 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
             nv2a_tex_pack_miss(hash, t->width, t->height, t->color, t->levels);
         }
     }
-    if (src && !tex_alloc(e, width, height, levels, bc3)) {
+    if (src && !tex_alloc(e, width, height, levels, bc3, 0)) {
         /* A refused entry is a miss too, tagged so in the trace. */
         nv2a_tex_pack_miss(hash, t->width, t->height, t->color, t->levels);
         src = NULL;
@@ -1917,10 +1974,10 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
      * under a hit they are decoded for it alone, once. s_texels is free
      * for that, since src points into the pack's buffer. */
     if (src && nv2a_tex_dump_on())
-        nv2a_tex_dump_upload(t, hash, nv2a_tex_dump_wants(t, hash) && decode_texture(t)
+        nv2a_tex_dump_upload(t, hash, nv2a_tex_dump_wants(t, hash) && decode_texture(t, 1)
                                       ? s_texels : NULL);
     if (!src) {
-        if (!decode_texture(t) || !tex_alloc(e, width, height, levels, 0))
+        if (!decode_texture(t, 1) || !tex_alloc(e, width, height, levels, 0, 0))
             return 0;
         src = s_texels;
         if (nv2a_tex_dump_on())
@@ -1962,12 +2019,22 @@ static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
 }
 
 /* The view for a stage's texture, decoded and uploaded if it is new or its
- * bytes changed since it was last checked (once per flip). */
-static ID3D11ShaderResourceView *tex_bind(const Stage *t)
+ * bytes changed since it was last checked (once per flip). `cube`: t goes
+ * up as a cube map (nv2a_stage_cube_bind), its six faces hashed and decoded
+ * together; the fallbacks are 2D, so such a stage gets the black cube. */
+static ID3D11ShaderResourceView *tex_bind_body(const Stage *t, int cube);
+
+static ID3D11ShaderResourceView *tex_bind(const Stage *t, int cube)
+{
+    ID3D11ShaderResourceView *v = tex_bind_body(t, cube);
+    return cube && (v == s_black_srv || v == s_magenta_srv) ? s_black_cube_srv : v;
+}
+
+static ID3D11ShaderResourceView *tex_bind_body(const Stage *t, int cube)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bytes = tex_extent(t), i;
+    uint32_t bytes = tex_extent(t, cube), i;
     TexEntry *e = NULL, *victim = &s_tc[0];
     uint32_t slot;
 
@@ -1987,13 +2054,13 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         }
         return s_magenta_srv ? s_magenta_srv : s_black_srv;
     }
-    slot = tc_slot(t);
+    slot = tc_slot(t, cube);
     if (memo_on() && s_tc_hint[slot]) {
         TexEntry *c = &s_tc[s_tc_hint[slot] - 1];
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
                 && c->pitch == t->pitch && c->palette == t->palette
-                && c->levels == t->levels)
+                && c->levels == t->levels && c->cube == cube)
             e = c;
     }
     uint32_t n = tex_cache_n();
@@ -2002,7 +2069,7 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
                 && c->pitch == t->pitch && c->palette == t->palette
-                && c->levels == t->levels) {
+                && c->levels == t->levels && c->cube == cube) {
             e = c;
             break;
         }
@@ -2037,6 +2104,7 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         e->pitch = t->pitch;
         e->palette = t->palette;
         e->levels = t->levels;
+        e->cube = cube;
         e->gen = g->flips;
         e->hash = tex_hash_pal(mem, t, bytes);
         e->pack_gen = nv2a_tex_pack_gen();
@@ -2203,6 +2271,21 @@ static void create_black_texture(void)
         ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t, NULL,
                                               &s_black_srv);
         ID3D11Texture2D_Release(t);
+    }
+    {
+        /* the same, as a cube map of six 1x1 faces */
+        D3D11_SUBRESOURCE_DATA faces[6];
+        int f;
+        for (f = 0; f < 6; f++)
+            faces[f] = sd;
+        td.ArraySize = 6;
+        td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+        t = NULL;
+        if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, faces, &t))) {
+            ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t, NULL,
+                                                  &s_black_cube_srv);
+            ID3D11Texture2D_Release(t);
+        }
     }
 }
 
@@ -2589,6 +2672,21 @@ static int aspect_quad(struct aspect_batch *hp, const struct nv2a_pb_vsh *v, Ren
     return bars && nv2a_aspect_band((const float (*)[2])xy, hp->count, rt->w, rt->h, bars);
 }
 
+/* For a pixel shader that declares 2D textures (the basic shader, the
+ * debug ones) after setup_pixel bound for the combiners': the stages in
+ * mask, bound as cubes or black for a dot stage that reads none, get their
+ * texture (a cube's face 0) as 2D, as before cubes and dot stages were
+ * bound. */
+static void stages_flat(unsigned mask)
+{
+    int n;
+    for (n = 0; n < 4; n++)
+        if (mask >> n & 1) {
+            ID3D11ShaderResourceView *flat = tex_bind(&s_stage[n], 0);
+            ID3D11DeviceContext_PSSetShaderResources(s_ctx, (UINT)n, 1, &flat);
+        }
+}
+
 static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
 {
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
@@ -2600,6 +2698,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
     unsigned bump_src;
 
     build_stages();
+    stages_cube_rt();
     bump_src = nv2a_bump_sources(s_stage, v->rc_set && (v->rc_ctl & 0xFF),
                                  v->other_stage_input);
     {
@@ -2624,12 +2723,20 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
     static struct {
         uint32_t stage_gen, rt_gen, tc_gen, pack_gen;
         uint64_t flip;
-        int ok, textured;
+        int ok, textured, combiner;
+        unsigned flat_mask, zero_mask;
         ID3D11ShaderResourceView *srv[4];
         TexEntry *e[4];
         const char *src[4];
     } lm;
-    int lhit = memo_on() && lm.ok && lm.stage_gen == s_stage_gen && lm.rt_gen == s_rt_gen
+    /* A combiner draw binds cube maps as cubes, the basic shader as face 0. */
+    int combiner = v->rc_set && (v->rc_ctl & 0xFF);
+    unsigned flat_mask = 0;   /* stages bound as cubes, or black for no read:
+                               * the basic shader wants their 2D texture */
+    unsigned zero_mask = 0;   /* dot stages that read no texture */
+    uint32_t rt_gen0 = s_rt_gen;   /* what cube_rt was decided against */
+    int lhit = memo_on() && lm.ok && lm.combiner == combiner
+              && lm.stage_gen == s_stage_gen && lm.rt_gen == s_rt_gen
               && lm.tc_gen == s_tc_gen && lm.pack_gen == nv2a_tex_pack_gen()
               && lm.flip == nv2a_pb_gpu_state()->flips;
     if (lhit) {
@@ -2642,11 +2749,21 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
             smp[n] = sampler(&s_stage[n], bump_src >> n & 1);
         }
         textured = lm.textured;
+        flat_mask = lm.flat_mask;
+        zero_mask = lm.zero_mask;
         s_loop_hits++;
     }
     for (n = 0; !lhit && n < 4; n++) {
         const Stage *t = &s_stage[n];
-        RenderTarget *src = (t->mode && t->mode != 4) ? rt_texture(t) : NULL;
+        /* A cube map's faces are decoded from guest memory: one over a
+         * live target is not bound as a cube (cube_rt) and reads the
+         * target as 2D. Only the combiners' shader declares one; the
+         * basic shader samples face 0. A dot stage that reads no texture
+         * gets black, as on Metal: nothing to decode. */
+        uint32_t ps_mode = nv2a_stage_ps_mode(t, n);
+        int zero = combiner && t->mode && t->mode != 4 && !nv2a_texmode_samples((int)ps_mode);
+        int cube = combiner && nv2a_stage_cube_bind(t, ps_mode);
+        RenderTarget *src = (t->mode && t->mode != 4 && !cube && !zero) ? rt_texture(t) : NULL;
         lm.e[n] = NULL;
         s_stage_rt[n] = src;
         s_stage_src[n] = !t->mode ? "none" : t->mode == 4 ? "passthru" : "cache";
@@ -2660,11 +2777,18 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
             s_rtt_binds++;
             nv2a_tex_dump_rt(t);
             textured = 1;
+        } else if (zero) {
+            srv[n] = s_black_srv;
+            s_stage_src[n] = "none(dot)";
+            flat_mask |= 1u << n;
+            zero_mask |= 1u << n;
         } else if (t->mode && t->mode != 4) {
-            srv[n] = tex_bind(t);
+            srv[n] = tex_bind(t, cube);
+            flat_mask |= (unsigned)cube << n;
             lm.e[n] = s_tex_last;
             if (srv[n] == s_magenta_srv) s_stage_src[n] = "MAGENTA(undecoded)";
-            else if (srv[n] == s_black_srv) s_stage_src[n] = "BLACK(too large/failed)";
+            else if (srv[n] == s_black_srv || srv[n] == s_black_cube_srv)
+                s_stage_src[n] = "BLACK(too large/failed)";
             textured = 1;
         } else {
             srv[n] = s_black_srv;
@@ -2678,15 +2802,24 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
          * failed re-upload only once, then the entry's old view for the
          * rest of the flip, which a remembered black would hide. */
         for (n = 0; n < 4; n++)
-            if (s_stage[n].mode && s_stage[n].mode != 4
-                && (srv[n] == s_black_srv || srv[n] == s_magenta_srv))
+            if (s_stage[n].mode && s_stage[n].mode != 4 && !(zero_mask >> n & 1)
+                && (srv[n] == s_black_srv || srv[n] == s_magenta_srv
+                    || srv[n] == s_black_cube_srv))
                 lm.ok = 0;
+        /* Nor one whose loop dropped a stale target (rt_texture): cube_rt
+         * was decided with it live, so a later draw, seeing it gone, keys
+         * a cube shader the remembered 2D view would not match. */
+        if (s_rt_gen != rt_gen0)
+            lm.ok = 0;
         lm.stage_gen = s_stage_gen;
         lm.rt_gen = s_rt_gen;
         lm.tc_gen = s_tc_gen;
         lm.pack_gen = nv2a_tex_pack_gen();
         lm.flip = nv2a_pb_gpu_state()->flips;
         lm.textured = textured;
+        lm.combiner = combiner;
+        lm.flat_mask = flat_mask;
+        lm.zero_mask = zero_mask;
         memcpy(lm.srv, srv, sizeof srv);
         memcpy(lm.src, s_stage_src, sizeof lm.src);
     }
@@ -2785,16 +2918,11 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
         ID3D11PixelShader *ps;
         uint32_t modes = 0;
         uint32_t inputs = 0;
-        for (n = 0; n < 4; n++) {
-            /* Only 2D textures are bound: other sampling modes read 2D at
-             * (s, t), as the CPU path does -- but BUMPENVMAP(_LUMINANCE),
-             * which reads 2D at (s, t) moved by an earlier stage's texel,
-             * from stage 1 on (OTHER_STAGE_INPUT names the stage). */
-            uint32_t m = nv2a_stage_ps_mode(&s_stage[n], n);
-            if (m == 6 || m == 7)
-                inputs |= (uint32_t)nv2a_stage_input(n, v->other_stage_input) << (4 * n);
-            modes |= m << (5 * n);
-        }
+        /* 2D textures, cube maps where a stage binds one, and the
+         * texture shader's dependent reads (BUMPENVMAP and the dot-product
+         * family, OTHER_STAGE_INPUT naming the input stage); other sampling
+         * modes read 2D at (s, t), as the CPU path does. */
+        nv2a_ps_stage_key(s_stage, v->other_stage_input, v->dot_rgbmapping, &modes, &inputs);
         /* The registers and modes that make the state: the same as the last
          * batch's give the same state and so the same shader. */
         static struct {
@@ -2827,8 +2955,11 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
             st.rect_snap = (int)(key[36] & 1u);   /* nv2a_snap_uv; in rc_hash via st */
             st.rt_offset = (int)(key[36] >> 1 & 1u);   /* hor+: tex_scale.w, nv2a_aspect_place */
             st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
-            for (n = 0; n < 4; n++)
+            for (n = 0; n < 4; n++) {
                 st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
+                st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
+                st.tex_cube[n] = (int)((inputs >> (28 + n)) & 1u);
+            }
             st.bump_on = 1;
             s_last_rc = st;
             memcpy(memo.r, key, sizeof key);
@@ -2836,8 +2967,10 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
             memo.ps_ok = 0;
         }
         s_last_rc_on = 1;
-        if (!s_dbg_post && (ps = debug_ps()) != NULL)
+        if (!s_dbg_post && (ps = debug_ps()) != NULL) {
+            stages_flat(flat_mask);   /* the debug shaders declare 2D */
             return ps;
+        }
         /* A compile since may have evicted the entry remembered. */
         if (hit && memo.ps_ok && memo.compiles == s_rc_compiles) {
             memo.e->last_use = s_tick;   /* as combiner_ps's hit does */
@@ -2851,6 +2984,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
         }
         if (ps)
             return ps;
+        /* No combiners' shader (no HLSL, a compile failure). */
+        stages_flat(flat_mask);
     }
     if (!(v->rc_set && (v->rc_ctl & 0xFF)))
         s_last_rc_on = 0;
@@ -6091,6 +6226,8 @@ static void blit_tex_stale(uint32_t addr, uint32_t bytes)
          * texture with its mips, rehashes a few too many at worst. */
         uint64_t cb = c->pitch ? (uint64_t)c->pitch * c->height
                                : (uint64_t)c->width * c->height * 4u * (c->levels > 1 ? 2u : 1u);
+        if (c->cube)
+            cb *= 6u;
         if (c->live && clo < hi && lo < clo + cb)
             c->gen = nv2a_pb_gpu_state()->flips - 1u;
     }

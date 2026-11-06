@@ -29,6 +29,7 @@ int msl_compile(const char *src, const char *fn, char *err, int errsize);
 #define NCOMB 400
 #define NCASE (2 * NPROG + NCOMB)
 #include "expected.h"   /* EXPECTED_HASH, EXPECTED_CHARS, s_expect[NCASE], or MSL_NO_EXPECT */
+#include "../d3d8_hlsl_split/dot_cases.h"   /* k_dot_cases, shared with the HLSL tests */
 
 static uint32_t s_seed = 0x2f6b1d3u;
 static uint32_t rnd(void)
@@ -261,6 +262,50 @@ static int bump_check(void)
     return bad;
 }
 
+/* The texture shader's dot-product modes (bump_on): Quantum Redshift's
+ * water (DOTPRODUCT, DOTPRODUCT, DOT_RFLCT_SPEC on a cube), the other
+ * reflection and dependent modes, over cubes and over 2D textures
+ * (nv2a_cube_2d), and a CUBEMAP stage (dot_cases.h), with and without
+ * rt_offset. tests/nv2a_dot and d3d8_hlsl_split check the text; these
+ * compile it. */
+static int dot_check(void)
+{
+    static char text[256 * 1024];
+    uint32_t seen[DOT_NCASE * 2];
+    NV2ACombinerState st;
+    int bad = 0, i, k, n, off, nseen = 0;
+
+    for (i = 0; i < DOT_NCASE; i++)
+        for (off = 0; off < 2; off++) {
+            int dot = 0;
+            dot_case_state(i, off, &st);
+            if ((n = d3d8_combiners_generate_msl(&st, text, (int)sizeof text)) <= 0) {
+                printf("FAIL: %s: no MSL\n", k_dot_cases[i].name);
+                bad = 1;
+                continue;
+            }
+            for (k = 0; k < NV2A_MAX_TEXTURES; k++)
+                dot |= NV2A_TEXMODE_DOT_ON(&st, k);
+            if (dot && !strstr(text, "nv2a_dotmap")) {
+                printf("FAIL: %s: no dot-product text\n", k_dot_cases[i].name);
+                bad = 1;
+            }
+            if (dot_text_seen(seen, nseen, dot_text_hash(text))) {
+                printf("FAIL: %s%s: the same text as an earlier case\n",
+                       k_dot_cases[i].name, off ? " (rt_offset)" : "");
+                bad = 1;
+            }
+            seen[nseen++] = dot_text_hash(text);
+            {
+                int before = s_compile_bad;
+                compile_case(k_dot_cases[i].name, off, text, n, "fs_main");
+                if (s_compile_bad != before)
+                    bad = 1;
+            }
+        }
+    return bad;
+}
+
 /* rt_offset (hor+, display.aspect): a 2D stage and a BUMPENVMAP stage add
  * tex_scale.w to u, the shift into a padded render target's guest columns;
  * the same state without the flag reads no .w, so the hashed cases above
@@ -377,6 +422,8 @@ int main(void)
     if (bump_check())
         return 1;
     if (rt_offset_check())
+        return 1;
+    if (dot_check())
         return 1;
     if (s_bad) {
         printf("FAIL: %d of %d cases differ (MSL_DUMP=<file> writes the text)\n",

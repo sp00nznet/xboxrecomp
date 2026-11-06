@@ -708,6 +708,13 @@ struct nv2a_stage {
      * BUMP_ENV_SCALE (0x1B38) and BUMP_ENV_OFFSET (0x1B3C). */
     float    bump[4], bump_scale, bump_offset;
     int      raw_mode;  /* the shader program's mode before the gating */
+    /* Set by the GPU backend for each draw: a CUBEMAP_ENABLE texture whose
+     * six-face span (nv2a_stage_cube_extent) overlaps a live render target.
+     * Such a stage is not bound as a cube (nv2a_stage_cube_bind), so its
+     * key, its shader and its bind all take the 2D read, the render
+     * target's own where one starts at t->offset, rather than decode faces
+     * from guest bytes the target has not written back. */
+    int      cube_rt;
 };
 
 /* SET_TEXTURE_ADDRESS modes: 1 wrap, 2 mirror, 3 clamp to edge, 4 border,
@@ -1185,18 +1192,119 @@ static inline int nv2a_stage_input(int n, uint32_t other_stage_input)
     return in < (uint32_t)n ? (int)in : n - 1;
 }
 
-/* The pixel shader's mode for stage n of a backend that generates
- * BUMPENVMAP: NONE, PASSTHRU and CLIPPLANE (5, from raw_mode) stay, 6 and 7
- * stay from stage 1 on (stage 0 has no earlier stage to read), and every
- * other mode is sampled as 2D. Both GPU backends key their shaders on it. */
+/* The texture-shader dot-product family (xemu psh.c, PS_TEXTUREMODES 8 to
+ * 0x12) and the stages each mode may sit in: a mode outside its stages is a
+ * title bug the hardware would not run, and is sampled as 2D instead.
+ * DOTPRODUCT (0x11), DOT_ZW (0x0A), BRDF (8) and DOT_RFLCT_SPEC_CONST
+ * (0x12) sample nothing: they read 0, as xemu's. */
+static inline int nv2a_dot_mode_ok(uint32_t m, int n)
+{
+    switch (m) {
+    case 0x08: case 0x09: case 0x0A: return n >= 2;   /* BRDF, DOT_ST, DOT_ZW */
+    case 0x0B: return n == 2;                          /* DOT_RFLCT_DIFF */
+    case 0x0C: case 0x0D: case 0x0E: case 0x12:
+        return n == 3;      /* DOT_RFLCT_SPEC, DOT_STR_3D, DOT_STR_CUBE, _SPEC_CONST */
+    case 0x0F: case 0x10: return n >= 1;               /* DPNDNT_AR, DPNDNT_GB */
+    case 0x11: return n == 1 || n == 2;                /* DOTPRODUCT */
+    default: return 0;
+    }
+}
+
+/* Modes that look up a cube map with a 3D vector: CUBEMAP, DOT_RFLCT_DIFF,
+ * DOT_RFLCT_SPEC and DOT_STR_CUBE. */
+static inline int nv2a_mode_cube(uint32_t m)
+{
+    return m == 3 || m == 0x0B || m == 0x0C || m == 0x0E;
+}
+
+/* Stage n's texture goes up as a real cube map: a cube-sampling mode over a
+ * CUBEMAP_ENABLE texture that is bound (t->mode) and square, as every
+ * NV2A cube face is. Both GPU backends bind it as a cube, and their shaders
+ * declare it so (NV2ACombinerState.tex_cube); any other stage over a cube
+ * texture samples its face 0 as 2D. */
+static inline int nv2a_stage_cube_bind(const struct nv2a_stage *t, uint32_t ps_mode)
+{
+    return t->mode && t->cube && !t->cube_rt && t->width == t->height
+        && nv2a_mode_cube(ps_mode);
+}
+
+/* Bytes from one face of t's cube map to the next, by FORMAT's level count
+ * (the memory layout, whatever is sampled), and the guest span of all six
+ * faces as t samples them. */
+static inline uint32_t nv2a_stage_face_stride(const struct nv2a_stage *t)
+{
+    return nv2a_tex_face_stride(t->color, t->width, t->height, t->pitch, t->fmt_levels);
+}
+static inline uint32_t nv2a_stage_cube_extent(const struct nv2a_stage *t)
+{
+    uint32_t face = nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
+    return face ? 5u * nv2a_stage_face_stride(t) + face : 0u;
+}
+
+/* t's cube faces overlap a render target of `bytes` bytes at rt_addr: the
+ * backend's test for nv2a_stage.cube_rt, over each live target. */
+static inline int nv2a_stage_cube_over_rt(const struct nv2a_stage *t, uint32_t rt_addr,
+                                          uint32_t bytes)
+{
+    return t->mode && t->cube && t->offset
+        && nv2a_rt_overlap(rt_addr, bytes, t->offset, nv2a_stage_cube_extent(t));
+}
+
+/* Stage n's dot mapping (SET_DOT_RGBMAPPING): 0 for stage 0, which has no
+ * dot-product mode. */
+static inline int nv2a_stage_dot_map(int n, uint32_t dot_rgbmapping)
+{
+    return n > 0 ? (int)((dot_rgbmapping >> (4 * (n - 1))) & 7u) : 0;
+}
+
+/* The pixel shader's mode for stage n of a backend that generates the
+ * texture shader: NONE, PASSTHRU and CLIPPLANE (5, from raw_mode) stay; 6
+ * and 7 stay from stage 1 on (stage 0 has no earlier stage to read); the
+ * dot-product family stays in its stages (nv2a_dot_mode_ok), from raw_mode,
+ * since a DOTPRODUCT stage reads no texture and titles leave it disabled
+ * (Quantum Redshift's water); CUBEMAP stays over a cube it can bind
+ * (nv2a_stage_cube_bind); every other mode is sampled as 2D. Both GPU
+ * backends key their shaders on it. */
 static inline uint32_t nv2a_stage_ps_mode(const struct nv2a_stage *t, int n)
 {
     uint32_t m = (uint32_t)t->mode;
     if (t->raw_mode == 5)
         return 5;   /* CLIPPLANE reads 0, not NONE's (0, 0, 0, 1) */
+    if (nv2a_dot_mode_ok((uint32_t)t->raw_mode, n))
+        return (uint32_t)t->raw_mode;
     if ((m == 6 || m == 7) && n > 0)
         return m;
+    if (m == 3 && nv2a_stage_cube_bind(t, m))
+        return 3;
     return m && m != 4 ? 1u : m;
+}
+
+/* The texture-shader half of a GPU backend's pixel-shader key: *modes
+ * holds nv2a_stage_ps_mode, 5 bits a stage; *extra the input stage of each
+ * stage that reads one (BUMPENVMAP and the dot-product family), 4 bits a
+ * stage from bit 0, the dot mappings of stages 1-3, 4 bits each from bit
+ * 16 (nv2a_stage_dot_map), and from bit 28 a bit a stage bound as a cube
+ * map (nv2a_stage_cube_bind). Stage 3's input and map go in too under a
+ * DOT_RFLCT_DIFF stage 2, whose third dot product they make whatever stage
+ * 3's own mode. The backend unpacks *extra into the combiner state's
+ * tex_input, dot_map and tex_cube. */
+static inline void nv2a_ps_stage_key(const struct nv2a_stage st[4], uint32_t other_stage_input,
+                                     uint32_t dot_rgbmapping, uint32_t *modes, uint32_t *extra)
+{
+    int n;
+    *modes = 0;
+    *extra = 0;
+    for (n = 0; n < 4; n++) {
+        uint32_t m = nv2a_stage_ps_mode(&st[n], n);
+        int diff3 = n == 3 && (*modes >> 10 & 31u) == 0x0Bu;
+        if (m >= 6 || diff3)
+            *extra |= (uint32_t)nv2a_stage_input(n, other_stage_input) << (4 * n);
+        if ((m >= 8 && n > 0) || diff3)
+            *extra |= (uint32_t)nv2a_stage_dot_map(n, dot_rgbmapping) << (16 + 4 * (n - 1));
+        if (nv2a_stage_cube_bind(&st[n], m))
+            *extra |= 1u << (28 + n);
+        *modes |= m << (5 * n);
+    }
 }
 
 /* RECOMP_TRACE=bump: one line on stderr the first time a batch shows a
@@ -1513,12 +1621,13 @@ uint32_t nv2a_host_opts_gen(void);
 /* render_scale as a factor: 1 when unset. */
 unsigned nv2a_host_render_scale(void);
 
-/* The stages of a draw that a later BUMPENVMAP(_LUMINANCE) stage reads as its
- * offset source (OTHER_STAGE_INPUT), as bits 1 << n; 0 for a draw without
- * register combiners, whose basic shader samples every stage as plain 2D.
- * combiner is v->rc_set && (v->rc_ctl & 0xFF). Only modes 6 and 7 are
- * generated as dependent reads today; DOT_ST, DEPENDENT_AR/GB and the other
- * dependent-read modes must be added here when they are generated. */
+/* The stages of a draw that a later stage reads as its input
+ * (OTHER_STAGE_INPUT): BUMPENVMAP(_LUMINANCE)'s offsets, the dot-product
+ * family's normal and DEPENDENT_AR/GB's coordinates (every mode from 8 on),
+ * and stage 3's under a DOT_RFLCT_DIFF stage 2 (nv2a_ps_stage_key); as bits
+ * 1 << n. 0 for a draw without register combiners, whose basic shader
+ * samples every stage as plain 2D. combiner is v->rc_set && (v->rc_ctl &
+ * 0xFF). */
 unsigned nv2a_bump_sources(const struct nv2a_stage st[4], int combiner,
                            uint32_t other_stage_input);
 /* render.aniso's max anisotropy for stage t's sampler, 0 = off: only a

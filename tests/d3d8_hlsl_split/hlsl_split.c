@@ -30,6 +30,7 @@
 #define EXPECTED_CHARS 7458912u        /* re-recorded: upscale tie shift */
 
 #include "expected.h"   /* s_expect[NCASE], or HLSL_NO_EXPECT */
+#include "dot_cases.h"  /* k_dot_cases, also compiled by d3dcompile_smoke */
 
 static uint32_t s_seed = 0x2f6b1d3u;
 static uint32_t rnd(void)
@@ -262,6 +263,57 @@ static int rt_offset_check(void)
     return bad;
 }
 
+/* The texture shader's dot-product cases (dot_cases.h), each with and
+ * without rt_offset: the text exists, uses the dot helpers where a stage is
+ * in the family, declares a cube exactly where tex_cube or CUBEMAP says, and
+ * applies no alpha_only fix-up to a stage that reads no texture. The text is
+ * compiled by d3dcompile_smoke on Windows. */
+static int dot_check(void)
+{
+    static char text[256 * 1024];
+    uint32_t seen[DOT_NCASE * 2];
+    NV2ACombinerState st;
+    char want[64];
+    int bad = 0, i, k, off, nseen = 0;
+
+    for (i = 0; i < DOT_NCASE; i++)
+        for (off = 0; off < 2; off++) {
+            int dot = 0;
+            dot_case_state(i, off, &st);
+            if (d3d8_combiners_generate_hlsl(&st, text, (int)sizeof text) <= 0) {
+                printf("FAIL: %s: no HLSL\n", k_dot_cases[i].name);
+                bad = 1;
+                continue;
+            }
+            for (k = 0; k < NV2A_MAX_TEXTURES; k++) {
+                int m = (int)st.tex_mode[k];
+                dot |= NV2A_TEXMODE_DOT_ON(&st, k);
+                snprintf(want, sizeof want, "TextureCube tex%d", k);
+                if (!strstr(text, want) != !nv2a_texmode_cube_decl(m, st.tex_cube[k])) {
+                    printf("FAIL: %s: stage %d cube declaration\n", k_dot_cases[i].name, k);
+                    bad = 1;
+                }
+                snprintf(want, sizeof want, "alpha_only[%d] == 2u", k);
+                if (m != NV2A_TEXMODE_NONE && m != NV2A_TEXMODE_PASSTHRU
+                    && !strstr(text, want) != !nv2a_texmode_samples(m) ) {
+                    printf("FAIL: %s: stage %d alpha_only\n", k_dot_cases[i].name, k);
+                    bad = 1;
+                }
+            }
+            if (dot && !strstr(text, "nv2a_dotmap")) {
+                printf("FAIL: %s: no dot-product text\n", k_dot_cases[i].name);
+                bad = 1;
+            }
+            if (dot_text_seen(seen, nseen, dot_text_hash(text))) {
+                printf("FAIL: %s%s: the same text as an earlier case\n",
+                       k_dot_cases[i].name, off ? " (rt_offset)" : "");
+                bad = 1;
+            }
+            seen[nseen++] = dot_text_hash(text);
+        }
+    return bad;
+}
+
 int main(void)
 {
     static uint32_t prog[NV2A_VS_MAX_INSTRUCTIONS * 4];
@@ -328,6 +380,8 @@ int main(void)
     if (bump_check())
         return 1;
     if (rt_offset_check())
+        return 1;
+    if (dot_check())
         return 1;
     if (s_bad) {
         printf("FAIL: %d of %d cases differ (HLSL_DUMP=<file> writes the text)\n",

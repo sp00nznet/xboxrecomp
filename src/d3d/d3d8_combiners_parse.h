@@ -99,9 +99,12 @@ typedef enum NV2AOutputMapping {
 /**
  * Texture-shader mode per stage: the hardware's SET_SHADER_STAGE_PROGRAM
  * field, which is also the XDK's PS_TEXTUREMODES value. BUMPENVMAP and
- * BUMPENVMAP_LUMINANCE are generated when the caller sets bump_on; the other
- * modes above 5 (dot products, ...) are sampled as 2D at (s, t), as the CPU
- * path does.
+ * BUMPENVMAP_LUMINANCE are generated when the caller sets bump_on. The
+ * dot-product family (8 to 0x12) is generated as xemu's psh.c does: each
+ * stage takes dot(texcoord.xyz, dotmap(input texel)), and the last stage of
+ * a chain looks up a texture at the vector the dots make (a cube map in
+ * tex_cube stages, else remapped to 2D). The CPU path samples these as 2D
+ * at (s, t).
  *
  * A stage with no texture is not zero: xemu's psh.c gives a NONE stage
  * (0, 0, 0, 1), as GL does for an unbound sampler, and titles read its
@@ -119,7 +122,46 @@ typedef enum NV2ATextureMode {
     NV2A_TEXMODE_BUMPENVMAP = 6,     /* 2D at (s, t) + the bump matrix times
                                       * an earlier stage's (du, dv) */
     NV2A_TEXMODE_BUMPENVMAP_LUM = 7, /* the same, times its luminance */
+    NV2A_TEXMODE_BRDF = 8,           /* reads 0 (xemu: unimplemented) */
+    NV2A_TEXMODE_DOT_ST = 9,         /* 2D at (dot[n-1], dot[n]) */
+    NV2A_TEXMODE_DOT_ZW = 10,        /* reads 0; the depth write is not done */
+    NV2A_TEXMODE_DOT_RFLCT_DIFF = 11, /* stage 2: cube at (dot1, dot2, dot of
+                                       * stage 3's coordinate) */
+    NV2A_TEXMODE_DOT_RFLCT_SPEC = 12, /* stage 3: cube at the eye vector
+                                       * (q of stages 1-3) reflected about
+                                       * (dot1, dot2, dot3) */
+    NV2A_TEXMODE_DOT_STR_3D = 13,    /* stage 3: volume at (dot1, dot2, dot3) */
+    NV2A_TEXMODE_DOT_STR_CUBE = 14,  /* stage 3: cube at (dot1, dot2, dot3) */
+    NV2A_TEXMODE_DPNDNT_AR = 15,     /* 2D at the input texel's (a, r) */
+    NV2A_TEXMODE_DPNDNT_GB = 16,     /* 2D at the input texel's (g, b) */
+    NV2A_TEXMODE_DOTPRODUCT = 17,    /* reads 0; its dot feeds a later stage */
+    NV2A_TEXMODE_DOT_RFLCT_SPEC_CONST = 18, /* reads 0 (xemu: unimplemented) */
 } NV2ATextureMode;
+
+/* Stage i is generated as a dot-product stage: only for a caller that
+ * fills tex_input, dot_map and tex_cube (bump_on, the PB backends); the
+ * D3D8 front end's modes 8 and up stay sampled as 2D. */
+#define NV2A_TEXMODE_DOT_ON(st, i) \
+    ((st)->bump_on && (int)(st)->tex_mode[i] >= NV2A_TEXMODE_BRDF \
+     && (int)(st)->tex_mode[i] <= NV2A_TEXMODE_DOT_RFLCT_SPEC_CONST)
+
+/* A dot-product stage reads a texture: it is declared and bound. */
+static inline int nv2a_texmode_samples(int m)
+{
+    return m != NV2A_TEXMODE_NONE && m != NV2A_TEXMODE_PASSTHRU
+        && m != NV2A_TEXMODE_CLIPPLANE && m != NV2A_TEXMODE_BRDF
+        && m != NV2A_TEXMODE_DOT_ZW && m != NV2A_TEXMODE_DOTPRODUCT
+        && m != NV2A_TEXMODE_DOT_RFLCT_SPEC_CONST && m <= NV2A_TEXMODE_DOT_RFLCT_SPEC_CONST;
+}
+
+/* The stage's texture is declared as a cube map: CUBEMAP, or a cube-reading
+ * dot mode over a texture the caller binds as a cube (tex_cube). */
+static inline int nv2a_texmode_cube_decl(int m, int tex_cube)
+{
+    return m == NV2A_TEXMODE_CUBEMAP
+        || (tex_cube && (m == NV2A_TEXMODE_DOT_RFLCT_DIFF || m == NV2A_TEXMODE_DOT_RFLCT_SPEC
+                         || m == NV2A_TEXMODE_DOT_STR_CUBE));
+}
 
 /* ================================================================
  * Combiner Stage Input / Output Descriptors
@@ -228,6 +270,14 @@ typedef struct NV2ACombinerState {
     int tex_input[NV2A_MAX_TEXTURES];
     int bump_on;     /* the caller fills bump/bumpls and tex_input: modes 6
                       * and 7 are generated as such, else sampled as 2D */
+    /* Dot-product stages: SET_DOT_RGBMAPPING's mapping of the input texel
+     * (0 unsigned, 1 signed as D3D (x - 128) / 127, 2 as GL, 3 two's
+     * complement; the HILO mappings 4-7 read it unsigned), and tex_cube 1
+     * where the texture bound is a cube map (nv2a_stage_cube_bind). Both
+     * are 0 unless the caller fills them, and with tex_input they serve
+     * only modes 8 and up, which only the PB backends pass. */
+    int dot_map[NV2A_MAX_TEXTURES];
+    int tex_cube[NV2A_MAX_TEXTURES];
 
     /* --- Flags --- */
     uint32_t flags;    /* Dot mapping and other flags from token bits 24-31 */

@@ -1127,7 +1127,8 @@ unsigned nv2a_bump_sources(const struct nv2a_stage st[4], int combiner,
         return 0;
     for (n = 1; n < 4; n++) {
         uint32_t mode = nv2a_stage_ps_mode(&st[n], n);
-        if (mode == 6 || mode == 7)
+        /* DOT_RFLCT_DIFF's third dot product is stage 3's, on its input */
+        if (mode >= 6 || (n == 3 && nv2a_stage_ps_mode(&st[2], 2) == 0x0Bu))
             m |= 1u << nv2a_stage_input(n, other_stage_input);
     }
     return m;
