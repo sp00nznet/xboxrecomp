@@ -325,6 +325,43 @@ static void test_save_dir_root(void)
     }
 }
 
+#if !defined(_WIN32)
+/* The Xbox's file systems ignore case; titles rely on it (a title asks for
+ * Data\movies\INTRO.bik where the disc has Data/Movies/intro.bik). On a POSIX
+ * host a component that is not there as spelled takes the spelling of the one
+ * directory entry that matches it ignoring case. Components nothing matches
+ * stay as asked, so a file about to be created is created where the title said. */
+static void test_case_folding(void)
+{
+    char dir[700], want[1200];
+    FILE *f;
+
+    printf("\nfile names ignore case (POSIX hosts)\n");
+    set_env("RECOMP_SAVE_DIR", NULL);
+    xbox_path_init(g_game, g_save);
+    snprintf(dir, sizeof dir, "%s" SEP "Data", g_game);
+    make_dir(dir);
+    snprintf(dir, sizeof dir, "%s" SEP "Data" SEP "Movies", g_game);
+    make_dir(dir);
+    snprintf(dir, sizeof dir, "%s" SEP "Data" SEP "Movies" SEP "intro.bik", g_game);
+    if ((f = fopen(dir, "wb")) != NULL) fclose(f);
+
+    snprintf(want, sizeof want, "%s" SEP "Data" SEP "Movies" SEP "intro.bik", g_game);
+    expect("\\Device\\Harddisk0\\Partition1\\Data\\Movies\\intro.bik", want,
+           "a path that exists as spelled is unchanged");
+    expect("\\Device\\Harddisk0\\Partition1\\Data\\movies\\INTRO.bik", want,
+           "directory and file take the spelling the host has");
+    expect("\\Device\\Harddisk0\\Partition1\\DATA\\MOVIES\\Intro.BIK", want,
+           "every component folds");
+    snprintf(want, sizeof want, "%s" SEP "Data" SEP "Movies" SEP "New.bin", g_game);
+    expect("\\Device\\Harddisk0\\Partition1\\data\\movies\\New.bin", want,
+           "existing directories fold, a file about to be created keeps its name");
+    snprintf(want, sizeof want, "%s" SEP "Nope" SEP "Sub" SEP "x.bin", g_game);
+    expect("\\Device\\Harddisk0\\Partition1\\Nope\\Sub\\x.bin", want,
+           "nothing matches: the path stays as asked");
+}
+#endif
+
 int main(int argc, char **argv)
 {
     /* argv[1]: write the report there (Proton drops a console exe's stdout) */
@@ -355,6 +392,9 @@ int main(int argc, char **argv)
     test_default_root();
     test_save_dir_root();
     test_legacy_saves();
+#if !defined(_WIN32)
+    test_case_folding();
+#endif
     remove_root();
 
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures, failures == 1 ? "" : "s");

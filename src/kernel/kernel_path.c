@@ -672,6 +672,8 @@ translate:
 #include <sys/types.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <strings.h>
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
@@ -705,6 +707,55 @@ static void mkdir_p(const char* path)
     }
     if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
+}
+
+/* The Xbox's file systems ignore case and titles rely on it: a title asks for
+ * D:\Data\movies\INTRO.bik where the disc has Movies/intro.bik.
+ * Linux's do not, so each component of path after its first `keep` bytes
+ * that is not there as spelled takes the spelling of the one entry in its
+ * directory that matches it ignoring case. A component nothing matches
+ * (a file about to be created) and everything after it stays as asked.
+ * Free on a case-insensitive host (macOS): every lstat succeeds. */
+static void fold_case(char *path, size_t keep)
+{
+    struct stat st;
+    char *comp = path + keep;
+
+    if (lstat(path, &st) == 0)
+        return;                             /* as spelled: the common case */
+    while (*comp == '/')
+        comp++;
+    while (*comp) {
+        char *end = strchr(comp, '/');
+        char save = end ? *end : '\0';
+        int found = 0;
+        if (end)
+            *end = '\0';
+        if (lstat(path, &st) != 0) {
+            DIR *d;
+            struct dirent *e;
+            char parent_end = comp[-1];
+            comp[-1] = '\0';
+            d = opendir(comp == path + 1 ? "/" : path);
+            comp[-1] = parent_end;
+            while (d && (e = readdir(d)) != NULL) {
+                if (strcasecmp(e->d_name, comp) == 0) {
+                    memcpy(comp, e->d_name, strlen(comp));   /* same length */
+                    found = 1;
+                    break;
+                }
+            }
+            if (d)
+                closedir(d);
+        } else {
+            found = 1;
+        }
+        if (end)
+            *end = save;
+        if (!found || !end)
+            return;
+        comp = end + 1;
+    }
 }
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
@@ -892,6 +943,7 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+        fold_case(host_path_buf, strlen(base_dir));
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         /* As the Win32 backend does: the bridge reads back the host path
