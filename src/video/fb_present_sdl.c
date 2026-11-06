@@ -30,7 +30,8 @@
  * lifted code cannot be stopped mid-flight. atexit handlers still run.
  *
  * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display;
- * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2).
+ * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2);
+ * RECOMP_FULLSCREEN=1 starts in borderless desktop fullscreen.
  */
 #if !defined(_WIN32)
 
@@ -298,9 +299,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 SDL_GetError());
         return guest_main();
     }
+    /* Honor the same fullscreen environment setting as the Windows presenter. */
+    Uint32 window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+    if (env_on("RECOMP_FULLSCREEN"))
+        window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+
     win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                            (int)FB_W * scale, (int)FB_H * scale,
-                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+                           window_flags);
     ren = win ? SDL_CreateRenderer(win, -1,
                                    vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
               : NULL;
