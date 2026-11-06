@@ -2829,6 +2829,9 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 #define NV097_SET_POLY_OFFSET_FILL_ENABLE_M 0x0338
 #define NV097_SET_POLYGON_OFFSET_SCALE_FACTOR_M 0x0384
 #define NV097_SET_POLYGON_OFFSET_BIAS_M     0x0388
+#define NV097_SET_CLIP_MIN_M                0x0394
+#define NV097_SET_CLIP_MAX_M                0x0398
+#define NV097_SET_ZMIN_MAX_CONTROL_M        0x1D78
 
 /* Transform-context rows (xemu nv2a_regs.h NV_IGRAPH_XF_XFCTX_*). */
 #define XF_VPSCL 0x3A
@@ -2995,6 +2998,9 @@ static int vsh_method(uint32_t method, uint32_t param)
     case NV097_SET_POLY_OFFSET_FILL_ENABLE_M: s_vsh.poly_offset = param != 0; return 1;
     case NV097_SET_POLYGON_OFFSET_SCALE_FACTOR_M: s_vsh.poly_factor = u2f(param); return 1;
     case NV097_SET_POLYGON_OFFSET_BIAS_M: s_vsh.poly_bias = u2f(param); return 1;
+    case NV097_SET_CLIP_MIN_M: s_vsh.clip_min = u2f(param); s_vsh.clip_set |= 1; return 1;
+    case NV097_SET_CLIP_MAX_M: s_vsh.clip_max = u2f(param); s_vsh.clip_set |= 2; return 1;
+    case NV097_SET_ZMIN_MAX_CONTROL_M:  s_vsh.zminmax_ctl = param;     return 1;
     case NV097_SET_TRANSFORM_EXECUTION_MODE_M:
         s_vsh.mode = param;
         s_vsh.mode_sets++;

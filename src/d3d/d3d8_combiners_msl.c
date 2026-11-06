@@ -187,7 +187,10 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
          "#include <metal_stdlib>\n"
          "using namespace metal;\n");
     EMIT("%s", D3D8_MSL_PSCONSTS);
-    EMIT("%s", D3D8_MSL_VOUT);
+    if (state->w_depth)
+        EMIT("%s", D3D8_MSL_VOUT_W D3D8_MSL_WDEPTH);
+    else
+        EMIT("%s", D3D8_MSL_VOUT);
     EMIT("%s", s_rc_helpers);
     if (state->rect_snap)
         EMIT("%s", D3D8_MSL_SNAP_UV);
@@ -204,8 +207,11 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
             break;
         }
 
-    EMIT("fragment float4 fs_main(VOut i [[stage_in]],\n"
-         "                        constant PsConsts &pc [[buffer(0)]]");
+    EMIT("fragment %s fs_main(VOut i [[stage_in]],\n"
+         "                        constant PsConsts &pc [[buffer(0)]]",
+         state->w_depth ? "FOut" : "float4");
+    if (state->w_depth)
+        EMIT(",\n                        constant WDepth &wd [[buffer(1)]]");
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
         int m = (int)state->tex_mode[i];
         if (m == NV2A_TEXMODE_NONE || m == NV2A_TEXMODE_PASSTHRU
@@ -219,6 +225,10 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
              i, i, i, i);
     }
     EMIT(") {\n");
+    /* Before anything can discard: the slope's derivatives need the whole
+     * quad. */
+    if (state->w_depth)
+        EMIT("%s", D3D8_MSL_WDEPTH_BEGIN);
     for (k = 0; k < 16; k++)
         EMIT("    float4 x%d = float4(0.0);\n", k);
     if (state->fog_input)
@@ -422,7 +432,10 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
          "        else if (f == 7u) ok = a >= r;\n"
          "        if (!ok) discard_fragment();\n"
          "    }\n");
-    EMIT("    return res;\n");
+    if (state->w_depth)
+        EMIT("%s", D3D8_MSL_WDEPTH_END);
+    else
+        EMIT("    return res;\n");
     EMIT("}\n");
     return off;
 }

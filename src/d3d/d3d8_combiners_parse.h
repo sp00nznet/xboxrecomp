@@ -313,6 +313,14 @@ typedef struct NV2ACombinerState {
      * (nv2a_aspect_place). A backend flag, set only while display.aspect
      * pads targets, so the stock shader text is unchanged; in the cache key. */
     int rt_offset;
+
+    /* 1: the batch is W-buffered (SET_CONTROL0 Z_PERSPECTIVE,
+     * nv2a_w_depth_on): the shader takes the vertex output's zw (the clip
+     * w) and writes depth from it, with the clip range's cull or clamp and
+     * polygon offset (WDepth / WDepthCB, struct nv2a_wdepth_consts), as
+     * xemu's psh.c does. A backend flag, 0 for every other batch, so the
+     * stock shader text (and its early-Z) is unchanged; in the cache key. */
+    int w_depth;
 } NV2ACombinerState;
 
 /**

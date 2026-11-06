@@ -1356,6 +1356,60 @@ void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
                          struct nv2a_vp_consts *o);
 
 /* ------------------------------------------------------------------------ */
+/* Depth: W-buffering and polygon offset                                     */
+/* ------------------------------------------------------------------------ */
+
+/* SET_CONTROL0 bit 16 Z_PERSPECTIVE: the depth unit stores the
+ * perspective-interpolated clip w instead of z/w (a W-buffer; Quantum
+ * Redshift). The GPU backends emulate it in the fragment shader,
+ * as xemu does (psh.c), only for a batch that has the depth test on, runs a
+ * vertex program (its output carries w: the vertex epilogue's zw) and
+ * programs the combiners (the generated shader's W variant). Anything else
+ * keeps the host's z/w, its early-Z and its stock shader text. */
+static inline int nv2a_w_depth_on(const struct nv2a_pb_vsh *v, int program, int combiners)
+{
+    return ((v->control0 >> 16) & 1u) && v->depth_enable && program && combiners;
+}
+
+/* Polygon offset applies to this primitive: SET_POLY_OFFSET_FILL_ENABLE and
+ * a filled (triangle-family) primitive, NV097 BEGIN 5..10. The line and
+ * point enables (0x0330, 0x0334) are not emulated. */
+static inline int nv2a_poly_offset_on(const struct nv2a_pb_vsh *v, uint32_t prim)
+{
+    return v->poly_offset && prim >= 5u && prim <= 10u;
+}
+
+/* The host's depth bias for a batch that does not take the W path, into
+ * the backends' D32F target that stores z / zmax: *bias in the target's
+ * units (D3D11 DepthBias, Metal depthBias) and *slope the factor on the
+ * host's depth slope (SlopeScaledDepthBias, slopeScale). Both 0 when the
+ * offset does not apply.
+ *
+ * SET_POLYGON_OFFSET_BIAS counts NV2A depth steps, 1/zmax of the range. A
+ * float target's unit is 2^(e - 23), e the exponent of the triangle's
+ * largest z: 2^-24 for z in [0.5, 1), where a 3D scene's depth sits, so
+ * bias * 2^24 / zmax is the hardware's offset there (x1 for Z24, x256 for
+ * Z16) and smaller nearer the eye. SCALE_FACTOR multiplies the slope per
+ * guest pixel, the host's is per host pixel: times the render scale. */
+void nv2a_depth_bias(const struct nv2a_pb_vsh *v, uint32_t prim, uint32_t surface_format,
+                     unsigned scale, float *bias, float *slope);
+
+/* The W variant's fragment constants (the generated shader's WDepth):
+ * w0 = (bias, factor * render scale, clip min, clip max), the bias and
+ * factor 0 unless polygon offset applies; w1 = (1 / zmax, 1 to cull outside
+ * the clip range or 0 to clamp to it (SET_ZMIN_MAX_CONTROL ZCLAMP_EN), 0,
+ * 0). The clip range is [0, zmax] until the title sets one; a title that
+ * sets only one end keeps the other's default. */
+struct nv2a_wdepth_consts {
+    float w0[4];
+    float w1[4];
+};
+
+void nv2a_wdepth_consts_fill(const struct nv2a_pb_vsh *v, uint32_t prim,
+                             uint32_t surface_format, unsigned scale,
+                             struct nv2a_wdepth_consts *o);
+
+/* ------------------------------------------------------------------------ */
 /* Visibility-test reports (GET_REPORT)                                      */
 /* ------------------------------------------------------------------------ */
 

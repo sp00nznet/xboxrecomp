@@ -974,6 +974,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_backend_common.c | - | nv2a_flip_hook_installed | global | keep | - | flip hook installed by enhance_actions at init |
 | src/kernel/nv2a_backend_common.c | - | nv2a_batch_filter_installed | global | keep | - | mod batch filter installed at init |
 | src/kernel/nv2a_backend_common.c | nv2a_batch_filter_ask | memo | local_static | reset | renderer.common | memo keyed by prog_dwords/start, not content; unreachable local |
+| src/kernel/nv2a_backend_common.c | nv2a_depth_bias | logged | local_static | keep | - | log-once guard |
+| src/kernel/nv2a_backend_common.c | nv2a_wdepth_consts_fill | logged | local_static | keep | - | log-once guard |
 
 ### src/kernel/nv2a_backend_common.h
 
@@ -1712,6 +1714,13 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | vertex_shader | memo | local_static | reset | renderer.d3d11 | keyed on prog_dwords/start; pgraph counter rewinds at reset |
 | src/d3d/nv2a_pb_d3d11.c | rasterizer_state | off | local_static | keep | - | cached env read |
 | src/d3d/nv2a_pb_d3d11.c | rasterizer_state | flip | local_static | keep | - | cached env read |
+| src/d3d/nv2a_pb_d3d11.c | rs_biased | e | local_static | keep | - | depth-bias rasterizer states keyed by their whole description |
+| src/d3d/nv2a_pb_d3d11.c | rs_biased | n | local_static | keep | - | depth-bias rasterizer cache fill |
+| src/d3d/nv2a_pb_d3d11.c | rs_biased | logged | local_static | keep | - | once-per-process warning that the bias cache is full |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ps_w | file_static | keep | - | set by setup_pixel before every batch's binds |
+| src/d3d/nv2a_pb_d3d11.c | st_w_on | cb | local_static | keep | - | W-depth constant buffer object |
+| src/d3d/nv2a_pb_d3d11.c | st_w_on | shadow | local_static | keep | - | last W-depth constants uploaded; only skips a same-value Map |
+| src/d3d/nv2a_pb_d3d11.c | st_w_on | ok | local_static | keep | - | buffer creation once-guard, host |
 | src/d3d/nv2a_pb_d3d11.c | blend_state | next | local_static | keep | - | round-robin eviction index |
 | src/d3d/nv2a_pb_d3d11.c | blend_color | warned | local_static | keep | - | warn-once guard |
 | src/d3d/nv2a_pb_d3d11.c | - | s_stage | file_static | reset | renderer.d3d11 | stages decoded from guest texture registers |
@@ -1759,6 +1768,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | setup_pixel | bump_trace | local_static | keep | - | cached env read |
 | src/d3d/nv2a_pb_d3d11.c | setup_pixel | lm | local_static | reset | renderer.d3d11 | stage-loop memo of s_tc views, keyed on flips |
 | src/d3d/nv2a_pb_d3d11.c | setup_pixel | memo | local_static | keep | - | keyed by combiner register content, kept s_rc |
+| src/d3d/nv2a_pb_d3d11.c | setup_pixel | st0 | local_static | keep | - | scratch copy of s_last_rc for the W fallback, rewritten before each use |
 | src/d3d/nv2a_pb_d3d11.c | read_tex_pixel | st | local_static | keep | - | debug staging texture |
 | src/d3d/nv2a_pb_d3d11.c | trace_stream_out | buf | local_static | keep | - | debug stream-out buffer |
 | src/d3d/nv2a_pb_d3d11.c | trace_stream_out | stage | local_static | keep | - | debug staging buffer |
@@ -2012,6 +2022,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_fs | file_static | keep | - | FS functions keyed by combiner-state content |
 | src/d3d/nv2a_pb_metal.m | - | s_fs_n | file_static | keep | - | FS cache fill count |
 | src/d3d/nv2a_pb_metal.m | - | s_fs_comb | file_static | keep | - | set by fs_select before every batch's binds |
+| src/d3d/nv2a_pb_metal.m | - | s_fs_w | file_static | keep | - | set by fs_select before every batch's binds |
 | src/d3d/nv2a_pb_metal.m | fs_basic | tried | local_static | keep | - | snap FS built once |
 | src/d3d/nv2a_pb_metal.m | fs_basic | fn | local_static | keep | - | snap FS from fixed source |
 | src/d3d/nv2a_pb_metal.m | fs_select_body | msl | local_static | keep | - | scratch MSL buffer |
@@ -2033,6 +2044,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | metal_on_draw | hxy | local_static | keep | - | scratch hor+ vertex xy |
 | src/d3d/nv2a_pb_metal.m | metal_on_draw | hxy_cap | local_static | keep | - | scratch capacity |
 | src/d3d/nv2a_pb_metal.m | metal_on_draw | bump_trace | local_static | keep | - | cached env read |
+| src/d3d/nv2a_pb_metal.m | metal_on_draw | bias_enc | local_static | keep | - | encoder serial of the last setDepthBias; s_enc_serial is monotonic |
+| src/d3d/nv2a_pb_metal.m | metal_on_draw | bias_set | local_static | keep | - | last depth bias on that encoder |
 | src/d3d/nv2a_pb_metal.m | - | s_shown_w | file_static | keep | - | last present extent, host display |
 | src/d3d/nv2a_pb_metal.m | - | s_shown_h | file_static | keep | - | last present extent, host display |
 | src/d3d/nv2a_pb_metal.m | write_back | row | local_static | keep | - | scratch row buffer |

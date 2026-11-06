@@ -294,10 +294,11 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
         "    float4 vp_scale; float4 vp_off;\n"
         "    float4 fog_param;   /* SET_FOG_PARAMS[0], [1] */\n"
         "    uint4  fog_ctl;     /* enable, 0 linear/1 exp/2 exp2, abs, inf/NaN result */\n"
-        /* spec_ctl.z: depth test off, so no far-plane clip (epilogue below). */
+        /* spec_ctl.z: depth test off, so no far-plane clip; .w: W-buffered
+         * depth (epilogue below). */
         "    uint4  spec_ctl;    /* x: specular on, y: alpha from material */\n"
         "};\n"
-        D3D8_MSL_VOUT
+        D3D8_MSL_VOUT_W
         "vertex VOut vs_main(uint vid [[vertex_id]],\n"
         "                    const device float4 *vb [[buffer(0)]],\n"
         "                    constant float4 *c [[buffer(1)]],\n"
@@ -356,6 +357,13 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
              * path's far plane, nv2a_pb_exec.c); Metal always clips at z > w.
              * Capping z at w keeps the near plane and drops the far one. */
             "    if (vp.spec_ctl.z != 0u) o.pos.z = min(o.pos.z, o.pos.w);\n"
+            /* A W-buffered batch (nv2a_w_depth_on): the fragment writes its
+             * depth from zw, the clip w (perspective-interpolated, so the
+             * true w there), and culls on the clip range itself, as the
+             * NV2A does. z/w 0.5 keeps Metal's near and far clip from
+             * firing on z; w <= 0 is still clipped. */
+            "    o.zw = pw;\n"
+            "    if (vp.spec_ctl.w != 0u) o.pos.z = 0.5 * o.pos.w;\n"
             "    {\n"
             "        float fd = oFog.x, ff = 1.0;\n"
             "        if (vp.fog_ctl.x != 0u) {\n"
@@ -372,7 +380,7 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
             "        else if (vp.spec_ctl.y == 0u) oD1.w = 1.0;\n"
             "    }\n");
     } else {
-        sb_append(&sb, "    (void)vp;\n    o.pos = oPos;\n");
+        sb_append(&sb, "    (void)vp;\n    o.pos = oPos;\n    o.zw = oPos.w;\n");
     }
     sb_append(&sb,
         "    o.d0 = saturate(oD0);\n"

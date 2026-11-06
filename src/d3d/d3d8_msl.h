@@ -26,6 +26,50 @@ extern "C" {
 /** The vertex-to-fragment struct, as MSL source. */
 #define D3D8_MSL_VOUT \
     "struct VOut {\n" \
+    D3D8_MSL_VOUT_MEMBERS \
+    "};\n"
+
+/** VOut with zw, the clip w for a W-buffered batch's fragment depth
+ * (nv2a_w_depth_on): what vs_main returns and the combiners' W variant
+ * takes. A fragment function without it links all the same (by name). */
+#define D3D8_MSL_VOUT_W \
+    "struct VOut {\n" \
+    D3D8_MSL_VOUT_MEMBERS \
+    "    float  zw  [[user(zw)]];\n" \
+    "};\n"
+
+/* The combiners' W variant (NV2ACombinerState.w_depth): its constants
+ * (struct nv2a_wdepth_consts: w0 = bias, factor x render scale, clip min,
+ * clip max; w1 = 1/zmax, cull) and its output, colour and depth. */
+#define D3D8_MSL_WDEPTH \
+    "struct WDepth { float4 w0; float4 w1; };\n" \
+    "struct FOut { float4 c [[color(0)]]; float d [[depth(any)]]; };\n"
+
+/* xemu's psh.c for Z_PERSPECTIVE: the depth is the perspective-correct w,
+ * plus polygon offset (the slope per guest pixel: the host's times the
+ * render scale, folded into w0.y); w <= 0 or NaN goes to the float max.
+ * Outside [clip min, clip max] it is culled (ZCLAMP_EN cull) or clamped.
+ * NaN by its bits, as fast math may fold isnan away (d3d8_vsh_hlsl.c's fog
+ * does the same). BEGIN runs first, in uniform control flow for dfdx/dfdy;
+ * END kills, then
+ * writes depth as w / zmax, the target's z / zmax units. */
+#define D3D8_MSL_WDEPTH_BEGIN \
+    "    float zv = i.zw;\n" \
+    "    float zs = max(abs(dfdx(i.zw)), abs(dfdy(i.zw)));\n" \
+    "    if (zv > 0.0) zv += wd.w0.x + wd.w0.y * zs;\n" \
+    "    else zv = as_type<float>(0x7F7FFFFFu);\n" \
+    "    if ((as_type<uint>(zv) & 0x7FFFFFFFu) > 0x7F800000u) zv = as_type<float>(0x7F7FFFFFu);\n" \
+    "    bool wkill = wd.w1.y != 0.0 && (zv < wd.w0.z || wd.w0.w < zv);\n" \
+    "    zv = clamp(zv, wd.w0.z, wd.w0.w);\n"
+
+#define D3D8_MSL_WDEPTH_END \
+    "    if (wkill) discard_fragment();\n" \
+    "    FOut o;\n" \
+    "    o.c = res;\n" \
+    "    o.d = saturate(zv * wd.w1.x);\n" \
+    "    return o;\n"
+
+#define D3D8_MSL_VOUT_MEMBERS \
     "    float4 pos [[position]];\n" \
     "    float4 d0  [[user(d0)]];\n" \
     "    float4 d1  [[user(d1)]];\n" \
@@ -34,8 +78,7 @@ extern "C" {
     "    float4 t2  [[user(t2)]];\n" \
     "    float4 t3  [[user(t3)]];\n" \
     "    float  fog [[user(fog)]];\n" \
-    "    float  psize [[point_size]];\n" \
-    "};\n"
+    "    float  psize [[point_size]];\n"
 
 /** The fragment constants: struct nv2a_ps_consts (nv2a_backend_common.h)
  * declared in float4/uint4 only, then Metal's own tex_bias (stage k's mip

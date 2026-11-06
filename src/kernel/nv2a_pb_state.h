@@ -203,6 +203,15 @@ struct nv2a_pb_vsh {
     uint32_t atest_func, atest_ref;
     int      poly_offset;
     float    poly_factor, poly_bias;
+    /* SET_CLIP_MIN / SET_CLIP_MAX, in depth units (0..zmax), and
+     * SET_ZMIN_MAX_CONTROL raw (bits 7:4 ZCLAMP_EN: 0 cull outside the
+     * range, 1 clamp to it). clip_set: bit 0 CLIP_MIN was written, bit 1
+     * CLIP_MAX; an unwritten one stays at its end of [0, zmax]
+     * (nv2a_wdepth_consts_fill), as the state is zero-initialised and a max
+     * of 0 would cull every W draw. */
+    float    clip_min, clip_max;
+    int      clip_set;
+    uint32_t zminmax_ctl;
     /* SET_CONTROL0: bit 16 Z_PERSPECTIVE_ENABLE (w-buffered depth), bit 12
      * Z_FORMAT float, bit 0 STENCIL_WRITE_ENABLE. */
     uint32_t control0;

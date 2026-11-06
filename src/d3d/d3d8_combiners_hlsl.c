@@ -210,9 +210,18 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
          "    float4 tc1 : TEXCOORD1;\n"
          "    float4 tc2 : TEXCOORD2;\n"
          "    float4 tc3 : TEXCOORD3;\n");
-    if (state->fog_input)
+    if (state->fog_input || state->w_depth)
         EMIT("    float  fog : FOG;\n");
+    /* The W variant reads oZW, so it declares the rest of VS_OUT before it
+     * (the stages link by register order). */
+    if (state->w_depth)
+        EMIT("    float  pts : PSIZE;\n"
+             "    float4 b0  : TEXCOORD4;\n"
+             "    float4 b1  : TEXCOORD5;\n"
+             "    float  zw  : TEXCOORD6;\n");
     EMIT("};\n");
+    if (state->w_depth)
+        EMIT("%s", D3D8_HLSL_WDEPTH);
     EMIT("%s", s_rc_helpers);
     if (state->rect_snap)
         EMIT("%s", D3D8_HLSL_SNAP_UV);
@@ -229,7 +238,12 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             break;
         }
 
-    EMIT("float4 main(PS_IN i) : SV_Target {\n");
+    if (state->w_depth)
+        /* Before anything can discard: the slope's derivatives need the
+         * whole quad. */
+        EMIT("PS_OUT main(PS_IN i) {\n%s", D3D8_HLSL_WDEPTH_BEGIN);
+    else
+        EMIT("float4 main(PS_IN i) : SV_Target {\n");
     for (k = 0; k < 16; k++)
         EMIT("    float4 x%d = 0;\n", k);
     if (state->fog_input)
@@ -433,7 +447,10 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
          "        else if (alpha_func == 7u) ok = a >= r;\n"
          "        if (!ok) discard;\n"
          "    }\n");
-    EMIT("    return res;\n");
+    if (state->w_depth)
+        EMIT("%s", D3D8_HLSL_WDEPTH_END);
+    else
+        EMIT("    return res;\n");
     EMIT("}\n");
     return off;
 }

@@ -351,7 +351,8 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
             "    float4 vp_off;\n"
             "    float4 fog_param;   /* SET_FOG_PARAMS[0], [1] */\n"
             "    uint4  fog_ctl;     /* enable, 0 linear/1 exp/2 exp2, abs, inf/NaN result */\n"
-            /* spec_ctl.z: depth test off, so no far-plane clip (epilogue below). */
+            /* spec_ctl.z: depth test off, so no far-plane clip; .w: W-buffered
+             * depth (epilogue below). */
             "    uint4  spec_ctl;    /* x: specular on, y: alpha from material */\n"
             "};\n"
             "\n");
@@ -379,6 +380,9 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
         "    float  oPts : PSIZE;\n"
         "    float4 oB0  : TEXCOORD4;\n"
         "    float4 oB1  : TEXCOORD5;\n"
+        /* The clip w, for a W-buffered batch's fragment depth (the
+         * combiners' W variant reads it, after the rest in this order). */
+        "    float  oZW  : TEXCOORD6;\n"
         "};\n\n");
 
     /* Main function */
@@ -471,9 +475,14 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
              * on (the CPU path's far plane, nv2a_pb_exec.c), and the
              * rasteriser state keeps DepthClipEnable for the near plane.
              * Capping z at w drops the far clip for depth-off draws. */
-            "    if (spec_ctl.z != 0u) o.oPos.z = min(o.oPos.z, o.oPos.w);\n");
+            "    if (spec_ctl.z != 0u) o.oPos.z = min(o.oPos.z, o.oPos.w);\n"
+            /* As the MSL: a W-buffered batch writes its depth from oZW in
+             * the pixel shader and culls on the clip range there; z/w 0.5
+             * keeps the rasteriser's depth clip from firing on z. */
+            "    o.oZW = pw;\n"
+            "    if (spec_ctl.w != 0u) o.oPos.z = 0.5 * o.oPos.w;\n");
     } else {
-        sb_append(&sb, "    o.oPos = oPos;\n");
+        sb_append(&sb, "    o.oPos = oPos;\n    o.oZW = oPos.w;\n");
     }
     if (flags & NV2A_VSH_HLSL_SCREEN_SPACE) {
         /* The NV2A pushbuffer path: what xemu's vsh.c appends to every

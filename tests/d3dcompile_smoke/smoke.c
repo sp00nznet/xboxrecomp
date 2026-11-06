@@ -18,7 +18,14 @@
  *   7. the backend's basic pixel shader compiles, stock and with
  *      render.snap_2d's gradient sampling (nv2a_basic_hlsl.h);
  *   8. the texture shader's dot-product and cube-map states
- *      (dot_cases.h) compile, with and without rt_offset.
+ *      (dot_cases.h) compile, with and without rt_offset;
+ *   9. the combiners' W-buffer variant (NV2ACombinerState.w_depth)
+ *      compiles to its own bytecode, which keeps SV_Depth and reads the
+ *      WDepthCB constants, for each stock state (its non-W twin), and a
+ *      vertex program with the zw output compiles; polygon offset, as the
+ *      backend translates it (nv2a_depth_bias, nv2a_wdepth_consts_fill),
+ *      gives a non-W batch a rasterizer state the device takes and a W
+ *      batch a constant buffer it takes.
  *
  * Exit code 0 only if every step passed. Output goes to stdout and, because
  * Proton drops a GUI process's stdio, also to the file named by
@@ -37,7 +44,18 @@
 #include "d3d8_vsh.h"
 #include "d3d8_combiners.h"
 #include "nv2a_basic_hlsl.h"
+#include "nv2a_backend_common.h"
 #include "../d3d8_hlsl_split/dot_cases.h"   /* k_dot_cases, text-checked by d3d8_hlsl_split */
+
+/* The batch info's present offset (nv2a_pb_exec.c): nv2a_backend_common.c's
+ * enhance batch filter asks for it, and this test links no executor, so
+ * without it an XBOXRECOMP_ENHANCE build (every package) does not link.
+ * Never asked here. */
+const struct nv2a_pb_present *nv2a_pb_present_state(void)
+{
+    static struct nv2a_pb_present p;
+    return &p;
+}
 
 typedef HRESULT (WINAPI *PFN_D3DCOMPILE)(LPCVOID, SIZE_T, LPCSTR,
     const D3D_SHADER_MACRO *, ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT,
@@ -230,33 +248,53 @@ static void compile_dump(const char *path)
     }
 }
 
+/* Stage 0: R0 = T0 * V0, in RGB and alpha; the final combiner outputs R0. */
+static void t0_v0_state(NV2ACombinerState *s)
+{
+    int i;
+
+    memset(s, 0, sizeof *s);
+    s->num_stages = 1;
+    /* Stage 0: R0 = T0 * V0, in RGB and alpha. */
+    s->stages[0].rgb_input[0].reg = NV2A_REG_T0;
+    s->stages[0].rgb_input[1].reg = NV2A_REG_V0;
+    s->stages[0].alpha_input[0].reg = NV2A_REG_T0;
+    s->stages[0].alpha_input[0].alpha_rep = 1;
+    s->stages[0].alpha_input[1].reg = NV2A_REG_V0;
+    s->stages[0].alpha_input[1].alpha_rep = 1;
+    s->stages[0].rgb_output.ab_dst = NV2A_REG_R0;
+    s->stages[0].alpha_output.ab_dst = NV2A_REG_R0;
+    /* Final: A*B + (1-A)*C + D with A = 1 (zero inverted), B = R0, G = R0.a. */
+    s->final_input[0].reg = NV2A_REG_ZERO;
+    s->final_input[0].mapping = NV2A_MAP_UNSIGNED_INVERT;
+    s->final_input[1].reg = NV2A_REG_R0;
+    s->final_input[6].reg = NV2A_REG_R0;
+    s->final_input[6].alpha_rep = 1;
+    s->tex_mode[0] = NV2A_TEXMODE_2D;
+    for (i = 1; i < NV2A_MAX_TEXTURES; i++)
+        s->tex_mode[i] = NV2A_TEXMODE_NONE;
+}
+
+/* The fog variant the pushbuffer backend draws with: FOG comes in from the
+ * vertex shader and the final combiner blends towards the fog colour by
+ * FOG.a. */
+static void fog_state(NV2ACombinerState *s)
+{
+    t0_v0_state(s);
+    s->fog_input = 1;
+    s->final_input[0].reg = NV2A_REG_FOG;
+    s->final_input[0].mapping = NV2A_MAP_UNSIGNED_IDENTITY;
+    s->final_input[0].alpha_rep = 1;
+    s->final_input[2].reg = NV2A_REG_FOG;
+}
+
 static void compile_combiner(void)
 {
     static NV2ACombinerState st;
     static char hlsl[65536];
-    int i, n;
+    int n;
 
-    memset(&st, 0, sizeof st);
-    st.num_stages = 1;
-    /* Stage 0: R0 = T0 * V0, in RGB and alpha. */
-    st.stages[0].rgb_input[0].reg = NV2A_REG_T0;
-    st.stages[0].rgb_input[1].reg = NV2A_REG_V0;
-    st.stages[0].alpha_input[0].reg = NV2A_REG_T0;
-    st.stages[0].alpha_input[0].alpha_rep = 1;
-    st.stages[0].alpha_input[1].reg = NV2A_REG_V0;
-    st.stages[0].alpha_input[1].alpha_rep = 1;
-    st.stages[0].rgb_output.ab_dst = NV2A_REG_R0;
-    st.stages[0].alpha_output.ab_dst = NV2A_REG_R0;
-    /* Final: A*B + (1-A)*C + D with A = 1 (zero inverted), B = R0, G = R0.a. */
-    st.final_input[0].reg = NV2A_REG_ZERO;
-    st.final_input[0].mapping = NV2A_MAP_UNSIGNED_INVERT;
-    st.final_input[1].reg = NV2A_REG_R0;
-    st.final_input[6].reg = NV2A_REG_R0;
-    st.final_input[6].alpha_rep = 1;
-    st.tex_mode[0] = NV2A_TEXMODE_2D;
-    for (i = 1; i < NV2A_MAX_TEXTURES; i++)
-        st.tex_mode[i] = NV2A_TEXMODE_NONE;
-
+    t0_v0_state(&st);
     n = d3d8_combiners_generate_hlsl(&st, hlsl, sizeof hlsl);
     say("     combiner T0*V0: %d bytes of HLSL\n", n);
     if (n <= 0) {
@@ -265,13 +303,7 @@ static void compile_combiner(void)
     }
     compile("combiner_t0_v0", hlsl, "ps_5_0");
 
-    /* The pushbuffer backend's variant: FOG comes in from the vertex shader
-     * and the final combiner blends towards the fog colour by FOG.a. */
-    st.fog_input = 1;
-    st.final_input[0].reg = NV2A_REG_FOG;
-    st.final_input[0].mapping = NV2A_MAP_UNSIGNED_IDENTITY;
-    st.final_input[0].alpha_rep = 1;
-    st.final_input[2].reg = NV2A_REG_FOG;
+    fog_state(&st);
     n = d3d8_combiners_generate_hlsl(&st, hlsl, sizeof hlsl);
     say("     combiner fog: %d bytes of HLSL\n", n);
     if (n <= 0) {
@@ -347,6 +379,259 @@ static void compile_dot(void)
     }
 }
 
+/* FNV-1a over a blob's bytecode. */
+static uint32_t blob_hash(ID3DBlob *code)
+{
+    const uint8_t *p = (const uint8_t *)ID3D10Blob_GetBufferPointer(code);
+    SIZE_T k, len = ID3D10Blob_GetBufferSize(code);
+    uint32_t h = 2166136261u;
+
+    for (k = 0; k < len; k++)
+        h = (h ^ p[k]) * 16777619u;
+    return h;
+}
+
+static int blob_has(ID3DBlob *code, const char *s)
+{
+    const char *p = (const char *)ID3D10Blob_GetBufferPointer(code);
+    SIZE_T k, len = ID3D10Blob_GetBufferSize(code), n = strlen(s);
+
+    for (k = 0; k + n <= len; k++)
+        if (!memcmp(p + k, s, n))
+            return 1;
+    return 0;
+}
+
+static uint32_t rd32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* A signature element in the DXBC container's ISGN or OSGN chunk: 1 if
+ * (name, index) is there, with *used its read mask (for an input, the
+ * components the shader reads). The container: "DXBC", a 16-byte hash,
+ * version, size, the chunk count and their offsets; a chunk: its fourcc,
+ * size, then the element count, 8, and 24-byte elements (name offset from
+ * the chunk data, index, system value, component type, register, mask,
+ * read/write mask). */
+static int sig_has(ID3DBlob *code, const char *chunk, const char *name,
+                   uint32_t index, unsigned *used)
+{
+    const uint8_t *b = (const uint8_t *)ID3D10Blob_GetBufferPointer(code);
+    uint32_t len = (uint32_t)ID3D10Blob_GetBufferSize(code), nchunk, c, e;
+
+    if (len < 32 || memcmp(b, "DXBC", 4))
+        return 0;
+    nchunk = rd32(b + 28);
+    for (c = 0; c < nchunk && 32 + 4 * c + 4 <= len; c++) {
+        uint32_t off = rd32(b + 32 + 4 * c), size, count;
+        const uint8_t *d;
+
+        if (off + 8 > len || memcmp(b + off, chunk, 4))
+            continue;
+        size = rd32(b + off + 4);
+        d = b + off + 8;
+        if (off + 8 + size > len || size < 8)
+            return 0;
+        count = rd32(d);
+        for (e = 0; e < count && 8 + 24 * e + 24 <= size; e++) {
+            const uint8_t *el = d + 8 + 24 * e;
+            uint32_t no = rd32(el);
+
+            if (no < size && rd32(el + 4) == index
+                    && !strncmp((const char *)d + no, name, size - no)) {
+                if (used)
+                    *used = el[21];
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* One stock state and its W variant: the variant must compile to its own
+ * bytecode, write SV_Depth, read zw (TEXCOORD6) and keep WDepthCB. Were the
+ * depth dead-stripped, the two would compile alike. */
+static void wdepth_twin(const char *name, NV2ACombinerState *st)
+{
+    static char hlsl[256 * 1024];
+    ID3DBlob *stock = NULL, *w = NULL;
+    char what[64];
+    unsigned used = 0;
+    int ok = 1;
+
+    st->w_depth = 0;
+    snprintf(what, sizeof what, "%s", name);
+    if (d3d8_combiners_generate_hlsl(st, hlsl, (int)sizeof hlsl) <= 0
+            || !compile_keep(what, hlsl, "ps_5_0", &stock)) {
+        say("FAIL %s: the stock twin did not build\n", what);
+        s_fail++;
+        return;
+    }
+    st->w_depth = 1;
+    snprintf(what, sizeof what, "%s-w", name);
+    if (d3d8_combiners_generate_hlsl(st, hlsl, (int)sizeof hlsl) <= 0
+            || !compile_keep(what, hlsl, "ps_5_0", &w)) {
+        say("FAIL %s: no W variant\n", what);
+        s_fail++;
+        st->w_depth = 0;
+        ID3D10Blob_Release(stock);
+        return;
+    }
+    st->w_depth = 0;
+    if (blob_hash(w) == blob_hash(stock)) {
+        say("FAIL %s: the same bytecode as its stock twin\n", what);
+        ok = 0;
+    }
+    if (!sig_has(w, "OSGN", "SV_Depth", 0, NULL)) {
+        say("FAIL %s: no SV_Depth output\n", what);
+        ok = 0;
+    }
+    if (sig_has(stock, "OSGN", "SV_Depth", 0, NULL)) {
+        say("FAIL %s: the stock twin writes SV_Depth\n", name);
+        ok = 0;
+    }
+    if (!sig_has(w, "ISGN", "TEXCOORD", 6, &used) || !used) {
+        say("FAIL %s: zw (TEXCOORD6) is not read\n", what);
+        ok = 0;
+    }
+    if (!blob_has(w, "WDepthCB")) {
+        say("FAIL %s: WDepthCB was stripped\n", what);
+        ok = 0;
+    }
+    if (ok)
+        say("ok   wdepth  %-24s SV_Depth, zw read 0x%X, %zu vs %zu bytes\n", what, used,
+            (size_t)ID3D10Blob_GetBufferSize(w), (size_t)ID3D10Blob_GetBufferSize(stock));
+    else
+        s_fail++;
+    ID3D10Blob_Release(w);
+    ID3D10Blob_Release(stock);
+}
+
+/* Quantum Redshift's 3D depth state: W-buffered, clip range 4 to
+ * 2^24 - 1, cull outside it, and its decals' polygon offset. */
+static void qr_depth_state(struct nv2a_pb_vsh *v, int w)
+{
+    static const uint32_t clip_min = 0x407FFFFBu, clip_max = 0x4B7FFFFFu;
+
+    memset(v, 0, sizeof *v);
+    v->control0 = w ? 0x110001u : 0x100001u;
+    v->depth_enable = 1;
+    memcpy(&v->clip_min, &clip_min, 4);
+    memcpy(&v->clip_max, &clip_max, 4);
+    v->clip_set = 1;
+    v->zminmax_ctl = 1u;
+    v->poly_offset = 1;
+    v->poly_factor = -0.25f;
+    v->poly_bias = -1.0f;
+}
+
+static void compile_wdepth(void)
+{
+    static NV2ACombinerState st;
+    static NV2AVshProgram parsed;
+    static struct nv2a_pb_vsh v;
+    static char hlsl[65536];
+    /* MOV oPos, v0 (as d3d8_hlsl_split's wdepth_check). */
+    static const uint32_t prog[4] = {0, 0x0020001Bu, 0x0836106Cu, 0x2070F800u | 1u};
+    struct nv2a_wdepth_consts wc;
+    float zb = 0.0f, zs = 0.0f;
+
+    t0_v0_state(&st);
+    wdepth_twin("combiner_t0_v0", &st);
+    fog_state(&st);
+    wdepth_twin("combiner_fog", &st);
+    dot_case_state(0, 0, &st);
+    wdepth_twin(k_dot_cases[0].name, &st);
+
+    /* The vertex side: every program outputs the clip w as oZW. */
+    d3d8_vsh_parse(prog, 1, &parsed);
+    if (d3d8_vsh_generate_hlsl_ex(&parsed, NV2A_VSH_HLSL_SCREEN_SPACE, hlsl,
+                                  (int)sizeof hlsl) <= 0 || !strstr(hlsl, "oZW")) {
+        say("FAIL vsh_zw: no oZW in the vertex HLSL\n");
+        s_fail++;
+    } else {
+        ID3DBlob *code = NULL;
+        if (compile_keep("vsh_zw", hlsl, "vs_5_0", &code) && code) {
+            if (!sig_has(code, "OSGN", "TEXCOORD", 6, NULL)) {
+                say("FAIL vsh_zw: no TEXCOORD6 output\n");
+                s_fail++;
+            }
+            if (s_dev)
+                check_layout("vsh_zw", &parsed, code);
+            ID3D10Blob_Release(code);
+        }
+    }
+
+    /* Polygon offset off the W path: a hardware bias in the rasterizer
+     * state, as nv2a_pb_d3d11.c's rs_biased builds it. */
+    qr_depth_state(&v, 0);
+    if (nv2a_w_depth_on(&v, 1, 1)) {
+        say("FAIL poly offset: a non-W state takes the W path\n");
+        s_fail++;
+    }
+    nv2a_depth_bias(&v, 5u, 0x128u, 2, &zb, &zs);
+    if (zb == 0.0f || zs == 0.0f) {
+        say("FAIL poly offset: no host bias (%g, %g)\n", zb, zs);
+        s_fail++;
+    } else if (s_dev) {
+        D3D11_RASTERIZER_DESC rd;
+        ID3D11RasterizerState *rs = NULL;
+        HRESULT hr;
+
+        memset(&rd, 0, sizeof rd);
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_BACK;
+        rd.DepthClipEnable = TRUE;
+        rd.ScissorEnable = TRUE;
+        rd.DepthBias = (INT)(zb < 0.0f ? zb - 0.5f : zb + 0.5f);
+        rd.SlopeScaledDepthBias = zs;
+        hr = ID3D11Device_CreateRasterizerState(s_dev, &rd, &rs);
+        if (FAILED(hr)) {
+            say("FAIL poly offset: rasterizer state hr=0x%08lX\n", (unsigned long)hr);
+            s_fail++;
+        } else {
+            say("ok   create  poly_offset_rs           DepthBias %d, slope %g\n",
+                rd.DepthBias, zs);
+            ID3D11RasterizerState_Release(rs);
+        }
+    }
+
+    /* On the W path the offset goes to the shader's WDepthCB instead. */
+    qr_depth_state(&v, 1);
+    if (!nv2a_w_depth_on(&v, 1, 1)) {
+        say("FAIL poly offset: the W state does not take the W path\n");
+        s_fail++;
+    }
+    nv2a_wdepth_consts_fill(&v, 5u, 0x128u, 2, &wc);
+    if (wc.w0[0] == 0.0f || wc.w0[1] == 0.0f || wc.w1[1] != 1.0f) {
+        say("FAIL poly offset: W constants (%g, %g, cull %g)\n", wc.w0[0], wc.w0[1],
+            wc.w1[1]);
+        s_fail++;
+    } else if (s_dev) {
+        D3D11_BUFFER_DESC bd;
+        D3D11_SUBRESOURCE_DATA init;
+        ID3D11Buffer *cb = NULL;
+        HRESULT hr;
+
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = sizeof wc;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        init.pSysMem = &wc;
+        init.SysMemPitch = init.SysMemSlicePitch = 0;
+        hr = ID3D11Device_CreateBuffer(s_dev, &bd, &init, &cb);
+        if (FAILED(hr)) {
+            say("FAIL poly offset: WDepthCB buffer hr=0x%08lX\n", (unsigned long)hr);
+            s_fail++;
+        } else {
+            say("ok   create  wdepth_cb                bias %g, slope %g, clip %g..%g\n",
+                wc.w0[0], wc.w0[1], wc.w0[2], wc.w0[3]);
+            ID3D11Buffer_Release(cb);
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *logpath = recomp_env(RENV_STDIO_LOG);
@@ -412,6 +697,7 @@ int main(int argc, char **argv)
     compile("trivial_ps", k_ps, "ps_5_0");
     compile_combiner();
     compile_dot();
+    compile_wdepth();
     compile("nv2a_ps_diffuse", NV2A_HLSL_PS_BASIC, "ps_5_0");
     compile("nv2a_ps_diffuse_snap", NV2A_HLSL_PS_BASIC_SNAP, "ps_5_0");
     for (i = 1; i < argc; i++)

@@ -120,6 +120,33 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
     "}\n"
 
 /**
+ * The combiners' W variant (NV2ACombinerState.w_depth), as D3D8_MSL_WDEPTH
+ * and its BEGIN / END in d3d8_msl.h: xemu's Z_PERSPECTIVE depth from the
+ * clip w (oZW), with polygon offset and the clip range, written as w / zmax.
+ * The constants are struct nv2a_wdepth_consts at b1. NaN by its bits, as
+ * vkd3d's compiler has no isnan (the vertex fog's test does the same).
+ */
+#define D3D8_HLSL_WDEPTH \
+    "cbuffer WDepthCB : register(b1) { float4 wd0; float4 wd1; };\n" \
+    "struct PS_OUT { float4 c : SV_Target; float d : SV_Depth; };\n"
+
+#define D3D8_HLSL_WDEPTH_BEGIN \
+    "    float zv = i.zw;\n" \
+    "    float zs = max(abs(ddx(i.zw)), abs(ddy(i.zw)));\n" \
+    "    if (zv > 0.0) zv += wd0.x + wd0.y * zs;\n" \
+    "    else zv = asfloat(0x7F7FFFFFu);\n" \
+    "    if ((asuint(zv) & 0x7FFFFFFFu) > 0x7F800000u) zv = asfloat(0x7F7FFFFFu);\n" \
+    "    bool wkill = wd1.y != 0.0 && (zv < wd0.z || wd0.w < zv);\n" \
+    "    zv = clamp(zv, wd0.z, wd0.w);\n"
+
+#define D3D8_HLSL_WDEPTH_END \
+    "    if (wkill) discard;\n" \
+    "    PS_OUT o;\n" \
+    "    o.c = res;\n" \
+    "    o.d = saturate(zv * wd1.x);\n" \
+    "    return o;\n"
+
+/**
  * nv2a_clip_kills(cm, t): whether a CLIPPLANE (texture-shader mode 5) stage
  * kills the pixel. cm is the stage's nv2a_ps_consts.clip_mode, 0x10 | its
  * nibble of SET_SHADER_CLIP_PLANE_MODE (0 when the stage is not CLIPPLANE),

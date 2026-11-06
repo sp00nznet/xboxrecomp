@@ -1522,11 +1522,62 @@ static ID3D11InputLayout *input_layout(VsEntry *e, const uint8_t fmt[16])
  * front faces (CULL_BACK) reverse-subtracted, which leaves alpha only where
  * the floor lies inside a volume. With no culling both passes cover the
  * whole volume and its screen footprint comes out as one dark wedge. */
-static ID3D11RasterizerState *rasterizer_state(int *all)
+/* A scissored state with polygon offset (nv2a_depth_bias), made the first
+ * time a (cull, winding, bias, slope) is drawn: titles use one or two. Past
+ * RS_BIAS_MAX distinct ones the batch draws without its offset, logged
+ * once. */
+#define RS_BIAS_MAX 16
+static ID3D11RasterizerState *rs_biased(int c, int f, float zb, float zs)
+{
+    static struct { int c, f; float zb, zs; ID3D11RasterizerState *rs; } e[RS_BIAS_MAX];
+    static int n;
+    D3D11_RASTERIZER_DESC rd;
+    int i;
+
+    for (i = 0; i < n; i++)
+        if (e[i].c == c && e[i].f == f && e[i].zb == zb && e[i].zs == zs)
+            return e[i].rs;
+    if (n == RS_BIAS_MAX) {
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "[D3D11] polygon offset: %d bias states in use; (%g, %g)"
+                    " and any later ones draw without their offset\n",
+                    RS_BIAS_MAX, (double)zb, (double)zs);
+        }
+        return s_rs_sc[c][f];
+    }
+    memset(&rd, 0, sizeof rd);
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.DepthClipEnable = TRUE;   /* as the stock states (init) */
+    rd.CullMode = c == 0 ? D3D11_CULL_NONE : c == 1 ? D3D11_CULL_BACK : D3D11_CULL_FRONT;
+    rd.FrontCounterClockwise = f;
+    rd.ScissorEnable = TRUE;
+    /* D32F: units of 2^(e - 23) at the triangle's largest z, which
+     * nv2a_depth_bias has already scaled to. */
+    rd.DepthBias = (INT)(zb < 0.0f ? zb - 0.5f : zb + 0.5f);
+    rd.SlopeScaledDepthBias = zs;
+    rd.DepthBiasClamp = 0.0f;
+    if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &e[n].rs)))
+        return s_rs_sc[c][f];
+    e[n].c = c;
+    e[n].f = f;
+    e[n].zb = zb;
+    e[n].zs = zs;
+    return e[n++].rs;
+}
+
+/* w: the W variant is bound (s_ps_w), whose shader applies the offset
+ * itself, the hardware bias not reaching a written depth. Any other pixel
+ * shader (a W compile failure, debug_ps, snap_ps, the basic shader) keeps
+ * the stock z and takes the bias in hardware, as Metal decides after
+ * fs_select. */
+static ID3D11RasterizerState *rasterizer_state(const struct nv2a_pb_draw *d, int w, int *all)
 {
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     static int off = -1;
     int c = 0, f = v->front_face != 0x900;
+    float zb = 0.0f, zs = 0.0f;
 
     static int flip = -1;
     if (off < 0)
@@ -1540,6 +1591,11 @@ static ID3D11RasterizerState *rasterizer_state(int *all)
         else if (v->cull_face == 0x404) c = 2;
         else if (v->cull_face == 0x408) *all = 1;
     }
+    if (!w)
+        nv2a_depth_bias(v, d->prim, nv2a_pb_gpu_state()->format, nv2a_host_render_scale(),
+                        &zb, &zs);
+    if (zb != 0.0f || zs != 0.0f)
+        return rs_biased(c, f, zb, zs);
     return s_rs_sc[c][f];
 }
 
@@ -2687,7 +2743,41 @@ static void stages_flat(unsigned mask)
         }
 }
 
-static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
+/* The pixel shader setup_pixel returned is the combiners' W variant: the
+ * vertex side's W mode (set_vp, vp u[7]) goes with it and with nothing
+ * else, so a fallback keeps the stock z. */
+static int s_ps_w;
+
+/* A W variant is bound: its constants at PS b1 (nv2a_wdepth_consts). */
+static int st_w_on(int w, const struct nv2a_pb_draw *d)
+{
+    static ID3D11Buffer *cb;
+    static struct nv2a_wdepth_consts shadow;
+    static int ok;
+    struct nv2a_wdepth_consts wc;
+    D3D11_MAPPED_SUBRESOURCE m;
+
+    if (!w)
+        return 0;
+    if (!cb && !(cb = make_buffer(sizeof wc, D3D11_BIND_CONSTANT_BUFFER)))
+        return 0;
+    nv2a_wdepth_consts_fill(nv2a_pb_vsh_state(), d->prim, nv2a_pb_gpu_state()->format,
+                            nv2a_host_render_scale(), &wc);
+    if (!(memo_on() && ok && !memcmp(&shadow, &wc, sizeof wc))) {
+        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)cb, 0,
+                                           D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            return 0;
+        memcpy(m.pData, &wc, sizeof wc);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)cb, 0);
+        shadow = wc;
+        ok = 1;
+    }
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &cb);
+    return 1;
+}
+
+static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a_pb_draw *d,
+                                      int w)
 {
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     ID3D11ShaderResourceView *srv[4];
@@ -2697,6 +2787,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
     int n, textured = 0;
     unsigned bump_src;
 
+    s_ps_w = 0;
     build_stages();
     stages_cube_rt();
     bump_src = nv2a_bump_sources(s_stage, v->rc_set && (v->rc_ctl & 0xFF),
@@ -2944,7 +3035,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
         key[35] = modes;
         /* render.scale changes at run time: each scale class has its own text */
         key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
-                | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u);
+                | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u)
+                | (w ? 8u : 0u);   /* W-buffered: the w_depth variant */
         key[37] = inputs;
         hit = memo_on() && memo.key_ok && !memcmp(memo.r, key, sizeof key);
         if (!hit) {
@@ -2955,6 +3047,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
             st.rect_snap = (int)(key[36] & 1u);   /* nv2a_snap_uv; in rc_hash via st */
             st.rt_offset = (int)(key[36] >> 1 & 1u);   /* hor+: tex_scale.w, nv2a_aspect_place */
             st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
+            st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */
             for (n = 0; n < 4; n++) {
                 st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
                 st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
@@ -2982,8 +3075,21 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
             memo.compiles = s_rc_compiles;
             memo.ps_ok = 1;
         }
-        if (ps)
+        if (ps && (!w || st_w_on(w, d))) {
+            s_ps_w = w;
             return ps;
+        }
+        if (ps) {
+            /* No W constants (a failed Map): the stock variant, with the
+             * stock z and the hardware bias, rather than the W shader
+             * reading a stale b1. */
+            static NV2ACombinerState st0;
+            st0 = s_last_rc;
+            st0.w_depth = 0;
+            ps = combiner_ps(&st0);
+            if (ps)
+                return ps;
+        }
         /* No combiners' shader (no HLSL, a compile failure). */
         stages_flat(flat_mask);
     }
@@ -3675,6 +3781,7 @@ static void set_vp(const struct nv2a_pb_vsh *v, const struct nv2a_pb_gpu *g,
     nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
     nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
     nv2a_vp_tie_fill(&vc, rt->hw, rt->hh);
+    vc.u[7] = s_ps_w ? 1u : 0u;   /* spec_ctl.w: the epilogue's W mode */
     memcpy(vp, vc.c, sizeof vc.c);
     memcpy(vp + sizeof vc.c, vc.u, sizeof vc.u);
     if (memo_on() && vp_ok && !memcmp(vp_shadow, vp, sizeof vp)) {
@@ -3718,7 +3825,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     RenderTarget *rt;
     VsEntry *vs;
     ID3D11RasterizerState *rs;
-    int cull_all;
+    int cull_all, w_on;
     uint8_t fmts[16];
     uint32_t lo = 0xFFFF, hi = 0, count, nidx, i, k;
     void *p;
@@ -3750,7 +3857,10 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         idx_cap = d->idx_count * 3u;
     }
     nidx = convert_indices(d, lo, idx, &topo);
-    rs = rasterizer_state(&cull_all);
+    w_on = nv2a_w_depth_on(v, d->program != 0, v->rc_set && (v->rc_ctl & 0xFF));
+    /* For cull_all; the state drawn with is chosen once the pixel shader
+     * is known (setup_pixel's s_ps_w). */
+    rasterizer_state(d, w_on, &cull_all);
     if (!nidx) {
         s_draws_skipped++;
         return;
@@ -4041,10 +4151,6 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
                 s_sc.vp = vp;
             }
-            if (!sc || s_sc.rs != rs) {
-                ID3D11DeviceContext_RSSetState(s_ctx, rs);
-                s_sc.rs = rs;
-            }
             if (!sc || s_sc.il != il) {
                 ID3D11DeviceContext_IASetInputLayout(s_ctx, il);
                 s_sc.il = il;
@@ -4073,11 +4179,16 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             if (skip_post < 0)
                 skip_post = recomp_env(RENV_D3D11_DEBUG_PS_SKIP_POST) != NULL;
             s_dbg_post = skip_post && !v->depth_enable && d->idx_count <= 8;
-            ps = setup_pixel(&hp);
+            ps = setup_pixel(&hp, d, w_on);
             /* setup_pixel may have compiled (and evicted) a shader */
             if (!sc_on() || s_sc.ps != ps) {
                 ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
                 s_sc.ps = ps;
+            }
+            rs = rasterizer_state(d, s_ps_w, &cull_all);
+            if (!sc_on() || s_sc.rs != rs) {
+                ID3D11DeviceContext_RSSetState(s_ctx, rs);
+                s_sc.rs = rs;
             }
         }
         if (hp.place != NV2A_PLACE_CENTRE)

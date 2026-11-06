@@ -346,6 +346,61 @@ static int rt_offset_check(void)
     return bad;
 }
 
+/* w_depth (a W-buffered batch, nv2a_w_depth_on): the shader takes zw and
+ * WDepth, writes [[depth(any)]] from w / zmax after the cull and the
+ * alpha test, and compiles; the vertex program's screen-space epilogue
+ * outputs zw and switches z on spec_ctl.w. Without the flag the fragment
+ * text has none of it, so the hashed cases above stay the stock text. */
+static int wdepth_check(void)
+{
+    static const uint32_t zero[8];
+    static char text[256 * 1024];
+    static uint32_t prog[4] = {0, 0x0020001Bu, 0x0836106Cu, 0x2070F800u | 1u};
+    static NV2AVshProgram parsed;
+    NV2ACombinerState st;
+    const char *kill, *atest;
+    int bad = 0, n;
+
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u, 1u, &st);
+    st.fog_input = 1;
+    st.w_depth = 1;
+    if ((n = d3d8_combiners_generate_msl(&st, text, (int)sizeof text)) <= 0)
+        return 1;
+    kill = strstr(text, "if (wkill) discard_fragment();");
+    atest = strstr(text, "if (pc.atest.z != 0u)");
+    if (!strstr(text, D3D8_MSL_VOUT_W) || !strstr(text, D3D8_MSL_WDEPTH)
+            || !strstr(text, "fragment FOut fs_main(VOut i [[stage_in]],")
+            || !strstr(text, "constant WDepth &wd [[buffer(1)]]")
+            || !strstr(text, D3D8_MSL_WDEPTH_BEGIN) || !strstr(text, D3D8_MSL_WDEPTH_END)
+            || !kill || !atest || kill < atest
+            || strstr(text, D3D8_MSL_WDEPTH_BEGIN) > strstr(text, "float4 x0 =")) {
+        printf("FAIL: the w_depth variant's text\n");
+        bad = 1;
+    }
+    {
+        int before = s_compile_bad;
+        compile_case("rc-wdepth", 0, text, n, "fs_main");
+        if (s_compile_bad != before)
+            bad = 1;
+    }
+    st.w_depth = 0;
+    if (d3d8_combiners_generate_msl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (strstr(text, "zw") || strstr(text, "WDepth") || strstr(text, "[[depth(")) {
+        printf("FAIL: W text without w_depth\n");
+        bad = 1;
+    }
+    d3d8_vsh_parse(prog, 1, &parsed);
+    if (d3d8_vsh_generate_msl(&parsed, D3D8_MSL_SCREEN_SPACE, text, (int)sizeof text) <= 0
+            || !strstr(text, D3D8_MSL_VOUT_W) || !strstr(text, "    o.zw = pw;\n")
+            || !strstr(text, "if (vp.spec_ctl.w != 0u) o.pos.z = 0.5 * o.pos.w;")) {
+        printf("FAIL: the vertex epilogue's zw and W mode\n");
+        bad = 1;
+    }
+    return bad;
+}
+
 int main(void)
 {
     static uint32_t prog[NV2A_VS_MAX_INSTRUCTIONS * 4];
@@ -424,6 +479,8 @@ int main(void)
     if (rt_offset_check())
         return 1;
     if (dot_check())
+        return 1;
+    if (wdepth_check())
         return 1;
     if (s_bad) {
         printf("FAIL: %d of %d cases differ (MSL_DUMP=<file> writes the text)\n",

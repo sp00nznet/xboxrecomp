@@ -1947,21 +1947,27 @@ static id<MTLFunction> fs_basic(void)
  * samples face 0 as 2D, as before. */
 static int s_fs_comb;
 
-static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v);
+/* fs_select returned the combiners' W variant (nv2a_w_depth_on): the
+ * vertex side's W mode (vc.u[7]) and the WDepth buffer go with it, and with
+ * nothing else, so a fallback to fs_basic keeps the stock z. */
+static int s_fs_w;
+
+static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w);
 
 /* The fragment function for the batch: its register combiners when they
  * are programmed (v->rc_set and a stage count), else fs_basic. As the D3D11
  * setup_pixel, the texture shader's modes are nv2a_stage_ps_mode's: cube
  * maps where a stage binds one, the dot-product family, BUMPENVMAP, and 2D
  * for every other sampling mode. */
-static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
+static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v, int w)
 {
-    id<MTLFunction> fn = fs_select_body(v);
+    id<MTLFunction> fn = fs_select_body(v, w);
     s_fs_comb = fn != s_fs_basic && fn != fs_basic();
+    s_fs_w = w && s_fs_comb;
     return fn;
 }
 
-static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v)
+static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
 {
     static char msl[65536];
     static struct { int valid; uint32_t r[38]; id<MTLFunction> fn; } memo;
@@ -1984,7 +1990,8 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v)
     key[35] = modes;
     /* render.scale changes at run time: each scale class has its own text */
     key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
-            | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u);
+            | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u)
+            | (w ? 8u : 0u);   /* W-buffered: the w_depth variant */
     key[37] = inputs;
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.fn;
@@ -1996,6 +2003,7 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v)
     st.rect_snap = (int)(key[36] & 1u);   /* nv2a_snap_uv; in the hash via st */
     st.rt_offset = (int)(key[36] >> 1 & 1u);   /* hor+: tex_scale.w, nv2a_aspect_place */
     st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
+    st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */
     for (n = 0; n < 4; n++) {
         st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
         st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
@@ -2404,7 +2412,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             float b = t->levels > 1 && filter_mip(t->filter) ? lod_bias(t->filter) : 0.0f;
             mpc.tex_bias[k] = b > 15.99f ? 15.99f : b < -16.0f ? -16.0f : b;
         }
-        ffn = fs_select(v);
+        ffn = fs_select(v, nv2a_w_depth_on(v, d->program != 0,
+                                           v->rc_set && (v->rc_ctl & 0xFF)));
         for (i = 0; i < d->idx_count; i++) {
             if (d->idx[i] < lo) lo = d->idx[i];
             if (d->idx[i] > hi) hi = d->idx[i];
@@ -2667,6 +2676,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
         nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
         nv2a_vp_tie_fill(&vc, rt->hw, rt->hh);
+        vc.u[7] = s_fs_w ? 1u : 0u;   /* spec_ctl.w: the epilogue's W mode */
 
         if (!s_enc || s_enc_rt != rt)
             begin_encoder(rt, 0, NULL);
@@ -2706,6 +2716,26 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         [s_enc setCullMode:cull == 1 ? MTLCullModeBack
                          : cull == 2 ? MTLCullModeFront : MTLCullModeNone];
         {
+            /* Polygon offset (nv2a_depth_bias); a W batch takes it in its
+             * shader instead, the hardware bias not reaching a written
+             * depth. A new encoder starts at 0, so a batch without offset
+             * sets nothing. */
+            static uint64_t bias_enc;
+            static float bias_set[2];
+            float zb = 0.0f, zs = 0.0f;
+            if (!s_fs_w)
+                nv2a_depth_bias(v, d->prim, g->format, nv2a_host_render_scale(), &zb, &zs);
+            if (bias_enc != s_enc_serial) {
+                bias_enc = s_enc_serial;
+                bias_set[0] = bias_set[1] = 0.0f;
+            }
+            if (zb != bias_set[0] || zs != bias_set[1]) {
+                [s_enc setDepthBias:zb slopeScale:zs clamp:0.0f];
+                bias_set[0] = zb;
+                bias_set[1] = zs;
+            }
+        }
+        {
             float bf[4];
             (void)nv2a_blend_constant(g->blend_enable, g->blend_sfactor,
                                       g->blend_dfactor, g->blend_color, bf, &(int){0});
@@ -2732,6 +2762,11 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             s_vc1.ok = 0;              /* buffer 1 is vc now, not c[] */
         }
         [s_enc setFragmentBytes:&mpc length:sizeof mpc atIndex:0];
+        if (s_fs_w) {
+            struct nv2a_wdepth_consts wc;
+            nv2a_wdepth_consts_fill(v, d->prim, g->format, nv2a_host_render_scale(), &wc);
+            [s_enc setFragmentBytes:&wc length:sizeof wc atIndex:1];
+        }
         for (k = 0; k < 4; k++) {
             [s_enc setFragmentTexture:stex[k] atIndex:k];
             [s_enc setFragmentSamplerState:sampler(&s_stage[k], bump_src >> k & 1)

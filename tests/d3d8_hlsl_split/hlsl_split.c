@@ -26,8 +26,8 @@
 #define NPROG 400
 #define NCOMB 400
 #define NCASE (2 * NPROG + NCOMB)
-#define EXPECTED_HASH 0xc0cfc59du      /* all cases, one FNV-1a */
-#define EXPECTED_CHARS 7458912u        /* re-recorded: upscale tie shift */
+#define EXPECTED_HASH 0x18fe4c08u      /* all cases, one FNV-1a */
+#define EXPECTED_CHARS 7517712u        /* re-recorded: the vertex zw output */
 
 #include "expected.h"   /* s_expect[NCASE], or HLSL_NO_EXPECT */
 #include "dot_cases.h"  /* k_dot_cases, also compiled by d3dcompile_smoke */
@@ -314,6 +314,62 @@ static int dot_check(void)
     return bad;
 }
 
+/* w_depth, as the MSL test's wdepth_check: PS_IN runs through VS_OUT's
+ * order to zw : TEXCOORD6, the shader writes SV_Depth from WDepthCB after
+ * the cull and the alpha test; the vertex program outputs oZW. Without the
+ * flag none of it, so the hashed cases above stay the stock text. */
+static int wdepth_check(void)
+{
+    static const uint32_t zero[8];
+    static char text[256 * 1024];
+    static uint32_t prog[4] = {0, 0x0020001Bu, 0x0836106Cu, 0x2070F800u | 1u};
+    static NV2AVshProgram parsed;
+    NV2ACombinerState st;
+    const char *kill, *atest;
+    int bad = 0;
+
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u, 1u, &st);
+    st.fog_input = 0;   /* the W variant declares fog all the same */
+    st.w_depth = 1;
+    if (d3d8_combiners_generate_hlsl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    kill = strstr(text, "if (wkill) discard;");
+    atest = strstr(text, "if (alpha_test_enable != 0u)");
+    if (!strstr(text, "    float4 tc3 : TEXCOORD3;\n"
+                      "    float  fog : FOG;\n"
+                      "    float  pts : PSIZE;\n"
+                      "    float4 b0  : TEXCOORD4;\n"
+                      "    float4 b1  : TEXCOORD5;\n"
+                      "    float  zw  : TEXCOORD6;\n"
+                      "};\n")
+            || !strstr(text, D3D8_HLSL_WDEPTH)
+            || !strstr(text, "PS_OUT main(PS_IN i) {\n" D3D8_HLSL_WDEPTH_BEGIN)
+            || !strstr(text, D3D8_HLSL_WDEPTH_END)
+            || !kill || !atest || kill < atest) {
+        printf("FAIL: the w_depth variant's text\n");
+        bad = 1;
+    }
+    st.w_depth = 0;
+    if (d3d8_combiners_generate_hlsl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (strstr(text, "zw") || strstr(text, "WDepth") || strstr(text, "SV_Depth")
+            || strstr(text, "FOG")) {
+        printf("FAIL: W text without w_depth\n");
+        bad = 1;
+    }
+    d3d8_vsh_parse(prog, 1, &parsed);
+    if (d3d8_vsh_generate_hlsl_ex(&parsed, NV2A_VSH_HLSL_SCREEN_SPACE, text, (int)sizeof text) <= 0
+            || !strstr(text, "    float4 oB1  : TEXCOORD5;\n"
+                             "    float  oZW  : TEXCOORD6;\n")
+            || !strstr(text, "    o.oZW = pw;\n")
+            || !strstr(text, "if (spec_ctl.w != 0u) o.oPos.z = 0.5 * o.oPos.w;")) {
+        printf("FAIL: the vertex epilogue's oZW and W mode\n");
+        bad = 1;
+    }
+    return bad;
+}
+
 int main(void)
 {
     static uint32_t prog[NV2A_VS_MAX_INSTRUCTIONS * 4];
@@ -382,6 +438,8 @@ int main(void)
     if (rt_offset_check())
         return 1;
     if (dot_check())
+        return 1;
+    if (wdepth_check())
         return 1;
     if (s_bad) {
         printf("FAIL: %d of %d cases differ (HLSL_DUMP=<file> writes the text)\n",

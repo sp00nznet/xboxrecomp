@@ -511,6 +511,55 @@ void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
     o->u[6] = v->depth_enable ? 0u : 1u;
 }
 
+void nv2a_depth_bias(const struct nv2a_pb_vsh *v, uint32_t prim, uint32_t surface_format,
+                     unsigned scale, float *bias, float *slope)
+{
+    *bias = 0.0f;
+    *slope = 0.0f;
+    if (!nv2a_poly_offset_on(v, prim))
+        return;
+    *bias = v->poly_bias * (16777216.0f / nv2a_zmax(surface_format));
+    *slope = v->poly_factor * (float)(scale ? scale : 1u);
+    {
+        /* One line per run: says whether a title uses the offset at all,
+         * which a stock-identical run (BLiNX 2's goldens) should not. */
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "[NV2A] polygon offset: first batch (factor %g, units %g, prim %u)\n",
+                    (double)v->poly_factor, (double)v->poly_bias, (unsigned)prim);
+        }
+    }
+}
+
+void nv2a_wdepth_consts_fill(const struct nv2a_pb_vsh *v, uint32_t prim,
+                             uint32_t surface_format, unsigned scale,
+                             struct nv2a_wdepth_consts *o)
+{
+    float zmax = nv2a_zmax(surface_format);
+
+    memset(o, 0, sizeof *o);
+    /* In W mode the offset is in w units, the stored value before the
+     * divide by zmax (xemu psh.c: zvalue += depthOffset). */
+    if (nv2a_poly_offset_on(v, prim)) {
+        o->w0[0] = v->poly_bias;
+        o->w0[1] = v->poly_factor * (float)(scale ? scale : 1u);
+    }
+    o->w0[2] = (v->clip_set & 1) ? v->clip_min : 0.0f;
+    o->w0[3] = (v->clip_set & 2) ? v->clip_max : zmax;
+    o->w1[0] = 1.0f / zmax;
+    o->w1[1] = ((v->zminmax_ctl >> 4) & 0xFu) == 0u ? 1.0f : 0.0f;
+    {
+        static int logged;   /* one line per run, as nv2a_depth_bias */
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "[NV2A] W-buffer: first batch (clip %g..%g, %s, zmax %g)\n",
+                    (double)o->w0[2], (double)o->w0[3], o->w1[1] != 0.0f ? "cull" : "clamp",
+                    (double)zmax);
+        }
+    }
+}
+
 void nv2a_report_write(uint8_t *mem, uint32_t va, uint32_t count)
 {
     volatile uint32_t *r = (volatile uint32_t *)(mem + va);
