@@ -8,8 +8,9 @@
  * aperture stayed plain zeroed memory and xbox_OhciHandleMmio returned 0, so
  * a title's USB driver found no controller and no pad.
  *
- * A host without a trapped-MMIO decoder (anything but arm64 here) keeps the
- * model off by design; the test checks that it says so and exits 77.
+ * A host without a trapped-MMIO decoder (anything but POSIX arm64 or Linux
+ * x86-64 here) keeps the model off by design; the test checks that it says
+ * so and exits 77.
  */
 #include "xbox_memory_layout.h"
 #include "ohci.h"
@@ -97,7 +98,7 @@ int main(int argc, char **argv)
 
     xbox_OhciInit();
 
-#if !defined(__aarch64__)
+#if !defined(__aarch64__) && !(defined(__x86_64__) && defined(__linux__))
     check(!xbox_OhciOwnsAddress(XBOX_OHCI0_BASE),
           "no decoder on this host: the model stays off", NULL);
     printf("\n%d failure(s); trap path not available here (skipped)\n",

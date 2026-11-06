@@ -9,6 +9,7 @@
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
 #include "../platform/mmio_decode_a64.h"
+#include "../platform/mmio_decode_x86_64.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
@@ -21,12 +22,17 @@
 
 /* Where the registers can be trapped. They are answered by faulting on the
  * aperture and decoding the instruction that touched it: the x86-64 decoder
- * under a Win32 VEH, or the A64 decoder under a POSIX SIGBUS/SIGSEGV
- * handler. A host with neither leaves the model off (see xbox_OhciInit). */
+ * under a Win32 VEH, or one POSIX decoder per arch under a SIGBUS/SIGSEGV
+ * handler (A64 on arm64, x86-64 on Linux). A host with neither leaves the
+ * model off (see xbox_OhciInit). */
 #if defined(_WIN32)
 #  define OHCI_TRAP_WIN32 1
-#elif defined(__aarch64__)
-#  define OHCI_TRAP_POSIX_A64 1
+#elif defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
+#  define OHCI_TRAP_POSIX 1
+#endif
+
+#if defined(__aarch64__)
+#define MMIO_CTX_PC(uc) A64_CTX_PC(uc)
 #endif
 
 /* The runtime maps guest memory at a fixed host offset. */
@@ -1356,7 +1362,7 @@ void xbox_OhciInit(void)
         if ((unsigned)s_npads > s_ndp)
             s_ndp = (unsigned)s_npads;      /* a port for every pad */
     }
-#if !defined(OHCI_TRAP_WIN32) && !defined(OHCI_TRAP_POSIX_A64)
+#if !defined(OHCI_TRAP_WIN32) && !defined(OHCI_TRAP_POSIX)
     /* No decoder for this host's instructions, so a trapped access could not
      * be answered. Leave the aperture as plain memory -- the title then sees
      * no controller, exactly as with RECOMP_USB unset -- and say so. */
@@ -1432,7 +1438,7 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
     return hc_for(xbox_va) != NULL;
 }
 
-#if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_WIN32)
+#if defined(OHCI_TRAP_POSIX) || defined(OHCI_TRAP_WIN32)
 /* Both decoders hand over 8-byte accesses whole (ldr/str x or a d register
  * on A64, a REX.W mov on x86-64); the registers are 32-bit, so an 8-byte
  * access is two of them. */
@@ -1456,20 +1462,25 @@ static void ohci_write_split(void *dev, uint32_t off, uint64_t val, int size)
 
 int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
 {
-#if defined(OHCI_TRAP_POSIX_A64)
+#if defined(OHCI_TRAP_POSIX)
     ucontext_t *uc = (ucontext_t *)ctx;
     OhciController *hc = hc_for(xbox_va);
     int ok;
 
     if (!hc)
         return 0;
+#if defined(__aarch64__)
     ok = mmio_emulate_a64(uc, xbox_va - hc->base, hc,
                           ohci_read_split, ohci_write_split);
+#else
+    ok = mmio_emulate_x86_64(uc, xbox_va - hc->base, hc,
+                             ohci_read_split, ohci_write_split);
+#endif
     /* stdio in a signal handler, deliberately: see apu_mmio_hook.c. */
     if (!ok && hc->decode_fail++ < 20) {
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: insn %08X\n",
                 hc->index, xbox_va - hc->base,
-                *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc));
+                *(const uint32_t *)(uintptr_t)MMIO_CTX_PC(uc));
         fflush(stderr);
     }
     return ok;
