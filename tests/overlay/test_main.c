@@ -215,7 +215,10 @@ static void test_frames(void)
     const struct nv2a_ovl_atlas *a;
     unsigned i;
     nv2a_overlay_reset_for_test();
-    CHECK(nv2a_overlay_arm(0xF, 1080) == 0, "arm");
+    CHECK(nv2a_overlay_arm(1u << NV2A_OVL_STATS | 1u << NV2A_OVL_STATUS | 1u << NV2A_OVL_TOAST
+                               | 1u << NV2A_OVL_MENU,
+                           1080) == 0,
+          "arm");
     a = nv2a_overlay_atlas();
     CHECK(a && a->px && a->w >= 512 && a->h >= 512, "no atlas");
     if (!a)
@@ -758,7 +761,10 @@ static void test_glyphs(void)
     }
 
     nv2a_overlay_reset_for_test();
-    CHECK(nv2a_overlay_arm(0xF, 1080) == 0, "arm");
+    CHECK(nv2a_overlay_arm(1u << NV2A_OVL_STATS | 1u << NV2A_OVL_STATUS | 1u << NV2A_OVL_TOAST
+                               | 1u << NV2A_OVL_MENU,
+                           1080) == 0,
+          "arm");
     {
         mu_Font f = OVL_FONT(OVL_FONT_BODY, 22, 0);
         nv2a_ovl_glyph_set_key_namer(NULL);

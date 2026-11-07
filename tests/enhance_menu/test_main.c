@@ -49,6 +49,7 @@
 #include "enhance_menu_input.h"
 #include "enhance_menu_layout.h"
 #include "enhance_osk.h"
+#include "enhance_padrec.h"
 #include "enhance_text.h"
 #include "file_browser.h"
 #include "host_open.h"
@@ -65,6 +66,7 @@
 #include "nv2a_present_chain.h"
 #include "nv2a_tex_pack.h"
 #include "pad_map.h"
+#include "pad_session.h"
 #include "pointer.h"
 #include "recomp_env.h"
 #include "recomp_exe_dir.h"
@@ -209,6 +211,8 @@ const struct nv2a_pb_present *nv2a_pb_present_state(void) { return &s_present; }
 
 /* ---- the fake pad backend --------------------------------------------- */
 
+#define VK_F1  0x70
+#define VK_F2  0x71
 #define VK_F5  0x74
 #define VK_F7  0x76
 #define VK_F10 0x79
@@ -498,7 +502,7 @@ static void test_navigate(void)
     CHECK(enhance_menu_is_open());
     CHECK(enhance_menu_page() == 0);
     CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
-    CHECK(enhance_menu_page_count() == 10);
+    CHECK(enhance_menu_page_count() == 11);
 
     /* The title: no buttons, one packet number while the pad changes. A
      * trigger: the menu reads none, so the press does nothing there. */
@@ -2708,10 +2712,11 @@ static uint32_t sum_of(const struct nv2a_ovl_list *l)
 static void test_pages(void)
 {
     /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Saves,
-     * Files. Saves with no title yet: its rows hold no dates. */
-    static const uint32_t k_sum[10] = {
-        0x893FD37Fu, 0xF5E5A2AAu, 0xD56F9851u, 0xF9F4DC86u, 0x39FA9CFAu,
-        0x0813383Bu, 0x05CA29ACu, 0x858EF665u, 0x7B5D7063u, 0x7778B546u };
+     * Recordings, Files. Saves with no title yet: its rows hold no dates;
+     * Recordings with no folder yet: no file rows. */
+    static const uint32_t k_sum[11] = {
+        0x6FDBE087u, 0xC58D4BA2u, 0xD06D4311u, 0x775B0691u, 0x109DEB36u,
+        0x6930FCBFu, 0xC1417056u, 0x3F80EEA3u, 0xE13F4B8Bu, 0xBE720FC1u, 0xE2E461FFu };
     /* Files shows Open exports folder only off Game Mode. */
     set_env("RECOMP_HOST_GAMESCOPE", NULL);
     start_with(ARMED, k_mods);
@@ -2719,7 +2724,7 @@ static void test_pages(void)
     CHECK(enhance_menu_is_open());
     for (int p = 0; p < enhance_menu_page_count(); p++) {
         const struct nv2a_ovl_list *l;
-        uint32_t want = p < 10 ? k_sum[p] : 0;  /* an eleventh page lands unpinned */
+        uint32_t want = p < 11 ? k_sum[p] : 0;  /* a twelfth page lands unpinned */
         CHECK(enhance_menu_set_page(enhance_menu_page_name(p)));
         enhance_menu_draw(100000);
         l = nv2a_overlay_acquire(NV2A_OVL_MENU);
@@ -3960,6 +3965,8 @@ static void test_shots(void)
     shot("1080p-compact-controls", 1920, 1080);
     CHECK(enhance_menu_set_page("Stats"));
     shot("1080p-compact-stats", 1920, 1080);
+    CHECK(enhance_menu_set_page("Recordings"));
+    shot("1080p-compact-recordings", 1920, 1080);
     open_menu();
     /* The Deck's panel: baked and drawn at its 800 lines. */
     {
@@ -5763,6 +5770,202 @@ static void test_saves(void)
     s_save_root[0] = s_save_root[1] = NULL;
 }
 
+/* ---- Recordings (pad-recording-ui R6) ------------------------------------ */
+
+/* padrec_stub.c: the session's menu side, with no pad thread. */
+void padrec_stub_set(const PadrecStatus *st);
+void padrec_stub_env(const char *key);
+void padrec_stub_reset(void);
+const char *padrec_stub_meta_name(void);
+
+#define RECS "config/recordings"
+
+static void recs_clear(void)
+{
+    struct enhance_padrec_file f[ENHANCE_PADREC_FILES];
+    int n = enhance_padrec_list(f, ENHANCE_PADREC_FILES);
+    char path[512];
+    for (int i = 0; i < n; i++) {
+        snprintf(path, sizeof path, RECS "/%s", f[i].name);
+        remove(path);
+    }
+    rmdir(RECS);
+}
+
+static int pr_state(void)
+{
+    PadrecStatus st;
+    padrec_status(&st);
+    return st.state;
+}
+
+static char s_toast[160];
+
+static void toast_seen(const char *line)
+{
+    snprintf(s_toast, sizeof s_toast, "%s", line);
+}
+
+static void test_padrec_page(void)
+{
+    struct enhance_padrec_file f[4];
+    char first[128], row[160];
+    PadrecStatus st;
+
+    padrec_stub_reset();
+    recs_clear();
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Recordings"));
+    CHECK(row_value("State") && !strcmp(s_val, "Idle"));
+    CHECK(row_value("No recordings yet") != NULL);
+    CHECK(row_value("Record") && !strcmp(s_val, "as the menu closes"));
+    CHECK(row_value("Start point") && !strcmp(s_val, "none"));
+    CHECK(row_value("Start") && !strcmp(s_val, "menu_close"));
+    CHECK(row_value("Clock") && !strcmp(s_val, "auto"));
+    CHECK(row_value("Strip") && !strcmp(s_val, "auto"));
+    CHECK(row_value("Play again") == NULL && row_value("Stop") == NULL);
+
+    /* The start point, typed into the row, goes into the record. */
+    CHECK(enhance_menu_select_row("Start point"));
+    tap(0x0D);
+    CHECK(xbox_InputTextActive());
+    type_text("2-1 start");
+    tap(0x0D);
+    CHECK(!xbox_InputTextActive());
+    CHECK(row_value("Start point") && !strcmp(s_val, "2-1 start"));
+    CHECK(status_has("2-1 start"));
+
+    /* Record, armed: the file is made now, the steps wait for the close. */
+    CHECK(enhance_menu_select_row("Record"));
+    tap(0x0D);
+    CHECK(status_has("Records from when the menu closes"));
+    CHECK(pr_state() == PADREC_ARMED_REC);
+    CHECK(row_value("State") && strstr(s_val, "Records when the menu closes"));
+    CHECK(row_value("Stop recording") != NULL);
+    CHECK(enhance_padrec_list(f, 4) == 1);
+    CHECK(!strncmp(f[0].name, "pad-", 4) && strstr(f[0].name, ".pad"));
+    snprintf(first, sizeof first, "%s", f[0].name);
+    /* The header gets the stem, as the strip and the "playing" row show it. */
+    CHECK(!strncmp(padrec_stub_meta_name(), first, strlen(first) - 4)
+          && padrec_stub_meta_name()[strlen(first) - 4] == 0);
+    /* Another record or a play waits for this one. */
+    CHECK(row_value(first) != NULL);
+    CHECK(enhance_menu_select_row(first));
+    tap(0x0D);
+    CHECK(status_has("Stop the record first"));
+    CHECK(pr_state() == PADREC_ARMED_REC);
+
+    /* The close starts it; the shortcuts were dropped while open. */
+    tap(VK_F5);
+    CHECK(pr_state() == PADREC_ARMED_REC);
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+    CHECK(pr_state() == PADREC_REC);
+
+    /* F1 with the menu closed: the record ends (a toggle). */
+    tap(VK_F1);
+    CHECK(pr_state() == PADREC_STOPPED);
+
+    /* A file row plays it, armed; Stop ends it. */
+    open_menu();
+    CHECK(enhance_menu_set_page("Recordings"));
+    CHECK(row_value(first) && !strcmp(s_val, "Play"));
+    CHECK(enhance_menu_select_row(first));
+    tap(0x0D);
+    CHECK(status_has("Plays when the menu closes"));
+    CHECK(pr_state() == PADREC_ARMED_PLAY);
+    CHECK(row_value(first) && !strcmp(s_val, "playing"));
+    CHECK(row_value("Record") != NULL);
+    CHECK(enhance_menu_select_row("Record"));
+    tap(0x0D);
+    CHECK(status_has("Stop the playback first"));
+    CHECK(row_value("Stop") != NULL);
+    CHECK(enhance_menu_select_row("Stop"));
+    tap(0x0D);
+    CHECK(pr_state() == PADREC_STOPPED);
+    CHECK(row_value("Play again") != NULL);
+    CHECK(enhance_menu_select_row("Play again"));
+    tap(0x0D);
+    CHECK(pr_state() == PADREC_ARMED_PLAY);
+    open_menu();
+    CHECK(pr_state() == PADREC_PLAY);
+
+    /* The counts as the file has them, and a warning. */
+    padrec_status(&st);
+    st.count = 120;
+    st.total = 300;
+    st.step = 2;
+    st.nsteps = 5;
+    snprintf(st.warn, sizeof st.warn, "late anchor");
+    padrec_stub_set(&st);
+    open_menu();
+    CHECK(enhance_menu_set_page("Recordings"));
+    CHECK(row_value("Count") && !strcmp(s_val, "g120 of g300"));
+    CHECK(row_value("Step") && !strcmp(s_val, "2 of 5"));
+    CHECK(row_value("Warning") && !strcmp(s_val, "late anchor"));
+    open_menu();
+
+    /* F2 with the menu closed plays the last file now, not armed. */
+    padrec_stop();
+    tap(VK_F2);
+    CHECK(pr_state() == PADREC_PLAY);
+
+    /* The shortcuts keep the page's guards: F1 over a playback and F2
+     * over a record are refused with the page's text, never a silent
+     * replace or a play of the partial file. */
+    s_toast[0] = 0;
+    nv2a_overlay_toast_hook_for_test(toast_seen, NULL);
+    tap(VK_F1);
+    nv2a_overlay_poll(1);
+    CHECK(pr_state() == PADREC_PLAY);
+    CHECK(strstr(s_toast, "Record: Stop the playback first") != NULL);
+    padrec_stop();
+    tap(VK_F1);
+    CHECK(pr_state() == PADREC_REC);
+    s_toast[0] = 0;
+    tap(VK_F2);
+    nv2a_overlay_poll(1);
+    CHECK(pr_state() == PADREC_REC);
+    CHECK(strstr(s_toast, "Play: Stop the record first") != NULL);
+    nv2a_overlay_toast_hook_for_test(NULL, NULL);
+    tap(VK_F1);
+    CHECK(pr_state() != PADREC_REC);
+    padrec_stop();
+
+    /* An env key drives the pad: the page only reads. */
+    padrec_stub_env("RECOMP_PAD_SCRIPT");
+    open_menu();
+    CHECK(enhance_menu_set_page("Recordings"));
+    CHECK(row_value("Driven by") && !strcmp(s_val, "RECOMP_PAD_SCRIPT"));
+    CHECK(enhance_menu_select_row("Record"));
+    tap(0x0D);
+    CHECK(status_has("Read only"));
+    CHECK(pr_state() == PADREC_STOPPED);
+    snprintf(row, sizeof row, "%s", first);
+    CHECK(enhance_menu_select_row(row));
+    tap(0x0D);
+    CHECK(status_has("Read only"));
+    open_menu();
+    padrec_stub_env(NULL);
+
+    /* padrec.start = "now": the page starts at once. */
+    start_with(ARMED "[padrec]\nstart = \"now\"\n", k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Recordings"));
+    CHECK(row_value("Record") && !strcmp(s_val, "now"));
+    CHECK(row_value("Start") && !strcmp(s_val, "now"));
+    CHECK(enhance_menu_select_row(first));
+    tap(0x0D);
+    CHECK(pr_state() == PADREC_PLAY);
+    CHECK(status_has("Playing"));
+    open_menu();
+
+    padrec_stub_reset();
+    recs_clear();
+    remove("config/config.toml");
+}
+
 int main(int argc, char **argv)
 {
     s_pin = argc > 1 && !strcmp(argv[1], "--pin");
@@ -5846,6 +6049,7 @@ int main(int argc, char **argv)
     test_files_import();
     test_files_folders();
     test_saves();
+    test_padrec_page();
     test_shots();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();

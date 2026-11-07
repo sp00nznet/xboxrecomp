@@ -63,8 +63,13 @@
 /* A recorded route of a few minutes is a few hundred button steps, but an
  * analog stick held by hand moves most flips: a long stroll can pass ten
  * thousand steps. On the poll clock every stick change is a step, up to 60 a
- * second while the stick is off centre: room for about 18 minutes of it. */
-#define PAD_SCRIPT_MAX 65536
+ * second while the stick is off centre: room for about 36 minutes of it.
+ * The one cap for record, import and replay (pad-recording-ui R5): a 4 MB
+ * file's worth at about 32 bytes a step, and a whole chain together, since
+ * it bounds the memory a session holds. The env script and an in-game
+ * session hold their steps on the heap. The CLI's pad_script.py uses the
+ * same number. */
+#define PAD_STEPS_MAX 131072
 
 /* An unheld flip-timed step lasts this many flips, the 150 ms default of the
  * millisecond form at 60 flips a second. */
@@ -135,6 +140,11 @@ typedef struct {
 int pad_script_parse_anchored(const char *text, PadStep *steps, int len,
                               int max, PadAnchors *anchors);
 
+/* The anchor entries (@open) in text, comments left out: a file over
+ * PAD_ANCHOR_MAX is refused before it plays (pad-recording-ui R5), where
+ * the parser alone would drop the extra ones and replay on. */
+int pad_script_anchor_lines(const char *text);
+
 /* Tie steps[from..len) to the last anchor at or before their start. A step
  * that starts on an anchor's flip counts from it (the recorder moves an
  * anchor a flip on when a press began earlier in its flip). */
@@ -179,7 +189,8 @@ int pad_anchor_retry(PadAnchors *anchors, int pad, uint32_t flip, PadStep *out,
 /* Parse text (comma or newline separated) and append its steps to
  * steps[len..max). Returns the new length. Bad entries are reported on
  * stderr; parsing stops at an entry without a time, and steps past max are
- * dropped with one warning. */
+ * dropped with one warning. A UTF-8 byte order mark at the start of text
+ * is skipped: Windows editors add one. */
 int pad_script_parse(const char *text, PadStep *steps, int len, int max);
 
 /* Whether st holds at t ms from the first report and at the given flip. */

@@ -56,7 +56,7 @@
 extern "C" {
 #endif
 
-#define XBOX_MOD_API_VERSION 8u
+#define XBOX_MOD_API_VERSION 9u
 
 struct xbox_mod_api;
 
@@ -507,6 +507,20 @@ struct xbox_mod_api {
     int (*draw3d_tris)(const struct xbox_dbg_vtx *v, uint32_t n_tris, uint32_t flags);
     int (*draw3d_lines)(const struct xbox_dbg_vtx *v, uint32_t n_lines, uint32_t flags);
     int (*draw3d_end)(const struct xbox_mod *m);
+
+    /* ---- version 9 (check size before using these) ---------------------
+     * Pad playback (pad-recording-ui R3). While a recording plays, port 0
+     * is the recording's: the title gets the replay, never a mod's
+     * capture. input_capture(1) is then ignored (a version 8 mod keeps
+     * working, its capture simply does not take). */
+
+    /* input_capture with an answer: 0 when done, -1 when refused (on
+     * during a playback). Off is never refused. Any thread. */
+    int (*input_capture_try)(int on);
+    /* fn(user) when a capture held as a playback starts is taken away, on
+     * the guest's thread (xbox_mod_frame), once per loss: a free camera
+     * lands and says so. Init only; up to XBOX_MOD_MAX_FRAME across mods. */
+    void (*on_capture_lost)(void (*fn)(void *user), void *user);
 };
 
 /* glyph_name's flags: one of the two. */

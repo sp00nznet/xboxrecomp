@@ -14,6 +14,7 @@
 
 #include "enhance_actions.h"
 #include "enhance_menu.h"
+#include "enhance_padrec.h"
 #include "enhance_text.h"
 #include "host_pad.h"
 #include "keyboard.h"
@@ -213,6 +214,9 @@ void enhance_mod_status_tick(int stopping)
     int px, py, w, h, dev, family;
     mu_Context *ctx;
 
+    /* The pad recording strip shares the hook: the tick that shows the
+     * mods' panels shows it, under the same arming (rule 6). */
+    enhance_padrec_strip_tick(stopping);
     if (stopping) {
         stop();
         return;

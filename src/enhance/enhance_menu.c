@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
@@ -35,6 +36,7 @@
 #include "enhance_menu_input.h"
 #include "enhance_menu_layout.h"
 #include "enhance_osk.h"
+#include "enhance_padrec.h"
 #include "enhance_text.h"
 #include "file_browser.h"
 #include "host_open.h"
@@ -81,10 +83,11 @@
 
 enum page {
     PAGE_RENDER, PAGE_SHADERS, PAGE_PACK, PAGE_GAME, PAGE_MODS, PAGE_STATS, PAGE_CONTROLS,
-    PAGE_DEBUG, PAGE_SAVES, PAGE_FILES, PAGE_COUNT
+    PAGE_DEBUG, PAGE_SAVES, PAGE_RECORDINGS, PAGE_FILES, PAGE_COUNT
 };
 static const char *const s_page_name[PAGE_COUNT] = {
-    "Render", "Shaders", "Pack", "Game", "Mods", "Stats", "Controls", "Debug", "Saves", "Files"
+    "Render", "Shaders", "Pack", "Game", "Mods", "Stats", "Controls", "Debug", "Saves", "Recordings",
+    "Files"
 };
 /* Each section's intro line (A.8): the toolkit's below, a title's through
  * enhance_menu_page_intro. Held for the section header to draw. */
@@ -99,6 +102,7 @@ static const char *const k_page_intro[PAGE_COUNT] = {
     "What each action is bound to, on the pad and the keyboard, and the mouse.",
     "The renderer's state and the trace channels, for bug reports.",
     "This game's saves: export them to a zip, or import one from another computer.",
+    "Record what the pad does and play it back, to show a bug or repeat a run.",
     "Where the settings are saved, and the way back to the defaults.",
 };
 
@@ -436,6 +440,16 @@ static void language_item(void)
     s_language.help = s_language_help;
 }
 
+/* The padrec.* keys (pad-recording-ui R8), as enhance_padrec.c reads them. */
+static const char *const k_padrec_start[] = { "menu_close", "now", NULL };
+static const char *const k_padrec_clock[] = { "auto", "poll", "flip", NULL };
+static const char *const k_padrec_hud[] = { "auto", "off", NULL };
+
+static void set_padrec(const struct enhance_item *it, const char *v)
+{
+    enhance_padrec_set_key(it->key, v);
+}
+
 static const struct enhance_item k_items[] = {
     { ITEM("render.scale", "Render scale", "Render", ENHANCE_ITEM_RANGE), .lo = 1, .hi = 4,
       .step = 1, .set = set_scale, .get = get_scale, .live = ENHANCE_LIVE_FLUSH, .def = "1",
@@ -507,6 +521,16 @@ static const struct enhance_item k_items[] = {
     { ITEM("input.pad_square_right", "Square right stick", "Controls", ENHANCE_ITEM_TOGGLE),
       .set = set_square, .get = get_square, .def = "false", .user = (void *)(uintptr_t)1,
       .help = "The same for the right stick" },
+    { ITEM("padrec.start", "Start", "Recordings", ENHANCE_ITEM_CHOICE),
+      .choices = k_padrec_start, .set = set_padrec, .def = "menu_close",
+      .help = "When a record or playback started here begins: as the menu closes, or now" },
+    { ITEM("padrec.clock", "Clock", "Recordings", ENHANCE_ITEM_CHOICE),
+      .choices = k_padrec_clock, .set = set_padrec, .def = "auto",
+      .help = "What a record's steps count: the game's pad reads (poll), its frames "
+              "(flip), or the game's pick (auto)" },
+    { ITEM("overlay.padrec_hud", "Strip", "Recordings", ENHANCE_ITEM_CHOICE),
+      .choices = k_padrec_hud, .set = set_padrec, .def = "auto",
+      .help = "The strip over the game while a record or playback runs" },
 };
 #define N_ITEMS ((int)(sizeof k_items / sizeof k_items[0]))
 
@@ -1158,7 +1182,8 @@ enum row_type {
     R_FBENT,            /* a folder or file of the listing: ref is its index */
     R_FBNAME,           /* "Export here as": the name's text entry */
     R_FBASK,            /* "Replace <name>?": ref 0 No, 1 Yes */
-    R_FBPREV            /* an import's preview: ref 0 Apply, 1 Cancel */
+    R_FBPREV,           /* an import's preview: ref 0 Apply, 1 Cancel */
+    R_PADREC            /* Recordings: PR_*, or PR_FILE + a file's index */
 };
 enum { TINT_NONE, TINT_BAD, TINT_WARN };
 enum { FIO_IMPORT, FIO_EXPORT_CFG, FIO_EXPORT_SHADER, FIO_OPEN_DIR, FIO_SAVES_EXPORT,
@@ -1424,7 +1449,7 @@ static void slot_rows(int page, int mod)
 static const uint32_t k_page_icon[PAGE_COUNT] = {
     NV2A_OVL_ICON_SLIDERS, NV2A_OVL_ICON_SPARKLES, NV2A_OVL_ICON_PACKAGE, NV2A_OVL_ICON_GAMEPAD,
     NV2A_OVL_ICON_PUZZLE, NV2A_OVL_ICON_ACTIVITY, NV2A_OVL_ICON_KEYBOARD, NV2A_OVL_ICON_BUG,
-    NV2A_OVL_ICON_DOWNLOAD, NV2A_OVL_ICON_FOLDER
+    NV2A_OVL_ICON_DOWNLOAD, NV2A_OVL_ICON_RESET, NV2A_OVL_ICON_FOLDER
 };
 
 /* Q11: the footer's buttons carry the shortcut that presses them. */
@@ -2086,7 +2111,7 @@ static const char *s_pchoice[NV2A_PRESENT_PARAMS_MAX][SHADER_PARAM_CHOICES_MAX +
 /* The text entry: a profile's Rename or an export's file name (D6), the
  * name being edited and the cursor, in bytes. An export's name may carry
  * its ".toml", which fb_name_check takes off. */
-enum { NAME_RENAME, NAME_EXPORT };
+enum { NAME_RENAME, NAME_EXPORT, NAME_START };
 static int s_name_on, s_name_for;
 static char s_name[FB_NAME_MAX + FB_EXT_MAX + 1];
 static int s_name_cur, s_name_dir;
@@ -2561,6 +2586,7 @@ static void float_literal(float v, char *out, size_t n)
 static int files_view_rows(void);
 static void files_rows(void);
 static void saves_rows(void);
+static void padrec_rows(void);
 /* The page the browser runs on: Files, or Saves for a saves zip. They
  * share one browser and one name entry; a page change closes it. */
 static int s_fb_page = PAGE_FILES;
@@ -2712,6 +2738,9 @@ static void build_rows(void)
         if (s_fb_page == PAGE_SAVES && files_view_rows())
             break;
         saves_rows();
+        break;
+    case PAGE_RECORDINGS:
+        padrec_rows();
         break;
     case PAGE_FILES: {
         /* Save lives in the footer (D9): this page is about the file. */
@@ -4603,6 +4632,251 @@ static int files_event(const struct row *r, int ok)
     }
 }
 
+/* ---- Recordings (pad-recording-ui, phase 1) --------------------------------
+ * The session lives in pad_session.c and its folder in enhance_padrec.c;
+ * this is the page over them. Starts wait for the menu to close when
+ * padrec.start says so (ARMED), so the steps never hold the menu's own
+ * presses. While an env key drives the pad the page only reads. */
+
+enum { PR_RECORD, PR_START, PR_STOP, PR_AGAIN, PR_FILE = 16 };
+static struct enhance_padrec_file s_prf[ENHANCE_PADREC_FILES];
+static int s_nprf;                  /* the files listed; -1 unreadable */
+/* The status the list was read at: a new session or a state change (a
+ * record saved) lists the folder again, not every draw. */
+static uint32_t s_prf_serial;
+static int s_prf_state = -1;
+static char s_rec_start[sizeof s_name];
+
+static void padrec_relist(void)
+{
+    s_prf_state = -1;
+}
+
+static void padrec_start_keep(const char *text)
+{
+    snprintf(s_rec_start, sizeof s_rec_start, "%s", text);
+    status(s_rec_start[0] ? "The next record starts at \"%s\"" : "No start point", s_rec_start);
+}
+
+static const char *padrec_state_text(int state)
+{
+    switch (state) {
+    case PADREC_REC: return "Recording";
+    case PADREC_PLAY: return "Playing";
+    case PADREC_ARMED_REC: return "Records when the menu closes";
+    case PADREC_ARMED_PLAY: return "Plays when the menu closes";
+    case PADREC_WAIT: return "Waiting for the game to load";
+    case PADREC_ENDED: return "Ended";
+    case PADREC_STOPPED: return "Stopped";
+    default: return "Idle";
+    }
+}
+
+static int padrec_live(int state)
+{
+    return enhance_padrec_live(state);
+}
+
+static void padrec_rows(void)
+{
+    static const char k_clock_tag[] = { 'm', 'f', 'g' };   /* PadrecStatus.clock */
+    PadrecStatus st;
+    const char *env = padrec_env_driven();
+    char dir[FB_PATH_MAX];
+    int on = enhance_padrec_dir(dir, sizeof dir), rec, live;
+    struct row *r;
+
+    padrec_status(&st);
+    if (st.serial != s_prf_serial || st.state != s_prf_state) {
+        s_nprf = on ? enhance_padrec_list(s_prf, ENHANCE_PADREC_FILES) : 0;
+        s_prf_serial = st.serial;
+        s_prf_state = st.state;
+    }
+    rec = st.state == PADREC_REC || st.state == PADREC_ARMED_REC;
+    live = padrec_live(st.state);
+
+    header("Session");
+    r = row_add(R_INFO, -1, 0, "State");
+    if (r) {
+        if (st.serial && st.name[0])
+            snprintf(r->value, sizeof r->value, "%s: %s", padrec_state_text(st.state), st.name);
+        else
+            snprintf(r->value, sizeof r->value, "%s", padrec_state_text(st.state));
+        r->tint = live ? TINT_WARN : TINT_NONE;
+    }
+    if (env) {
+        r = row_add(R_INFO, -1, 0, "Driven by");
+        if (r) {
+            snprintf(r->value, sizeof r->value, "%s", env);
+            r->tint = TINT_WARN;
+            snprintf(r->help, sizeof r->help,
+                     "The command line drives the pad for this run: the page only reads");
+        }
+    }
+    if (st.serial && st.state != PADREC_IDLE) {
+        /* The raw counts, as the file and the [PADREC] lines have them. */
+        char c = k_clock_tag[st.clock >= 0 && st.clock <= 2 ? st.clock : 0];
+        if (st.total)
+            info("Count", "%c%u of %c%u", c, (unsigned)st.count, c, (unsigned)st.total);
+        else
+            info("Count", "%c%u", c, (unsigned)st.count);
+        if (st.nsteps)
+            info("Step", "%d of %d", st.step, st.nsteps);
+        if (st.full)
+            info("Full", "the record reached its step cap and stopped");
+        if (st.warn[0]) {
+            r = row_add(R_INFO, -1, 0, "Warning");
+            if (r) {
+                snprintf(r->value, sizeof r->value, "%s", st.warn);
+                r->tint = TINT_WARN;
+            }
+        }
+    }
+
+    header("New record");
+    r = row_add(R_PADREC, PR_RECORD, 1, rec ? "Stop recording" : "Record");
+    if (r) {
+        if (!rec)
+            snprintf(r->value, sizeof r->value, "%s",
+                     enhance_padrec_start_on_close() ? "as the menu closes" : "now");
+        r->dim = !rec && (env || !on || live);
+        snprintf(r->help, sizeof r->help, "%s",
+                 rec   ? "Ends the record and saves it"
+                 : env ? "Read only while the command line drives the pad"
+                 : !on ? "Off with RECOMP_CONFIG=none"
+                 : live ? "Stop the playback first"
+                        : "Records the pad into a new file, named after the time");
+    }
+    r = row_add(R_PADREC, PR_START, 1, "Start point");
+    if (r) {
+        if (s_name_on && s_name_for == NAME_START) {
+            snprintf(r->value, sizeof r->value, "%.*s|%s", s_name_cur, s_name,
+                     s_name + s_name_cur);
+            r->tint = TINT_WARN;
+        } else {
+            snprintf(r->value, sizeof r->value, "%s", s_rec_start[0] ? s_rec_start : "none");
+        }
+        r->dim = env != NULL;
+        snprintf(r->help, sizeof r->help,
+                 "Where the game is when the record starts (\"2-1, first checkpoint\"): "
+                 "kept in the file");
+    }
+    if (live && !rec) {
+        r = row_add(R_PADREC, PR_STOP, 1, "Stop");
+        if (r)
+            snprintf(r->help, sizeof r->help, "Ends the playback; the pad is yours again");
+    }
+    if (!live && st.nsteps > 0) {
+        r = row_add(R_PADREC, PR_AGAIN, 1, "Play again");
+        if (r) {
+            snprintf(r->value, sizeof r->value, "%s", st.name);
+            r->dim = env != NULL;
+            snprintf(r->help, sizeof r->help,
+                     "The last playback again; go back to its start point first");
+        }
+    }
+
+    header("Recordings");
+    if (!on) {
+        info("Folder", "off (RECOMP_CONFIG=none)");
+    } else if (s_nprf < 0) {
+        info("Folder", "cannot be read");
+    } else if (!s_nprf) {
+        r = row_add(R_INFO, -1, 0, "No recordings yet");
+        if (r)
+            snprintf(r->help, sizeof r->help, "Record makes one in %s", dir);
+    }
+    for (int i = 0; on && i < s_nprf; i++) {
+        struct tm tm;
+        time_t t = (time_t)s_prf[i].mtime;
+        /* The session's name is the file's without its extension. */
+        size_t nl = strlen(st.name);
+        int playing = st.nsteps > 0 && live && nl && !strncmp(st.name, s_prf[i].name, nl)
+                      && s_prf[i].name[nl] == '.';
+        r = row_add(R_PADREC, PR_FILE + i, 1, s_prf[i].name);
+        if (!r)
+            break;
+        snprintf(r->value, sizeof r->value, "%s", playing ? "playing" : "Play");
+        r->dim = env != NULL || (live && !playing);
+#ifdef _WIN32
+        if (localtime_s(&tm, &t) != 0)
+#else
+        if (!localtime_r(&t, &tm))
+#endif
+            memset(&tm, 0, sizeof tm);
+        snprintf(r->help, sizeof r->help,
+                 "Recorded %04d-%02d-%02d %02d:%02d; A plays it from where it started",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+    }
+    header("Options");
+    slot_rows(PAGE_RECORDINGS, -1);
+}
+
+/* A on a Recordings row: 1 when it was one. */
+static int padrec_event(const struct row *r, int ok)
+{
+    char why[160];
+    const char *env;
+    unsigned armed;
+    PadrecStatus st;
+
+    if (r->type != R_PADREC)
+        return 0;
+    if (!ok)
+        return 1;
+    env = padrec_env_driven();
+    padrec_status(&st);
+    armed = enhance_padrec_start_on_close() ? PADREC_ARMED : 0u;
+    why[0] = 0;
+    if (env && r->ref != PR_STOP) {
+        status("Read only: %s drives the pad", env);
+        return 1;
+    }
+    switch (r->ref) {
+    case PR_RECORD:
+        if (st.state == PADREC_REC || st.state == PADREC_ARMED_REC) {
+            padrec_record_stop();
+            status(st.state == PADREC_REC ? "Saved %s" : "Record cancelled", st.name);
+        } else if (padrec_live(st.state)) {
+            status("Stop the playback first");
+        } else if (enhance_padrec_record(armed != 0, s_rec_start, why, sizeof why) < 0) {
+            status("Record: %s", why);
+        } else {
+            status(armed ? "Records from when the menu closes" : "Recording");
+        }
+        break;
+    case PR_START:
+        if (!s_name_on)
+            name_begin(NAME_START, s_rec_start);
+        break;
+    case PR_STOP:
+        padrec_stop();
+        status("Stopped");
+        break;
+    case PR_AGAIN:
+        if (padrec_again(armed, why, sizeof why) < 0)
+            status("Play again: %s", why);
+        else
+            status(armed ? "Plays when the menu closes: go back to the start point first"
+                         : "Playing again");
+        break;
+    default:
+        if (r->ref < PR_FILE || r->ref - PR_FILE >= s_nprf)
+            break;
+        if (padrec_live(st.state)) {
+            status("Stop the %s first", st.nsteps > 0 ? "playback" : "record");
+        } else if (enhance_padrec_play_file(s_prf[r->ref - PR_FILE].name, armed != 0, why,
+                                            sizeof why) < 0) {
+            status("Play: %s", why);
+        } else {
+            status(armed ? "Plays when the menu closes" : "Playing");
+        }
+        break;
+    }
+    padrec_relist();
+    return 1;
+}
+
 /* ---- the state machine ---------------------------------------------------- */
 
 static void stats_page_use(void)
@@ -4735,6 +5009,8 @@ static void page_to(int p)
     files_close();
     if (p == PAGE_SHADERS)
         shader_edit_refresh();
+    if (p == PAGE_RECORDINGS)
+        padrec_relist();
     stats_page_use();
 }
 
@@ -5516,7 +5792,7 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
         int dir = ev == ENHANCE_EV_LEFT ? -1 : 1, ok = ev == ENHANCE_EV_OK;
         if (!r)
             break;
-        if (sh_event(r, dir, ok) || files_event(r, ok))
+        if (sh_event(r, dir, ok) || files_event(r, ok) || padrec_event(r, ok))
             break;
         switch (r->type) {
         case R_SLOT:
@@ -6070,7 +6346,7 @@ static uint32_t release_step(uint32_t held, uint32_t press)
 static void name_insert_utf8(const char *u)
 {
     size_t len = strlen(s_name), n = strlen(u);
-    size_t cap = s_name_for == NAME_EXPORT ? sizeof s_name - 1 : SHADER_PROFILE_NAME_MAX;
+    size_t cap = s_name_for == NAME_RENAME ? SHADER_PROFILE_NAME_MAX : sizeof s_name - 1;
     if (!n || len + n > cap)
         return;
     memmove(s_name + s_name_cur + n, s_name + s_name_cur, len - (size_t)s_name_cur + 1);
@@ -6109,11 +6385,17 @@ static void name_cut(int from, int to)
 }
 
 static int files_name_keep(const char *name);
+static void padrec_start_keep(const char *text);
 
 static void name_keep(void)
 {
     char msg[SHADER_PROFILE_ERR_MAX * 2];
     msg[0] = 0;
+    if (s_name_for == NAME_START) {
+        padrec_start_keep(s_name);
+        name_end();
+        return;
+    }
     if (s_name_for == NAME_EXPORT) {
         /* A refused name keeps the field open with the reason (D6). */
         if (files_name_keep(s_name))
@@ -6131,7 +6413,9 @@ static void name_keep(void)
 static void name_cancel(void)
 {
     name_end();
-    status(s_name_for == NAME_EXPORT ? "Export cancelled" : "Rename cancelled");
+    status(s_name_for == NAME_EXPORT  ? "Export cancelled"
+           : s_name_for == NAME_START ? "Start point unchanged"
+                                      : "Rename cancelled");
 }
 
 /* The focused key of the on-screen keyboard, pressed. */
@@ -7525,11 +7809,14 @@ void enhance_menu_hook(unsigned port, uint32_t held, XBOX_INPUT_STATE *st, uint6
     default:
         break;
     }
+    /* The padrec.* shortcuts, on the thread a session starts from. */
+    enhance_padrec_requests(s_state == ST_OPEN);
     if (s_state == ST_OPEN) {
         /* Shaders: the parameters appear once the backend built the chain. */
         int w, h, px, py, live = s_page == PAGE_STATS || s_page == PAGE_DEBUG
                                  || s_page == PAGE_SHADERS
-                                 || s_page == PAGE_PACK || s_page == PAGE_CONTROLS;
+                                 || s_page == PAGE_PACK || s_page == PAGE_CONTROLS
+                                 || s_page == PAGE_RECORDINGS;
         nv2a_overlay_placement(&px, &py, &w, &h);
         if (w <= 0 || h <= 0)
             w = 1920, h = 1080;
@@ -7548,6 +7835,9 @@ void enhance_menu_hook(unsigned port, uint32_t held, XBOX_INPUT_STATE *st, uint6
         if ((!all && !any_key_down()) || now_ms - s_close_t >= CLOSE_MS) {
             s_state = ST_CLOSED;
             release = 1;
+            /* A session the page armed starts with the title's pad, not
+             * with the press that closed the menu. */
+            enhance_padrec_menu_closed();
         }
     }
     /* The closing poll too: the filter took this poll's mask before the
@@ -7575,6 +7865,7 @@ void enhance_menu_start(void)
     /* The mods' panels and glyph names work with the menu off too. */
     enhance_mod_status_start();
     s_hints = enhance_cfg_choice("overlay.menu_hints", k_menu_hints, MENU_HINTS_TOOLTIP);
+    enhance_padrec_start();
     if (!enhance_actions_keyed("menu.enabled")) {
         fprintf(stderr, LOGP "menu.enabled=off\n");
         return;
@@ -7794,6 +8085,8 @@ void enhance_menu_reset_for_test(void)
     s_fb_page = PAGE_FILES;
     s_saves_quit = 0;
     s_nkept = 0;
+    s_rec_start[0] = 0;
+    padrec_relist();
     memset(&s_osk, 0, sizeof s_osk);
     s_osk_lay_ok = 0;
     xbox_InputTextReset();

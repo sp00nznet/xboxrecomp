@@ -1,8 +1,10 @@
 /* pad_script: the step grammar (ms and f<flip>), step timing, the press, and
  * the recorder, whose lines must parse back to the presses it saw. */
 #include "pad_script.h"
+#include "pad_header.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int fails;
@@ -857,14 +859,123 @@ static int count_entries(const char *text)
     return n;
 }
 
+/* pad-recording-ui R5: the header of an in-game recording. */
+static void test_header(void)
+{
+    static PadHeader h, r;
+    static char buf[8192], big[4096];
+    PadStep s[8];
+    int n;
+
+    /* Round trip: text and integer keys, an unknown key kept. */
+    pad_header_init(&h);
+    CHECK(pad_header_set_text(&h, "game", "blinx2") == 0);
+    CHECK(pad_header_set_text(&h, "origin", "session") == 0);
+    CHECK(pad_header_set_text(&h, "name", "boss \"2-1\" \\ s\xC3\xA9") == 0);
+    CHECK(pad_header_set_int(&h, "length", 5412) == 0);
+    CHECK(pad_header_set_text(&h, "future_key", "kept") == 0);
+    n = pad_header_write(&h, buf, sizeof buf);
+    CHECK(n > 0);
+    CHECK(!strncmp(buf, "# xbr-export: pad 1\n", 20));
+    strcat(buf, "g0:a:3\ng5:@end\n");
+    CHECK(pad_header_read(buf, &r) == PAD_HDR_OK);
+    CHECK(r.present);
+    CHECK(!strcmp(pad_header_get(&r, "game"), "blinx2"));
+    CHECK(!strcmp(pad_header_get(&r, "name"), "boss \"2-1\" \\ s\xC3\xA9"));
+    CHECK(pad_header_get_int(&r, "length", -1) == 5412);
+    CHECK(!strcmp(pad_header_get(&r, "future_key"), "kept"));
+    CHECK(!strcmp(pad_header_origin(&r), "session"));
+    /* The steps parser skips the header as comments. */
+    CHECK(pad_script_parse(buf, s, 0, 8) == 2);
+
+    /* A CR or LF in a note is dropped: one comment line, no step. */
+    pad_header_init(&h);
+    pad_header_set_text(&h, "notes", "the door\rg0:a\ndoes not open\x01");
+    n = pad_header_write(&h, buf, sizeof buf);
+    CHECK(n > 0);
+    CHECK(!strcmp(buf, "# xbr-export: pad 1\n# xbr-pad: notes = \"the doorg0:adoes not open\"\n"));
+    CHECK(pad_script_parse(buf, s, 0, 8) == 0);
+
+    /* A BOM and CRLF, from a Windows editor; TOML literal strings and
+     * \u escapes; a trailing comment. */
+    CHECK(pad_header_read("\xEF\xBB\xBF# xbr-export: pad 1\r\n# xbr-pad: clock = 'poll'\r\n"
+                          "# xbr-pad: title = \"BLiNX \\u0032\"  # the name\r\n"
+                          "# xbr-pad: deterministic = 0\r\ng0:a\r\n", &r) == PAD_HDR_OK);
+    CHECK(r.present && !strcmp(pad_header_get(&r, "clock"), "poll"));
+    CHECK(!strcmp(pad_header_get(&r, "title"), "BLiNX 2"));
+    CHECK(pad_header_get_int(&r, "deterministic", -1) == 0);
+    CHECK(pad_script_parse("\xEF\xBB\xBFg0:a:3\r\ng9:b\r\n", s, 0, 8) == 2);
+    CHECK(s[0].by_flip == 2 && s[0].hold == 3);
+
+    /* A bare value with control bytes, from a hand edit: they go, as in a
+     * quoted one, before the strip draws it; one with nothing else left is
+     * a syntax error. */
+    CHECK(pad_header_read("# xbr-export: pad 1\n# xbr-pad: name = do\x01or\x1b\x7f\n"
+                          "g0:a\n", &r) == PAD_HDR_OK);
+    CHECK(!strcmp(pad_header_get(&r, "name"), "door"));
+    CHECK(pad_header_read("# xbr-export: pad 1\n# xbr-pad: name = \x01\x02\ng0:a\n", &r)
+          == PAD_HDR_SYNTAX);
+
+    /* A newer format, another kind: refused. */
+    CHECK(pad_header_read("# xbr-export: pad 2\ng0:a\n", &r) == PAD_HDR_NEWER);
+    CHECK(pad_header_read("# xbr-export: config 1\ng0:a\n", &r) == PAD_HDR_KIND_OTHER);
+
+    /* No header: an env record, origin boot. */
+    CHECK(pad_header_read("# pad_record: steps\nf10:a\n", &r) == PAD_HDR_OK);
+    CHECK(!r.present && !strcmp(pad_header_origin(&r), "boot"));
+    /* A header line after the first step is the body's, not read. */
+    CHECK(pad_header_read("# xbr-export: pad 1\ng0:a\n# xbr-pad: x = 1\n", &r) == PAD_HDR_OK);
+    CHECK(r.present && !pad_header_get(&r, "x"));
+
+    /* Bounds: a long line, too many keys, a long value. */
+    memset(big, 'a', 1100);
+    big[1100] = 0;
+    snprintf(buf, sizeof buf, "# xbr-export: pad 1\n# xbr-pad: notes = \"%s\"\n", big);
+    CHECK(pad_header_read(buf, &r) == PAD_HDR_LONG_LINE);
+    big[600] = 0;
+    snprintf(buf, sizeof buf, "# xbr-export: pad 1\n# xbr-pad: notes = \"%s\"\n", big);
+    CHECK(pad_header_read(buf, &r) == PAD_HDR_LONG_VALUE);
+    n = snprintf(buf, sizeof buf, "# xbr-export: pad 1\n");
+    for (int i = 0; i < PAD_HDR_KEYS_MAX + 1; i++)
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "# xbr-pad: k%d = %d\n", i, i);
+    CHECK(pad_header_read(buf, &r) == PAD_HDR_TOO_MANY);
+    CHECK(pad_header_read("# xbr-export: pad 1\n# xbr-pad: name = \"open\n", &r)
+          == PAD_HDR_SYNTAX);
+
+    /* The writer cuts a long text to what the reader takes, whole. */
+    pad_header_init(&h);
+    memset(big, '"', 400);
+    big[400] = 0;
+    pad_header_set_text(&h, "notes", big);
+    CHECK(pad_header_write(&h, buf, sizeof buf) > 0);
+    CHECK(pad_header_read(buf, &r) == PAD_HDR_OK);
+    CHECK(strlen(pad_header_get(&r, "notes")) == (PAD_HDR_VALUE_MAX - 2) / 2);
+}
+
+/* A file of more anchors than PAD_ANCHOR_MAX is refused by the session
+ * (pad-recording-ui R5); the count leaves comments out. */
+static void test_anchor_lines(void)
+{
+    size_t cap = (PAD_ANCHOR_MAX + 1) * 32 + 64;
+    char *t = malloc(cap);
+    size_t o = 0;
+
+    CHECK(pad_script_anchor_lines("f1:@open:a,f2:@open:b\n# f3:@open:c\nf4:a # @open:x\n") == 2);
+    o += (size_t)snprintf(t + o, cap - o, "# f0:@open:comment\n");
+    for (int i = 0; i < PAD_ANCHOR_MAX + 1; i++)
+        o += (size_t)snprintf(t + o, cap - o, "g%d:@open:stg%d\n", i * 10, i);
+    CHECK(pad_script_anchor_lines(t) == PAD_ANCHOR_MAX + 1);
+    free(t);
+}
+
 static void check_record(const char *text, int clock, int anchors)
 {
     static PadAnchors a;
-    static PadStep s[PAD_SCRIPT_MAX];
+    static PadStep s[PAD_STEPS_MAX];
     int n;
 
     memset(&a, 0, sizeof a);
-    n = pad_script_parse_anchored(text, s, 0, PAD_SCRIPT_MAX, &a);
+    n = pad_script_parse_anchored(text, s, 0, PAD_STEPS_MAX, &a);
     CHECK(n + a.n == count_entries(text));
     CHECK(a.clock == clock);
     if (anchors >= 0)
@@ -964,6 +1075,8 @@ int main(int argc, char **argv)
     test_end_marker();
     test_poll_depth_not_a_press();
     test_record_formats();
+    test_header();
+    test_anchor_lines();
     check_files(argc, argv);
     if (fails) {
         fprintf(stderr, "pad_script: %d failure(s)\n", fails);

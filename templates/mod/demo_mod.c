@@ -142,6 +142,16 @@ static void on_enable(int on, void *user)
     s_shown[0] = '\0';
 }
 
+#if XBOX_MOD_API_VERSION >= 9
+/* On the guest's thread, once per loss of a capture held as a playback
+ * starts. A mod holding the pad lets go of its state here. */
+static void on_capture_lost(void *user)
+{
+    (void)user;
+    s_api->log(&s_mod, "the pad went to a recording");
+}
+#endif
+
 static void on_setting(uint32_t idx, double value, void *user)
 {
     (void)user;
@@ -183,6 +193,15 @@ static int init(const struct xbox_mod_api *api)
     /* Inited dormant (off, the menu on): the menu may turn it on later. */
     s_on = api->setting(&k_desc, SET_ENABLE) != 0;
     s_since_draw = s_interval;
+#if XBOX_MOD_API_VERSION >= 9
+    /* This mod never takes the pad. One that does captures with
+     * api->input_capture_try(1), which is refused (-1) while a pad recording
+     * plays, and registers here to land when a playback takes a held
+     * capture away. Below 9: input_capture, which cannot refuse. */
+    if (api->size >= offsetof(struct xbox_mod_api, on_capture_lost) + sizeof api->on_capture_lost
+        && api->on_capture_lost)
+        api->on_capture_lost(on_capture_lost, NULL);
+#endif
     api->on_enable(on_enable, NULL);
     api->on_setting(&k_desc, on_setting, NULL);
     if (s_on)

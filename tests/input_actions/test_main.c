@@ -130,7 +130,12 @@ void nv2a_overlay_toast(const char *fmt, ...)
 /* ---- the fake pad backend --------------------------------------------- */
 
 /* Win32 virtual-key codes, as the key table holds them. */
+#define VK_F1  0x70
+#define VK_F2  0x71
+#define VK_F5  0x74
 #define VK_F6  0x75
+#define VK_F7  0x76
+#define VK_F9  0x78
 #define VK_F8  0x77
 #define VK_F10 0x79
 
@@ -1116,7 +1121,7 @@ static void test_mod_api(void)
     const char *out;
     int id;
 
-    CHECK(XBOX_MOD_API_VERSION == 8u);
+    CHECK(XBOX_MOD_API_VERSION == 9u);
     out = start_with("[camera]\nfree = true\n", &k_fake, mods);
     CHECK(strstr(out, "[ENHANCE] actions hook=on (camera.free)\n") != NULL);
     CHECK(s_cam_armed == 1);
@@ -2397,6 +2402,100 @@ static void test_record_torn(void)
 }
 #endif
 
+/* ---- the padrec.* defaults (pad-recording-ui R3, R8) --------------------- */
+
+/* The free camera's defaults, as cat registers them (free_camera.c). */
+static int fc_init(const struct xbox_mod_api *api)
+{
+    static const char *const toggle[] = { "F6", "guide+y", "back+right_thumb@400", NULL };
+    static const char *const hud[] = { "F7", NULL };
+    static const char *const freeze[] = { "End", NULL };
+    static const char *const reset[] = { "Home", NULL };
+    api->action_register("camera.free.toggle", "Toggle flight", toggle);
+    api->action_register("camera.free.hud", "Toggle HUD", hud);
+    api->action_register("camera.free.freeze", "Freeze game", freeze);
+    api->action_register("camera.free.reset", "Reset camera", reset);
+    api->actions_arm("camera.free");
+    return 0;
+}
+static const struct xbox_mod k_fc = { "freecam", fc_init, NULL, NULL };
+
+/* The menu's hook (tests/enhance_menu has the menu): with one set, a
+ * padrec.* fire is a request the menu takes. */
+static void null_hook(unsigned port, uint32_t held, XBOX_INPUT_STATE *st, uint64_t now_ms)
+{
+    (void)port;
+    (void)held;
+    (void)st;
+    (void)now_ms;
+}
+
+static int fires(const char *name)
+{
+    return enhance_action_pressed(enhance_action_find(name));
+}
+
+static void test_padrec_defaults(void)
+{
+    static const struct xbox_mod *const mods[] = { &k_fc, NULL };
+    static const char *const pr[] = { "padrec.record", "padrec.play", "padrec.stop" };
+    const char *out;
+
+    /* Menu off (RECOMP_MENU=0, the goldens): nothing armed, F1, F2 and F5
+     * fire nothing and ask for nothing. */
+    out = start(NULL);
+    (void)out;
+    enhance_actions_padrec_request();
+    tap_key(VK_F1);
+    tap_key(VK_F2);
+    tap_key(VK_F5);
+    CHECK(enhance_actions_padrec_request() == 0);
+    for (int i = 0; i < 3; i++)
+        CHECK(fires(pr[i]) == 0);
+
+    /* Everything a game sets beside them: no refusal line. */
+    out = start_with(ARMED "[input]\nwalk_key = \"LAlt\"\nmouse_release_key = \"F9\"\n"
+                           "[input.actions]\n\"overlay.stats\" = \"F3\"\n",
+                     &k_fake, mods);
+    poll0();
+    if (strstr(out, "refused"))
+        fprintf(stderr, "%s", out);
+    CHECK(strstr(out, "refused") == NULL);
+    CHECK(strstr(out, "config warning") == NULL);
+    /* No menu hook: the fire toasts why nothing happens. */
+    s_toasts = 0;
+    tap_key(VK_F1);
+    CHECK(fires("padrec.record") == 1);
+    CHECK(s_toasts == 1 && strstr(s_toast, "need the menu") != NULL);
+    CHECK(enhance_actions_padrec_request() == 0);
+    enhance_actions_set_menu_hook(null_hook);
+    tap_key(VK_F1);
+    CHECK(fires("padrec.record") == 1);
+    CHECK(fires("padrec.play") == 0 && fires("padrec.stop") == 0);
+    CHECK(fires("camera.free.toggle") == 0 && fires("camera.free.hud") == 0);
+    CHECK(fires("overlay.stats") == 0 && menu_fires() == 0);
+    CHECK(enhance_actions_padrec_request() == 1);
+    tap_key(VK_F2);
+    CHECK(fires("padrec.play") == 1 && fires("padrec.record") == 0);
+    tap_key(VK_F5);
+    CHECK(fires("padrec.stop") == 1 && fires("padrec.play") == 0);
+    CHECK(enhance_actions_padrec_request() == 6);
+    tap_key(VK_F7);
+    CHECK(fires("camera.free.hud") == 1);
+    for (int i = 0; i < 3; i++)
+        CHECK(fires(pr[i]) == 0);
+    tap_key(VK_F6);
+    CHECK(fires("camera.free.toggle") == 1);
+    /* F9 is the mouse's, not an action's. */
+    tap_key(VK_F9);
+    for (int i = 0; i < 3; i++)
+        CHECK(fires(pr[i]) == 0);
+    CHECK(enhance_actions_padrec_request() == 0);
+    enhance_actions_set_menu_hook(NULL);
+    xbox_mod_shutdown();
+    remove("config/config.toml");
+}
+
 int main(void)
 {
     MKDIR("config");
@@ -2432,6 +2531,7 @@ int main(void)
 #ifndef _WIN32
     test_live_arm();
 #endif
+    test_padrec_defaults();
     test_record();
     test_record_chord();
     test_record_mouse();

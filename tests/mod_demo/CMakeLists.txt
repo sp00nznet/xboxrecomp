@@ -29,6 +29,8 @@ add_executable(mod_demo_test
     ${XR_SRC}/enhance/enhance_input.c
     ${XR_SRC}/enhance/enhance_actions.c
     ${XR_SRC}/enhance/mod.c
+    # The pad session's menu side, without a pad (mod.c asks padrec_playing).
+    ${XR_ROOT}/tests/pad_session/padrec_stub.c
     ${XR_SRC}/enhance/hud_anchor.c
     ${XR_SRC}/enhance/hud_capture.c
     ${XR_SRC}/kernel/recomp_hook.c
@@ -47,7 +49,7 @@ add_executable(mod_demo_test
     ${XR_SRC}/platform/recomp_env.c
     ${XR_SRC}/platform/recomp_exe_dir.c
     ${XR_SRC}/platform/recomp_exit_hook.c)
-target_include_directories(mod_demo_test PRIVATE ${XR_ROOT}/templates/mod ${XR_SRC}/enhance ${XR_SRC}/platform
+target_include_directories(mod_demo_test PRIVATE ${XR_ROOT}/templates/mod ${XR_SRC}/enhance ${XR_SRC}/usb ${XR_SRC}/platform
     ${XR_SRC}/input ${XR_SRC}/kernel ${XR_SRC}/d3d ${XR_SRC} ${XR_SRC}/../third_party/librashader)
 target_compile_definitions(mod_demo_test PRIVATE RECOMP_ENV_HAVE_ENHANCE_KEYS
     XBOXRECOMP_ENHANCE DEMO_MOD_HOOK_VA=0x00010000u)
@@ -62,7 +64,7 @@ target_link_libraries(mod_demo_test PRIVATE ${CMAKE_DL_LIBS})
 
 # As a game builds the copy: the API, no DEMO_MOD_HOOK_VA.
 add_library(mod_demo_nohook OBJECT ${XR_ROOT}/templates/mod/demo_mod.c)
-target_include_directories(mod_demo_nohook PRIVATE ${XR_ROOT}/templates/mod ${XR_SRC}/enhance
+target_include_directories(mod_demo_nohook PRIVATE ${XR_ROOT}/templates/mod ${XR_SRC}/enhance ${XR_SRC}/usb
     ${XR_SRC}/platform ${XR_SRC}/input ${XR_SRC}/kernel ${XR_SRC}/d3d ${XR_SRC}
     ${XR_SRC}/../third_party/librashader)
 target_compile_definitions(mod_demo_nohook PRIVATE RECOMP_ENV_HAVE_ENHANCE_KEYS XBOXRECOMP_ENHANCE)

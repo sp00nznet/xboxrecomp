@@ -13,6 +13,7 @@
  */
 #include "usb_gamepad.h"
 #include "pad_script.h"
+#include "pad_session.h"
 #include "recomp_env.h"
 #include "recomp_exit_hook.h"   /* the recorder's held steps at exit */
 
@@ -366,17 +367,21 @@ static uint8_t synthetic_buttons(void)
  * RECOMP_DEBUG=pad_record=<file>,pad_anchor=<text>|<text>, the record writes
  * one for each open whose path holds one of the texts.
  *
- * Like RECOMP_PAD_PRESS these are bring-up tools, off unless set. */
-static PadStep s_script[PAD_SCRIPT_MAX];
+ * Like RECOMP_PAD_PRESS these are bring-up tools, off unless set.
+ *
+ * A session started in the game (pad_session.h) is the same thing from the
+ * menu; these keys win over it, so it starts only while none is set.
+ *
+ * The steps live on the heap, PAD_STEPS_MAX of them, allocated only with
+ * RECOMP_PAD_SCRIPT or RECOMP_PAD_LIVE set: a stock run holds none. */
+static PadStep *s_script;
 static int     s_script_len = -1;
 static PadAnchors s_anchors;
 /* The pads the anchors' retries press: fixed once the script is read. */
 static uint32_t s_anchor_pads;
-/* Opens come on the game's threads, any of them at once (a loader thread
- * and the main one), and the pad thread ticks the give-up and records: an
- * anchor matched twice, or lost, would hang a replay. Taken only with a
- * pad script or record set (usb_gamepad_file_open's `on`). */
-static SRWLOCK s_anchor_lock = SRWLOCK_INIT;
+/* The anchors and the record are read under pad_lock (pad_session.c):
+ * opens come on the game's threads, any of them at once, and the pad
+ * thread ticks the give-up and records. */
 /* 0 not read, 1 being read, 2 read. The script is read on the first pad
  * poll or the first file open, whichever comes first, and those are
  * different threads. */
@@ -392,10 +397,10 @@ static volatile uint32_t s_flip;
 
 void usb_gamepad_flip(uint32_t flip)
 {
-    s_flip = flip;
+    __atomic_store_n(&s_flip, flip, __ATOMIC_RELAXED);
 }
 
-uint32_t usb_gamepad_flips(void) { return s_flip; }
+uint32_t usb_gamepad_flips(void) { return __atomic_load_n(&s_flip, __ATOMIC_RELAXED); }
 
 /* The title's port-0 polls so far: the poll clock (g<poll> steps,
  * pad_script.h). Only the pad's thread moves it, after a poll's record, so
@@ -414,14 +419,27 @@ static int rec_poll(void)
     }
     return v;
 }
-static uint32_t script_clock(void) { return s_script_poll ? s_polls : s_flip; }
-static uint32_t rec_clock(void) { return rec_poll() ? s_polls : s_flip; }
+/* Relaxed atomics: a file open reads these on the game's thread (TSan,
+ * tests/pad_session's threads case); a stale count is one poll late. */
+static uint32_t polls_now(void) { return __atomic_load_n(&s_polls, __ATOMIC_RELAXED); }
+static uint32_t flip_now(void) { return __atomic_load_n(&s_flip, __ATOMIC_RELAXED); }
+static uint32_t script_clock(void) { return s_script_poll ? polls_now() : flip_now(); }
+static uint32_t rec_clock(void) { return rec_poll() ? polls_now() : flip_now(); }
 
 static void pad_script_read(void)
 {
     const char *spec = recomp_env(RENV_PAD_SCRIPT);
+    const char *live = recomp_env(RENV_PAD_LIVE);
 
     s_script_len = 0;
+    if ((!spec || !*spec) && (!live || !*live))
+        return;
+    s_script = malloc((size_t)PAD_STEPS_MAX * sizeof *s_script);
+    if (!s_script) {
+        fprintf(stderr, "  PAD: no memory for the pad script\n");
+        fflush(stderr);
+        return;
+    }
     if (!spec || !*spec)
         return;
     if (spec[0] == '@') {
@@ -445,11 +463,11 @@ static void pad_script_read(void)
         n = (long)fread(buf, 1, (size_t)n, f);
         fclose(f);
         buf[n] = 0;
-        s_script_len = pad_script_parse_anchored(buf, s_script, 0, PAD_SCRIPT_MAX,
+        s_script_len = pad_script_parse_anchored(buf, s_script, 0, PAD_STEPS_MAX,
                                                  &s_anchors);
         free(buf);
     } else {
-        s_script_len = pad_script_parse_anchored(spec, s_script, 0, PAD_SCRIPT_MAX,
+        s_script_len = pad_script_parse_anchored(spec, s_script, 0, PAD_STEPS_MAX,
                                                  &s_anchors);
     }
     s_script_poll = s_anchors.clock == 2;
@@ -517,7 +535,7 @@ static void pad_live_poll(unsigned long t)
             fflush(stderr);
         }
     }
-    if (!path || !*path || (t - last_poll < 50 && last_poll))
+    if (!path || !*path || !s_script || (t - last_poll < 50 && last_poll))
         return;
     last_poll = t;
     f = fopen(path, "rb");
@@ -566,7 +584,7 @@ static void pad_live_poll(unsigned long t)
                     snprintf(line, sizeof line, "%s", pending);
                 else
                     snprintf(line, sizeof line, "%lu:%s", at, pending);
-                if (s_script_len >= PAD_SCRIPT_MAX - 1)
+                if (s_script_len >= PAD_STEPS_MAX - 1)
                     pad_script_compact(t);
                 {
                     int had = s_script_len;
@@ -574,7 +592,7 @@ static void pad_live_poll(unsigned long t)
                      * would race it, and a live line is pressed now, not on
                      * a recorded event. The parser says it skipped one. */
                     s_script_len = pad_script_parse(line, s_script, s_script_len,
-                                                    PAD_SCRIPT_MAX);
+                                                    PAD_STEPS_MAX);
                     if (s_script_len > had)
                         pad_step_not_before(&s_script[s_script_len - 1],
                                             script_clock());
@@ -668,7 +686,7 @@ static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
     /* Only the LLE pushbuffer walker counts flips (usb_gamepad_flip); a
      * title on the HLE D3D8 present path would get every f-step at boot.
      * g<poll> steps count the title's polls and need no flips. */
-    if (!warned && !s_flip && t > 20000) {
+    if (!warned && !flip_now() && t > 20000) {
         for (i = 0; i < s_script_len; i++)
             if (s_script[i].by_flip == 1)
                 break;
@@ -695,10 +713,10 @@ static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
         PadStep retry;
         int on;
         char log[512], rlog[160];
-        AcquireSRWLockExclusive(&s_anchor_lock);
+        pad_lock();
         pad_anchors_tick(&s_anchors, s_script, s_script_len, flip, log, sizeof log);
         on = pad_anchor_retry(&s_anchors, pad, flip, &retry, rlog, sizeof rlog);
-        ReleaseSRWLockExclusive(&s_anchor_lock);
+        pad_unlock();
         if (log[0] || rlog[0]) {
             fputs(log, stderr);
             fputs(rlog, stderr);
@@ -753,7 +771,9 @@ static uint32_t script_pads(void)
         if (press && *press && strtoul(press, NULL, 0) & 0xFFu)
             named |= 1u;
     }
-    return named;
+    /* A session's playback, pending or running: a game that presses only
+     * the ports named here (cat's pad_input.c) reaches it too (R7). */
+    return named | padrec_pads();
 }
 
 uint32_t usb_gamepad_present(void)
@@ -839,7 +859,7 @@ static void pad_record_end(void)
      * is not recursive, so atexit would deadlock there. */
     if (!__atomic_load_n(&s_rec_file, __ATOMIC_ACQUIRE))
         return;
-    AcquireSRWLockExclusive(&s_anchor_lock);
+    pad_lock();
     f = __atomic_load_n(&s_rec_file, __ATOMIC_ACQUIRE);
     if (f) {
         /* Before pad_recorder_end, which forgets the pads' last reports. */
@@ -853,7 +873,7 @@ static void pad_record_end(void)
         fflush(f);
         __atomic_store_n(&s_rec_file, NULL, __ATOMIC_RELEASE);
     }
-    ReleaseSRWLockExclusive(&s_anchor_lock);
+    pad_unlock();
 }
 
 static void pad_record_exit_hook(const char *why)
@@ -903,35 +923,11 @@ static void pad_record_signal(int sig)
 static uint32_t s_rec_anchor_at;
 static char s_rec_anchor_name[PAD_ANCHOR_TEXT];
 
-/* RECOMP_DEBUG=pad_anchor=<text>|<text>: an open whose path holds one of
- * them, in any case. */
-static int anchor_wanted(const char *path)
-{
-    const char *list = recomp_env(RENV_PAD_ANCHOR), *p;
-
-    if (!list || !*list)
-        return 0;
-    for (p = list; *p; ) {
-        size_t n = strcspn(p, "|"), i, j;
-        for (i = 0; n && path[i]; i++) {
-            for (j = 0; j < n && path[i + j]; j++)
-                if (tolower((unsigned char)path[i + j]) != tolower((unsigned char)p[j]))
-                    break;
-            if (j == n)
-                return 1;
-        }
-        p += n;
-        if (*p == '|')
-            p++;
-    }
-    return 0;
-}
-
 /* An anchor line for an open, written on the thread that opened the file,
- * under s_anchor_lock: the pad thread feeds the recorders under it too, so
+ * under pad_lock: the pad thread feeds the recorders under it too, so
  * the presses the retry is read from are whole and the anchor's line goes
  * in order with the steps around it. */
-/* Under s_anchor_lock: a refusal goes to log[0..logn), printed after it. */
+/* Under pad_lock: a refusal goes to log[0..logn), printed after it. */
 static void pad_record_open(const char *path, char *log, size_t logn)
 {
     FILE *f = __atomic_load_n(&s_rec_file, __ATOMIC_ACQUIRE);
@@ -940,7 +936,7 @@ static void pad_record_open(const char *path, char *log, size_t logn)
     const char *name;
     int w;
 
-    if (!f || !anchor_wanted(path))
+    if (!f || !pad_anchor_wanted(path))
         return;
     name = pad_path_name(path);
     if (s_rec_anchor_name[0] && !strcmp(name, s_rec_anchor_name))
@@ -1005,14 +1001,14 @@ static void pad_record(int pad, const uint8_t *out, uint32_t flip)
         return;
     /* One uncontended lock per pad poll, only while recording. The file is
      * read again under it: pad_record_end may have ended the record since. */
-    AcquireSRWLockExclusive(&s_anchor_lock);
+    pad_lock();
     f = __atomic_load_n(&s_rec_file, __ATOMIC_ACQUIRE);
     if (f && pad_recorder_feed(&s_rec[pad], pad_bits_from_report(out), flip,
                                lines, sizeof lines)) {
         fputs(lines, f);
         fflush(f);
     }
-    ReleaseSRWLockExclusive(&s_anchor_lock);
+    pad_unlock();
 }
 
 /* The clock a poll's press reads: the poll's count or the flip read
@@ -1021,6 +1017,21 @@ static uint32_t script_at(uint32_t flip, uint32_t polls)
 {
     pad_script_load();   /* s_script_poll comes with the script */
     return s_script_poll ? polls : flip;
+}
+
+/* The clocks a session reads, only once one was started: a stock poll
+ * pays one load here (padrec_any). */
+static int session_clocks(PadrecClocks *c, uint32_t flip, uint32_t polls, int tap)
+{
+    if (!padrec_any())
+        return 0;
+    c->polls = polls;
+    c->flip = flip;
+    c->ms = pad_ms();
+    c->game_tap = tap;
+    if (tap >= 0)
+        padrec_sync(c);
+    return 1;
 }
 
 static void (*volatile s_poll_hook)(uint32_t poll);
@@ -1037,7 +1048,7 @@ static void poll_done(int pad)
         void (*hook)(uint32_t) = s_poll_hook;
         if (hook)
             hook(s_polls);
-        s_polls = s_polls + 1;
+        __atomic_store_n(&s_polls, s_polls + 1, __ATOMIC_RELAXED);
     }
 }
 
@@ -1048,7 +1059,11 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     uint8_t synth = synthetic_buttons();
     /* One flip for the script and the recorder: the walker may count one
      * between two reads, and the record would then lag the press by a flip. */
-    uint32_t flip = s_flip, polls = s_polls;
+    uint32_t flip = flip_now(), polls = s_polls;
+    PadrecClocks pc;
+    /* A session swaps in at the start of a port-0 poll, so the ports that
+     * follow read the same one. */
+    int ses = session_clocks(&pc, flip, polls, pad == 0 ? 0 : -1);
 
     if (max < 20)
         return 0;
@@ -1102,7 +1117,11 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     } else if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
         pad_script_apply(pad, out, script_at(flip, polls));
+        if (ses)
+            padrec_press(pad, out, &pc);
         pad_record(pad, out, rec_poll() ? polls : flip);
+        if (ses)
+            padrec_feed(pad, out, &pc);
         poll_done(pad);
         return 20;
     }
@@ -1111,7 +1130,11 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     report_from_gamepad(g, out);
     out[2] |= synth;
     pad_script_apply(pad, out, script_at(flip, polls));
+    if (ses)
+        padrec_press(pad, out, &pc);
     pad_record(pad, out, rec_poll() ? polls : flip);
+    if (ses)
+        padrec_feed(pad, out, &pc);
     poll_done(pad);
     return 20;
 }
@@ -1128,16 +1151,23 @@ static uint8_t  s_game_pressed[USB_GAMEPAD_MAX];
 void usb_gamepad_game_press(int pad, struct XBOX_GAMEPAD *g)
 {
     uint8_t r[20];
-    uint32_t flip = s_flip;
+    uint32_t flip = flip_now();
+    PadrecClocks pc;
+    int ses;
 
     if (pad < 0 || pad >= USB_GAMEPAD_MAX)
         return;
+    ses = session_clocks(&pc, flip, s_polls, pad == 0 ? 1 : -1);
     s_game_flip[pad] = flip;
     s_game_pressed[pad] = 1;
     report_from_gamepad(g, r);
     if (pad == 0)
         r[2] |= synthetic_buttons();
     pad_script_apply(pad, r, script_at(flip, s_polls));
+    if (ses) {
+        pc.game_tap = 1;
+        padrec_press(pad, r, &pc);
+    }
     gamepad_from_report(r, g);
 }
 
@@ -1145,15 +1175,24 @@ void usb_gamepad_game_record(int pad, const struct XBOX_GAMEPAD *g)
 {
     uint8_t r[20];
     uint32_t flip;
+    PadrecClocks pc;
+    int ses;
 
     if (pad < 0 || pad >= USB_GAMEPAD_MAX)
         return;
     /* The press's flip when this poll had one, else this one's own. The
      * poll clock moves only below, so the press read this poll's count. */
-    flip = s_game_pressed[pad] ? s_game_flip[pad] : s_flip;
+    flip = s_game_pressed[pad] ? s_game_flip[pad] : flip_now();
     s_game_pressed[pad] = 0;
+    /* A port the session does not press gets no press call: its poll may
+     * start here. */
+    ses = session_clocks(&pc, flip, s_polls, pad == 0 ? 1 : -1);
     report_from_gamepad(g, r);
     pad_record(pad, r, rec_poll() ? s_polls : flip);
+    if (ses) {
+        pc.game_tap = 1;
+        padrec_feed(pad, r, &pc);
+    }
     poll_done(pad);
 }
 
@@ -1177,13 +1216,32 @@ void usb_gamepad_file_open(const char *path, uint32_t status)
             || (recomp_env(RENV_PAD_RECORD) && *recomp_env(RENV_PAD_RECORD));
         __atomic_store_n(&on, o, __ATOMIC_RELAXED);
     }
-    if (!o || status || !path)
+    /* A session, or start_open's tracking with pad_anchor set (R2): one
+     * more load per open in a stock run. */
+    if ((!o && !padrec_wants_opens()) || status || !path)
         return;
-    pad_script_load();
-    AcquireSRWLockExclusive(&s_anchor_lock);
-    pad_anchors_open(&s_anchors, path, script_clock(), log, sizeof log);
-    pad_record_open(path, log, sizeof log);
-    ReleaseSRWLockExclusive(&s_anchor_lock);
+    log[0] = 0;
+    if (!o) {
+        PadrecClocks pc = { 0, 0, 0, 0 };
+        padrec_open_name(path);
+        if (!padrec_any())
+            return;
+        /* The clocks are read under the lock: read before it, a session the
+         * pad thread swaps in meanwhile has its origin past them, and the
+         * open lands 2^32 flips late (seen in pad_session_threads). */
+        pad_lock();
+        pc.polls = polls_now();
+        pc.flip = flip_now();
+        pc.ms = pad_ms();
+        padrec_file_open(path, &pc, log, sizeof log);
+        pad_unlock();
+    } else {
+        pad_script_load();
+        pad_lock();
+        pad_anchors_open(&s_anchors, path, script_clock(), log, sizeof log);
+        pad_record_open(path, log, sizeof log);
+        pad_unlock();
+    }
     /* Printed unlocked: a slow stderr must not hold the pad threads. */
     if (log[0]) {
         fputs(log, stderr);

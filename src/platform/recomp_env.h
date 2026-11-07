@@ -107,6 +107,9 @@ extern "C" {
     X(OVERLAY_UI_SCALE,  CONFIG, "RECOMP_OVERLAY_UI_SCALE",  NULL, "enhancements: overlay.ui_scale, the menu's and the overlays' size over the automatic scale, 0.75 to 2 (default 1); live from the menu") \
     X(OVERLAY_UI_FIT,    CONFIG, "RECOMP_OVERLAY_UI_FIT",    NULL, "enhancements: overlay.ui_fit, what the overlay's automatic scale follows: display (default: the output height, never under the OS's UI scale or a handheld's density) or output (the output height alone); live from the menu") \
     X(MENU,              CONFIG, "RECOMP_MENU",              NULL, "enhancements: menu.enabled, the in-game enhancements menu opened by the menu.open action (F10, guide+a, paddle1) (1/0, default 0)") \
+    X(PADREC_CLOCK,      CONFIG, "RECOMP_PADREC_CLOCK",      NULL, "pad recordings: padrec.clock, the clock an in-game record is timed by: auto (default: the game's pad_clock, else poll on the game's own pad poll, flip on the USB model when flips count, else poll), poll or flip") \
+    X(PADREC_START,      CONFIG, "RECOMP_PADREC_START",      NULL, "pad recordings: padrec.start, when a record or playback started from the menu begins: menu_close (default: as the menu closes) or now; the shortcuts start at once") \
+    X(OVERLAY_PADREC_HUD, CONFIG, "RECOMP_OVERLAY_PADREC_HUD", NULL, "pad recordings: overlay.padrec_hud, the strip that shows a record or playback: auto (default: sessions started in the game) or off") \
     X(MODS_DESCRIBE,     CONFIG, "RECOMP_MODS_DESCRIBE",     NULL, "mods: json writes every mod's descriptor and resolved settings and bindings as JSON (schema 1) before the game starts, then exits; no mod init runs. Any other value is logged and ignored") \
     X(MODS_DESCRIBE_OUT, CONFIG, "RECOMP_MODS_DESCRIBE_OUT", NULL, "mods: the file RECOMP_MODS_DESCRIBE=json writes (replaced); unset = stdout. A Windows or Proton launcher needs it: the game has no stdout there")
 #else

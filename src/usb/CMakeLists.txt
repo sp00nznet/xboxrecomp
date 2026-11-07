@@ -4,6 +4,8 @@ add_library(xbox_usb STATIC
     ohci.c
     usb_gamepad.c
     pad_script.c
+    pad_header.c
+    pad_session.c
 )
 
 target_include_directories(xbox_usb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

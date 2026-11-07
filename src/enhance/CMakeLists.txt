@@ -44,6 +44,9 @@
 #                  pure (enhance_menu_input.h)
 #   enhance_osk.c  the on-screen keyboard for a text field on a pad: grid,
 #                  model, draw and hit test (enhance_osk.h)
+#   enhance_padrec.c pad recordings from the menu and the padrec.* actions,
+#                  and their strip; the session is src/usb/pad_session.c
+#                  (enhance_padrec.h)
 # docs/runtime/config.md has the file format and the keys.
 #
 # The layer links the runtime (xbox_kernel, for nv2a_host_opts_set), never
@@ -54,11 +57,12 @@ add_library(xbox_enhance STATIC recomp_cfg.c enhance_cfg.c enhance.c enhance_inp
     shader_profile.c shader_profile_req.c shader_profile_edit.c file_browser.c
     shader_param_kinds.c enhance_files.c)
 target_include_directories(xbox_enhance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(xbox_enhance PUBLIC recomp_env xbox_kernel xbox_input)
+target_link_libraries(xbox_enhance PUBLIC recomp_env xbox_kernel xbox_input xbox_usb)
 target_sources(xbox_enhance PRIVATE enhance_text.c enhance_menu_layout.c)
 target_sources(xbox_enhance PRIVATE enhance_mod_status.c enhance_menu_input.c enhance_osk.c)
 target_sources(xbox_enhance PRIVATE saves_zip.c saves_store.c)
 target_sources(xbox_enhance PRIVATE enhance_display.c)
+target_sources(xbox_enhance PRIVATE enhance_padrec.c)
 if(WIN32)
     # enhance_display.c reads the SMBIOS names from the registry.
     target_link_libraries(xbox_enhance PRIVATE advapi32)

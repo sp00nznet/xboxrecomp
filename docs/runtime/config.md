@@ -196,6 +196,9 @@ the stock settings, `present.pacing = "spin"` included.
 | `overlay.menu_size` | string | `"compact"` (a panel at the left, the game beside it) or `"expanded"` (the whole window over a dimmed game). R3 in the menu flips it and writes this key at once, alone; not with `RECOMP_CONFIG=none` | `"compact"` | none |
 | `overlay.menu_hints` | string | where the menu shows the selected row's help: `"tooltip"` (a card beside the row, 350 ms after a pad or key selection settles, 500 ms after the mouse rests), `"inline"` (a line under every row) or `"off"`. L3 (on release), F1 and the header's `?` flip between tooltip and inline (from off: inline) and write this key at once, alone; not with `RECOMP_CONFIG=none` | `"tooltip"` | none |
 | `menu.enabled` | bool | the in-game menu, opened by the `menu.open` action ([In-game menu](#in-game-menu-menuenabled)) | `false` | `RECOMP_MENU` |
+| `padrec.clock` | string | the clock an in-game pad record is timed by ([Pad recordings](#pad-recordings)): `"auto"` (the game's `pad_clock`, else `poll` on the game's own pad poll, `flip` on the USB model when flips count, else `poll`), `"poll"` or `"flip"` | `"auto"` | `RECOMP_PADREC_CLOCK` |
+| `padrec.start` | string | when a record or playback started from the menu's Recordings page begins: `"menu_close"` (as the menu closes) or `"now"`; the shortcuts start at once | `"menu_close"` | `RECOMP_PADREC_START` |
+| `overlay.padrec_hud` | string | the strip that shows a record or playback: `"auto"` (sessions started in the game) or `"off"` | `"auto"` | `RECOMP_OVERLAY_PADREC_HUD` |
 | `storage.ram_cache` | bool | the title's cache partition (`Z:`, `Partition3`-`5`) lives in memory: capped at the stock 750 MB (a full one answers `STATUS_DISK_FULL`, as FATX does), seeded read-only from `<hdd>/Cache` at the first file call, never written back. For a title that rewrites its cache all the time (BLiNX 1: about 7 GB an hour); the console clears these partitions anyway. On by default for every title; `false` puts the files in `<hdd>/Cache` as stock. Read before the guest starts | `true` | `RECOMP_STORAGE_RAM_CACHE` |
 | `system.language` | string | the dashboard language the title is told (`XC_LANGUAGE`, EEPROM index 7, and `+0x30` of the `XC_MAX_OS` block): `en`, `ja`, `de`, `fr`, `es`, `it`, `ko`, `zh` (traditional Chinese) or `pt` (1 to 9), lower case only. A game that names its languages (game.toml `[system] languages`, built in as `XBOXRECOMP_LANGUAGES`) gets a Language item on the menu's Game page with those only, and any other code is logged and gives English. Read before the guest starts; titles read it once at boot, so a change applies at the next start (kernel_language.h) | `"en"` | `RECOMP_SYSTEM_LANGUAGE` |
 | `mods.<name>` | bool | a mod ([Mods](#mods)) runs; `false` leaves its init out at start. The menu's Mods page writes it | `true` | none |
@@ -1106,6 +1109,9 @@ The toolkit's actions:
 | `menu.open` | `F10`, `guide+a`, `paddle1` | opens and closes the menu when `menu.enabled` is on |
 | `overlay.stats` | none | toggles the stats strip |
 | `shot.window` | none | a window shot (a log line for now) |
+| `padrec.record` | `F1` | starts or stops a pad recording ([Pad recordings](#pad-recordings)) |
+| `padrec.play` | `F2` | plays the recording picked on the Recordings page, or the last one |
+| `padrec.stop` | `F5` | stops a recording or its playback |
 
 A game's `config.default.toml` adds to these, for example a fallback chord
 for hosts where Guide is not seen (BLiNX 2: `back+left_thumb@400`). A mod
@@ -1676,6 +1682,44 @@ the swap, its rollback with renames failed on purpose, and a failed
 undo), `tests/kernel_directory_posix` (the busy table and the
 generation), `tests/enhance_menu` (the page).
 
+### Pad recordings
+
+With the menu on (`menu.enabled`), the menu's Recordings page and the
+`padrec.*` actions record player 1's pad and play it back in the game, with
+no environment variable (the `RECOMP_PAD_*` keys still work as before and
+win: while one drives the pad the page is read only). A record is a
+`pad_script` text file (the format of `src/usb/pad_script.h`) under
+`<user dir>/recordings/`, named after the game and the time, with a header
+of `# xbr-pad:` lines under `# xbr-export: pad 1`: the clock, the origin, the
+title, the start point typed on the page, its length.
+
+- **The clock.** Counts start at the session's first poll (`g0`, `f0`), so
+  a record plays back from wherever it is started. `padrec.clock` picks
+  the clock; the pick and why is one `[PADREC]` line.
+- **Start.** A session started from the page waits, ARMED, until the
+  menu closes (`padrec.start = "menu_close"`); a shortcut starts at the
+  next poll. While the menu is open the shortcuts do nothing (F5 is the
+  menu's Save) and the title gets a released pad, which a record takes
+  as idle.
+- **Playback.** Port 0 is the recording's: the host pad's buttons and
+  sticks never reach the title while it plays, a mod's capture is
+  refused (`input_capture_try`, `on_capture_lost`, mod API v9), and the
+  host pad comes back at the record's `@end` or a stop. File anchors
+  (`@open:`) wait for the game's own file opens, as for an env script.
+- **Limits.** A record stops itself at `PAD_STEPS_MAX` steps, with room
+  for its `@end`, so it plays back whole ("recording full" on the strip).
+- **The strip** (`overlay.padrec_hud`) shows the state, name, times, step
+  and count at the bottom of the screen, at the top while the menu is
+  open, and stays 5 s after a playback ends.
+
+The actions need the menu: with `menu.enabled` off a press shows "Pad
+recordings need the menu (menu.enabled)" and does nothing.
+
+Tests: `tests/pad_script` (the header), `tests/pad_session` (the session,
+its threads under TSan, the cap), `tests/usb_pad_game` (a session on the
+game's own pad poll), `tests/enhance_menu` (the page), `tests/input_actions`
+(the defaults), `tests/mod_status` (API v9).
+
 ### Naming rule
 
 - Tables group keys by feature: `[render]`, `[present]`, `[display]`, and a title's own.
@@ -1825,7 +1869,7 @@ The title's glue calls two entries:
 - `xbox_mod_input_captured()` from its pad read. While it returns true, the
   title must see a released pad.
 
-`struct xbox_mod_api` (version 8, `XBOX_MOD_API_VERSION`) holds:
+`struct xbox_mod_api` (version 9, `XBOX_MOD_API_VERSION`) holds:
 
 | Member | What it gives |
 | --- | --- |
@@ -1854,6 +1898,8 @@ The title's glue calls two entries:
 | `glyph_name(mod, ref, out, cap, flags)` | v7. The binding of a source, an action or one of the mod's controls, named for the device in use ([Glyphs and the status panel](#glyphs-and-the-status-panel-v7)). Any thread. |
 | `status(mod, text)` | v7. The mod's status panel at the top left of the screen ([Glyphs and the status panel](#glyphs-and-the-status-panel-v7)). Any thread. |
 | `draw3d_begin(mod, view, proj)`, `draw3d_tris(v, n, flags)`, `draw3d_lines(v, n, flags)`, `draw3d_end(mod)` | v8. World-space triangles and lines drawn over the game's 3D frame ([3D debug draw](#3d-debug-draw-v8)). The guest's thread, once a frame. |
+| `input_capture_try(on)` | v9. `input_capture` with an answer: 0 when done, -1 when refused. A pad recording playing back holds port 0 ([Pad recordings](#pad-recordings)), so a capture is refused then (off never is), and `input_capture(1)` is ignored: a v8 mod keeps working, its capture simply does not take. Any thread. |
+| `on_capture_lost(fn, user)` | v9. `fn(user)` once when a playback starts while the mod holds port 0: the toolkit drops the capture, and `xbox_enhance_pad_seen` returns 0 while the recording plays. Called from the next `xbox_mod_frame`, on the guest's thread; a free camera lands there and says so with a toast. Init only; up to `XBOX_MOD_MAX_FRAME` across mods. |
 
 `struct xbox_mod` gained two fields in v4, after `desc`:
 

@@ -24,15 +24,18 @@
  * vertex: a rounded rect's fan and feather ring take about 4.5, a glyph
  * quad 1.5. */
 static const uint32_t s_cap_vtx[NV2A_OVL_COUNT] = {
-    [NV2A_OVL_STATS] = 2048, [NV2A_OVL_STATUS] = 4096, [NV2A_OVL_TOAST] = 2048,
+    [NV2A_OVL_STATS] = 2048, [NV2A_OVL_STATUS] = 4096, [NV2A_OVL_PADREC] = 2048,
+    [NV2A_OVL_TOAST] = 2048,
     [NV2A_OVL_MENU] = 16384, [NV2A_OVL_CURSOR] = 64,
 };
 static const uint32_t s_cap_cmd[NV2A_OVL_COUNT] = {
-    [NV2A_OVL_STATS] = 16, [NV2A_OVL_STATUS] = 32, [NV2A_OVL_TOAST] = 16,
+    [NV2A_OVL_STATS] = 16, [NV2A_OVL_STATUS] = 32, [NV2A_OVL_PADREC] = 16,
+    [NV2A_OVL_TOAST] = 16,
     [NV2A_OVL_MENU] = 256, [NV2A_OVL_CURSOR] = 2,
 };
 static const char *const s_layer_name[NV2A_OVL_COUNT] = {
-    [NV2A_OVL_STATS] = "stats", [NV2A_OVL_STATUS] = "status", [NV2A_OVL_TOAST] = "toast",
+    [NV2A_OVL_STATS] = "stats", [NV2A_OVL_STATUS] = "status", [NV2A_OVL_PADREC] = "padrec",
+    [NV2A_OVL_TOAST] = "toast",
     [NV2A_OVL_MENU] = "menu", [NV2A_OVL_CURSOR] = "cursor",
 };
 

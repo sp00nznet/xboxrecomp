@@ -14,3 +14,12 @@ target_include_directories(usb_pad_game_test PRIVATE
 target_link_libraries(usb_pad_game_test PRIVATE xboxrecomp)
 enable_testing()
 add_test(NAME usb_pad_game_test COMMAND usb_pad_game_test)
+
+# test_session: a pad session started in the game (pad-recording-ui) on the
+# same path, with no env key: its own binary, since the env is read once.
+add_executable(usb_pad_game_session test_session.c)
+target_include_directories(usb_pad_game_session PRIVATE
+    ../../src/kernel ../../src/usb ../../src/input ../../src/platform)
+target_link_libraries(usb_pad_game_session PRIVATE xboxrecomp)
+add_test(NAME usb_pad_game_session COMMAND usb_pad_game_session
+         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})

@@ -250,6 +250,11 @@ static int s_log_n, s_log_dropped;
  * s_step_lock, so the strip's read-then-set never races another fire. */
 static int s_stats_act = -1;
 static int s_menu_act = -1;
+/* padrec.record, padrec.play, padrec.stop (pad-recording-ui R3): a fire is
+ * a request bit the menu's hook takes, as menu.open's is, since starting a
+ * session reads a file and must not run under the step lock. */
+static int s_padrec_act[3] = { -1, -1, -1 };
+static int s_padrec_req;
 
 /* The menu (enhance_menu.c): its hook runs after each step, outside the
  * step lock, and a menu.open fire is a request it takes there. */
@@ -269,9 +274,25 @@ static int s_menu_req;
  * fires nothing (enhance_actions_quiet). */
 static int s_quiet;
 
-static void toolkit_fire(int action)
+static void mask_locked(unsigned port, uint32_t bits);
+
+static void toolkit_fire(const struct binding *b)
 {
 #ifdef XBOXRECOMP_ENHANCE
+    int action = b->action;
+    for (int i = 0; i < 3; i++) {
+        if (action != s_padrec_act[i])
+            continue;
+        /* A chord's buttons are the game's again only once let go: a
+         * record that starts on guide+x must not record the x. */
+        if (b->kind != B_KEY && b->port < PORTS)
+            mask_locked(b->port, b->bits);
+        if (__atomic_load_n(&s_menu_hook, __ATOMIC_ACQUIRE))
+            __atomic_or_fetch(&s_padrec_req, 1 << i, __ATOMIC_ACQ_REL);
+        else
+            nv2a_overlay_toast("Pad recordings need the menu (menu.enabled)");
+        return;
+    }
     if (action == s_stats_act)
         nv2a_overlay_set_stats(!nv2a_overlay_stats());
     /* Without the menu (menu.enabled off, the hook armed by another key) a
@@ -285,7 +306,7 @@ static void toolkit_fire(int action)
             nv2a_overlay_toast("Menu is off (menu.enabled)");
     }
 #else
-    (void)action;
+    (void)b;
 #endif
 }
 
@@ -629,7 +650,7 @@ static void fire(const struct binding *b, uint64_t now)
 {
     __atomic_add_fetch(&s_act[b->action].pressed, 1, __ATOMIC_ACQ_REL);
     fire_log(b, now);
-    toolkit_fire(b->action);
+    toolkit_fire(b);
 }
 
 /* One step of port's bindings with the host pad's bits. tick: the flip's
@@ -946,15 +967,21 @@ void enhance_actions_tick(void)
         hook(0, held0, NULL, now);
 }
 
+/* Under the step lock. */
+static void mask_locked(unsigned port, uint32_t bits)
+{
+    /* The held sources that feed them: the map may give a control two. */
+    for (int i = 0; s_table && i < SRC_BITS; i++)
+        if (s_table->feeds[i] & bits & GUEST_BITS)
+            s_port[port].consumed |= (1u << i) & s_port[port].held;
+}
+
 void enhance_actions_mask_until_release(unsigned port, uint32_t bits)
 {
     if (port >= PORTS)
         return;
     spin_lock(&s_step_lock);
-    /* The held sources that feed them: the map may give a control two. */
-    for (int i = 0; s_table && i < SRC_BITS; i++)
-        if (s_table->feeds[i] & bits & GUEST_BITS)
-            s_port[port].consumed |= (1u << i) & s_port[port].held;
+    mask_locked(port, bits);
     spin_unlock(&s_step_lock);
 }
 
@@ -2126,6 +2153,7 @@ void enhance_actions_quiet(int on)
 void enhance_actions_set_menu_hook(enhance_menu_hook_fn fn)
 {
     __atomic_store_n(&s_menu_req, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_padrec_req, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&s_menu_hook, fn, __ATOMIC_RELEASE);
 }
 
@@ -2141,6 +2169,11 @@ int enhance_actions_menu_request(void)
     return __atomic_exchange_n(&s_menu_req, 0, __ATOMIC_ACQ_REL);
 }
 
+int enhance_actions_padrec_request(void)
+{
+    return __atomic_exchange_n(&s_padrec_req, 0, __ATOMIC_ACQ_REL);
+}
+
 /* ---- the toolkit's actions and the start ------------------------------ */
 
 void enhance_actions_init(void)
@@ -2151,11 +2184,23 @@ void enhance_actions_init(void)
      * under Proton Steam Input maps R4 to F10 instead (config.md, "Host
      * actions"). Host-only, so it never takes a press from the game. */
     static const char *const menu_open[] = { "F10", "guide+a", "paddle1", NULL };
+    /* F1, F2 and F5 are free in every game the toolkit runs: F3 is the
+     * stats strip's suggestion, F6, F7, F9, F10, Home and End are taken
+     * (the free camera, the mouse release, the menu). In the menu F5 is
+     * Save: the menu drops the requests made while it is open (its
+     * Recordings page has the same commands). */
+    static const char *const rec_keys[] = { "F1", NULL };
+    static const char *const play_keys[] = { "F2", NULL };
+    static const char *const stop_keys[] = { "F5", NULL };
 
     enhance_actions_reset();
     s_menu_act = enhance_action_register("menu.open", "Open the menu", menu_open);
     s_stats_act = enhance_action_register("overlay.stats", "Stats strip", NULL);
     enhance_action_register("shot.window", "Window screenshot", NULL);
+    s_padrec_act[0] = enhance_action_register("padrec.record", "Record the pad", rec_keys);
+    s_padrec_act[1] = enhance_action_register("padrec.play", "Play a recording", play_keys);
+    s_padrec_act[2] = enhance_action_register("padrec.stop", "Stop recording or playback",
+                                              stop_keys);
     s_ntoolkit = s_nact;
 }
 

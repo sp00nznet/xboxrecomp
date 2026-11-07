@@ -223,6 +223,20 @@ static const char *parse_anchor(const char *b, const PadStep *st, PadAnchors *a,
     return b;
 }
 
+int pad_script_anchor_lines(const char *text)
+{
+    int n = 0;
+    for (const char *p = text; *p; ) {
+        const char *nl = strchr(p, '\n'), *e = nl ? nl : p + strlen(p);
+        /* Every @open before the line's comment: "f1:@open:a,f2:@open:b". */
+        for (; p + 6 <= e && *p != '#'; p++)
+            if (!strncmp(p, "@open:", 6))
+                n++;
+        p = nl ? nl + 1 : e;
+    }
+    return n;
+}
+
 int pad_script_parse(const char *text, PadStep *steps, int len, int max)
 {
     return pad_script_parse_anchored(text, steps, len, max, NULL);
@@ -234,6 +248,9 @@ int pad_script_parse_anchored(const char *text, PadStep *steps, int len,
     const char *p = text;
     int first = len, added = 0;
 
+    if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB
+        && (unsigned char)p[2] == 0xBF)
+        p += 3;
     while (*p) {
         PadStep st;
         char *end;

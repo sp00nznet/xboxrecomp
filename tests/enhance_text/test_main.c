@@ -379,7 +379,10 @@ int main(void)
     const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
     float s;
     nv2a_overlay_reset_for_test();
-    CHECK(nv2a_overlay_arm(0xF, 1080) == 0, "arm");
+    CHECK(nv2a_overlay_arm(1u << NV2A_OVL_STATS | 1u << NV2A_OVL_STATUS | 1u << NV2A_OVL_TOAST
+                               | 1u << NV2A_OVL_MENU,
+                           1080) == 0,
+          "arm");
     s = nv2a_ovl_ui_scale(1080);
     s_font = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(s, t->font_body), 0);
     s_h = nv2a_ovl_text_height(s_font);

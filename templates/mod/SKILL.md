@@ -42,6 +42,22 @@ pin's `mod.h` decide what the mod can call.
 - A mod with a control or a panel calls `api->actions_arm("mods.<id>.enable")` in
   init, or they work only while the menu is on.
 - `api->mem` is 0 during init. Test it in `on_frame`.
+- A mod that takes the pad (`input_capture`) uses `input_capture_try` from API 9:
+  the toolkit refuses a capture while a pad recording plays, and may take a held
+  one away when a playback starts. Register `on_capture_lost` and land there (a
+  free camera says so). Below 9, fall back to `input_capture`:
+
+  ```c
+  #if XBOX_MOD_API_VERSION >= 9
+      if (api->size >= offsetof(struct xbox_mod_api, on_capture_lost) + sizeof api->on_capture_lost
+          && api->input_capture_try) {
+          api->on_capture_lost(on_lost, NULL);   /* init only */
+          if (api->input_capture_try(1) < 0)    /* a recording plays: not now */
+              return;
+      } else
+  #endif
+          api->input_capture(1);
+  ```
 - A hook runs on the caller's thread. What a frame callback reads from it is atomic.
 - Keep to the short list of how to reach the game, in this order: frame + memory,
   hook slot, HUD table, `guest_call`. A wrapper in `recomp_manual.c` only when none

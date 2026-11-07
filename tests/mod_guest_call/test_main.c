@@ -432,7 +432,7 @@ int main(void)
     capture_begin();
     xbox_enhance_init(".", NULL);
     out = capture_end();
-    CHECK(s_api && s_api->version == 8u && XBOX_MOD_API_VERSION == 8u);
+    CHECK(s_api && s_api->version == 9u && XBOX_MOD_API_VERSION == 9u);
     HAS(out, "[MOD] 2 running: caller other");
 
     /* 1. From a frame callback: registers back, arguments, frame, eax. */

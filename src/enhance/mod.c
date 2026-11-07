@@ -24,6 +24,7 @@
 #ifdef XBOXRECOMP_ENHANCE
 #include "nv2a_dbg_draw.h"
 #include "nv2a_overlay.h"
+#include "pad_session.h"
 #endif
 #include "enhance_menu.h"
 #include "recomp_cfg.h"
@@ -1601,6 +1602,13 @@ static int s_rec_busy;
 /* Bumped as a capture starts: a record from before it (an earlier flight)
  * reads as nothing until the first poll of this one. */
 static unsigned s_cap_epoch;
+/* A playback took a capture away (version 9): told on the next frame. */
+static int s_cap_lost;
+static struct {
+    void (*fn)(void *user);
+    void *user;
+} s_lost[XBOX_MOD_MAX_FRAME];
+static int s_nlost;
 
 int xbox_enhance_pad_seen(DWORD port, const XBOX_GAMEPAD *g, int connected)
 {
@@ -1611,6 +1619,14 @@ int xbox_enhance_pad_seen(DWORD port, const XBOX_GAMEPAD *g, int connected)
      * glue that calls this for every port leaves the others to the game. */
     if (port != 0 || !enhance_input_captured())
         return 0;
+    /* A playback owns port 0 (R3): the capture is let go here, at the
+     * first poll the playback drives, and the mods hear of it on their
+     * next frame. */
+    if (padrec_playing()) {
+        enhance_input_capture(0);
+        __atomic_store_n(&s_cap_lost, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
     if (__atomic_exchange_n(&s_rec_busy, 1, __ATOMIC_ACQUIRE))
         return 1;
     memset(w, 0, sizeof w);
@@ -1659,12 +1675,33 @@ static int rec_read(XBOX_GAMEPAD *g)
     return 1;
 }
 
-/* api->input_capture: a new capture starts a new record. */
+/* api->input_capture: a new capture starts a new record. None while a
+ * playback runs (version 9): the title gets the replay. */
 static void api_input_capture(int on)
 {
+    if (on && padrec_playing())
+        return;
     if (on && !enhance_input_captured())
         __atomic_add_fetch(&s_cap_epoch, 1u, __ATOMIC_ACQ_REL);
     enhance_input_capture(on);
+}
+
+/* Version 9. */
+static int api_input_capture_try(int on)
+{
+    if (on && padrec_playing())
+        return -1;
+    api_input_capture(on);
+    return 0;
+}
+
+static void api_on_capture_lost(void (*fn)(void *user), void *user)
+{
+    if (!fn || s_nlost >= XBOX_MOD_MAX_FRAME)
+        return;
+    s_lost[s_nlost].fn = fn;
+    s_lost[s_nlost].user = user;
+    s_nlost++;
 }
 
 static int s_code_lock;
@@ -1901,6 +1938,8 @@ static int mod_init(int describe)
     memset(s_on_enable_user, 0, sizeof s_on_enable_user);
     memset(s_mod, 0, sizeof s_mod);
     memset(&s_api, 0, sizeof s_api);
+    s_nlost = 0;
+    __atomic_store_n(&s_cap_lost, 0, __ATOMIC_RELEASE);
     for (i = 0; i < MOD_MAX; i++) {
         s_active[i] = -1;
         s_follows_on[i] = 0;
@@ -1964,6 +2003,8 @@ static int mod_init(int describe)
     s_api.on_setting = api_on_setting;
     s_api.control_action = api_control_action;
     s_api.control_value = api_control_value;
+    s_api.input_capture_try = api_input_capture_try;
+    s_api.on_capture_lost = api_on_capture_lost;
     /* The record and the neutral pad: input_core.c calls this on every
      * port-0 poll, and it is one load while no mod captures. */
     xbox_InputSetPadSeen(xbox_enhance_pad_seen);
@@ -2235,6 +2276,11 @@ void xbox_mod_frame(void)
 static void mod_frame_run(void)
 {
     int i;
+
+    if (__atomic_load_n(&s_cap_lost, __ATOMIC_ACQUIRE)
+        && __atomic_exchange_n(&s_cap_lost, 0, __ATOMIC_ACQ_REL))
+        for (i = 0; i < s_nlost; i++)
+            s_lost[i].fn(s_lost[i].user);
 
     /* The Mods page's toggles and settings, on the thread the mods' frames
      * run on. */

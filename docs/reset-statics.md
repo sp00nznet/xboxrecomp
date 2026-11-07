@@ -2724,7 +2724,6 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/usb/usb_gamepad.c | - | s_script_len | file_static | keep | - | pad automation or host diag |
 | src/usb/usb_gamepad.c | - | s_anchors | file_static | keep | - | pad automation or host diag |
 | src/usb/usb_gamepad.c | - | s_anchor_pads | file_static | keep | - | pad automation or host diag |
-| src/usb/usb_gamepad.c | - | s_anchor_lock | file_static | keep | - | pad automation or host diag |
 | src/usb/usb_gamepad.c | - | s_script_state | file_static | keep | - | pad automation or host diag |
 | src/usb/usb_gamepad.c | - | s_script_gen | file_static | keep | - | pad automation or host diag |
 | src/usb/usb_gamepad.c | - | s_flip | file_static | keep | - | pad automation or host diag |
@@ -2759,6 +2758,38 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/usb/usb_gamepad.c | - | s_game_flip | file_static | keep | - | pad automation or host diag |
 | src/usb/usb_gamepad.c | - | s_game_pressed | file_static | keep | - | pad automation or host diag |
 | src/usb/usb_gamepad.c | usb_gamepad_file_open | on | local_static | keep | - | pad automation or host diag |
+
+### src/usb/pad_session.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/usb/pad_session.c | - | s_pad_lock | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_pending | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_active | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_retired | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_hold | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_stop | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_ever | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_live | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_playing | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_play_pads | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_pending_pads | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_serial | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_sig_rec | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_synced | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_sync_poll | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_cfg_clock | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_status_seq | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_status_words | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_status_w | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_open_seq | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_open_name | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_old_int | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_old_term | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_sig_installed | once | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_sig_clock | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | padrec_wants_opens | anchor | local_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_last_path | file_static | keep | - | pad session: host automation like the env script, survives a reset |
 
 ### src/video/fb_present.c
 
@@ -2927,6 +2958,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/enhance_actions.c | - | s_quiet | file_static | keep | - | menu capture quiets action fires |
 | src/enhance/enhance_actions.c | - | s_why | file_static | keep | - | per-thread reason buffer for enhance_action_check |
 | src/enhance/enhance_actions.c | - | s_why_n | file_static | keep | - | size of the per-thread reason buffer |
+| src/enhance/enhance_actions.c | - | s_padrec_act | file_static | keep | - | padrec.* action ids and the request bits the menu takes |
+| src/enhance/enhance_actions.c | - | s_padrec_req | file_static | keep | - | padrec.* action ids and the request bits the menu takes |
 
 ### src/enhance/enhance_cfg.c
 
@@ -3090,6 +3123,27 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/enhance_menu.c | enhance_menu_draw | kinds | local_static | keep | - | scratch row kinds |
 | src/enhance/enhance_menu.c | enhance_menu_draw | vw | local_static | keep | - | scratch row widths |
 | src/enhance/enhance_menu.c | - | s_ao | file_static | keep | - | the AO menu items; note and help set from render.ao_suited |
+| src/enhance/enhance_menu.c | - | s_prf | file_static | keep | - | Recordings page state (file list, start point text) |
+| src/enhance/enhance_menu.c | - | s_nprf | file_static | keep | - | Recordings page state (file list, start point text) |
+| src/enhance/enhance_menu.c | - | s_prf_serial | file_static | keep | - | Recordings page state (file list, start point text) |
+| src/enhance/enhance_menu.c | - | s_prf_state | file_static | keep | - | Recordings page state (file list, start point text) |
+| src/enhance/enhance_menu.c | - | s_rec_start | file_static | keep | - | Recordings page state (file list, start point text) |
+
+### src/enhance/enhance_padrec.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/enhance/enhance_padrec.c | - | s_on_close | file_static | keep | - | pad recording keys, last file and strip state (host UI) |
+| src/enhance/enhance_padrec.c | - | s_hud | file_static | keep | - | pad recording keys, last file and strip state (host UI) |
+| src/enhance/enhance_padrec.c | - | s_last | file_static | keep | - | pad recording keys, last file and strip state (host UI) |
+| src/enhance/enhance_padrec.c | - | s_seen_serial | file_static | keep | - | pad recording keys, last file and strip state (host UI) |
+| src/enhance/enhance_padrec.c | - | s_seen_state | file_static | keep | - | pad recording keys, last file and strip state (host UI) |
+| src/enhance/enhance_padrec.c | - | s_state_t | file_static | keep | - | pad recording keys, last file and strip state (host UI) |
+| src/enhance/enhance_padrec.c | - | s_drawn_t | file_static | keep | - | pad recording keys, last file and strip state (host UI) |
+| src/enhance/enhance_padrec.c | - | s_shown | file_static | keep | - | pad recording keys, last file and strip state (host UI) |
+| src/enhance/enhance_padrec.c | - | s_shown_top | file_static | keep | - | pad recording keys, last file and strip state (host UI) |
+| src/enhance/enhance_padrec.c | - | s_stop_gen | file_static | keep | - | pad recording keys, last file and strip state (host UI) |
+| src/enhance/enhance_padrec.c | - | s_seen_gen | file_static | keep | - | pad recording keys, last file and strip state (host UI) |
 
 ### src/enhance/enhance_mod_status.c
 
@@ -3250,6 +3304,9 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/mod.c | - | s_rec_busy | file_static | keep | - | record writer busy flag, host poll thread |
 | src/enhance/mod.c | - | s_cap_epoch | file_static | keep | - | monotonic capture epoch; bump invalidates s_rec |
 | src/enhance/mod.c | - | s_code_lock | file_static | keep | - | host spin lock over controls' parsed sources |
+| src/enhance/mod.c | - | s_cap_lost | file_static | keep | - | mods' capture-lost handlers (mod API 9) |
+| src/enhance/mod.c | - | s_lost | file_static | keep | - | mods' capture-lost handlers (mod API 9) |
+| src/enhance/mod.c | - | s_nlost | file_static | keep | - | mods' capture-lost handlers (mod API 9) |
 
 ### src/enhance/mod_describe.c
 

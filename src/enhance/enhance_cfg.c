@@ -104,6 +104,9 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("overlay.ui_scale", RENV_OVERLAY_UI_SCALE);
     enhance_cfg_bind_env("overlay.ui_fit", RENV_OVERLAY_UI_FIT);
     enhance_cfg_bind_env("menu.enabled", RENV_MENU);
+    enhance_cfg_bind_env("padrec.clock", RENV_PADREC_CLOCK);
+    enhance_cfg_bind_env("padrec.start", RENV_PADREC_START);
+    enhance_cfg_bind_env("overlay.padrec_hud", RENV_OVERLAY_PADREC_HUD);
 #endif
 }
 

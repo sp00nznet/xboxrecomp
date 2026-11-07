@@ -60,6 +60,9 @@ add_executable(enhance_menu_test
     ${XR_SRC}/enhance/enhance_text.c
     ${XR_SRC}/enhance/enhance_mod_status.c
     ${XR_SRC}/enhance/mod.c
+    ${XR_SRC}/enhance/enhance_padrec.c
+    # The pad session's menu side, without a pad (mod.c asks padrec_playing).
+    ${XR_ROOT}/tests/pad_session/padrec_stub.c
     ${XR_SRC}/enhance/hud_anchor.c
     ${XR_SRC}/enhance/hud_capture.c
     ${XR_SRC}/kernel/recomp_hook.c
@@ -86,7 +89,7 @@ add_executable(enhance_menu_test
     ${XR_SRC}/platform/recomp_exe_dir.c
     ${XR_SRC}/platform/recomp_exit_hook.c
     ${_vendored} "${_fonts_c}")
-target_include_directories(enhance_menu_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/platform
+target_include_directories(enhance_menu_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/usb ${XR_SRC}/platform
     ${XR_SRC}/input ${XR_SRC}/kernel ${XR_SRC}/d3d ${XR_SRC} ${XR_TP}/microui ${XR_TP}/stb ${XR_SRC}/../third_party/librashader)
 target_compile_definitions(enhance_menu_test PRIVATE RECOMP_ENV_HAVE_ENHANCE_KEYS
     XBOXRECOMP_ENHANCE)

@@ -19,11 +19,16 @@
  *             the right stick's mouse), and a control after its rebinding
  *   device    the device the panel names follows the last press
  *   v6        a mod written against version 6 loads, runs and arms nothing
+ *   v9        a playback (pad-recording-ui R3): input_capture_try refused,
+ *             input_capture ignored, a capture held when it starts let go
+ *             at the next pad_seen (which then returns 0), and the
+ *             on_capture_lost handlers told once on the next frame
  *
  * Runs in its working directory, where it writes config/config.toml.
  */
 #include "enhance.h"
 #include "enhance_actions.h"
+#include "enhance_input.h"
 #include "enhance_menu.h"
 #include "enhance_mod_status.h"
 #include "enhance_text.h"
@@ -38,6 +43,7 @@
 #include "nv2a_pb_state.h"
 #include "nv2a_tex_pack.h"
 #include "pad_map.h"
+#include "pad_session.h"
 #include "recomp_env.h"
 
 #include <fcntl.h>
@@ -441,7 +447,7 @@ static void test_status(void)
     s = mod_index("second");
     CHECK(p == 0 && s == 1);
     CHECK(xbox_mod_state(p) == XBOX_MOD_ON && xbox_mod_state(s) == XBOX_MOD_ON);
-    CHECK(s_papi && s_papi->version == 8u && s_papi->glyph_name && s_papi->status);
+    CHECK(s_papi && s_papi->version == 9u && s_papi->glyph_name && s_papi->status);
     /* The one second's init set, kept once it started. */
     CHECK(!strcmp(panel(s), "Second\nline"));
 
@@ -849,6 +855,70 @@ static void test_draw3d(void)
     nv2a_dbg_reset();
 }
 
+/* ---- v9: a pad playback owns port 0 ---------------------------------------- */
+
+/* padrec_stub.c */
+void padrec_stub_set(const PadrecStatus *st);
+void padrec_stub_reset(void);
+
+static int s_lost_calls;
+static void *s_lost_user;
+static void on_lost(void *user)
+{
+    s_lost_calls++;
+    s_lost_user = user;
+}
+
+static void test_v9(void)
+{
+    static int tag;
+    PadrecStatus st;
+    XBOX_GAMEPAD g;
+
+    padrec_stub_reset();
+    start_with(ARMED, k_mods);
+    CHECK(s_papi && s_papi->size >= offsetof(struct xbox_mod_api, on_capture_lost)
+                                        + sizeof s_papi->on_capture_lost);
+    CHECK(s_papi->input_capture_try && s_papi->on_capture_lost);
+    s_lost_calls = 0;
+    s_papi->on_capture_lost(on_lost, &tag);
+    memset(&g, 0, sizeof g);
+
+    /* No playback: the try takes the capture, as input_capture does. */
+    CHECK(s_papi->input_capture_try(1) == 0);
+    CHECK(enhance_input_captured());
+    CHECK(xbox_enhance_pad_seen(0, &g, 1) == 1);
+
+    /* A playback starts: the capture goes at the next poll, once. */
+    memset(&st, 0, sizeof st);
+    st.serial = 1;
+    st.state = PADREC_PLAY;
+    padrec_stub_set(&st);
+    CHECK(xbox_enhance_pad_seen(0, &g, 1) == 0);
+    CHECK(!enhance_input_captured());
+    CHECK(s_lost_calls == 0);
+    xbox_mod_frame();
+    CHECK(s_lost_calls == 1 && s_lost_user == &tag);
+    xbox_mod_frame();
+    CHECK(s_lost_calls == 1);
+
+    /* While it plays: the try refused, input_capture ignored, a release
+     * still taken. */
+    CHECK(s_papi->input_capture_try(1) == -1);
+    CHECK(!enhance_input_captured());
+    s_papi->input_capture(1);
+    CHECK(!enhance_input_captured());
+    CHECK(s_papi->input_capture_try(0) == 0);
+
+    /* Ended: captures work again. */
+    st.state = PADREC_ENDED;
+    padrec_stub_set(&st);
+    CHECK(s_papi->input_capture_try(1) == 0);
+    CHECK(enhance_input_captured());
+    s_papi->input_capture(0);
+    padrec_stub_reset();
+}
+
 int main(void)
 {
     MKDIR("config");
@@ -861,6 +931,7 @@ int main(void)
     test_device();
     test_v6();
     test_draw3d();
+    test_v9();
     xbox_mod_shutdown();
     printf("mod_status: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;

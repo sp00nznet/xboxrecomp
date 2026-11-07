@@ -45,7 +45,9 @@ typedef struct mu_Context mu_Context;   /* third_party/microui/microui.h */
 /* In drawing order: the mods' status panels (enhance_mod_status.h) go
  * under the toasts and the menu, and the pointer over everything. */
 enum nv2a_overlay_layer {
-    NV2A_OVL_STATS, NV2A_OVL_STATUS, NV2A_OVL_TOAST, NV2A_OVL_MENU, NV2A_OVL_CURSOR,
+    NV2A_OVL_STATS, NV2A_OVL_STATUS,
+    NV2A_OVL_PADREC,    /* the pad recording strip (pad-recording-ui R4) */
+    NV2A_OVL_TOAST, NV2A_OVL_MENU, NV2A_OVL_CURSOR,
     NV2A_OVL_COUNT
 };
 

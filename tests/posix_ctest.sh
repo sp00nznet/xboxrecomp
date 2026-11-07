@@ -110,6 +110,10 @@ fi
 if [ -f "$here/input_actions/CMakeLists.txt" ]; then
     build_one input_actions_tsan input_actions -DINPUT_ACTIONS_TSAN=ON >>"$built"
 fi
+# pad_session the same way: the pad, game and menu threads of a pad session.
+if [ -f "$here/pad_session/CMakeLists.txt" ]; then
+    build_one pad_session_tsan pad_session -DPAD_SESSION_TSAN=ON >>"$built"
+fi
 for d in "$here"/*/; do
     [ -f "$d/CMakeLists.txt" ] || echo "n/a   $(basename "$d"): no CMakeLists.txt, not a ctest"
 done >>"$built"

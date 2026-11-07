@@ -222,6 +222,10 @@ typedef void (*enhance_menu_hook_fn)(unsigned port, uint32_t held,
                                      XBOX_INPUT_STATE *st, uint64_t now_ms);
 void enhance_actions_set_menu_hook(enhance_menu_hook_fn fn);
 int enhance_actions_menu_request(void);
+/* The padrec.* fires since the last call, taken: bit 0 padrec.record, 1
+ * padrec.play, 2 padrec.stop (pad-recording-ui R3). Without the hook a
+ * fire toasts that the menu is off instead. */
+int enhance_actions_padrec_request(void);
 
 /* The mods' status panels (enhance_mod_status.h): fn(0) first on every
  * flip tick, on the overlay's thread. The tick runs only while the hook

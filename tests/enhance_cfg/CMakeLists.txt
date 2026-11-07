@@ -24,6 +24,8 @@ add_executable(enhance_cfg_test
     ${XR_SRC}/enhance/enhance_input.c
     ${XR_SRC}/enhance/enhance_actions.c
     ${XR_SRC}/enhance/mod.c
+    # The pad session's menu side, without a pad (mod.c asks padrec_playing).
+    ${XR_SRC}/../tests/pad_session/padrec_stub.c
     ${XR_SRC}/enhance/hud_anchor.c
     ${XR_SRC}/enhance/hud_capture.c
     ${XR_SRC}/kernel/recomp_hook.c
@@ -40,7 +42,7 @@ add_executable(enhance_cfg_test
     ${XR_SRC}/platform/recomp_env.c
     ${XR_SRC}/platform/recomp_exe_dir.c
     ${XR_SRC}/platform/recomp_exit_hook.c)
-target_include_directories(enhance_cfg_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/platform
+target_include_directories(enhance_cfg_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/usb ${XR_SRC}/platform
     ${XR_SRC}/input
     ${XR_SRC}/kernel ${XR_SRC}/d3d ${XR_SRC} ${XR_SRC}/../third_party/librashader)
 target_compile_definitions(enhance_cfg_test PRIVATE RECOMP_ENV_HAVE_ENHANCE_KEYS
