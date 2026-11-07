@@ -1943,6 +1943,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_gpu_ns | file_static | keep | - | ao trace totals |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_gpu_n | file_static | keep | - | ao trace totals |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_trace | file_static | keep | - | ao trace channel from env |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_frames | file_static | keep | - | ao_frames trace channel from env |
+| src/d3d/nv2a_pb_d3d11.c | ao_flip | runs0 | local_static | keep | - | ao_frames trace: s_ao_runs at the last flip |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_dump | file_static | keep | - | ao_dump debug trigger and its log, from env |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_vs | file_static | keep | - | render.ao shader from fixed source |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_ps | file_static | keep | - | render.ao shader from fixed source |
@@ -2172,6 +2174,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_ao_gpu_ns | file_static | keep | - | ao trace totals |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_gpu_n | file_static | keep | - | ao trace totals |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_trace | file_static | keep | - | ao trace channel from env |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_frames | file_static | keep | - | ao_frames trace channel from env |
+| src/d3d/nv2a_pb_metal.m | ao_flip | runs0 | local_static | keep | - | ao_frames trace: s_ao_runs at the last flip |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_dump | file_static | keep | - | ao_dump debug trigger and its log, from env |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_pso | file_static | keep | - | render.ao pipeline from fixed source |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_mul_pso | file_static | keep | - | render.ao pipeline from fixed source |

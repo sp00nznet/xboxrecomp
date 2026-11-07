@@ -18,9 +18,17 @@
  *    after rearm_draws more depth-writing draws. A frame drawn in chunks
  *    (BLiNX 2) or one whose world is split by a lone 2D draw (JSRF) has
  *    several events; the occlusion runs at the last one, whose ordinal the
- *    previous frame left (the memo), since the last is only known at the
- *    flip. "The first 2D draw after 3D" does not work: Burnout 3 draws its
- *    3D offscreen and its HUD is not classified as 2D.
+ *    previous frames left (the memo), since the last is only known at the
+ *    flip. The memo is the count of the frame one period back: a game whose
+ *    count cycles (N, N, N + 1 on the Deck) would otherwise fire
+ *    early or miss on two frames in three. After a scene change the memo
+ *    lags by up to the period (4 frames), unless a loading screen (a frame
+ *    with no events and no 3D) clears the history. One event short of the
+ *    memo, an event that looks like that frame's last one (same cause after
+ *    the same cause, as many depth draws since, and clearly unlike the
+ *    event before the last) fires too: a frame that lost a chunk then
+ *    still gets its occlusion. "The first 2D draw after 3D" does not work:
+ *    Burnout 3 draws its 3D offscreen and its HUD is not classified as 2D.
  *  - The depth fit: the buffer stores z / zmax (oPos.z after the XDK
  *    epilogue's divide), d = A + B / w. FOV and planes are unknown, so the
  *    vertex programs' own output is sampled (the backend runs a few
@@ -84,6 +92,15 @@ struct nv2a_ao_fit {
 int nv2a_ao_fit_z(const float *d, const float *iw, unsigned n, float min_conf,
                   struct nv2a_ao_fit *fit);
 
+/* Why an event fired: the next draw went to another target, did not write
+ * depth, had no depth buffer, sampled the candidate; or the flip. */
+enum { NV2A_AO_WHY_RT = 1, NV2A_AO_WHY_NOZ, NV2A_AO_WHY_NODEPTH, NV2A_AO_WHY_SAMPLE,
+       NV2A_AO_WHY_FLIP };
+#define NV2A_AO_EVENTS 16
+/* Event counts of the last frames that had any, for the memo's period
+ * (nv2a_ao_frame_end). */
+#define NV2A_AO_HIST 16
+
 /* The trigger and the frame's samples. Opaque target pointers: the
  * backend's own render targets. */
 struct nv2a_ao_trig {
@@ -103,6 +120,26 @@ struct nv2a_ao_trig {
     struct nv2a_ao_fit fit;       /* the previous frame's, used by this one */
     /* Totals for the trace: frames, frames that fired, fit refusals. */
     uint64_t    frames, fired_frames, no_fit, missed;
+    /* This frame's events for the ao_frames trace (nv2a_ao_frame_str):
+     * why each fired (NV2A_AO_WHY_*), the candidate's depth-writing draws
+     * by then, and the ordinal the occlusion ran at (0: none). */
+    uint8_t     ev_why[NV2A_AO_EVENTS];
+    uint16_t    ev_zd[NV2A_AO_EVENTS];
+    const void *ev_rt[NV2A_AO_EVENTS];
+    unsigned    fired_at;
+    uint8_t     hist[NV2A_AO_HIST];  /* ring of event counts, newest at nhist - 1 */
+    unsigned    nhist;
+    /* The same frames' last event: its cause, the one before it (0: none)
+     * and the candidate's depth-writing draws between them; tail_ok 0 when
+     * the frame had more than NV2A_AO_EVENTS. */
+    uint8_t     tail_why[NV2A_AO_HIST], tail_pwhy[NV2A_AO_HIST], tail_ok[NV2A_AO_HIST];
+    uint16_t    tail_gap[NV2A_AO_HIST];
+    /* And the event before that last one, which a tail match must be
+     * clearly farther from. */
+    uint8_t     pre_why[NV2A_AO_HIST], pre_pwhy[NV2A_AO_HIST];
+    uint16_t    pre_gap[NV2A_AO_HIST];
+    unsigned    want_back;        /* the memo's frame, 0 = the newest */
+    unsigned    memo;             /* want as frame_end set it (the flip moves want) */
 };
 
 void nv2a_ao_reset(struct nv2a_ao_trig *t);
@@ -139,6 +176,15 @@ void nv2a_ao_sample_put(struct nv2a_ao_trig *t, int slot, float z, float w, floa
  * guest size (0 x 0: none). */
 const void *nv2a_ao_flip(struct nv2a_ao_trig *t);
 void nv2a_ao_frame_end(struct nv2a_ao_trig *t, uint32_t shown_w, uint32_t shown_h);
+
+/* The ao_frames trace's body for the frame between nv2a_ao_flip and
+ * nv2a_ao_frame_end: "ord=5 want=5 at=5 ok=1 conf=1.000 ns=256
+ * ev=z16,z24,r40,f0", one letter per event (r target, z no depth write,
+ * d no depth buffer, s sampled, f flip) and the candidate's depth-writing
+ * draws by then; a '*' marks the one occluded. id(rt) names a target
+ * (the backend's guest address), or NULL for the pointer's low bits. */
+void nv2a_ao_frame_str(const struct nv2a_ao_trig *t, char *buf, size_t cap,
+                       uint32_t (*id)(const void *rt));
 
 /* The two passes' constants: float4 only, so the MSL and HLSL layouts are
  * the C one. p0 = (a, b, wmode, zmax); p1 = (radius in host pixels,

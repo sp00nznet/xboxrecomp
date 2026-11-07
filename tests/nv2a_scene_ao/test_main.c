@@ -194,6 +194,185 @@ static void test_growing(void)
     check(a3 == 60, "then back on the memo");
 }
 
+/* A frame of k chunks of 30 depth draws, each ended by 2 non-depth draws
+ * (k events), then a HUD of 5. Returns the draw that fired, -1 the flip, -2
+ * none; *last is the index of the last chunk's end. */
+static int frame_chunks(struct nv2a_ao_trig *t, unsigned k, int *last)
+{
+    int at = -2, i = 0;
+    unsigned c, j;
+    for (c = 0; c < k; c++) {
+        for (j = 0; j < 30; j++, i++) {
+            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0) && at == -2) at = i;
+            put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
+        }
+        *last = i;
+        for (j = 0; j < 2; j++, i++)
+            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
+    }
+    for (j = 0; j < 5; j++, i++)
+        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
+    if (nv2a_ao_flip(t) && at == -2) at = -1;
+    nv2a_ao_frame_end(t, 640, 480);
+    return at;
+}
+
+/* The Deck's event count cycled N, N, N + 1. The previous frame's
+ * count fired early on the long frame and missed the frame after it; the
+ * period memo locks on to the cycle once the window has seen it. */
+static unsigned cycle_bad(const unsigned *pat, unsigned plen, unsigned frames, unsigned from)
+{
+    struct nv2a_ao_trig t;
+    unsigned f, bad = 0;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < frames; f++) {
+        int last, at = frame_chunks(&t, pat[f % plen], &last);
+        if (f >= from && at != last) bad++;
+    }
+    return bad;
+}
+
+static void test_cycle(void)
+{
+    static const unsigned n_n_n1[] = { 2, 2, 3 }, n_n1[] = { 3, 4 }, n4[] = { 2, 2, 2, 3 },
+                          flat[] = { 3 };
+    check(cycle_bad(n_n_n1, 3, 60, 16) == 0, "N, N, N+1: every frame fires at its last event");
+    check(cycle_bad(n_n1, 2, 60, 16) == 0, "N, N+1: every frame fires at its last event");
+    check(cycle_bad(n4, 4, 60, 16) == 0, "N, N, N, N+1: every frame fires at its last event");
+    check(cycle_bad(flat, 1, 60, 2) == 0, "a steady count: every frame after the first fit");
+}
+
+/* One frame in thirty with an extra event (the PC's wander): the memo stays
+ * on the previous frame, so only the odd frame and the one after it are off. */
+static void test_wander(void)
+{
+    struct nv2a_ao_trig t;
+    unsigned f, bad = 0;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 89; f++) {
+        int last, at = frame_chunks(&t, f % 30 == 29 ? 3 : 2, &last);
+        if (f >= 2 && at != last) bad++;
+    }
+    check(bad == 4, "each lone extra event costs two frames, no period is found");
+    check(t.want == 2, "and the memo is back on the usual count");
+}
+
+/* A frame of k chunks of 30 depth draws and a tail of 12, each ended by 2
+ * non-depth draws, then a HUD of 5: k + 1 events, the last 12 draws after
+ * the one before. Returns as frame_chunks. */
+static int frame_tail(struct nv2a_ao_trig *t, unsigned k, int *last)
+{
+    int at = -2, i = 0;
+    unsigned c, j;
+    for (c = 0; c <= k; c++) {
+        for (j = 0; j < (c < k ? 30u : 12u); j++, i++) {
+            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0) && at == -2) at = i;
+            put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
+        }
+        *last = i;
+        for (j = 0; j < 2; j++, i++)
+            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
+    }
+    for (j = 0; j < 5; j++, i++)
+        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
+    if (nv2a_ao_flip(t) && at == -2) at = -1;
+    nv2a_ao_frame_end(t, 640, 480);
+    return at;
+}
+
+/* A frame that loses a chunk now and then (the PC's misses): one
+ * event short of the memo, an event that looks like the memo frame's last
+ * one (12 depth draws after a chunk) fires. Like chunks with no distinct
+ * tail never fire early that way (test_chunks, test_cycle). */
+static void test_lost_chunk(void)
+{
+    struct nv2a_ao_trig t;
+    unsigned f, bad = 0;
+    uint64_t missed;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 4; f++) {
+        int last;
+        frame_tail(&t, 3, &last);
+    }
+    missed = t.missed;
+    for (f = 0; f < 20; f++) {
+        int last, at = frame_tail(&t, f % 5 == 4 ? 2 : 3, &last);
+        if (at != last) bad++;
+    }
+    check(t.missed == missed, "a frame one chunk short is not missed");
+    /* Short frames 4, 9, 14 and 19; the last has no frame after it. */
+    check(bad == 3, "only the frame after a short one fires early, on its memo");
+}
+
+/* Frames of chunks of the given sizes, each ended by 2 non-depth draws,
+ * then a HUD of 5. Returns as frame_chunks. */
+static int frame_sizes(struct nv2a_ao_trig *t, const unsigned *sz, unsigned k, int *last)
+{
+    int at = -2, i = 0;
+    unsigned c, j;
+    for (c = 0; c < k; c++) {
+        for (j = 0; j < sz[c]; j++, i++) {
+            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0) && at == -2) at = i;
+            put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
+        }
+        *last = i;
+        for (j = 0; j < 2; j++, i++)
+            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
+    }
+    for (j = 0; j < 5; j++, i++)
+        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
+    if (nv2a_ao_flip(t) && at == -2) at = -1;
+    nv2a_ao_frame_end(t, 640, 480);
+    return at;
+}
+
+/* A steady count whose last two chunks are close in size and jitter by a
+ * few draws (review of the memo fix): the event before the last falls in the
+ * tail's band now and then, and must not fire a chunk early. */
+static void test_tail_jitter(void)
+{
+    static const unsigned base[][2] = { { 24, 20 }, { 20, 24 }, { 30, 26 }, { 14, 13 } };
+    unsigned b, f, early = 0, missed = 0, seed = 1;
+    for (b = 0; b < 4; b++) {
+        struct nv2a_ao_trig t;
+        nv2a_ao_reset(&t);
+        for (f = 0; f < 200; f++) {
+            unsigned sz[3];
+            int last, at;
+            seed = seed * 1103515245u + 12345u;
+            sz[0] = 40;
+            sz[1] = base[b][0] + (seed >> 16) % 5;
+            sz[2] = base[b][1] + (seed >> 20) % 5;
+            at = frame_sizes(&t, sz, 3, &last);
+            if (f >= 2 && at >= 0 && at < last) early++;
+            if (f >= 2 && at == -2) missed++;
+        }
+    }
+    check(early == 0 && missed == 0, "close, jittered last chunks: never early, never missed");
+}
+
+/* A scene change after the memo locked on to a period: a loading screen
+ * (no events, no 3D) clears the history, so the new scene's steady count
+ * is the memo from its second frame. */
+static void test_scene_change(void)
+{
+    static const unsigned pat[] = { 2, 2, 3 };
+    struct nv2a_ao_trig t;
+    unsigned f, bad = 0;
+    int last;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 30; f++)
+        frame_chunks(&t, pat[f % 3], &last);
+    nv2a_ao_flip(&t);
+    nv2a_ao_frame_end(&t, 640, 480);
+    check(t.nhist == 0 && t.want == 0, "a loading screen clears the memo's history");
+    for (f = 0; f < 12; f++) {
+        int at = frame_chunks(&t, 4, &last);
+        if (f >= 1 && at != last) bad++;
+    }
+    check(bad == 0, "the new scene's count is the memo from its second frame");
+}
+
 static void test_no_fit(void)
 {
     struct nv2a_ao_trig t;
@@ -336,6 +515,11 @@ int main(void)
     test_hud_never_arms();
     test_shadow_and_flip();
     test_growing();
+    test_cycle();
+    test_wander();
+    test_lost_chunk();
+    test_tail_jitter();
+    test_scene_change();
     test_no_fit();
     test_fit_two_projections();
     test_wmode();

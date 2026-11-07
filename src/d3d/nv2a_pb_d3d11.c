@@ -4041,6 +4041,20 @@ static int ao_trace(void)
     return s_ao_trace;
 }
 
+static int s_ao_frames = -1;
+
+static int ao_frames(void)
+{
+    if (s_ao_frames < 0)
+        s_ao_frames = recomp_env(RENV_AO_FRAMES) != NULL;
+    return s_ao_frames;
+}
+
+static uint32_t ao_rt_id(const void *rt)
+{
+    return rt ? ((const RenderTarget *)rt)->addr : 0;
+}
+
 static int ao_dump_due(void)
 {
     if (!s_ao_dump.parsed) {
@@ -4369,6 +4383,17 @@ static void ao_flip(RenderTarget *shown)
         if (fire)
             ao_apply((RenderTarget *)(uintptr_t)fire);
         fired = s_ao.fired;
+        if (ao_frames()) {
+            /* ran: the passes this frame drew. fired with ran=0 is an
+             * occlusion ao_apply dropped (no readable depth of its size). */
+            static uint64_t runs0;
+            char line[400];
+            nv2a_ao_frame_str(&s_ao, line, sizeof line, ao_rt_id);
+            fprintf(stderr, LOGP "ao: flip %llu shown@%x ran=%llu %s\n",
+                    (unsigned long long)s_presents, ao_rt_id(shown),
+                    (unsigned long long)(s_ao_runs - runs0), line);
+            runs0 = s_ao_runs;
+        }
         if (ao_dump_due()) {
             if (!s_ao_dump.log) {
                 char path[600];

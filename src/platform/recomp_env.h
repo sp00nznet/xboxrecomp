@@ -173,6 +173,7 @@ extern "C" {
     X(PRESENT_TRACE,     TRACE, "present",         "RECOMP_PRESENT_TRACE",     "present-surface choices") \
     X(PRESENT_STATS,     TRACE, "present_stats",   "RECOMP_PRESENT_STATS",     "SDL host present statistics") \
     X(AO_TRACE,          TRACE, "ao",              NULL,                       "render.ao every 300 flips: frames occluded, missed and refused, the depth fit (A, B, inlier share, W mode, scene depth), GPU passes") \
+    X(AO_FRAMES,         TRACE, "ao_frames",       NULL,                       "render.ao: one line per flip with the trigger's events (why each fired, the candidate's depth-writing draws, its target), the one occluded, the memo, the depth fit and the target shown") \
     X(AO_VIEW,           DEBUG, "ao_view",         NULL,                       "=1: render.ao draws its occlusion map in place of the scene (white = open), for tuning") \
     X(AO_DUMP,           DEBUG, "ao_dump",         NULL,                       "=DIR[:FROM[:N]]: render.ao writes the 3D target before and after occlusion as DIR/ao-<flip>-{pre,post}.ppm and the trigger state as DIR/ao-frames.txt, N frames (default 300) from flip FROM; heavy") \
     X(METAL_PROF,        TRACE, "metal_prof",      NULL,                       "Metal flip cost every 300 flips: GPU wait, readbacks, write-back, slot blit, hand-off, GPU time") \
