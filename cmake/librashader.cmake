@@ -1,15 +1,23 @@
 # present.shader (src/kernel/nv2a_present_chain.c): the bundled slang
 # presets and the librashader library, staged beside a game's executable.
 #
+# Every game gets it with no line of its own: when the top-level CMakeLists
+# ends, each executable that links the enhancements layer (xbox_enhance,
+# which holds the menu's Shaders page) is staged. Scanning at the end is what
+# makes it automatic, since the toolkit is added before the game's targets
+# exist; a game added later cannot forget it, as four did with an opt-in call.
+#
 #   xboxrecomp_present_shaders(<exe-target>)
 #
-# A game calls it after add_executable to offer present.shader. After each
-# build of <exe-target> its directory holds shaders/ (assets/shaders, the
-# PD/MIT presets) and, with XBOXRECOMP_LIBRASHADER on, librashader.dll or
-# librashader.dylib. The runtime loads the library at run time and never
-# links it (the D3D11 runtime does not build with MinGW), so the game builds
-# and runs without it: present.shader then says the library is missing and
-# the present stays stock.
+# stages an executable that does not link the layer. On one that does it
+# changes nothing, so a game's older call stays harmless.
+#
+# Before each build of a staged target its directory gets shaders/
+# (assets/shaders, the PD/MIT presets) and, with XBOXRECOMP_LIBRASHADER on,
+# librashader.dll or librashader.dylib. The runtime loads the library at run
+# time and never links it (the D3D11 runtime does not build with MinGW), so
+# the game builds and runs without it: present.shader then says the library
+# is missing and the present stays stock.
 #
 # The library is a prebuilt release, never built here (no Rust toolchain on
 # the build machines), pinned by sha256 like cmake/dsp56300.cmake. macOS and
@@ -197,35 +205,133 @@ function(_xboxrecomp_librashader_fetch_plat plat out notices)
 endfunction()
 
 function(xboxrecomp_present_shaders target)
-    if(NOT XBOXRECOMP_ENHANCE)
-        return()
+    if(XBOXRECOMP_ENHANCE)
+        set_property(TARGET ${target} PROPERTY XBOXRECOMP_PRESENT_SHADERS ON)
     endif()
+endfunction()
+
+# Every target under <dir>, its subdirectories included, into <out>.
+function(_xboxrecomp_targets_under dir out)
+    get_property(all DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+    get_property(subs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+    foreach(sub IN LISTS subs)
+        _xboxrecomp_targets_under("${sub}" under)
+        list(APPEND all ${under})
+    endforeach()
+    set(${out} "${all}" PARENT_SCOPE)
+endfunction()
+
+# The copies run in a custom target the executable depends on, not as its
+# POST_BUILD: add_custom_command(TARGET) is refused for a target of another
+# directory (CMP0040), and this runs in the top-level one while Burnout 3's
+# executable lives in src/game. $<TARGET_FILE_DIR> adds no dependency back on
+# the executable (CMP0112), and copy_directory makes the directory, so this
+# can run before the link. Being a dependency it also runs for a build of
+# just the executable, and puts back a shaders/ someone deleted.
+function(_xboxrecomp_present_shaders_stage target)
     get_filename_component(root "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/.." ABSOLUTE)
-    add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-                "${root}/assets/shaders" "$<TARGET_FILE_DIR:${target}>/shaders"
-        COMMENT "present.shader presets beside ${target}"
-        VERBATIM)
+    set(dir "$<TARGET_FILE_DIR:${target}>")
+    set(copies COMMAND ${CMAKE_COMMAND} -E copy_directory "${root}/assets/shaders" "${dir}/shaders")
     if(XBOXRECOMP_LIBRASHADER)
         _xboxrecomp_librashader_fetch(lib notices)
         if(lib)
             # The MPL-2.0 text, the third-party notices and the source link
             # travel in shaders/, so the packaging carries one directory and
             # the library.
-            set(copy_notices "")
-            if(notices)
-                set(copy_notices COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${notices}"
-                    "$<TARGET_FILE_DIR:${target}>/shaders/THIRDPARTY-librashader.txt")
-            endif()
-            add_custom_command(TARGET ${target} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${lib}" "$<TARGET_FILE_DIR:${target}>/"
+            list(APPEND copies
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${lib}" "${dir}/"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                         "${root}/LICENSES/MPL-2.0-librashader.txt"
-                        "$<TARGET_FILE_DIR:${target}>/shaders/LICENSE-librashader.txt"
-                ${copy_notices}
-                VERBATIM)
+                        "${dir}/shaders/LICENSE-librashader.txt")
+            if(notices)
+                list(APPEND copies COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                     "${notices}" "${dir}/shaders/THIRDPARTY-librashader.txt")
+            endif()
         endif()
     endif()
+    add_custom_target(${target}_present_shaders ${copies}
+        COMMENT "present.shader presets beside ${target}"
+        VERBATIM)
+    add_dependencies(${target} ${target}_present_shaders)
 endfunction()
+
+# <out> is 1 when <target> reaches xbox_enhance through its link closure.
+# A game links the xboxrecomp umbrella, not the layer itself (cat, KUF), so
+# its own LINK_LIBRARIES never name xbox_enhance: the INTERFACE ones of what
+# it links are walked too. $<LINK_ONLY:> is what a static library's PRIVATE
+# link becomes; any other generator expression and plain flags or files are
+# not targets and are skipped, as are the ::@ markers of a link made from
+# another directory.
+function(_xboxrecomp_links_enhance target out)
+    set(todo ${target})
+    set(seen "")
+    set(found 0)
+    while(todo)
+        list(POP_FRONT todo t)
+        if(NOT TARGET "${t}" OR t IN_LIST seen)
+            continue()
+        endif()
+        list(APPEND seen "${t}")
+        get_target_property(real "${t}" ALIASED_TARGET)
+        if(real)
+            set(t "${real}")
+        endif()
+        if(t STREQUAL "xbox_enhance")
+            set(found 1)
+            break()
+        endif()
+        get_target_property(type "${t}" TYPE)
+        set(libs "")
+        if(NOT type STREQUAL "INTERFACE_LIBRARY")
+            get_target_property(l "${t}" LINK_LIBRARIES)
+            if(l)
+                list(APPEND libs ${l})
+            endif()
+        endif()
+        get_target_property(l "${t}" INTERFACE_LINK_LIBRARIES)
+        if(l)
+            list(APPEND libs ${l})
+        endif()
+        foreach(l IN LISTS libs)
+            string(REGEX REPLACE "^\\$<LINK_ONLY:(.*)>$" "\\1" l "${l}")
+            if(NOT l MATCHES "^(\\$<|::@)")
+                list(APPEND todo "${l}")
+            endif()
+        endforeach()
+    endwhile()
+    set(${out} ${found} PARENT_SCOPE)
+endfunction()
+
+function(_xboxrecomp_present_shaders_all)
+    if(NOT XBOXRECOMP_ENHANCE)
+        return()
+    endif()
+    get_property(own GLOBAL PROPERTY _XBOXRECOMP_PRESENT_SHADERS_OWN)
+    _xboxrecomp_targets_under("${CMAKE_SOURCE_DIR}" targets)
+    foreach(t IN LISTS targets)
+        get_target_property(type ${t} TYPE)
+        if(NOT type STREQUAL "EXECUTABLE")
+            continue()
+        endif()
+        get_target_property(asked ${t} XBOXRECOMP_PRESENT_SHADERS)
+        # The toolkit's own executables (its in-tree test harnesses) link the
+        # umbrella too, and never show a menu: only a name asks for them.
+        set(mine FALSE)
+        if(own)
+            get_target_property(src ${t} SOURCE_DIR)
+            cmake_path(IS_PREFIX own "${src}" NORMALIZE mine)
+        endif()
+        if(mine AND NOT asked)
+            continue()
+        endif()
+        _xboxrecomp_links_enhance(${t} links)
+        if(asked OR links)
+            _xboxrecomp_present_shaders_stage(${t})
+        endif()
+    endforeach()
+endfunction()
+
+# The directory that included this, the toolkit's top: the scan runs in the
+# game's top directory, which does not see this one's variables.
+set_property(GLOBAL PROPERTY _XBOXRECOMP_PRESENT_SHADERS_OWN "${CMAKE_CURRENT_SOURCE_DIR}")
+cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL _xboxrecomp_present_shaders_all)

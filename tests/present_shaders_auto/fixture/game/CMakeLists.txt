@@ -1,0 +1,11 @@
+add_executable(game main.c)
+if(UMBRELLA)
+    # As cat and KUF do: only the umbrella, which carries the layer.
+    target_link_libraries(game PRIVATE xboxrecomp)
+elseif(TARGET xbox_enhance)
+    target_link_libraries(game PRIVATE xbox_enhance)
+endif()
+if(CALL_GAME)
+    xboxrecomp_present_shaders(game)
+endif()
+add_subdirectory(tool)

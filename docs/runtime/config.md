@@ -487,8 +487,8 @@ same requests at given flips, to check a switch without the menu.
   `cmake/librashader.cmake` stages a prebuilt release (pinned by
   sha256; upstream's on macOS, our D3D11-only build of the same source on
   x86-64 Windows, which needs no DirectX 9 or Visual C++ runtime) beside
-  the executable when a game calls
-  `xboxrecomp_present_shaders(<target>)`; a configure that cannot
+  every executable that links `xbox_enhance`, directly or through the
+  `xboxrecomp` umbrella, with no line in the game; a configure that cannot
   download it warns and builds without it. `present.shader_lib` points at
   another copy, loaded as given with no hash check: it runs code from the
   path the player names, as any library they put there would. A missing

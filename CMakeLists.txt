@@ -54,9 +54,10 @@ if(XBOXRECOMP_ENHANCE)
     target_compile_definitions(recomp_env PUBLIC RECOMP_ENV_HAVE_ENHANCE_KEYS XBOXRECOMP_ENHANCE)
     add_subdirectory(src/enhance)
 endif()
-# present.shader's presets and librashader, staged beside a game's exe by
-# xboxrecomp_present_shaders(<target>). Always defined, so a game can call it
-# unconditionally; it does nothing without XBOXRECOMP_ENHANCE.
+# present.shader's presets and librashader, staged beside every executable
+# that links xbox_enhance when the top-level CMakeLists ends. Nothing without
+# XBOXRECOMP_ENHANCE. xboxrecomp_present_shaders(<target>) stays defined for
+# the games that call it and for an executable that does not link the layer.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/librashader.cmake)
 # The staged Windows library must load on a stock Windows (an objdump reads
 # its import table). Other hosts check the same pinned zip on request: it is
