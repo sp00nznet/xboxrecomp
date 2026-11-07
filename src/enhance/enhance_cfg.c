@@ -78,6 +78,10 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("render.scale", RENV_RENDER_SCALE);
     enhance_cfg_bind_env("render.aniso", RENV_RENDER_ANISO);
     enhance_cfg_bind_env("render.snap_2d", RENV_RENDER_SNAP_2D);
+    enhance_cfg_bind_env("render.ao", RENV_RENDER_AO);
+    enhance_cfg_bind_env("render.ao_strength", RENV_RENDER_AO_STRENGTH);
+    enhance_cfg_bind_env("render.ao_radius", RENV_RENDER_AO_RADIUS);
+    enhance_cfg_bind_env("render.ao_suited", RENV_RENDER_AO_SUITED);
     enhance_cfg_bind_env("display.aspect", RENV_DISPLAY_ASPECT);
     enhance_cfg_bind_env("display.movie", RENV_DISPLAY_MOVIE);
     enhance_cfg_bind_env("display.hud_aspect", RENV_DISPLAY_HUD_ASPECT);

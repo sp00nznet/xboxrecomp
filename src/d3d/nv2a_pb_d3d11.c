@@ -61,6 +61,8 @@
 #include "librashader.h"
 #endif
 #include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
+#include "nv2a_scene_ao.h"
+#include "nv2a_scene_ao_shaders.h"
 #include "shader_cache.h"
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
 #include "video/video_player.h"   /* xbox_FramebufferWindowTitleText */
@@ -768,11 +770,20 @@ static int init(void)
  * format. setup_pixel's stage memo keys on it. */
 static uint32_t s_rt_gen;
 
+/* render.ao's trigger (the passes are further down): here so a freed
+ * target can leave it. The configuration is latched at each flip
+ * (ao_flip): the menu thread may change it at any time, and a frame keeps
+ * one value for its depth buffers and passes. */
+static struct nv2a_ao_trig s_ao;
+static struct nv2a_ao_cfg s_ao_cfg;   /* render.ao_*, as of the last flip */
+static int s_ao_on;                   /* s_ao_cfg.on and the passes built */
+
 static void rt_release(RenderTarget *rt)
 {
     s_rt_gen++;
     if (s_drawn == rt)
         s_drawn = NULL;
+    nv2a_ao_forget(&s_ao, rt);
     if (rt->srv)
         ID3D11ShaderResourceView_Release(rt->srv);
     ID3D11RenderTargetView_Release(rt->rtv);
@@ -1040,6 +1051,9 @@ typedef struct {
     UINT                    hw, hh;     /* host size (render.scale, hor+ pads) */
     ID3D11Texture2D        *tex;
     ID3D11DepthStencilView *dsv;
+    ID3D11ShaderResourceView *srv;      /* render.ao: the depth, readable */
+    int                     readable;   /* made for render.ao (srv may still
+                                         * have failed: then never retried) */
     uint64_t                last_use;
 } DepthTarget;
 
@@ -1054,21 +1068,32 @@ static DepthTarget *depth_target(UINT w, UINT h)
     uint32_t zeta = nv2a_pb_vsh_state()->zeta_offset;
     DepthTarget *e = NULL, *lru = &s_dt[0];
     D3D11_TEXTURE2D_DESC td;
-    int i;
+    /* render.ao reads it in a pass of its own: typeless, with a float view
+     * of the depth half. Off, the stock format and no view. */
+    int readable = s_ao_on, i;
 
     for (i = 0; i < DT_MAX; i++) {
         DepthTarget *d = &s_dt[i];
         if (d->tex && d->zeta == zeta && d->w == w && d->h == h) {
             d->last_use = s_tick;
-            return d;
+            if (!readable || d->readable)
+                return d;
+            /* render.ao turned on at the last flip: made again, readable,
+             * and cleared below like a new buffer. The flip comes before
+             * the next frame's draws, so no depth of this frame is lost. */
+            e = d;
+            break;
         }
         if (!d->tex && !e)
             e = d;
         if (d->last_use < lru->last_use)
             lru = d;
     }
-    if (!e) {
+    if (!e)
         e = lru;
+    if (e->tex) {
+        if (e->srv)
+            ID3D11ShaderResourceView_Release(e->srv);
         ID3D11DepthStencilView_Release(e->dsv);
         ID3D11Texture2D_Release(e->tex);
         memset(e, 0, sizeof *e);
@@ -1080,18 +1105,35 @@ static DepthTarget *depth_target(UINT w, UINT h)
     td.Height = e->hh;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    td.Format = readable ? DXGI_FORMAT_R32G8X24_TYPELESS : DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL | (readable ? D3D11_BIND_SHADER_RESOURCE : 0);
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &e->tex)))
         return NULL;
-    if (FAILED(ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)e->tex,
-                                                   NULL, &e->dsv))) {
-        ID3D11Texture2D_Release(e->tex);
-        e->tex = NULL;
-        return NULL;
+    {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dd;
+        memset(&dd, 0, sizeof dd);
+        dd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        dd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        if (FAILED(ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)e->tex,
+                                                       readable ? &dd : NULL, &e->dsv))) {
+            ID3D11Texture2D_Release(e->tex);
+            e->tex = NULL;
+            return NULL;
+        }
     }
+    if (readable) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+        memset(&sd, 0, sizeof sd);
+        sd.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex, &sd,
+                                                         &e->srv)))
+            e->srv = NULL;      /* drawn as usual; render.ao skips it */
+    }
+    e->readable = readable;
     /* The CPU path starts its buffer at the far plane, stencil 0. */
     ID3D11DeviceContext_ClearDepthStencilView(s_ctx, e->dsv,
                                               D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
@@ -3971,6 +4013,398 @@ static void set_vp(const struct nv2a_pb_vsh *v, const struct nv2a_pb_gpu *g,
     }
 }
 
+/* ---- render.ao: the scene stage (nv2a_scene_ao.h) ------------------------- */
+
+/* The trigger and fit are shared with Metal; here are the passes. Off
+ * (stock), d3d11_on_draw and d3d11_flip test s_ao_on and do nothing else. */
+static int s_ao_bad;          /* the passes failed to build: off for the run */
+static ID3D11VertexShader *s_ao_vs;
+static ID3D11PixelShader *s_ao_ps, *s_ao_comp_ps;
+static ID3D11BlendState *s_ao_mul_bs, *s_ao_rep_bs;
+static ID3D11Buffer *s_ao_cb;
+static ID3D11Texture2D *s_ao_tex;
+static ID3D11RenderTargetView *s_ao_rtv;
+static ID3D11ShaderResourceView *s_ao_srv;
+static UINT s_ao_w, s_ao_h;
+/* ao trace: one pair of timestamps in flight, read without waiting. */
+static ID3D11Query *s_ao_q[3];
+static int s_ao_q_busy;
+static uint64_t s_ao_runs, s_ao_gpu_ns, s_ao_gpu_n;
+static int s_ao_trace = -1;
+/* ao_dump=DIR[:FROM[:N]]: N frames (default 300) from flip FROM. */
+static struct { char dir[480]; unsigned long from, n; int parsed, made; FILE *log; } s_ao_dump;
+
+static int ao_trace(void)
+{
+    if (s_ao_trace < 0)
+        s_ao_trace = recomp_env(RENV_AO_TRACE) != NULL;
+    return s_ao_trace;
+}
+
+static int ao_dump_due(void)
+{
+    if (!s_ao_dump.parsed) {
+        const char *v = recomp_env(RENV_AO_DUMP);
+        s_ao_dump.parsed = 1;
+        nv2a_ao_dump_parse(v, s_ao_dump.dir, sizeof s_ao_dump.dir, &s_ao_dump.from,
+                           &s_ao_dump.n);
+    }
+    if (!(s_ao_dump.dir[0] && s_presents >= s_ao_dump.from
+          && s_presents < s_ao_dump.from + s_ao_dump.n))
+        return 0;
+    /* Made at the first due frame, whose draw-time pass writes first. */
+    if (!s_ao_dump.made) {
+        s_ao_dump.made = 1;
+        CreateDirectoryA(s_ao_dump.dir, NULL); /* an existing one is fine */
+    }
+    return 1;
+}
+
+/* The HLSL with one of its entry points named main (compile's entry). */
+static int ao_compile(const char *entry, const char *target, ID3DBlob **code)
+{
+    static const char body[] = NV2A_AO_HLSL;
+    char *src = (char *)malloc(sizeof body + 64);
+    int ok;
+    if (!src)
+        return 0;
+    snprintf(src, sizeof body + 64, "#define %s main\n%s", entry, body);
+    ok = compile(entry, src, target, code);
+    free(src);
+    return ok;
+}
+
+static int ao_build(void)
+{
+    ID3DBlob *b = NULL;
+    D3D11_BLEND_DESC bd;
+    int ok = 1;
+    if (s_ao_comp_ps)
+        return 1;
+    if (s_ao_bad)
+        return 0;
+    s_ao_bad = 1;
+    if (ao_compile("ao_vs", "vs_5_0", &b)) {
+        ok &= SUCCEEDED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                                        ID3D10Blob_GetBufferSize(b), NULL,
+                                                        &s_ao_vs));
+        ID3D10Blob_Release(b);
+    } else
+        ok = 0;
+    if (ok && ao_compile("ao_fs", "ps_5_0", &b)) {
+        ok &= SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                                       ID3D10Blob_GetBufferSize(b), NULL,
+                                                       &s_ao_ps));
+        ID3D10Blob_Release(b);
+    } else
+        ok = 0;
+    if (ok && ao_compile("ao_comp_fs", "ps_5_0", &b)) {
+        ok &= SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                                       ID3D10Blob_GetBufferSize(b), NULL,
+                                                       &s_ao_comp_ps));
+        ID3D10Blob_Release(b);
+    } else
+        ok = 0;
+    /* ao_view: the map replaces the colour, alpha kept. */
+    memset(&bd, 0, sizeof bd);
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED
+        | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
+    ok &= SUCCEEDED(ID3D11Device_CreateBlendState(s_dev, &bd, &s_ao_rep_bs));
+    /* The occlusion multiplies the colour (dst * src); alpha is the
+     * title's (a glow or a later pass may read it), so it is not written. */
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_SRC_COLOR;
+    ok &= SUCCEEDED(ID3D11Device_CreateBlendState(s_dev, &bd, &s_ao_mul_bs));
+    s_ao_cb = make_buffer(sizeof(struct nv2a_ao_consts), D3D11_BIND_CONSTANT_BUFFER);
+    if (!ok || !s_ao_cb) {
+        fprintf(stderr, LOGP "render.ao: the passes failed to build; off\n");
+        return 0;
+    }
+    s_ao_bad = 0;
+    return 1;
+}
+
+/* rt's depth buffer, if it has a readable one of its size. */
+static DepthTarget *ao_depth(const RenderTarget *rt)
+{
+    int i;
+    if (!rt->has_zeta)
+        return NULL;
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *d = &s_dt[i];
+        if (d->tex && d->srv && d->zeta == rt->zeta && d->w == rt->w && d->h == rt->h
+                && d->hw == rt->hw && d->hh == rt->hh)
+            return d;
+    }
+    return NULL;
+}
+
+static void ao_dump_write(const RenderTarget *rt, const char *tag)
+{
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D *st = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    char path[600];
+    FILE *f;
+    uint8_t *row;
+    ID3D11Texture2D_GetDesc(rt->tex, &td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
+        return;
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)rt->tex);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0,
+                                          &m))) {
+        snprintf(path, sizeof path, "%s/ao-%06llu-%s.ppm", s_ao_dump.dir,
+                 (unsigned long long)s_presents, tag);
+        f = fopen(path, "wb");
+        row = (uint8_t *)malloc((size_t)rt->hw * 3u);
+        if (f && row) {
+            fprintf(f, "P6\n%u %u\n255\n", rt->hw, rt->hh);
+            for (UINT y = 0; y < rt->hh; y++) {
+                const uint8_t *s = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
+                for (UINT x = 0; x < rt->hw; x++) {
+                    row[x * 3u] = s[x * 4u + 2u];
+                    row[x * 3u + 1u] = s[x * 4u + 1u];
+                    row[x * 3u + 2u] = s[x * 4u];
+                }
+                fwrite(row, 1, (size_t)rt->hw * 3u, f);
+            }
+        }
+        free(row);
+        if (f)
+            fclose(f);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+    }
+    ID3D11Texture2D_Release(st);
+}
+
+static void ao_gpu_collect(void)
+{
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+    UINT64 t0, t1;
+    if (!s_ao_q_busy)
+        return;
+    if (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)s_ao_q[0], &dj, sizeof dj,
+                                    D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK
+            || ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)s_ao_q[1], &t0,
+                                           sizeof t0, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK
+            || ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)s_ao_q[2], &t1,
+                                           sizeof t1, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+        return;
+    s_ao_q_busy = 0;
+    if (!dj.Disjoint && dj.Frequency && t1 > t0) {
+        s_ao_gpu_ns += (uint64_t)((double)(t1 - t0) * 1e9 / (double)dj.Frequency);
+        s_ao_gpu_n++;
+    }
+}
+
+/* Occlude rt's colour now, from its depth buffer. The draw that follows
+ * rebinds everything (s_state_gen). */
+static void ao_apply(RenderTarget *rt)
+{
+    const struct nv2a_ao_cfg *c = &s_ao_cfg;
+    DepthTarget *dt = rt ? ao_depth(rt) : NULL;
+    struct nv2a_ao_consts k;
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_VIEWPORT vp;
+    ID3D11ShaderResourceView *srv[2], *none[2] = {NULL, NULL};
+    int dump, timed = ao_trace() && !s_ao_q_busy;
+
+    if (!dt || !ao_build())
+        return;
+    if (!s_ao_tex || s_ao_w != rt->hw || s_ao_h != rt->hh) {
+        D3D11_TEXTURE2D_DESC td;
+        if (s_ao_srv) ID3D11ShaderResourceView_Release(s_ao_srv);
+        if (s_ao_rtv) ID3D11RenderTargetView_Release(s_ao_rtv);
+        if (s_ao_tex) ID3D11Texture2D_Release(s_ao_tex);
+        s_ao_srv = NULL;
+        s_ao_rtv = NULL;
+        s_ao_tex = NULL;
+        memset(&td, 0, sizeof td);
+        td.Width = rt->hw;
+        td.Height = rt->hh;
+        td.MipLevels = td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ao_tex))
+                || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_ao_tex,
+                                                              NULL, &s_ao_rtv))
+                || FAILED(ID3D11Device_CreateShaderResourceView(
+                        s_dev, (ID3D11Resource *)s_ao_tex, NULL, &s_ao_srv))) {
+            s_ao_w = s_ao_h = 0;
+            return;
+        }
+        s_ao_w = rt->hw;
+        s_ao_h = rt->hh;
+    }
+    nv2a_ao_consts_fill(&s_ao, c, rt->hw, rt->hh, rt->h, rt->n, &k);
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ao_cb, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return;
+    memcpy(m.pData, &k, sizeof k);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ao_cb, 0);
+    dump = ao_dump_due();
+    if (dump)
+        ao_dump_write(rt, "pre");
+    if (timed) {
+        if (!s_ao_q[0]) {
+            D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+            ID3D11Device_CreateQuery(s_dev, &qd, &s_ao_q[0]);
+            qd.Query = D3D11_QUERY_TIMESTAMP;
+            ID3D11Device_CreateQuery(s_dev, &qd, &s_ao_q[1]);
+            ID3D11Device_CreateQuery(s_dev, &qd, &s_ao_q[2]);
+        }
+        timed = s_ao_q[0] && s_ao_q[1] && s_ao_q[2];
+        if (timed) {
+            ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)s_ao_q[0]);
+            ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_ao_q[1]);
+        }
+    }
+    vp.TopLeftX = vp.TopLeftY = 0;
+    vp.Width = (float)rt->hw;
+    vp.Height = (float)rt->hh;
+    vp.MinDepth = 0;
+    vp.MaxDepth = 1;
+    /* Pass 1 into the R8 map. The depth buffer is unbound first: a view
+     * bound for writing cannot also be read. */
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_ao_rtv, NULL);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs[0][0]);
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_ao_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_ao_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_ao_cb);
+    srv[0] = dt->srv;
+    srv[1] = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, srv);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    /* Pass 2 over the colour. */
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, none);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, NULL);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, c->view ? s_ao_rep_bs : s_ao_mul_bs, NULL,
+                                        0xFFFFFFFF);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_ao_comp_ps, NULL, 0);
+    srv[1] = s_ao_srv;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, srv);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, none);
+    if (timed) {
+        ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_ao_q[2]);
+        ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_ao_q[0]);
+        s_ao_q_busy = 1;
+    }
+    s_state_gen++;              /* the next draw rebinds everything */
+    s_ao_runs++;
+    if (dump)
+        ao_dump_write(rt, "post");
+}
+
+/* Before a draw on rt: the trigger's step, and the passes if it fires. */
+static void ao_on_draw(RenderTarget *rt, int has_depth, int zwrite)
+{
+    const RenderTarget *cand = (const RenderTarget *)s_ao.cand;
+    int smp = 0;
+    const void *fire;
+    if (cand) {
+        build_stages();
+        for (int k = 0; k < 4 && !smp; k++) {
+            const Stage *t = &s_stage[k];
+            smp = t->mode && t->mode != 4 && t->offset
+                  && !((cand->addr ^ t->offset) & 0x07FFFFFFu);
+        }
+    }
+    fire = nv2a_ao_draw(&s_ao, rt, rt->w, rt->h, has_depth, zwrite, smp);
+    if (fire)
+        ao_apply((RenderTarget *)(uintptr_t)fire);
+}
+
+/* One vertex of a depth-writing program batch through the CPU interpreter,
+ * for the frame's depth fit: oPos z and w as the hardware got them. */
+static void ao_sample(const struct nv2a_pb_draw *d, const struct nv2a_pb_vsh *v,
+                      unsigned inputs, uint32_t lo, uint32_t count, uint32_t fmt, int wmode)
+{
+    float in[NV2A_VSH_INPUTS][4];
+    Nv2aVshOut out;
+    unsigned i;
+    int s = nv2a_ao_sample_slot(&s_ao, wmode);
+    uint32_t j;
+    if (s < 0 || !count)
+        return;
+    j = (uint32_t)(((uint64_t)s_ao.seen * 2654435761u) % count);
+    memset(in, 0, sizeof in);
+    for (i = 0; i < NV2A_VSH_INPUTS && i < NV2A_VS_MAX_INPUTS; i++)
+        if (inputs & (1u << i))
+            vtx_input(d, v, i, lo + j, in[i]);
+    nv2a_vsh_run((const uint32_t (*)[4])v->prog, v->start, (float (*)[4])(uintptr_t)v->c, 0,
+                 (const float (*)[4])in, &out);
+    nv2a_ao_sample_put(&s_ao, s, out.ok ? out.o[NV2A_VSH_O_POS][2] : 0.0f,
+                       out.ok ? out.o[NV2A_VSH_O_POS][3] : 0.0f, nv2a_zmax(fmt));
+}
+
+/* At the flip, before the frame is shown: the last pass if the trigger
+ * held it to here, then the fit for the next frame. */
+static void ao_flip(RenderTarget *shown)
+{
+    int was = s_ao_on;
+    s_ao_cfg = *nv2a_ao_cfg();
+    s_ao_on = s_ao_cfg.on && !s_ao_bad;
+    if (was) {
+        const void *fire = nv2a_ao_flip(&s_ao);
+        int fired;
+        if (fire)
+            ao_apply((RenderTarget *)(uintptr_t)fire);
+        fired = s_ao.fired;
+        if (ao_dump_due()) {
+            if (!s_ao_dump.log) {
+                char path[600];
+                snprintf(path, sizeof path, "%s/ao-frames.txt", s_ao_dump.dir);
+                s_ao_dump.log = fopen(path, "w");
+            }
+            if (s_ao_dump.log) {
+                fprintf(s_ao_dump.log, "%llu fired=%d ord=%u want=%u ok=%d conf=%.3f a=%.6f"
+                        " b=%.6g wmode=%d wref=%.4g ns=%u\n", (unsigned long long)s_presents,
+                        fired, s_ao.ord, s_ao.want, s_ao.fit.ok, s_ao.fit.conf, s_ao.fit.a,
+                        s_ao.fit.b, s_ao.fit.wmode, s_ao.fit.wref, s_ao.ns);
+                fflush(s_ao_dump.log);
+            }
+        }
+        nv2a_ao_frame_end(&s_ao, shown ? shown->w : 0, shown ? shown->h : 0);
+        if (ao_trace()) {
+            ao_gpu_collect();
+            if (s_presents % 300 == 0) {
+                fprintf(stderr, LOGP "ao: flip %llu: %llu frames, %llu occluded, %llu missed,"
+                        " %llu refused fits; fit a=%.6f b=%.6g conf=%.2f wmode=%d wref=%.4g;"
+                        " %llu passes, GPU %.3f ms each\n", (unsigned long long)s_presents,
+                        (unsigned long long)s_ao.frames, (unsigned long long)s_ao.fired_frames,
+                        (unsigned long long)s_ao.missed, (unsigned long long)s_ao.no_fit,
+                        s_ao.fit.a, s_ao.fit.b, s_ao.fit.conf, s_ao.fit.wmode, s_ao.fit.wref,
+                        (unsigned long long)s_ao_runs,
+                        s_ao_gpu_n ? (double)s_ao_gpu_ns / (double)s_ao_gpu_n / 1e6 : 0.0);
+                s_ao_gpu_ns = s_ao_gpu_n = 0;
+            }
+        }
+    } else if (s_ao_on) {
+        nv2a_ao_reset(&s_ao);
+        if (shown)
+            nv2a_ao_frame_end(&s_ao, shown->w, shown->h);
+    }
+}
+
 static void d3d11_on_draw(const struct nv2a_pb_draw *d)
 {
     /* As Metal's: at most three list entries per index, grown to the
@@ -4036,6 +4470,13 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                      || topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)) {
         s_draws_culled++;
         return;
+    }
+
+    /* render.ao: before this batch binds anything (a pass rebinds it all). */
+    if (s_ao_on) {
+        ao_on_draw(rt, rt->has_zeta || v->depth_enable, v->depth_enable && v->depth_mask);
+        if (d->program && v->depth_enable && v->depth_mask)
+            ao_sample(d, v, vs->inputs, lo, count, g->format, w_on);
     }
 
     /* Streams: each one the shader reads. One in a format the input
@@ -6004,6 +6445,8 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     /* The frame's target size, for a HUD canvas on "frame". */
     if (s_drawn)
         nv2a_aspect_frame_publish(s_drawn->w, s_drawn->h);
+    /* AO first: the debug overlay draws on the frame and is not scene. */
+    ao_flip(s_drawn);
 #ifdef XBOXRECOMP_ENHANCE
     dbg_present(s_drawn);
 #endif
@@ -6197,6 +6640,8 @@ static void scale_drop(void)
         DepthTarget *d = &s_dt[i];
         if (!d->tex)
             continue;
+        if (d->srv)
+            ID3D11ShaderResourceView_Release(d->srv);
         ID3D11DepthStencilView_Release(d->dsv);
         ID3D11Texture2D_Release(d->tex);
         memset(d, 0, sizeof *d);

@@ -548,13 +548,13 @@ static void test_navigate(void)
     tap(0x26);
     CHECK(!strcmp(selected_label(), "Render scale"));
     CHECK(enhance_menu_focus() == 0);
-    CHECK(enhance_menu_select_row("Overlay fit"));
+    CHECK(enhance_menu_select_row("AO radius"));
     tap(0x28);
     CHECK(enhance_menu_focus() == 2 && enhance_menu_footer_selected() == 0);
-    CHECK(!strcmp(selected_label(), "Overlay fit"));
+    CHECK(!strcmp(selected_label(), "AO radius"));
     tap(0x26);
     CHECK(enhance_menu_focus() == 0 && enhance_menu_footer_selected() == -1);
-    CHECK(!strcmp(selected_label(), "Overlay fit"));
+    CHECK(!strcmp(selected_label(), "AO radius"));
 
     /* Right on Render scale: 1 -> 2, at the flip; unsaved. */
     CHECK(enhance_menu_select_row("Render scale"));
@@ -2710,8 +2710,8 @@ static void test_pages(void)
     /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Saves,
      * Files. Saves with no title yet: its rows hold no dates. */
     static const uint32_t k_sum[10] = {
-        0xD2D6070Cu, 0xF5E5A2AAu, 0xD56F9851u, 0xF9F4DC86u, 0x39FA9CFAu,
-        0x0813383Bu, 0x05CA29ACu, 0xF83B0097u, 0x7B5D7063u, 0x7778B546u };
+        0x893FD37Fu, 0xF5E5A2AAu, 0xD56F9851u, 0xF9F4DC86u, 0x39FA9CFAu,
+        0x0813383Bu, 0x05CA29ACu, 0x858EF665u, 0x7B5D7063u, 0x7778B546u };
     /* Files shows Open exports folder only off Game Mode. */
     set_env("RECOMP_HOST_GAMESCOPE", NULL);
     start_with(ARMED, k_mods);

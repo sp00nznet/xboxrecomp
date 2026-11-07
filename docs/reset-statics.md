@@ -1361,6 +1361,12 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_present_chain.c | - | s_novr | file_static | keep | - | host present shader chain, params and library |
 | src/kernel/nv2a_present_chain.c | ovr_add | s_full_said | local_static | keep | - | host present shader chain, params and library |
 
+### src/kernel/nv2a_scene_ao.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/kernel/nv2a_scene_ao.c | - | s_cfg | file_static | keep | - | render.ao config, cached from the enhancements layer |
+
 ### src/kernel/nv2a_stats.c
 
 | file | scope | name | kind | class | hook | why |
@@ -1928,6 +1934,28 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_state | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_hash | file_static | keep | - | the tex_mag trace and the dump's facts, debug figures keyed by content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_scale | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao | file_static | reset | renderer.d3d11 | render.ao trigger: candidate points into s_rt (rt_release drops it), memo and fit of the running boot |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_on | file_static | keep | - | render.ao, latched at each flip |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_cfg | file_static | keep | - | render.ao settings, latched at each flip from the menu's |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_bad | file_static | keep | - | render.ao passes failed to build, host |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_tex | file_static | keep | - | render.ao occlusion target, host, remade on size change |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_runs | file_static | keep | - | ao trace totals |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_gpu_ns | file_static | keep | - | ao trace totals |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_gpu_n | file_static | keep | - | ao trace totals |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_trace | file_static | keep | - | ao trace channel from env |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_dump | file_static | keep | - | ao_dump debug trigger and its log, from env |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_vs | file_static | keep | - | render.ao shader from fixed source |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_ps | file_static | keep | - | render.ao shader from fixed source |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_comp_ps | file_static | keep | - | render.ao shader from fixed source |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_mul_bs | file_static | keep | - | render.ao blend state |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_rep_bs | file_static | keep | - | render.ao blend state |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_cb | file_static | keep | - | render.ao constant buffer |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_rtv | file_static | keep | - | view of s_ao_tex |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_srv | file_static | keep | - | view of s_ao_tex |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_w | file_static | keep | - | size of s_ao_tex |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_h | file_static | keep | - | size of s_ao_tex |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_q | file_static | keep | - | ao trace timestamp queries, host |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_q_busy | file_static | keep | - | ao trace query in flight, host |
 
 ### src/d3d/nv2a_pb_metal.m
 
@@ -2135,6 +2163,20 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_tex_last | file_static | keep | - | the entry tex_bind just bound, set again on each bind |
 | src/d3d/nv2a_pb_metal.m | - | s_stage_pack | file_static | keep | - | the entry each stage just bound, set again on each draw |
 | src/d3d/nv2a_pb_metal.m | - | s_stage_hash | file_static | keep | - | the entry each stage just bound, set again on each draw |
+| src/d3d/nv2a_pb_metal.m | - | s_ao | file_static | reset | renderer.metal | render.ao trigger: candidate points into s_rt (rt_free drops it), memo and fit of the running boot |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_on | file_static | keep | - | render.ao, latched at each flip |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_cfg | file_static | keep | - | render.ao settings, latched at each flip from the menu's |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_bad | file_static | keep | - | render.ao passes failed to build, host |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_tex | file_static | keep | - | render.ao occlusion target, host, remade on size change |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_runs | file_static | keep | - | ao trace totals |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_gpu_ns | file_static | keep | - | ao trace totals |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_gpu_n | file_static | keep | - | ao trace totals |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_trace | file_static | keep | - | ao trace channel from env |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_dump | file_static | keep | - | ao_dump debug trigger and its log, from env |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_pso | file_static | keep | - | render.ao pipeline from fixed source |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_mul_pso | file_static | keep | - | render.ao pipeline from fixed source |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_rep_pso | file_static | keep | - | render.ao pipeline from fixed source |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_cmd | file_static | keep | - | ao trace command buffer of the last pass, host |
 
 ## Devices: APU, DSP, audio, input, USB, video, platform
 
@@ -3047,6 +3089,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/enhance_menu.c | - | s_lay_pages | file_static | keep | - | per-page layout cache |
 | src/enhance/enhance_menu.c | enhance_menu_draw | kinds | local_static | keep | - | scratch row kinds |
 | src/enhance/enhance_menu.c | enhance_menu_draw | vw | local_static | keep | - | scratch row widths |
+| src/enhance/enhance_menu.c | - | s_ao | file_static | keep | - | the AO menu items; note and help set from render.ao_suited |
 
 ### src/enhance/enhance_mod_status.c
 

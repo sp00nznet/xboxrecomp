@@ -78,6 +78,7 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -90,6 +91,8 @@
 #include "nv2a_tex_dump.h"
 #include "d3d8_msl.h"
 #include "nv2a_basic_msl.h"
+#include "nv2a_scene_ao.h"
+#include "nv2a_scene_ao_shaders.h"
 #include "metal_compile.h"
 #ifdef XBOXRECOMP_ENHANCE
 #include "nv2a_dbg_draw.h"
@@ -221,6 +224,7 @@ typedef struct {
     id<MTLTexture> tex;
     uint64_t       last_use;
     int            fresh;      /* contents undefined: the next pass clears */
+    int            readable;   /* made with ShaderRead, for render.ao only */
 } DepthTarget;
 
 /* A post-process chain can draw more than 8 targets a frame (a glow chain
@@ -584,8 +588,17 @@ static int rt_drop_if_stale(RenderTarget *rt, const char *why)
     return 1;
 }
 
+/* render.ao's trigger (the passes are further down): here so a freed
+ * target can leave it. The configuration is latched at each flip
+ * (ao_flip): the menu thread may change it at any time, and a frame keeps
+ * one value for its depth buffers and passes. */
+static struct nv2a_ao_trig s_ao;
+static struct nv2a_ao_cfg s_ao_cfg;   /* render.ao_*, as of the last flip */
+static int s_ao_on;                   /* s_ao_cfg.on and the passes built */
+
 static void rt_free(RenderTarget *rt)
 {
+    nv2a_ao_forget(&s_ao, rt);
     /* A presented target's bytes are what a new target at that surface seeds
      * from, as when every flip wrote it back. The eviction in surface() has
      * already written back any target it frees. */
@@ -608,8 +621,23 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
     MTLTextureDescriptor *td;
     int i;
 
+    /* render.ao samples the buffer: ShaderRead only then, since it can
+     * cost the buffer's lossless compression, so stock keeps the usage it
+     * always had. One made before the option was turned on (at the last
+     * flip, so before this frame's draws) is made again (fresh: the next
+     * pass clears it, as a new one). */
+    int readable = s_ao_on;
     for (i = 0; i < DT_MAX; i++) {
         DepthTarget *d = &s_dt[i];
+        if (d->tex && d->zeta == zeta && d->w == w && d->h == h && readable && !d->readable) {
+            if (s_enc_dt == d)
+                end_encoder();
+            for (int j = 0; j < RT_MAX; j++)
+                if (s_rt[j].dt == d)
+                    s_rt[j].dt = NULL;
+            [d->tex release];
+            memset(d, 0, sizeof *d);
+        }
         if (d->tex && d->zeta == zeta && d->w == w && d->h == h) {
             d->last_use = s_tick;
             return d;
@@ -634,11 +662,12 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
                           &e->hw, &e->hh);
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
                                                             width:e->hw height:e->hh mipmapped:NO];
-    td.usage = MTLTextureUsageRenderTarget;
+    td.usage = MTLTextureUsageRenderTarget | (readable ? MTLTextureUsageShaderRead : 0);
     td.storageMode = MTLStorageModePrivate;
     e->tex = [s_dev newTextureWithDescriptor:td];
     if (!e->tex)
         return NULL;
+    e->readable = readable;
     e->zeta = zeta;
     e->w = w;
     e->h = h;
@@ -2491,6 +2520,325 @@ static void aspect_log_post(uint32_t hash, const RenderTarget *rt, int place)
             rt->pad, rt->addr, names[place]);
 }
 
+/* ---- render.ao: the scene stage (nv2a_scene_ao.h) ------------------------- */
+
+/* The trigger and fit are shared with D3D11; here are the passes. Off
+ * (stock), metal_on_draw and metal_flip test s_ao_on and do nothing else. */
+static int s_ao_bad;          /* the passes failed to build: off for the run */
+static id<MTLRenderPipelineState> s_ao_pso, s_ao_mul_pso, s_ao_rep_pso;
+static id<MTLTexture> s_ao_tex;
+static id<MTLCommandBuffer> s_ao_cmd;   /* ao trace: the last passes' own buffer */
+static uint64_t s_ao_runs, s_ao_gpu_ns, s_ao_gpu_n;
+static int s_ao_trace = -1;
+/* ao_dump=DIR[:FROM[:N]]: N frames (default 300) from flip FROM. */
+static struct { char dir[480]; unsigned long from, n; int parsed, made; FILE *log; } s_ao_dump;
+
+static int ao_trace(void)
+{
+    if (s_ao_trace < 0)
+        s_ao_trace = recomp_env(RENV_AO_TRACE) != NULL;
+    return s_ao_trace;
+}
+
+static int ao_dump_due(void)
+{
+    if (!s_ao_dump.parsed) {
+        const char *v = recomp_env(RENV_AO_DUMP);
+        s_ao_dump.parsed = 1;
+        nv2a_ao_dump_parse(v, s_ao_dump.dir, sizeof s_ao_dump.dir, &s_ao_dump.from,
+                           &s_ao_dump.n);
+    }
+    if (!(s_ao_dump.dir[0] && s_presents >= s_ao_dump.from
+          && s_presents < s_ao_dump.from + s_ao_dump.n))
+        return 0;
+    /* Made at the first due frame, whose draw-time pass writes first. */
+    if (!s_ao_dump.made) {
+        s_ao_dump.made = 1;
+        mkdir(s_ao_dump.dir, 0755); /* an existing one is fine */
+    }
+    return 1;
+}
+
+static int ao_build(void)
+{
+    NSError *err = nil;
+    id<MTLLibrary> lib;
+    id<MTLFunction> vs, fs, cs;
+    MTLRenderPipelineDescriptor *pd;
+    if (s_ao_pso)
+        return 1;
+    if (s_ao_bad)
+        return 0;
+    s_ao_bad = 1;
+    lib = metal_compile_library(s_dev, [NSString stringWithUTF8String:NV2A_AO_MSL], "render.ao",
+                                &err);
+    if (!lib) {
+        fprintf(stderr, LOGP "render.ao: MSL compile failed: %s; off\n",
+                err ? [[err localizedDescription] UTF8String] : "?");
+        return 0;
+    }
+    vs = [lib newFunctionWithName:@"ao_vs"];
+    fs = [lib newFunctionWithName:@"ao_fs"];
+    cs = [lib newFunctionWithName:@"ao_comp_fs"];
+    [lib release];
+    pd = [[MTLRenderPipelineDescriptor alloc] init];
+    pd.vertexFunction = vs;
+    pd.fragmentFunction = fs;
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatR8Unorm;
+    s_ao_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    pd.fragmentFunction = cs;
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    /* ao_view: the map replaces the colour, alpha kept. */
+    pd.colorAttachments[0].writeMask = MTLColorWriteMaskRed | MTLColorWriteMaskGreen
+                                     | MTLColorWriteMaskBlue;
+    s_ao_rep_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    /* The occlusion multiplies the colour (dst * src); alpha is the
+     * title's (a glow or a later pass may read it), so it is not written. */
+    pd.colorAttachments[0].blendingEnabled = YES;
+    pd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorZero;
+    pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorSourceColor;
+    s_ao_mul_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    [pd release];
+    [vs release];
+    [fs release];
+    [cs release];
+    if (!s_ao_pso || !s_ao_rep_pso || !s_ao_mul_pso) {
+        fprintf(stderr, LOGP "render.ao: pipeline failed: %s; off\n",
+                err ? [[err localizedDescription] UTF8String] : "?");
+        [s_ao_pso release];
+        [s_ao_rep_pso release];
+        [s_ao_mul_pso release];
+        s_ao_pso = s_ao_rep_pso = s_ao_mul_pso = nil;
+        return 0;
+    }
+    s_ao_bad = 0;
+    return 1;
+}
+
+/* A shared copy of rt's colour, for ao_dump (written after the wait). */
+static id<MTLBuffer> ao_dump_copy(RenderTarget *rt)
+{
+    NSUInteger bpr = (NSUInteger)rt->hw * 4u;
+    id<MTLBuffer> b = [s_dev newBufferWithLength:bpr * rt->hh options:MTLResourceStorageModeShared];
+    id<MTLBlitCommandEncoder> bl;
+    if (!b)
+        return nil;
+    ensure_cmd();
+    bl = [s_cmd blitCommandEncoder];
+    [bl copyFromTexture:rt->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+             sourceSize:MTLSizeMake(rt->hw, rt->hh, 1) toBuffer:b destinationOffset:0
+ destinationBytesPerRow:bpr destinationBytesPerImage:bpr * rt->hh];
+    [bl endEncoding];
+    return b;
+}
+
+static void ao_dump_write(id<MTLBuffer> b, const RenderTarget *rt, const char *tag)
+{
+    char path[600];
+    FILE *f;
+    const uint8_t *p = (const uint8_t *)[b contents];
+    uint8_t *row;
+    snprintf(path, sizeof path, "%s/ao-%06llu-%s.ppm", s_ao_dump.dir,
+             (unsigned long long)s_presents, tag);
+    f = fopen(path, "wb");
+    row = (uint8_t *)malloc((size_t)rt->hw * 3u);
+    if (f && row) {
+        fprintf(f, "P6\n%u %u\n255\n", rt->hw, rt->hh);
+        for (uint32_t y = 0; y < rt->hh; y++) {
+            const uint8_t *s = p + (size_t)y * rt->hw * 4u;
+            for (uint32_t x = 0; x < rt->hw; x++) {
+                row[x * 3u] = s[x * 4u + 2u];
+                row[x * 3u + 1u] = s[x * 4u + 1u];
+                row[x * 3u + 2u] = s[x * 4u];
+            }
+            fwrite(row, 1, (size_t)rt->hw * 3u, f);
+        }
+    }
+    free(row);
+    if (f)
+        fclose(f);
+}
+
+static void ao_gpu_collect(void)
+{
+    if (s_ao_cmd && [s_ao_cmd status] >= MTLCommandBufferStatusCompleted) {
+        double t = [s_ao_cmd GPUEndTime] - [s_ao_cmd GPUStartTime];
+        if (t > 0) {
+            s_ao_gpu_ns += (uint64_t)(t * 1e9);
+            s_ao_gpu_n++;
+        }
+        [s_ao_cmd release];
+        s_ao_cmd = nil;
+    }
+}
+
+/* Occlude rt's colour now, from its depth buffer. Between passes: the open
+ * one ends, and the next draw on rt opens one that loads the result. */
+static void ao_apply(RenderTarget *rt)
+{
+    const struct nv2a_ao_cfg *c = &s_ao_cfg;
+    DepthTarget *dt = rt ? rt->dt : NULL;
+    struct nv2a_ao_consts k;
+    MTLRenderPassDescriptor *rp;
+    id<MTLRenderCommandEncoder> e;
+    id<MTLBuffer> pre = nil, post = nil;
+    int dump, timed = ao_trace();
+
+    if (!dt || !dt->readable || dt->hw != rt->hw || dt->hh != rt->hh || !ao_build())
+        return;
+    if (!s_ao_tex || [s_ao_tex width] != rt->hw || [s_ao_tex height] != rt->hh) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:rt->hw height:rt->hh
+                                     mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        [s_ao_tex release];
+        s_ao_tex = [s_dev newTextureWithDescriptor:td];
+        if (!s_ao_tex)
+            return;
+    }
+    nv2a_ao_consts_fill(&s_ao, c, rt->hw, rt->hh, rt->h, rt->n, &k);
+    dump = ao_dump_due();
+    end_encoder();
+    if (timed) {
+        /* The passes in a command buffer of their own, for their GPU time:
+         * the frame's work so far is committed (not waited for). */
+        ao_gpu_collect();
+        flush(0);
+    }
+    ensure_cmd();
+    if (dump)
+        pre = ao_dump_copy(rt);
+    rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = s_ao_tex;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    e = [s_cmd renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:s_ao_pso];
+    [e setFragmentTexture:dt->tex atIndex:0];
+    [e setFragmentBytes:&k length:sizeof k atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = rt->tex;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    e = [s_cmd renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:c->view ? s_ao_rep_pso : s_ao_mul_pso];
+    [e setFragmentTexture:dt->tex atIndex:0];
+    [e setFragmentTexture:s_ao_tex atIndex:1];
+    [e setFragmentBytes:&k length:sizeof k atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    rt->dirty = 1;
+    s_ao_runs++;
+    if (dump)
+        post = ao_dump_copy(rt);
+    if (timed) {
+        /* A second pass in one frame, or the last one's GPU still running:
+         * its time is dropped rather than its buffer leaked. */
+        if (s_ao_cmd)
+            [s_ao_cmd release];
+        s_ao_cmd = [s_cmd retain];
+        flush(dump);
+    } else if (dump) {
+        flush(1);
+    }
+    if (dump && pre && post) {
+        ao_dump_write(pre, rt, "pre");
+        ao_dump_write(post, rt, "post");
+    }
+    [pre release];
+    [post release];
+}
+
+/* Before a draw on rt: the trigger's step, and the passes if it fires. */
+static void ao_on_draw(RenderTarget *rt, int has_depth, int zwrite)
+{
+    const RenderTarget *cand = (const RenderTarget *)s_ao.cand;
+    int smp = 0;
+    const void *fire;
+    if (cand)
+        for (int k = 0; k < 4 && !smp; k++) {
+            const Stage *t = &s_stage[k];
+            smp = t->mode && t->mode != 4 && t->offset
+                  && !((cand->addr ^ t->offset) & 0x07FFFFFFu);
+        }
+    fire = nv2a_ao_draw(&s_ao, rt, rt->w, rt->h, has_depth, zwrite, smp);
+    if (fire)
+        ao_apply((RenderTarget *)(uintptr_t)fire);
+}
+
+/* One vertex of a depth-writing program batch through the CPU interpreter,
+ * for the frame's depth fit: oPos z and w as the hardware got them. */
+static void ao_sample(const struct nv2a_pb_vsh *v, uint32_t fmt, const float *vf, uint32_t nf4,
+                      const int *slot, uint32_t count, int wmode)
+{
+    float in[NV2A_VSH_INPUTS][4];
+    Nv2aVshOut out;
+    uint32_t j, k;
+    int s = nv2a_ao_sample_slot(&s_ao, wmode);
+    if (s < 0 || !count)
+        return;
+    j = (uint32_t)(((uint64_t)s_ao.seen * 2654435761u) % count);
+    memset(in, 0, sizeof in);
+    for (k = 0; k < nf4; k++)
+        if (slot[k] >= 0 && slot[k] < NV2A_VSH_INPUTS)
+            memcpy(in[slot[k]], vf + ((size_t)j * nf4 + k) * 4u, 16);
+    nv2a_vsh_run((const uint32_t (*)[4])v->prog, v->start, (float (*)[4])(uintptr_t)v->c, 0,
+                 (const float (*)[4])in, &out);
+    nv2a_ao_sample_put(&s_ao, s, out.ok ? out.o[NV2A_VSH_O_POS][2] : 0.0f,
+                       out.ok ? out.o[NV2A_VSH_O_POS][3] : 0.0f, nv2a_zmax(fmt));
+}
+
+/* At the flip, before the frame is shown: the last pass if the trigger
+ * held it to here, then the fit for the next frame. */
+static void ao_flip(RenderTarget *shown)
+{
+    int was = s_ao_on;
+    s_ao_cfg = *nv2a_ao_cfg();
+    s_ao_on = s_ao_cfg.on && !s_ao_bad;
+    if (was) {
+        const void *fire = nv2a_ao_flip(&s_ao);
+        int fired;
+        if (fire)
+            ao_apply((RenderTarget *)(uintptr_t)fire);
+        fired = s_ao.fired;
+        if (ao_dump_due()) {
+            if (!s_ao_dump.log) {
+                char path[600];
+                snprintf(path, sizeof path, "%s/ao-frames.txt", s_ao_dump.dir);
+                s_ao_dump.log = fopen(path, "w");
+            }
+            if (s_ao_dump.log) {
+                fprintf(s_ao_dump.log, "%llu fired=%d ord=%u want=%u ok=%d conf=%.3f a=%.6f"
+                        " b=%.6g wmode=%d wref=%.4g ns=%u\n", (unsigned long long)s_presents,
+                        fired, s_ao.ord, s_ao.want, s_ao.fit.ok, s_ao.fit.conf, s_ao.fit.a,
+                        s_ao.fit.b, s_ao.fit.wmode, s_ao.fit.wref, s_ao.ns);
+                fflush(s_ao_dump.log);
+            }
+        }
+        nv2a_ao_frame_end(&s_ao, shown ? shown->w : 0, shown ? shown->h : 0);
+        if (ao_trace() && s_presents % 300 == 0) {
+            ao_gpu_collect();
+            fprintf(stderr, LOGP "ao: flip %llu: %llu frames, %llu occluded, %llu missed,"
+                    " %llu refused fits; fit a=%.6f b=%.6g conf=%.2f wmode=%d wref=%.4g;"
+                    " %llu passes, GPU %.3f ms each\n", (unsigned long long)s_presents,
+                    (unsigned long long)s_ao.frames, (unsigned long long)s_ao.fired_frames,
+                    (unsigned long long)s_ao.missed, (unsigned long long)s_ao.no_fit,
+                    s_ao.fit.a, s_ao.fit.b, s_ao.fit.conf, s_ao.fit.wmode, s_ao.fit.wref,
+                    (unsigned long long)s_ao_runs,
+                    s_ao_gpu_n ? (double)s_ao_gpu_ns / (double)s_ao_gpu_n / 1e6 : 0.0);
+            s_ao_gpu_ns = s_ao_gpu_n = 0;
+        }
+    } else if (s_ao_on) {
+        nv2a_ao_reset(&s_ao);
+        if (shown)
+            nv2a_ao_frame_end(&s_ao, shown->w, shown->h);
+    }
+}
+
 static void metal_on_draw(const struct nv2a_pb_draw *d)
 {
     /* The expanded list: at most three entries per index (a fan or a quad
@@ -2571,6 +2919,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         build_stages();
         stages_cube_rt();
+        /* render.ao: before this batch's rings (a pass can wait, under
+         * ao_dump, and a wait resets them). */
+        if (s_ao_on)
+            ao_on_draw(rt, rt->dt != NULL || use_z, v->depth_enable && v->depth_mask);
         bump_src = nv2a_bump_sources(s_stage, v->rc_set && (v->rc_ctl & 0xFF),
                                      v->other_stage_input);
         {
@@ -2657,6 +3009,9 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             }
         }
         memcpy(ip, idx, (size_t)nidx * 4u);
+        if (s_ao_on && d->program && v->depth_enable && v->depth_mask)
+            ao_sample(v, g->format, vf, nf4, slot, count,
+                      nv2a_w_depth_on(v, 1, v->rc_set && (v->rc_ctl & 0xFF)));
 
         /* Hor+: which batches are 2D, and their x range (nv2a_aspect_place
          * decides from it). A pass-through batch is 2D, its positions in
@@ -4071,6 +4426,8 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
             int wb;
             id<MTLTexture> slot = nil;
             rt = present_target(surface_offset);
+            /* AO first: the debug overlay draws on the frame and is not scene. */
+            ao_flip(rt);
             if (rt) {
                 /* The frame's target size, for a HUD canvas on "frame". */
                 nv2a_aspect_frame_publish(rt->w, rt->h);

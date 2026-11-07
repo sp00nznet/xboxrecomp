@@ -79,6 +79,10 @@ extern "C" {
     X(RENDER_SCALE,      CONFIG, "RECOMP_RENDER_SCALE",      NULL, "enhancements: render.scale, internal resolution factor (1 = stock)") \
     X(RENDER_ANISO,      CONFIG, "RECOMP_RENDER_ANISO",      NULL, "enhancements: render.aniso, anisotropic filtering on mipmapped textures, 0/1 (stock) or 2..16") \
     X(RENDER_SNAP_2D,    CONFIG, "RECOMP_RENDER_SNAP_2D",    NULL, "enhancements: render.snap_2d, above render.scale 1 2D batches sample textures on the guest grid, as at 1x (no seams between tiles, blockier 2D art) (1/0, default 0)") \
+    X(RENDER_AO,         CONFIG, "RECOMP_RENDER_AO",         NULL, "enhancements: render.ao, ambient occlusion on the 3D scene before the HUD, from the depth buffer (1/0, default 0)") \
+    X(RENDER_AO_STRENGTH, CONFIG, "RECOMP_RENDER_AO_STRENGTH", NULL, "enhancements: render.ao_strength, how dark full occlusion gets, 0.0 to 2.0 (default 1.5)") \
+    X(RENDER_AO_RADIUS,  CONFIG, "RECOMP_RENDER_AO_RADIUS",  NULL, "enhancements: render.ao_radius, the occlusion's reach in 480-line guest pixels, 2 to 32 (default 20)") \
+    X(RENDER_AO_SUITED,  CONFIG, "RECOMP_RENDER_AO_SUITED",  NULL, "enhancements: render.ao_suited, a game's config.default.toml sets false where AO does not suit the art (cel-shaded): the menu says so (1/0, default 1)") \
     X(DISPLAY_ASPECT,    CONFIG, "RECOMP_DISPLAY_ASPECT",    NULL, "enhancements: display.aspect, 4:3 (stock), 16:9, 16:10, 21:9") \
     X(DISPLAY_MOVIE,     CONFIG, "RECOMP_DISPLAY_MOVIE",     NULL, "enhancements: display.movie, the sides of a 4:3 movie or still on a wide display.aspect: black (default, pillarbox), fit (stretched to the width), fill (scaled to cover, top and bottom cropped)") \
     X(DISPLAY_HUD_ASPECT, CONFIG, "RECOMP_DISPLAY_HUD_ASPECT", NULL, "enhancements: display.hud_aspect, how wide the HUD reaches under a HUD mod on a wide display.aspect: display (default, the frame's edges) or W:H from 4:3 up") \
@@ -165,6 +169,9 @@ extern "C" {
     X(FLIP_LOG,          TRACE, "flip",            "RECOMP_FLIP_LOG",          "one line per flip, machine-readable") \
     X(PRESENT_TRACE,     TRACE, "present",         "RECOMP_PRESENT_TRACE",     "present-surface choices") \
     X(PRESENT_STATS,     TRACE, "present_stats",   "RECOMP_PRESENT_STATS",     "SDL host present statistics") \
+    X(AO_TRACE,          TRACE, "ao",              NULL,                       "render.ao every 300 flips: frames occluded, missed and refused, the depth fit (A, B, inlier share, W mode, scene depth), GPU passes") \
+    X(AO_VIEW,           DEBUG, "ao_view",         NULL,                       "=1: render.ao draws its occlusion map in place of the scene (white = open), for tuning") \
+    X(AO_DUMP,           DEBUG, "ao_dump",         NULL,                       "=DIR[:FROM[:N]]: render.ao writes the 3D target before and after occlusion as DIR/ao-<flip>-{pre,post}.ppm and the trigger state as DIR/ao-frames.txt, N frames (default 300) from flip FROM; heavy") \
     X(METAL_PROF,        TRACE, "metal_prof",      NULL,                       "Metal flip cost every 300 flips: GPU wait, readbacks, write-back, slot blit, hand-off, GPU time") \
     X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip; each new pitch-alias pair once") \
     X(METAL_SHADERS,     TRACE, "metal_shaders",   NULL,                       "Metal shader and pipeline builds: each MSL library and pipeline state with its ms, and a [metal] build line for every flip that built one or uploaded textures for 5 ms or more") \

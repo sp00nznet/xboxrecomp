@@ -51,6 +51,7 @@
 #include "nv2a_overlay_glyph.h"
 #include "nv2a_overlay_int.h"
 #include "nv2a_present_chain.h"
+#include "nv2a_scene_ao.h"
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
 #include "pad_map.h"
@@ -350,6 +351,62 @@ static const struct enhance_item k_hud_margin = {
     .live = ENHANCE_LIVE, .def = "0",
     .help = "Pulls the HUD in from the screen edges on a wide picture"
 };
+
+/* render.ao (nv2a_scene_ao.h): the backends read the config each flip, so
+ * a change lands at the next one; turning it on remakes the depth buffers
+ * as samplable (their next pass clears them, as new ones). */
+static void set_ao(const struct enhance_item *it, const char *v)
+{
+    struct nv2a_ao_cfg c = *nv2a_ao_cfg();
+    double x = atof(v);
+    if (it->user == (void *)(uintptr_t)0)
+        c.on = on_text(v);
+    else if (it->user == (void *)(uintptr_t)1)
+        c.strength = (float)(x < 0.0 ? 0.0 : x > 2.0 ? 2.0 : x);
+    else
+        c.radius = (float)(x < 2.0 ? 2.0 : x > 32.0 ? 32.0 : x);
+    nv2a_ao_cfg_set(&c);
+}
+
+static const char *get_ao(const struct enhance_item *it, char *b, size_t n)
+{
+    const struct nv2a_ao_cfg *c = nv2a_ao_cfg();
+    if (it->user == (void *)(uintptr_t)0)
+        snprintf(b, n, "%s", c->on ? "true" : "false");
+    else
+        snprintf(b, n, "%g", it->user == (void *)(uintptr_t)1 ? c->strength : c->radius);
+    return b;
+}
+
+/* Not const: a game whose art AO does not suit (render.ao_suited = false,
+ * the cel-shaded ones) gets the note and the hint that say so, read when
+ * the menu is built; the option still works there. */
+static struct enhance_item s_ao[] = {
+    { ITEM("render.ao", "Ambient occlusion", "Render", ENHANCE_ITEM_TOGGLE), .set = set_ao,
+      .get = get_ao, .def = "false", .user = (void *)(uintptr_t)0 },
+    { ITEM("render.ao_strength", "AO strength", "Render", ENHANCE_ITEM_RANGE), .lo = 0,
+      .hi = 2, .step = 0.1, .set = set_ao, .get = get_ao, .def = "1.5",
+      .user = (void *)(uintptr_t)1, .help = "How dark the occluded creases get" },
+    { ITEM("render.ao_radius", "AO radius", "Render", ENHANCE_ITEM_RANGE), .lo = 2, .hi = 32,
+      .step = 2, .set = set_ao, .get = get_ao, .def = "20", .user = (void *)(uintptr_t)2,
+      .help = "How far the occlusion reaches, in Xbox pixels" },
+};
+
+static void ao_items(void)
+{
+    int suited = enhance_cfg_bool("render.ao_suited", 1);
+    const char *b = recomp_env(RENV_PB_BACKEND);
+    s_ao[0].note = suited ? NULL : "not for this art";
+    s_ao[0].help = suited ? "Shades the creases and contacts of the 3D scene, under the HUD"
+                          : "This game's flat-shaded art gains little from it; off is "
+                            "recommended";
+    /* The CPU renderer has no AO pass: the rows stay, so a config shared
+     * with a GPU run keeps its values, but say they do nothing here. */
+    if (b && !strcmp(b, "cpu")) {
+        s_ao[0].note = "no effect on CPU";
+        s_ao[0].help = "The CPU renderer does not draw it; Metal and Direct3D 11 do";
+    }
+}
 
 /* kernel_language.h's side, declared here as kernel_pacing.h's are: the
  * menu takes no kernel header. */
@@ -782,6 +839,9 @@ static void build_slots(void)
         slot_add(&k_items[i], page_by_name(k_items[i].page, PAGE_RENDER), -1);
     if (hud_layer_has_mod_table())
         slot_add(&k_hud_margin, PAGE_RENDER, -1);
+    ao_items();
+    for (int i = 0; i < (int)(sizeof s_ao / sizeof s_ao[0]); i++)
+        slot_add(&s_ao[i], PAGE_RENDER, -1);
     if (xbox_LanguagesShipped()[0]) {
         language_item();
         slot_add(&s_language, PAGE_GAME, -1);

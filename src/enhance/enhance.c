@@ -21,6 +21,7 @@
 #include "nv2a_backend_common.h"
 #include "nv2a_overlay.h"
 #include "nv2a_present_chain.h"
+#include "nv2a_scene_ao.h"
 #include "nv2a_tex_pack.h"
 #include "recomp_env.h"
 #include "recomp_exe_dir.h"
@@ -156,6 +157,35 @@ static const char *const s_surface[] = { "auto", "window", "internal", NULL };
 static const char *const s_onoff[] = { "off", "on", NULL };
 /* Indexes match enum nv2a_movie_mode. */
 static const char *const s_movie[] = { "black", "fit", "fill", NULL };
+
+/* render.ao (nv2a_scene_ao.h): off is stock, and the backends then never
+ * call the trigger, make a pass or a samplable depth buffer. Read either
+ * way so the keys are never reported unused; named only when on. A game
+ * whose art the effect does not suit (cel-shaded) sets render.ao_suited =
+ * false in its config.default.toml: the menu says so, the default stays
+ * off as everywhere. */
+static void load_ao(void)
+{
+    struct nv2a_ao_cfg c;
+    double v, r, vc, rc;
+    nv2a_ao_cfg_default(&c);
+    c.on = enhance_cfg_bool("render.ao", 0);
+    v = enhance_cfg_float("render.ao_strength", c.strength);
+    r = enhance_cfg_float("render.ao_radius", c.radius);
+    vc = v < 0.0 ? 0.0 : v > 2.0 ? 2.0 : v;
+    rc = r < 2.0 ? 2.0 : r > 32.0 ? 32.0 : r;
+    c.strength = (float)vc;
+    c.radius = (float)rc;
+    if (vc != v || rc != r)
+        fprintf(stderr, LOGP "render.ao_strength=%g render.ao_radius=%g out of range:"
+                " clamped to %g and %g (0..2, 2..32)\n", v, r, vc, rc);
+    (void)enhance_cfg_bool("render.ao_suited", 1);
+    c.view = recomp_env_on(RENV_AO_VIEW);
+    nv2a_ao_cfg_set(&c);
+    if (c.on)
+        fprintf(stderr, LOGP "render.ao=1 render.ao_strength=%g render.ao_radius=%g%s\n",
+                c.strength, c.radius, c.view ? " (ao_view)" : "");
+}
 
 int xbox_enhance_init(const char *root, const char *title)
 {
@@ -320,6 +350,7 @@ int xbox_enhance_init(const char *root, const char *title)
         break;
     }
     load_tex_pack(&o);
+    load_ao();
     enhance_input_init();
     /* The toolkit's host actions before the mods register theirs. */
     enhance_actions_init();
