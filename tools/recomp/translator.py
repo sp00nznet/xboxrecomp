@@ -2764,74 +2764,98 @@ class FunctionTranslator:
         # become a block leader, so it gets no label and its `goto` is dropped
         # as dead code. Re-decode at every newly discovered leader and refresh
         # the computed-edge census until both describe the same instruction set.
-        if recovered is None:
-            resync = set()
-            while True:
-                missing = switch_leaders - {
-                    insn.address for insn in instructions}
-                new_missing = missing - resync
-                if not new_missing:
-                    break
-                resync.update(new_missing)
-                instructions = self.disasm.disassemble_function(
-                    raw_bytes, start, end, resync=resync)
-                if not instructions:
-                    return [], []
-                (imm_refs, computed_jump_edges, debug_slide_int3s,
-                 debug_slide_bypasses,
-                 switch_leaders) = self._control_flow_census(
-                     instructions, start, end, coalesced)
+        resync = set()
+        while True:
+            if recovered is None:
+                while True:
+                    missing = switch_leaders - {
+                        insn.address for insn in instructions}
+                    new_missing = missing - resync
+                    if not new_missing:
+                        break
+                    resync.update(new_missing)
+                    instructions = self.disasm.disassemble_function(
+                        raw_bytes, start, end, resync=resync)
+                    if not instructions:
+                        return [], []
+                    (imm_refs, computed_jump_edges, debug_slide_int3s,
+                     debug_slide_bypasses,
+                     switch_leaders) = self._control_flow_census(
+                         instructions, start, end, coalesced)
 
-        self.lifter.imm_code_refs = imm_refs
+            self.lifter.imm_code_refs = imm_refs
 
-        # Build basic blocks
-        forced = getattr(self, "_forced_leaders", None)
-        if forced:
-            switch_leaders = set(switch_leaders or ()) | {
-                a for a in forced if start < a < end}
-        blocks = self.disasm.build_basic_blocks(
-            instructions, start, end,
-            extra_leaders=switch_leaders if switch_leaders else None,
-            stop_mnemonics=("ud2", "hlt", "iret", "iretd")
-            if coalesced else ("iret", "iretd"))
-        block_starts = {block.start for block in blocks}
-        for block in blocks:
-            last = block.last_insn
-            if last is None:
-                continue
-            for target in computed_jump_edges.get(last.address, ()):
-                if target in block_starts and target not in block.successors:
-                    block.successors.append(target)
-        if coalesced:
+            # Build basic blocks
+            forced = getattr(self, "_forced_leaders", None)
+            if forced:
+                switch_leaders = set(switch_leaders or ()) | {
+                    a for a in forced if start < a < end}
+            blocks = self.disasm.build_basic_blocks(
+                instructions, start, end,
+                extra_leaders=switch_leaders if switch_leaders else None,
+                stop_mnemonics=("ud2", "hlt", "iret", "iretd")
+                if coalesced else ("iret", "iretd"))
+            block_starts = {block.start for block in blocks}
             for block in blocks:
-                bypass = (debug_slide_bypasses.get(block.last_insn.address)
-                          if block.last_insn is not None else None)
-                if bypass is not None:
-                    slide = block.last_insn.end_address
-                    block.successors = [
-                        bypass if successor == slide else successor
-                        for successor in block.successors
-                    ]
-                    if bypass not in block.successors:
-                        block.successors.append(bypass)
-                if (block.last_insn is not None
-                        and block.last_insn.mnemonic == "int3"
-                        and block.last_insn.address not in debug_slide_int3s):
-                    block.successors = []
-        # Linear decoding also sees inline tables and padding after returns.
-        # Only executable CFG edges (including the computed-edge census) can
-        # make those blocks part of this function. Immediate code addresses
-        # stay too: an intra-function register jmp may reach them by a goto
-        # the CFG could not prove (_lift_jmp).
-        by_start = {block.start: block for block in blocks}
-        reachable = set()
-        pending = [start, *imm_refs]
-        while pending:
-            address = pending.pop()
-            if address in reachable or address not in by_start:
-                continue
-            reachable.add(address)
-            pending.extend(by_start[address].successors)
+                last = block.last_insn
+                if last is None:
+                    continue
+                for target in computed_jump_edges.get(last.address, ()):
+                    if target in block_starts and target not in block.successors:
+                        block.successors.append(target)
+            if coalesced:
+                for block in blocks:
+                    bypass = (debug_slide_bypasses.get(block.last_insn.address)
+                              if block.last_insn is not None else None)
+                    if bypass is not None:
+                        slide = block.last_insn.end_address
+                        block.successors = [
+                            bypass if successor == slide else successor
+                            for successor in block.successors
+                        ]
+                        if bypass not in block.successors:
+                            block.successors.append(bypass)
+                    if (block.last_insn is not None
+                            and block.last_insn.mnemonic == "int3"
+                            and block.last_insn.address not in debug_slide_int3s):
+                        block.successors = []
+
+            # Linear decoding also sees inline tables and padding after
+            # returns. Only executable CFG edges (including the computed-edge
+            # census) can make those blocks part of this function. Immediate
+            # code addresses stay too: an intra-function register jmp may
+            # reach them by a goto the CFG could not prove (_lift_jmp).
+            by_start = {block.start: block for block in blocks}
+            reachable = set()
+            pending = [start, *imm_refs]
+            while pending:
+                address = pending.pop()
+                if address in reachable or address not in by_start:
+                    continue
+                reachable.add(address)
+                pending.extend(by_start[address].successors)
+            if recovered is not None:
+                break
+            # A direct jump to code just past an inline table lands on bytes
+            # the table's decode swallowed, the same way a switch target does.
+            # Only reachable edges count, so branches decoded from the table
+            # data itself cannot force a resync.
+            new_missing = {
+                target for address in reachable
+                for target in by_start[address].successors
+                if target not in by_start and start <= target < end
+            } - resync
+            if not new_missing:
+                break
+            resync.update(new_missing)
+            instructions = self.disasm.disassemble_function(
+                raw_bytes, start, end, resync=resync)
+            if not instructions:
+                return [], []
+            (imm_refs, computed_jump_edges, debug_slide_int3s,
+             debug_slide_bypasses,
+             switch_leaders) = self._control_flow_census(
+                 instructions, start, end, coalesced)
         blocks = [block for block in blocks if block.start in reachable]
         instructions = [insn for block in blocks for insn in block.instructions]
         return instructions, blocks
