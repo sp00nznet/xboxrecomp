@@ -1326,17 +1326,18 @@ def test_resync_recomputes_register_jump_edges():
 
 
 def test_direct_jump_past_inline_data_is_resynced():
-    # jmp +4; then data that decodes as mov eax, imm32 and swallows the ret
-    # the jump lands on (DOA3 JP 0x72FB8 -> 0x72FE0 past a jump table).
-    raw = bytes.fromhex("e904000000b8112233c3")
-    target = BASE + 9
+    # jmp +5; an unreachable nop; then data that decodes as mov eax, imm32
+    # and swallows the ret the jump lands on (DOA3 JP 0x72FB8 -> 0x72FE0
+    # past a jump table). The prune runs on the resynced blocks.
+    raw = bytes.fromhex("e90500000090b8112233c3")
+    target = BASE + 10
     subject = translator(raw, [])
 
     instructions, blocks = subject.decode_function(BASE, BASE + len(raw))
 
     assert [block.start for block in blocks] == [BASE, target]
-    assert instructions[-1].address == target
-    assert instructions[-1].mnemonic == "ret"
+    assert [(insn.address, insn.mnemonic) for insn in instructions] == [
+        (BASE, "jmp"), (target, "ret")]
 
 
 def test_resync_evicts_stale_decode_inside_real_instruction():
