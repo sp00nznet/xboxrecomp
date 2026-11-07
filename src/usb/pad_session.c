@@ -27,10 +27,6 @@
 #define ps_lseek lseek
 #endif
 
-/* A recording or a setup is text at about 32 bytes a step: PAD_STEPS_MAX
- * steps fit in 4 MB, the import cap (R5). A larger file is not read. */
-#define PAD_FILE_MAX (4L << 20)
-
 /* ---- the pad lock -------------------------------------------------------- */
 
 /* Opens come on the game's threads, any of them at once (a loader thread
@@ -936,6 +932,22 @@ int padrec_record_start(const char *path, const PadrecMeta *m, unsigned flags,
 
 /* The last playback's paths, for padrec_again. */
 static char s_last_path[1024];
+/* The running title, for padrec_play's check (padrec_set_title). */
+static uint32_t s_title_id;
+static char s_title[64];
+
+void padrec_set_title(uint32_t title_id, const char *title)
+{
+    s_title_id = title_id;
+    snprintf(s_title, sizeof s_title, "%s", title ? title : "");
+}
+
+void padrec_path_moved(const char *from, const char *to)
+{
+    if (!from || strcmp(s_last_path, from))
+        return;
+    snprintf(s_last_path, sizeof s_last_path, "%s", to ? to : "");
+}
 
 int padrec_play(const char *const *paths, int n, unsigned flags, char *why, size_t whyn)
 {
@@ -971,6 +983,13 @@ int padrec_play(const char *const *paths, int n, unsigned flags, char *why, size
             /* Counted from boot: it plays only from the start of a run. */
             snprintf(why, whyn, "%s was recorded from boot (RECOMP_PAD_SCRIPT)",
                      pad_path_name(paths[0]));
+        free(h);
+        free(text);
+        return -1;
+    }
+    /* Another game's file copied into recordings/ by hand: its presses
+     * mean nothing to this title. */
+    if (pad_header_title_check(h, s_title_id, s_title, why, whyn) < 0) {
         free(h);
         free(text);
         return -1;
@@ -1085,6 +1104,8 @@ void padrec_reset_for_test(void)
     s_stop = s_hold = 0;
     s_synced = 0;
     s_last_path[0] = 0;
+    s_title_id = 0;
+    s_title[0] = 0;
     pad_unlock();
     memset(&st, 0, sizeof st);
     status_put(&st);

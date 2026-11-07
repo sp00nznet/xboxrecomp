@@ -11,6 +11,9 @@
 #include <time.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <sys/utime.h>
+#else
+#include <utime.h>
 #endif
 
 #include "enhance_actions.h"
@@ -23,6 +26,8 @@
 #include "kernel.h"
 #include "nv2a_overlay.h"
 #include "nv2a_overlay_int.h"
+#include "pad_script.h"
+#include "shader_profile.h"
 
 #define LOGP "[PADREC] "
 #define ENDED_MS 5000u      /* R4: a finished playback's strip stays 5 s */
@@ -103,6 +108,23 @@ static int64_t file_mtime(const char *path)
 #endif
 }
 
+/* A rename writes a new file: it keeps the old one's time, which the list
+ * sorts and dates by. */
+static void file_set_mtime(const char *path, int64_t t)
+{
+#ifdef _WIN32
+    wchar_t w[FB_PATH_MAX];
+    struct __utimbuf64 u;
+    u.actime = u.modtime = (__time64_t)t;
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, FB_PATH_MAX))
+        _wutime64(w, &u);
+#else
+    struct utimbuf u;
+    u.actime = u.modtime = (time_t)t;
+    utime(path, &u);
+#endif
+}
+
 struct list_ctx {
     struct enhance_padrec_file *out;
     int max, n;
@@ -172,6 +194,277 @@ int enhance_padrec_list(struct enhance_padrec_file *out, int max)
 
 /* ---- starting ------------------------------------------------------------ */
 
+/* The host side of a rename and a delete, UTF-8 paths on Windows too. */
+static int host_rename(const char *from, const char *to)
+{
+#ifdef _WIN32
+    wchar_t wf[FB_PATH_MAX], wt[FB_PATH_MAX];
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, from, -1, wf, FB_PATH_MAX)
+        || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, to, -1, wt, FB_PATH_MAX))
+        return -1;
+    /* No REPLACE_EXISTING: the caller checked the name is free or is this
+     * file under another case, which MoveFileExW renames in place. */
+    return MoveFileExW(wf, wt, 0) ? 0 : -1;
+#else
+    return rename(from, to);
+#endif
+}
+
+static int host_remove(const char *path)
+{
+#ifdef _WIN32
+    wchar_t w[FB_PATH_MAX];
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, w, FB_PATH_MAX))
+        return -1;
+    return DeleteFileW(w) ? 0 : -1;
+#else
+    return remove(path);
+#endif
+}
+
+/* a and b name one file: a case-only rename on a case-insensitive volume
+ * (macOS, Windows), where the new name already "exists". */
+static int same_file(const char *a, const char *b)
+{
+#ifdef _WIN32
+    /* NTFS has no inode to compare. Both paths share the recordings
+     * folder, so the same name under another (ASCII) case is the same file
+     * there; any other taken name is refused before anything is written.
+     * In a folder a user made case-sensitive, MoveFileExW then fails
+     * rather than replacing. */
+    return _stricmp(a, b) == 0;
+#else
+    struct stat sa, sb;
+    return stat(a, &sa) == 0 && stat(b, &sb) == 0 && sa.st_dev == sb.st_dev
+           && sa.st_ino == sb.st_ino;
+#endif
+}
+
+void enhance_padrec_default_stem(time_t t, char *out, size_t n)
+{
+    char slug[33];
+    if (!shader_profile_slug(xbox_path_title_name(), slug, sizeof slug))
+        snprintf(slug, sizeof slug, "pad");
+    fb_default_name(slug, t, "", out, n);
+}
+
+/* The folder made, and a file's path in it. 0, or -1 with why. */
+static int file_path(const char *name, char *path, size_t pn, char *why, size_t n)
+{
+    char dir[FB_PATH_MAX];
+    if (!enhance_padrec_dir(dir, sizeof dir)) {
+        snprintf(why, n, "No user folder (RECOMP_CONFIG=none)");
+        return -1;
+    }
+    if (!name || !name[0] || fb_path_join(dir, name, path, pn) != FB_OK) {
+        snprintf(why, n, "No such recording");
+        return -1;
+    }
+    return 0;
+}
+
+/* The file a record is writing is never renamed, deleted or exported
+ * half-written: s_last names it while the session runs. Under an env key
+ * the page is read only (env set): an export still reads. */
+static int busy(const char *name, int env, char *why, size_t n)
+{
+    PadrecStatus st;
+    const char *key = env ? padrec_env_driven() : NULL;
+    if (key) {
+        snprintf(why, n, "Driven by %s", key);
+        return 1;
+    }
+    padrec_status(&st);
+    if ((st.state == PADREC_REC || st.state == PADREC_ARMED_REC) && !strcmp(name, s_last)) {
+        snprintf(why, n, "Stop the record first");
+        return 1;
+    }
+    return 0;
+}
+
+static int read_named(const char *name, char **text, size_t *len, char *why, size_t n)
+{
+    char path[FB_PATH_MAX];
+    int rc;
+    if (file_path(name, path, sizeof path, why, n) < 0)
+        return -1;
+    rc = fb_read_file(path, (size_t)PAD_FILE_MAX, text, len);
+    if (rc == FB_E_TOO_BIG)
+        snprintf(why, n, "Over %ld MB", PAD_FILE_MAX >> 20);
+    else if (rc != FB_OK)
+        snprintf(why, n, "%s cannot be read", name);
+    return rc == FB_OK ? 0 : -1;
+}
+
+int enhance_padrec_check(const char *text, size_t len, PadFileInfo *info, char *why, size_t n)
+{
+    return pad_file_check(text, len, xbox_path_title_id(), nv2a_overlay_game(), info, why, n);
+}
+
+int enhance_padrec_import(const char *src_name, const char *text, size_t len, char *out,
+                          size_t on, char *why, size_t n)
+{
+    char dir[FB_PATH_MAX], stem[FB_ENTRY_NAME_MAX];
+    size_t sl;
+    int rc;
+    const char *env = padrec_env_driven();
+
+    if (env) {
+        snprintf(why, n, "Driven by %s", env);
+        return -1;
+    }
+    if (!enhance_padrec_dir(dir, sizeof dir)) {
+        snprintf(why, n, "No user folder (RECOMP_CONFIG=none)");
+        return -1;
+    }
+    if (fb_mkdirs(dir) != 0) {
+        snprintf(why, n, "The recordings folder cannot be made");
+        return -1;
+    }
+    snprintf(stem, sizeof stem, "%s", src_name ? src_name : "");
+    sl = strlen(stem);
+    if (ends_with_pad(stem))
+        stem[sl - 4] = 0;
+    rc = fb_import_unique(dir, stem, ".pad", text, len, out, on);
+    /* A name the browser listed but fb_name_check refuses (a reserved name
+     * made on Linux, a long one): the file still comes in, named as a new
+     * record is. */
+    if (rc == FB_E_NAME) {
+        enhance_padrec_default_stem(time(NULL), stem, sizeof stem);
+        rc = fb_import_unique(dir, stem, ".pad", text, len, out, on);
+    }
+    if (rc != FB_OK) {
+        snprintf(why, n, "It cannot be copied into the recordings folder");
+        return -1;
+    }
+    return 0;
+}
+
+int enhance_padrec_read(const char *name, char **text, size_t *len, char *why, size_t n)
+{
+    if (busy(name, 0, why, n))
+        return -1;
+    return read_named(name, text, len, why, n);
+}
+
+int enhance_padrec_info(const char *name, PadFileInfo *info, char *why, size_t n)
+{
+    char *text = NULL;
+    size_t len = 0;
+    int rc;
+    if (read_named(name, &text, &len, why, n) < 0)
+        return -1;
+    /* Title 0: Info shows another game's file as it is, to say why it was
+     * refused or what it holds. */
+    rc = pad_file_check(text, len, 0, NULL, info, why, n);
+    free(text);
+    return rc;
+}
+
+int enhance_padrec_rename(const char *name, const char *typed, char *out, size_t on,
+                          char *why, size_t n)
+{
+    char from[FB_PATH_MAX], to[FB_PATH_MAX], nn[FB_NAME_MAX + FB_EXT_MAX + 1];
+    char *text = NULL, *next = NULL;
+    const char *reason = NULL;
+    size_t len = 0;
+    PadHeader *h = NULL;
+    int64_t when;
+    int rc = -1, same;
+
+    if (busy(name, 1, why, n))
+        return -1;
+    if (fb_name_check(typed, ".pad", nn, sizeof nn, &reason)) {
+        snprintf(why, n, "%s", reason ? reason : "Not a file name");
+        return -1;
+    }
+    if (!strcmp(nn, name)) {
+        snprintf(out, on, "%s", name);
+        return 0;
+    }
+    if (file_path(name, from, sizeof from, why, n) < 0
+        || file_path(nn, to, sizeof to, why, n) < 0)
+        return -1;
+    same = fb_exists(to) && same_file(from, to);
+    if (fb_exists(to) && !same) {
+        snprintf(why, n, "%s is taken", nn);
+        return -1;
+    }
+    if (read_named(name, &text, &len, why, n) < 0)
+        return -1;
+    when = file_mtime(from);
+    /* The header's name is what the strip and the page's "playing" show,
+     * so it follows the file's. A file with no header (an env record) is
+     * moved as it is. */
+    if (!(h = malloc(sizeof *h))) {
+        snprintf(why, n, "Out of memory");
+        goto out;
+    }
+    if (pad_header_read(text, h) == PAD_HDR_OK && h->present) {
+        char stem[sizeof nn];
+        snprintf(stem, sizeof stem, "%.*s", (int)(strlen(nn) - 4), nn);
+        pad_header_set_text(h, "name", stem);
+        if (!(next = pad_header_replace(text, h))) {
+            snprintf(why, n, "Out of memory");
+            goto out;
+        }
+    }
+    if (same) {
+        /* One file under two cases: rewrite it in place, then rename. */
+        if (fb_write_atomic(from, next ? next : text, next ? strlen(next) : len) != FB_OK
+            || host_rename(from, to) != 0) {
+            snprintf(why, n, "%s cannot be renamed", name);
+            goto out;
+        }
+        if (when)
+            file_set_mtime(to, when);
+    } else {
+        int w = fb_write_new(to, next ? next : text, next ? strlen(next) : len);
+        if (w == FB_E_EXISTS) {
+            snprintf(why, n, "%s is taken", nn);
+            goto out;
+        }
+        if (w != FB_OK) {
+            snprintf(why, n, "%s cannot be written", nn);
+            goto out;
+        }
+        if (when)
+            file_set_mtime(to, when);
+        /* Both names for a moment, never neither: the old goes once the
+         * new one is whole. */
+        if (host_remove(from) != 0) {
+            host_remove(to);
+            snprintf(why, n, "%s cannot be renamed", name);
+            goto out;
+        }
+    }
+    if (!strcmp(s_last, name))
+        snprintf(s_last, sizeof s_last, "%s", nn);
+    padrec_path_moved(from, to);            /* Play again follows */
+    snprintf(out, on, "%s", nn);
+    rc = 0;
+out:
+    free(h);
+    free(next);
+    free(text);
+    return rc;
+}
+
+int enhance_padrec_delete(const char *name, char *why, size_t n)
+{
+    char path[FB_PATH_MAX];
+    if (busy(name, 1, why, n) || file_path(name, path, sizeof path, why, n) < 0)
+        return -1;
+    if (host_remove(path) != 0) {
+        snprintf(why, n, "%s cannot be deleted", name);
+        return -1;
+    }
+    if (!strcmp(s_last, name))
+        s_last[0] = 0;
+    padrec_path_moved(path, NULL);
+    return 0;
+}
+
 int enhance_padrec_record(int armed, const char *start_point, char *why, size_t n)
 {
     char dir[FB_PATH_MAX], name[FB_NAME_MAX + FB_EXT_MAX + 1], stem[FB_NAME_MAX + 1];
@@ -191,9 +484,12 @@ int enhance_padrec_record(int armed, const char *start_point, char *why, size_t 
         snprintf(why, n, "The recordings folder cannot be made");
         return -1;
     }
-    /* "pad-<yyyymmdd-hhmm>", then -2, -3 within the minute. */
-    fb_default_name("pad", time(NULL), "", stem, sizeof stem);
-    if (fb_unique_name(dir, stem, ".pad", name, sizeof name) != FB_OK
+    /* "<game>-<yyyymmdd-hhmm>", then -2, -3 within the minute. The empty
+     * file takes the name as an import does (R5): two records in one
+     * minute, or names apart only by case on a case-insensitive volume,
+     * never share a file. */
+    enhance_padrec_default_stem(time(NULL), stem, sizeof stem);
+    if (fb_import_unique(dir, stem, ".pad", "", 0, name, sizeof name) != FB_OK
         || fb_path_join(dir, name, path, sizeof path) != FB_OK) {
         snprintf(why, n, "No free file name in the recordings folder");
         return -1;
@@ -206,8 +502,10 @@ int enhance_padrec_record(int armed, const char *start_point, char *why, size_t 
     snprintf(stem, sizeof stem, "%.*s", (int)(strlen(name) - 4), name);
     m.name = stem;
     m.start_point = start_point;
-    if (padrec_record_start(path, &m, armed ? PADREC_ARMED : 0, why, n) < 0)
+    if (padrec_record_start(path, &m, armed ? PADREC_ARMED : 0, why, n) < 0) {
+        host_remove(path);
         return -1;
+    }
     snprintf(s_last, sizeof s_last, "%s", name);
     return 0;
 }
@@ -231,11 +529,34 @@ int enhance_padrec_play_file(const char *name, int armed, char *why, size_t n)
         return -1;
     }
     one[0] = path;
+    padrec_set_title(xbox_path_title_id(), nv2a_overlay_game());
     if (padrec_play(one, 1, armed ? PADREC_ARMED : 0, why, n) < 0)
         return -1;
     if (name != s_last)
         snprintf(s_last, sizeof s_last, "%s", name);
     return 0;
+}
+
+int enhance_padrec_again(int armed, char *why, size_t n)
+{
+    padrec_set_title(xbox_path_title_id(), nv2a_overlay_game());
+    return padrec_again(armed ? PADREC_ARMED : 0, why, n);
+}
+
+int enhance_padrec_playable(const PadFileInfo *info, int rc, const char *rc_why, char *why,
+                            size_t n)
+{
+    if (rc < 0 || !info) {
+        snprintf(why, n, "%s", rc_why && *rc_why ? rc_why : "It cannot be read");
+        return 0;
+    }
+    if (strcmp(pad_header_origin(&info->h), "session")) {
+        snprintf(why, n, "Recorded from boot: it plays only with RECOMP_PAD_SCRIPT");
+        return 0;
+    }
+    if (pad_header_title_check(&info->h, xbox_path_title_id(), nv2a_overlay_game(), why, n) < 0)
+        return 0;
+    return 1;
 }
 
 int enhance_padrec_live(int state)

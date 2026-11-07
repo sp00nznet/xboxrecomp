@@ -19,6 +19,8 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define REC_PATH "pad_session_rec.pad"
 #define ARMED_PATH "pad_session_armed.pad"
 #define BOOT_PATH "pad_session_boot.pad"
+#define OTHER_PATH "pad_session_other.pad"
+#define MOVED_PATH "pad_session_moved.pad"
 #define REC_AT 1000u
 #define PLAY_AT 5000u
 #define A_POLLS 5u      /* A held from the record's first poll */
@@ -258,6 +260,42 @@ static void test_refusals(void)
     check(padrec_env_driven() == NULL, "no env key");
 }
 
+/* Another title's file is refused (copied into recordings/ by hand); the
+ * last playback follows a rename and is gone after a delete. */
+static void test_title_and_moves(void)
+{
+    const char *one[1] = { OTHER_PATH };
+    char why[160];
+    FILE *f = fopen(OTHER_PATH, "wb");
+    printf("another title, rename, delete\n");
+    if (f) {
+        fputs("# xbr-export: pad 1\n# xbr-pad: title = \"BLiNX\"\n"
+              "# xbr-pad: title_id = \"4d530018\"\n# xbr-pad: origin = \"session\"\n"
+              "f10:A:5\nf20:@end\n", f);
+        fclose(f);
+    }
+    padrec_set_title(0x4d530065, "BLiNX 2");
+    why[0] = 0;
+    check(padrec_play(one, 1, 0, why, sizeof why) < 0
+              && strstr(why, "a recording of BLiNX (4d530018), not of BLiNX 2 (4d530065)"),
+          "another title's file is refused");
+    padrec_set_title(0x4d530018, "BLiNX");
+    check(padrec_play(one, 1, 0, why, sizeof why) == 0, "its own title plays it");
+    padrec_stop();
+    poll0(7000, 0, 0);
+    remove(MOVED_PATH);
+    check(rename(OTHER_PATH, MOVED_PATH) == 0, "renamed on disk");
+    padrec_path_moved(OTHER_PATH, MOVED_PATH);
+    check(padrec_again(0, why, sizeof why) == 0, "play again after a rename");
+    padrec_stop();
+    poll0(7001, 0, 0);
+    padrec_path_moved(MOVED_PATH, NULL);
+    why[0] = 0;
+    check(padrec_again(0, why, sizeof why) < 0 && strstr(why, "nothing played"),
+          "nothing to play again after a delete");
+    padrec_set_title(0, NULL);
+}
+
 int main(void)
 {
     recomp_env_init();
@@ -268,10 +306,13 @@ int main(void)
     test_armed_cancel();
     test_armed_exit();
     test_refusals();
+    test_title_and_moves();
     padrec_reset_for_test();
     remove(REC_PATH);
     remove(ARMED_PATH);
     remove(BOOT_PATH);
+    remove(OTHER_PATH);
+    remove(MOVED_PATH);
     printf("%s (%d failure%s)\n", failures ? "FAIL" : "PASS", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

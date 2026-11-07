@@ -2,6 +2,7 @@
  * pad_header.c -- the header of a pad recording (pad_header.h).
  */
 #include "pad_header.h"
+#include "pad_script.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -365,4 +366,125 @@ const char *pad_header_error(int rc)
     case PAD_HDR_LONG_VALUE: return "a header value is too long";
     default: return "the header cannot be read";
     }
+}
+
+/* ---- replacing ---------------------------------------------------------- */
+
+char *pad_header_replace(const char *text, const PadHeader *h)
+{
+    size_t tl = strlen(text), cap = (size_t)PAD_HDR_KEYS_MAX * (PAD_HDR_LINE_MAX + 2) + 64;
+    char *out = malloc(cap + tl + 1);
+    const char *p = text;
+    int w;
+    size_t o;
+
+    if (!out)
+        return NULL;
+    if ((w = pad_header_write(h, out, cap)) < 0) {
+        free(out);
+        return NULL;
+    }
+    o = (size_t)w;
+    if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB
+        && (unsigned char)p[2] == 0xBF)
+        p += 3;
+    /* The leading comment block loses its marker and key lines; its other
+     * comments and blank lines stay, and from the first step on the text
+     * is copied as it is. */
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        const char *next = nl ? nl + 1 : p + len;
+        size_t bare = len && p[len - 1] == '\r' ? len - 1 : len;
+
+        if (bare && p[0] != '#')
+            break;
+        if (!starts(p, bare, MARKER) && !starts(p, bare, KEYLINE)) {
+            memcpy(out + o, p, (size_t)(next - p));
+            o += (size_t)(next - p);
+        }
+        p = next;
+    }
+    memcpy(out + o, p, strlen(p) + 1);
+    return out;
+}
+
+/* ---- a whole file ------------------------------------------------------- */
+
+int pad_header_title_check(const PadHeader *h, uint32_t title_id, const char *title,
+                           char *why, size_t whyn)
+{
+    const char *tid = h->present ? pad_header_get(h, "title_id") : NULL;
+    const char *of;
+
+    if (!title_id || !tid || !*tid || strtoul(tid, NULL, 16) == title_id)
+        return 0;
+    of = pad_header_get(h, "title");
+    if (!of || !*of)
+        of = pad_header_get(h, "game");
+    if (title && *title)
+        snprintf(why, whyn, "a recording of %s (%s), not of %s (%08x)",
+                 of && *of ? of : "another game", tid, title, (unsigned)title_id);
+    else
+        snprintf(why, whyn, "a recording of %s (%s), not of this game (%08x)",
+                 of && *of ? of : "another game", tid, (unsigned)title_id);
+    return -1;
+}
+
+int pad_file_check(const char *text, size_t len, uint32_t title_id, const char *title,
+                   PadFileInfo *out, char *why, size_t whyn)
+{
+    PadFileInfo info;
+    PadStep *steps;
+    PadAnchors *anchors;
+    int rc;
+
+    if (why && whyn)
+        why[0] = 0;
+    memset(&info, 0, sizeof info);
+    if (len > (size_t)PAD_FILE_MAX) {
+        snprintf(why, whyn, "over %ld MB", PAD_FILE_MAX >> 20);
+        return -1;
+    }
+    /* A NUL inside is a binary, not a recording the parser can read whole. */
+    if (strlen(text) != len) {
+        snprintf(why, whyn, "not a text file");
+        return -1;
+    }
+    if ((rc = pad_header_read(text, &info.h)) < 0) {
+        snprintf(why, whyn, "%s", pad_header_error(rc));
+        return -1;
+    }
+    if (pad_header_title_check(&info.h, title_id, title, why, whyn) < 0)
+        return -1;
+    info.anchors = pad_script_anchor_lines(text);
+    if (info.anchors > PAD_ANCHOR_MAX) {
+        snprintf(why, whyn, "%d anchors, over %d", info.anchors, PAD_ANCHOR_MAX);
+        return -1;
+    }
+    /* One step past the cap tells a full file from one the cap cut. */
+    steps = malloc(sizeof *steps * (PAD_STEPS_MAX + 1));
+    anchors = calloc(1, sizeof *anchors);
+    if (!steps || !anchors) {
+        free(steps);
+        free(anchors);
+        snprintf(why, whyn, "out of memory");
+        return -1;
+    }
+    /* Parsed as the session parses it, anchors and all, so the count is
+     * the one playback would see. */
+    info.steps = pad_script_parse_anchored(text, steps, 0, PAD_STEPS_MAX + 1, anchors);
+    free(steps);
+    free(anchors);
+    if (info.steps > PAD_STEPS_MAX) {
+        snprintf(why, whyn, "more than %d steps", PAD_STEPS_MAX);
+        return -1;
+    }
+    if (info.steps < 1) {
+        snprintf(why, whyn, "no steps");
+        return -1;
+    }
+    if (out)
+        *out = info;
+    return 0;
 }

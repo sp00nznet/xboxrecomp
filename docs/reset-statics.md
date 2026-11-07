@@ -2790,6 +2790,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/usb/pad_session.c | - | s_sig_clock | file_static | keep | - | pad session: host automation like the env script, survives a reset |
 | src/usb/pad_session.c | padrec_wants_opens | anchor | local_static | keep | - | pad session: host automation like the env script, survives a reset |
 | src/usb/pad_session.c | - | s_last_path | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_title_id | file_static | keep | - | pad session: the running title, set before each play |
+| src/usb/pad_session.c | - | s_title | file_static | keep | - | pad session: the running title, set before each play |
 
 ### src/video/fb_present.c
 
@@ -3128,6 +3130,13 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/enhance_menu.c | - | s_prf_serial | file_static | keep | - | Recordings page state (file list, start point text) |
 | src/enhance/enhance_menu.c | - | s_prf_state | file_static | keep | - | Recordings page state (file list, start point text) |
 | src/enhance/enhance_menu.c | - | s_rec_start | file_static | keep | - | Recordings page state (file list, start point text) |
+| src/enhance/enhance_menu.c | - | s_pr_sub | file_static | keep | - | open recording page (its file name) |
+| src/enhance/enhance_menu.c | - | s_pr_info | file_static | keep | - | open recording page (its header, read on open) |
+| src/enhance/enhance_menu.c | - | s_pr_info_rc | file_static | keep | - | open recording page (its header, read on open) |
+| src/enhance/enhance_menu.c | - | s_pr_info_why | file_static | keep | - | open recording page (its header, read on open) |
+| src/enhance/enhance_menu.c | - | s_pr_del | file_static | keep | - | open recording page (delete confirm) |
+| src/enhance/enhance_menu.c | - | s_pr_back_sel | file_static | keep | - | open recording page (list row to return to) |
+| src/enhance/enhance_menu.c | - | s_pimp | file_static | keep | - | recording import preview (text and header) |
 
 ### src/enhance/enhance_padrec.c
 

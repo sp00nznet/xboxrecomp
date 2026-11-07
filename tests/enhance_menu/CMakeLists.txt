@@ -63,6 +63,9 @@ add_executable(enhance_menu_test
     ${XR_SRC}/enhance/enhance_padrec.c
     # The pad session's menu side, without a pad (mod.c asks padrec_playing).
     ${XR_ROOT}/tests/pad_session/padrec_stub.c
+    # The import's check and a rename's header (pad_file_check).
+    ${XR_SRC}/usb/pad_header.c
+    ${XR_SRC}/usb/pad_script.c
     ${XR_SRC}/enhance/hud_anchor.c
     ${XR_SRC}/enhance/hud_capture.c
     ${XR_SRC}/kernel/recomp_hook.c

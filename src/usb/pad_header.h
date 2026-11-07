@@ -22,6 +22,7 @@
 #define XBOX_USB_PAD_HEADER_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #define PAD_HDR_KIND   "pad"
 #define PAD_HDR_FORMAT 1
@@ -84,5 +85,41 @@ int pad_header_read(const char *text, PadHeader *h);
 
 /* A rc of pad_header_read in words, for a log line or a toast. */
 const char *pad_header_error(int rc);
+
+/* text with its header replaced by h's: h written first, the marker and
+ * key lines of the leading comment block dropped, every other line kept as
+ * it is (a step's CRLF included). A rename's new name goes in this way.
+ * malloc'd, or NULL out of memory or when h does not write. */
+char *pad_header_replace(const char *text, const PadHeader *h);
+
+/* ---- a whole file: the menu's import and Info ---------------------------- */
+
+/* The header's title_id against the running title's: 0 when they match or
+ * either is unknown (title_id 0, no header, no title_id), else -1 with
+ * "a recording of BLiNX (4d530018), not of BLiNX 2 (4d530065)" in why
+ * (title may be NULL). pad_file_check and padrec_play both ask it. */
+int pad_header_title_check(const PadHeader *h, uint32_t title_id, const char *title,
+                           char *why, size_t whyn);
+
+/* What a recording holds, as pad_file_check read it. */
+typedef struct {
+    PadHeader h;
+    int steps;                  /* the steps parsed, @end included */
+    int anchors;                /* its @open entries */
+} PadFileInfo;
+
+/* Check a recording's text as an import takes it (pad-recording-ui R5):
+ * at most PAD_FILE_MAX bytes and no NUL; a header pad_header_read takes
+ * (no newer format, no other kind, bounded); the title_id of the running
+ * title, when both are known (title_id 0: Info, which shows any file);
+ * at most PAD_ANCHOR_MAX anchors and PAD_STEPS_MAX steps, and one step at
+ * least. A file with no header passes as an env record (origin boot).
+ * toolkit and game_build are only shown, never checked. title names the
+ * running game in the refusal ("a recording of BLiNX, not of BLiNX 2").
+ * Parses the whole file: up to PAD_STEPS_MAX steps on the heap for the
+ * call. Returns 0, or -1 with a reason in why. This one needs
+ * pad_script.c. */
+int pad_file_check(const char *text, size_t len, uint32_t title_id, const char *title,
+                   PadFileInfo *out, char *why, size_t whyn);
 
 #endif /* XBOX_USB_PAD_HEADER_H */

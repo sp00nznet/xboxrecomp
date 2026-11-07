@@ -80,9 +80,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #ifdef _WIN32
 #include <direct.h>
 #include <io.h>
+#include <sys/utime.h>
 #define MKDIR(p) _mkdir(p)
 #define rmdir _rmdir
 #define DUP _dup
@@ -91,6 +93,7 @@
 #define OPEN_TRUNC(p) _open(p, _O_WRONLY | _O_CREAT | _O_TRUNC, 0644)
 #else
 #include <unistd.h>
+#include <utime.h>
 #define MKDIR(p) mkdir(p, 0755)
 #define DUP dup
 #define DUP2 dup2
@@ -2716,7 +2719,7 @@ static void test_pages(void)
      * Recordings with no folder yet: no file rows. */
     static const uint32_t k_sum[11] = {
         0x6FDBE087u, 0xC58D4BA2u, 0xD06D4311u, 0x775B0691u, 0x109DEB36u,
-        0x6930FCBFu, 0xC1417056u, 0x3F80EEA3u, 0xE13F4B8Bu, 0xBE720FC1u, 0xE2E461FFu };
+        0x6930FCBFu, 0xC1417056u, 0x3F80EEA3u, 0xE13F4B8Bu, 0xDAE05AEAu, 0xE2E461FFu };
     /* Files shows Open exports folder only off Game Mode. */
     set_env("RECOMP_HOST_GAMESCOPE", NULL);
     start_with(ARMED, k_mods);
@@ -5849,12 +5852,29 @@ static void test_padrec_page(void)
     /* The header gets the stem, as the strip and the "playing" row show it. */
     CHECK(!strncmp(padrec_stub_meta_name(), first, strlen(first) - 4)
           && padrec_stub_meta_name()[strlen(first) - 4] == 0);
-    /* Another record or a play waits for this one. */
+    /* A opens the file's page; a play, rename, export or delete of the
+     * file being written waits for its stop. */
     CHECK(row_value(first) != NULL);
     CHECK(enhance_menu_select_row(first));
     tap(0x0D);
+    CHECK(row_value("Play") != NULL && row_value("Rename") != NULL);
+    CHECK(enhance_menu_select_row("Play"));
+    tap(0x0D);
     CHECK(status_has("Stop the record first"));
+    CHECK(enhance_menu_select_row("Rename"));
+    tap(0x0D);
+    CHECK(status_has("Stop the record first"));
+    CHECK(!xbox_InputTextActive());
+    CHECK(enhance_menu_select_row("Export"));
+    tap(0x0D);
+    CHECK(status_has("Stop the record first"));
+    CHECK(enhance_menu_select_row("Delete"));
+    tap(0x0D);
+    CHECK(status_has("Stop the record first"));
+    CHECK(row_value("Yes, delete it") == NULL);
     CHECK(pr_state() == PADREC_ARMED_REC);
+    tap(0x08);                                    /* B: back to the list */
+    CHECK(row_value("Rename") == NULL && row_value(first) != NULL);
 
     /* The close starts it; the shortcuts were dropped while open. */
     tap(VK_F5);
@@ -5867,14 +5887,19 @@ static void test_padrec_page(void)
     tap(VK_F1);
     CHECK(pr_state() == PADREC_STOPPED);
 
-    /* A file row plays it, armed; Stop ends it. */
+    /* Play on the file's page, armed; Stop ends it. */
     open_menu();
     CHECK(enhance_menu_set_page("Recordings"));
-    CHECK(row_value(first) && !strcmp(s_val, "Play"));
+    CHECK(row_value(first) && strcmp(s_val, "playing"));
     CHECK(enhance_menu_select_row(first));
+    tap(0x0D);
+    CHECK(row_value("Play") && !strcmp(s_val, "as the menu closes"));
+    CHECK(enhance_menu_select_row("Play"));
     tap(0x0D);
     CHECK(status_has("Plays when the menu closes"));
     CHECK(pr_state() == PADREC_ARMED_PLAY);
+    CHECK(row_value("Play") && !strcmp(s_val, "playing"));
+    tap(0x08);
     CHECK(row_value(first) && !strcmp(s_val, "playing"));
     CHECK(row_value("Record") != NULL);
     CHECK(enhance_menu_select_row("Record"));
@@ -5942,10 +5967,19 @@ static void test_padrec_page(void)
     tap(0x0D);
     CHECK(status_has("Read only"));
     CHECK(pr_state() == PADREC_STOPPED);
+    /* The file's page still opens, for its header and an export. */
     snprintf(row, sizeof row, "%s", first);
     CHECK(enhance_menu_select_row(row));
     tap(0x0D);
+    CHECK(row_value("Play") != NULL);
+    CHECK(enhance_menu_select_row("Play"));
+    tap(0x0D);
     CHECK(status_has("Read only"));
+    CHECK(enhance_menu_select_row("Delete"));
+    tap(0x0D);
+    CHECK(status_has("Read only"));
+    CHECK(row_value("Yes, delete it") == NULL);
+    CHECK(pr_state() == PADREC_STOPPED);
     open_menu();
     padrec_stub_env(NULL);
 
@@ -5957,6 +5991,9 @@ static void test_padrec_page(void)
     CHECK(row_value("Start") && !strcmp(s_val, "now"));
     CHECK(enhance_menu_select_row(first));
     tap(0x0D);
+    CHECK(row_value("Play") && !strcmp(s_val, "now"));
+    CHECK(enhance_menu_select_row("Play"));
+    tap(0x0D);
     CHECK(pr_state() == PADREC_PLAY);
     CHECK(status_has("Playing"));
     open_menu();
@@ -5964,6 +6001,228 @@ static void test_padrec_page(void)
     padrec_stub_reset();
     recs_clear();
     remove("config/config.toml");
+}
+
+/* A recording's time in the list, -1 when it is not there. */
+static int64_t recs_mtime(const char *name)
+{
+    struct enhance_padrec_file f[ENHANCE_PADREC_FILES];
+    int n = enhance_padrec_list(f, ENHANCE_PADREC_FILES);
+    for (int i = 0; i < n; i++)
+        if (!strcmp(f[i].name, name))
+            return f[i].mtime;
+    return -1;
+}
+
+/* Import, Info, rename, export and delete (pad-recording-ui R5, R6): a
+ * recording made on another host, CRLF and all, with the game's title. */
+static void test_padrec_files(void)
+{
+    static const char run[] = "# xbr-export: pad 1\r\n# xbr-pad: title = \"BLiNX 2\"\r\n"
+                              "# xbr-pad: title_id = \"4d530065\"\r\n"
+                              "# xbr-pad: origin = \"session\"\r\n"
+                              "# xbr-pad: name = \"run\"\r\n# xbr-pad: clock = \"flip\"\r\n"
+                              "# xbr-pad: length = 61\r\n# xbr-pad: host_os = \"macos\"\r\n"
+                              "f10:a:5\r\nf40:@open:menu.xpr\r\nf45:b:2\r\nf60:@end\r\n";
+    char kept[sizeof run + 64];
+    const char *f, *steps = strstr(run, "f10:a:5");
+    char why[160];
+    int64_t week = (int64_t)time(NULL) - 7 * 86400;
+    PadrecStatus st;
+    FILE *big;
+
+    padrec_stub_reset();
+    recs_clear();
+    s_tid = 0x4d530065;
+    MKDIR(EXPORTS);
+    write_file(EXPORTS "/other.pad", "# xbr-export: pad 1\n# xbr-pad: title = \"BLiNX\"\n"
+                                     "# xbr-pad: title_id = \"4d530018\"\nf10:a\n");
+    write_file(EXPORTS "/run.pad", run);
+    big = fopen(EXPORTS "/big.pad", "wb");
+    CHECK(big != NULL);
+    if (big) {
+        fseek(big, (5L << 20) - 1, SEEK_SET);
+        fputc('\n', big);
+        fclose(big);
+    }
+    write_file(EXPORTS "/notes.toml", "a = 1\n");
+
+    start_with(ARMED, k_mods);
+    nv2a_overlay_set_game("BLiNX 2");             /* the start resets it */
+    open_menu();
+    CHECK(enhance_menu_set_page("Recordings"));
+    CHECK(enhance_menu_select_row("Import"));
+    tap(0x0D);
+    /* Recordings only, from Exports. */
+    CHECK(row_value("run.pad") != NULL && row_value("notes.toml") == NULL);
+    CHECK(enhance_menu_select_row("other.pad"));
+    tap(0x0D);
+    CHECK(status_has("a recording of BLiNX (4d530018), not of BLiNX 2 (4d530065)"));
+    CHECK(enhance_menu_select_row("big.pad"));
+    tap(0x0D);
+    CHECK(status_has("over 4 MB: not imported"));
+    /* The preview: its Info, then Import. */
+    CHECK(enhance_menu_select_row("run.pad"));
+    tap(0x0D);
+    CHECK(row_value("File") && !strcmp(s_val, "run.pad"));
+    CHECK(row_value("Game") && !strcmp(s_val, "BLiNX 2 (4d530065)"));
+    CHECK(row_value("Another game") == NULL);
+    CHECK(row_value("Made on") && !strcmp(s_val, "macos"));
+    CHECK(row_value("Length") && !strcmp(s_val, "61 flips"));
+    CHECK(row_value("Anchors") && !strcmp(s_val, "1"));
+    CHECK(enhance_menu_select_row("Import"));
+    tap(0x0D);
+    CHECK(status_has("Imported as run.pad"));
+    CHECK(!strcmp(read_file(RECS "/run.pad"), run));    /* byte for byte */
+    CHECK(row_value("run.pad") != NULL && row_value("Record") != NULL);
+    /* Again: a new name, nothing replaced. */
+    CHECK(enhance_menu_select_row("Import"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("run.pad"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Import"));
+    tap(0x0D);
+    CHECK(status_has("Imported as run-2.pad"));
+
+    /* The file's page: its header as Info. */
+    CHECK(enhance_menu_select_row("run.pad"));
+    tap(0x0D);
+    CHECK(row_value("Game") && strstr(s_val, "4d530065"));
+    CHECK(row_value("Origin") && !strcmp(s_val, "recorded in the game"));
+    CHECK(row_value("Steps") != NULL && row_value("Cannot be played") == NULL);
+    CHECK(enhance_menu_row_help(row_index("Play"))[0] && !strstr(
+              enhance_menu_row_help(row_index("Play")), "not of"));
+
+    /* A week-old recording, played once: a rename keeps its date, and
+     * Play again follows it to its new name. */
+    {
+#ifdef _WIN32
+        struct _utimbuf u = { (time_t)week, (time_t)week };
+        CHECK(_utime(RECS "/run.pad", &u) == 0);
+#else
+        struct utimbuf u = { (time_t)week, (time_t)week };
+        CHECK(utime(RECS "/run.pad", &u) == 0);
+#endif
+    }
+    CHECK(enhance_padrec_play_file("run.pad", 0, why, sizeof why) == 0);
+    padrec_stop();
+
+    /* Rename: a refused name keeps the field; the header's name follows. */
+    CHECK(enhance_menu_select_row("Rename"));
+    tap(0x0D);
+    CHECK(xbox_InputTextActive());
+    name_type("CON");
+    CHECK(xbox_InputTextActive());
+    CHECK(enhance_menu_status()[0] != 0);
+    name_type("run-2");
+    CHECK(xbox_InputTextActive());
+    CHECK(status_has("run-2.pad is taken"));
+    name_type("first run");
+    CHECK(!xbox_InputTextActive());
+    CHECK(status_has("Renamed to first run.pad"));
+    CHECK(!fb_exists(RECS "/run.pad"));
+    f = read_file(RECS "/first run.pad");
+    CHECK(strstr(f, "# xbr-pad: name = \"first run\"") != NULL);
+    CHECK(strstr(f, "\"run\"") == NULL);
+    CHECK(strstr(f, steps) != NULL);                     /* the steps, CRLF kept */
+    snprintf(kept, sizeof kept, "%s", f);
+    CHECK(row_value("Rename") != NULL);                  /* still on its page */
+    CHECK(recs_mtime("first run.pad") == week);          /* not today's */
+    CHECK(enhance_padrec_again(0, why, sizeof why) == 0);
+    padrec_status(&st);
+    CHECK(!strcmp(st.name, "first run"));
+    padrec_stop();
+
+    /* Export: its own name, the bytes as they are. */
+    CHECK(enhance_menu_select_row("Export"));
+    tap(0x0D);
+    CHECK(row_value("Export here as") && !strcmp(s_val, "first run.pad"));
+    CHECK(enhance_menu_select_row("Export here as"));
+    tap(0x0D);
+    tap(0x0D);
+    CHECK(status_has("Exported to ") && status_has("first run.pad"));
+    CHECK(!strcmp(read_file(EXPORTS "/first run.pad"), kept));
+    tap(0x08);                                    /* Exports, then the roots */
+    tap(0x08);
+    CHECK(row_value("Rename") != NULL);
+
+    /* Delete asks first, the focus on No: A at once keeps it. */
+    CHECK(enhance_menu_select_row("Delete"));
+    tap(0x0D);
+    CHECK(row_value("Yes, delete it") != NULL && row_value("Rename") == NULL);
+    tap(0x0D);
+    CHECK(status_has("Not deleted"));
+    CHECK(fb_exists(RECS "/first run.pad"));
+    CHECK(row_value("Rename") != NULL);
+    CHECK(enhance_menu_select_row("Delete"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Yes, delete it"));
+    tap(0x0D);
+    CHECK(status_has("Deleted first run.pad"));
+    CHECK(!fb_exists(RECS "/first run.pad"));
+    CHECK(row_value("Record") != NULL && row_value("first run.pad") == NULL);
+    why[0] = 0;
+    CHECK(enhance_padrec_again(0, why, sizeof why) < 0 && strstr(why, "nothing played"));
+
+    /* Copied in by hand, past the import: another game's file and one
+     * recorded from boot show, with Play dimmed and refused. */
+    write_file(RECS "/other.pad", "# xbr-export: pad 1\n# xbr-pad: title = \"BLiNX\"\n"
+                                  "# xbr-pad: title_id = \"4d530018\"\n"
+                                  "# xbr-pad: origin = \"session\"\nf10:a\nf20:@end\n");
+    write_file(RECS "/boot.pad", "f10:a\nf20:@end\n");
+    padrec_stub_set(&(PadrecStatus){ .serial = 9, .state = PADREC_STOPPED });
+    CHECK(enhance_menu_select_row("other.pad"));
+    tap(0x0D);
+    CHECK(row_value("Another game") != NULL);
+    CHECK(strstr(enhance_menu_row_help(row_index("Play")),
+                 "a recording of BLiNX (4d530018), not of BLiNX 2 (4d530065)") != NULL);
+    CHECK(enhance_menu_select_row("Play"));
+    tap(0x0D);
+    CHECK(status_has("Play: a recording of BLiNX"));
+    CHECK(pr_state() == PADREC_STOPPED);
+    /* The shortcut and Play again reach padrec_play, which checks the
+     * title too (tests/pad_session). */
+    tap(0x08);
+    CHECK(enhance_menu_select_row("boot.pad"));
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_row_help(row_index("Play")), "Recorded from boot") != NULL);
+    CHECK(enhance_menu_select_row("Play"));
+    tap(0x0D);
+    CHECK(status_has("Play: Recorded from boot"));
+    tap(0x08);
+    remove(RECS "/other.pad");
+    remove(RECS "/boot.pad");
+    padrec_stub_set(&(PadrecStatus){ .serial = 10, .state = PADREC_STOPPED });
+
+    /* An env key: no import, rename or delete; Info and Export stay. */
+    padrec_stub_env("RECOMP_PAD_SCRIPT");
+    CHECK(enhance_menu_select_row("Import"));
+    tap(0x0D);
+    CHECK(status_has("Read only"));
+    CHECK(row_value("Export here as") == NULL);
+    CHECK(enhance_menu_select_row("run-2.pad"));
+    tap(0x0D);
+    CHECK(row_value("Steps") != NULL);
+    CHECK(enhance_menu_select_row("Rename"));
+    tap(0x0D);
+    CHECK(status_has("Read only") && !xbox_InputTextActive());
+    CHECK(enhance_menu_select_row("Export"));
+    tap(0x0D);
+    CHECK(row_value("Export here as") != NULL);
+    files_quit();
+    padrec_stub_env(NULL);
+
+    padrec_stub_reset();
+    recs_clear();
+    remove(EXPORTS "/other.pad");
+    remove(EXPORTS "/run.pad");
+    remove(EXPORTS "/big.pad");
+    remove(EXPORTS "/notes.toml");
+    remove(EXPORTS "/first run.pad");
+    rmdir(EXPORTS);
+    remove("config/config.toml");
+    nv2a_overlay_set_game(NULL);
+    s_tid = 0;
 }
 
 int main(int argc, char **argv)
@@ -6050,6 +6309,7 @@ int main(int argc, char **argv)
     test_files_folders();
     test_saves();
     test_padrec_page();
+    test_padrec_files();
     test_shots();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();

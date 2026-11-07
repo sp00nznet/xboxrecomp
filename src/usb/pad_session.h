@@ -106,6 +106,13 @@ int padrec_play(const char *const *paths, int n, unsigned flags, char *why, size
 /* The last playback again, from the next padrec_release (it does not
  * rewind the game: the player goes back to the start point first). */
 int padrec_again(unsigned flags, char *why, size_t whyn);
+/* The running title (id, name), set before a play: padrec_play refuses a
+ * file whose header names another title_id. 0 checks nothing. */
+void padrec_set_title(uint32_t title_id, const char *title);
+/* A recording was renamed (to its new path) or deleted (to NULL): the
+ * last playback follows, so padrec_again plays it under its new name or
+ * says nothing was played. */
+void padrec_path_moved(const char *from, const char *to);
 /* Stop whatever runs or waits: a record ends with @end. */
 void padrec_stop(void);
 void padrec_record_stop(void);

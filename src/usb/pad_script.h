@@ -71,6 +71,11 @@
  * same number. */
 #define PAD_STEPS_MAX 131072
 
+/* A recording or a setup is text at about 32 bytes a step: PAD_STEPS_MAX
+ * steps fit in 4 MB, the import cap (R5). A larger file is not read, by the
+ * session or by the menu's import. */
+#define PAD_FILE_MAX (4L << 20)
+
 /* An unheld flip-timed step lasts this many flips, the 150 ms default of the
  * millisecond form at 60 flips a second. */
 #define PAD_HOLD_FLIPS_DEFAULT 9

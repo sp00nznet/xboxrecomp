@@ -15,8 +15,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #include "microui.h"
+#include "pad_header.h"
 #include "pad_session.h"
 
 #ifdef __cplusplus
@@ -66,8 +68,51 @@ int enhance_padrec_list(struct enhance_padrec_file *out, int max);
 int enhance_padrec_record(int armed, const char *start_point, char *why, size_t n);
 /* Play a file of the folder (its name) now or armed. 0, or -1 with why. */
 int enhance_padrec_play_file(const char *name, int armed, char *why, size_t n);
+/* The last playback again (Play again), now or armed. 0, or -1 with why. */
+int enhance_padrec_again(int armed, char *why, size_t n);
+/* Whether a file whose Info read gave rc (rc_why) and *info plays here:
+ * read whole, recorded in the game (origin session), and this title's.
+ * 1, or 0 with why (Play's help on its page). */
+int enhance_padrec_playable(const PadFileInfo *info, int rc, const char *rc_why, char *why,
+                            size_t n);
 /* The last file played or recorded ("" for none), for the play action. */
 const char *enhance_padrec_last(void);
+
+/* ---- the files (R5): import, export, rename, delete, Info ---------------- */
+
+/* A new recording's stem: "<game>-<yyyymmdd-hhmm>" at local time t, the
+ * game the running title's name as a slug ("pad" without one). */
+void enhance_padrec_default_stem(time_t t, char *out, size_t n);
+
+/* Check text (len bytes, as read) for an import into the running title:
+ * pad_file_check with its title id and name. 0 with *info, or -1 with
+ * why. */
+int enhance_padrec_check(const char *text, size_t len, PadFileInfo *info, char *why,
+                         size_t n);
+
+/* Copy a checked text into the folder under a name not taken, from the
+ * picked file's name (src_name, its .pad dropped; the default stem when
+ * fb_name_check refuses it). The name used into out. 0, or -1 with why. */
+int enhance_padrec_import(const char *src_name, const char *text, size_t len, char *out,
+                          size_t on, char *why, size_t n);
+
+/* A file of the folder (its name), read whole for an export: malloc'd,
+ * NUL ended, at most PAD_FILE_MAX bytes. 0, or -1 with why. */
+int enhance_padrec_read(const char *name, char **text, size_t *len, char *why, size_t n);
+
+/* A file's header and counts for Info: any title's file shows. 0, or -1
+ * with why. */
+int enhance_padrec_info(const char *name, PadFileInfo *info, char *why, size_t n);
+
+/* Rename a file to typed (fb_name_check, ".pad" added): the header's name
+ * follows, so the strip shows the new one. Refused for the file a record
+ * is writing and under an env key. The new name into out. 0, or -1 with
+ * why. */
+int enhance_padrec_rename(const char *name, const char *typed, char *out, size_t on,
+                          char *why, size_t n);
+
+/* Delete a file of the folder: refused as rename is. 0, or -1 with why. */
+int enhance_padrec_delete(const char *name, char *why, size_t n);
 
 /* overlay.padrec_hud: auto, off. "on" (env-driven scripts too) waits
  * until the env path reports a status (pad-recording-ui tasks 5). */

@@ -646,6 +646,60 @@ static int no_dos(const char *u, char *out, size_t n)
     return 0;
 }
 
+/* Recordings (pad-recording-ui R5): a .pad import has its own 4 MB cap, a
+ * reserved stem is refused with .pad as with .toml, and a non-ASCII stem
+ * goes in and reads back. */
+static void test_pad_files(void)
+{
+    enum { PAD_CAP = 4 << 20 };
+    struct file_browser fb;
+    char p[FB_PATH_MAX], out[FB_ENTRY_NAME_MAX], name[96];
+    const char *why = NULL;
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *f;
+    int i;
+
+    dir("pads");
+    path(p, "pads/big.pad");
+    f = fopen(p, "wb");
+    CHECK(f != NULL);
+    if (f) {
+        /* 5 MB, sparse: a size the stat refuses, before a byte is read */
+        fseek(f, (5L << 20) - 1, SEEK_SET);
+        fputc('\n', f);
+        fclose(f);
+    }
+    CHECK(fb_read_file(p, PAD_CAP, &buf, &len) == FB_E_TOO_BIG && !buf);
+    put("pads/ok.pad", "g0:a\n");
+    fb_init(&fb);
+    path(p, "pads");
+    CHECK(fb_root_add(&fb, "Pads", p, FB_ROOT_OTHER, 0) == 0);
+    fb_set_filter(&fb, ".pad");
+    CHECK(fb_open_root(&fb, 0) == FB_OK);
+    i = row(&fb, "big.pad");
+    CHECK(i >= 0 && fb_import_entry(&fb, i, PAD_CAP, &buf, &len) == FB_E_TOO_BIG && !buf);
+    i = row(&fb, "ok.pad");
+    CHECK(i >= 0 && fb_import_entry(&fb, i, PAD_CAP, &buf, &len) == FB_OK && buf
+          && !strcmp(buf, "g0:a\n"));
+    free(buf);
+    buf = NULL;
+    fb_free(&fb);
+
+    CHECK(fb_name_check("CON", ".pad", out, sizeof out, &why) == -1 && why);
+    CHECK(fb_name_check("nul.pad", ".pad", out, sizeof out, &why) == -1 && why);
+    CHECK(fb_name_check("LPT9", ".pad", out, sizeof out, &why) == -1 && why);
+    CHECK(!fb_name_check("run 2.pad", ".pad", out, sizeof out, &why)
+          && !strcmp(out, "run 2.pad"));
+
+    path(p, "pads");
+    CHECK(fb_import_unique(p, "caf\xc3\xa9-\xe6\x97\xa5", ".pad", "g1:b\n", 5, name, sizeof name)
+          == FB_OK && !strcmp(name, "caf\xc3\xa9-\xe6\x97\xa5.pad"));
+    path(p, "pads/caf\xc3\xa9-\xe6\x97\xa5.pad");
+    CHECK(fb_read_file(p, PAD_CAP, &buf, &len) == FB_OK && len == 5 && !strcmp(buf, "g1:b\n"));
+    free(buf);
+}
+
 static void test_homes(void)
 {
     char out[FB_PATH_MAX], home[FB_PATH_MAX], user[FB_PATH_MAX];
@@ -722,6 +776,7 @@ int main(void)
     test_links_and_denied();
 #endif
     test_files();
+    test_pad_files();
     test_homes();
     printf("%d checks, %d failed\n", s_checks, s_failed);
     if (!s_failed) {

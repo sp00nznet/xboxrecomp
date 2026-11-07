@@ -5,7 +5,9 @@
  * checks it exists; the state moves as the real one does on the menu thread
  * (ARMED until padrec_release, then REC or PLAY), with no pad thread.
  * padrec_stub_set puts a status for the page's rows; padrec_stub_env makes
- * an env key drive the pad.
+ * an env key drive the pad. A record's file holds a session header and
+ * its @end, so the page's Info finds it playable; the last playback
+ * follows a rename or delete. The title check is pad_session's (its test).
  */
 #include "pad_session.h"
 
@@ -38,6 +40,18 @@ void padrec_stub_reset(void)
     memset(&s_st, 0, sizeof s_st);
     s_env = NULL;
     s_last[0] = 0;
+}
+
+void padrec_set_title(uint32_t title_id, const char *title)
+{
+    (void)title_id;
+    (void)title;
+}
+
+void padrec_path_moved(const char *from, const char *to)
+{
+    if (from && !strcmp(s_last, from))
+        snprintf(s_last, sizeof s_last, "%s", to ? to : "");
 }
 
 static void start(const char *path, int kind, unsigned flags)
@@ -82,6 +96,7 @@ int padrec_record_start(const char *path, const PadrecMeta *meta, unsigned flags
         snprintf(why, whyn, "cannot write");
         return -1;
     }
+    fputs("# xbr-export: pad 1\n# xbr-pad: origin = \"session\"\nf1:@end\n", f);
     fclose(f);
     start(path, PADREC_REC, flags);
     return 0;

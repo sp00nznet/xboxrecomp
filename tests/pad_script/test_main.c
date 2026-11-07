@@ -968,6 +968,88 @@ static void test_anchor_lines(void)
     free(t);
 }
 
+static int file_refused(const char *text, char *why, size_t n)
+{
+    return pad_file_check(text, strlen(text), 0, NULL, NULL, why, n) < 0;
+}
+
+/* pad_file_check: the import's gate (pad-recording-ui R5). */
+static void test_file_check(void)
+{
+    static const char good[] = "# xbr-export: pad 1\r\n# xbr-pad: title = \"BLiNX\"\r\n"
+                               "# xbr-pad: title_id = \"4d530018\"\r\n"
+                               "# xbr-pad: origin = \"session\"\r\n"
+                               "g10:a:5\r\ng40:@open:menu.xpr\r\ng45:b\r\n";
+    PadFileInfo fi;
+    char why[160], *t;
+    const char *bare;
+    size_t cap, o = 0;
+
+    CHECK(pad_file_check(good, strlen(good), 0x4d530018, "BLiNX", &fi, why, sizeof why) == 0);
+    CHECK(fi.steps >= 2 && fi.anchors == 1);
+    CHECK(!strcmp(pad_header_get(&fi.h, "title"), "BLiNX"));
+    /* Title 0 (Info) shows any game's file. */
+    CHECK(pad_file_check(good, strlen(good), 0, NULL, &fi, why, sizeof why) == 0);
+    /* Another title: both games named. */
+    CHECK(pad_file_check(good, strlen(good), 0x4d530065, "BLiNX 2", NULL, why, sizeof why) < 0);
+    CHECK(strstr(why, "BLiNX (4d530018)") && strstr(why, "not of BLiNX 2 (4d530065)"));
+    /* A newer format, another kind, a NUL inside, nothing to play. */
+    CHECK(file_refused("# xbr-export: pad 2\ng0:a\n", why, sizeof why));
+    CHECK(strstr(why, "newer") != NULL);
+    CHECK(file_refused("# xbr-export: config 1\ng0:a\n", why, sizeof why));
+    CHECK(pad_file_check("g0:a\0g1:b\n", 10, 0, NULL, NULL, why, sizeof why) < 0);
+    CHECK(strstr(why, "not a text file") != NULL);
+    CHECK(file_refused("# xbr-export: pad 1\n# only notes\n", why, sizeof why));
+    CHECK(strstr(why, "no steps") != NULL);
+    CHECK(pad_file_check("g0:a\n", (size_t)PAD_FILE_MAX + 1, 0, NULL, NULL, why, sizeof why)
+          < 0);
+    CHECK(strstr(why, "over 4 MB") != NULL);
+    /* No header: an env record, any title. */
+    bare = "f10:a\nf20:b\n";
+    CHECK(pad_file_check(bare, strlen(bare), 0x4d530065, "BLiNX 2", &fi, why, sizeof why) == 0);
+    CHECK(!fi.h.present && fi.steps >= 2);
+
+    /* The caps: one anchor and one step past them. */
+    cap = (size_t)(PAD_STEPS_MAX + 2) * 16;
+    t = malloc(cap);
+    for (int i = 0; i < PAD_ANCHOR_MAX + 1; i++)
+        o += (size_t)snprintf(t + o, cap - o, "g%d:@open:stg%d\ng%d:a\n", i * 10, i, i * 10 + 1);
+    CHECK(pad_file_check(t, o, 0, NULL, NULL, why, sizeof why) < 0);
+    CHECK(strstr(why, "anchors, over 256") != NULL);
+    o = 0;
+    for (int i = 0; i < PAD_STEPS_MAX + 1; i++)
+        o += (size_t)snprintf(t + o, cap - o, "g%d:a\n", i);
+    CHECK(pad_file_check(t, o, 0, NULL, NULL, why, sizeof why) < 0);
+    CHECK(strstr(why, "more than") != NULL);
+    free(t);
+}
+
+/* A rename's new header: the steps and their CRLF as they were. */
+static void test_header_replace(void)
+{
+    static const char in[] = "\xEF\xBB\xBF# xbr-export: pad 1\r\n# xbr-pad: name = \"old\"\r\n"
+                             "# a note kept\r\n\r\ng10:a:5\r\n# xbr-pad: name = \"step part\"\r\n"
+                             "g20:b\r\n";
+    PadHeader h;
+    char *out;
+
+    CHECK(pad_header_read(in, &h) == PAD_HDR_OK && h.present);
+    CHECK(pad_header_set_text(&h, "name", "new one") == 0);
+    out = pad_header_replace(in, &h);
+    CHECK(out != NULL);
+    if (!out)
+        return;
+    CHECK(!strncmp(out, "# xbr-export: pad 1\n", 20));
+    CHECK(strstr(out, "name = \"new one\"\n") != NULL);
+    CHECK(strstr(out, "\"old\"") == NULL);
+    CHECK(strstr(out, "\xEF\xBB\xBF") == NULL);
+    CHECK(strstr(out, "# a note kept\r\n\r\ng10:a:5\r\n# xbr-pad: name = \"step part\"\r\n"
+                      "g20:b\r\n") != NULL);
+    CHECK(pad_header_read(out, &h) == PAD_HDR_OK);
+    CHECK(!strcmp(pad_header_get(&h, "name"), "new one"));
+    free(out);
+}
+
 static void check_record(const char *text, int clock, int anchors)
 {
     static PadAnchors a;
@@ -1077,6 +1159,8 @@ int main(int argc, char **argv)
     test_record_formats();
     test_header();
     test_anchor_lines();
+    test_file_check();
+    test_header_replace();
     check_files(argc, argv);
     if (fails) {
         fprintf(stderr, "pad_script: %d failure(s)\n", fails);
