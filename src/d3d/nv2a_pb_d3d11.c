@@ -2224,7 +2224,7 @@ static ID3D11UnorderedAccessView *s_mag_uav;
 static struct nv2a_tex_mag_draw  *s_mag_rec[2];
 static unsigned s_mag_n[2], s_mag_cur;
 static int      s_mag_copied[2], s_mag_state;   /* s_mag_state: 0 not tried, 1 ok, -1 failed */
-/* What setup_pixel bound, for the trace's draw. */
+/* What setup_pixel bound, for the trace's draw and the dump's facts. */
 static uint64_t s_mag_hash[NV2A_TEX_MAG_STAGES];
 static uint32_t s_mag_scale[NV2A_TEX_MAG_STAGES];
 
@@ -2778,6 +2778,7 @@ struct aspect_batch {
     uint32_t lo, count, nidx;
     float lo_x, hi_x;
     int vary_z;         /* a program's 2D batch off one oPos.z (nv2a_aspect_gate) */
+    unsigned bump_src;  /* setup_pixel's nv2a_bump_sources, for the dump's facts */
     int post_tex;       /* a full-width 2D pass whose picture nv2a_aspect_place_tex dropped */
     /* The batch, for the copy test (aspect_copy_tracks): any batch. */
     const struct nv2a_pb_draw *draw;
@@ -2937,6 +2938,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
     stages_cube_rt();
     bump_src = nv2a_bump_sources(s_stage, v->rc_set && (v->rc_ctl & 0xFF),
                                  v->other_stage_input);
+    hp->bump_src = bump_src;
     {
         static int bump_trace = -1;
         if (bump_trace < 0)
@@ -2963,6 +2965,11 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         unsigned flat_mask, zero_mask;
         ID3D11ShaderResourceView *srv[4];
         TexEntry *e[4];
+        /* By value: a later stage's bind can evict an earlier stage's entry
+         * at a small tex_cache, and the dump must not read a freed or reused
+         * slot's hash. */
+        uint64_t hash[4];
+        uint32_t scale[4];
         const char *src[4];
     } lm;
     /* A combiner draw binds cube maps as cubes, the basic shader as face 0. */
@@ -3001,6 +3008,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         int cube = combiner && nv2a_stage_cube_bind(t, ps_mode);
         RenderTarget *src = (t->mode && t->mode != 4 && !cube && !zero) ? rt_texture(t) : NULL;
         lm.e[n] = NULL;
+        lm.hash[n] = 0;
+        lm.scale[n] = 1u;
         s_stage_rt[n] = src;
         s_stage_src[n] = !t->mode ? "none" : t->mode == 4 ? "passthru" : "cache";
         if (src) {
@@ -3022,6 +3031,10 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
             srv[n] = tex_bind(t, cube);
             flat_mask |= (unsigned)cube << n;
             lm.e[n] = s_tex_last;
+            if (lm.e[n]) {
+                lm.hash[n] = lm.e[n]->hash;
+                lm.scale[n] = lm.e[n]->pack_scale;
+            }
             if (srv[n] == s_magenta_srv) s_stage_src[n] = "MAGENTA(undecoded)";
             else if (srv[n] == s_black_srv || srv[n] == s_black_cube_srv)
                 s_stage_src[n] = "BLACK(too large/failed)";
@@ -3031,10 +3044,10 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         }
         smp[n] = sampler(t, bump_src >> n & 1, lm.e[n]);
     }
-    if (nv2a_tex_mag_on())
+    if (nv2a_tex_mag_on() || nv2a_tex_dump_on())
         for (n = 0; n < 4; n++) {
-            s_mag_hash[n] = lm.e[n] ? lm.e[n]->hash : 0;
-            s_mag_scale[n] = lm.e[n] ? lm.e[n]->pack_scale : 1u;
+            s_mag_hash[n] = lm.hash[n];
+            s_mag_scale[n] = lm.scale[n];
         }
     if (!lhit) {
         /* Taken after the loop: tex_bind's own uploads moved the counters. */
@@ -4364,6 +4377,36 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         if (hp.post_tex && aspect_trace())
             aspect_log_post(vs->hash, rt, hp.place);
         set_vp(v, g, rt, hp.place, hp.two_d || flat, lift, cb);
+        if (nv2a_tex_dump_on()) {
+            /* Its own buffer use comes after the Hor+ scan's, which it never
+             * feeds: the dump must not move a frame. */
+            int dump_2d = !d->program;
+            if (d->program && nv2a_tex_dump_draw_open(s_mag_hash)) {
+                int slot[NV2A_VS_MAX_INPUTS];
+                unsigned nf4 = 0;
+                dump_2d = -1;
+                for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
+                    if (vs->inputs & (1u << i))
+                        slot[nf4++] = (int)i;
+                if ((size_t)count * nf4 * 4u > hvf_cap) {
+                    float *grown = (float *)realloc(hvf, (size_t)count * nf4 * 16u);
+                    if (grown) {
+                        hvf = grown;
+                        hvf_cap = (size_t)count * nf4 * 4u;
+                    }
+                }
+                if ((size_t)count * nf4 * 4u <= hvf_cap) {
+                    for (k = 0; k < count; k++)
+                        for (i = 0; i < nf4; i++)
+                            vtx_input(d, v, (unsigned)slot[i], lo + k,
+                                      hvf + ((size_t)k * nf4 + i) * 4u);
+                    dump_2d = nv2a_aspect_batch_2d((const uint32_t (*)[4])v->prog, v->start,
+                                                   (float (*)[4])(uintptr_t)v->c, hvf, nf4,
+                                                   slot, count, v->depth_enable);
+                }
+            }
+            nv2a_tex_dump_draw(s_mag_hash, hp.bump_src, dump_2d);
+        }
         if (mag_shader(d))
             mag_draw();
         else if (nv2a_tex_mag_on() && topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)

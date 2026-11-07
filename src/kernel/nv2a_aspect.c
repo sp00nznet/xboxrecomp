@@ -62,6 +62,41 @@ int nv2a_aspect_scan(struct nv2a_aspect_gate *gate,
     return 1;
 }
 
+int nv2a_aspect_batch_2d(const uint32_t prog[][4], uint32_t start, float c[][4],
+                         const float *vf, unsigned nf4, const int *slot, uint32_t count,
+                         int depth_test)
+{
+    float in[NV2A_VSH_INPUTS][4], w0 = 0.0f, z0 = 0.0f;
+    Nv2aVshOut out;
+    uint32_t step = count > 32 ? count / 32 : 1, j;
+    unsigned k;
+
+    if (!count)
+        return -1;
+    for (j = 0; j < count; j += step) {
+        const float *p = out.o[NV2A_VSH_O_POS];
+        memset(in, 0, sizeof in);
+        for (k = 0; k < nf4; k++)
+            if (slot[k] >= 0 && slot[k] < NV2A_VSH_INPUTS)
+                memcpy(in[slot[k]], vf + ((size_t)j * nf4 + k) * 4u, 16);
+        nv2a_vsh_run((const uint32_t (*)[4])prog, start, (float (*)[4])c, 0,
+                     (const float (*)[4])in, &out);
+        /* A program the interpreter can't finish says nothing of the batch:
+         * a false here would settle the hash as 3D for good. */
+        if (!out.ok)
+            return -1;
+        if (j == 0) {
+            if (!nv2a_aspect_layer_w(p[3]) && (depth_test || !nv2a_aspect_flat_w(p[3])))
+                return 0;
+            w0 = p[3];
+            z0 = p[2];
+        } else if (p[3] != w0 || p[2] != z0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int nv2a_aspect_screen_quad(const uint32_t prog[][4], uint32_t start, float c[][4],
                             const float *vf, unsigned nf4, const int *slot, uint32_t count,
                             float (*xy)[2], float *lo, float *hi)

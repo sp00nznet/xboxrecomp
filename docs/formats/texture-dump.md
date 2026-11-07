@@ -36,6 +36,7 @@ written at the upload:
   dump saw, repeats included.
 - `volatile.json`: `[{"offset", "width", "height", "hashes": [8 hashes]}]`,
   the addresses the dump gave up on.
+- `render_targets.json`: the targets a stage sampled (below).
 
 Each file is written to `<name>.tmp` and renamed, so a killed run never
 leaves half a file under its real name.
@@ -81,7 +82,10 @@ entry, so a dumped texture goes into a pack unchanged.
   "lod_min": 0, "lod_max": 8, "cube": false,
   "offset": "0x00A41000",
   "first_flip": 312,
-  "texels": true
+  "texels": true,
+  "bump": false,
+  "rt": false,
+  "drawn_2d": true
 }
 ```
 
@@ -96,6 +100,74 @@ entry, so a dumped texture goes into a pack unchanged.
 - `offset`: the guest address at the first upload.
 - `texels`: whether a `.xtd` holds the texels (below).
 
+The last three are what only a draw or a bind can tell, so they start false
+or absent at the first upload and are rewritten by each summary that has
+something new. A run that ends without its exit summary loses what it learnt
+since the last one.
+
+- `bump`: a draw read this hash as slopes for another stage (a bump or
+  dot-product shader mode).
+- `rt`: an address and size this hash was uploaded at were also **sampled** by
+  a stage as a live render target, before or after the upload. Any of the
+  addresses it sat at counts. Addresses compare on their low 27 bits, as the
+  backends' target lookup does, so two windows onto the same memory match;
+  width and height must be equal; the format is not compared, since a target
+  has its own. It says nothing of a target only rendered to: a write-back the
+  game reads as a plain texture (one the runtime decoded from guest memory
+  because no live target served it) is not flagged unless that address and
+  size were sampled live too, and under the `*_NO_RTT` debug keys no target is
+  ever sampled, so nothing is flagged. A texture whose memory was later reused
+  for a target of the same size is a false positive, which is why a build's
+  rule may bring an `rt` entry back. The targets themselves are in
+  `render_targets.json`; those past its table mark nothing.
+- `drawn_2d`: `true` when every draw seen of the hash was 2D, `false` once one
+  was not, and absent when no draw was seen, so a scene that only loaded a
+  texture has no say. 2D is a pass-through batch, or a program batch whose
+  sampled positions (at most about 33 vertices, evenly spaced) the vertex
+  interpreter finds at one z and one w, that w a whole number from 1 to 1024
+  (a screen layer) or, with the depth test off, the reciprocal of a whole number
+  from 2 to 1024 (a near layer, such as Burnout 3's menus at w 0.1). An
+  orthographic model with depths is not 2D, nor a flat quad at any other w
+  (1.5). A batch with no vertices, inputs that could not be read or a program
+  the interpreter cannot finish gives no answer, which leaves the fact as it
+  was. This is about the batch and not the target: an element drawn flat into
+  an offscreen target counts as 2D.
+
+Old dumps have no `bump`: unknown, not false.
+
+What these facts cannot promise:
+
+- `drawn_2d` is of the batch as drawn, after draw merging (`merge_on` in
+  `nv2a_pb_exec.c`). The samples are spread over the merged count, and Hor+ or
+  the snap change what merges, so turning those on can change an answer.
+- A pass-through batch always counts as 2D, so a game that transforms its 3D in
+  software and submits it pre-transformed has that 3D class as `ui`.
+- The facts can differ per backend. Metal drops a batch that writes nothing
+  before the dump sees it; D3D11 counts it.
+- A run into a directory that already holds a dump starts over for each hash it
+  uploads: the first upload's sidecar has `bump` and `rt` false and no
+  `drawn_2d`, whatever the old file held, until this run learns them again. A
+  hash this run never uploads keeps its old file. Dump each scene to its own
+  directory; an inventory merges them.
+
+## `render_targets.json`
+
+```json
+{
+  "targets": [
+    {"offset": "0x03A00000", "width": 640, "height": 480, "format_id": 7, "binds": 918}
+  ],
+  "dropped_binds": 0
+}
+```
+
+Each distinct target (offset on its low 27 bits, size, format) a stage sampled,
+with its binds over the run. The table holds 1024; `dropped_binds` counts the
+binds of targets past it, which have no row and mark no `rt`, and a nonzero
+count also shows in the summary line. These have no hash, so this list is the
+only record of them; an inventory reads the `<hash>.json` files and does not
+read this file, since no pack entry could match a row. It is a diagnostic.
+
 ## What is not written
 
 Counted in the summary instead:
@@ -109,8 +181,9 @@ Counted in the summary instead:
   frames swapped in place stay under the limit; a surface the CPU rewrites
   each frame does not.
 - **Render targets**: a stage bound to a render target has no guest texels
-  to hash. Binds and distinct targets (offset, size, format, up to 1024) are
-  counted.
+  to hash, so it has no `<hash>.json` or `.xtd` and no pack entry. Binds and
+  distinct targets (up to 1024) are counted, and each is one row of
+  `render_targets.json` (above).
 - **Over size**: a texture wider or taller than a pack entry may be (16384).
 
 ## Limits and errors
@@ -146,8 +219,8 @@ backends' only added work per upload is one test.
 
 `RECOMP_TRACE=tex_mag` records how far each texture is ever magnified on
 screen, what its upscale can be for. It works with or without the dump. With
-the dump, each hash's `<hash>.json` also has these fields, rewritten by every
-summary:
+the dump, each hash's `<hash>.json` also has these fields, last, rewritten by
+every summary:
 
 ```
 "mag_max": 12.000,     highest host pixels per source texel

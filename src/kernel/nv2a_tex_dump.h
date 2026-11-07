@@ -84,9 +84,23 @@ int nv2a_tex_dump_wants(const struct nv2a_stage *t, uint64_t hash);
 void nv2a_tex_dump_upload(const struct nv2a_stage *t, uint64_t hash,
                           const uint32_t *levels);
 
-/* A stage bound to a render target instead of guest texels: counted per
- * bind and per distinct target (offset, size, format). */
+/* A stage sampling a render target instead of guest texels: counted per
+ * bind and per distinct target (offset, size, format), listed in
+ * render_targets.json, and a hash uploaded at that address (low 27 bits) and
+ * size, before or after, gets `rt` in its sidecar. A target only rendered
+ * to and never sampled live is not seen here. */
 void nv2a_tex_dump_rt(const struct nv2a_stage *t);
+
+/* A draw, with what its stages have bound (hash 0: no cache entry). Goes
+ * into the sidecars at the next summary. bump_stages is a mask of stages read
+ * as slopes (nv2a_bump_sources). two_d: the batch is 2D (a backend's
+ * nv2a_aspect_batch_2d, or pass-through), 0 it is not, -1 unknown. */
+#define NV2A_TEX_DUMP_STAGES 4
+void nv2a_tex_dump_draw(const uint64_t hash[NV2A_TEX_DUMP_STAGES], unsigned bump_stages, int two_d);
+
+/* Whether a draw of these could still change a `drawn_2d`: one 3D draw settles
+ * a hash, so a backend only runs the vertex interpreter for the others. */
+int nv2a_tex_dump_draw_open(const uint64_t hash[NV2A_TEX_DUMP_STAGES]);
 
 /* A present: the flip the next first sightings record, and the summary
  * line every 600. */
@@ -107,6 +121,7 @@ struct nv2a_tex_dump_stats {
     uint64_t volatile_skips;  /* uploads skipped at them */
     uint64_t rt_binds;        /* stage binds of a render target */
     uint64_t rt_targets;      /* distinct targets bound (up to a table) */
+    uint64_t rt_dropped;      /* binds of a target past that table */
     uint64_t oversize;        /* uploads over NV2A_TEX_PACK_MAX_DIM */
     uint64_t errors;          /* files that could not be written (the
                                * hash is retried, up to 3 times) */

@@ -628,6 +628,72 @@ int main(void)
         CHECK(nv2a_aspect_scan(&g, (const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1, slot, 4,
                                hxy, &lo, &hi) == 1);
         CHECK(hxy[2][0] == 630.0f && hxy[2][1] == 480.0f);
+        /* The dump's question: its answer, off any program's gate, whose
+         * cadence decides what Hor+ does. */
+#define BATCH_2D(count, depth_test) \
+    nv2a_aspect_batch_2d((const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1, slot, (count), \
+                         (depth_test))
+        {
+            struct nv2a_aspect_gate before = g;
+            CHECK(BATCH_2D(4, 1) == 1);
+            CHECK(BATCH_2D(4, 0) == 1);
+            vf[1][2] = 0.5f;    /* an orthographic mesh with depths */
+            CHECK(BATCH_2D(4, 1) == 0);
+            vf[1][2] = 0.0f;
+            vf[1][3] = 5.0f;    /* perspective */
+            CHECK(BATCH_2D(4, 1) == 0);
+            vf[1][3] = 1.0f;
+            CHECK(memcmp(&before, &g, sizeof g) == 0);
+            /* Its near layer, the menus of Burnout 3's front end: only with
+             * the depth test off, as nv2a_aspect_flat's callers ask. What the
+             * frame-affecting tests answer does not move with it. */
+            for (i = 0; i < 4; i++)
+                vf[i][3] = 0.1f;
+            CHECK(BATCH_2D(4, 0) == 1);
+            CHECK(BATCH_2D(4, 1) == 0);
+            vf[2][2] = 0.5f;    /* near, but with depths */
+            CHECK(BATCH_2D(4, 0) == 0);
+            vf[2][2] = 0.0f;
+            {
+                struct nv2a_aspect_gate fresh = { -1, 0, 0 }, kept;
+                float w = 0.0f, l = 0.0f, h = 0.0f;
+                CHECK(nv2a_aspect_scan(&fresh, (const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1,
+                                       slot, 4, NULL, &l, &h) == 0);
+                CHECK(fresh.two_d == 0);
+                kept = fresh;
+                (void)BATCH_2D(4, 0);
+                CHECK(memcmp(&kept, &fresh, sizeof fresh) == 0);
+                CHECK(nv2a_aspect_flat((const uint32_t (*)[4])prog, 0, cst, &vf[0][0], 1, slot, 4,
+                                       &w) == 1 && w == 0.1f);
+            }
+            for (i = 0; i < 4; i++)
+                vf[i][3] = 0.5f;
+            CHECK(BATCH_2D(4, 0) == 1);
+            CHECK(BATCH_2D(4, 1) == 0);
+            for (i = 0; i < 4; i++)
+                vf[i][3] = 1.5f;    /* neither a whole layer nor a reciprocal */
+            CHECK(BATCH_2D(4, 0) == 0);
+            CHECK(BATCH_2D(4, 1) == 0);
+            for (i = 0; i < 4; i++)
+                vf[i][3] = 1.0f;
+            /* No answer: it must not settle a hash as 3D. */
+            CHECK(BATCH_2D(0, 0) == -1);
+            {
+                uint32_t saved = prog[0][3];
+                prog[0][3] &= ~1u;    /* no final bit: runs off the program */
+                CHECK(BATCH_2D(4, 0) == -1);
+                {
+                    struct nv2a_aspect_gate fresh = { -1, 0, 0 };
+                    float l = 0.0f, h = 0.0f;
+                    /* The gate's own reading of that stays what it was. */
+                    CHECK(nv2a_aspect_scan(&fresh, (const uint32_t (*)[4])prog, 0, cst, &vf[0][0],
+                                           1, slot, 4, NULL, &l, &h) == 0);
+                    CHECK(fresh.two_d == -1 && fresh.n == 1);
+                }
+                prog[0][3] = saved;
+            }
+            CHECK(memcmp(&before, &g, sizeof g) == 0);
+        }
         /* A screen layer at a fixed depth (the stage HUD's w 3) is 2D too. */
         for (i = 0; i < 4; i++)
             vf[i][3] = 3.0f;

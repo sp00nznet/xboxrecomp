@@ -2952,6 +2952,15 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                                                    s_stage_pack[k][0], s_stage_pack[k][1])
                                      atIndex:k];
         }
+        /* A read of this batch's inputs only: the dump must not move a frame. */
+        if (nv2a_tex_dump_on()) {
+            int dump_2d = !d->program;
+            if (d->program && nv2a_tex_dump_draw_open(s_stage_hash))
+                dump_2d = nv2a_aspect_batch_2d((const uint32_t (*)[4])v->prog, v->start,
+                                               (float (*)[4])(uintptr_t)v->c, vf, nf4, slot,
+                                               count, v->depth_enable);
+            nv2a_tex_dump_draw(s_stage_hash, bump_src, dump_2d);
+        }
         if (s_fs_mag && s_fs_comb)
             mag_draw();
         else if (nv2a_tex_mag_on() && !d->program && topo == NV2A_TOPO_TRIANGLES)

@@ -13,6 +13,10 @@
  *             9th marks it volatile and writes nothing, nor do later ones
  *             (even a hash seen before at it); volatile.json names it
  *   rt        render-target binds count per bind and per distinct target
+ *   rt match  the sidecar's `rt` by address (low 27 bits) and size, whichever
+ *             came first, at every address a hash sat at; a target past the
+ *             table counts its binds as dropped and marks nothing; the file
+ *             parses, and its rows say what was bound
  *   oversize  a texture over the pack's size cap is counted, not written
  *   retry     a sidecar that cannot be written (its name is a directory)
  *             removes the .xtd and leaves the hash to the next upload,
@@ -480,6 +484,388 @@ static void test_mag_triangle(void)
 /* A dump-built pack matches a P8 upload: the hash the upload computes names
  * the dump's file and keys the pack; this is the whole route a game without
  * an archive reader has. */
+/* Just enough JSON to say a file the dump wrote is whole: the inventory reads
+ * these with a real parser, and a stray comma would lose it the file. */
+static const char *json_value(const char *p);
+
+static const char *json_ws(const char *p)
+{
+    while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')
+        p++;
+    return p;
+}
+
+static const char *json_string(const char *p)
+{
+    if (*p != '"')
+        return NULL;
+    for (p++; *p && *p != '"'; p++)
+        if (*p == '\\' && !*++p)
+            return NULL;
+    return *p ? p + 1 : NULL;
+}
+
+static const char *json_list(const char *p, char close, int keys)
+{
+    p = json_ws(p + 1);
+    if (*p == close)
+        return p + 1;
+    for (;;) {
+        if (keys) {
+            if (!(p = json_string(json_ws(p))))
+                return NULL;
+            p = json_ws(p);
+            if (*p++ != ':')
+                return NULL;
+        }
+        if (!(p = json_value(p)))
+            return NULL;
+        p = json_ws(p);
+        if (*p == close)
+            return p + 1;
+        if (*p++ != ',')
+            return NULL;
+    }
+}
+
+static const char *json_value(const char *p)
+{
+    char *end;
+    p = json_ws(p);
+    switch (*p) {
+    case '{': return json_list(p, '}', 1);
+    case '[': return json_list(p, ']', 0);
+    case '"': return json_string(p);
+    case 't': return strncmp(p, "true", 4) ? NULL : p + 4;
+    case 'f': return strncmp(p, "false", 5) ? NULL : p + 5;
+    case 'n': return strncmp(p, "null", 4) ? NULL : p + 4;
+    default:
+        (void)strtod(p, &end);
+        return end == p ? NULL : end;
+    }
+}
+
+static int json_valid(const char *b)
+{
+    const char *p = json_value(b);
+    return p && !*json_ws(p);
+}
+
+/* A row of render_targets.json, found by its offset. */
+struct rt_row { unsigned width, height, format; unsigned long long binds; };
+
+static int rt_row_of(const char *b, uint32_t offset, struct rt_row *r)
+{
+    char key[40];
+    const char *p;
+    snprintf(key, sizeof key, "{\"offset\": \"0x%08X\"", offset);
+    p = strstr(b, key);
+    return p && sscanf(p + strlen(key),
+                       ", \"width\": %u, \"height\": %u, \"format_id\": %u, \"binds\": %llu}",
+                       &r->width, &r->height, &r->format, &r->binds) == 4;
+}
+
+static long long rt_dropped_of(const char *b)
+{
+    const char *p = strstr(b, "\"dropped_binds\": ");
+    return p ? atoll(p + strlen("\"dropped_binds\": ")) : -1;
+}
+
+static int rt_of(uint64_t hash)
+{
+    char name[64], *b;
+    int on;
+    name_of(name, sizeof name, hash, "json");
+    b = slurp(name, NULL);
+    CHECK(b != NULL);
+    if (!b)
+        return -1;
+    CHECK(json_valid(b));
+    on = strstr(b, "\"rt\": true") != NULL;
+    free(b);
+    return on;
+}
+
+/* `rt` against what the backends call the same memory; a session of its own,
+ * since it fills the target table. */
+static void test_rt_match(const char *dir)
+{
+    static uint32_t big[4096];
+    struct nv2a_tex_dump_stats st;
+    struct nv2a_stage a = stage(0x100000, 0x06, 64, 64, 1);
+    struct nv2a_stage b = stage(0x200000, 0x06, 64, 64, 1);
+    struct nv2a_stage alias = stage(0x300000, 0x06, 64, 64, 1);
+    struct nv2a_stage tall = stage(0x400000, 0x06, 64, 32, 1);
+    struct nv2a_stage square = tall;
+    struct nv2a_stage other_fmt = stage(0x500000, 0x06, 64, 64, 1);
+    struct nv2a_stage past = stage(0x1000000 + 1050u * 0x1000u, 0x06, 16, 16, 1);
+    uint64_t before;
+    char *f;
+    unsigned i;
+
+    snprintf(s_dir, sizeof s_dir, "%s", dir);
+    CHECK(nv2a_tex_dump_set_dir(s_dir) == 0);
+
+    /* One hash at two addresses, the target at either, either way round. */
+    nv2a_tex_dump_upload(&a, 0xA1, big);
+    nv2a_tex_dump_upload(&b, 0xA1, big);
+    nv2a_tex_dump_rt(&a);
+    {
+        struct nv2a_stage c = stage(0x210000, 0x06, 64, 64, 1);
+        struct nv2a_stage d = stage(0x220000, 0x06, 64, 64, 1);
+        nv2a_tex_dump_upload(&c, 0xA2, big);
+        nv2a_tex_dump_upload(&d, 0xA2, big);
+        nv2a_tex_dump_rt(&d);
+        /* And a target first, then the upload that lands on it. */
+        struct nv2a_stage e = stage(0x230000, 0x06, 64, 64, 1);
+        struct nv2a_stage g = stage(0x240000, 0x06, 64, 64, 1);
+        nv2a_tex_dump_rt(&e);
+        nv2a_tex_dump_upload(&g, 0xA3, big);
+        nv2a_tex_dump_upload(&e, 0xA3, big);
+    }
+    /* Through another window of the address space, both orders; one row. */
+    nv2a_tex_dump_upload(&alias, 0xA4, big);
+    alias.offset = 0x80300000u;
+    nv2a_tex_dump_rt(&alias);
+    {
+        struct nv2a_stage up = stage(0x00310000, 0x06, 64, 64, 1);
+        struct nv2a_stage rt = stage(0x80310000u, 0x06, 64, 64, 1);
+        nv2a_tex_dump_rt(&rt);
+        nv2a_tex_dump_upload(&up, 0xA5, big);
+        up.offset = 0x00310000;
+        nv2a_tex_dump_rt(&up);   /* the same target through the other window */
+    }
+    /* The size must agree; the format need not (a target has its own). */
+    nv2a_tex_dump_upload(&tall, 0xA6, big);
+    square.height = 64;
+    nv2a_tex_dump_rt(&square);
+    nv2a_tex_dump_upload(&other_fmt, 0xA7, big);
+    other_fmt.color = 0x12;
+    nv2a_tex_dump_rt(&other_fmt);
+
+    /* Past the table: counted, no row, no `rt`. */
+    nv2a_tex_dump_get_stats(&st);
+    CHECK(st.rt_dropped == 0);
+    before = st.rt_targets;
+    for (i = 0; i < 1100; i++) {
+        struct nv2a_stage t = stage(0x1000000 + i * 0x1000u, 0x06, 16, 16, 1);
+        nv2a_tex_dump_rt(&t);
+    }
+    nv2a_tex_dump_upload(&past, 0xA8, big);
+    nv2a_tex_dump_get_stats(&st);
+    CHECK(st.rt_targets == 1024);
+    CHECK(st.rt_dropped == before + 1100u - 1024u);
+    nv2a_tex_dump_summary();
+
+    CHECK(rt_of(0xA1) == 1);
+    CHECK(rt_of(0xA2) == 1);
+    CHECK(rt_of(0xA3) == 1);
+    CHECK(rt_of(0xA4) == 1);
+    CHECK(rt_of(0xA5) == 1);
+    CHECK(rt_of(0xA6) == 0);
+    CHECK(rt_of(0xA7) == 1);
+    CHECK(rt_of(0xA8) == 0);
+
+    CHECK((f = slurp("render_targets.json", NULL)) != NULL);
+    if (f) {
+        struct rt_row r;
+        unsigned rows = 0;
+        const char *p;
+        CHECK(json_valid(f));
+        for (p = f; (p = strstr(p, "{\"offset\"")) != NULL; p++)
+            rows++;
+        CHECK(rows == 1024);
+        CHECK(rt_dropped_of(f) == (long long)st.rt_dropped);
+        CHECK(rt_row_of(f, 0x100000, &r) && r.binds == 1);
+        CHECK(rt_row_of(f, 0x80310000u, &r) && r.binds == 2);
+        CHECK(!rt_row_of(f, 0x00310000, &r));
+        CHECK(!rt_row_of(f, past.offset, &r));
+        free(f);
+    }
+    nv2a_tex_dump_set_dir(NULL);
+}
+
+/* A sidecar an older dump left in the directory has no facts: they are added,
+ * once, and the file stays whole. */
+static void test_older_sidecar(void)
+{
+    const uint64_t OLD = 0xF0F0000000000010ull;
+    static const char old[] = "{\n  \"hash\": \"F0F0000000000010\",\n  \"width\": 4,\n"
+                              "  \"texels\": true\n}\n";
+    uint32_t texels[16] = { 0 };
+    struct nv2a_stage t = stage(0x7A0000, 0x06, 4, 4, 1);
+    uint64_t bound[NV2A_TEX_DUMP_STAGES] = { OLD };
+    char name[64], path[640], *b;
+    FILE *f;
+
+    nv2a_tex_dump_upload(&t, OLD, texels);
+    name_of(name, sizeof name, OLD, "json");
+    snprintf(path, sizeof path, "%s/%s", s_dir, name);
+    f = fopen(path, "wb");
+    CHECK(f != NULL);
+    if (!f)
+        return;
+    fputs(old, f);
+    fclose(f);
+    nv2a_tex_dump_draw(bound, 1u, 1);
+    nv2a_tex_dump_summary();
+    CHECK((b = slurp(name, NULL)) != NULL);
+    if (b) {
+        CHECK(json_valid(b));
+        CHECK(strstr(b, "\"texels\": true") != NULL);
+        CHECK(strstr(b, "\"bump\": true") != NULL);
+        CHECK(strstr(b, "\"drawn_2d\": true") != NULL);
+        CHECK(strstr(strstr(b, "\"bump\"") + 1, "\"bump\"") == NULL);
+        free(b);
+    }
+    /* And again over what that wrote: replaced, not added. */
+    nv2a_tex_dump_draw(bound, 0, 0);
+    nv2a_tex_dump_summary();
+    CHECK((b = slurp(name, NULL)) != NULL);
+    if (b) {
+        CHECK(json_valid(b));
+        CHECK(strstr(b, "\"drawn_2d\": false") != NULL);
+        CHECK(strstr(strstr(b, "drawn_2d") + 1, "drawn_2d") == NULL);
+        free(b);
+    }
+}
+
+/* What a draw or a bind adds to a sidecar, after the upload wrote it. */
+static void test_facts(void)
+{
+    const uint64_t HU = 0xF0F0000000000001ull, MODEL = 0xF0F0000000000002ull,
+                   NONE = 0xF0F0000000000003ull, BUMP = 0xF0F0000000000004ull,
+                   RT1 = 0xF0F0000000000005ull, RT2 = 0xF0F0000000000006ull;
+    uint32_t texels[16] = { 0 };
+    struct nv2a_stage hu = stage(0x700000, 0x06, 4, 4, 1);
+    struct nv2a_stage model = stage(0x710000, 0x06, 4, 4, 1);
+    struct nv2a_stage none = stage(0x720000, 0x06, 4, 4, 1);
+    struct nv2a_stage bump = stage(0x730000, 0x06, 4, 4, 1);
+    struct nv2a_stage target = stage(0x740000, 0x06, 64, 64, 1);
+    struct nv2a_stage later = stage(0x750000, 0x06, 64, 64, 1);
+    uint64_t bound[NV2A_TEX_DUMP_STAGES] = { 0 };
+    char name[64], *b;
+    static uint32_t big[4096];
+
+    nv2a_tex_dump_upload(&hu, HU, texels);
+    nv2a_tex_dump_upload(&model, MODEL, texels);
+    nv2a_tex_dump_upload(&none, NONE, texels);
+    nv2a_tex_dump_upload(&bump, BUMP, texels);
+    nv2a_tex_dump_upload(&target, RT1, big);
+
+    /* First write: nothing drawn, so no say on 2D. */
+    name_of(name, sizeof name, HU, "json");
+    CHECK((b = slurp(name, NULL)) != NULL);
+    if (b) {
+        CHECK(strstr(b, "\"bump\": false") != NULL);
+        CHECK(strstr(b, "\"rt\": false") != NULL);
+        CHECK(strstr(b, "drawn_2d") == NULL);
+        free(b);
+    }
+
+    /* An unknown hash, and an unknown answer, are no facts. */
+    bound[0] = 0xF0F00000000000FFull;
+    nv2a_tex_dump_draw(bound, 1, 0);
+    CHECK(nv2a_tex_dump_draw_open(bound) == 0);
+    bound[0] = NONE;
+    CHECK(nv2a_tex_dump_draw_open(bound) == 1);
+    nv2a_tex_dump_draw(bound, 0, -1);
+
+    bound[0] = HU;
+    nv2a_tex_dump_draw(bound, 0, 1);
+    CHECK(nv2a_tex_dump_draw_open(bound) == 1);
+    /* 3D wins whichever comes first, and settles it. */
+    bound[0] = MODEL;
+    nv2a_tex_dump_draw(bound, 0, 1);
+    nv2a_tex_dump_draw(bound, 0, 0);
+    CHECK(nv2a_tex_dump_draw_open(bound) == 0);
+    nv2a_tex_dump_draw(bound, 0, 1);
+    /* The mask is per stage: only stage 1 is read as slopes. */
+    bound[0] = HU;
+    bound[1] = BUMP;
+    nv2a_tex_dump_draw(bound, 2u, -1);
+    memset(bound, 0, sizeof bound);
+
+    /* A target bound at the address of a texture, in both orders. */
+    nv2a_tex_dump_rt(&target);
+    nv2a_tex_dump_rt(&target);
+    nv2a_tex_dump_rt(&later);
+    nv2a_tex_dump_upload(&later, RT2, big);
+    nv2a_tex_dump_summary();
+
+    CHECK((b = slurp(name, NULL)) != NULL);
+    if (b) {
+        CHECK(strstr(b, "\"drawn_2d\": true") != NULL);
+        CHECK(strstr(b, "\"bump\": false") != NULL);
+        CHECK(strstr(b, "\"texels\": true") != NULL);
+        CHECK(strstr(strstr(b, "\"bump\"") + 1, "\"bump\"") == NULL);  /* replaced, not added */
+        CHECK(strcmp(b + strlen(b) - 2, "}\n") == 0);
+        free(b);
+    }
+    name_of(name, sizeof name, MODEL, "json");
+    CHECK((b = slurp(name, NULL)) != NULL);
+    if (b) {
+        CHECK(strstr(b, "\"drawn_2d\": false") != NULL);
+        free(b);
+    }
+    name_of(name, sizeof name, NONE, "json");
+    CHECK((b = slurp(name, NULL)) != NULL);
+    if (b) {
+        CHECK(strstr(b, "drawn_2d") == NULL);
+        free(b);
+    }
+    name_of(name, sizeof name, BUMP, "json");
+    CHECK((b = slurp(name, NULL)) != NULL);
+    if (b) {
+        CHECK(strstr(b, "\"bump\": true") != NULL);
+        free(b);
+    }
+    name_of(name, sizeof name, RT1, "json");
+    CHECK((b = slurp(name, NULL)) != NULL);
+    if (b) {
+        CHECK(strstr(b, "\"rt\": true") != NULL);
+        free(b);
+    }
+    name_of(name, sizeof name, RT2, "json");
+    CHECK((b = slurp(name, NULL)) != NULL);
+    if (b) {
+        CHECK(strstr(b, "\"rt\": true") != NULL);
+        free(b);
+    }
+    /* The targets themselves have no hash; they have this list. */
+    CHECK((b = slurp("render_targets.json", NULL)) != NULL);
+    if (b) {
+        struct rt_row r;
+        CHECK(json_valid(b));
+        CHECK(rt_row_of(b, 0x740000, &r) && r.width == 64 && r.height == 64 && r.format == 6
+              && r.binds == 2);
+        CHECK(rt_row_of(b, 0x750000, &r) && r.binds == 1);
+        CHECK(rt_dropped_of(b) == 0);
+        free(b);
+    }
+
+    /* Facts and the trace's figures share the sidecar, each once. */
+    nv2a_tex_mag_set_on(1);
+    nv2a_tex_mag_note(HU, 4.0, 2);
+    nv2a_tex_dump_summary();
+    bound[0] = HU;
+    nv2a_tex_dump_draw(bound, 1u, 0);
+    nv2a_tex_mag_note(HU, 8.0, 2);
+    nv2a_tex_dump_summary();
+    nv2a_tex_mag_set_on(0);
+    name_of(name, sizeof name, HU, "json");
+    CHECK((b = slurp(name, NULL)) != NULL);
+    if (b) {
+        CHECK(strstr(b, "\"drawn_2d\": false") != NULL);
+        CHECK(strstr(b, "\"bump\": true") != NULL);
+        CHECK(strstr(b, "\"mag_max\": 8.000") != NULL);
+        CHECK(strstr(strstr(b, "mag_max") + 1, "mag_max") == NULL);
+        CHECK(strstr(strstr(b, "\"bump\"") + 1, "\"bump\"") == NULL);
+        CHECK(strstr(b, "\"render_scale\": 2\n}\n") != NULL);
+        free(b);
+    }
+}
+
 static void test_p8(void)
 {
     static uint8_t mem[0x10000];
@@ -549,6 +935,8 @@ int main(void)
     test_rt_oversize();
     test_mag();
     test_mag_triangle();
+    test_facts();
+    test_older_sidecar();
     test_p8();
 #ifndef _WIN32
     test_retry();   /* rename onto a directory fails the POSIX way */
@@ -557,6 +945,11 @@ int main(void)
     test_cap();
     nv2a_tex_dump_summary();
     test_off();
+    {
+        char other[sizeof s_dir];
+        snprintf(other, sizeof other, "tex_dump_out_%d/rt", (int)getpid());
+        test_rt_match(other);
+    }
     if (s_fail)
         return 1;
     printf("tex_dump: ok\n");

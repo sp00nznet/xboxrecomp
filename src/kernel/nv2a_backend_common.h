@@ -2013,6 +2013,19 @@ int nv2a_aspect_scan(struct nv2a_aspect_gate *gate,
                      const float *vf, unsigned nf4, const int *slot, uint32_t count,
                      float (*xy)[2], float *lo, float *hi);
 
+/* The dump's own question, apart from any program's gate and from what Hor+
+ * or the snap decide, so asking never moves a frame: whether this batch is 2D
+ * on one screen layer. 1: every sampled vertex (nv2a_aspect_scan's stride) has
+ * one w and one z, the w a whole screen layer (nv2a_aspect_layer_w) or, with
+ * the depth test off, a near layer (nv2a_aspect_flat_w, as nv2a_aspect_flat's
+ * callers require). 0: it is not; an orthographic 3D mesh (a menu model) has
+ * depths. -1: no answer, for no vertices or a program the interpreter cannot
+ * finish. A w of neither kind (1.5, computed) stays 0: nothing tells such a
+ * quad from a perspective mesh's flat face. */
+int nv2a_aspect_batch_2d(const uint32_t prog[][4], uint32_t start, float c[][4],
+                         const float *vf, unsigned nf4, const int *slot, uint32_t count,
+                         int depth_test);
+
 /* A screen quad through a perspective program: count (at most
  * NV2A_ASPECT_QUAD_MAX) vertices that all share one positive oPos.w, run
  * without the gate, their x, y in xy and x range in *lo, *hi. JSRF's Can

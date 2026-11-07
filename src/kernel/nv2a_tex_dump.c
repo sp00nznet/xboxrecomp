@@ -44,7 +44,12 @@ typedef struct {
     uint8_t  used;
     uint8_t  done;   /* its files are written; else the next upload retries */
     uint8_t  tries;  /* failed writes, given up on at DUMP_TRIES */
+    /* The facts only a draw or a target bind can tell, after the first upload
+     * wrote the sidecar; `dirty` is a sidecar to rewrite. */
+    uint8_t  drawn;  /* DRAWN_* */
+    uint8_t  bump, rt, dirty;
 } HashSlot;
+enum { DRAWN_NONE, DRAWN_2D, DRAWN_3D };   /* 3D wins: one 3D draw and it is not 2D */
 #define DUMP_TRIES 3u
 static HashSlot *s_hash;
 static size_t    s_hash_cap, s_hash_n;
@@ -60,9 +65,13 @@ static AddrSlot *s_addr;
 static size_t    s_addr_cap, s_addr_n;
 
 /* Render targets bound, distinct by (offset, size, format): a few hundred
- * in a title at most, so a fixed table; past it only the binds count. */
+ * in a title at most, so a fixed table; past it only the binds count, as
+ * s_st.rt_dropped too, and such a target marks no `rt`. */
 #define RT_SEEN 1024u
-static struct { uint32_t offset, width, height, color; } s_rt[RT_SEEN];
+/* The bits the backends' rt_texture compares: the same memory is seen through
+ * more than one window of the GPU's address space. */
+#define RT_ADDR_MASK 0x07FFFFFFu
+static struct { uint32_t offset, width, height, color; uint64_t binds; } s_rt[RT_SEEN];
 static unsigned s_rt_n;
 
 static void lock(void)
@@ -531,6 +540,9 @@ static int write_xtd(const struct nv2a_stage *t, uint64_t hash, const uint32_t *
     return commit_tmp(tmp, name, f);
 }
 
+static void print_facts(FILE *f, uint64_t hash);
+static MagSlot *mag_slot(uint64_t hash, int add);
+
 static int write_json(const struct nv2a_stage *t, uint64_t hash, int texels)
 {
     char name[48], tmp[sizeof s_dir + 64], fbuf[8];
@@ -566,8 +578,7 @@ static int write_json(const struct nv2a_stage *t, uint64_t hash, int texels)
             "  \"cube\": %s,\n"
             "  \"offset\": \"0x%08X\",\n"
             "  \"first_flip\": %llu,\n"
-            "  \"texels\": %s\n"
-            "}\n",
+            "  \"texels\": %s",
             (unsigned long long)hash, t->width, t->height, t->levels, fn, t->color,
             t->pitch,
             fl & XTD_FLAG_DXT ? "dxt" : fl & XTD_FLAG_SWIZZLED ? "swizzled" : "linear",
@@ -576,6 +587,8 @@ static int write_json(const struct nv2a_stage *t, uint64_t hash, int texels)
             wrap_name(t->addr_u), wrap_name(t->addr_v), min_name(t->filter),
             mag_name(t->filter), t->lod_min, t->lod_max, t->cube ? "true" : "false",
             t->offset, (unsigned long long)s_flip, texels ? "true" : "false");
+    print_facts(f, hash);
+    fputs("\n}\n", f);
     return commit_tmp(tmp, name, f);
 }
 
@@ -594,6 +607,17 @@ static void remove_file(uint64_t hash, const char *ext)
     char path[sizeof s_dir + 64];
     snprintf(path, sizeof path, "%s/%016llX.%s", s_dir, (unsigned long long)hash, ext);
     remove(path);
+}
+
+/* Whether a stage has been bound to a render target at this address and size. */
+static int rt_bound(uint32_t offset, uint32_t width, uint32_t height)
+{
+    unsigned i;
+    for (i = 0; i < s_rt_n; i++)
+        if (((s_rt[i].offset ^ offset) & RT_ADDR_MASK) == 0 && s_rt[i].width == width
+                && s_rt[i].height == height)
+            return 1;
+    return 0;
 }
 
 void nv2a_tex_dump_upload(const struct nv2a_stage *t, uint64_t hash,
@@ -643,6 +667,10 @@ void nv2a_tex_dump_upload(const struct nv2a_stage *t, uint64_t hash,
     if (!addr_has(a, hash) && a->n < NV2A_TEX_DUMP_VOLATILE)
         a->hashes[a->n++] = hash;
     h->uploads++;
+    if (!h->rt && rt_bound(t->offset, t->width, t->height)) {
+        h->rt = 1;
+        h->dirty = 1;
+    }
     s_dirty = 1;
     if (c == UP_REPEAT) {
         s_st.repeats++;
@@ -699,8 +727,9 @@ void nv2a_tex_dump_rt(const struct nv2a_stage *t)
         return;
     lock();
     s_st.rt_binds++;
+    s_dirty = 1;
     for (i = 0; i < s_rt_n; i++)
-        if (s_rt[i].offset == t->offset && s_rt[i].width == t->width
+        if (((s_rt[i].offset ^ t->offset) & RT_ADDR_MASK) == 0 && s_rt[i].width == t->width
                 && s_rt[i].height == t->height && s_rt[i].color == t->color)
             break;
     if (i == s_rt_n && s_rt_n < RT_SEEN) {
@@ -708,8 +737,68 @@ void nv2a_tex_dump_rt(const struct nv2a_stage *t)
         s_rt[s_rt_n].width = t->width;
         s_rt[s_rt_n].height = t->height;
         s_rt[s_rt_n].color = t->color;
+        s_rt[s_rt_n].binds = 0;
         s_rt_n++;
         s_st.rt_targets++;
+        /* What was uploaded from this memory before the game rendered there.
+         * By address, not by a hash's latest: one hash can sit at two. */
+        for (size_t k = 0; k < s_addr_cap; k++) {
+            const AddrSlot *a = &s_addr[k];
+            uint32_t j, n;
+            if (!a->used || ((a->offset ^ t->offset) & RT_ADDR_MASK) || a->width != t->width
+                    || a->height != t->height)
+                continue;
+            n = a->n < NV2A_TEX_DUMP_VOLATILE ? a->n : NV2A_TEX_DUMP_VOLATILE;
+            for (j = 0; j < n; j++) {
+                HashSlot *h = hash_slot(a->hashes[j], 0);
+                if (h && !h->rt) {
+                    h->rt = 1;
+                    h->dirty = 1;
+                }
+            }
+        }
+    }
+    if (i < s_rt_n)
+        s_rt[i].binds++;
+    else
+        s_st.rt_dropped++;
+    unlock();
+}
+
+int nv2a_tex_dump_draw_open(const uint64_t hash[NV2A_TEX_DUMP_STAGES])
+{
+    int k, open = 0;
+    if (s_on <= 0)
+        return 0;
+    lock();
+    for (k = 0; k < NV2A_TEX_DUMP_STAGES && !open; k++) {
+        const HashSlot *h = hash[k] ? hash_slot(hash[k], 0) : NULL;
+        open = h && h->drawn != DRAWN_3D;
+    }
+    unlock();
+    return open;
+}
+
+void nv2a_tex_dump_draw(const uint64_t hash[NV2A_TEX_DUMP_STAGES], unsigned bump_stages, int two_d)
+{
+    int k;
+    if (s_on <= 0)
+        return;
+    lock();
+    for (k = 0; k < NV2A_TEX_DUMP_STAGES; k++) {
+        HashSlot *h = hash[k] ? hash_slot(hash[k], 0) : NULL;
+        uint8_t drawn;
+        if (!h)
+            continue;
+        drawn = two_d < 0 ? h->drawn : !two_d || h->drawn == DRAWN_3D ? DRAWN_3D : DRAWN_2D;
+        if (drawn != h->drawn) {
+            h->drawn = drawn;
+            h->dirty = 1;
+        }
+        if (bump_stages >> k & 1u && !h->bump) {
+            h->bump = 1;
+            h->dirty = 1;
+        }
     }
     unlock();
 }
@@ -771,6 +860,28 @@ static void write_volatile(void)
     }
     fputs(first ? "]\n" : "\n]\n", f);
     if (!commit_tmp(tmp, "volatile.json", f))
+        s_st.errors++;
+}
+
+/* The targets themselves: no hash and no texels, so no sidecar to hold them. */
+static void write_render_targets(void)
+{
+    char tmp[sizeof s_dir + 64];
+    FILE *f = open_tmp(tmp, sizeof tmp, "render_targets.json");
+    unsigned i;
+    if (!f) {
+        s_st.errors++;
+        return;
+    }
+    fputs("{\n  \"targets\": [\n", f);
+    for (i = 0; i < s_rt_n; i++)
+        fprintf(f, "%s    {\"offset\": \"0x%08X\", \"width\": %u, \"height\": %u,"
+                " \"format_id\": %u, \"binds\": %llu}",
+                i ? ",\n" : "", s_rt[i].offset, s_rt[i].width, s_rt[i].height, s_rt[i].color,
+                (unsigned long long)s_rt[i].binds);
+    fprintf(f, "%s  ],\n  \"dropped_binds\": %llu\n}\n", s_rt_n ? "\n" : "",
+            (unsigned long long)s_st.rt_dropped);
+    if (!commit_tmp(tmp, "render_targets.json", f))
         s_st.errors++;
 }
 
@@ -919,17 +1030,40 @@ int nv2a_tex_mag_get(uint64_t hash, double *mag_max, uint64_t *draws, unsigned *
     return m != NULL;
 }
 
-/* The figures into a hash's sidecar, in place of the last ones. A hash the
- * dump did not write has no sidecar; it stays dirty, for one written later. */
-static void mag_sidecar(MagSlot *m)
+/* The fields after "texels": what is known of the hash so far. No `drawn_2d`
+ * until a draw shows it, so a scene that only uploaded a texture has no say. */
+static void print_facts(FILE *f, uint64_t hash)
 {
+    const HashSlot *h = hash_slot(hash, 0);
+    const MagSlot *m = mag_slot(hash, 0);
+    fprintf(f, ",\n  \"bump\": %s,\n  \"rt\": %s", h && h->bump ? "true" : "false",
+            h && h->rt ? "true" : "false");
+    if (h && h->drawn != DRAWN_NONE)
+        fprintf(f, ",\n  \"drawn_2d\": %s", h->drawn == DRAWN_2D ? "true" : "false");
+    if (m)
+        fprintf(f,
+                ",\n"
+                "  \"mag_max\": %.3f,\n"
+                "  \"mag_scale1\": %.3f,\n"
+                "  \"mag_draws\": %llu,\n"
+                "  \"render_scale\": %u",
+                m->mag_max, m->mag_max / (m->render_scale ? m->render_scale : 1u),
+                (unsigned long long)m->draws, m->render_scale);
+}
+
+/* The facts into a hash's sidecar, in place of the last ones. A hash the dump
+ * did not write has no sidecar; it stays dirty, for one written later. */
+static void rewrite_sidecar(uint64_t hash)
+{
+    HashSlot *h = hash_slot(hash, 0);
+    MagSlot *m = mag_slot(hash, 0);
     char name[48], tmp[sizeof s_dir + 64], path[sizeof s_dir + 64];
     char buf[4096];
     size_t n;
-    char *cut;
+    char *cut, *mag;
     FILE *f;
 
-    snprintf(name, sizeof name, "%016llX.json", (unsigned long long)m->hash);
+    snprintf(name, sizeof name, "%016llX.json", (unsigned long long)hash);
     snprintf(path, sizeof path, "%s/%s", s_dir, name);
     if (!(f = fopen(path, "rb")))
         return;
@@ -938,14 +1072,22 @@ static void mag_sidecar(MagSlot *m)
     /* The dump's own sidecars are under 500 bytes. A longer file is not one of
      * them, and rewriting a cut copy would leave the inventory corrupt JSON. */
     if (n == sizeof buf) {
-        fprintf(stderr, "[TEXDUMP] %s: over %zu bytes, tex_mag figures not written\n",
+        fprintf(stderr, "[TEXDUMP] %s: over %zu bytes, facts not written\n",
                 name, sizeof buf - 1);
         s_st.errors++;
-        m->dirty = 0;
+        if (h)
+            h->dirty = 0;
+        if (m)
+            m->dirty = 0;
         return;
     }
     buf[n] = '\0';
-    if ((cut = strstr(buf, ",\n  \"mag_max\"")) == NULL)
+    /* A sidecar of an older dump in the same directory has only the figures. */
+    cut = strstr(buf, ",\n  \"bump\"");
+    mag = strstr(buf, ",\n  \"mag_max\"");
+    if (!cut || (mag && mag < cut))
+        cut = mag;
+    if (!cut)
         cut = strrchr(buf, '}');
     if (!cut)
         return;
@@ -957,19 +1099,17 @@ static void mag_sidecar(MagSlot *m)
         s_st.errors++;
         return;
     }
-    fprintf(f,
-            "%s,\n"
-            "  \"mag_max\": %.3f,\n"
-            "  \"mag_scale1\": %.3f,\n"
-            "  \"mag_draws\": %llu,\n"
-            "  \"render_scale\": %u\n"
-            "}\n",
-            buf, m->mag_max, m->mag_max / (m->render_scale ? m->render_scale : 1u),
-            (unsigned long long)m->draws, m->render_scale);
-    if (commit_tmp(tmp, name, f))
-        m->dirty = 0;
-    else
+    fputs(buf, f);
+    print_facts(f, hash);
+    fputs("\n}\n", f);
+    if (commit_tmp(tmp, name, f)) {
+        if (h)
+            h->dirty = 0;
+        if (m)
+            m->dirty = 0;
+    } else {
         s_st.errors++;
+    }
 }
 
 /* Under the lock: a summary's worth of the trace, the sidecars when there is
@@ -985,7 +1125,7 @@ static void mag_summary(int exiting)
         if (!top || m->mag_max > top->mag_max)
             top = m;
         if (s_on > 0 && m->dirty)
-            mag_sidecar(m);
+            rewrite_sidecar(m->hash);
         if (s_on <= 0 && exiting)
             fprintf(stderr, "[TEXDUMP] mag %016llX mag_max=%.3f mag_scale1=%.3f draws=%llu"
                     " render_scale=%u\n", (unsigned long long)m->hash, m->mag_max,
@@ -1003,6 +1143,7 @@ static void summary(int exiting)
 {
     struct nv2a_tex_dump_stats st;
     const char *stop;
+    char dropped[48] = "";
     if (s_on <= 0 && s_mag <= 0)
         return;
     if (!exiting) {
@@ -1016,7 +1157,14 @@ static void summary(int exiting)
     if (s_on > 0 && s_dirty) {
         write_counts();
         write_volatile();
+        write_render_targets();
         s_dirty = 0;
+    }
+    if (s_on > 0) {
+        size_t i;
+        for (i = 0; i < s_hash_cap; i++)
+            if (s_hash[i].used && s_hash[i].dirty)
+                rewrite_sidecar(s_hash[i].hash);
     }
     if (s_mag > 0)
         mag_summary(exiting);
@@ -1027,15 +1175,18 @@ static void summary(int exiting)
         fflush(stderr);
         return;
     }
+    if (st.rt_dropped)
+        snprintf(dropped, sizeof dropped, ", %llu binds past the table",
+                 (unsigned long long)st.rt_dropped);
     fprintf(stderr, "[TEXDUMP] flip %llu: %llu written (%llu texels), %llu repeat uploads,"
             " %llu linear (sidecar only), %llu volatile addresses (%llu uploads skipped),"
-            " %llu render-target binds skipped (%llu targets), %llu over size, %llu errors;"
+            " %llu render-target binds skipped (%llu targets%s), %llu over size, %llu errors;"
             " %s%s%s\n",
             (unsigned long long)s_flip, (unsigned long long)st.written,
             (unsigned long long)st.texels, (unsigned long long)st.repeats,
             (unsigned long long)st.linear, (unsigned long long)st.volatile_addrs,
             (unsigned long long)st.volatile_skips, (unsigned long long)st.rt_binds,
-            (unsigned long long)st.rt_targets, (unsigned long long)st.oversize,
+            (unsigned long long)st.rt_targets, dropped, (unsigned long long)st.oversize,
             (unsigned long long)st.errors, s_dir, stop ? "; stopped: " : "",
             stop ? stop : "");
     fflush(stderr);
