@@ -39,6 +39,8 @@ One per stage, in the order you run them.
 
 - [Memory Layout Reproduction](technical/memory-layout.md) — CreateFileMapping, mirror views, and address space tricks
 - [Xbox Kernel Replacement](technical/kernel-replacement.md) — Mapping Xbox kernel ordinals to Win32, and the gotchas
+- [Mods: reference](runtime/mods.md) — The mod API's contract, its calls, and how a mod reaches the game
+- [Write a mod](runtime/mod-howto.md) — A minimal mod with settings, controls, a status panel and a hook; the code is `templates/mod/`
 
 ### Graphics
 

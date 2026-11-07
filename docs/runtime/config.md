@@ -1787,7 +1787,9 @@ A mod is game code built into the title's executable that reads and steers
 the guest through one small API (`src/enhance/mod.h`). It exists only with
 `XBOXRECOMP_ENHANCE=ON`. A title with no mods runs exactly as before and
 logs one line, `[ENHANCE] mods=none` ([The mods= line](#the-mods-line)).
-The draw paths then have one untaken branch.
+The draw paths then have one untaken branch. To write one, start at
+[Write a mod](mod-howto.md); [Mods: reference](mods.md) is the map of this
+section.
 
 The title lists its mods in a NULL-terminated table and hands it over before
 `xbox_enhance_init`, which runs each `init` in table order as its last step:
