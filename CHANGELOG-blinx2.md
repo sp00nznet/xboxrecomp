@@ -9,6 +9,51 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.15.0] - 2026-11-07
+
+### Added
+- Present shaders reach every game: the toolkit stages librashader and
+  the `shaders/` presets beside any exe that links the enhancements
+  layer, so a game no longer needs its own `xboxrecomp_present_shaders`
+  call. Shaders stay off by default.
+- The 2D engine (NV062 surfaces, NV09F image blits), copied on the GPU:
+  Quantum Redshift's lens raindrops draw from its back-buffer copy
+  instead of black, on D3D11 and Metal.
+- Texture-shader dot-product modes and real cube maps on D3D11 and
+  Metal, so Quantum Redshift's water reflects instead of drawing as a
+  flat plane.
+- Square-stick mapping (`input.pad_square_left` and `_right`, under
+  Controls > Sticks; off by default): a modern pad's round gate reaches
+  the full diagonal an original Duke's square gate did. It stretches only
+  toward the rim, so drift and partial tilts keep their length, and the
+  keyboard's ramped diagonal follows it.
+- Mod link settings (descriptor version 2): a mod's page can show a
+  toolkit setting as one of its own rows, with one value and one saved
+  key. A mod's on/off switch shows the help of its enable setting.
+- Texture pack version 3: world entries (`textures.world`), BC1 payloads
+  and samplers that follow an entry's own mip chain. `RECOMP_TRACE=tex_mag`
+  measures how far each texture is magnified, and `tex_dump` records
+  whether a texture was drawn flat, used as a bump source or sampled as a
+  render target.
+- `recomp` resolves names in the manual file (`--names`), so a port's
+  hand-written wraps follow the CLI's per-release names.
+- A game can set its own code default for a toolkit key, which the menu
+  then treats as the default.
+- The mod API reference, a how-to, a template mod with a ctest and the
+  order to try hook points in.
+
+### Fixed
+- W-buffered depth and polygon offset on D3D11 and Metal: Quantum
+  Redshift's billboards, globe clouds and pillars no longer z-fight.
+- `RtlTryEnterCriticalSection` shares the Enter/Leave locks, so a title
+  that pairs TryEnter with a plain Leave no longer holds the lock for
+  good: Quantum Redshift's frontend music and voices play.
+- A thread created suspended waits until it is resumed, so a worker can
+  no longer run before its creator fills what it waits on (Quantum
+  Redshift's Bink setup crashed).
+- The menu's Save updates the loaded config, so a later reload keeps the
+  saved values.
+
 ## [blinx2-v0.14.0] - 2026-11-04
 
 ### Added
