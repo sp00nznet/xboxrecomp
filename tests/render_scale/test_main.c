@@ -159,12 +159,70 @@ static int host_span(const struct nv2a_vp_consts *c, int axis, float a, float b,
     return *lo >= 0;
 }
 
+static int feq(float a, float b)
+{
+    return fabsf(a - b) < 1e-4f;
+}
+
+/* Guest LODs against a pack entry's chain (nv2a_stage_lod). */
+static int test_stage_lod(void)
+{
+    static const uint32_t scales[] = { 1, 2, 4, 3 };
+    static const float shifts[] = { 0.0f, 1.0f, 2.0f, 1.5849625f };
+    uint32_t k, gmin;
+    struct nv2a_stage_lod l;
+
+    /* Stock: what the backends' clamps always were, and no key bits. */
+    l = nv2a_stage_lod(0, 3, 9, 1, 1);
+    CHECK(l.mip == 0 && l.min == 0.0f && l.max == 0.0f && l.key == 0);
+    l = nv2a_stage_lod(2, 1, 5, 1, 6);
+    CHECK(l.mip == 2 && l.min == 1.0f && l.max == 5.0f && l.key == 0);
+    l = nv2a_stage_lod(1, 0, 5, 0, 6);
+    CHECK(l.mip == 1 && l.min == 0.0f && l.max == 5.0f && l.key == 0);
+
+    /* A guest chain: max follows the shift; min moves only when the guest
+     * set one, or level 0, the new detail, could never be reached. */
+    for (k = 0; k < 4; k++)
+        for (gmin = 0; gmin < 2; gmin++) {
+            l = nv2a_stage_lod(2, gmin, 5, scales[k], 6);
+            CHECK(l.mip == 2);
+            CHECK(feq(l.max, 5.0f + shifts[k]));
+            CHECK(feq(l.min, gmin ? 1.0f + shifts[k] : 0.0f));
+            if (!gmin)
+                CHECK(l.min == 0.0f);
+            CHECK(k ? (l.key >> NV2A_STAGE_LOD_SCALE_BIT & 15u) == scales[k] : l.key == 0);
+            CHECK(!(l.key >> NV2A_STAGE_LOD_FORCED_BIT & 1u));
+        }
+
+    /* A guest of one level under a chain: the nearest level, over the
+     * levels above the guest's own. */
+    for (k = 1; k < 4; k++) {
+        l = nv2a_stage_lod(0, 0, 0, scales[k], 4);
+        CHECK(l.mip == 1 && l.min == 0.0f && feq(l.max, shifts[k]));
+        CHECK(l.key >> NV2A_STAGE_LOD_FORCED_BIT & 1u);
+    }
+    /* A one-level entry has nothing to follow: no mip filter of its own. */
+    l = nv2a_stage_lod(0, 0, 0, 2, 1);
+    CHECK(l.mip == 0 && l.min == 0.0f && l.max == 0.0f);
+
+    /* Two scales never share a sampler. */
+    CHECK(nv2a_stage_lod(1, 0, 5, 2, 6).key != nv2a_stage_lod(1, 0, 5, 3, 6).key);
+
+    CHECK(nv2a_stage_pack_scale(64, 64) == 1 && nv2a_stage_pack_scale(64, 128) == 2
+          && nv2a_stage_pack_scale(64, 192) == 3 && nv2a_stage_pack_scale(64, 256) == 4);
+    CHECK(nv2a_stage_pack_scale(64, 100) == 1 && nv2a_stage_pack_scale(64, 32) == 1
+          && nv2a_stage_pack_scale(0, 32) == 1 && nv2a_stage_pack_scale(64, 64 * 16) == 1);
+    return 0;
+}
+
 int main(void)
 {
     struct nv2a_rect r;
     uint32_t hw, hh, x, y;
 
     /* ---- host options: zero is stock ---- */
+    if (test_stage_lod())
+        return 1;
     CHECK(nv2a_host_opts()->render_scale == 0);
     CHECK(nv2a_host_opts()->present_filter == NV2A_PRESENT_NEAREST);
     CHECK(nv2a_host_opts()->fullscreen == 0);

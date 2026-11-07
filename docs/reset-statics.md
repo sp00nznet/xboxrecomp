@@ -1393,8 +1393,13 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_tex_dump.c | - | s_addr_n | file_static | keep | - | debug dump catalog, content-hash keyed |
 | src/kernel/nv2a_tex_dump.c | - | s_rt | file_static | keep | - | debug dump catalog, content-hash keyed |
 | src/kernel/nv2a_tex_dump.c | - | s_rt_n | file_static | keep | - | debug dump catalog, content-hash keyed |
-| src/kernel/nv2a_tex_dump.c | nv2a_tex_dump_set_dir | hooked | local_static | keep | - | exit hook registered once |
+| src/kernel/nv2a_tex_dump.c | hook_exit_once | hooked | local_static | keep | - | exit hook registered once |
 | src/kernel/nv2a_tex_dump.c | nv2a_tex_dump_upload | why | local_static | keep | - | stop-reason text for log |
+| src/kernel/nv2a_tex_dump.c | - | s_mag | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/kernel/nv2a_tex_dump.c | - | s_mag_tab | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/kernel/nv2a_tex_dump.c | - | s_mag_cap | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/kernel/nv2a_tex_dump.c | - | s_mag_n | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/kernel/nv2a_tex_dump.c | - | s_mag_dropped | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 
 ### src/kernel/nv2a_tex_pack.c
 
@@ -1427,6 +1432,9 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_tex_pack.c | - | s_snap_n | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_snap | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | read_failed | said | local_static | keep | - | texture pack keyed by content hash |
+| src/kernel/nv2a_tex_pack.c | - | s_version | file_static | keep | - | texture pack keyed by content hash |
+| src/kernel/nv2a_tex_pack.c | - | s_bc1_count | file_static | keep | - | texture pack keyed by content hash |
+| src/kernel/nv2a_tex_pack.c | - | s_keep | file_static | keep | - | texture pack keyed by content hash |
 
 ### src/nv2a/nv2a_core.c
 
@@ -1909,6 +1917,17 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_occ_made | file_static | keep | - | queries made total |
 | src/d3d/nv2a_pb_d3d11.c | - | s_occ_mode | file_static | keep | - | cached RENV_D3D11_OCC read |
 | src/d3d/nv2a_pb_d3d11.c | occ_now_us | f | local_static | constant | - | QPC frequency |
+| src/d3d/nv2a_pb_d3d11.c | - | s_mag_buf | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_mag_read | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_mag_cb | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_mag_uav | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_mag_rec | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_mag_n | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_mag_cur | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_mag_copied | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_mag_state | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_mag_hash | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_mag_scale | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 
 ### src/d3d/nv2a_pb_metal.m
 
@@ -2107,6 +2126,15 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_dbg_failed | file_static | keep | - | debug-draw build failed flag |
 | src/d3d/nv2a_pb_metal.m | metal_flip | px | local_static | keep | - | scratch readback buffer |
 | src/d3d/nv2a_pb_metal.m | metal_flip | cap | local_static | keep | - | scratch capacity |
+| src/d3d/nv2a_pb_metal.m | - | s_mag | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_metal.m | - | s_mag_cur | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_metal.m | - | s_mag_state | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_metal.m | - | s_fs_mag | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_metal.m | - | s_up_scale | file_static | keep | - | the upload just made, read back by its caller |
+| src/d3d/nv2a_pb_metal.m | - | s_up_levels | file_static | keep | - | the upload just made, read back by its caller |
+| src/d3d/nv2a_pb_metal.m | - | s_tex_last | file_static | keep | - | the entry tex_bind just bound, set again on each bind |
+| src/d3d/nv2a_pb_metal.m | - | s_stage_pack | file_static | keep | - | the entry each stage just bound, set again on each draw |
+| src/d3d/nv2a_pb_metal.m | - | s_stage_hash | file_static | keep | - | the entry each stage just bound, set again on each draw |
 
 ## Devices: APU, DSP, audio, input, USB, video, platform
 

@@ -434,6 +434,10 @@ static const struct enhance_item k_items[] = {
       .set = set_pack_bit, .get = get_pack_bit, .live = ENHANCE_LIVE_FLUSH, .def = "on",
       .user = (void *)(uintptr_t)NV2A_PACK_OFF_TEXT,
       .help = "Uses the pack's text images in place of the game's" },
+    { ITEM("textures.world", "Pack world", "Pack", ENHANCE_ITEM_CHOICE), .choices = k_onoff,
+      .set = set_pack_bit, .get = get_pack_bit, .live = ENHANCE_LIVE_FLUSH, .def = "on",
+      .user = (void *)(uintptr_t)NV2A_PACK_OFF_WORLD,
+      .help = "Uses the pack's world textures in place of the game's" },
     { ITEM("overlay.stats", "Stats strip", "Stats", ENHANCE_ITEM_TOGGLE), .set = set_stats,
       .get = get_stats, .def = "false",
       .help = "Shows frame time and rate in a strip over the game" },
@@ -2525,11 +2529,17 @@ static void build_rows(void)
                 slot_row("textures.text");
             else
                 info("Pack text", "none in this pack");
-            info("Entries", "%u (%u art, %u font, %u text)", n,
+            if (nv2a_tex_pack_kind_count(XRTP_KIND_WORLD))
+                slot_row("textures.world");
+            else
+                info("Pack world", "none in this pack");
+            info("Entries", "%u (%u art, %u font, %u text, %u world)", n,
                  nv2a_tex_pack_kind_count(XRTP_KIND_ART), nv2a_tex_pack_kind_count(XRTP_KIND_FONT),
-                 nv2a_tex_pack_kind_count(XRTP_KIND_TEXT));
+                 nv2a_tex_pack_kind_count(XRTP_KIND_TEXT),
+                 nv2a_tex_pack_kind_count(XRTP_KIND_WORLD));
             info("Scale", "%ux, text %ux", nv2a_tex_pack_scale(), nv2a_tex_pack_text_scale());
-            info("BC3 entries", "%u", nv2a_tex_pack_bc3_count());
+            info("Block entries", "%u BC1, %u BC3", nv2a_tex_pack_bc1_count(),
+                 nv2a_tex_pack_bc3_count());
             info("Hits", "%llu", (unsigned long long)nv2a_tex_pack_hits());
         }
         info("Misses", "%llu", (unsigned long long)nv2a_tex_pack_miss_total());

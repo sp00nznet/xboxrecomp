@@ -16,9 +16,9 @@ not write this dump.
 The file name is the upload's texel hash, the one the backend's texture
 cache uses and passes to the pack lookup (texture-pack.md, "Key"), as 16
 upper-case hex digits. A dumped `<hash>` is the key of the pack entry that
-would replace that texture. A P8 texture's hash has its palette folded in,
-as in the cache; such a hash never matches a pack entry, but the texture is
-dumped all the same.
+would replace that texture. A P8 texture's hash has its palette folded in
+(`nv2a_stage_hash`), so an entry built from its dump replaces that one palette:
+the same indices under another palette are another hash and another dump.
 
 ## Files
 
@@ -141,3 +141,36 @@ On: `[TEXDUMP] dumping each uploaded texture once per hash to <dir>`. Every
 
 A directory that cannot be made turns the dump off with one line. Off, the
 backends' only added work per upload is one test.
+
+## The magnification trace
+
+`RECOMP_TRACE=tex_mag` records how far each texture is ever magnified on
+screen, what its upscale can be for. It works with or without the dump. With
+the dump, each hash's `<hash>.json` also has these fields, rewritten by every
+summary:
+
+```
+"mag_max": 12.000,     highest host pixels per source texel
+"mag_scale1": 4.000,   mag_max / render_scale, the figure a pack is built for
+"mag_draws": 3127,     readings folded in
+"render_scale": 3
+```
+
+Without it, each hash gets one line at exit:
+`[TEXDUMP] mag <hash> mag_max=... mag_scale1=... draws=... render_scale=...`.
+Each summary and exit print `[TEXDUMP] tex_mag: N textures, highest X (<hash>),
+K draws past the frame's slots; an upper bound: occluded fragments count`.
+
+Under the trace the combiner shader of a program batch takes one variant
+(`NV2ACombinerState.tex_mag`, in its cache key, so the stock text is untouched)
+that reads each 2D stage's unclamped LOD and keeps the largest with an atomic,
+at one pixel in 64 of a screen tile, in a slot per draw id and stage of a device
+buffer read a frame or more behind (8192 draws a frame; more are counted). The
+slot holds `(32 - lod) * 1024`, so `2^-lod` is the pixels per texel of what is
+bound; a source texel is `scale` texels of a pack entry, so the fold multiplies
+by the entry's scale. A pre-transformed batch takes no variant: its figure comes
+from up to 64 of its triangles on the CPU (`nv2a_tex_mag_triangle`).
+
+Not measured: 3D, cube, bump and dot-mapped stages, and batches that don't
+reach the combiner shader or are not triangles. The figure is an upper bound:
+an occluded fragment counts. Off, the only added work is one test per draw.

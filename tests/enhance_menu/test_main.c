@@ -2705,7 +2705,7 @@ static void test_pages(void)
      * Files. Saves with no title yet: its rows hold no dates. */
     static const uint32_t k_sum[10] = {
         0xD2D6070Cu, 0xF5E5A2AAu, 0xD56F9851u, 0xF9F4DC86u, 0x39FA9CFAu,
-        0x0813383Bu, 0x05CA29ACu, 0xCC7407C7u, 0x7B5D7063u, 0x7778B546u };
+        0x0813383Bu, 0x05CA29ACu, 0xF83B0097u, 0x7B5D7063u, 0x7778B546u };
     /* Files shows Open exports folder only off Game Mode. */
     set_env("RECOMP_HOST_GAMESCOPE", NULL);
     start_with(ARMED, k_mods);

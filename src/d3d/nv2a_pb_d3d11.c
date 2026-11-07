@@ -1754,7 +1754,10 @@ typedef struct {
     /* What tex holds: the guest size, or a pack entry's (textures.pack);
      * a re-upload of another size or format makes a new texture. */
     uint32_t tex_w, tex_h, tex_levels;
-    int      tex_bc3, tex_cube;
+    int      tex_bc, tex_cube;      /* tex_bc: XRTP_BC_* */
+    /* What the sampler follows (nv2a_stage_lod): the entry's scale over the
+     * guest texture, and its chain. 1 and tex_levels for guest texels. */
+    uint32_t pack_scale, pack_levels;
     ID3D11Texture2D          *tex;
     ID3D11ShaderResourceView *srv;
 } TexEntry;
@@ -1889,11 +1892,6 @@ static uint32_t tex_extent(const Stage *t, int cube)
     return nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
 }
 
-static uint64_t tex_hash(const uint8_t *p, uint32_t n)
-{
-    return nv2a_tex_hash(p, n, NV2A_TEX_HASH_SEED);
-}
-
 /* The whole texture into s_texels (A8R8G8B8): level 0 (width x height),
  * then each further level packed after it; `faces` of them (6 for a cube
  * map), each nv2a_stage_face_stride on from the last, one after another. */
@@ -1921,16 +1919,16 @@ static int decode_texture(const Stage *t, uint32_t faces)
 }
 
 /* e's texture at this size: a new one is made before the old one is
- * released, so a refusal leaves e as it was. `bc3`: BC3 blocks (a pack
- * entry's payload, XRTP_FLAG_BC3) rather than A8R8G8B8 texels. */
+ * released, so a refusal leaves e as it was. `bc`: XRTP_BC_*, a pack entry's
+ * blocks (XRTP_FLAG_BC1, XRTP_FLAG_BC3) rather than A8R8G8B8 texels. */
 static int tex_alloc(TexEntry *e, uint32_t width, uint32_t height, uint32_t levels,
-                     int bc3, int cube)
+                     int bc, int cube)
 {
     D3D11_TEXTURE2D_DESC td;
     ID3D11Texture2D *tex = NULL;
     ID3D11ShaderResourceView *srv = NULL;
     if (e->tex && e->tex_w == width && e->tex_h == height && e->tex_levels == levels
-            && e->tex_bc3 == bc3 && e->tex_cube == cube)
+            && e->tex_bc == bc && e->tex_cube == cube)
         return 1;
     memset(&td, 0, sizeof td);
     td.Width = width;
@@ -1941,7 +1939,8 @@ static int tex_alloc(TexEntry *e, uint32_t width, uint32_t height, uint32_t leve
      * TEXTURECUBE resource). */
     td.ArraySize = cube ? 6 : 1;
     td.MiscFlags = cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
-    td.Format = bc3 ? DXGI_FORMAT_BC3_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Format = bc == XRTP_BC_3 ? DXGI_FORMAT_BC3_UNORM
+              : bc == XRTP_BC_1 ? DXGI_FORMAT_BC1_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -1960,7 +1959,7 @@ static int tex_alloc(TexEntry *e, uint32_t width, uint32_t height, uint32_t leve
     e->tex_w = width;
     e->tex_h = height;
     e->tex_levels = levels;
-    e->tex_bc3 = bc3;
+    e->tex_bc = bc;
     e->tex_cube = cube;
     return 1;
 }
@@ -1983,7 +1982,8 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
     const uint8_t *p;
     uint32_t width = t->width, height = t->height, levels = t->levels;
     uint32_t l, f;
-    int bc3 = 0;
+    int bc = XRTP_BC_NONE;
+    struct nv2a_tex_pack_entry *pe = NULL;
     if (e->cube) {
         /* No pack entry is a cube map: the six faces go up from the guest.
          * tex_dump writes face 0, the first texels decoded. */
@@ -2000,6 +2000,8 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
                                                       NULL, p, w * 4u, 0);
                 p += (size_t)w * h * 4u;
             }
+        e->pack_scale = 1;
+        e->pack_levels = levels;
         s_tex_uploads++;
         nv2a_stats_add(NV2A_STAT_TEX_UPLOADS, 1);
         if (levels > 1)
@@ -2007,24 +2009,24 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
         return 1;
     }
     if (nv2a_tex_pack_count()) {
-        struct nv2a_tex_pack_entry *pe = nv2a_tex_pack_find(hash, t->width, t->height);
+        pe = nv2a_tex_pack_find(hash, t->width, t->height);
         if (pe && (src = nv2a_tex_pack_texels(pe)) != NULL) {
             width = pe->width;
             height = pe->height;
             levels = pe->levels;
-            bc3 = pe->bc3;
+            bc = pe->bc;
         } else {
             nv2a_tex_pack_miss(hash, t->width, t->height, t->color, t->levels);
         }
     }
-    if (src && !tex_alloc(e, width, height, levels, bc3, 0)) {
+    if (src && !tex_alloc(e, width, height, levels, bc, 0)) {
         /* A refused entry is a miss too, tagged so in the trace. */
         nv2a_tex_pack_miss(hash, t->width, t->height, t->color, t->levels);
         src = NULL;
         width = t->width;
         height = t->height;
         levels = t->levels;
-        bc3 = 0;
+        bc = XRTP_BC_NONE;
     }
     /* RECOMP_DEBUG=tex_dump writes the guest's texels, never the pack's:
      * under a hit they are decoded for it alone, once. s_texels is free
@@ -2039,16 +2041,21 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
         if (nv2a_tex_dump_on())
             nv2a_tex_dump_upload(t, hash, s_texels);
     }
-    /* BC3 levels go up as they are, one row of 4x4 blocks per pitch. */
+    /* Block levels go up as they are, one row of 4x4 blocks per pitch. */
     p = (const uint8_t *)src;
     for (l = 0; l < levels; l++) {
         uint32_t w = nv2a_tex_level_dim(width, l), h = nv2a_tex_level_dim(height, l);
-        uint32_t row = bc3 ? (w + 3u) / 4u * 16u : w * 4u;
-        uint32_t rows = bc3 ? (h + 3u) / 4u : h;
+        uint32_t row = bc ? (w + 3u) / 4u * (bc == XRTP_BC_1 ? 8u : 16u) : w * 4u;
+        uint32_t rows = bc ? (h + 3u) / 4u : h;
         ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex,
                                               l, NULL, p, row, 0);
         p += (size_t)row * rows;
     }
+    /* src is the guest's when the entry was refused above. */
+    e->pack_scale = src != s_texels ? nv2a_stage_pack_scale(t->width, width) : 1u;
+    e->pack_levels = levels;
+    if (pe && src != s_texels)
+        nv2a_tex_pack_release(pe);
     s_tex_uploads++;
     nv2a_stats_add(NV2A_STAT_TEX_UPLOADS, 1);
     if (levels > 1)
@@ -2068,10 +2075,7 @@ static void tex_free(TexEntry *e)
  * new texture. */
 static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
 {
-    uint64_t h = tex_hash(mem + t->offset, bytes);
-    if (t->color == 0x0B)
-        h ^= tex_hash(mem + t->palette, t->pal_len * 4u) * 31u;
-    return h;
+    return nv2a_stage_hash(mem, t, bytes);
 }
 
 /* The view for a stage's texture, decoded and uploaded if it is new or its
@@ -2205,30 +2209,171 @@ static struct { uint64_t key; uint32_t border; ID3D11SamplerState *s; } s_smp[SM
 static int s_smp_n;
 static int s_smp_last[4];   /* per stage: the entry it got last */
 
-static ID3D11SamplerState *sampler(const Stage *t, int bump_source)
+/* e: the cache entry bound to the stage, or NULL (a render target, a black
+ * or magenta one): a pack entry there moves the clamps (nv2a_stage_lod). */
+/* RECOMP_TRACE=tex_mag (nv2a_tex_dump.h): a program batch's combiners take
+ * the trace's variant. A pre-transformed one has its figure from its vertices
+ * (mag_pretransformed), exact, with no atomics to pay. */
+static int mag_shader(const struct nv2a_pb_draw *d)
+{
+    return nv2a_tex_mag_on() && d && d->program;
+}
+
+static ID3D11Buffer              *s_mag_buf, *s_mag_read[2], *s_mag_cb;
+static ID3D11UnorderedAccessView *s_mag_uav;
+static struct nv2a_tex_mag_draw  *s_mag_rec[2];
+static unsigned s_mag_n[2], s_mag_cur;
+static int      s_mag_copied[2], s_mag_state;   /* s_mag_state: 0 not tried, 1 ok, -1 failed */
+/* What setup_pixel bound, for the trace's draw. */
+static uint64_t s_mag_hash[NV2A_TEX_MAG_STAGES];
+static uint32_t s_mag_scale[NV2A_TEX_MAG_STAGES];
+
+static int mag_init(void)
+{
+    D3D11_BUFFER_DESC bd;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud;
+    static const UINT zero[4] = { 0, 0, 0, 0 };
+    int k, ok = 1;
+
+    if (s_mag_state)
+        return s_mag_state > 0;
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = NV2A_TEX_MAG_BYTES;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    ok = ok && SUCCEEDED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_mag_buf));
+    memset(&ud, 0, sizeof ud);
+    ud.Format = DXGI_FORMAT_R32_UINT;
+    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    ud.Buffer.NumElements = NV2A_TEX_MAG_BYTES / 4u;
+    ok = ok && SUCCEEDED(ID3D11Device_CreateUnorderedAccessView(s_dev, (ID3D11Resource *)s_mag_buf,
+                                                                &ud, &s_mag_uav));
+    bd.Usage = D3D11_USAGE_STAGING;
+    bd.BindFlags = 0;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    for (k = 0; k < 2; k++) {
+        ok = ok && SUCCEEDED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_mag_read[k]));
+        s_mag_rec[k] = (struct nv2a_tex_mag_draw *)malloc(NV2A_TEX_MAG_DRAWS * sizeof *s_mag_rec[k]);
+        ok = ok && s_mag_rec[k];
+    }
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = 16;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    ok = ok && SUCCEEDED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_mag_cb));
+    s_mag_state = ok ? 1 : -1;
+    if (ok)
+        ID3D11DeviceContext_ClearUnorderedAccessViewUint(s_ctx, s_mag_uav, zero);
+    else
+        fprintf(stderr, LOGP "tex_mag: no device buffer; the trace reads nothing\n");
+    return ok;
+}
+
+/* Reads one vertex's position (surface pixels) and stage k's texcoord. */
+static void mag_pretransformed(const struct nv2a_pb_draw *d, const struct nv2a_pb_vsh *v,
+                               uint32_t lo, const uint32_t *idx, uint32_t nidx)
+{
+    unsigned rs = nv2a_host_render_scale();
+    uint32_t k, i;
+    for (k = 0; k < NV2A_TEX_MAG_STAGES; k++) {
+        const Stage *t = &s_stage[k];
+        int norm = nv2a_tex_size_from_format(t->color);
+        /* A few triangles of each: a 2D batch's pieces share their scale. */
+        for (i = 0; s_mag_hash[k] && i + 3 <= nidx && i < 3u * 64u; i += 3) {
+            float xy[3][2], uv[3][2], o[4];
+            int c;
+            for (c = 0; c < 3; c++) {
+                vtx_input(d, v, 0, lo + idx[i + (uint32_t)c], o);
+                xy[c][0] = o[0];
+                xy[c][1] = o[1];
+                vtx_input(d, v, 9 + k, lo + idx[i + (uint32_t)c], o);
+                uv[c][0] = norm ? o[0] * (float)t->width : o[0];
+                uv[c][1] = norm ? o[1] * (float)t->height : o[1];
+            }
+            nv2a_tex_mag_note(s_mag_hash[k], nv2a_tex_mag_triangle((const float (*)[2])xy,
+                                                                   (const float (*)[2])uv) * rs,
+                              rs);
+        }
+    }
+}
+
+/* The next draw's id, and the buffer it writes. The depth and colour targets
+ * stay what they are. */
+static void mag_draw(void)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    unsigned id;
+    if (!mag_init())
+        return;
+    id = nv2a_tex_mag_draw_id(s_mag_rec[s_mag_cur], &s_mag_n[s_mag_cur], s_mag_hash, s_mag_scale);
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_mag_cb, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return;
+    *(uint32_t *)m.pData = id;
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_mag_cb, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 3, 1, &s_mag_cb);
+    ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(
+        s_ctx, D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, NULL, NULL, 7, 1, &s_mag_uav, NULL);
+}
+
+/* The frame's buffer into a staging copy, the frame before's folded: one
+ * frame behind, so the Map does not wait for this frame's work. */
+static void mag_flip(void)
+{
+    static const UINT zero[4] = { 0, 0, 0, 0 };
+    unsigned other = 1u - s_mag_cur;
+    D3D11_MAPPED_SUBRESOURCE m;
+
+    if (s_mag_state <= 0)
+        return;
+    if (s_mag_copied[other]) {
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_mag_read[other], 0,
+                                              D3D11_MAP_READ, 0, &m))) {
+            nv2a_tex_mag_fold(s_mag_rec[other], s_mag_n[other], (const uint32_t *)m.pData,
+                              nv2a_host_render_scale());
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_mag_read[other], 0);
+        }
+        s_mag_copied[other] = 0;
+    }
+    if (s_mag_n[s_mag_cur]) {
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_mag_read[s_mag_cur],
+                                         (ID3D11Resource *)s_mag_buf);
+        ID3D11DeviceContext_ClearUnorderedAccessViewUint(s_ctx, s_mag_uav, zero);
+        s_mag_copied[s_mag_cur] = 1;
+    }
+    s_mag_cur = other;
+    s_mag_n[other] = 0;
+}
+
+static ID3D11SamplerState *sampler(const Stage *t, int bump_source, const TexEntry *e)
 {
     static int point = -1;
     static ID3D11SamplerState *fallback;
     D3D11_SAMPLER_DESC sd;
     uint32_t u = t->addr_u & 0xF, v = t->addr_v & 0xF;
-    int mn, mg, mip, i;
+    int mn, mg, mip, guest_mip, i;
     unsigned an;
     uint64_t key;
     uint32_t border;
     ID3D11SamplerState *st = NULL;
+    struct nv2a_stage_lod lod;
 
     if (point < 0)
         point = recomp_env(RENV_D3D11_POINT) != NULL;
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
-    mip = t->levels > 1 ? filter_mip(t->filter) : 0;
+    guest_mip = t->levels > 1 ? filter_mip(t->filter) : 0;
+    lod = nv2a_stage_lod(guest_mip, t->lod_min, t->lod_max, e ? e->pack_scale : 1u,
+                         e ? e->pack_levels : 1u);
+    mip = lod.mip;
     /* render.aniso: anisotropic filtering on the world's surfaces, seen at
      * an angle (nv2a_stage_aniso has the rule). In the key, so a stage that
      * is a bump source in one draw and plain in the next gets its own. */
-    an = nv2a_stage_aniso(t, mip, mn, bump_source);
+    an = nv2a_stage_aniso(t, guest_mip, mn, bump_source);
     key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9
-        | (uint64_t)mip << 10 | (uint64_t)an << 35;
-    if (mip)
+        | (uint64_t)mip << 10 | (uint64_t)an << 35 | lod.key;
+    if (guest_mip)
         key |= (uint64_t)(t->filter & 0x1FFFu) << 12
              | (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
     /* The colour is part of the state only where an axis uses it. */
@@ -2254,11 +2399,11 @@ static ID3D11SamplerState *sampler(const Stage *t, int bump_source)
     sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     nv2a_argb_to_float4(border, sd.BorderColor);
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    sd.MipLODBias = mip ? lod_bias(t->filter) : 0.0f;
+    sd.MipLODBias = guest_mip ? lod_bias(t->filter) : 0.0f;
     if (sd.MipLODBias > 15.99f) sd.MipLODBias = 15.99f;
     if (sd.MipLODBias < -16.0f) sd.MipLODBias = -16.0f;
-    sd.MinLOD = mip ? (float)t->lod_min : 0.0f;
-    sd.MaxLOD = mip ? (float)t->lod_max : 0.0f;
+    sd.MinLOD = lod.min;
+    sd.MaxLOD = lod.max;
     ID3D11Device_CreateSamplerState(s_dev, &sd, &st);
     if (!st)
         return fallback;
@@ -2837,7 +2982,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
             s_stage_src[n] = lm.src[n];
             if (lm.e[n])
                 lm.e[n]->used = ++s_tc_clock;   /* the LRU sees the use */
-            smp[n] = sampler(&s_stage[n], bump_src >> n & 1);
+            smp[n] = sampler(&s_stage[n], bump_src >> n & 1, lm.e[n]);
         }
         textured = lm.textured;
         flat_mask = lm.flat_mask;
@@ -2884,8 +3029,13 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         } else {
             srv[n] = s_black_srv;
         }
-        smp[n] = sampler(t, bump_src >> n & 1);
+        smp[n] = sampler(t, bump_src >> n & 1, lm.e[n]);
     }
+    if (nv2a_tex_mag_on())
+        for (n = 0; n < 4; n++) {
+            s_mag_hash[n] = lm.e[n] ? lm.e[n]->hash : 0;
+            s_mag_scale[n] = lm.e[n] ? lm.e[n]->pack_scale : 1u;
+        }
     if (!lhit) {
         /* Taken after the loop: tex_bind's own uploads moved the counters. */
         lm.ok = !s_stage_rt[0] && !s_stage_rt[1] && !s_stage_rt[2] && !s_stage_rt[3];
@@ -3036,7 +3186,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         /* render.scale changes at run time: each scale class has its own text */
         key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
                 | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u)
-                | (w ? 8u : 0u);   /* W-buffered: the w_depth variant */
+                | (w ? 8u : 0u)    /* W-buffered: the w_depth variant */
+                | (mag_shader(d) ? 16u : 0u);   /* the trace's variant */
         key[37] = inputs;
         hit = memo_on() && memo.key_ok && !memcmp(memo.r, key, sizeof key);
         if (!hit) {
@@ -3048,6 +3199,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
             st.rt_offset = (int)(key[36] >> 1 & 1u);   /* hor+: tex_scale.w, nv2a_aspect_place */
             st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
             st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */
+            st.tex_mag = (int)(key[36] >> 4 & 1u);     /* RECOMP_TRACE=tex_mag */
             for (n = 0; n < 4; n++) {
                 st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
                 st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
@@ -4212,6 +4364,10 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         if (hp.post_tex && aspect_trace())
             aspect_log_post(vs->hash, rt, hp.place);
         set_vp(v, g, rt, hp.place, hp.two_d || flat, lift, cb);
+        if (mag_shader(d))
+            mag_draw();
+        else if (nv2a_tex_mag_on() && topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+            mag_pretransformed(d, v, lo, idx, nidx);
         if (px_on()) {
             uint32_t before[4];
             int n;
@@ -4482,6 +4638,7 @@ static void flip_log(uint32_t surface_offset)
                     p_occ, p_occ_vis, p_occ_us, p_occ_late, p_occ_super,
                     p_occ_set, p_occ_stale, p_occ_first, p_loop;
     static int zt = -1;
+    mag_flip();
     nv2a_tex_dump_flip(s_presents);
     /* With a pack, its hit count every 600 flips, flip trace or not. */
     if (nv2a_tex_pack_count() && s_presents % 600 == 0) {

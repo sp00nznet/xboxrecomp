@@ -25,14 +25,15 @@ typedef struct stat pack_stat_t;
 #endif
 
 static struct nv2a_tex_pack_entry *s_entries;
-static unsigned  s_count, s_scale, s_text_scale;
-static unsigned  s_kind_count[XRTP_KIND_COUNT], s_bc3_count;
+static unsigned  s_count, s_scale, s_text_scale, s_version;
+static unsigned  s_kind_count[XRTP_KIND_COUNT], s_bc1_count, s_bc3_count;
 static char     *s_path;
 static uint64_t  s_hits;
 
 /* Read entries, most recently used at the head, and their payload bytes. */
 static struct nv2a_tex_pack_entry *s_lru_head, *s_lru_tail;
 static size_t s_resident, s_resident_max = NV2A_TEX_PACK_RESIDENT_MAX;
+static int s_keep;        /* RECOMP_DEBUG=tex_pack_keep */
 static uint64_t s_freed;   /* payloads freed for the budget, for the trace */
 /* The file as loaded. A payload is read later, at offsets checked against
  * this file; a pack rebuilt in place since then (a new `enhance hud` while
@@ -102,16 +103,26 @@ static uint32_t max_levels(uint32_t w, uint32_t h)
     return n;
 }
 
-size_t nv2a_tex_pack_bc3_bytes(uint32_t w, uint32_t h, uint32_t levels)
+static size_t block_bytes(uint32_t w, uint32_t h, uint32_t levels, uint32_t per_block)
 {
     size_t n = 0;
     uint32_t l;
     for (l = 0; l < levels; l++) {
-        n += (size_t)((w + 3u) / 4u) * ((h + 3u) / 4u) * 16u;
+        n += (size_t)((w + 3u) / 4u) * ((h + 3u) / 4u) * per_block;
         w = w > 1 ? w / 2 : 1;
         h = h > 1 ? h / 2 : 1;
     }
     return n;
+}
+
+size_t nv2a_tex_pack_bc3_bytes(uint32_t w, uint32_t h, uint32_t levels)
+{
+    return block_bytes(w, h, levels, 16u);
+}
+
+size_t nv2a_tex_pack_bc1_bytes(uint32_t w, uint32_t h, uint32_t levels)
+{
+    return block_bytes(w, h, levels, 8u);
 }
 
 static void fail(char *err, size_t errlen, const char *msg)
@@ -138,7 +149,9 @@ void nv2a_tex_pack_unload(void)
     s_count = 0;
     s_scale = 0;
     s_text_scale = 0;
+    s_version = 0;
     memset(s_kind_count, 0, sizeof s_kind_count);
+    s_bc1_count = 0;
     s_bc3_count = 0;
     s_hits = 0;
     memset(s_miss, 0, sizeof s_miss);
@@ -153,8 +166,8 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
     FILE *f;
     long long size;
     uint64_t index_off;
-    uint32_t count, version, scale, text_scale = 0;
-    unsigned i, kinds[XRTP_KIND_COUNT] = {0}, bc3 = 0;
+    uint32_t count, version, scale, text_scale = 0, known = 0, kinds_read = 0;
+    unsigned i, kinds[XRTP_KIND_COUNT] = {0}, bc1 = 0, bc3 = 0;
     struct nv2a_tex_pack_entry *entries = NULL;
     const char *why = NULL;
 
@@ -188,14 +201,24 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
     count = rd32(hdr + 8);
     scale = rd32(hdr + 12);
     index_off = rd64(hdr + 16);
-    if (version == 2u)
+    if (version >= 2u)
         text_scale = rd32(hdr + 24);
-    if (version != 1u && version != 2u)
+    /* What this version defines, so a v2 file still refuses a world entry
+     * or a BC1 payload: a later meaning is never misread. */
+    if (version == 2u) {
+        known = XRTP_FLAGS_KNOWN_V2;
+        kinds_read = 3u;
+    } else if (version == 3u) {
+        known = XRTP_FLAGS_KNOWN_V3;
+        kinds_read = 4u;
+    }
+    if (version < 1u || version > NV2A_TEX_PACK_VERSION)
         why = "unsupported pack version";
     /* Zero in v1 and v2's last u32, so a later reader can give them a
      * meaning an older reader refuses instead of misreading. v2 gave the
-     * first u32 the text scale. */
-    else if ((version == 1u ? rd64(hdr + 24) : rd32(hdr + 28)) != 0)
+     * first u32 the text scale; v3 the last the classes, which nothing
+     * here depends on. */
+    else if (version < 3u && (version == 1u ? rd64(hdr + 24) : rd32(hdr + 28)) != 0)
         why = "non-zero reserved header field";
     else if (count > NV2A_TEX_PACK_MAX_ENTRIES)
         why = "too many entries";
@@ -240,27 +263,32 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
             why = "entry with a bad size";
         else if (version == 1u && e->flags)
             why = "entry with non-zero flags";
-        else if (e->flags & ~XRTP_FLAGS_KNOWN)
+        else if (version >= 2u && (e->flags & ~known))
             why = "entry with unknown flags";
-        else if ((e->flags & XRTP_KIND_MASK) >= XRTP_KIND_COUNT)
+        else if (version >= 2u && (e->flags & XRTP_KIND_MASK) >= kinds_read)
             why = "entry with an unknown kind";
+        else if ((e->flags & XRTP_FLAG_BC3) && (e->flags & XRTP_FLAG_BC1))
+            why = "entry with two block formats";
         /* D3D11 refuses a block-compressed texture whose top level is not
-         * whole blocks; the CLI writes BC3 only for such sizes. */
-        else if ((e->flags & XRTP_FLAG_BC3) && ((e->width | e->height) & 3u))
-            why = "BC3 entry not a multiple of 4";
+         * whole blocks; the CLI writes blocks only for such sizes. */
+        else if ((e->flags & (XRTP_FLAG_BC3 | XRTP_FLAG_BC1)) && ((e->width | e->height) & 3u))
+            why = "block-compressed entry not a multiple of 4";
         else if (i && entries[i - 1].hash >= e->hash)
             why = "index not sorted by hash";
         else {
             e->kind = e->flags & XRTP_KIND_MASK;
-            e->bc3 = (e->flags & XRTP_FLAG_BC3) != 0;
+            e->bc = (e->flags & XRTP_FLAG_BC3) ? XRTP_BC_3
+                  : (e->flags & XRTP_FLAG_BC1) ? XRTP_BC_1 : XRTP_BC_NONE;
             e->texels = level_texels(e->width, e->height, e->levels);
-            e->bytes = e->bc3 ? nv2a_tex_pack_bc3_bytes(e->width, e->height, e->levels)
-                              : e->texels * 4u;
+            e->bytes = e->bc == XRTP_BC_3 ? nv2a_tex_pack_bc3_bytes(e->width, e->height, e->levels)
+                     : e->bc == XRTP_BC_1 ? nv2a_tex_pack_bc1_bytes(e->width, e->height, e->levels)
+                     :                      e->texels * 4u;
             if (e->offset < NV2A_TEX_PACK_HDR || e->offset > (uint64_t)size
                     || (uint64_t)e->bytes > (uint64_t)size - e->offset)
                 why = "entry texels outside the file";
             kinds[e->kind]++;
-            bc3 += e->bc3 ? 1u : 0u;
+            bc1 += e->bc == XRTP_BC_1 ? 1u : 0u;
+            bc3 += e->bc == XRTP_BC_3 ? 1u : 0u;
         }
     }
     free(index);
@@ -280,8 +308,10 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
     s_count = count;
     s_file_size = (uint64_t)size;
     s_scale = scale;
+    s_version = version;
     s_text_scale = text_scale ? text_scale : scale;
     memcpy(s_kind_count, kinds, sizeof kinds);
+    s_bc1_count = bc1;
     s_bc3_count = bc3;
     return (int)count;
 }
@@ -296,6 +326,11 @@ unsigned nv2a_tex_pack_scale(void)
     return s_scale;
 }
 
+unsigned nv2a_tex_pack_version(void)
+{
+    return s_version;
+}
+
 unsigned nv2a_tex_pack_text_scale(void)
 {
     return s_text_scale;
@@ -304,6 +339,11 @@ unsigned nv2a_tex_pack_text_scale(void)
 unsigned nv2a_tex_pack_kind_count(uint32_t kind)
 {
     return kind < XRTP_KIND_COUNT ? s_kind_count[kind] : 0;
+}
+
+unsigned nv2a_tex_pack_bc1_count(void)
+{
+    return s_bc1_count;
 }
 
 unsigned nv2a_tex_pack_bc3_count(void)
@@ -468,7 +508,7 @@ const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e)
         old->data = NULL;
         s_freed++;
     }
-    /* bytes is a multiple of 4 either way: texels * 4, or 16 per block. */
+    /* bytes is a multiple of 4 every way: texels * 4, or 8 or 16 per block. */
     data = (uint32_t *)malloc(e->bytes);
     if (!data || pack_seek(f, e->offset) != 0 || fread(data, 1u, e->bytes, f) != e->bytes) {
         read_failed(e);
@@ -478,7 +518,7 @@ const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e)
     }
     fclose(f);
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    if (!e->bc3) {  /* BC3 blocks are bytes in GPU order: never swapped */
+    if (!e->bc) {   /* blocks are bytes in GPU order: never swapped */
         size_t i;
         for (i = 0; i < e->texels; i++) {
             uint32_t v = data[i];
@@ -490,6 +530,21 @@ const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e)
     s_resident += e->bytes;
     lru_push(e);
     return data;
+}
+
+void nv2a_tex_pack_set_keep(int keep)
+{
+    s_keep = keep;
+}
+
+void nv2a_tex_pack_release(struct nv2a_tex_pack_entry *e)
+{
+    if (!e || !e->data || s_keep)
+        return;
+    lru_unlink(e);
+    s_resident -= e->bytes;
+    free(e->data);
+    e->data = NULL;
 }
 
 /* ---- Misses ------------------------------------------------------------- */
@@ -534,12 +589,11 @@ void nv2a_tex_pack_miss(uint64_t hash, uint32_t w, uint32_t h, uint32_t color,
     m->count = 1;
     m->why = why;
     m->kind = e ? e->kind : 0;
-    /* What a pack can hold: the hash is over guest bytes the CLI also
-     * reads from the dump's image files (swizzled or DXT, one level). A
-     * linear or mipmapped upload is a render target, a movie frame or a
-     * generated texture, which no file in the dump holds. */
-    m->candidate = (d3d8_format_is_swizzled(color) || d3d8_format_dxt_block_bytes(color))
-                && levels <= 1;
+    /* What a pack can hold: the texture dump writes the decoded texels of
+     * any swizzled or DXT upload, palette or mips included, under this very
+     * hash. A linear upload is a render target or a movie frame, which a
+     * pack leaves out. */
+    m->candidate = d3d8_format_is_swizzled(color) || d3d8_format_dxt_block_bytes(color);
 }
 
 static int miss_cmp(const void *a, const void *b)
@@ -622,7 +676,7 @@ static const char *fmt_name(uint32_t color, char *buf, size_t len)
 static const char *why_name(const struct nv2a_tex_pack_miss *m)
 {
     static const char *const kind_off[XRTP_KIND_COUNT] = {
-        " (art off)", " (font off)", " (text off)",
+        " (art off)", " (font off)", " (text off)", " (world off)",
     };
     switch (m->why) {
     case NV2A_TEX_PACK_MISS_PACK_OFF: return " (pack off)";
@@ -646,5 +700,5 @@ void nv2a_tex_pack_print_misses(void)
         fprintf(stderr, "[TEXPACK] miss %016llX %ux%u %s x%u %s%s\n",
                 (unsigned long long)m[i].hash, m[i].width, m[i].height,
                 fmt_name(m[i].color, buf, sizeof buf), m[i].count,
-                m[i].candidate ? "candidate" : "linear/mip", why_name(&m[i]));
+                m[i].candidate ? "candidate" : "linear", why_name(&m[i]));
 }

@@ -321,6 +321,12 @@ typedef struct NV2ACombinerState {
      * xemu's psh.c does. A backend flag, 0 for every other batch, so the
      * stock shader text (and its early-Z) is unchanged; in the cache key. */
     int w_depth;
+
+    /* 1: RECOMP_TRACE=tex_mag, each 2D stage's unclamped LOD, one pixel in
+     * 64, max'd into a device buffer (nv2a_tex_mag_fold reads it). A backend
+     * flag, set only under the trace, so the stock shader text is unchanged;
+     * in the cache key. 3D, cube, bump and dot stages are not measured. */
+    int tex_mag;
 } NV2ACombinerState;
 
 /**

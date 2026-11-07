@@ -189,6 +189,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
+| `textures.world` | string | `"on"`, `"off"`: the pack's world entries (version 3) | `"on"` | `RECOMP_TEXTURES_WORLD` |
 | `overlay.stats` | bool | the stats strip in the window's top right corner: fps, frame ms (average and worst of the last second), pacing, scale and backend, at 2 Hz; never in a frame dump | `false` | `RECOMP_OVERLAY_STATS` |
 | `overlay.ui_scale` | number | the menu's and the overlays' size over the automatic scale (`overlay.ui_fit`), 0.75 to 2 in quarter steps: larger for a TV across the room. Live from the menu: the font atlas is baked again between frames | `1` | `RECOMP_OVERLAY_UI_SCALE` |
 | `overlay.ui_fit` | string | what the automatic scale follows: `"display"` (the larger of the output height over 1080 and the display's floor: the OS's UI scale, and on a Steam Deck's own 1280x800 panel (`SteamDeck=1` or its SMBIOS names) its 216 ppi over 160, held to the output height over 600; [Overlay scale](#overlay-scale)) or `"output"` (the output height over 1080 alone, the rule before the display floor; the height shown, so under gamescope the window's lines after the compositor's fit to the screen). Live from the menu, like `overlay.ui_scale` | `"display"` | `RECOMP_OVERLAY_UI_FIT` |
@@ -803,7 +804,7 @@ declares `OriginalSize` in its uniform block) is not a read.
   (a `.app` keeps the pack beside the executable too). The layer
   loads the pack's index at startup and logs one line after the settings
   line: `[ENHANCE] textures.pack=none` when unset, or
-  `[ENHANCE] textures.pack=enhance/hud.pack (41 entries: 30 art, 1 font, 10 text; scale 4, text 2; 10 bc3) textures.font=on textures.text=on`
+  `[ENHANCE] textures.pack=enhance/hud.pack (41 entries: 30 ui, 1 font, 10 text, 0 world; v2; scale 4, text 2; 0 bc1, 10 bc3) textures.font=on textures.text=on textures.world=on`
   (the path ends at the first space). A
   file that is missing, has another magic or version, a non-zero reserved
   field, flags the version does not define, an entry outside the file, an
@@ -825,14 +826,15 @@ declares `OriginalSize` in its uniform block) is not a read.
   with a pack logs its hit count; under `RECOMP_TRACE=tex_pack` it also
   prints `[TEXPACK] resident <n> KB of <budget> KB, <n> freed` (the CPU
   copies held under the 512 MB budget) and the uploads the pack did not replace, one
-  `[TEXPACK] miss <hash> <w>x<h> <format> x<count> candidate|linear/mip`
+  `[TEXPACK] miss <hash> <w>x<h> <format> x<count> candidate|linear`
   line each (texture-pack.md, "Misses"), which says what a pack still
   lacks. A texture the pack holds but did not use carries a tag:
   ` (text off)` (or art, font), ` (pack off)`, or ` (entry refused)` when
   the backend could not take the entry (a GPU without BC3, such as an
   older iPad, says so once; a texture too large; a failed read).
-- **`textures.font = "on" | "off"`, `textures.text = "on" | "off"`.** A
-  version 2 pack marks each entry as art, the font atlas or baked text.
+- **`textures.font`, `textures.text`, `textures.world` = `"on" | "off"`.** A
+  pack marks each entry as art, the font atlas, baked text or (version 3) a
+  texture of the 3D scene; `textures.world` turns those off alone.
   `off` makes the pack skip that kind, so the game's own glyphs or text
   images are drawn, for a player who prefers them or a language the pack
   does not cover. Both are read whether or not a pack is set; with one
@@ -841,6 +843,13 @@ declares `OriginalSize` in its uniform block) is not a read.
   flip: the backends upload again every texture made under the old
   setting. A golden run must show
   `textures.pack=none`: the golden check fails any other value.
+- **Magnification trace: `RECOMP_TRACE=tex_mag`.** How far each texture hash
+  is ever magnified, with or without the dump: into the sidecars with it, in
+  `[TEXDUMP] mag` lines at exit without it. A shader variant and a device
+  buffer under the trace only; an upper bound
+  ([texture-dump.md](../formats/texture-dump.md)).
+- **`RECOMP_DEBUG=tex_pack_keep`.** Keeps a pack entry's payload in RAM after
+  its GPU upload, under the 512 MB budget, instead of freeing it, for A/B.
 - **Texture dump: `RECOMP_DEBUG=tex_dump=<dir>`.** Not a config key: a
   debug entry, off by default. The Metal and D3D11 backends write every
   texture they upload into `<dir>` once per texel hash, the hash a pack
@@ -1540,7 +1549,7 @@ points, its live class; the footer names the selected row's:
 | Class | Takes effect | Items |
 |---|---|---|
 | live | at the next flip | `render.aniso`, `render.snap_2d`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `overlay.stats`, `overlay.ui_scale`, `overlay.ui_fit`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
-| at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text` |
+| at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text`, `textures.world` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
 | at restart | at the next start; the change is saved, not applied | `display.aspect`, `present.surface`, a mod without `on_enable` |
@@ -1697,6 +1706,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_TEXTURES_PACK` | overrides `textures.pack` |
 | `RECOMP_TEXTURES_FONT` | overrides `textures.font` |
 | `RECOMP_TEXTURES_TEXT` | overrides `textures.text` |
+| `RECOMP_TEXTURES_WORLD` | overrides `textures.world` |
 | `RECOMP_OVERLAY_STATS` | overrides `overlay.stats` |
 | `RECOMP_MENU` | overrides `menu.enabled` |
 | `RECOMP_KEYBOARD` | overrides `input.keyboard` (an older name, outside the naming rule) |

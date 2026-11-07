@@ -17,16 +17,23 @@
  *   v2        kind flags read and counted, the text scale, a kind or the
  *             whole pack switched off is a miss and bumps the generation
  *             (once per change); a miss records why (absent, kind off,
- *             pack off, held but refused); unknown flag bits, kind 3 and
- *             the v2 reserved word refused
+ *             pack off, held but refused); unknown flag bits, kind 3, BC1
+ *             and the v2 reserved word refused
+ *   v3        kind 3 counted, found and switched alone; a BC1 entry's payload
+ *             is its block count x 8, read as it is, the block test_bc1_vector
+ *             in the CLI encodes decoding through d3d8_dxt_decode_texel; the
+ *             word at +28 not refused; bit 6 and both block flags refused; v1
+ *             and v2 still read
+ *   release   frees the payload, a later read brings back the same bytes;
+ *             under set_keep it does nothing
  *   bc3       a BC3 entry's payload is its block count x 16, bounds-checked
  *             and read as it is; the block the CLI's test_bc3_vector encodes
  *             decodes through d3d8_dxt_decode_texel to its texels (alpha
  *             exact, colour within the one level the expansions differ); a
  *             size that is not whole blocks is refused
  *   misses    the ring keeps distinct (hash, size, format) with counts,
- *             sorted by count; candidates are swizzled or DXT one-level
- *             uploads; 64 at most, the oldest giving way; unload clears it
+ *             sorted by count; candidates are swizzled or DXT uploads,
+ *             palettes and mips included; 64 at most, the oldest giving way; unload clears it
  *   resident  with a budget that holds one entry, reading the other frees
  *             the least recently used; a freed entry reads back the same
  *             texels; a use moves an entry to the front; an entry over the
@@ -267,7 +274,7 @@ static void test_v2(void)
           "scales %u, %u", nv2a_tex_pack_scale(), nv2a_tex_pack_text_scale());
     CHECK(nv2a_tex_pack_bc3_count() == 0, "bc3 count");
     e = nv2a_tex_pack_find(HASH_A, 1, 1);
-    CHECK(e && e->kind == XRTP_KIND_FONT && !e->bc3 && e->bytes == TEXELS_A * 4, "entry A kind");
+    CHECK(e && e->kind == XRTP_KIND_FONT && e->bc == XRTP_BC_NONE && e->bytes == TEXELS_A * 4, "entry A kind");
     e = nv2a_tex_pack_find(HASH_B, 2, 1);
     CHECK(e && e->kind == XRTP_KIND_TEXT, "entry B kind");
 
@@ -406,7 +413,7 @@ static void test_bc3(void)
     CHECK(nv2a_tex_pack_bc3_count() == 1 && nv2a_tex_pack_kind_count(XRTP_KIND_TEXT) == 1,
           "bc3 counts");
     e = nv2a_tex_pack_find(HASH_C, 4, 2);
-    CHECK(e && e->bc3 && e->kind == XRTP_KIND_TEXT && e->bytes == 32, "bc3 entry");
+    CHECK(e && e->bc == XRTP_BC_3 && e->kind == XRTP_KIND_TEXT && e->bytes == 32, "bc3 entry");
     px = e ? (const uint8_t *)nv2a_tex_pack_texels(e) : NULL;
     CHECK(px && memcmp(px, BC3_B, 16) == 0 && memcmp(px + 16, BC3_B, 16) == 0,
           "bc3 bytes not as stored");
@@ -433,6 +440,125 @@ static void test_bc3(void)
     refuse("bc3_short.pack", buf, n - 1, "outside the file");
 }
 
+/* A BC1 world entry and a texel one, v3: a 4x4 opaque block whose first row
+ * is pure red and the other three pure blue, the vector the CLI's writer tests
+ * are to share, so both ends read one layout. */
+static const uint8_t BC1_B[8] = { 0x00, 0xF8, 0x1F, 0x00, 0x00, 0x55, 0x55, 0x55 };
+
+static size_t build_v3(uint8_t *buf, uint32_t flags, uint32_t w, uint32_t h)
+{
+    size_t idx = NV2A_TEX_PACK_HDR, pay = idx + NV2A_TEX_PACK_ENTRY;
+    size_t bytes = nv2a_tex_pack_bc1_bytes(w, h, 1), i;
+    memset(buf, 0, pay + bytes);
+    memcpy(buf, NV2A_TEX_PACK_MAGIC, 4);
+    wr32(buf + 4, 3);
+    wr32(buf + 8, 1);
+    wr32(buf + 12, 2);
+    wr64(buf + 16, idx);
+    wr32(buf + 24, 2);
+    wr32(buf + 28, 1u << XRTP_KIND_WORLD);
+    wr64(buf + idx, HASH_C);
+    wr32(buf + idx + 8, w);
+    wr32(buf + idx + 12, h);
+    wr32(buf + idx + 16, 1);
+    wr32(buf + idx + 20, flags);
+    wr64(buf + idx + 24, pay);
+    for (i = 0; i < bytes; i += 8)
+        memcpy(buf + pay + i, BC1_B, 8);
+    return pay + bytes;
+}
+
+static void test_v3(void)
+{
+    uint8_t buf[512];
+    char err[128] = "";
+    struct nv2a_tex_pack_entry *e;
+    const uint8_t *px;
+    uint32_t argb = 0, g;
+    int rc;
+    size_t n;
+
+    CHECK(nv2a_tex_pack_bc1_bytes(4, 4, 1) == 8 && nv2a_tex_pack_bc1_bytes(8, 4, 1) == 16
+          && nv2a_tex_pack_bc1_bytes(6, 2, 1) == 16
+          && nv2a_tex_pack_bc1_bytes(8, 8, 2) == 32 + 8, "bc1 byte counts");
+
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_BC1, 8, 4);
+    write_file("v3.pack", buf, n);
+    rc = nv2a_tex_pack_load("v3.pack", err, sizeof err);
+    CHECK(rc == 1, "v3 load: %d (%s)", rc, err);
+    CHECK(nv2a_tex_pack_version() == 3, "version %u", nv2a_tex_pack_version());
+    CHECK(nv2a_tex_pack_bc1_count() == 1 && nv2a_tex_pack_bc3_count() == 0
+          && nv2a_tex_pack_kind_count(XRTP_KIND_WORLD) == 1
+          && nv2a_tex_pack_kind_count(XRTP_KIND_ART) == 0, "v3 counts");
+    e = nv2a_tex_pack_find(HASH_C, 4, 2);
+    CHECK(e && e->bc == XRTP_BC_1 && e->kind == XRTP_KIND_WORLD && e->bytes == 16, "bc1 entry");
+    px = e ? (const uint8_t *)nv2a_tex_pack_texels(e) : NULL;
+    CHECK(px && memcmp(px, BC1_B, 8) == 0 && memcmp(px + 8, BC1_B, 8) == 0,
+          "bc1 bytes not as stored");
+    /* Row 0 is index 0, the first endpoint; the rest index 1, the second. */
+    CHECK(px && d3d8_dxt_decode_texel(px, 0x0C, 0, 0, 8, &argb) && argb == 0xFFFF0000u,
+          "bc1 texel %08X", argb);
+    CHECK(px && d3d8_dxt_decode_texel(px, 0x0C, 0, 1, 8, &argb) && argb == 0xFF0000FFu,
+          "bc1 texel %08X", argb);
+
+    /* The kind is one switch of its own, a generation each way. */
+    g = nv2a_tex_pack_gen();
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_WORLD, 0);
+    CHECK(nv2a_tex_pack_find(HASH_C, 4, 2) == NULL, "world off: found");
+    CHECK(nv2a_tex_pack_gen() == g + 1, "world off: gen");
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_WORLD, 1);
+    CHECK(nv2a_tex_pack_find(HASH_C, 4, 2) != NULL, "world on: missing");
+    CHECK(nv2a_tex_pack_gen() == g + 2, "world on: gen");
+
+    /* Release: the payload goes, and comes back the same. */
+    e = nv2a_tex_pack_find(HASH_C, 4, 2);
+    CHECK(e && nv2a_tex_pack_resident_bytes() == 16, "held %zu", nv2a_tex_pack_resident_bytes());
+    nv2a_tex_pack_release(e);
+    CHECK(e && !e->data && nv2a_tex_pack_resident_bytes() == 0, "released");
+    px = e ? (const uint8_t *)nv2a_tex_pack_texels(e) : NULL;
+    CHECK(px && memcmp(px, BC1_B, 8) == 0, "read again");
+    nv2a_tex_pack_set_keep(1);
+    nv2a_tex_pack_release(e);
+    CHECK(e && e->data && nv2a_tex_pack_resident_bytes() == 16, "tex_pack_keep held it");
+    nv2a_tex_pack_set_keep(0);
+    nv2a_tex_pack_release(e);
+    nv2a_tex_pack_release(e);   /* twice, and of what is not held: nothing */
+    nv2a_tex_pack_release(NULL);
+    CHECK(nv2a_tex_pack_resident_bytes() == 0, "double release");
+    nv2a_tex_pack_unload();
+
+    /* Texels at kind 3, and each version's refusals. */
+    n = build_v3(buf, XRTP_KIND_WORLD, 2, 2) + 8;   /* BC1's 8 bytes; 2x2 texels are 16 */
+    write_file("v3_texels.pack", buf, n);
+    CHECK(nv2a_tex_pack_load("v3_texels.pack", err, sizeof err) == 1, "v3 texels: '%s'", err);
+    e = nv2a_tex_pack_find(HASH_C, 2, 2);
+    CHECK(e && e->bc == XRTP_BC_NONE && e->kind == XRTP_KIND_WORLD && e->bytes == 16,
+          "texel entry at kind 3");
+    nv2a_tex_pack_unload();
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_BC1, 8, 4);
+    wr32(buf + NV2A_TEX_PACK_HDR + 20, XRTP_KIND_WORLD | XRTP_FLAG_BC1 | 0x40u);
+    refuse("v3_bit6.pack", buf, n, "flags");
+    wr32(buf + NV2A_TEX_PACK_HDR + 20, XRTP_KIND_WORLD | XRTP_FLAG_BC1 | XRTP_FLAG_BC3);
+    refuse("v3_both.pack", buf, n, "two block formats");
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_BC1, 6, 4);
+    refuse("v3_odd.pack", buf, n, "multiple of 4");
+    /* A v2 file refuses what only v3 defines, whatever else it holds. */
+    n = build_v3(buf, XRTP_KIND_WORLD, 8, 4);
+    wr32(buf + 4, 2);
+    wr32(buf + 28, 0);
+    refuse("v2_world.pack", buf, n, "kind");
+    n = build_v3(buf, XRTP_KIND_ART | XRTP_FLAG_BC1, 8, 4);
+    wr32(buf + 4, 2);
+    wr32(buf + 28, 0);
+    refuse("v2_bc1.pack", buf, n, "flags");
+    /* v1 and v2 still load under the v3 reader (test_write, test_v2 too). */
+    n = build_pack(buf, HASH_A, HASH_B, 2);
+    write_file("v2_still.pack", buf, n);
+    CHECK(nv2a_tex_pack_load("v2_still.pack", err, sizeof err) == 2
+          && nv2a_tex_pack_version() == 2, "v2 file: '%s'", err);
+    nv2a_tex_pack_unload();
+}
+
 static void test_misses(void)
 {
     struct nv2a_tex_pack_miss m[NV2A_TEX_PACK_MISSES + 4];
@@ -455,13 +581,22 @@ static void test_misses(void)
     CHECK(m[1].hash == 0xCC && m[1].count == 2 && m[1].candidate, "second miss");
     for (i = 2; i < n; i++) {
         CHECK(m[i].count == 1, "miss %u count %u", i, m[i].count);
-        if (m[i].hash == 0xBB || m[i].hash == 0xDD)
+        if (m[i].hash == 0xBB)
             CHECK(!m[i].candidate, "%llX taken for a candidate", (unsigned long long)m[i].hash);
+        else if (m[i].hash == 0xDD)
+            CHECK(m[i].candidate, "a mipped upload is a candidate");
         else
             CHECK(m[i].candidate && m[i].width == 32, "the 32x32 DXT5 miss");
     }
     CHECK(nv2a_tex_pack_misses(m, 2) == 2 && m[0].hash == 0xAA, "a short read");
     nv2a_tex_pack_print_misses();
+    /* A P8 upload is a candidate now: its hash folds the palette, so a pack
+     * built from its dump matches it. */
+    nv2a_tex_pack_miss(0xEEull, 16, 16, 0x0B, 1);
+    n = nv2a_tex_pack_misses(m, NV2A_TEX_PACK_MISSES);
+    for (i = 0; i < n; i++)
+        if (m[i].hash == 0xEE)
+            CHECK(m[i].candidate, "a P8 upload is a candidate");
 
     /* 70 more distinct: the ring holds 64, the oldest gone first. */
     for (i = 0; i < 70; i++)
@@ -628,6 +763,7 @@ int main(void)
     test_hash();
     test_v2();
     test_bc3();
+    test_v3();
     test_misses();
     test_resident();
     if (fails) {

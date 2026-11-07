@@ -223,6 +223,15 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     if (state->w_depth)
         EMIT("%s", D3D8_HLSL_WDEPTH);
     EMIT("%s", s_rc_helpers);
+    if (state->tex_mag)
+        EMIT("cbuffer TexMag : register(b3) { uint mag_draw; };\n"
+             "RWBuffer<uint> mag_buf : register(u7);\n"
+             "void mag_put(uint slot, float lod) {\n"
+             "    float m = 32.0 - lod;\n"
+             "    uint v = 0u, was;\n"
+             "    if (m > 0.0 && m < 64.0) v = uint(m * 1024.0);\n"
+             "    InterlockedMax(mag_buf[mag_draw * 4u + slot], v, was);\n"
+             "}\n");
     if (state->rect_snap)
         EMIT("%s", D3D8_HLSL_SNAP_UV);
     if (state->rect_snap && state->snap_2d)
@@ -246,6 +255,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         EMIT("float4 main(PS_IN i) : SV_Target {\n");
     for (k = 0; k < 16; k++)
         EMIT("    float4 x%d = 0;\n", k);
+    if (state->tex_mag)
+        EMIT("    float mag_lod[4] = { 64.0, 64.0, 64.0, 64.0 };\n");
     if (state->fog_input)
         EMIT("    x3 = float4(fog_color.rgb, saturate(i.fog));\n");
     else
@@ -315,6 +326,10 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                  * as the CPU path's stage_sample does. */
                 EMIT("        if (tex_mode[%d] == 1u && i.tc%d.w != 0.0 && i.tc%d.w != 1.0)"
                      " uv /= i.tc%d.w;\n", i, i, i, i);
+            /* Before the snap, whose derivatives spike at its steps. */
+            if (state->tex_mag)
+                EMIT("        mag_lod[%d] = tex%d.CalculateLevelOfDetailUnclamped(samp%d,"
+                     " uv * tex_scale[%d].xy);\n", i, i, i, i);
             if (state->rect_snap && state->snap_2d) {
                 /* A 2D-snapped stage (.z < 0) samples with the 1x
                  * gradients, so its mip level and min/mag choice are the
@@ -350,6 +365,12 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             EMIT("    if (alpha_only[%d] == 2u) x%d.a = 1.0;\n"
                  "    else if (alpha_only[%d] != 0u) x%d.rgb = 1.0;\n", i, 8 + i, i, 8 + i);
     }
+    /* Before anything can discard, one pixel in 64 of a screen tile. */
+    if (state->tex_mag)
+        EMIT("    if ((uint(i.pos.x) & 7u) == 0u && (uint(i.pos.y) & 7u) == 0u) {\n"
+             "        mag_put(0u, mag_lod[0]); mag_put(1u, mag_lod[1]);\n"
+             "        mag_put(2u, mag_lod[2]); mag_put(3u, mag_lod[3]);\n"
+             "    }\n");
     EMIT("    x12.a = x8.a;\n");
 
     /* ---- General combiner stages ---- */

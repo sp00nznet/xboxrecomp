@@ -24,8 +24,13 @@ texture, every level packed (for DXT, the block bytes); for a linear one,
 with D3DX as it is, that is the file's data block, which is how a pack can
 be built offline from the game's files.
 
-A P8 texture's cache key folds its palette into the hash, so P8 textures
-never match a pack entry.
+A P8 texture's key folds its palette in (`nv2a_stage_hash`): the hash of the
+indices, xor 31 times the hash of the palette's `4 * entries` bytes, with the
+same function and seed. An entry whose hash comes from the runtime dump
+(texture-dump.md) therefore matches that one palette, and the same indices
+under another palette miss. The pack holds decoded texels, never a palette.
+The archive path can't name such a hash, since an archive reader has no
+palette in hand, so P8 is reached only through a dump.
 
 Test vector, shared with the CLI's Python port: the 1034 bytes `0..255`
 four times followed by `xboxrecomp` hash to `0x0B060D91FB09F186`; the
@@ -34,55 +39,65 @@ empty input to `0x40500CA3D9E617F3`; 64 zero bytes to `0x69597731194007AB`.
 ## Layout
 
 All fields little-endian. Version 2 adds entry kinds, BC3 payloads and a
-text scale; the reader takes version 1 and version 2 files.
+text scale. Version 3 adds kind 3 (world), BC1 payloads and the `classes`
+word. The reader takes all three, each by its own rules.
 
 ```
 offset  size  field
 0       4     magic "XRTP"
-4       4     version, 1 or 2
+4       4     version, 1, 2 or 3
 8       4     count
 12      4     scale: the factor the art entries were made at (informational;
               logged as "scale N")
 16      8     index offset (>= 32)
 24      8     v1: reserved, 0 (a reader refuses any other value)
-24      4     v2: text scale, the factor the TEXT entries were made at
+24      4     v2, v3: text scale, the factor the TEXT entries were made at
               (informational; 0 means the header scale)
 28      4     v2: reserved, 0
+28      4     v3: classes, a bit per kind present (1 << kind); informational,
+              the reader does not check it
 
 index: count entries of 32 bytes, sorted by hash, strictly increasing
 0       8     hash (nv2a_tex_hash of the guest texture)
 8       4     width  (1..16384)
 12      4     height (1..16384)
 16      4     levels (1 .. 1 + floor(log2(max(w, h))))
-20      4     flags: v1 0; v2 below (a reader refuses any other value)
+20      4     flags: v1 0; v2 and v3 below (a reader refuses any other value)
 24      8     payload offset (>= 32)
 
 payload: per entry, every level, level 0 first, each further level
 halving width and height (floor, minimum 1):
-  without XRTP_FLAG_BC3  one u32 A8R8G8B8 texel per pixel: the value
+  no block flag          one u32 A8R8G8B8 texel per pixel: the value
                          nv2a_tex_decode produces, which the backends
                          upload as BGRA8 bytes
-  with XRTP_FLAG_BC3     the level's BC3 (DXT5) blocks, row of blocks by
+  XRTP_FLAG_BC3          the level's BC3 (DXT5) blocks, row of blocks by
                          row, 16 bytes per 4x4 block
+  XRTP_FLAG_BC1 (v3)     the level's BC1 (DXT1) blocks, always opaque, row of
+                         blocks by row, 8 bytes per 4x4 block
 ```
 
-v2 entry flags:
+Entry flags:
 
 | Bits | Name | Meaning |
 |---|---|---|
-| 0-1 | kind | `0` art (HUD pieces and other images), `1` font (the atlas the glyphs are drawn from), `2` text (an image of pre-rendered text); `3` is refused |
+| 0-1 | kind | `0` art (HUD pieces and other images), `1` font (the atlas the glyphs are drawn from), `2` text (an image of pre-rendered text); `3` world (textures of the 3D scene), v3 only |
 | 4 | `XRTP_FLAG_BC3` | the payload is BC3 blocks |
+| 5 | `XRTP_FLAG_BC1` | the payload is BC1 blocks, v3 only; never with bit 4 |
 
-Every other bit is refused, so a later meaning is never misread by this
+Each version refuses what it does not define (a v2 file with kind 3 or bit 5,
+any file with another bit), so a later meaning is never misread by this
 reader. The kind is the unit a player turns off (`textures.font`,
-`textures.text`, [config.md](../runtime/config.md)): a
+`textures.text`, `textures.world`, [config.md](../runtime/config.md)): a
 turned-off entry is not found, and the guest texture goes up as without a
 pack. The header scale describes the art; each entry carries its own size,
 so text built at 2x and art at 4x share one pack.
 
-A BC3 entry's width and height must be multiples of 4, so every level the
+A block entry's width and height must be multiples of 4, so every level the
 backends create from it is whole blocks; the reader refuses the file
-otherwise ("BC3 entry not a multiple of 4"). BC3 is a quarter of the bytes
+otherwise ("block-compressed entry not a multiple of 4"). BC1's test vector,
+which the CLI's writer is to share: the block `00F81F0000555555` has endpoints
+0xF800 and 0x001F, its first row index 0 (opaque red, `FFFF0000`), the other
+three index 1 (opaque blue, `FF0000FF`). BC3 is a quarter of the bytes
 of A8R8G8B8 on disk and in video memory, and is uploaded as it is. Test
 vector, shared with the CLI's encoder: the 16 texels whose RGBA bytes are
 `0aff00002ff2031f54e50c2f79d81b3f9ecb304fc3be4b00e8b16c6f0da4937f3297c08f578af39f7c7d2cafa1706bbfc663b0cfeb56fbdf10494cef353ca3ff`
@@ -96,22 +111,38 @@ The reader (`src/kernel/nv2a_tex_pack.c`) checks the magic and version,
 the reserved field and the flags, that the index and every entry's payload
 lie inside the file, the sizes, and the sort order, and refuses the whole file otherwise; the layer logs
 the reason and the run stays stock. The index is read at load; an entry's
-texels are read on first use and kept while the read entries total at
-most 512 MB (`NV2A_TEX_PACK_RESIDENT_MAX`); past it the least recently
-used entries' CPU copies are freed, and an entry is read from the file
-again when a backend uploads it again. The GPU copies stay in the
-backends' texture caches, and a pack smaller than the budget is never
-trimmed. A re-read checks that the file still has the size and mtime it
+payload is read when a backend uploads it and freed as soon as the backend
+holds the GPU copy (`nv2a_tex_pack_release`), so a large pack costs VRAM and
+not the same bytes again in RAM; a later upload reads it again.
+`RECOMP_DEBUG=tex_pack_keep` keeps the payloads instead, for A/B, while the
+read entries total at most 512 MB (`NV2A_TEX_PACK_RESIDENT_MAX`); past it the
+least recently used entries' CPU copies are freed. That budget also bounds
+any payload a backend has not released yet. A re-read checks that the file still has the size and mtime it
 had at load: a pack rebuilt in place while the game runs would hold other
 bytes at the checked offsets, so it is not read again (said once in the
 log), and the textures not held go up from the guest until the next load.
 The file is opened before anything is freed, so a pack that cannot be
-read keeps what is held. The sampler state
-comes from the guest's registers as always, so a replacement is sampled
-with the guest's filter and wrap modes and, since swizzled and DXT
-textures use normalised coordinates, needs no other change. A linear
-texture (texel coordinates) would be sampled at guest texel positions and
-should not be put in a pack.
+read keeps what is held.
+
+The sampler state comes from the guest's registers as always, so a replacement
+is sampled with the guest's filter and wrap modes and, since swizzled and DXT
+textures use normalised coordinates, needs no other change, except the mip
+range: the guest's LOD clamps count its own levels, and a pack entry's level 0
+is finer. Both samplers follow the entry (`nv2a_stage_lod`). With `scale` the
+entry's width over the guest's, when that is an exact multiple of at most 15
+(1 otherwise, and the stock clamps), and `shift = log2(scale)`:
+
+- a guest texture that mips keeps its mode, and its top clamp moves to
+  `max + shift`; its bottom clamp stays 0 when it was 0, or the entry's finer
+  levels could never be reached, and moves by `shift` when the guest had
+  clamped its own level 0 away;
+- a guest texture that does not mip, under an entry with more than one level,
+  samples `[0, shift]` with the nearest level. Without it the entry aliases
+  worse than stock, and past `shift` the far end is what the guest showed;
+- an entry with one level has nothing to choose from: `[0, 0]`, as before.
+
+A linear texture (texel coordinates) would be sampled at guest texel positions
+and should not be put in a pack.
 
 A sidecar `hud-pack.toml` written by the CLI beside the pack describes
 the entries for people (archive entry names, kinds, hashes, sizes, the
@@ -129,12 +160,12 @@ print it every 600 flips, most counted first:
 [TEXPACK] miss 0123456789ABCDEF 256x64 DXT5 x42 candidate
 ```
 
-`candidate` marks a swizzled or DXT texture without mips, which a pack
-can replace; `linear/mip` one it should not hold. A texture the pack does
+`candidate` marks a swizzled or DXT texture, P8 and mipped ones too, which a
+pack can replace; `linear` one it should not hold. A texture the pack does
 hold is tagged with why it went up from the guest: ` (text off)`,
-` (font off)` or ` (art off)` for a kind switched off, ` (pack off)`, or
-` (entry refused)` when the backend could not use the entry (a GPU without
-BC3, a size the device refuses, a failed read). The list is what an
+` (font off)`, ` (world off)` or ` (art off)` for a kind switched off,
+` (pack off)`, or ` (entry refused)` when the backend could not use the entry
+(a GPU without BC1 or BC3, a size the device refuses, a failed read). The list is what an
 owner checks after a run to see what a pack still misses.
 
 Tests: `tests/tex_pack` (ctest `tex_pack`), `tests/host_opts_live` (turning

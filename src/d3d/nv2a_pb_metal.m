@@ -193,7 +193,7 @@ static id<MTLCommandBuffer>        s_cmd;      /* the frame's, begun lazily */
 static id<MTLRenderCommandEncoder> s_enc;      /* open pass, or nil */
 static int                         s_failed;
 static int                         s_unified;  /* shared textures readable */
-static int                         s_bc;       /* BC3 textures sample (pack entries) */
+static int                         s_bc;       /* BC1 and BC3 textures sample (pack entries) */
 
 /* Vertex and index rings, reset after every wait (flip or overflow). */
 static id<MTLBuffer> s_vb, s_ib;
@@ -1210,6 +1210,9 @@ typedef struct {
     uint32_t       bytes;       /* nv2a_tex_extent, for tex_cache_stale */
     uint32_t       gen, used;
     uint32_t       pack_gen;    /* nv2a_tex_pack_gen() it was uploaded under */
+    /* What the sampler follows (nv2a_stage_lod): the entry's scale over the
+     * guest texture, and its chain. 1 and the guest's levels for guest texels. */
+    uint32_t       pack_scale, pack_levels;
     uint64_t       hash;
     int            live;
     id<MTLTexture> tex;
@@ -1353,24 +1356,23 @@ static void stages_cube_rt(void)
 
 static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
 {
-    uint64_t h = nv2a_tex_hash(mem + t->offset, bytes, NV2A_TEX_HASH_SEED);
-    if (t->color == NV2A_TEX_P8)
-        h ^= nv2a_tex_hash(mem + t->palette, t->pal_len * 4u, NV2A_TEX_HASH_SEED) * 31u;
-    return h;
+    return nv2a_stage_hash(mem, t, bytes);
 }
 
-/* A texture of `levels` levels from src (level 0 first), or nil. `bc3`: src
- * is BC3 blocks (a pack entry's payload, XRTP_FLAG_BC3), uploaded as they
- * are with a block-row pitch; otherwise A8R8G8B8 texels into BGRA8. */
+/* A texture of `levels` levels from src (level 0 first), or nil. `bc`:
+ * XRTP_BC_*, src is a pack entry's blocks (XRTP_FLAG_BC1, XRTP_FLAG_BC3),
+ * uploaded as they are with a block-row pitch; otherwise A8R8G8B8 texels
+ * into BGRA8. */
 static id<MTLTexture> tex_make(uint32_t width, uint32_t height, uint32_t levels,
-                               const uint32_t *src, int bc3)
+                               const uint32_t *src, int bc)
 {
     MTLTextureDescriptor *td;
     id<MTLTexture> tex;
     const uint8_t *p = (const uint8_t *)src;
     uint32_t l;
-    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:bc3 ? MTLPixelFormatBC3_RGBA
-                                                                     : MTLPixelFormatBGRA8Unorm
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:bc == XRTP_BC_3 ? MTLPixelFormatBC3_RGBA
+                                                                  : bc == XRTP_BC_1 ? MTLPixelFormatBC1_RGBA
+                                                                  : MTLPixelFormatBGRA8Unorm
                                                             width:width
                                                            height:height
                                                         mipmapped:levels > 1];
@@ -1382,8 +1384,8 @@ static id<MTLTexture> tex_make(uint32_t width, uint32_t height, uint32_t levels,
         return nil;
     for (l = 0; l < levels; l++) {
         uint32_t w = nv2a_tex_level_dim(width, l), h = nv2a_tex_level_dim(height, l);
-        uint32_t row = bc3 ? (w + 3u) / 4u * 16u : w * 4u;
-        uint32_t rows = bc3 ? (h + 3u) / 4u : h;
+        uint32_t row = bc ? (w + 3u) / 4u * (bc == XRTP_BC_1 ? 8u : 16u) : w * 4u;
+        uint32_t rows = bc ? (h + 3u) / 4u : h;
         [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:l withBytes:p
                bytesPerRow:row];
         p += (size_t)row * rows;
@@ -1425,6 +1427,8 @@ static id<MTLTexture> tex_make_cube(uint32_t size, uint32_t levels, const uint32
  * refuses a texture of the entry's size, the guest texels go up instead:
  * the pack only ever adds detail, never a black texture. */
 static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube);
+/* What the last tex_upload left (TexEntry.pack_scale, .pack_levels). */
+static uint32_t s_up_scale, s_up_levels;
 
 static id<MTLTexture> tex_upload(const Stage *t, uint64_t hash, int cube)
 {
@@ -1463,6 +1467,8 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
 {
     id<MTLTexture> tex = nil;
 
+    s_up_scale = 1;
+    s_up_levels = t->levels;
     if (cube) {
         /* No pack entry is a cube map: the six faces go up from the guest.
          * tex_dump writes face 0, the first texels decoded. */
@@ -1479,16 +1485,21 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
     if (nv2a_tex_pack_count()) {
         struct nv2a_tex_pack_entry *pe = nv2a_tex_pack_find(hash, t->width, t->height);
         const uint32_t *src = NULL;
-        if (pe && pe->bc3 && !s_bc) {
+        if (pe && pe->bc && !s_bc) {
             static int said;
             if (!said++)
-                fprintf(stderr, LOGP "textures.pack: this GPU has no BC3; BC3 entries "
-                                     "go up from the guest\n");
+                fprintf(stderr, LOGP "textures.pack: this GPU has no BC textures; BC1 and BC3"
+                                     " entries go up from the guest\n");
         } else if (pe) {
             src = nv2a_tex_pack_texels(pe);
         }
         if (src)
-            tex = tex_make(pe->width, pe->height, pe->levels, src, pe->bc3);
+            tex = tex_make(pe->width, pe->height, pe->levels, src, pe->bc);
+        if (tex) {
+            s_up_scale = nv2a_stage_pack_scale(t->width, pe->width);
+            s_up_levels = pe->levels;
+            nv2a_tex_pack_release(pe);
+        }
         /* A refused entry is a miss too, tagged so in the trace. */
         if (!tex)
             nv2a_tex_pack_miss(hash, t->width, t->height, t->color, t->levels);
@@ -1512,6 +1523,9 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
     return tex;
 }
 
+/* The entry tex_bind's last texture came from (NULL for magenta or black). */
+static TexEntry *s_tex_last;
+
 /* `cube`: t goes up as a cube map (nv2a_stage_cube_bind), its six faces
  * hashed and decoded together; tex_bind's fallbacks are 2D, so such a
  * stage gets s_black_cube for them. */
@@ -1530,6 +1544,7 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
     uint32_t bytes = 0, i;
     TexEntry *e = NULL, *victim = &s_tc[0];
 
+    s_tex_last = NULL;
     if (t->valid && (uint64_t)t->width * t->height <= TEX_MAX_TEXELS)
         bytes = cube ? nv2a_stage_cube_extent(t)
                      : nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
@@ -1617,6 +1632,8 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
                     return s_black;
                 e->hash = h;
                 e->pack_gen = pg;
+                e->pack_scale = s_up_scale;
+                e->pack_levels = s_up_levels;
                 [e->tex release];
                 e->tex = nt;
             }
@@ -1643,10 +1660,13 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
         e->gen = g->flips;
         e->hash = h;
         e->pack_gen = nv2a_tex_pack_gen();
+        e->pack_scale = s_up_scale;
+        e->pack_levels = s_up_levels;
         e->tex = nt;
         e->live = 1;
     }
     e->used = ++s_tc_clock;
+    s_tex_last = e;
     return e->tex;
 }
 
@@ -1692,20 +1712,163 @@ static int border_colour(uint32_t argb)
 #define filter_mip    nv2a_tex_filter_mip
 #define lod_bias      nv2a_tex_lod_bias
 
+/* What each stage's bind took from its cache entry, by value: a later
+ * stage's bind in the same draw can evict the entry at a small tex_cache.
+ * The sampler's scale and chain, and the texel hash (0: no cache entry). */
+static uint32_t s_stage_pack[4][2];
+static uint64_t s_stage_hash[4];
+
+static void stage_from_cache(int k)
+{
+    if (s_tex_last) {
+        s_stage_pack[k][0] = s_tex_last->pack_scale;
+        s_stage_pack[k][1] = s_tex_last->pack_levels;
+        s_stage_hash[k] = s_tex_last->hash;
+    }
+}
+
+/* ---- The trace's buffer: a frame's slots and what each draw id had bound.
+ * Several frames, since each stays with the GPU until its command buffer is
+ * done; the walker polls them at the flip and folds the ones that are, and
+ * waits only when the next one is still out. */
+#define MAG_FRAMES 4u
+static struct {
+    id<MTLBuffer>            buf;
+    id<MTLCommandBuffer>     cmd;    /* of the frame's last commit; nil: free */
+    struct nv2a_tex_mag_draw *rec;
+    unsigned                 n;
+} s_mag[MAG_FRAMES];
+static unsigned s_mag_cur;
+static int      s_mag_state;   /* 0 not tried, 1 ok, -1 failed */
+
+static int mag_init(void)
+{
+    unsigned k;
+    if (s_mag_state)
+        return s_mag_state > 0;
+    s_mag_state = 1;
+    for (k = 0; k < MAG_FRAMES; k++) {
+        s_mag[k].buf = [s_dev newBufferWithLength:NV2A_TEX_MAG_BYTES
+                                          options:MTLResourceStorageModeShared];
+        s_mag[k].rec = (struct nv2a_tex_mag_draw *)malloc(NV2A_TEX_MAG_DRAWS
+                                                          * sizeof *s_mag[k].rec);
+        if (!s_mag[k].buf || !s_mag[k].rec)
+            s_mag_state = -1;
+        else
+            memset([s_mag[k].buf contents], 0, NV2A_TEX_MAG_BYTES);
+    }
+    if (s_mag_state < 0)
+        fprintf(stderr, LOGP "tex_mag: no device buffer; the trace reads nothing\n");
+    return s_mag_state > 0;
+}
+
+/* The next draw's id, and where in the frame's buffer it writes: no id in
+ * the shader, the slots start at the buffer offset. */
+static void mag_draw(void)
+{
+    uint64_t hash[NV2A_TEX_MAG_STAGES];
+    uint32_t scale[NV2A_TEX_MAG_STAGES];
+    unsigned k, id;
+    for (k = 0; k < NV2A_TEX_MAG_STAGES; k++) {
+        hash[k] = s_stage_hash[k];
+        scale[k] = s_stage_pack[k][0];
+    }
+    id = nv2a_tex_mag_draw_id(s_mag[s_mag_cur].rec, &s_mag[s_mag_cur].n, hash, scale);
+    [s_enc setFragmentBuffer:s_mag[s_mag_cur].buf
+                      offset:(NSUInteger)id * NV2A_TEX_MAG_STAGES * 4u
+                     atIndex:2];
+}
+
+/* A pre-transformed batch's figure: positions in surface pixels (slot 0)
+ * and each stage's texcoord (slot 9 + stage), as the vertex ring holds them. */
+static void mag_pretransformed(const float *vf, unsigned nf4, const int *slot,
+                               const uint32_t *idx, uint32_t nidx)
+{
+    unsigned rs = nv2a_host_render_scale(), k, a;
+    for (k = 0; k < NV2A_TEX_MAG_STAGES; k++) {
+        const Stage *t = &s_stage[k];
+        int norm = nv2a_tex_size_from_format(t->color), kp = -1, kt = -1;
+        uint32_t i;
+        for (a = 0; a < nf4; a++) {
+            if (slot[a] == 0)
+                kp = (int)a;
+            if (slot[a] == 9 + (int)k)
+                kt = (int)a;
+        }
+        if (kp < 0 || kt < 0)
+            continue;
+        /* A few triangles of each: a 2D batch's pieces share their scale. */
+        for (i = 0; s_stage_hash[k] && i + 3 <= nidx && i < 3u * 64u; i += 3) {
+            float xy[3][2], uv[3][2];
+            int c;
+            for (c = 0; c < 3; c++) {
+                const float *o = vf + (size_t)idx[i + (uint32_t)c] * nf4 * 4u;
+                xy[c][0] = o[(size_t)kp * 4u];
+                xy[c][1] = o[(size_t)kp * 4u + 1];
+                uv[c][0] = o[(size_t)kt * 4u];
+                uv[c][1] = o[(size_t)kt * 4u + 1];
+                if (norm) {
+                    uv[c][0] *= (float)t->width;
+                    uv[c][1] *= (float)t->height;
+                }
+            }
+            nv2a_tex_mag_note(s_stage_hash[k], nv2a_tex_mag_triangle((const float (*)[2])xy,
+                                                                     (const float (*)[2])uv) * rs,
+                              rs);
+        }
+    }
+}
+
+/* The frame goes with the flip's last command buffer; each frame whose
+ * command buffer is done is folded, and the next one starts empty. */
+static void mag_fold_frame(unsigned k)
+{
+    nv2a_tex_mag_fold(s_mag[k].rec, s_mag[k].n, (const uint32_t *)[s_mag[k].buf contents],
+                      nv2a_host_render_scale());
+    memset([s_mag[k].buf contents], 0, NV2A_TEX_MAG_BYTES);
+    s_mag[k].n = 0;
+    [s_mag[k].cmd release];
+    s_mag[k].cmd = nil;
+}
+
+static void mag_flip(void)
+{
+    unsigned k, next = (s_mag_cur + 1u) % MAG_FRAMES;
+    if (s_mag_state <= 0)
+        return;
+    if (s_mag[s_mag_cur].n && s_last_cmd)
+        s_mag[s_mag_cur].cmd = [s_last_cmd retain];
+    for (k = 0; k < MAG_FRAMES; k++)
+        if (s_mag[k].cmd && [s_mag[k].cmd status] >= MTLCommandBufferStatusCompleted)
+            mag_fold_frame(k);
+    if (s_mag[next].cmd) {
+        [s_mag[next].cmd waitUntilCompleted];
+        mag_fold_frame(next);
+    }
+    /* An empty frame stays current; one without a command buffer is too. */
+    if (s_mag[s_mag_cur].cmd || !s_mag[s_mag_cur].n)
+        s_mag_cur = next;
+}
+
 #define SMP_MAX 128
 static struct { uint64_t key; id<MTLSamplerState> s; } s_smp[SMP_MAX];
 static int s_smp_n;
 
-static id<MTLSamplerState> sampler(const Stage *t, int bump_source)
+/* scale, entry_levels: the bound cache entry's (TexEntry.pack_scale,
+ * .pack_levels), 1 and 1 for a render target or a black or magenta one: a
+ * pack entry moves the clamps (nv2a_stage_lod). */
+static id<MTLSamplerState> sampler(const Stage *t, int bump_source, uint32_t scale,
+                                   uint32_t entry_levels)
 {
     static int point = -1;
     MTLSamplerDescriptor *sd;
     id<MTLSamplerState> st;
     uint32_t u = t->addr_u & 0xF, v = t->addr_v & 0xF;
-    int mn, mg, mip, i;
+    int mn, mg, mip, guest_mip, i;
     unsigned an;
     uint64_t key;
     int bc = 0;
+    struct nv2a_stage_lod lod;
 
     if (point < 0)
         point = recomp_env(RENV_METAL_POINT) != NULL;
@@ -1713,13 +1876,15 @@ static id<MTLSamplerState> sampler(const Stage *t, int bump_source)
         bc = border_colour(t->border);
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
-    mip = t->levels > 1 ? filter_mip(t->filter) : 0;
+    guest_mip = t->levels > 1 ? filter_mip(t->filter) : 0;
+    lod = nv2a_stage_lod(guest_mip, t->lod_min, t->lod_max, scale, entry_levels);
+    mip = lod.mip;
     /* render.aniso, on the D3D11 sampler's rule (nv2a_stage_aniso) and key
      * bit: a bump source in one draw and plain in the next gets its own. */
-    an = nv2a_stage_aniso(t, mip, mn, bump_source);
+    an = nv2a_stage_aniso(t, guest_mip, mn, bump_source);
     key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9 | (uint64_t)mip << 10
-        | (uint64_t)an << 35 | (uint64_t)bc << 40;
-    if (mip)
+        | (uint64_t)an << 35 | (uint64_t)bc << 40 | lod.key;
+    if (guest_mip)
         key |= (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
     for (i = 0; i < s_smp_n; i++)
         if (s_smp[i].key == key)
@@ -1734,8 +1899,8 @@ static id<MTLSamplerState> sampler(const Stage *t, int bump_source)
     sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
     if (bc)
         sd.borderColor = (MTLSamplerBorderColor)(bc - 1);
-    sd.lodMinClamp = mip ? (float)t->lod_min : 0.0f;
-    sd.lodMaxClamp = mip ? (float)t->lod_max : 0.0f;
+    sd.lodMinClamp = lod.min;
+    sd.lodMaxClamp = lod.max;
     if (an) {
         /* D3D11_FILTER_ANISOTROPIC filters min, mag and mip linearly; set
          * the same here so both backends apply one filter. */
@@ -1952,6 +2117,12 @@ static int s_fs_comb;
  * nothing else, so a fallback to fs_basic keeps the stock z. */
 static int s_fs_w;
 
+/* RECOMP_TRACE=tex_mag (nv2a_tex_dump.h): this batch's combiners take the
+ * trace's variant: a program batch. A pre-transformed one has its figure from
+ * its vertices (mag_pretransformed), exact, with no atomics to pay. As on
+ * D3D11, in the same terms. */
+static int s_fs_mag;
+
 static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w);
 
 /* The fragment function for the batch: its register combiners when they
@@ -1991,7 +2162,8 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     /* render.scale changes at run time: each scale class has its own text */
     key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
             | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u)
-            | (w ? 8u : 0u);   /* W-buffered: the w_depth variant */
+            | (w ? 8u : 0u)    /* W-buffered: the w_depth variant */
+            | (s_fs_mag ? 16u : 0u);   /* the trace's variant */
     key[37] = inputs;
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.fn;
@@ -2004,6 +2176,7 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     st.rt_offset = (int)(key[36] >> 1 & 1u);   /* hor+: tex_scale.w, nv2a_aspect_place */
     st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
     st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */
+    st.tex_mag = (int)(key[36] >> 4 & 1u);     /* RECOMP_TRACE=tex_mag */
     for (n = 0; n < 4; n++) {
         st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
         st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
@@ -2412,6 +2585,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             float b = t->levels > 1 && filter_mip(t->filter) ? lod_bias(t->filter) : 0.0f;
             mpc.tex_bias[k] = b > 15.99f ? 15.99f : b < -16.0f ? -16.0f : b;
         }
+        /* The variant declares the buffer: no buffer, no variant. */
+        s_fs_mag = nv2a_tex_mag_on() && d->program && mag_init();
         ffn = fs_select(v, nv2a_w_depth_on(v, d->program != 0,
                                            v->rc_set && (v->rc_ctl & 0xFF)));
         for (i = 0; i < d->idx_count; i++) {
@@ -2544,6 +2719,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 const Stage *t = &s_stage[k];
                 RenderTarget *src;
                 stex[k] = s_black;
+                s_stage_pack[k][0] = s_stage_pack[k][1] = 1;
+                s_stage_hash[k] = 0;
                 if (!t->mode || t->mode == 4)
                     continue;
                 textured = 1;
@@ -2556,6 +2733,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     continue;
                 } else if (s_fs_comb && nv2a_stage_cube_bind(t, nv2a_stage_ps_mode(t, k))) {
                     stex[k] = tex_bind(t, 1);
+                    stage_from_cache(k);
                 } else if ((src = rt_texture(t, rt)) != NULL) {
                     stex[k] = src->tex;
                     nv2a_ps_consts_rt(&mpc.b, k, t, src->w, src->h);
@@ -2570,6 +2748,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     nv2a_tex_dump_rt(t);
                 } else {
                     stex[k] = tex_bind(t, 0);
+                    stage_from_cache(k);
                     if (nv2a_aspect_picture(t->width, rt->w, bump_src >> k & 1))
                         guest_tex = 1;
                 }
@@ -2769,9 +2948,14 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         for (k = 0; k < 4; k++) {
             [s_enc setFragmentTexture:stex[k] atIndex:k];
-            [s_enc setFragmentSamplerState:sampler(&s_stage[k], bump_src >> k & 1)
+            [s_enc setFragmentSamplerState:sampler(&s_stage[k], bump_src >> k & 1,
+                                                   s_stage_pack[k][0], s_stage_pack[k][1])
                                      atIndex:k];
         }
+        if (s_fs_mag && s_fs_comb)
+            mag_draw();
+        else if (nv2a_tex_mag_on() && !d->program && topo == NV2A_TOPO_TRIANGLES)
+            mag_pretransformed(vf, nf4, slot, idx, nidx);
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
         s_draws += d->batches;
@@ -3563,6 +3747,7 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
                 s_sh_flip.lib, s_sh_flip.lib_ns / 1e6, s_sh_flip.pso, s_sh_flip.pso_ns / 1e6,
                 s_sh_flip.tex, s_sh_flip.tex_ns / 1e6);
     memset(&s_sh_flip, 0, sizeof s_sh_flip);
+    mag_flip();
     nv2a_tex_dump_flip(s_presents);
     /* With a pack, its hit count every 600 flips, flip trace or not. */
     if (nv2a_tex_pack_count() && s_presents % 600 == 0) {

@@ -314,6 +314,39 @@ static int dot_check(void)
     return bad;
 }
 
+/* tex_mag, as the MSL test's tex_mag_check: the slot is the draw id's, the
+ * buffer u7. Without the flag none of it, so the hashed cases above stay the
+ * stock text. */
+static int tex_mag_check(void)
+{
+    static const uint32_t zero[8];
+    static char text[256 * 1024];
+    NV2ACombinerState st;
+    int bad = 0;
+
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u, 1u, &st);
+    st.tex_mag = 1;
+    if (d3d8_combiners_generate_hlsl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (!strstr(text, "RWBuffer<uint> mag_buf : register(u7);")
+            || !strstr(text, "cbuffer TexMag : register(b3) { uint mag_draw; };")
+            || !strstr(text, "mag_lod[0] = tex0.CalculateLevelOfDetailUnclamped(samp0, uv * tex_scale[0].xy);")
+            || !strstr(text, "(uint(i.pos.x) & 7u) == 0u && (uint(i.pos.y) & 7u) == 0u")
+            || !strstr(text, "InterlockedMax(mag_buf[mag_draw * 4u + slot], v, was);")) {
+        printf("FAIL: the tex_mag variant's text\n");
+        bad = 1;
+    }
+    st.tex_mag = 0;
+    if (d3d8_combiners_generate_hlsl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (strstr(text, "mag_")) {
+        printf("FAIL: tex_mag text without the flag\n");
+        bad = 1;
+    }
+    return bad;
+}
+
 /* w_depth, as the MSL test's wdepth_check: PS_IN runs through VS_OUT's
  * order to zw : TEXCOORD6, the shader writes SV_Depth from WDepthCB after
  * the cull and the alpha test; the vertex program outputs oZW. Without the
@@ -438,6 +471,8 @@ int main(void)
     if (rt_offset_check())
         return 1;
     if (dot_check())
+        return 1;
+    if (tex_mag_check())
         return 1;
     if (wdepth_check())
         return 1;

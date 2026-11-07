@@ -95,6 +95,7 @@ extern "C" {
     X(TEXTURES_PACK,     CONFIG, "RECOMP_TEXTURES_PACK",     NULL, "enhancements: textures.pack, a texture pack file (host-side texture replacements; unset = stock)") \
     X(TEXTURES_FONT,     CONFIG, "RECOMP_TEXTURES_FONT",     NULL, "enhancements: textures.font, the pack's font-atlas entries, on (default) or off") \
     X(TEXTURES_TEXT,     CONFIG, "RECOMP_TEXTURES_TEXT",     NULL, "enhancements: textures.text, the pack's baked-text entries, on (default) or off") \
+    X(TEXTURES_WORLD,    CONFIG, "RECOMP_TEXTURES_WORLD",    NULL, "enhancements: textures.world, the pack's world entries, on (default) or off") \
     X(INPUT_PAD_SQUARE_LEFT,  CONFIG, "RECOMP_INPUT_PAD_SQUARE_LEFT",  NULL, "enhancements: input.pad_square_left, circle-to-square mapping of the left host stick so a full diagonal reads about (1,1) like the Duke's square gate (full diagonal movement), blended in from 0.7 of full so drift and partial tilts keep their length; ramped left-stick keys keep their diagonal at (1,1) too (1/0, default 0)") \
     X(INPUT_PAD_SQUARE_RIGHT, CONFIG, "RECOMP_INPUT_PAD_SQUARE_RIGHT", NULL, "enhancements: input.pad_square_right, the same for the right host stick (1/0, default 0)") \
     X(INPUT_CHORD_DELAY_MS, CONFIG, "RECOMP_INPUT_CHORD_DELAY_MS", NULL, "enhancements: input.chord_delay_ms, ms a host-action chord member is held back from the game after its press, 0 (default) to 100") \
@@ -175,6 +176,7 @@ extern "C" {
     X(TEX_STATE,         TRACE, "tex_state",       "RECOMP_TEX_STATE",         "texture-state methods seen, in the report") \
     X(BUMP_TRACE,        TRACE, "bump",            NULL,                       "[BUMP] line per distinct BUMPENVMAP stage setup (stage, input, matrix as stored, scale, offset, formats), with the flip; GPU backends") \
     X(TEX_PACK_TRACE,    TRACE, "tex_pack",        NULL,                       "texture pack misses every 600 flips: hash, size, format, count, candidate") \
+    X(TEX_MAG_TRACE,     TRACE, "tex_mag",         NULL,                       "Metal and D3D11: host pixels per source texel of each texture hash, an upper bound (occluded fragments count), at exit and into the tex_dump sidecars") \
     X(CLIP_TRACE,        TRACE, "clip",            "RECOMP_CLIP_TRACE",        "near-plane clipping, per triangle") \
     X(ZPASS_TRACE,       TRACE, "zpass",           "RECOMP_ZPASS_TRACE",       "occlusion report writes") \
     X(PB_EXEC_VERBOSE,   TRACE, "pb_verbose",      "RECOMP_PB_EXEC_VERBOSE",   "executor bring-up detail") \
@@ -303,6 +305,7 @@ extern "C" {
     X(OPTS_AT,           DEBUG, "opts_at",         NULL,                       "=flip:key=value,...: live option requests at those flips, as the in-game menu makes them (scale, filter, fullscreen, aniso, movie, overscan, snap_2d, pacing)") \
     X(MOD_SET_AT,        DEBUG, "mod_set_at",      NULL,                       "=frame:key=value,...: mod settings changed live from the flip tick once the guest reaches that xbox_mod_frame count, as the Mods page does (needs the menu armed)") \
     X(TEX_DUMP,          DEBUG, "tex_dump",        "RECOMP_TEX_DUMP",          "=dir: Metal and D3D11 write each uploaded texture once per texel hash as <hash>.xtd and <hash>.json, the hash a texture pack matches (docs/formats/texture-dump.md); the CPU rasteriser writes first-use BMPs with it as a file prefix instead") \
+    X(TEX_PACK_KEEP,     DEBUG, "tex_pack_keep",   NULL,                       "keep a pack entry's payload in RAM after its GPU upload, under the resident budget, for A/B") \
     X(TEX_DUMP_EVERY,    DEBUG, "tex_dump_every",  "RECOMP_TEX_DUMP_EVERY",    "=n: tex_dump every nth bind too") \
     X(VSH_DUMP,          DEBUG, "vsh_dump",        "RECOMP_VSH_DUMP",          "=prefix: vertex programs, raw, once each (every backend)") \
     X(VSH_CONST_DUMP,    DEBUG, "vsh_const_dump",  NULL,                       "=path: every program batch's constants c[0..191] with its flip, draw and program hash, one file (src/kernel/nv2a_vsh_cdump.h); stops at 256 MB") \

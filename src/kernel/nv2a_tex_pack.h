@@ -9,24 +9,28 @@
  * view, and a texture the game rewrites stops matching.
  *
  * File format (docs/formats/texture-pack.md), little-endian:
- *   header  "XRTP", u32 version (1 or 2), u32 count, u32 scale,
+ *   header  "XRTP", u32 version (1, 2 or 3), u32 count, u32 scale,
  *           u64 index offset, v1: u64 reserved; v2: u32 text scale,
- *           u32 reserved
+ *           u32 reserved; v3: u32 text scale, u32 classes
  *   index   count x 32 bytes, sorted by hash: u64 hash, u32 width,
  *           u32 height, u32 levels, u32 flags, u64 payload offset
  *   payload per entry, level 0 then each further level, one A8R8G8B8
  *           texel per pixel (the bytes nv2a_tex_decode produces), or
- *           with XRTP_FLAG_BC3 the BC3 (DXT5) blocks of each level
+ *           with XRTP_FLAG_BC3 or XRTP_FLAG_BC1 the blocks of each level
  *
  * v1 flags are 0. v2 flags: bits 0-1 the kind (art, font atlas, baked
- * text: the unit a player turns off), bit 4 a BC3 payload; any other bit
- * is refused, so a later meaning is never misread. The header scale is
- * the art scale; each entry carries its own size, so text built at 2x and
- * art at 4x share one pack.
+ * text: the unit a player turns off), bit 4 a BC3 payload. v3 adds kind 3
+ * (world) and bit 5 (a BC1 payload), and gives the header word at +28 to
+ * `classes`, a bit per kind present, informational. Each version refuses
+ * what it does not define, so a later meaning is never misread. The header
+ * scale is the art scale; each entry carries its own size, so text built
+ * at 2x and art at 4x share one pack.
  *
- * The index is read at load; an entry's texels are read on first use and
- * kept while the read entries fit NV2A_TEX_PACK_RESIDENT_MAX, the least
- * recently used freed past it. Lives in the kernel library like nv2a_host_opts, so the backends
+ * The index is read at load; an entry's payload is read when an upload
+ * needs it and released once the backend holds the GPU copy
+ * (nv2a_tex_pack_release), so a large pack costs VRAM, not RAM twice over.
+ * Held payloads stay within NV2A_TEX_PACK_RESIDENT_MAX, the least recently
+ * used freed past it. Lives in the kernel library like nv2a_host_opts, so the backends
  * never link the enhancements layer: without a pack nv2a_tex_pack_count()
  * is 0 and nothing else runs. Not thread-safe: load at startup, use from
  * the thread that uploads textures.
@@ -42,7 +46,7 @@ extern "C" {
 #endif
 
 #define NV2A_TEX_PACK_MAGIC   "XRTP"
-#define NV2A_TEX_PACK_VERSION 2u   /* the newest read; 1 is read too */
+#define NV2A_TEX_PACK_VERSION 3u   /* the newest read; 1 and 2 are read too */
 #define NV2A_TEX_PACK_HDR     32u
 #define NV2A_TEX_PACK_ENTRY   32u
 #define NV2A_TEX_PACK_MAX_DIM 16384u   /* D3D11 and Metal texture limit */
@@ -53,23 +57,31 @@ extern "C" {
  * a long session. A small pack (BLiNX 2's) never reaches it. */
 #define NV2A_TEX_PACK_RESIDENT_MAX ((size_t)512u << 20)
 
-/* v2 entry flags. */
+/* Entry flags: v2's, and v3's on top. */
 #define XRTP_KIND_MASK  0x3u
 #define XRTP_KIND_ART   0u    /* HUD pieces and other images */
 #define XRTP_KIND_FONT  1u    /* the font atlas the glyphs are drawn from */
 #define XRTP_KIND_TEXT  2u    /* images of pre-rendered text */
-#define XRTP_KIND_COUNT 3u
+#define XRTP_KIND_WORLD 3u    /* v3: textures of the 3D scene */
+#define XRTP_KIND_COUNT 4u
 #define XRTP_FLAG_BC3   0x10u /* payload is BC3 blocks, not A8R8G8B8 texels */
-#define XRTP_FLAGS_KNOWN (XRTP_KIND_MASK | XRTP_FLAG_BC3)
+#define XRTP_FLAG_BC1   0x20u /* v3: payload is BC1 blocks, always opaque */
+#define XRTP_FLAGS_KNOWN_V2 (XRTP_KIND_MASK | XRTP_FLAG_BC3)
+#define XRTP_FLAGS_KNOWN_V3 (XRTP_KIND_MASK | XRTP_FLAG_BC3 | XRTP_FLAG_BC1)
+
+/* nv2a_tex_pack_entry.bc: the payload's block format. */
+#define XRTP_BC_NONE 0
+#define XRTP_BC_1    1
+#define XRTP_BC_3    3
 
 struct nv2a_tex_pack_entry {
     uint64_t  hash;
     uint32_t  width, height, levels, flags;
     uint64_t  offset;         /* of the payload in the file */
     size_t    texels;         /* over every level */
-    size_t    bytes;          /* of the payload: texels * 4, or the BC3 blocks */
+    size_t    bytes;          /* of the payload: texels * 4, or the blocks */
     uint32_t  kind;           /* XRTP_KIND_* */
-    int       bc3;            /* payload is BC3 blocks */
+    int       bc;             /* XRTP_BC_*: the payload's block format */
     uint32_t *data;           /* read on use; NULL until then or once freed */
     /* Read entries, most recently used first (the resident budget). */
     struct nv2a_tex_pack_entry *lru_prev, *lru_next;
@@ -84,14 +96,19 @@ void nv2a_tex_pack_unload(void);
 
 unsigned nv2a_tex_pack_count(void);
 unsigned nv2a_tex_pack_scale(void);
-/* Entries of one XRTP_KIND_*, and the BC3 ones, for the log line. */
+/* The loaded file's version, for the log line. */
+unsigned nv2a_tex_pack_version(void);
+/* Entries of one XRTP_KIND_*, and the BC1 and BC3 ones, for the log line. */
 unsigned nv2a_tex_pack_kind_count(uint32_t kind);
+unsigned nv2a_tex_pack_bc1_count(void);
 unsigned nv2a_tex_pack_bc3_count(void);
-/* The scale the TEXT entries were built at: v2's u32 at header +24 (0 in
- * the file means the header scale). Informational, like the scale. */
+/* The scale the TEXT entries were built at: the u32 at header +24 from v2
+ * on (0 in the file means the header scale). Informational, like the scale. */
 unsigned nv2a_tex_pack_text_scale(void);
 /* Bytes of a BC3 payload of w x h over `levels` levels: 16 per 4x4 block. */
 size_t nv2a_tex_pack_bc3_bytes(uint32_t w, uint32_t h, uint32_t levels);
+/* Bytes of a BC1 payload: 8 per 4x4 block. */
+size_t nv2a_tex_pack_bc1_bytes(uint32_t w, uint32_t h, uint32_t levels);
 
 /* Turn the whole pack, or one kind of entry, off and on: find then
  * returns NULL for it, and the guest texture is uploaded as without a
@@ -105,16 +122,17 @@ uint32_t nv2a_tex_pack_gen(void);
 uint64_t nv2a_tex_pack_hits(void);
 
 /* The entry for a texel hash, or NULL. The hash is the one the backend
- * computed for its cache entry; a P8 texture's folds its palette in and
- * so never matches, which is right (the pack holds no palettes). An entry
- * whose aspect differs from the guest texture's (guest_w x guest_h) is
+ * computed for its cache entry and the dump names its files by; a P8
+ * texture's folds its palette in, so an entry built from a dump matches
+ * that one palette (the pack holds decoded texels, never a palette, and the
+ * archive path cannot name such a hash). An entry whose aspect differs from the guest texture's (guest_w x guest_h) is
  * not taken, nor counted as a hit. */
 struct nv2a_tex_pack_entry *nv2a_tex_pack_find(uint64_t hash, uint32_t guest_w,
                                                uint32_t guest_h);
 
 /* The entry's payload (e->bytes of it, level 0 first), read from the
- * file when it is not held: e->texels A8R8G8B8 texels, or BC3 blocks when
- * e->bc3. NULL if the read failed (the caller then uploads the guest
+ * file when it is not held: e->texels A8R8G8B8 texels, or blocks when
+ * e->bc. NULL if the read failed (the caller then uploads the guest
  * texels as if there were no entry). A read that takes the held bytes past
  * the budget frees the least recently used other entries first, so the
  * pointer is good until the next call: upload from it, never keep it. An
@@ -124,6 +142,13 @@ struct nv2a_tex_pack_entry *nv2a_tex_pack_find(uint64_t hash, uint32_t guest_w,
  * load's (rebuilt in place) is never read again, said once, until the next
  * load. */
 const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e);
+/* The backend's GPU copy of the entry exists: the payload is freed, and a
+ * later upload reads it again. */
+void nv2a_tex_pack_release(struct nv2a_tex_pack_entry *e);
+/* Release does nothing and the payloads stay held under the budget, for A/B
+ * (RECOMP_DEBUG=tex_pack_keep, set by the layer that loads a pack). Kept
+ * across unload and load. */
+void nv2a_tex_pack_set_keep(int keep);
 /* Payload bytes held now, for the tests and the stats. */
 size_t nv2a_tex_pack_resident_bytes(void);
 /* Tests only: the budget in bytes (NV2A_TEX_PACK_RESIDENT_MAX by default),
@@ -146,7 +171,7 @@ struct nv2a_tex_pack_miss {
     uint64_t hash;
     uint32_t width, height, color, levels;
     uint32_t count;
-    int      candidate;   /* swizzled or DXT without mips: packable */
+    int      candidate;   /* swizzled or DXT, palette or mips or not: packable */
     uint32_t why;         /* NV2A_TEX_PACK_MISS_*, as of the latest miss */
     uint32_t kind;        /* the entry's kind, for KIND_OFF */
 };

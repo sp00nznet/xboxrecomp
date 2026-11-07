@@ -1035,6 +1035,7 @@ static void pack_apply_off(unsigned off)
     nv2a_tex_pack_set_kind_enabled(XRTP_KIND_ART, !(off & NV2A_PACK_OFF_ART));
     nv2a_tex_pack_set_kind_enabled(XRTP_KIND_FONT, !(off & NV2A_PACK_OFF_FONT));
     nv2a_tex_pack_set_kind_enabled(XRTP_KIND_TEXT, !(off & NV2A_PACK_OFF_TEXT));
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_WORLD, !(off & NV2A_PACK_OFF_WORLD));
 }
 
 void nv2a_host_opts_set(const struct nv2a_host_opts *o)
@@ -1181,6 +1182,14 @@ unsigned nv2a_bump_sources(const struct nv2a_stage st[4], int combiner,
             m |= 1u << nv2a_stage_input(n, other_stage_input);
     }
     return m;
+}
+
+uint64_t nv2a_stage_hash(const uint8_t *mem, const struct nv2a_stage *t, uint32_t bytes)
+{
+    uint64_t h = nv2a_tex_hash(mem + t->offset, bytes, NV2A_TEX_HASH_SEED);
+    if (t->color == NV2A_TEX_P8)
+        h ^= nv2a_tex_hash(mem + t->palette, t->pal_len * 4u, NV2A_TEX_HASH_SEED) * 31u;
+    return h;
 }
 
 unsigned nv2a_stage_aniso(const struct nv2a_stage *t, int mip, int min_linear,

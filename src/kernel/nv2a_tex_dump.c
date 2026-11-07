@@ -8,6 +8,7 @@
 #include "recomp_exit_hook.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -225,9 +226,22 @@ static int make_dirs(const char *dir)
 
 static void summary(int exiting);
 
+/* The magnification trace: -1 not read yet, 0 off, 1 on. One slot a hash,
+ * with or without the dump; a slot's dirty mark is a sidecar to rewrite. */
+static int s_mag = -1;
+typedef struct {
+    uint64_t hash, draws;
+    double   mag_max;
+    unsigned render_scale;
+    uint8_t  used, dirty;
+} MagSlot;
+static MagSlot *s_mag_tab;
+static size_t   s_mag_cap, s_mag_n;
+static uint64_t s_mag_dropped;
+
 static void at_exit(void)
 {
-    if (s_on > 0)
+    if (s_on > 0 || s_mag > 0)
         summary(1);
 }
 
@@ -249,11 +263,24 @@ static void reset(void)
     s_dirty = 0;
     s_stop = NULL;
     memset(&s_st, 0, sizeof s_st);
+    free(s_mag_tab);
+    s_mag_tab = NULL;
+    s_mag_cap = s_mag_n = 0;
+    s_mag_dropped = 0;
+}
+
+static void hook_exit_once(void)
+{
+    static int hooked;
+    if (!hooked) {
+        hooked = 1;
+        atexit(at_exit);
+        recomp_exit_hook_add(at_exit_hook);   /* the windows' ExitProcess */
+    }
 }
 
 int nv2a_tex_dump_set_dir(const char *dir)
 {
-    static int hooked;
     size_t n;
     lock();
     reset();
@@ -274,11 +301,8 @@ int nv2a_tex_dump_set_dir(const char *dir)
                     " texture dump off\n", dir);
     }
     unlock();
-    if (s_on > 0 && !hooked) {
-        hooked = 1;
-        atexit(at_exit);
-        recomp_exit_hook_add(at_exit_hook);   /* the windows' ExitProcess */
-    }
+    if (s_on > 0)
+        hook_exit_once();
     if (s_on > 0) {
         fprintf(stderr, "[TEXDUMP] dumping each uploaded texture once per hash to %s\n",
                 s_dir);
@@ -692,7 +716,7 @@ void nv2a_tex_dump_rt(const struct nv2a_stage *t)
 
 void nv2a_tex_dump_flip(uint64_t flip)
 {
-    if (s_on <= 0)
+    if (s_on <= 0 && s_mag <= 0)
         return;
     s_flip = flip;
     if (flip && flip % 600 == 0)
@@ -750,11 +774,236 @@ static void write_volatile(void)
         s_st.errors++;
 }
 
+int nv2a_tex_mag_on(void)
+{
+    if (s_mag < 0) {
+        s_mag = recomp_env_on(RENV_TEX_MAG_TRACE) ? 1 : 0;
+        if (s_mag > 0)
+            hook_exit_once();
+    }
+    return s_mag > 0;
+}
+
+void nv2a_tex_mag_set_on(int on)
+{
+    lock();
+    s_mag = on ? 1 : 0;
+    free(s_mag_tab);
+    s_mag_tab = NULL;
+    s_mag_cap = s_mag_n = 0;
+    s_mag_dropped = 0;
+    unlock();
+}
+
+static MagSlot *mag_slot(uint64_t hash, int add)
+{
+    size_t i;
+    if (add && (s_mag_n + 1) * 2 > s_mag_cap) {
+        size_t cap = s_mag_cap ? s_mag_cap * 2 : 1024, k;
+        MagSlot *t = (MagSlot *)calloc(cap, sizeof *t);
+        if (!t)
+            return NULL;
+        for (k = 0; k < s_mag_cap; k++) {
+            if (!s_mag_tab[k].used)
+                continue;
+            i = mix(s_mag_tab[k].hash) & (cap - 1);
+            while (t[i].used)
+                i = (i + 1) & (cap - 1);
+            t[i] = s_mag_tab[k];
+        }
+        free(s_mag_tab);
+        s_mag_tab = t;
+        s_mag_cap = cap;
+    }
+    if (!s_mag_cap)
+        return NULL;
+    i = mix(hash) & (s_mag_cap - 1);
+    while (s_mag_tab[i].used) {
+        if (s_mag_tab[i].hash == hash)
+            return &s_mag_tab[i];
+        i = (i + 1) & (s_mag_cap - 1);
+    }
+    if (!add)
+        return NULL;
+    s_mag_tab[i].used = 1;
+    s_mag_tab[i].hash = hash;
+    s_mag_n++;
+    return &s_mag_tab[i];
+}
+
+/* Under the lock. */
+static void mag_add(uint64_t hash, double mag, unsigned render_scale)
+{
+    MagSlot *m = mag_slot(hash, 1);
+    if (!m)
+        return;
+    if (mag > m->mag_max)
+        m->mag_max = mag;
+    m->draws++;
+    m->render_scale = render_scale;
+    m->dirty = 1;
+}
+
+void nv2a_tex_mag_note(uint64_t hash, double mag, unsigned render_scale)
+{
+    if (!hash || !(mag > 0.0))
+        return;
+    lock();
+    mag_add(hash, mag, render_scale);
+    unlock();
+}
+
+unsigned nv2a_tex_mag_draw_id(struct nv2a_tex_mag_draw *draws, unsigned *n,
+                              const uint64_t hash[NV2A_TEX_MAG_STAGES],
+                              const uint32_t scale[NV2A_TEX_MAG_STAGES])
+{
+    struct nv2a_tex_mag_draw *d;
+    if (*n >= NV2A_TEX_MAG_DRAWS - 1u) {
+        __atomic_add_fetch(&s_mag_dropped, 1, __ATOMIC_RELAXED);
+        return NV2A_TEX_MAG_DRAWS - 1u;
+    }
+    d = &draws[*n];
+    memcpy(d->hash, hash, sizeof d->hash);
+    memcpy(d->scale, scale, sizeof d->scale);
+    return (*n)++;
+}
+
+void nv2a_tex_mag_fold(const struct nv2a_tex_mag_draw *draws, unsigned n,
+                       const uint32_t *slots, unsigned render_scale)
+{
+    unsigned i, k;
+    lock();
+    for (i = 0; i < n; i++)
+        for (k = 0; k < NV2A_TEX_MAG_STAGES; k++) {
+            uint32_t v = slots[i * NV2A_TEX_MAG_STAGES + k];
+            uint32_t scale = draws[i].scale[k] ? draws[i].scale[k] : 1u;
+            /* The shader's 2^-lod is host pixels per texel of what is bound;
+             * a source texel is `scale` of an entry's. */
+            if (draws[i].hash[k] && v && v < 64u * 1024u)
+                mag_add(draws[i].hash[k], pow(2.0, v / 1024.0 - 32.0) * scale, render_scale);
+        }
+    unlock();
+}
+
+double nv2a_tex_mag_triangle(const float xy[3][2], const float uv[3][2])
+{
+    double dx1 = xy[1][0] - xy[0][0], dy1 = xy[1][1] - xy[0][1];
+    double dx2 = xy[2][0] - xy[0][0], dy2 = xy[2][1] - xy[0][1];
+    double du1 = uv[1][0] - uv[0][0], dv1 = uv[1][1] - uv[0][1];
+    double du2 = uv[2][0] - uv[0][0], dv2 = uv[2][1] - uv[0][1];
+    double det = dx1 * dy2 - dx2 * dy1, rx, ry, rho;
+    if (det == 0.0)
+        return 0.0;
+    /* The gradients of (u, v) over (x, y), and the larger of their lengths:
+     * what the sampler's isotropic LOD is the log of. */
+    rx = hypot((du1 * dy2 - du2 * dy1) / det, (dv1 * dy2 - dv2 * dy1) / det);
+    ry = hypot((du2 * dx1 - du1 * dx2) / det, (dv2 * dx1 - dv1 * dx2) / det);
+    rho = rx > ry ? rx : ry;
+    return rho > 0.0 ? 1.0 / rho : 0.0;
+}
+
+int nv2a_tex_mag_get(uint64_t hash, double *mag_max, uint64_t *draws, unsigned *render_scale)
+{
+    const MagSlot *m;
+    lock();
+    m = mag_slot(hash, 0);
+    if (m) {
+        if (mag_max)
+            *mag_max = m->mag_max;
+        if (draws)
+            *draws = m->draws;
+        if (render_scale)
+            *render_scale = m->render_scale;
+    }
+    unlock();
+    return m != NULL;
+}
+
+/* The figures into a hash's sidecar, in place of the last ones. A hash the
+ * dump did not write has no sidecar; it stays dirty, for one written later. */
+static void mag_sidecar(MagSlot *m)
+{
+    char name[48], tmp[sizeof s_dir + 64], path[sizeof s_dir + 64];
+    char buf[4096];
+    size_t n;
+    char *cut;
+    FILE *f;
+
+    snprintf(name, sizeof name, "%016llX.json", (unsigned long long)m->hash);
+    snprintf(path, sizeof path, "%s/%s", s_dir, name);
+    if (!(f = fopen(path, "rb")))
+        return;
+    n = fread(buf, 1, sizeof buf, f);
+    fclose(f);
+    /* The dump's own sidecars are under 500 bytes. A longer file is not one of
+     * them, and rewriting a cut copy would leave the inventory corrupt JSON. */
+    if (n == sizeof buf) {
+        fprintf(stderr, "[TEXDUMP] %s: over %zu bytes, tex_mag figures not written\n",
+                name, sizeof buf - 1);
+        s_st.errors++;
+        m->dirty = 0;
+        return;
+    }
+    buf[n] = '\0';
+    if ((cut = strstr(buf, ",\n  \"mag_max\"")) == NULL)
+        cut = strrchr(buf, '}');
+    if (!cut)
+        return;
+    /* Back over the newline before the closing brace, if that is the cut. */
+    if (*cut == '}' && cut > buf && cut[-1] == '\n')
+        cut--;
+    *cut = '\0';
+    if (!(f = open_tmp(tmp, sizeof tmp, name))) {
+        s_st.errors++;
+        return;
+    }
+    fprintf(f,
+            "%s,\n"
+            "  \"mag_max\": %.3f,\n"
+            "  \"mag_scale1\": %.3f,\n"
+            "  \"mag_draws\": %llu,\n"
+            "  \"render_scale\": %u\n"
+            "}\n",
+            buf, m->mag_max, m->mag_max / (m->render_scale ? m->render_scale : 1u),
+            (unsigned long long)m->draws, m->render_scale);
+    if (commit_tmp(tmp, name, f))
+        m->dirty = 0;
+    else
+        s_st.errors++;
+}
+
+/* Under the lock: a summary's worth of the trace, the sidecars when there is
+ * a dump, each hash's line at exit when there is none. */
+static void mag_summary(int exiting)
+{
+    size_t i;
+    const MagSlot *top = NULL;
+    for (i = 0; i < s_mag_cap; i++) {
+        MagSlot *m = &s_mag_tab[i];
+        if (!m->used)
+            continue;
+        if (!top || m->mag_max > top->mag_max)
+            top = m;
+        if (s_on > 0 && m->dirty)
+            mag_sidecar(m);
+        if (s_on <= 0 && exiting)
+            fprintf(stderr, "[TEXDUMP] mag %016llX mag_max=%.3f mag_scale1=%.3f draws=%llu"
+                    " render_scale=%u\n", (unsigned long long)m->hash, m->mag_max,
+                    m->mag_max / (m->render_scale ? m->render_scale : 1u),
+                    (unsigned long long)m->draws, m->render_scale);
+    }
+    fprintf(stderr, "[TEXDUMP] tex_mag: %llu textures, highest %.3f (%016llX), %llu draws past"
+            " the frame's slots; an upper bound: occluded fragments count\n",
+            (unsigned long long)s_mag_n, top ? top->mag_max : 0.0,
+            (unsigned long long)(top ? top->hash : 0u),
+            (unsigned long long)__atomic_load_n(&s_mag_dropped, __ATOMIC_RELAXED));
+}
+
 static void summary(int exiting)
 {
     struct nv2a_tex_dump_stats st;
     const char *stop;
-    if (s_on <= 0)
+    if (s_on <= 0 && s_mag <= 0)
         return;
     if (!exiting) {
         lock();
@@ -764,14 +1013,20 @@ static void summary(int exiting)
         fflush(stderr);
         return;
     }
-    if (s_dirty) {
+    if (s_on > 0 && s_dirty) {
         write_counts();
         write_volatile();
         s_dirty = 0;
     }
+    if (s_mag > 0)
+        mag_summary(exiting);
     st = s_st;
     stop = s_stop;
     unlock();
+    if (s_on <= 0) {
+        fflush(stderr);
+        return;
+    }
     fprintf(stderr, "[TEXDUMP] flip %llu: %llu written (%llu texels), %llu repeat uploads,"
             " %llu linear (sidecar only), %llu volatile addresses (%llu uploads skipped),"
             " %llu render-target binds skipped (%llu targets), %llu over size, %llu errors;"

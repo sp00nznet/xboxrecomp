@@ -14,7 +14,9 @@
  *   <hash>.json  the facts: size, levels, format, pitch, layout, palette,
  *                wrap, filters, address, the first flip it was seen at
  * and, rewritten at each summary, counts.json (uploads per hash) and
- * volatile.json (the addresses given up on, with their hashes).
+ * volatile.json (the addresses given up on, with their hashes). Under
+ * RECOMP_TRACE=tex_mag (below, with or without the dump) the sidecars take
+ * the magnification too.
  *
  * Not written, counted instead: a stage bound to a render target (it never
  * hashes; the backend calls nv2a_tex_dump_rt), an address whose texels
@@ -112,6 +114,47 @@ struct nv2a_tex_dump_stats {
     uint64_t stopped;         /* uploads after the dump stopped */
 };
 void nv2a_tex_dump_get_stats(struct nv2a_tex_dump_stats *out);
+
+/* ---- The magnification trace (RECOMP_TRACE=tex_mag, design D14): how far
+ * each texture is ever magnified, what the upscale of a texture can be for.
+ * A combiner shader built with NV2ACombinerState.tex_mag max's the biased
+ * -lod of its 2D stages into one device buffer per frame, a slot per draw id
+ * and stage; the backend reads it a frame or so behind, never per draw, and
+ * folds it here with what each draw id had bound. A pre-transformed batch
+ * has its figure from its vertices instead (nv2a_tex_mag_triangle). Each
+ * value is an upper bound: an occluded fragment counts, and so does the part
+ * of a draw its scissor would not have let the sampler see. */
+#define NV2A_TEX_MAG_DRAWS  8192u   /* a frame's draws read; more share a slot, dropped */
+#define NV2A_TEX_MAG_STAGES 4u
+#define NV2A_TEX_MAG_BYTES  (NV2A_TEX_MAG_DRAWS * NV2A_TEX_MAG_STAGES * 4u)
+
+/* What a draw id had bound: hash 0 is a stage without a cache entry (a render
+ * target, black, no texture); scale is the entry's over the guest texture. */
+struct nv2a_tex_mag_draw {
+    uint64_t hash[NV2A_TEX_MAG_STAGES];
+    uint32_t scale[NV2A_TEX_MAG_STAGES];
+};
+
+/* RENV_TEX_MAG_TRACE, read once. */
+int nv2a_tex_mag_on(void);
+/* The next draw id of a frame's records (at most NV2A_TEX_MAG_DRAWS, *n of
+ * them taken), with what is bound now. Past the last, the last id: its slots
+ * are never folded and the draws count as dropped. */
+unsigned nv2a_tex_mag_draw_id(struct nv2a_tex_mag_draw *draws, unsigned *n,
+                              const uint64_t hash[NV2A_TEX_MAG_STAGES],
+                              const uint32_t scale[NV2A_TEX_MAG_STAGES]);
+/* A frame's buffer: n records and their NV2A_TEX_MAG_STAGES slots each. */
+void nv2a_tex_mag_fold(const struct nv2a_tex_mag_draw *draws, unsigned n,
+                       const uint32_t *slots, unsigned render_scale);
+/* Pixels per texel of a triangle at xy (pixels) and uv (texels), the rule the
+ * GPU's LOD follows; 0 when it has no area or its uv does not vary. */
+double nv2a_tex_mag_triangle(const float xy[3][2], const float uv[3][2]);
+/* One reading for hash: `mag` host pixels per source texel. */
+void nv2a_tex_mag_note(uint64_t hash, double mag, unsigned render_scale);
+/* The table, for the tests: 0 when the hash has no reading. */
+int nv2a_tex_mag_get(uint64_t hash, double *mag_max, uint64_t *draws, unsigned *render_scale);
+/* Tests: turn the trace on (the environment is then not read), table empty. */
+void nv2a_tex_mag_set_on(int on);
 
 /* Tests: dump into `dir` from now on (NULL turns it off), with every count,
  * table and the flip reset. The environment is then not read. */

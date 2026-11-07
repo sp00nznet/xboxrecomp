@@ -207,11 +207,20 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
             break;
         }
 
+    if (state->tex_mag)
+        EMIT("static inline void mag_put(device atomic_uint *mag, uint slot, float lod) {\n"
+             "    float m = 32.0 - lod;\n"
+             "    uint v = 0u;\n"
+             "    if (m > 0.0 && m < 64.0) v = uint(m * 1024.0);\n"
+             "    atomic_fetch_max_explicit(mag + slot, v, memory_order_relaxed);\n"
+             "}\n");
     EMIT("fragment %s fs_main(VOut i [[stage_in]],\n"
          "                        constant PsConsts &pc [[buffer(0)]]",
          state->w_depth ? "FOut" : "float4");
     if (state->w_depth)
         EMIT(",\n                        constant WDepth &wd [[buffer(1)]]");
+    if (state->tex_mag)
+        EMIT(",\n                        device atomic_uint *mag [[buffer(2)]]");
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
         int m = (int)state->tex_mode[i];
         if (m == NV2A_TEXMODE_NONE || m == NV2A_TEXMODE_PASSTHRU
@@ -231,6 +240,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
         EMIT("%s", D3D8_MSL_WDEPTH_BEGIN);
     for (k = 0; k < 16; k++)
         EMIT("    float4 x%d = float4(0.0);\n", k);
+    if (state->tex_mag)
+        EMIT("    float mag_lod[4] = { 64.0, 64.0, 64.0, 64.0 };\n");
     if (state->fog_input)
         EMIT("    x3 = float4(pc.fog_color.rgb, saturate(i.fog));\n");
     else
@@ -295,6 +306,10 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                 /* As the HLSL: only true 2D stages divide by q. */
                 EMIT("        if (pc.tex_mode[%d] == 1u && i.t%d.w != 0.0 && i.t%d.w != 1.0)"
                      " uv /= i.t%d.w;\n", i, i, i, i);
+            /* As the HLSL: before the snap. */
+            if (state->tex_mag)
+                EMIT("        mag_lod[%d] = tex%d.calculate_unclamped_lod(samp%d,"
+                     " uv * pc.tex_scale[%d].xy);\n", i, i, i, i);
             if (state->rect_snap && state->snap_2d) {
                 /* As the HLSL: a .z < 0 stage samples with the 1x
                  * gradients. gradient2d takes no bias(), so the stage's
@@ -333,6 +348,12 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                  "    else if (pc.alpha_only[%d] != 0u) x%d.rgb = float3(1.0);\n",
                  i, 8 + i, i, 8 + i);
     }
+    /* As the HLSL: before anything can discard, one pixel in 64. */
+    if (state->tex_mag)
+        EMIT("    if ((uint(i.pos.x) & 7u) == 0u && (uint(i.pos.y) & 7u) == 0u) {\n"
+             "        mag_put(mag, 0u, mag_lod[0]); mag_put(mag, 1u, mag_lod[1]);\n"
+             "        mag_put(mag, 2u, mag_lod[2]); mag_put(mag, 3u, mag_lod[3]);\n"
+             "    }\n");
     EMIT("    x12.a = x8.a;\n");
 
     /* ---- General combiner stages ---- */

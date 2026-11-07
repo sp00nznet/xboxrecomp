@@ -119,6 +119,66 @@ static inline int nv2a_tex_filter_mip(uint32_t f)
     return m == 3 || m == 4 ? 1 : m == 5 || m == 6 ? 2 : 0;
 }
 
+/* What a sampler does with the texture a stage's cache entry holds: stock,
+ * or a pack entry's size and chain. The GPU computes the LOD against the
+ * entry's real size, so guest level k is entry LOD k + log2(scale): the
+ * entry's LODs below that are the new detail, reached only at magnification.
+ * scale is the entry's width over the guest's (1 for a guest texture, or an
+ * entry at no exact multiple); entry_levels its chain.
+ *   - lod_max follows the guest's clamp into the longer chain;
+ *   - lod_min stays 0 when the guest's is 0, or those levels could never be
+ *     reached; a guest that clamps away its own level 0 keeps that intent;
+ *   - a guest that does not mip, under an entry with a chain, gets the
+ *     nearest level over [0, log2(scale)]: without it the entry aliases
+ *     worse than stock, and past it the far end is what the guest showed;
+ * mip is what the sampler filters with (nv2a_tex_filter_mip's values), key
+ * its bits above the stock key's: 0 for stock, so stock states stay what
+ * they were. The key carries the integer scale, which quantises the shift
+ * (a 3x chain's levels fall between the guest's: log2 3). Float clamps, on
+ * both APIs. */
+struct nv2a_stage_lod {
+    int      mip;
+    float    min, max;
+    uint64_t key;
+};
+#define NV2A_STAGE_LOD_SCALE_BIT  44   /* 4 bits */
+#define NV2A_STAGE_LOD_FORCED_BIT 48
+#define NV2A_STAGE_LOD_SCALE_MAX  15u
+
+static inline struct nv2a_stage_lod nv2a_stage_lod(int guest_mip, uint32_t lod_min,
+                                                   uint32_t lod_max, uint32_t scale,
+                                                   uint32_t entry_levels)
+{
+    struct nv2a_stage_lod l;
+    float shift = scale > 1u ? (float)log2((double)scale) : 0.0f;
+
+    l.mip = guest_mip;
+    l.min = guest_mip ? (float)lod_min : 0.0f;
+    l.max = guest_mip ? (float)lod_max : 0.0f;
+    l.key = 0;
+    if (scale <= 1u)
+        return l;
+    l.key = (uint64_t)scale << NV2A_STAGE_LOD_SCALE_BIT;
+    if (guest_mip) {
+        if (lod_min)
+            l.min += shift;
+        l.max += shift;
+    } else if (entry_levels > 1u) {
+        l.mip = 1;
+        l.max = shift;
+        l.key |= (uint64_t)1 << NV2A_STAGE_LOD_FORCED_BIT;
+    }
+    return l;
+}
+
+/* An entry's scale over the guest texture: its width over the guest's when
+ * that is an exact multiple the key can carry, else 1 (the stock clamps). */
+static inline uint32_t nv2a_stage_pack_scale(uint32_t guest_w, uint32_t entry_w)
+{
+    uint32_t s = guest_w && entry_w % guest_w == 0 ? entry_w / guest_w : 1u;
+    return s >= 1u && s <= NV2A_STAGE_LOD_SCALE_MAX ? s : 1u;
+}
+
 /* The mip LOD bias, signed 5.8 fixed point. */
 static inline float nv2a_tex_lod_bias(uint32_t f)
 {
@@ -1635,6 +1695,7 @@ struct nv2a_host_opts {
 #define NV2A_PACK_OFF_FONT  0x2u
 #define NV2A_PACK_OFF_TEXT  0x4u
 #define NV2A_PACK_OFF_ART   0x8u
+#define NV2A_PACK_OFF_WORLD 0x10u
 
 /* Field masks for nv2a_host_opts_request / _apply. ANISO, MOVIE and
  * OVERSCAN need nothing from a backend at the flip: the samplers are keyed
@@ -1694,6 +1755,11 @@ unsigned nv2a_bump_sources(const struct nv2a_stage st[4], int combiner,
  * keeps the sharp ripple at grazing angles and scatters the dependent lookups
  * into noise (BLiNX 2's stage 1 sea). Both GPU backends key their samplers
  * on the result. */
+/* The hash a stage's texture is known by: the upload's change check, the
+ * pack's key and the dump's file name. A P8 texture's folds its palette in:
+ * the same indices under another palette are other texels. */
+uint64_t nv2a_stage_hash(const uint8_t *mem, const struct nv2a_stage *t, uint32_t bytes);
+
 unsigned nv2a_stage_aniso(const struct nv2a_stage *t, int mip, int min_linear,
                           int bump_source);
 /* Hor+ padding of a guest w x h colour target, guest pixels on each side:

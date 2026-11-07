@@ -22,6 +22,7 @@
 #include "nv2a_overlay.h"
 #include "nv2a_present_chain.h"
 #include "nv2a_tex_pack.h"
+#include "recomp_env.h"
 #include "recomp_exe_dir.h"
 #include "shader_profile.h"
 
@@ -125,18 +126,23 @@ static void load_tex_pack(const struct nv2a_host_opts *o)
         snprintf(path, sizeof path, "%s/%s", root, pack);
     else
         snprintf(path, sizeof path, "%s", pack);
+    nv2a_tex_pack_set_keep(recomp_env_on(RENV_TEX_PACK_KEEP));
     n = nv2a_tex_pack_load(path, err, sizeof err);
     if (n < 0)
         fprintf(stderr, LOGP "textures.pack=%s: %s (%s); no pack\n", pack, err, path);
     else
-        fprintf(stderr, LOGP "textures.pack=%s (%d entries: %u art, %u font, %u text;"
-                " scale %u, text %u; %u bc3) textures.font=%s textures.text=%s\n",
+        fprintf(stderr, LOGP "textures.pack=%s (%d entries: %u ui, %u font, %u text, %u world;"
+                " v%u; scale %u, text %u; %u bc1, %u bc3) textures.font=%s textures.text=%s"
+                " textures.world=%s\n",
                 pack, n, nv2a_tex_pack_kind_count(XRTP_KIND_ART),
                 nv2a_tex_pack_kind_count(XRTP_KIND_FONT),
-                nv2a_tex_pack_kind_count(XRTP_KIND_TEXT), nv2a_tex_pack_scale(),
-                nv2a_tex_pack_text_scale(), nv2a_tex_pack_bc3_count(),
+                nv2a_tex_pack_kind_count(XRTP_KIND_TEXT),
+                nv2a_tex_pack_kind_count(XRTP_KIND_WORLD), nv2a_tex_pack_version(),
+                nv2a_tex_pack_scale(), nv2a_tex_pack_text_scale(), nv2a_tex_pack_bc1_count(),
+                nv2a_tex_pack_bc3_count(),
                 (o->pack_off & NV2A_PACK_OFF_FONT) ? "off" : "on",
-                (o->pack_off & NV2A_PACK_OFF_TEXT) ? "off" : "on");
+                (o->pack_off & NV2A_PACK_OFF_TEXT) ? "off" : "on",
+                (o->pack_off & NV2A_PACK_OFF_WORLD) ? "off" : "on");
 }
 
 static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };
@@ -146,7 +152,7 @@ static const char *const s_pacing[] = { "spin", "sleep", NULL };
 static const char *const s_shader_lines[] = { "auto", "guest", "host", NULL };
 /* present.surface: "auto" (index 0) is resolved here, never stored. */
 static const char *const s_surface[] = { "auto", "window", "internal", NULL };
-/* textures.font / textures.text: words, as the menu shows them. */
+/* textures.font, .text and .world: words, as the menu shows them. */
 static const char *const s_onoff[] = { "off", "on", NULL };
 /* Indexes match enum nv2a_movie_mode. */
 static const char *const s_movie[] = { "black", "fit", "fill", NULL };
@@ -273,6 +279,8 @@ int xbox_enhance_init(const char *root, const char *title)
         o.pack_off |= NV2A_PACK_OFF_FONT;
     if (!enhance_cfg_choice("textures.text", s_onoff, 1))
         o.pack_off |= NV2A_PACK_OFF_TEXT;
+    if (!enhance_cfg_choice("textures.world", s_onoff, 1))
+        o.pack_off |= NV2A_PACK_OFF_WORLD;
 
     nv2a_host_opts_set(&o);
     fprintf(stderr, LOGP "render.scale=%u render.aniso=%u present.filter=%s"

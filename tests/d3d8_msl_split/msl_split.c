@@ -346,6 +346,45 @@ static int rt_offset_check(void)
     return bad;
 }
 
+/* tex_mag (RECOMP_TRACE=tex_mag): the variant measures each 2D stage's
+ * unclamped LOD and max's it, one pixel in 64, into buffer 2, and compiles.
+ * Without the flag none of it, so the hashed cases above stay the stock text. */
+static int tex_mag_check(void)
+{
+    static const uint32_t zero[8];
+    static char text[256 * 1024];
+    NV2ACombinerState st;
+    int bad = 0, n;
+
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u, 1u, &st);
+    st.tex_mag = 1;
+    if ((n = d3d8_combiners_generate_msl(&st, text, (int)sizeof text)) <= 0)
+        return 1;
+    if (!strstr(text, "device atomic_uint *mag [[buffer(2)]]")
+            || !strstr(text, "mag_lod[0] = tex0.calculate_unclamped_lod(samp0, uv * pc.tex_scale[0].xy);")
+            || !strstr(text, "(uint(i.pos.x) & 7u) == 0u && (uint(i.pos.y) & 7u) == 0u")
+            || !strstr(text, "mag_put(mag, 3u, mag_lod[3]);")
+            || !strstr(text, "uint(m * 1024.0)")) {
+        printf("FAIL: the tex_mag variant's text\n");
+        bad = 1;
+    }
+    {
+        int before = s_compile_bad;
+        compile_case("rc-tex-mag", 0, text, n, "fs_main");
+        if (s_compile_bad != before)
+            bad = 1;
+    }
+    st.tex_mag = 0;
+    if (d3d8_combiners_generate_msl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (strstr(text, "mag_")) {
+        printf("FAIL: tex_mag text without the flag\n");
+        bad = 1;
+    }
+    return bad;
+}
+
 /* w_depth (a W-buffered batch, nv2a_w_depth_on): the shader takes zw and
  * WDepth, writes [[depth(any)]] from w / zmax after the cull and the
  * alpha test, and compiles; the vertex program's screen-space epilogue
@@ -479,6 +518,8 @@ int main(void)
     if (rt_offset_check())
         return 1;
     if (dot_check())
+        return 1;
+    if (tex_mag_check())
         return 1;
     if (wdepth_check())
         return 1;
