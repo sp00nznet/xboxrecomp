@@ -1195,6 +1195,33 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     int fd;
+
+    /* FILE_NON_DIRECTORY_FILE means "fail if this is a directory", and
+     * nothing here enforced it. Win32 gets the refusal for free: CreateFileW
+     * without FILE_FLAG_BACKUP_SEMANTICS cannot open one. POSIX open() opens a
+     * directory read-only quite happily, so the caller got a handle it was
+     * promised it would not, and found out later.
+     *
+     * STATUS_ACCESS_DENIED, not the STATUS_FILE_IS_A_DIRECTORY a real NT
+     * kernel returns here: the Win32 backend reaches this through
+     * CreateFileW failing with ERROR_ACCESS_DENIED, which maps to
+     * STATUS_ACCESS_DENIED above. Matching the other backend matters more
+     * than matching NT, because a title that switches on the status would
+     * otherwise take a different branch per host. */
+    if (CreateOptions & XBOX_FILE_NON_DIRECTORY_FILE) {
+        struct stat st;
+        if (stat(host_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            XBOX_TRACE(XBOX_LOG_FILE,
+                       "NtCreateFile: %s is a directory, refused for "
+                       "FILE_NON_DIRECTORY_FILE", host_path);
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = STATUS_ACCESS_DENIED;
+                IoStatusBlock->Information = 0;
+            }
+            return STATUS_ACCESS_DENIED;
+        }
+    }
+
     /* A partition device opened as a directory: the volume, for a free-space
      * query, rather than the image's bytes. As in the Win32 backend, the
      * directory holding the image answers that. */
