@@ -2352,22 +2352,57 @@ class Lifter:
     def _lift_muldiv(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
-        src = _fmt_operand_read(ops[0])
         if m == "mul":
             return self._lift_product(ops, signed=False)
-        elif m == "div":
-            return [
-                f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
-                f"  eax = (uint32_t)(_dividend / (uint32_t){src});",
-                f"  edx = (uint32_t)(_dividend % (uint32_t){src}); }}"
-            ]
-        elif m == "idiv":
-            return [
-                f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax;",
-                f"  eax = (uint32_t)((int32_t)(_dividend / (int32_t){src}));",
-                f"  edx = (uint32_t)((int32_t)(_dividend % (int32_t){src})); }}"
-            ]
+        elif m in ("div", "idiv"):
+            return self._lift_division(ops, signed=(m == "idiv"))
         return [f"/* {m}: unhandled */"]
+
+    def _lift_division(self, ops, signed):
+        width = (_operand_width(ops[0]) or 4) * 8
+        src = _fmt_operand_read(ops[0])
+        prefix = "int" if signed else "uint"
+
+        if width == 8:
+            divisor = f"({prefix}8_t)({src})"
+            dividend = "(int16_t)LO16(eax)" if signed else "LO16(eax)"
+            return [
+                f"{{ {prefix}32_t _divisor = {divisor};",
+                f"  {prefix}32_t _dividend = {dividend};",
+                f"  {prefix}32_t _quotient = _dividend / _divisor;",
+                f"  {prefix}32_t _remainder = _dividend % _divisor;",
+                "  SET_LO16(eax, (((uint32_t)_remainder & 0xFFu) << 8)"
+                " | ((uint32_t)_quotient & 0xFFu)); }",
+            ]
+        elif width == 16:
+            divisor = f"({prefix}16_t)({src})"
+            dividend = ("(int32_t)(((uint32_t)LO16(edx) << 16) | LO16(eax))"
+                        if signed else
+                        "((uint32_t)LO16(edx) << 16) | LO16(eax)")
+            wide = "int64_t" if signed else "uint32_t"
+            return [
+                f"{{ {prefix}32_t _divisor = {divisor};",
+                f"  {wide} _dividend = {dividend};",
+                f"  {wide} _quotient = _dividend / _divisor;",
+                f"  {wide} _remainder = _dividend % _divisor;",
+                "  SET_LO16(eax, _quotient); SET_LO16(edx, _remainder); }",
+            ]
+        elif width == 32 and signed:
+            return [
+                f"{{ int32_t _divisor = (int32_t)({src});",
+                "  int64_t _dividend = (int64_t)(int32_t)edx * 4294967296LL"
+                " + (uint32_t)eax;",
+                "  eax = (uint32_t)(_dividend / _divisor);",
+                "  edx = (uint32_t)(_dividend % _divisor); }",
+            ]
+        elif width == 32:
+            return [
+                f"{{ uint32_t _divisor = (uint32_t)({src});",
+                "  uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
+                "  eax = (uint32_t)(_dividend / _divisor);",
+                "  edx = (uint32_t)(_dividend % _divisor); }",
+            ]
+        return [f"/* {'idiv' if signed else 'div'}: unsupported width */"]
 
     def _lift_shift(self, insn, ops, c_op):
         if len(ops) < 2:
