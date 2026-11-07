@@ -15,6 +15,7 @@ Each form reads the flags of the jcc with the same condition code.
 
 from tools.recomp.disasm import BasicBlock, Instruction, Operand
 from tools.recomp.lifter import Lifter, lift_basic_block
+from tools.recomp.translator import FunctionTranslator
 
 
 def _reg(name, size=4):
@@ -90,3 +91,19 @@ def test_parity_forms_read_parity():
 def test_untracked_flags_fall_back_to_flags_variable():
     body = "\n".join(Lifter().lift_instruction(_fcmov("fcmovne", 2)))
     assert body.startswith("if (_flags") and "g_fp_stack[(g_fp_top + 2) & 7]" in body, body
+
+
+def test_carry_forms_request_carry_tracking():
+    setter = _insn(0, "sub", "eax, ebx", [_reg("eax"), _reg("ebx")])
+    for mnemonic in ("fcmovb", "fcmovnb", "fcmovbe", "fcmovnbe"):
+        assert FunctionTranslator._function_needs_cf(
+            [setter, _fcmov(mnemonic, address=2)]
+        ), mnemonic
+
+
+def test_noncarry_forms_do_not_request_carry_tracking():
+    setter = _insn(0, "sub", "eax, ebx", [_reg("eax"), _reg("ebx")])
+    for mnemonic in ("fcmove", "fcmovne", "fcmovu", "fcmovnu"):
+        assert not FunctionTranslator._function_needs_cf(
+            [setter, _fcmov(mnemonic, address=2)]
+        ), mnemonic
