@@ -1,3 +1,7 @@
+/* Windows only: the XAudio2 backend is COM and Windows-only; POSIX hosts use the SDL2
+ * backend in apu_sdl.c.
+ */
+#if defined(_WIN32)
 /* Windows SDK only; no audio device required.
  * cmake -S tests/xaudio2 -B build/xaudio2-test
  * cmake --build build/xaudio2-test --config Debug
@@ -407,3 +411,8 @@ int main(void)
     printf("XAudio2 regression: %d failures\n", failures);
     return failures ? 1 : 0;
 }
+
+#else
+#include <stdio.h>
+int main(void) { printf("xaudio2: Windows-only, skipped\n"); return 77; }
+#endif

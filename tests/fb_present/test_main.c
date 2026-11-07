@@ -1,3 +1,7 @@
+/* Windows only: the GDI framebuffer presenter is Windows-only; POSIX hosts present through
+ * fb_present_sdl.c.
+ */
+#if defined(_WIN32)
 #include <windows.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -234,3 +238,8 @@ int main(void)
     free(guest);
     return ok ? 0 : 1;
 }
+
+#else
+#include <stdio.h>
+int main(void) { printf("fb_present: Windows-only, skipped\n"); return 77; }
+#endif

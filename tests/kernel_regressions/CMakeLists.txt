@@ -1,8 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_regressions_test C)
-if(NOT WIN32)
-    message(FATAL_ERROR "This synthetic-memory regression uses Windows VirtualAlloc")
-endif()
 set(CMAKE_C_STANDARD 11)
 add_subdirectory(../.. runtime)
 add_executable(kernel_regressions_test test_main.c)

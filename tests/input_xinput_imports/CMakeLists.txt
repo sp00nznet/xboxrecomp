@@ -7,18 +7,24 @@ project(input_xinput_imports C)
 # xbox_input exactly as a game does and the check reads its import table on
 # the build host with objdump, so no Windows or emulator is needed to run it.
 # llvm-mingw and mingw-w64 provide CMAKE_OBJDUMP; MSVC does not.
+enable_testing()
+
 if(NOT WIN32)
-    message(FATAL_ERROR "This check reads a Windows exe's import table.")
+    add_test(NAME input_xinput_imports COMMAND ${CMAKE_COMMAND} -E echo
+             "skip: this check reads a Windows exe's import table")
+    set_tests_properties(input_xinput_imports PROPERTIES
+                         SKIP_REGULAR_EXPRESSION "skip:")
+    return()
 endif()
 if(NOT CMAKE_OBJDUMP)
     message(FATAL_ERROR "This check needs an objdump (a mingw toolchain).")
 endif()
+
 set(CMAKE_C_STANDARD 11)
 # Only xbox_input and what it links are built.
 add_subdirectory(../.. runtime EXCLUDE_FROM_ALL)
 add_executable(input_xinput_probe probe.c)
 target_link_libraries(input_xinput_probe PRIVATE xbox_input)
-enable_testing()
 add_test(NAME input_xinput_imports
          COMMAND ${CMAKE_COMMAND}
                  -DOBJDUMP=${CMAKE_OBJDUMP}
