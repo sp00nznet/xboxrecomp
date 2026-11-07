@@ -1208,7 +1208,8 @@ typedef struct {
     uint32_t       offset, color, width, height, pitch, palette, levels;
     int            cube;        /* six faces in a cube texture (nv2a_stage_cube_bind) */
     uint32_t       bytes;       /* nv2a_tex_extent, for tex_cache_stale */
-    uint32_t       gen, used;
+    uint32_t       gen;
+    uint64_t       used;        /* s_tc_clock at its last bind (nv2a_tex_cache_older) */
     uint32_t       pack_gen;    /* nv2a_tex_pack_gen() it was uploaded under */
     /* What the sampler follows (nv2a_stage_lod): the entry's scale over the
      * guest texture, and its chain. 1 and the guest's levels for guest texels. */
@@ -1217,23 +1218,24 @@ typedef struct {
     int            live;
     id<MTLTexture> tex;
 } TexEntry;
+/* A 32-bit used wraps within hours of play (NV2A_TEX_CACHE_MIN), which the
+ * ctest cannot see. */
+_Static_assert(sizeof(((TexEntry *)0)->used) == 8, "TexEntry.used must be 64-bit");
 
 static TexEntry       s_tc[TEX_CACHE];
 
-/* Entries in use: RECOMP_DEBUG=tex_cache=n, 1..TEX_CACHE. Default 256, this
- * backend's value since its first frames (D3D11 uses 512); neither has been
- * measured against the other. */
+/* Entries in use: RECOMP_DEBUG=tex_cache=n, NV2A_TEX_CACHE_MIN..TEX_CACHE
+ * (nv2a_tex_cache_entries). Default 256, this backend's value since its
+ * first frames (D3D11 uses 512); neither has been measured against the
+ * other. */
 static uint32_t tex_cache_n(void)
 {
     static long n = -1;
-    if (n < 0) {
-        n = recomp_env_int(RENV_TEX_CACHE, 256);
-        if (n < 1) n = 1;
-        if (n > TEX_CACHE) n = TEX_CACHE;
-    }
+    if (n < 0)
+        n = nv2a_tex_cache_entries(recomp_env_int(RENV_TEX_CACHE, 256), TEX_CACHE);
     return (uint32_t)n;
 }
-static uint32_t       s_tc_clock;
+static uint64_t       s_tc_clock;
 
 /* A write-back just rewrote guest [addr, addr + bytes): the cache entries over
  * it rehash at their next bind even inside this flip. tex_bind hashes a
@@ -1612,7 +1614,7 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
             e = c;
             break;
         }
-        if (!c->live || (victim->live && c->used < victim->used))
+        if (nv2a_tex_cache_older(c->live, c->used, victim->live, victim->used))
             victim = c;
     }
     if (e) {
@@ -1712,9 +1714,11 @@ static int border_colour(uint32_t argb)
 #define filter_mip    nv2a_tex_filter_mip
 #define lod_bias      nv2a_tex_lod_bias
 
-/* What each stage's bind took from its cache entry, by value: a later
- * stage's bind in the same draw can evict the entry at a small tex_cache.
- * The sampler's scale and chain, and the texel hash (0: no cache entry). */
+/* What each stage's bind took from its cache entry, by value. The
+ * NV2A_TEX_CACHE_MIN floor keeps a draw's binds from evicting each other's
+ * entries, so the copy is only a safety net against a later change to
+ * that. The sampler's scale and chain, and the texel hash (0: no cache
+ * entry). */
 static uint32_t s_stage_pack[4][2];
 static uint64_t s_stage_hash[4];
 

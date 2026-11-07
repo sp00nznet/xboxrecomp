@@ -156,6 +156,41 @@ int main(void)
         CHECK(nv2a_tex_extent(0x16, 4, 2, 16, 1) == 16u + 8u);
     }
 
+    /* The texture cache: tex_cache=1..3 takes four entries, and a draw that
+     * misses on all four stages never evicts an earlier stage's entry, even
+     * as the use clock passes 2^32 (where a 32-bit clock wrapped and made
+     * the draw's own entries look oldest). The scan is the backends'. */
+    {
+        enum { CAP = 8 };
+        long ask;
+        CHECK(nv2a_tex_cache_entries(1, 512) == NV2A_TEX_CACHE_MIN);
+        CHECK(nv2a_tex_cache_entries(-5, 512) == NV2A_TEX_CACHE_MIN);
+        CHECK(nv2a_tex_cache_entries(300, 256) == 256u);
+        CHECK(nv2a_tex_cache_entries(64, 512) == 64u);
+        for (ask = 1; ask <= CAP; ask++) {
+            uint32_t n = nv2a_tex_cache_entries(ask, CAP), d, k, j;
+            uint64_t used[CAP] = { 0 }, clock = 0xFFFFFFF0u;
+            int live[CAP] = { 0 }, owner[CAP];
+            for (d = 0; d < 16; d++) {
+                int mine[4];
+                for (k = 0; k < 4; k++) {
+                    uint32_t v = 0;
+                    for (j = 0; j < n; j++)
+                        if (nv2a_tex_cache_older(live[j], used[j], live[v], used[v]))
+                            v = j;
+                    /* The victim held none of this draw's earlier stages. */
+                    for (j = 0; j < k; j++)
+                        CHECK(mine[j] != (int)v || owner[v] != (int)(d * 4 + j));
+                    live[v] = 1;
+                    used[v] = ++clock;
+                    owner[v] = (int)(d * 4 + k);
+                    mine[k] = (int)v;
+                }
+            }
+            CHECK(clock > 0xFFFFFFFFu);
+        }
+    }
+
     puts("nv2a_tex: all passed");
     return 0;
 }

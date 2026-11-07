@@ -1747,7 +1747,8 @@ static RenderTarget *s_stage_rt[4];
 typedef struct {
     uint32_t offset, color, width, height, pitch, palette, levels;
     int      cube;          /* six faces in a cube texture (nv2a_stage_cube_bind) */
-    uint32_t gen, used;
+    uint32_t gen;
+    uint64_t used;          /* s_tc_clock at its last bind (nv2a_tex_cache_older) */
     uint32_t pack_gen;      /* nv2a_tex_pack_gen() it was uploaded under */
     uint64_t hash;
     int      live;
@@ -1761,22 +1762,23 @@ typedef struct {
     ID3D11Texture2D          *tex;
     ID3D11ShaderResourceView *srv;
 } TexEntry;
+/* A 32-bit used wraps within hours of play (NV2A_TEX_CACHE_MIN), which the
+ * ctest cannot see. */
+_Static_assert(sizeof(((TexEntry *)0)->used) == 8, "TexEntry.used must be 64-bit");
 
 static TexEntry  s_tc[TEX_CACHE];
 
-/* Entries in use: RECOMP_DEBUG=tex_cache=n, 1..TEX_CACHE. Default 512: a
- * busy frame binds ~100 textures and 64 thrashed. */
+/* Entries in use: RECOMP_DEBUG=tex_cache=n, NV2A_TEX_CACHE_MIN..TEX_CACHE
+ * (nv2a_tex_cache_entries). Default 512: a busy frame binds ~100 textures
+ * and 64 thrashed. */
 static uint32_t tex_cache_n(void)
 {
     static long n = -1;
-    if (n < 0) {
-        n = recomp_env_int(RENV_TEX_CACHE, 512);
-        if (n < 1) n = 1;
-        if (n > TEX_CACHE) n = TEX_CACHE;
-    }
+    if (n < 0)
+        n = nv2a_tex_cache_entries(recomp_env_int(RENV_TEX_CACHE, 512), TEX_CACHE);
     return (uint32_t)n;
 }
-static uint32_t  s_tc_clock;
+static uint64_t  s_tc_clock;
 /* Key hash -> entry + 1, checked before the scan. A live entry with a key
  * is the only one (one is made only when the scan finds none), so a hint
  * that matches is the entry the scan would find; a stale or colliding one
@@ -2133,7 +2135,7 @@ static ID3D11ShaderResourceView *tex_bind_body(const Stage *t, int cube)
             e = c;
             break;
         }
-        if (!c->live || (victim->live && c->used < victim->used))
+        if (nv2a_tex_cache_older(c->live, c->used, victim->live, victim->used))
             victim = c;
     }
     if (e) {
@@ -2965,9 +2967,9 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         unsigned flat_mask, zero_mask;
         ID3D11ShaderResourceView *srv[4];
         TexEntry *e[4];
-        /* By value: a later stage's bind can evict an earlier stage's entry
-         * at a small tex_cache, and the dump must not read a freed or reused
-         * slot's hash. */
+        /* By value: stages_flat's 2D re-binds run after the loop and can
+         * evict one of these entries, and the dump must not read a freed or
+         * reused slot's hash. */
         uint64_t hash[4];
         uint32_t scale[4];
         const char *src[4];

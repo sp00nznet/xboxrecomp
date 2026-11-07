@@ -179,6 +179,35 @@ static inline uint32_t nv2a_stage_pack_scale(uint32_t guest_w, uint32_t entry_w)
     return s >= 1u && s <= NV2A_STAGE_LOD_SCALE_MAX ? s : 1u;
 }
 
+/* The GPU backends' texture cache (RECOMP_DEBUG=tex_cache=n). A draw binds
+ * up to four cache textures before it draws, and each bind makes its entry
+ * the newest on a 64-bit use clock (a 32-bit one wraps within hours of
+ * play, after which the newest entries look oldest). A bind that misses
+ * evicts the least recently used entry and frees its view, so with fewer
+ * than four entries a later stage's bind would free the view an earlier
+ * stage of the same draw is about to bind (a crash at tex_cache=2). With
+ * four or more, the victim is never one of the draw's own. D3D11's
+ * stages_flat binds again after the draw's views are set and can evict
+ * one of them; that is safe, as the D3D11 context holds its own reference
+ * to each bound view. */
+#define NV2A_TEX_CACHE_MIN 4u
+
+/* The entries in use for RECOMP_DEBUG=tex_cache=n: n within
+ * [NV2A_TEX_CACHE_MIN, cap]. */
+static inline uint32_t nv2a_tex_cache_entries(long n, uint32_t cap)
+{
+    if (n < (long)NV2A_TEX_CACHE_MIN)
+        return NV2A_TEX_CACHE_MIN;
+    return n > (long)cap ? cap : (uint32_t)n;
+}
+
+/* The miss scan's rule: entry c takes over as the victim from v when c is
+ * free, or both are live and c was used before v. */
+static inline int nv2a_tex_cache_older(int c_live, uint64_t c_used, int v_live, uint64_t v_used)
+{
+    return !c_live || (v_live && c_used < v_used);
+}
+
 /* The mip LOD bias, signed 5.8 fixed point. */
 static inline float nv2a_tex_lod_bias(uint32_t f)
 {

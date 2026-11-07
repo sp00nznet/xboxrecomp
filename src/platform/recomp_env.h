@@ -355,7 +355,7 @@ extern "C" {
     X(IRQ_SAFE_FORCE,    DEBUG, "irq_safe_force",  "RECOMP_IRQ_SAFE_FORCE",    "=1: past irq_safe_ms, deliver beside the holder (A/B; reinstates the race)") \
     X(DPC_ON_RAISE,      DEBUG, "dpc_on_raise",    "RECOMP_DPC_ON_RAISE",      "=0: with RECOMP_DISPATCH_GATE, DPCs queued by an interrupt wait for the timer thread's drain (default with the gate: a guest thread runs them on its next raise to DISPATCH or at its gate release, and KeInsertQueueDpc wakes the timer thread; without the gate: off)") \
     X(PRESENT_STALE,     DEBUG, "present_stale",   NULL,                       "=n: a colour surface not drawn or cleared for n flips no longer sets the present size (default 120)") \
-    X(TEX_CACHE,         DEBUG, "tex_cache",       NULL,                       "=n: GPU texture-cache entries in use, 1..512 (default 512 on D3D11, 256 on Metal)") \
+    X(TEX_CACHE,         DEBUG, "tex_cache",       NULL,                       "=n: GPU texture-cache entries in use, 4..512 (default 512 on D3D11, 256 on Metal)") \
     X(ZBUF_SLOTS,        DEBUG, "zbuf_slots",      NULL,                       "=n: CPU raster depth/stencil buffers kept, by zeta offset and clip extent, 1..16 (default 8)") \
     /* ── the enhancements layer's keys (RECOMP_ENV_ENHANCE_KEYS, below) ── */ \
     RECOMP_ENV_ENHANCE_KEYS(X) \
