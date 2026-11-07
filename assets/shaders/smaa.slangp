@@ -1,0 +1,44 @@
+# SMAA 1x, color edge detection: libretro/slang-shaders' anti-aliasing/smaa.slangp
+# with the filters SMAA expects. Ours; the passes are unmodified upstream.
+#
+# filter_linear0 = true is the fix. librashader samples a pass's output by
+# alias or PassOutputN with the filter of the pass that drew it; RetroArch
+# uses the next pass's filter. Upstream sets filter_linear0 = false, so under
+# librashader the last pass reads SMAA_Input nearest, and the sub-pixel
+# offsets of SMAA's neighbourhood blend land on the same texel: about 0.1% of
+# pixels change instead of about 8%. In RetroArch this line changes nothing.
+#
+# The last pass names its scale so that inside a profile the next stage gets
+# the picture at the game's size; alone it still draws at the viewport.
+
+shaders = 4
+
+shader0 = xboxrecomp/passthrough.slang
+filter_linear0 = true
+scale_type0 = source
+scale0 = 1.0
+alias0 = SMAA_Input
+
+shader1 = anti-aliasing/shaders/smaa/smaa-pass0.slang
+filter_linear1 = true
+scale_type1 = source
+scale1 = 1.0
+
+shader2 = anti-aliasing/shaders/smaa/smaa-pass1.slang
+filter_linear2 = true
+scale_type2 = source
+scale2 = 1.0
+
+shader3 = anti-aliasing/shaders/smaa/smaa-pass2.slang
+filter_linear3 = true
+scale_type3 = source
+scale3 = 1.0
+
+# The area texture is read between texels, so bilinear. SMAASearchLength
+# scales and biases its lookup onto the search texture's texel centres, so
+# point reads the same values and leaves no rounding to the GPU.
+textures = "areaTex;searchTex"
+areaTex = anti-aliasing/shaders/smaa/AreaTex.png
+areaTex_linear = true
+searchTex = anti-aliasing/shaders/smaa/SearchTex.png
+searchTex_linear = false

@@ -27,7 +27,8 @@ extern "C" {
 /* The presets the toolkit bundles (assets/shaders), in menu order after
  * "none". A request may also be a path to any .slangp. One list: the menu's
  * choices are built from the macro, so the two cannot drift. */
-#define NV2A_PRESENT_CHAIN_NAMES "crt-lottes", "crt-lottes-fast", "crt-hyllian", "fsr"
+#define NV2A_PRESENT_CHAIN_NAMES \
+    "crt-lottes", "crt-lottes-fast", "crt-hyllian", "fsr", "smaa", "cas"
 extern const char *const nv2a_present_chain_names[];
 
 /* The request: "none" (or NULL, or empty) for the stock present, a bundled

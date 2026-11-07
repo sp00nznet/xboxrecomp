@@ -156,9 +156,36 @@ MIT and permissive — the enhancements overlay (XBOXRECOMP_ENHANCE)
                         (c) the librashader authors. MIT (its comment).
 
   assets/shaders/       RetroArch slang presets for present.shader,
-                        unmodified from libretro/slang-shaders; each file
-                        keeps its header, and assets/shaders/README.md
-                        lists them: public domain, MIT and Unlicense only.
+                        unmodified from libretro/slang-shaders 2b0530ba;
+                        each file keeps its header, and
+                        assets/shaders/README.md lists them: public
+                        domain, MIT and Unlicense only. Among them:
+
+    anti-aliasing/shaders/smaa/
+                        SMAA 1x. smaa-pass0/1/2.slang: the slang port by
+                        Jonatas Esteves, Unlicense (their SPDX lines).
+                        SMAA.hlsl, AreaTex.png, SearchTex.png: from
+                        iryoku/smaa (71c806a), (c) 2013 Jorge Jimenez,
+                        Jose I. Echevarria, Belen Masia, Fernando Navarro
+                        and Diego Gutierrez. MIT; the header keeps its
+                        notice and the textures, which carry none, ship
+                        with LICENSE-SMAA.txt beside them (also
+                        LICENSES/MIT-SMAA.txt). SMAA.hlsl adds upstream's
+                        PR #11 fix; the PNGs hold the same texels as
+                        iryoku's AreaTex.h and SearchTex.h but one
+                        (AreaTex, x 159 y 0: 0,0 for 66,61).
+
+  assets/shaders/xboxrecomp/cas.slang
+                        Contrast Adaptive Sharpening, ported from AMD
+                        FidelityFX CAS (GPUOpen-Effects/FidelityFX-CAS
+                        9fabcc9, ffx_cas.h). (c) 2020 Advanced Micro
+                        Devices, Inc. MIT, its notice in the file;
+                        LICENSES/MIT-FidelityFX-CAS.txt and
+                        LICENSE-FidelityFX-CAS.txt beside it.
+
+  assets/shaders/xboxrecomp/passthrough.slang, assets/shaders/smaa.slangp,
+  assets/shaders/cas.slangp, assets/shaders/param-kinds.toml
+                        Ours (MIT, as the toolkit).
 
 
 MPL-2.0 — librashader (present.shader, XBOXRECOMP_ENHANCE)

@@ -76,3 +76,12 @@ top-level NOTICE):
 
 The packaging copies this whole directory into every game package, macOS
 ones included.
+
+Two of the bundled present shaders (`assets/shaders`, see "assets/shaders/"
+in the top-level NOTICE) carry licences that want their text beside the
+files:
+
+- `MIT-SMAA.txt`: iryoku/smaa's `LICENSE.txt`, verbatim, for `SMAA.hlsl`,
+  `AreaTex.png` and `SearchTex.png` (also `LICENSE-SMAA.txt` beside them).
+- `MIT-FidelityFX-CAS.txt`: FidelityFX CAS's `LICENSE.txt`, verbatim, for
+  the CAS port in `assets/shaders/xboxrecomp/cas.slang` (also beside it).

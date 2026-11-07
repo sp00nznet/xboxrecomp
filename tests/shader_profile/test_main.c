@@ -783,6 +783,45 @@ static void case_bundled(const char *shaders)
         free(t);
     }
     {
+        /* smaa: four passes at the game's size, the alias and both lookup
+         * textures, with the filters librashader needs (linear into the
+         * neighbourhood blend, point search texture) */
+        const char *n[] = { "smaa" };
+        t = compose_bundled(shaders, n, 1, &info, err, sizeof err);
+        CHECK(t != NULL);
+        if (!t)
+            fprintf(stderr, "  smaa: %s\n", err);
+        CHECK(t && info.passes == 4 && has(t, "shaders = 4\n"));
+        CHECK(t && has(t, "/xboxrecomp/passthrough.slang\"\n")
+              && has(t, "/anti-aliasing/shaders/smaa/smaa-pass2.slang\"\n"));
+        CHECK(t && has(t, "filter_linear0 = \"true\"\n") && has(t, "alias0 = \"SMAA_Input\"\n"));
+        CHECK(t && has(t, "scale_type3 = \"source\"\n") && !has(t, "viewport"));
+        CHECK(t && has(t, "textures = \"areaTex;searchTex\"\n")
+              && has(t, "/anti-aliasing/shaders/smaa/AreaTex.png\"\n")
+              && has(t, "areaTex_linear = \"true\"\n") && has(t, "searchTex_linear = \"false\"\n"));
+        CHECK(info.stage[0].flags == 0);
+        free(t);
+    }
+    {
+        /* cas: one pass, low by default */
+        const char *n[] = { "cas" };
+        t = compose_bundled(shaders, n, 1, &info, err, sizeof err);
+        CHECK(t && info.passes == 1 && has(t, "/xboxrecomp/cas.slang\"\n"));
+        CHECK(t && has(t, "scale_type0 = \"source\"\n") && info.stage[0].flags == 0);
+        free(t);
+    }
+    {
+        /* smaa then cas, then a CRT: both hand on the game's size */
+        const char *n[] = { "smaa", "cas", "crt-lottes" };
+        t = compose_bundled(shaders, n, 3, &info, err, sizeof err);
+        CHECK(t && info.passes == 6 && has(t, "shaders = 6\n"));
+        CHECK(t && has(t, "shader4 = \"") && has(t, "/xboxrecomp/cas.slang\"\n"));
+        CHECK(t && has(t, "scale_type4 = \"source\"\n") && has(t, "alias0 = \"SMAA_Input\"\n"));
+        CHECK(info.stage[1].first_pass == 4 && info.stage[1].flags == 0);
+        CHECK(info.stage[2].first_pass == 5 && info.stage[2].flags == 0);
+        free(t);
+    }
+    {
         /* fsr twice: one list, one value each */
         const char *n[] = { "fsr", "fsr" };
         t = compose_bundled(shaders, n, 2, &info, err, sizeof err);

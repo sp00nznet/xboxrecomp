@@ -1,0 +1,13 @@
+# Contrast Adaptive Sharpening (AMD FidelityFX CAS, sharpen only), ours.
+# Low by default: these games draw their HUD at 480 lines, and full-strength
+# CAS rings its edges. Raise CAS_SHARPNESS or CAS_AMOUNT in the menu.
+#
+# The pass names its scale so that inside a profile the next stage gets the
+# picture at the game's size; alone it still draws at the viewport.
+
+shaders = 1
+
+shader0 = xboxrecomp/cas.slang
+filter_linear0 = true
+scale_type0 = source
+scale0 = 1.0

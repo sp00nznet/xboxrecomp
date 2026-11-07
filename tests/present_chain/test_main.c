@@ -80,7 +80,9 @@ static void case_request(void)
 
     /* The menu's choices are the bundled names. */
     CHECK(!strcmp(nv2a_present_chain_names[0], "crt-lottes"));
-    CHECK(nv2a_present_chain_names[4] == NULL);
+    CHECK(!strcmp(nv2a_present_chain_names[4], "smaa"));
+    CHECK(!strcmp(nv2a_present_chain_names[5], "cas"));
+    CHECK(nv2a_present_chain_names[6] == NULL);
 }
 
 static void write_file(const char *p)

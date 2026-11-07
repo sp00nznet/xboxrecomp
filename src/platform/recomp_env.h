@@ -88,7 +88,7 @@ extern "C" {
     X(PRESENT_FULLSCREEN, CONFIG, "RECOMP_PRESENT_FULLSCREEN", NULL, "enhancements: present.fullscreen, borderless desktop fullscreen at start (1/0)") \
     X(PRESENT_PACING,    CONFIG, "RECOMP_PRESENT_PACING",    NULL, "enhancements: present.pacing, sleep (default: lowered spin waits sleep) or spin (stock busy-wait, the console-original timing)") \
     X(PRESENT_SURFACE,   CONFIG, "RECOMP_PRESENT_SURFACE",   NULL, "enhancements: present.surface, auto (default), window, internal") \
-    X(PRESENT_SHADER,    CONFIG, "RECOMP_PRESENT_SHADER",    NULL, "enhancements: present.shader, none (stock), crt-lottes, crt-lottes-fast, crt-hyllian, fsr, or a .slangp path") \
+    X(PRESENT_SHADER,    CONFIG, "RECOMP_PRESENT_SHADER",    NULL, "enhancements: present.shader, none (stock), crt-lottes, crt-lottes-fast, crt-hyllian, fsr, smaa, cas, or a .slangp path") \
     X(PRESENT_PROFILE,   CONFIG, "RECOMP_PRESENT_PROFILE",   NULL, "enhancements: present.profile, a shader profile's file name (config/shader-profiles/<name>.toml), or none; RECOMP_PRESENT_SHADER wins over it") \
     X(PRESENT_SHADER_LIB, CONFIG, "RECOMP_PRESENT_SHADER_LIB", NULL, "enhancements: present.shader_lib, the librashader library path (default: beside the executable)") \
     X(HOST_GAMESCOPE,    CONFIG, "RECOMP_HOST_GAMESCOPE",    NULL, "host: 1 when the launcher runs the game under gamescope (Steam Game Mode); present.surface=auto then means internal") \

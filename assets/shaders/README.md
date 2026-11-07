@@ -6,7 +6,9 @@ RetroArch slang presets run by librashader when `present.shader` names one
 `2b0530bac0e8083d9d643c194929dc0a6b69bd35`, in the same layout, so the
 presets' relative paths resolve as upstream. The top-level `<name>.slangp`
 files are ours: a `#reference` line each, so a bare name in the config maps
-to `shaders/<name>.slangp` beside the executable.
+to `shaders/<name>.slangp` beside the executable. `smaa.slangp` and
+`cas.slangp` are full presets of ours instead, and `xboxrecomp/` holds our
+own passes (below).
 
 Two of them set calmer curvature than upstream, which bends a 4:3 picture a
 lot on a small screen. The in-game Shaders page resets to these values, and
@@ -32,9 +34,35 @@ licence header.
 | `crt-lottes-fast` | `crt/crt-lottes-fast.slangp` | public domain (Timothy Lottes, CRTS) |
 | `crt-hyllian` | `crt/crt-hyllian-fast.slangp` | MIT (Hyllian) |
 | `fsr` | `edge-smoothing/fsr/fsr.slangp` | Unlicense; `ffx_a.h`, `ffx_fsr1.h` MIT (AMD) |
+| `smaa` | after `anti-aliasing/smaa.slangp` | passes Unlicense (Jonatas Esteves); `SMAA.hlsl`, `AreaTex.png`, `SearchTex.png` MIT (iryoku/smaa, `LICENSE-SMAA.txt`) |
+| `cas` | none: `xboxrecomp/cas.slang`, ours | MIT (AMD FidelityFX CAS, `xboxrecomp/LICENSE-FidelityFX-CAS.txt`) |
 
 The five-pass `crt/crt-hyllian.slangp` is not bundled: its support passes and
 LUT images carry no licence. Point `present.shader` at your own copy to use it.
+
+`smaa` differs from upstream's preset in three lines, all about filtering.
+Upstream reads the first pass's output nearest (`filter_linear0 = false`),
+which RetroArch ignores, since it samples a pass's output with the filter of
+the pass that reads it. librashader uses the filter of the pass that drew
+it, so under librashader the neighbourhood blend lands on whole texels and
+changes about 0.1% of the pixels instead of about 10%. `filter_linear0 =
+true` gives the same picture on both. The lookup textures are set as SMAA
+reads them: `areaTex` bilinear, `searchTex` point. The first pass is our
+`xboxrecomp/passthrough.slang` in place of upstream's `stock.slang`, which
+has no licence header. SMAA's textures came from iryoku/smaa (`71c806a`)
+through slang-shaders as PNGs: SearchTex holds iryoku's `SearchTex.h` in
+red, AreaTex its `AreaTex.h` in red and green, with one texel off (x 159,
+y 0: 0,0 for 66,61); restoring it changed no pixel on six test frames.
+Linear `searchTex` changes a few hundred pixels per 640x480 frame by 1 to 7
+levels against point.
+
+`cas` is a one-pass port of FidelityFX CAS's sharpen-only path. Its
+`CAS_AMOUNT` (0.4) mixes the result with the input, since even at
+`CAS_SHARPNESS` 0 full CAS rings a 480-line HUD; at the defaults HUD edge
+energy stays within 1.3 times stock.
+
+`smaa` and `cas` name their last pass's scale (`source`, 1.0), so in a
+profile the next stage gets the frame at its own size.
 
 ## librashader
 

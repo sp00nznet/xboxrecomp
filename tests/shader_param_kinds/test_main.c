@@ -124,6 +124,18 @@ static const struct {
     {"crt-hyllian-fast.slang", "BRIGHTBOOST", SHADER_PARAM_SLIDER, 0, NULL, NULL},
     {"crt-hyllian-fast.slang", "SCANLINES", SHADER_PARAM_SLIDER, 0, NULL, NULL},
     {"crt-hyllian-fast.slang", "SHARPER", SHADER_PARAM_TOGGLE, 0, NULL, NULL},
+    {"smaa-pass0.slang", "SMAA_EDT", SHADER_PARAM_TOGGLE, 2, "SMAA Edge Detection", "Luma"},
+    {"smaa-pass0.slang", "SMAA_THRESHOLD", SHADER_PARAM_SLIDER, 0, NULL, NULL},
+    {"smaa-pass0.slang", "SMAA_MAX_SEARCH_STEPS", SHADER_PARAM_SLIDER, 0, NULL, NULL},
+    {"smaa-pass0.slang", "SMAA_MAX_SEARCH_STEPS_DIAG", SHADER_PARAM_SLIDER, 0, NULL, NULL},
+    {"smaa-pass0.slang", "SMAA_LOCAL_CONTRAST_ADAPTATION_FACTOR", SHADER_PARAM_SLIDER, 0, NULL,
+     NULL},
+    {"smaa-pass1.slang", "SMAA_THRESHOLD", SHADER_PARAM_SLIDER, 0, NULL, NULL},
+    {"smaa-pass1.slang", "SMAA_MAX_SEARCH_STEPS", SHADER_PARAM_SLIDER, 0, NULL, NULL},
+    {"smaa-pass1.slang", "SMAA_MAX_SEARCH_STEPS_DIAG", SHADER_PARAM_SLIDER, 0, NULL, NULL},
+    {"smaa-pass1.slang", "SMAA_CORNER_ROUNDING", SHADER_PARAM_SLIDER, 0, NULL, NULL},
+    {"cas.slang", "CAS_SHARPNESS", SHADER_PARAM_SLIDER, 0, NULL, NULL},
+    {"cas.slang", "CAS_AMOUNT", SHADER_PARAM_SLIDER, 0, NULL, NULL},
 };
 #define N_SHIPPED (int)(sizeof k_shipped / sizeof k_shipped[0])
 
@@ -135,9 +147,15 @@ static const char *const k_passes[] = {
     "crt/shaders/hyllian/crt-hyllian-fast.slang",
     "edge-smoothing/fsr/shaders/fsr-pass0.slang",
     "edge-smoothing/fsr/shaders/fsr-pass1.slang",
+    "xboxrecomp/passthrough.slang",
+    "anti-aliasing/shaders/smaa/smaa-pass0.slang",
+    "anti-aliasing/shaders/smaa/smaa-pass1.slang",
+    "anti-aliasing/shaders/smaa/smaa-pass2.slang",
+    "xboxrecomp/cas.slang",
 };
-static const char *const k_presets[] = {"crt-hyllian.slangp", "crt-lottes-fast.slangp",
-                                        "crt-lottes.slangp", "fsr.slangp"};
+static const char *const k_presets[] = {"cas.slangp",          "crt-hyllian.slangp",
+                                        "crt-lottes-fast.slangp", "crt-lottes.slangp",
+                                        "fsr.slangp",          "smaa.slangp"};
 
 /* #pragma parameter NAME "desc" initial min max step, as librashader reads
  * it, from one pass source. */

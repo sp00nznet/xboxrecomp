@@ -2014,7 +2014,8 @@ static void test_param_kinds(void)
 static void shader_files(void)
 {
     static const char *const k_names[] = { "crt-lottes", "crt-lottes-fast", "crt-hyllian", "fsr",
-                                           "stage_a", "stage_b", "broken_one", NULL };
+                                           "smaa", "cas", "stage_a", "stage_b", "broken_one",
+                                           NULL };
     char path[128];
     MKDIR("shaders");
     write_file("shaders/x.slang", "#version 450\n");
@@ -2027,7 +2028,8 @@ static void shader_files(void)
 static void shader_files_remove(void)
 {
     static const char *const k_names[] = { "crt-lottes", "crt-lottes-fast", "crt-hyllian", "fsr",
-                                           "stage_a", "stage_b", "broken_one", NULL };
+                                           "smaa", "cas", "stage_a", "stage_b", "broken_one",
+                                           NULL };
     char path[128];
     for (int i = 0; k_names[i]; i++) {
         snprintf(path, sizeof path, "shaders/%s.slangp", k_names[i]);
@@ -2129,13 +2131,17 @@ static void test_profiles(void)
     open_menu();
     CHECK(enhance_menu_set_page("Shaders"));
     n0 = shader_edit_count();
-    CHECK(n0 == 8);
+    CHECK(n0 == 10);
     CHECK(!strcmp(row_value("Profile"), "Off"));
     CHECK(enhance_menu_select_row("Profile"));
     CHECK(enhance_menu_row_live(enhance_menu_selected()) == ENHANCE_LIVE);
     for (int i = 0; i < 4; i++)
         tap(0x27);
     CHECK(!strcmp(row_value("Profile"), "fsr"));
+    tap(0x27);
+    CHECK(!strcmp(row_value("Profile"), "smaa"));
+    tap(0x27);
+    CHECK(!strcmp(row_value("Profile"), "cas"));
     tap(0x27);
     CHECK(!strcmp(row_value("Profile"), "Mine"));
     tap(0x27);

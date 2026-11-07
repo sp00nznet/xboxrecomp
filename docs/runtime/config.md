@@ -181,7 +181,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"sleep"`, `"spin"` (stock, the console-original timing): how a lowered guest busy-wait waits | `"sleep"` | `RECOMP_PRESENT_PACING` |
 | `present.profile` | string | `"none"` or a shader profile's slug, its file `config/shader-profiles/<slug>.toml`: a chain of slang presets run in place of the final present, on Metal and D3D11 ([shader profiles](#shaderprofiles)); in the layer that sets it, it wins over `present.shader` | `"none"` | `RECOMP_PRESENT_PROFILE` |
-| `present.shader` | string | `"none"`, `"crt-lottes"`, `"crt-lottes-fast"`, `"crt-hyllian"`, `"fsr"`, or a `.slangp` path: a RetroArch slang preset run by librashader in place of the final present, on Metal and D3D11 ([present.shader](#presentshader)) | `"none"` | `RECOMP_PRESENT_SHADER` |
+| `present.shader` | string | `"none"`, `"crt-lottes"`, `"crt-lottes-fast"`, `"crt-hyllian"`, `"fsr"`, `"smaa"`, `"cas"`, or a `.slangp` path: a RetroArch slang preset run by librashader in place of the final present, on Metal and D3D11 ([present.shader](#presentshader)) | `"none"` | `RECOMP_PRESENT_SHADER` |
 | `present.shader_params.<preset>.<param>` | number | a slang preset's runtime parameter, per preset: `<preset>` is the bundled name or a path's file stem, `<param>` a `#pragma parameter` name. Clamped to the parameter's range ([shader parameters](#shaderparams)) | the preset's own value | none |
 | `present.shader_lib` | string | the librashader library; relative to the executable's directory. Loaded as given, with no hash check (the sha256 pin covers only the build's own copy) | `librashader.dll` beside the executable; macOS `librashader.dylib` beside it, then `../Frameworks/librashader.dylib` | `RECOMP_PRESENT_SHADER_LIB` |
 | `present.shader_lines` | string | `"auto"`, `"guest"`, `"host"`: whether the shader chain gets the guest's line count or the frame at `render.scale` ([pass order](#presentshader)); `auto` decides by the preset's name. Over a profile's `lines` | `"auto"` | none |
@@ -479,8 +479,10 @@ same requests at given flips, to check a switch without the menu.
   `shaders/` beside the executable (`assets/shaders`, public domain, MIT
   and Unlicense only, listed in its README): `crt-lottes` and
   `crt-lottes-fast` (shadow mask, scanlines, curvature), `crt-hyllian`
-  (the one-pass fast variant) and `fsr` (AMD FidelityFX Super Resolution
-  1, an upscaler, not a CRT). Any other value with a `/` or ending in
+  (the one-pass fast variant), `fsr` (AMD FidelityFX Super Resolution
+  1, an upscaler, not a CRT), `smaa` (SMAA 1x anti-aliasing at the
+  frame's size) and `cas` (AMD FidelityFX Contrast Adaptive Sharpening,
+  low by default: `CAS_AMOUNT` 0.4 and `CAS_SHARPNESS` 0). Any other value with a `/` or ending in
   `.slangp` is a preset path, relative to the executable's directory; a
   bundled name or path that is not there says so once and the present
   stays stock. The library is loaded on first use, never linked:
@@ -651,8 +653,8 @@ maskDark = 0.6
   with one line): the display name; the slug when absent.
 - `stages` (array of strings, 1 to 8; past 8 the first 8 are taken with one
   line): the chain, first stage first. A stage is a bundled name
-  (`crt-lottes`, `crt-lottes-fast`, `crt-hyllian`, `fsr`), `user:<stem>`
-  for `<root>/shaders/<stem>.slangp`, an absolute `.slangp` path, or a
+  (`crt-lottes`, `crt-lottes-fast`, `crt-hyllian`, `fsr`, `smaa`, `cas`),
+  `user:<stem>` for `<root>/shaders/<stem>.slangp`, an absolute `.slangp` path, or a
   relative one, looked up in `<root>/shaders/` and then beside the
   executable. A file in `<root>/shaders/` named like a bundled preset is
   refused, so `fsr` always means the bundled one.
