@@ -363,7 +363,7 @@ static int tex_mag_check(void)
         return 1;
     if (!strstr(text, "device atomic_uint *mag [[buffer(2)]]")
             || !strstr(text, "mag_lod[0] = tex0.calculate_unclamped_lod(samp0, uv * pc.tex_scale[0].xy);")
-            || !strstr(text, "(uint(i.pos.x) & 7u) == 0u && (uint(i.pos.y) & 7u) == 0u")
+            || !strstr(text, "(uint(i.pos.x) & 6u) == 0u && (uint(i.pos.y) & 6u) == 0u")
             || !strstr(text, "mag_put(mag, 3u, mag_lod[3]);")
             || !strstr(text, "uint(m * 1024.0)")) {
         printf("FAIL: the tex_mag variant's text\n");

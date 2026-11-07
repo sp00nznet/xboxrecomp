@@ -390,6 +390,47 @@ static void test_mag_sidecar_size(void)
     }
 }
 
+/* Nine draws show a texel over one pixel and one sliver over a thousand: the
+ * maximum is the sliver's, the 90th percentile the texture's, as a real
+ * reading (the largest of its quarter octave), so a 1:1 texture reads 1. */
+static void test_mag_quantile(void)
+{
+    const uint64_t H = 0xF6F6ull, ONE = 0xF7F7ull;
+    struct nv2a_stage t = stage(0x40000, 0x06, 4, 4, 1);
+    uint32_t texels[16] = { 0 };
+    char name[64], *b;
+    long len;
+    int i;
+
+    for (i = 0; i < 9; i++)
+        nv2a_tex_mag_note(H, 2.0, 2);
+    nv2a_tex_mag_note(H, 2000.0, 2);
+    /* 3.0 and 3.2 share a quarter octave (2.83 to 3.36): the larger. */
+    nv2a_tex_mag_note(ONE, 3.0, 1);
+    nv2a_tex_mag_note(ONE, 3.2, 1);
+    nv2a_tex_dump_upload(&t, H, texels);
+    nv2a_tex_dump_upload(&t, ONE, texels);
+    nv2a_tex_dump_summary();
+    name_of(name, sizeof name, H, "json");
+    b = slurp(name, &len);
+    CHECK(b != NULL);
+    if (b) {
+        CHECK(strstr(b, "\"mag_max\": 2000.000,\n") != NULL);
+        CHECK(strstr(b, "\"mag_scale1\": 1000.000,\n") != NULL);
+        CHECK(strstr(b, "\"mag_p90\": 2.000,\n") != NULL);
+        CHECK(strstr(b, "\"mag_scale1_p90\": 1.000,\n") != NULL);
+        CHECK(strstr(b, "\"mag_draws\": 10,\n") != NULL);
+        free(b);
+    }
+    name_of(name, sizeof name, ONE, "json");
+    b = slurp(name, &len);
+    CHECK(b != NULL);
+    if (b) {
+        CHECK(strstr(b, "\"mag_p90\": 3.200,\n") != NULL);
+        free(b);
+    }
+}
+
 static void test_mag(void)
 {
     static uint32_t slots[NV2A_TEX_MAG_DRAWS * NV2A_TEX_MAG_STAGES];
@@ -443,6 +484,7 @@ static void test_mag(void)
     if (b) {
         CHECK(strstr(b, "\"mag_max\": 4.000,\n") != NULL);
         CHECK(strstr(b, "\"mag_scale1\": 2.000,\n") != NULL);
+        CHECK(strstr(b, "\"mag_p90\": 4.000,\n") != NULL);
         CHECK(strstr(b, "\"mag_draws\": 2,\n") != NULL);
         CHECK(strstr(b, "\"render_scale\": 2\n}\n") != NULL);
         CHECK(strstr(b, "\"texels\"") != NULL);
@@ -463,6 +505,7 @@ static void test_mag(void)
         CHECK(strstr(b, "\"mag_draws\": 3,\n") != NULL);
         free(b);
     }
+    test_mag_quantile();
     test_mag_sidecar_size();
     nv2a_tex_mag_set_on(0);
     CHECK(!nv2a_tex_mag_on());

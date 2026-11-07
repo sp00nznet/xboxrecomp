@@ -365,9 +365,14 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             EMIT("    if (alpha_only[%d] == 2u) x%d.a = 1.0;\n"
                  "    else if (alpha_only[%d] != 0u) x%d.rgb = 1.0;\n", i, 8 + i, i, 8 + i);
     }
-    /* Before anything can discard, one pixel in 64 of a screen tile. */
+    /* Before anything can discard: one 2x2 quad in each 8x8 screen tile.
+     * The compiler may sink mag_lod's LOD into this branch, and an LOD (its
+     * derivatives) taken where only one pixel of a quad runs reads the
+     * others' stale lanes: zero gradients (LOD -32, no figure), or a figure
+     * off by the render scale times the texture's width. The quad's four
+     * pixels take the branch together, so their derivatives hold. */
     if (state->tex_mag)
-        EMIT("    if ((uint(i.pos.x) & 7u) == 0u && (uint(i.pos.y) & 7u) == 0u) {\n"
+        EMIT("    if ((uint(i.pos.x) & 6u) == 0u && (uint(i.pos.y) & 6u) == 0u) {\n"
              "        mag_put(0u, mag_lod[0]); mag_put(1u, mag_lod[1]);\n"
              "        mag_put(2u, mag_lod[2]); mag_put(3u, mag_lod[3]);\n"
              "    }\n");

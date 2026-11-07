@@ -332,7 +332,7 @@ static int tex_mag_check(void)
     if (!strstr(text, "RWBuffer<uint> mag_buf : register(u7);")
             || !strstr(text, "cbuffer TexMag : register(b3) { uint mag_draw; };")
             || !strstr(text, "mag_lod[0] = tex0.CalculateLevelOfDetailUnclamped(samp0, uv * tex_scale[0].xy);")
-            || !strstr(text, "(uint(i.pos.x) & 7u) == 0u && (uint(i.pos.y) & 7u) == 0u")
+            || !strstr(text, "(uint(i.pos.x) & 6u) == 0u && (uint(i.pos.y) & 6u) == 0u")
             || !strstr(text, "InterlockedMax(mag_buf[mag_draw * 4u + slot], v, was);")) {
         printf("FAIL: the tex_mag variant's text\n");
         bad = 1;

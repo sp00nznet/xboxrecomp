@@ -236,11 +236,20 @@ static int make_dirs(const char *dir)
 static void summary(int exiting);
 
 /* The magnification trace: -1 not read yet, 0 off, 1 on. One slot a hash,
- * with or without the dump; a slot's dirty mark is a sidecar to rewrite. */
+ * with or without the dump; a slot's dirty mark is a sidecar to rewrite.
+ * Besides the maximum, each slot counts its readings by quarter octave
+ * (MAG_BINS from 2^MAG_BIN_LO) and keeps each one's largest, for a quantile
+ * that is a real reading: one draw whose coordinate
+ * barely moves (a sliver, a texture stretched over a seam) sets the maximum
+ * of a texture every other draw shows at a fraction of it. */
+#define MAG_BINS    112
+#define MAG_BIN_LO  (-8)
 static int s_mag = -1;
 typedef struct {
     uint64_t hash, draws;
     double   mag_max;
+    uint32_t bins[MAG_BINS];
+    float    bin_max[MAG_BINS];
     unsigned render_scale;
     uint8_t  used, dirty;
 } MagSlot;
@@ -942,14 +951,49 @@ static MagSlot *mag_slot(uint64_t hash, int add)
     return &s_mag_tab[i];
 }
 
+static unsigned mag_bin(double mag)
+{
+    double b = floor((log2(mag) - MAG_BIN_LO) * 4.0);
+    return b < 0.0 ? 0u : b >= MAG_BINS ? MAG_BINS - 1u : (unsigned)b;
+}
+
+/* The figure a fraction q of the readings stay at or under: the largest
+ * reading of the quarter octave that holds it. At most 19% over the exact
+ * quantile, and exact when the readings of that quarter octave agree: a 1:1
+ * texture reads 1, not the octave's edge, which would be one upscale step
+ * more. */
+static double mag_quantile(const MagSlot *m, double q)
+{
+    uint64_t total = 0, run = 0, want;
+    unsigned b;
+    for (b = 0; b < MAG_BINS; b++)
+        total += m->bins[b];
+    if (!total)
+        return 0.0;
+    want = (uint64_t)ceil(q * (double)total);
+    if (want < 1)
+        want = 1;
+    for (b = 0; b < MAG_BINS - 1u; b++) {
+        run += m->bins[b];
+        if (run >= want)
+            break;
+    }
+    return m->bin_max[b];
+}
+
 /* Under the lock. */
 static void mag_add(uint64_t hash, double mag, unsigned render_scale)
 {
     MagSlot *m = mag_slot(hash, 1);
+    unsigned b;
     if (!m)
         return;
     if (mag > m->mag_max)
         m->mag_max = mag;
+    b = mag_bin(mag);
+    m->bins[b]++;
+    if ((float)mag > m->bin_max[b])
+        m->bin_max[b] = (float)mag;
     m->draws++;
     m->render_scale = render_scale;
     m->dirty = 1;
@@ -1040,15 +1084,20 @@ static void print_facts(FILE *f, uint64_t hash)
             h && h->rt ? "true" : "false");
     if (h && h->drawn != DRAWN_NONE)
         fprintf(f, ",\n  \"drawn_2d\": %s", h->drawn == DRAWN_2D ? "true" : "false");
-    if (m)
+    if (m) {
+        unsigned rs = m->render_scale ? m->render_scale : 1u;
+        double p90 = mag_quantile(m, 0.9);
         fprintf(f,
                 ",\n"
                 "  \"mag_max\": %.3f,\n"
                 "  \"mag_scale1\": %.3f,\n"
+                "  \"mag_p90\": %.3f,\n"
+                "  \"mag_scale1_p90\": %.3f,\n"
                 "  \"mag_draws\": %llu,\n"
                 "  \"render_scale\": %u",
-                m->mag_max, m->mag_max / (m->render_scale ? m->render_scale : 1u),
+                m->mag_max, m->mag_max / rs, p90, p90 / rs,
                 (unsigned long long)m->draws, m->render_scale);
+    }
 }
 
 /* The facts into a hash's sidecar, in place of the last ones. A hash the dump
@@ -1126,11 +1175,14 @@ static void mag_summary(int exiting)
             top = m;
         if (s_on > 0 && m->dirty)
             rewrite_sidecar(m->hash);
-        if (s_on <= 0 && exiting)
-            fprintf(stderr, "[TEXDUMP] mag %016llX mag_max=%.3f mag_scale1=%.3f draws=%llu"
-                    " render_scale=%u\n", (unsigned long long)m->hash, m->mag_max,
-                    m->mag_max / (m->render_scale ? m->render_scale : 1u),
-                    (unsigned long long)m->draws, m->render_scale);
+        if (s_on <= 0 && exiting) {
+            unsigned rs = m->render_scale ? m->render_scale : 1u;
+            fprintf(stderr, "[TEXDUMP] mag %016llX mag_max=%.3f mag_scale1=%.3f"
+                    " mag_scale1_p90=%.3f draws=%llu render_scale=%u\n",
+                    (unsigned long long)m->hash, m->mag_max, m->mag_max / rs,
+                    mag_quantile(m, 0.9) / rs, (unsigned long long)m->draws,
+                    m->render_scale);
+        }
     }
     fprintf(stderr, "[TEXDUMP] tex_mag: %llu textures, highest %.3f (%016llX), %llu draws past"
             " the frame's slots; an upper bound: occluded fragments count\n",

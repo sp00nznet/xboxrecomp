@@ -223,27 +223,44 @@ the dump, each hash's `<hash>.json` also has these fields, last, rewritten by
 every summary:
 
 ```
-"mag_max": 12.000,     highest host pixels per source texel
-"mag_scale1": 4.000,   mag_max / render_scale, the figure a pack is built for
-"mag_draws": 3127,     readings folded in
+"mag_max": 12.000,     highest host pixels per source texel, of any draw
+"mag_scale1": 4.000,   mag_max / render_scale
+"mag_p90": 3.000,      what 9 draws in 10 stay at or under
+"mag_scale1_p90": 1.000, mag_p90 / render_scale, the figure a pack is built for
+"mag_draws": 3127,     readings folded in, one per draw and hash
 "render_scale": 3
 ```
 
+The maximum is one draw's word: a sliver, or a texture stretched over a seam,
+reads tens to millions of pixels per texel on a texture every other draw shows
+at a fraction of that. The p90 comes from each hash's count of readings by
+quarter octave (2^-8 to 2^20): it is the largest reading of the quarter octave
+that holds it, so a real reading, at most 19% over the exact p90, and exact
+when that quarter octave's readings agree (a 1:1 texture reads 1.000).
+
 Without it, each hash gets one line at exit:
-`[TEXDUMP] mag <hash> mag_max=... mag_scale1=... draws=... render_scale=...`.
+`[TEXDUMP] mag <hash> mag_max=... mag_scale1=... mag_scale1_p90=... draws=...
+render_scale=...`.
 Each summary and exit print `[TEXDUMP] tex_mag: N textures, highest X (<hash>),
 K draws past the frame's slots; an upper bound: occluded fragments count`.
 
 Under the trace the combiner shader of a program batch takes one variant
 (`NV2ACombinerState.tex_mag`, in its cache key, so the stock text is untouched)
 that reads each 2D stage's unclamped LOD and keeps the largest with an atomic,
-at one pixel in 64 of a screen tile, in a slot per draw id and stage of a device
+at one 2x2 quad in each 8x8 screen tile, in a slot per draw id and stage of a device
 buffer read a frame or more behind (8192 draws a frame; more are counted). The
 slot holds `(32 - lod) * 1024`, so `2^-lod` is the pixels per texel of what is
 bound; a source texel is `scale` texels of a pack entry, so the fold multiplies
 by the entry's scale. A pre-transformed batch takes no variant: its figure comes
 from up to 64 of its triangles on the CPU (`nv2a_tex_mag_triangle`).
 
-Not measured: 3D, cube, bump and dot-mapped stages, and batches that don't
+The sampled pixels are a whole quad, never one pixel of it: an LOD comes from
+the derivatives across its quad, and the compiler may move the LOD into the
+branch. Taken where one pixel of a quad runs alone, it read the other three's
+stale values: zero gradients, so no figure at all for most textures, or one off
+by the render scale times the texture's width.
+
+Not measured: 3D, cube, dot-mapped stages and the stage a bump map offsets
+(the bump map itself is a 2D stage and has a figure, though no pack uses it), and batches that don't
 reach the combiner shader or are not triangles. The figure is an upper bound:
 an occluded fragment counts. Off, the only added work is one test per draw.

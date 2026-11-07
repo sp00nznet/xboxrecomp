@@ -348,9 +348,11 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                  "    else if (pc.alpha_only[%d] != 0u) x%d.rgb = float3(1.0);\n",
                  i, 8 + i, i, 8 + i);
     }
-    /* As the HLSL: before anything can discard, one pixel in 64. */
+    /* As the HLSL: before anything can discard, one 2x2 quad in each 8x8
+     * tile, all four pixels together, so an LOD the compiler sinks into the
+     * branch still has its quad's derivatives. */
     if (state->tex_mag)
-        EMIT("    if ((uint(i.pos.x) & 7u) == 0u && (uint(i.pos.y) & 7u) == 0u) {\n"
+        EMIT("    if ((uint(i.pos.x) & 6u) == 0u && (uint(i.pos.y) & 6u) == 0u) {\n"
              "        mag_put(mag, 0u, mag_lod[0]); mag_put(mag, 1u, mag_lod[1]);\n"
              "        mag_put(mag, 2u, mag_lod[2]); mag_put(mag, 3u, mag_lod[3]);\n"
              "    }\n");
