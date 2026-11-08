@@ -145,52 +145,6 @@ static unsigned memo_back(const struct nv2a_ao_trig *t)
     return best;
 }
 
-/* The tail rule (event): an event within AO_TAIL_GAP_TOL depth draws of
- * the memo frame's last gap matches, and only when it is clearly nearer
- * that than the gap of the event before the last (AO_TAIL_SEP more): two
- * last chunks of close sizes jitter into each other's band, and a match on
- * the one before would fire a chunk early on a steady frame. */
-#define AO_TAIL_GAP_TOL 2
-#define AO_TAIL_SEP 5
-
-/* Event ord's cause, the cause before it and the depth draws between. */
-static void sig_of(const struct nv2a_ao_trig *t, unsigned ord, unsigned *why, unsigned *pwhy,
-                   uint16_t *gap)
-{
-    *why = t->ev_why[ord - 1];
-    *pwhy = ord > 1 ? t->ev_why[ord - 2] : 0;
-    /* uint16: a gap across a change of candidate wraps alike on both sides. */
-    *gap = (uint16_t)(t->ev_zd[ord - 1] - (ord > 1 ? t->ev_zd[ord - 2] : 0u));
-}
-
-/* gap - gap2 as a distance, uint16 both sides (see sig_of). */
-static int gap_dist(uint16_t gap, uint16_t gap2)
-{
-    int d = (int16_t)(uint16_t)(gap - gap2);
-    return d < 0 ? -d : d;
-}
-
-/* Event ord (recorded) against the memo frame's last event and the one
- * before it. */
-static int tail_match(const struct nv2a_ao_trig *t, unsigned ord)
-{
-    unsigned j = (t->nhist - 1u - t->want_back) % NV2A_AO_HIST, why, pwhy;
-    uint16_t gap;
-    int dt;
-    if (!t->nhist || t->want_back >= t->nhist || !t->tail_ok[j] || ord > NV2A_AO_EVENTS)
-        return 0;
-    sig_of(t, ord, &why, &pwhy, &gap);
-    if (why != t->tail_why[j] || pwhy != t->tail_pwhy[j])
-        return 0;
-    dt = gap_dist(gap, t->tail_gap[j]);
-    if (dt > AO_TAIL_GAP_TOL)
-        return 0;
-    /* Causes unlike the event before the last tell them apart alone. */
-    if (why != t->pre_why[j] || pwhy != t->pre_pwhy[j])
-        return 1;
-    return gap_dist(gap, t->pre_gap[j]) >= dt + AO_TAIL_SEP;
-}
-
 static const void *event(struct nv2a_ao_trig *t, int why)
 {
     const void *fire = NULL;
@@ -204,12 +158,18 @@ static const void *event(struct nv2a_ao_trig *t, int why)
     t->since = 0;
     if (!t->fit.ok)
         return NULL;
-    if (!t->fired) {
-        if (t->ord == t->want || (t->ord + 1u == t->want && tail_match(t, t->ord))) {
+    if (!t->fired && !t->gave_up) {
+        if (t->ord == t->want) {
             fire = t->cand;
             t->fired = 1;
             t->fired_at = t->ord;
             t->fired_rt = t->cand;
+        } else if (t->ord + 1u == t->want && t->cand) {
+            /* One short of the memo: if the frame ends here, its HUD is
+             * next and no event follows it, so the flip's fallback needs
+             * the colour as of now (nv2a_ao_snap). */
+            t->snap_rt = t->cand;
+            t->snap_req = 1;
         }
     } else if (t->cand && t->cand == t->fired_rt) {
         /* A top-up: the occluded target took a chunk more after its pass
@@ -220,9 +180,41 @@ static const void *event(struct nv2a_ao_trig *t, int why)
         t->fired++;
         t->topups++;
     }
+    if (fire)
+        t->late = 0;
     if (fire && t->ord <= NV2A_AO_EVENTS)
         t->ev_fired |= (uint16_t)(1u << (t->ord - 1u));
     return fire;
+}
+
+void nv2a_ao_dropped(struct nv2a_ao_trig *t)
+{
+    if (!t->fired)
+        return;
+    t->drops++;
+    t->drop_total++;
+    if (t->fallback) {
+        t->fallback = 0;
+        t->fallbacks--;
+    }
+    if (t->ord && t->ord <= NV2A_AO_EVENTS)
+        t->ev_fired &= (uint16_t)~(1u << (t->ord - 1u));
+    if (t->fired > 1) {
+        t->fired--;
+        t->topups--;
+        return;
+    }
+    /* The first pass: the next event on a candidate takes its place, as
+     * nothing of this frame was occluded yet. Once only: a second decline
+     * is likely the same missing depth, and the event after it may come
+     * after the HUD (a 3D portrait), so the frame goes without. */
+    t->fired = 0;
+    t->fired_at = 0;
+    t->fired_rt = NULL;
+    t->want = t->ord + 1;
+    if (t->retried)
+        t->gave_up = 1;
+    t->retried = 1;
 }
 
 void nv2a_ao_forget(struct nv2a_ao_trig *t, const void *rt)
@@ -235,6 +227,18 @@ void nv2a_ao_forget(struct nv2a_ao_trig *t, const void *rt)
     }
     if (rt && t->fired_rt == rt)
         t->fired_rt = NULL;
+    if (rt && t->snap_rt == rt) {
+        t->snap_rt = NULL;
+        t->snap_req = 0;
+    }
+}
+
+const void *nv2a_ao_snap(struct nv2a_ao_trig *t)
+{
+    if (!t->snap_req)
+        return NULL;
+    t->snap_req = 0;
+    return t->snap_rt;
 }
 
 const void *nv2a_ao_draw(struct nv2a_ao_trig *t, const void *rt, uint32_t w, uint32_t h,
@@ -251,6 +255,8 @@ const void *nv2a_ao_draw(struct nv2a_ao_trig *t, const void *rt, uint32_t w, uin
     t->cur_disp = disp && has_depth && zwrite;
     if (!t->cur_disp)
         return fire;
+    if (t->fired && rt == t->fired_rt)
+        t->late++;
     if (rt != t->cand) {
         t->cand = rt;
         t->zdraws = 0;
@@ -296,14 +302,28 @@ void nv2a_ao_sample_put(struct nv2a_ao_trig *t, int slot, float z, float w, floa
     t->zmax = zmax;
 }
 
-const void *nv2a_ao_flip(struct nv2a_ao_trig *t)
+const void *nv2a_ao_flip(struct nv2a_ao_trig *t, const void *shown)
 {
     /* The flip ends the frame's last pass. An armed candidate that has not
      * fired yet fires here (the memo was too high, or the frame is the
      * first), and one that fired tops up the chunk drawn since, since
      * nothing after the flip can be HUD. */
-    if (!t->armed)
-        return NULL;
+    if (!t->armed) {
+        /* A frame one event short of the memo: its last 3D chunk ended
+         * before the HUD, so a full pass now would occlude the HUD. The
+         * fallback occludes what changed little since the copy (the event
+         * one short of the memo): the 3D under a glow, not the HUD drawn
+         * over it (nv2a_ao_fb_keep). Only on the shown target: one drawn
+         * offscreen and composited (Burnout 3) was consumed already, and
+         * a later read of it would see the occlusion. */
+        if (t->fired || t->gave_up || !t->snap_rt || t->snap_rt != shown || !t->fit.ok)
+            return NULL;
+        t->fired = 1;
+        t->fired_rt = t->snap_rt;
+        t->fallback = 1;
+        t->fallbacks++;
+        return t->snap_rt;
+    }
     t->want = t->fired ? t->want : t->ord + 1;
     return event(t, NV2A_AO_WHY_FLIP);
 }
@@ -326,6 +346,10 @@ void nv2a_ao_frame_end(struct nv2a_ao_trig *t, uint32_t shown_w, uint32_t shown_
         t->fired_frames++;
     else if (t->fit.ok && t->ord)
         t->missed++;
+    if (t->late) {
+        t->late_frames++;
+        t->late_draws += t->late;
+    }
     for (i = 0; i < t->ns; i++) {
         if (!(t->sw[i] > 0.0f) || t->sm[i] != wmode)
             continue;
@@ -364,26 +388,7 @@ void nv2a_ao_frame_end(struct nv2a_ao_trig *t, uint32_t shown_w, uint32_t shown_
     if (t->ord) {
         unsigned j = t->nhist++ % NV2A_AO_HIST, o = t->ord;
         t->hist[j] = (uint8_t)(o > 255u ? 255u : o);
-        /* The tail is usable when it tells the last event from the one
-         * before it: in a frame of like chunks every event looks the same,
-         * and matching one would fire a chunk early every frame. */
-        t->tail_ok[j] = 0;
-        if (o >= 2 && o <= NV2A_AO_EVENTS) {
-            unsigned w1, p1, w2, p2;
-            uint16_t g1, g2;
-            sig_of(t, o, &w1, &p1, &g1);
-            sig_of(t, o - 1, &w2, &p2, &g2);
-            t->tail_why[j] = (uint8_t)w1;
-            t->tail_pwhy[j] = (uint8_t)p1;
-            t->tail_gap[j] = g1;
-            t->pre_why[j] = (uint8_t)w2;
-            t->pre_pwhy[j] = (uint8_t)p2;
-            t->pre_gap[j] = g2;
-            t->tail_ok[j] =
-                w1 != w2 || p1 != p2 || gap_dist(g1, g2) > AO_TAIL_GAP_TOL + AO_TAIL_SEP;
-        }
-        t->want_back = memo_back(t);
-        t->want = hist_at(t, t->want_back);
+        t->want = hist_at(t, memo_back(t));
     } else {
         t->want = 0;
         /* No events and no 3D at all (a loading screen): what follows is
@@ -397,6 +402,13 @@ void nv2a_ao_frame_end(struct nv2a_ao_trig *t, uint32_t shown_w, uint32_t shown_
     t->fired = 0;
     t->fired_at = 0;
     t->fired_rt = NULL;
+    t->late = 0;
+    t->drops = 0;
+    t->retried = 0;
+    t->gave_up = 0;
+    t->snap_rt = NULL;
+    t->snap_req = 0;
+    t->fallback = 0;
     t->ev_fired = 0;
     t->cand = NULL;
     t->zdraws = 0;
@@ -420,8 +432,10 @@ void nv2a_ao_frame_str(const struct nv2a_ao_trig *t, char *buf, size_t cap,
     unsigned i, n = t->ord < NV2A_AO_EVENTS ? t->ord : NV2A_AO_EVENTS;
     if (!cap)
         return;
-    o = (size_t)snprintf(buf, cap, "ord=%u want=%u at=%u ok=%d conf=%.3f ns=%u ev=", t->ord,
-                         t->memo, t->fired_at, t->fit.ok, t->fit.conf, t->ns);
+    o = (size_t)snprintf(buf, cap,
+                         "ord=%u want=%u at=%u ok=%d conf=%.3f ns=%u late=%u drop=%u fb=%d ev=",
+                         t->ord, t->memo, t->fired_at, t->fit.ok, t->fit.conf, t->ns, t->late,
+                         t->drops, t->fallback);
     for (i = 0; i < n && o < cap; i++) {
         uint32_t rid = id ? id(t->ev_rt[i]) : (uint32_t)((uintptr_t)t->ev_rt[i] & 0xFFFFFu);
         o += (size_t)snprintf(buf + o, cap - o, "%s%c%u@%x%s", i ? "," : "",
@@ -456,7 +470,8 @@ void nv2a_ao_consts_fill(const struct nv2a_ao_trig *t, const struct nv2a_ao_cfg 
     o->p3[0] = c->strength;
     o->p3[1] = 0.1f; /* angle bias: flat ground shades itself without it */
     o->p3[2] = (float)c->view;
-    o->p3[3] = t->fired > 1 ? 1.0f : 0.0f; /* a top-up (nv2a_ao_draw) */
+    /* A fallback (nv2a_ao_flip), a top-up (nv2a_ao_draw) or a first pass. */
+    o->p3[3] = t->fallback ? 2.0f : t->fired > 1 ? 1.0f : 0.0f;
 }
 
 float nv2a_ao_comp_px(float filt, float d, int top, float prev_t, float prev_d, float *t)
@@ -471,6 +486,12 @@ float nv2a_ao_comp_px(float filt, float d, int top, float prev_t, float prev_d, 
         a = filt < prev_t ? filt / prev_t : 1.0f;
     }
     return a;
+}
+
+float nv2a_ao_fb_keep(float change)
+{
+    float k = 1.0f - (change - NV2A_AO_FB_LO) / (NV2A_AO_FB_HI - NV2A_AO_FB_LO);
+    return k < 0.0f ? 0.0f : k > 1.0f ? 1.0f : k;
 }
 
 void nv2a_ao_dump_parse(const char *v, char *dir, size_t cap, unsigned long *from,

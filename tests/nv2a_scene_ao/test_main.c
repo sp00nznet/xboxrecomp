@@ -13,9 +13,13 @@
  * failed fit, and the fit itself: a clean projection, two projections in
  * one frame (the majority wins), a menu of scattered depths (refused),
  * W-buffer frames (no fit, wref from w), the constants' radius scaling,
- * the ao_dump parse and a freed candidate (never handed back).
+ * the ao_dump parse, a freed candidate (never handed back), a frame one
+ * event short of the memo (the colour copied at the event before, the
+ * flip's fallback pass, only on the shown target) and passes the
+ * backend declines (one retry a frame).
  */
 #include "nv2a_scene_ao.h"
+#include "nv2a_scene_ao_shaders.h"
 
 #include <math.h>
 #include <string.h>
@@ -33,6 +37,9 @@ static int A, S; /* two targets: the 3D one and a shadow map */
 /* The frame helpers return the draw of the frame's last pass (a top-up
  * after the first, if any); g_first holds the first's, g_passes the count. */
 static int g_first, g_passes;
+/* The draw the colour was copied before (nv2a_ao_snap, -1 none) and
+ * whether the frame's pass was the flip's fallback. */
+static int g_snap = -1, g_fb;
 #define RT_3D ((const void *)&A)
 #define RT_SHADOW ((const void *)&S)
 
@@ -54,7 +61,18 @@ static void frame_done(struct nv2a_ao_trig *t)
 {
     g_passes = (int)t->fired;
     g_first = t->fired ? (int)t->fired_at : 0;
+    g_fb = t->fallback;
     nv2a_ao_frame_end(t, 640, 480);
+}
+
+/* Draw i of a frame on the 3D target, as the backend steps it: the
+ * trigger, then the colour copy it asks for. */
+static const void *draw3d(struct nv2a_ao_trig *t, int zw, int i)
+{
+    const void *f = nv2a_ao_draw(t, RT_3D, 640, 480, 1, zw, 0);
+    if (nv2a_ao_snap(t) == RT_3D)
+        g_snap = i;
+    return f;
 }
 
 /* A frame: 3D (n draws), then HUD (h non-depth draws). Returns the index
@@ -68,7 +86,7 @@ static int frame_3d_hud(struct nv2a_ao_trig *t, unsigned n, unsigned h)
         if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, zw, 0)) at = (int)i;
         if (zw) put_proj(t, 2.0f + (float)(i * 53 % 900), 0.5f, 2000.0f, 0);
     }
-    if (nv2a_ao_flip(t)) at = -1;
+    if (nv2a_ao_flip(t, RT_3D)) at = -1;
     frame_done(t);
     return at;
 }
@@ -105,7 +123,7 @@ static void test_chunks(void)
         }
         for (k = 0; k < 5; k++, i++)
             if (nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
-        if (nv2a_ao_flip(&t) && at == -2) at = -1;
+        if (nv2a_ao_flip(&t, RT_3D) && at == -2) at = -1;
         nv2a_ao_frame_end(&t, 640, 480);
         last = at;
     }
@@ -128,7 +146,7 @@ static void test_sampled(void)
         /* A glow pass on the 3D target itself, still depth-writing state
          * but sampling it. */
         if (nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 1, 1) && at == -2) at = 40;
-        if (nv2a_ao_flip(&t) && at == -2) at = -1;
+        if (nv2a_ao_flip(&t, RT_3D) && at == -2) at = -1;
         nv2a_ao_frame_end(&t, 640, 480);
     }
     check(at == 40, "a draw sampling the candidate fires");
@@ -146,7 +164,7 @@ static void test_hud_never_arms(void)
             put_proj(&u, 2.0f + (float)i, 0.5f, 2000.0f, 0);
         }
         for (i = 0; i < 6; i++) fired += nv2a_ao_draw(&u, RT_3D, 640, 480, 1, 0, 0) != NULL;
-        fired += nv2a_ao_flip(&u) != NULL;
+        fired += nv2a_ao_flip(&u, RT_3D) != NULL;
         nv2a_ao_frame_end(&u, 640, 480);
     }
     check(fired == 0, "six depth-writing draws never arm");
@@ -171,7 +189,7 @@ static void test_shadow_and_flip(void)
             if (nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 1, 0) && at == -2) at = (int)i;
             put_proj(&t, 2.0f + (float)(i * 31 % 500), 0.5f, 2000.0f, 0);
         }
-        if (nv2a_ao_flip(&t) && at == -2) at = -1;
+        if (nv2a_ao_flip(&t, RT_3D) && at == -2) at = -1;
         nv2a_ao_frame_end(&t, 640, 480);
     }
     check(at == -1, "3D up to the flip fires at the flip; shadow map never");
@@ -195,7 +213,7 @@ static void test_growing(void)
             if (zw) put_proj(&t, 2.0f + (float)(i * 53 % 900), 0.5f, 2000.0f, 0);
         }
         a1 = at;
-        if (nv2a_ao_flip(&t)) a1 = a1 == 30 ? -1 : -3;
+        if (nv2a_ao_flip(&t, RT_3D)) a1 = a1 == 30 ? -1 : -3;
         frame_done(&t);
     }
     check(a1 == -1 && g_passes == 2,
@@ -213,24 +231,43 @@ static void test_growing(void)
 static int frame_chunks(struct nv2a_ao_trig *t, unsigned k, int *last)
 {
     int at = -2, i = 0;
+    g_snap = -1;
     unsigned c, j;
     for (c = 0; c < k; c++) {
         for (j = 0; j < 30; j++, i++) {
-            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0)) at = i;
+            if (draw3d(t, 1, i)) at = i;
             put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
         }
         *last = i;
         for (j = 0; j < 2; j++, i++)
-            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0)) at = i;
+            if (draw3d(t, 0, i)) at = i;
     }
     for (j = 0; j < 5; j++, i++)
-        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0)) at = i;
-    if (nv2a_ao_flip(t)) at = -1;
+        if (draw3d(t, 0, i)) at = i;
+    if (nv2a_ao_flip(t, RT_3D)) at = -1;
     frame_done(t);
     return at;
 }
 
 static int frame_sizes(struct nv2a_ao_trig *t, const unsigned *sz, unsigned k, int *last);
+
+/* frame_chunks up to its HUD, the flip and frame end left to the caller. */
+static void frame_chunks_open(struct nv2a_ao_trig *t, unsigned k)
+{
+    int i = 0;
+    unsigned c, j;
+    g_snap = -1;
+    for (c = 0; c < k; c++) {
+        for (j = 0; j < 30; j++, i++) {
+            draw3d(t, 1, i);
+            put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
+        }
+        for (j = 0; j < 2; j++, i++)
+            draw3d(t, 0, i);
+    }
+    for (j = 0; j < 5; j++, i++)
+        draw3d(t, 0, i);
+}
 
 /* The Deck's event count cycled N, N, N + 1. The previous frame's
  * count fired early on the long frame and missed the frame after it; the
@@ -326,7 +363,7 @@ static void test_topup_target(void)
         }
         nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 0, 0);
         if (f < 3) {
-            nv2a_ao_flip(&t);
+            nv2a_ao_flip(&t, RT_3D);
             frame_done(&t);
             continue;
         }
@@ -334,7 +371,7 @@ static void test_topup_target(void)
         for (i = 0; i < 40; i++)
             got |= nv2a_ao_draw(&t, (const void *)&B, 640, 480, 1, 1, 0) != NULL;
         got |= nv2a_ao_draw(&t, (const void *)&B, 640, 480, 1, 0, 0) != NULL;
-        got |= nv2a_ao_flip(&t) != NULL;
+        got |= nv2a_ao_flip(&t, RT_3D) != NULL;
         frame_done(&t);
     }
     check(!got && g_passes == 1, "top-up: another target's chunk runs nothing");
@@ -347,7 +384,7 @@ static void test_topup_target(void)
     nv2a_ao_forget(&t, RT_3D);
     for (i = 0; i < 40; i++)
         got |= nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 1, 0) != NULL;
-    got |= nv2a_ao_flip(&t) != NULL;
+    got |= nv2a_ao_flip(&t, RT_3D) != NULL;
     frame_done(&t);
     check(freed && !got, "top-up: a forgotten target is not topped up");
 }
@@ -373,31 +410,34 @@ static void test_wander(void)
 static int frame_tail(struct nv2a_ao_trig *t, unsigned k, int *last)
 {
     int at = -2, i = 0;
+    g_snap = -1;
     unsigned c, j;
     for (c = 0; c <= k; c++) {
         for (j = 0; j < (c < k ? 30u : 12u); j++, i++) {
-            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0)) at = i;
+            if (draw3d(t, 1, i)) at = i;
             put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
         }
         *last = i;
         for (j = 0; j < 2; j++, i++)
-            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0)) at = i;
+            if (draw3d(t, 0, i)) at = i;
     }
     for (j = 0; j < 5; j++, i++)
-        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0)) at = i;
-    if (nv2a_ao_flip(t)) at = -1;
+        if (draw3d(t, 0, i)) at = i;
+    if (nv2a_ao_flip(t, RT_3D)) at = -1;
     frame_done(t);
     return at;
 }
 
 /* A frame that loses a chunk now and then (the PC's misses): one
- * event short of the memo, an event that looks like the memo frame's last
- * one (12 depth draws after a chunk) fires. Like chunks with no distinct
- * tail never fire early that way (test_chunks, test_cycle). */
+ * event short of the memo, the frame ends with no pass before its HUD. The
+ * colour is copied before the draw after its last event, and the flip runs
+ * the fallback (masked to the pixels that changed little since that copy),
+ * so no frame is missed; the frames after a short one fire early and are
+ * topped up. */
 static void test_lost_chunk(void)
 {
     struct nv2a_ao_trig t;
-    unsigned f, bad = 0;
+    unsigned f, bad = 0, fb = 0;
     uint64_t missed;
     nv2a_ao_reset(&t);
     for (f = 0; f < 4; f++) {
@@ -406,11 +446,129 @@ static void test_lost_chunk(void)
     }
     missed = t.missed;
     for (f = 0; f < 20; f++) {
-        int last, at = frame_tail(&t, f % 5 == 4 ? 2 : 3, &last);
-        if (at != last) bad++;
+        int shortf = f % 5 == 4, last, at = frame_tail(&t, shortf ? 2 : 3, &last);
+        fb += g_fb;
+        /* The first short frame: the memo still says 4. The next ones are
+         * in the window of 8, so the memo is 3 and they fire at the last. */
+        if (shortf && f == 4)
+            bad += at != -1 || !g_fb || g_snap != last;
+        else
+            bad += at != last || g_fb;
     }
-    check(t.missed == missed, "a frame one chunk short is not missed");
-    check(bad == 0, "and the frames after a short one fire early and are topped up");
+    check(t.missed == missed && fb == 1 && t.fallbacks == 1,
+          "a frame one chunk short gets the flip's fallback, none missed");
+    check(bad == 0, "copied at its last event; the frames after it fire early, topped up");
+}
+
+/* BLiNX 2's hub on the Mac: 4 events for about 45 frames, then
+ * 3 for about 30. The memo is the low of 8 frames, so the first frame of
+ * each run of 3s came one event short of it with no pass: a full dropout
+ * every 2.5 s. Now each of those is the flip's fallback, and only those. */
+static void test_mac_hub(void)
+{
+    struct nv2a_ao_trig t;
+    unsigned f, k, prev = 4, bad = 0, downs = 0, fb = 0;
+    uint64_t missed = 0, fb0 = 0;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 600; f++) {
+        int last, at;
+        k = (f % 75) < 45 ? 4 : 3;
+        if (f == 8) {
+            missed = t.missed;
+            fb0 = t.fallbacks;
+        }
+        at = frame_chunks(&t, k, &last);
+        if (f >= 8) {
+            downs += k < prev;
+            fb += g_fb;
+            bad += g_fb ? at != -1 || g_snap != last || k >= prev : at != last;
+        }
+        prev = k;
+    }
+    check(bad == 0 && t.missed == missed, "Mac hub runs of 4 and 3: every frame covered");
+    check(fb == downs && t.fallbacks - fb0 == downs && downs == 8,
+          "Mac hub: a fallback on each first frame of 3s, no other");
+}
+
+/* The fallback's mask (nv2a_ao_fb_keep, ao_comp_fs): the story hub's glow
+ * moves most pixels a few levels after the last chunk and must keep the
+ * occlusion; the HUD's text moves them far and must keep none. Both
+ * shaders spell the same ramp. */
+static void test_fallback_mask(void)
+{
+    char ramp[128];
+    check(nv2a_ao_fb_keep(0.0f) == 1.0f && nv2a_ao_fb_keep(0.06f) == 1.0f,
+          "fallback mask: unchanged and glow-sized changes keep it all");
+    check(fabsf(nv2a_ao_fb_keep(0.13f) - 0.5f) < 1e-4f, "fallback mask: half way at 0.13");
+    check(nv2a_ao_fb_keep(0.2f) == 0.0f && nv2a_ao_fb_keep(1.0f) == 0.0f,
+          "fallback mask: HUD-sized changes keep none");
+    /* The whole mask, not just its numbers: the largest channel's change,
+     * 1 - the ramp, clamped, then applied to both the factor and the
+     * record (MSL mix, HLSL lerp). */
+    snprintf(ramp, sizeof ramp,
+             "float k = saturate(1.0 - (max(dc.r, max(dc.g, dc.b)) - %.2f) / %.2f);\n",
+             (double)NV2A_AO_FB_LO, (double)(NV2A_AO_FB_HI - NV2A_AO_FB_LO));
+    check(strstr(NV2A_AO_MSL, ramp) && strstr(NV2A_AO_HLSL, ramp),
+          "fallback mask: MSL and HLSL use the C ramp");
+    check(strstr(NV2A_AO_MSL, "a = mix(1.0, a, k);\n")
+              && strstr(NV2A_AO_MSL, "t = mix(1.0, t, k);\n")
+              && strstr(NV2A_AO_HLSL, "a = lerp(1.0, a, k);\n")
+              && strstr(NV2A_AO_HLSL, "t = lerp(1.0, t, k);\n"),
+          "fallback mask: both shaders mask the factor and the record");
+}
+
+/* The fallback's own edges: none when the copied target was freed, one
+ * the backend declines (no copy of the target's size) is undone, and its
+ * constants select the masked pass. */
+static void test_fallback_edges(void)
+{
+    struct nv2a_ao_trig t;
+    struct nv2a_ao_consts k;
+    const void *got;
+    char line[400];
+    int last;
+    unsigned f;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 4; f++)
+        frame_chunks(&t, 3, &last);
+    /* Two chunks: the second's event asks for the copy. */
+    frame_chunks_open(&t, 2);
+    check(g_snap == 62, "fallback: the copy is asked for at the event one short");
+    got = nv2a_ao_flip(&t, RT_3D);
+    nv2a_ao_consts_fill(&t, nv2a_ao_cfg(), 640, 480, 480, 1, &k);
+    nv2a_ao_frame_str(&t, line, sizeof line, NULL);
+    check(got == RT_3D && t.fallback && t.fired == 1 && k.p3[3] == 2.0f,
+          "fallback: the flip hands the copied target back, mode 2");
+    check(strstr(line, " fb=1 ev=") != NULL, "fallback: ao_frames shows fb=1");
+    nv2a_ao_dropped(&t);
+    check(!t.fallback && !t.fired && t.fallbacks == 0, "fallback: a declined one is undone");
+    frame_done(&t);
+    check(t.missed == 1, "fallback: and that frame counts as missed");
+    for (f = 0; f < 8; f++)
+        frame_chunks(&t, 3, &last);
+    frame_chunks_open(&t, 2);
+    nv2a_ao_forget(&t, RT_3D);
+    got = nv2a_ao_flip(&t, RT_3D);
+    check(got == NULL && !t.fallback, "fallback: none when the copied target was freed");
+    frame_done(&t);
+    for (f = 0; f < 8; f++)
+        frame_chunks(&t, 3, &last);
+    frame_chunks_open(&t, 3);
+    got = nv2a_ao_flip(&t, RT_3D);
+    check(got == NULL && !t.fallback && t.fired == 1, "fallback: none after a pass");
+    frame_done(&t);
+    /* A target drawn offscreen and composited before the flip (Burnout 3):
+     * the copy is of it, but the flip shows another; a pass there would
+     * occlude a target already consumed. */
+    for (f = 0; f < 8; f++)
+        frame_chunks(&t, 3, &last);
+    frame_chunks_open(&t, 2);
+    got = nv2a_ao_flip(&t, RT_SHADOW);
+    check(got == NULL && !t.fallback && t.fallbacks == 0,
+          "fallback: none when another target is shown");
+    got = nv2a_ao_flip(&t, NULL);
+    check(got == NULL && !t.fallback, "fallback: none when nothing is shown");
+    frame_done(&t);
 }
 
 /* Frames of chunks of the given sizes, each ended by 2 non-depth draws,
@@ -418,27 +576,28 @@ static void test_lost_chunk(void)
 static int frame_sizes(struct nv2a_ao_trig *t, const unsigned *sz, unsigned k, int *last)
 {
     int at = -2, i = 0;
+    g_snap = -1;
     unsigned c, j;
     for (c = 0; c < k; c++) {
         for (j = 0; j < sz[c]; j++, i++) {
-            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0)) at = i;
+            if (draw3d(t, 1, i)) at = i;
             put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
         }
         *last = i;
         for (j = 0; j < 2; j++, i++)
-            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0)) at = i;
+            if (draw3d(t, 0, i)) at = i;
     }
     for (j = 0; j < 5; j++, i++)
-        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0)) at = i;
-    if (nv2a_ao_flip(t)) at = -1;
+        if (draw3d(t, 0, i)) at = i;
+    if (nv2a_ao_flip(t, RT_3D)) at = -1;
     frame_done(t);
     return at;
 }
 
-/* A steady count whose last two chunks are close in size and jitter by a
- * few draws (review of the memo fix): the event before the last falls in the
- * tail's band now and then, and must not fire a chunk early. */
-static void test_tail_jitter(void)
+/* A steady count of chunks whose sizes jitter by a few draws, the last
+ * two close (review of the memo fix): the memo counts events, not draws, so
+ * no frame fires a chunk early (a top-up) or misses its last. */
+static void test_jittered_chunks(void)
 {
     static const unsigned base[][2] = { { 24, 20 }, { 20, 24 }, { 30, 26 }, { 14, 13 } };
     unsigned b, f, early = 0, missed = 0, seed = 1;
@@ -472,7 +631,7 @@ static void test_scene_change(void)
     nv2a_ao_reset(&t);
     for (f = 0; f < 30; f++)
         frame_chunks(&t, pat[f % 3], &last);
-    nv2a_ao_flip(&t);
+    nv2a_ao_flip(&t, RT_3D);
     nv2a_ao_frame_end(&t, 640, 480);
     check(t.nhist == 0 && t.want == 0, "a loading screen clears the memo's history");
     for (f = 0; f < 12; f++) {
@@ -498,7 +657,7 @@ static void test_no_fit(void)
                                    1.0f + (float)((i * 104729u) % 50u), 16777215.0f);
         }
         for (i = 0; i < 5; i++) fired += nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 0, 0) != NULL;
-        fired += nv2a_ao_flip(&t) != NULL;
+        fired += nv2a_ao_flip(&t, RT_3D) != NULL;
         nv2a_ao_frame_end(&t, 640, 480);
     }
     check(fired == 0 && !t.fit.ok && t.no_fit == 3, "scattered depths: refused, no fire");
@@ -541,7 +700,7 @@ static void test_wmode(void)
             put_proj(&t, 1.0f + (float)i * 10.0f, 0.5f, 1000.0f, 1);
         }
         if (nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = 50;
-        nv2a_ao_flip(&t);
+        nv2a_ao_flip(&t, RT_3D);
         nv2a_ao_frame_end(&t, 640, 480);
     }
     check(at == 50 && t.fit.ok && t.fit.wmode, "W-buffer frames: no fit needed, fires");
@@ -623,7 +782,7 @@ static void test_hud_then_3d(void)
             if (nv2a_ao_draw(&t, RT_3D, 640, 480, 1, zw, 0)) at = (int)i;
             if (zw) put_proj(&t, 2.0f + (float)(i * 53 % 900), 0.5f, 2000.0f, 0);
         }
-        if (nv2a_ao_flip(&t)) at = -1;
+        if (nv2a_ao_flip(&t, RT_3D)) at = -1;
         frame_done(&t);
         if (f < 4)
             continue;
@@ -678,10 +837,140 @@ static void test_forget(void)
     got = nv2a_ao_draw(&t, RT_SHADOW, 512, 512, 1, 1, 0);
     stale |= got == RT_3D;
     check(got == NULL, "forget: a draw elsewhere fires nothing");
-    got = nv2a_ao_flip(&t);
+    got = nv2a_ao_flip(&t, RT_3D);
     stale |= got == RT_3D;
     check(got == NULL && !stale, "forget: the flip fires nothing");
     nv2a_ao_frame_end(&t, 640, 480);
+}
+
+/* A frame of 60 depth draws, a 2D draw, then a short chunk of tail depth
+ * draws before the HUD. Returns t.late at the flip. */
+static unsigned frame_late(struct nv2a_ao_trig *t, unsigned tail, char *line, size_t cap)
+{
+    unsigned i, late;
+    for (i = 0; i < 60; i++) {
+        nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0);
+        put_proj(t, 2.0f + (float)(i * 53 % 900), 0.5f, 2000.0f, 0);
+    }
+    nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0);
+    for (i = 0; i < tail; i++) {
+        nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0);
+        put_proj(t, 2.0f + (float)(i * 31 % 900), 0.5f, 2000.0f, 0);
+    }
+    for (i = 0; i < 10; i++)
+        nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0);
+    nv2a_ao_flip(t, RT_3D);
+    late = t->late;
+    if (line)
+        nv2a_ao_frame_str(t, line, cap, NULL);
+    frame_done(t);
+    return late;
+}
+
+/* Depth draws after the frame's last pass are drawn with no occlusion: a
+ * tail too short to re-arm (rearm_draws) gets no top-up, and the trace
+ * counts it; a longer one is topped up and counts nothing. */
+static void test_late(void)
+{
+    struct nv2a_ao_trig t;
+    char line[400];
+    unsigned i, l5, l20;
+    nv2a_ao_reset(&t);
+    for (i = 0; i < 3; i++)
+        frame_late(&t, 0, NULL, 0);
+    l5 = frame_late(&t, 5, line, sizeof line);
+    check(l5 == 5, "late: a 5-draw tail after the pass is counted");
+    check(strstr(line, " late=5 drop=0 fb=0 ev=") != NULL, "late: ao_frames shows late=5");
+    check(t.late_frames == 1 && t.late_draws == 5, "late: totals count the frame");
+    l20 = frame_late(&t, 20, NULL, 0);
+    check(l20 == 0 && g_passes >= 2, "late: a 20-draw tail is topped up, none late");
+    check(t.late == 0, "late: frame_end clears it");
+}
+
+/* The backend declines a pass (no readable depth of the target's size, a
+ * record that no longer fits): a dropped first pass leaves the frame
+ * unoccluded and the next event takes its place; a dropped top-up is not
+ * counted, so the next one is the frame's second, not its third. */
+static void test_dropped(void)
+{
+    struct nv2a_ao_trig t;
+    char line[400];
+    unsigned f, i, j;
+    const void *got;
+    int second = 0, third = 0;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 4; f++)
+        frame_chunks(&t, 1, &(int){0});
+    /* One chunk per frame: the pass fires at the first event; drop it. */
+    for (i = 0; i < 30; i++) {
+        nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 1, 0);
+        put_proj(&t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
+    }
+    got = nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 0, 0);
+    check(got == RT_3D, "drop: the pass fires");
+    nv2a_ao_dropped(&t);
+    check(t.fired == 0 && t.fired_rt == NULL && t.drops == 1, "drop: a first pass undone");
+    for (i = 0; i < 30; i++)
+        nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 1, 0);
+    got = nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 0, 0);
+    check(got == RT_3D && t.fired == 1 && t.fired_at == 2, "drop: the next event is the first pass");
+    nv2a_ao_frame_str(&t, line, sizeof line, NULL);
+    check(strstr(line, " drop=1 fb=0 ev=") != NULL && t.ev_fired == 2u,
+          "drop: ao_frames shows it, the dropped event unmarked");
+    /* Two more chunks: the top-up of the first is dropped, the second's
+     * runs as pass two. */
+    for (j = 0; j < 2; j++) {
+        for (i = 0; i < 30; i++)
+            nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 1, 0);
+        got = nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 0, 0);
+        if (!j && got) {
+            nv2a_ao_dropped(&t);
+            second = t.fired == 1;
+        } else if (got) {
+            third = t.fired == 2;
+        }
+    }
+    check(second && third, "drop: a dropped top-up is not counted");
+    check(t.drop_total == 2 && t.ev_fired == 0xAu, "drop: total, and the events that ran");
+    frame_done(&t);
+    check(t.drops == 0, "drop: frame_end clears the frame's count");
+}
+
+/* A decline that persists (no readable depth of that size for the whole
+ * frame): one retry at the next event, then the frame goes without, so a
+ * later depth chunk (a 3D element drawn after the HUD) never gets a pass
+ * and the drops stay at two a frame. */
+static void test_dropped_persistent(void)
+{
+    struct nv2a_ao_trig t;
+    unsigned f, c, i, fires = 0;
+    const void *got;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 4; f++)
+        frame_chunks(&t, 1, &(int){0});
+    for (f = 0; f < 3; f++) {
+        for (c = 0; c < 4; c++) {
+            for (i = 0; i < 30; i++) {
+                nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 1, 0);
+                put_proj(&t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
+            }
+            got = nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 0, 0);
+            if (got) {
+                fires++;
+                nv2a_ao_dropped(&t);
+            }
+        }
+        for (i = 0; i < 30; i++)
+            nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 1, 0);
+        if (nv2a_ao_flip(&t, RT_3D)) {
+            fires++;
+            nv2a_ao_dropped(&t);
+        }
+        check(t.drops == 2 && t.gave_up && !t.fired, "persistent drop: one retry, then none");
+        frame_done(&t);
+    }
+    check(fires == 6 && t.drop_total == 6, "persistent drop: two passes a frame, at most");
+    check(!t.retried && !t.gave_up, "persistent drop: frame_end clears the retry");
 }
 
 int main(void)
@@ -703,7 +992,10 @@ int main(void)
     test_topup_target();
     test_wander();
     test_lost_chunk();
-    test_tail_jitter();
+    test_mac_hub();
+    test_fallback_edges();
+    test_fallback_mask();
+    test_jittered_chunks();
     test_scene_change();
     test_no_fit();
     test_fit_two_projections();
@@ -713,6 +1005,9 @@ int main(void)
     test_hud_then_3d();
     test_dump_parse();
     test_forget();
+    test_late();
+    test_dropped();
+    test_dropped_persistent();
     printf("%s (%d failed)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

@@ -4,7 +4,7 @@ project(nv2a_scene_ao_test C)
 # draws and samples are arguments, so the test builds it alone, on every host.
 set(CMAKE_C_STANDARD 11)
 add_executable(nv2a_scene_ao_test test_main.c ../../src/kernel/nv2a_scene_ao.c)
-target_include_directories(nv2a_scene_ao_test PRIVATE ../../src/kernel)
+target_include_directories(nv2a_scene_ao_test PRIVATE ../../src/kernel ../../src/d3d)
 if(NOT MSVC)
     target_link_libraries(nv2a_scene_ao_test m)
 endif()

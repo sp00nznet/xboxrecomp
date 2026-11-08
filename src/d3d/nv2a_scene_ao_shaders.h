@@ -40,7 +40,16 @@
  *     - a depth buffer swapped on the same target between passes makes
  *       every depth compare miss, and the top-up runs as a full pass.
  *     nv2a_ao_comp_px is this step in C, for the tests. Under ao_view the
- *     new map replaces the colour.
+ *     new map replaces the colour. A fallback (p3.w 2, a frame one event
+ *     short of the memo) runs at the flip, after the HUD: it
+ *     reads the colour copied at the event before (texture 3) and the
+ *     colour now (texture 4). A pixel whose colour moved little since (a
+ *     full-screen glow, fog: up to 0.06 a channel) takes the occlusion in
+ *     full, one that moved a lot (the HUD, text, a reflection drawn over
+ *     the floor: 0.20 or more) none, with a ramp between
+ *     (nv2a_ao_fb_keep). An exact compare kept nothing in the story hub,
+ *     where the glow drawn after the last 3D chunk changes nearly every
+ *     pixel by a few levels.
  *
  * Nothing samples with a sampler: integer reads, clamped to the target,
  * so the passes are exact at every render scale and need no state.
@@ -113,7 +122,9 @@
 "struct AoO { float4 c [[color(0)]]; float2 s [[color(1)]]; };\n" \
 "fragment AoO ao_comp_fs(AoV i [[stage_in]], depth2d<float> dt [[texture(0)]],\n" \
 "                        texture2d<float> at [[texture(1)]],\n" \
-"                        texture2d<float> st [[texture(2)]], constant AoC &c [[buffer(0)]]) {\n" \
+"                        texture2d<float> st [[texture(2)]],\n" \
+"                        texture2d<float> sn [[texture(3)]],\n" \
+"                        texture2d<float> cu [[texture(4)]], constant AoC &c [[buffer(0)]]) {\n" \
 "    int2 p = int2(i.pos.xy);\n" \
 "    float d = ao_d(dt, p, c), a = 1.0;\n" \
 "    if (d < 0.99999) {\n" \
@@ -130,12 +141,18 @@
 "        a = ws > 0.0 ? sum / ws : 1.0;\n" \
 "    }\n" \
 "    float t = a;\n" \
-"    if (c.p3.w > 0.5 && c.p3.z < 0.5) {\n" \
+"    if (c.p3.w > 0.5 && c.p3.w < 1.5 && c.p3.z < 0.5) {\n" \
 "        float2 pv = st.read(uint2(p)).rg;\n" \
 "        if (pv.y == d) {\n" \
 "            t = min(a, pv.x);\n" \
 "            a = a < pv.x ? a / pv.x : 1.0;\n" \
 "        }\n" \
+"    }\n" \
+"    if (c.p3.w > 1.5) {\n" \
+"        float3 dc = abs(sn.read(uint2(p)).rgb - cu.read(uint2(p)).rgb);\n" \
+"        float k = saturate(1.0 - (max(dc.r, max(dc.g, dc.b)) - 0.06) / 0.14);\n" \
+"        a = mix(1.0, a, k);\n" \
+"        t = mix(1.0, t, k);\n" \
 "    }\n" \
 "    AoO o;\n" \
 "    o.c = float4(a, a, a, 1.0);\n" \
@@ -148,6 +165,8 @@
 "Texture2D<float> dt : register(t0);\n" \
 "Texture2D<float> at : register(t1);\n" \
 "Texture2D<float2> st : register(t2);\n" \
+"Texture2D<float4> sn : register(t3);\n" \
+"Texture2D<float4> cu : register(t4);\n" \
 "float4 ao_vs(uint vid : SV_VertexID) : SV_Position {\n" \
 "    float2 p = float2(float((vid << 1) & 2u), float(vid & 2u));\n" \
 "    return float4(p * 2.0 - 1.0, 0.0, 1.0);\n" \
@@ -220,12 +239,18 @@
 "        a = ws > 0.0 ? sum / ws : 1.0;\n" \
 "    }\n" \
 "    float t = a;\n" \
-"    if (p3.w > 0.5 && p3.z < 0.5) {\n" \
+"    if (p3.w > 0.5 && p3.w < 1.5 && p3.z < 0.5) {\n" \
 "        float2 pv = st.Load(int3(p, 0));\n" \
 "        if (pv.y == d) {\n" \
 "            t = min(a, pv.x);\n" \
 "            a = a < pv.x ? a / pv.x : 1.0;\n" \
 "        }\n" \
+"    }\n" \
+"    if (p3.w > 1.5) {\n" \
+"        float3 dc = abs(sn.Load(int3(p, 0)).rgb - cu.Load(int3(p, 0)).rgb);\n" \
+"        float k = saturate(1.0 - (max(dc.r, max(dc.g, dc.b)) - 0.06) / 0.14);\n" \
+"        a = lerp(1.0, a, k);\n" \
+"        t = lerp(1.0, t, k);\n" \
 "    }\n" \
 "    AoO o;\n" \
 "    o.c = float4(a, a, a, 1.0);\n" \
