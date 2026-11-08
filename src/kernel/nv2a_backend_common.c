@@ -1025,6 +1025,12 @@ static unsigned s_req_mask;
 static atomic_flag s_req_lock = ATOMIC_FLAG_INIT;
 static atomic_uint s_req_pending;
 static atomic_uint s_opts_gen;
+/* NV2A_OPT_PACK_FILE: the pack to load at the flip, "" for none, and what
+ * the last such load did, both under s_req_lock (the menu reads the one
+ * and writes the other from its own thread). */
+static char s_req_pack[1024];
+static char s_pack_said[160];
+static unsigned s_pack_seq;
 
 /* The pack's enable bits from pack_off. A change of what the pack matches
  * bumps nv2a_tex_pack_gen() (in nv2a_tex_pack), which every backend's
@@ -1078,15 +1084,65 @@ void nv2a_host_opts_request(const struct nv2a_host_opts *o, unsigned mask)
         s_req_opts.snap_2d = o->snap_2d;
     if (mask & NV2A_OPT_DETILE)
         s_req_opts.detile = o->detile;
-    s_req_mask |= mask;
+    s_req_mask |= mask & ~NV2A_OPT_PACK_FILE;
     req_unlock();
     atomic_store_explicit(&s_req_pending, 1u, memory_order_release);
+}
+
+void nv2a_host_pack_request(const char *path)
+{
+    req_lock();
+    snprintf(s_req_pack, sizeof s_req_pack, "%s", path ? path : "");
+    s_req_mask |= NV2A_OPT_PACK_FILE;
+    req_unlock();
+    atomic_store_explicit(&s_req_pending, 1u, memory_order_release);
+}
+
+unsigned nv2a_host_pack_status(char *out, size_t n)
+{
+    unsigned seq;
+    req_lock();
+    seq = s_pack_seq;
+    if (out && n)
+        snprintf(out, n, "%s", s_pack_said);
+    req_unlock();
+    return seq;
+}
+
+/* The pack the menu picked, on the walker at the flip: the only thread that
+ * uploads, so no draw holds an entry across the swap. The load bumps
+ * nv2a_tex_pack_gen() and every cached texture uploads again. */
+static void pack_apply_file(const char *path)
+{
+    char err[128], said[sizeof s_pack_said];
+    int n;
+    if (!*path) {
+        nv2a_tex_pack_unload();
+        snprintf(said, sizeof said, "none");
+        fprintf(stderr, "[ENHANCE] textures.pack live: none\n");
+    } else if ((n = nv2a_tex_pack_load(path, err, sizeof err)) < 0) {
+        snprintf(said, sizeof said, "%s", err);
+        fprintf(stderr, "[ENHANCE] textures.pack live: %s: %s; no pack\n", path, err);
+    } else {
+        snprintf(said, sizeof said, "%d entries", n);
+        fprintf(stderr, "[ENHANCE] textures.pack live: %s (%d entries: %u ui, %u font,"
+                " %u text, %u world; v%u; %u marked detile)\n", path, n,
+                nv2a_tex_pack_kind_count(XRTP_KIND_ART), nv2a_tex_pack_kind_count(XRTP_KIND_FONT),
+                nv2a_tex_pack_kind_count(XRTP_KIND_TEXT),
+                nv2a_tex_pack_kind_count(XRTP_KIND_WORLD), nv2a_tex_pack_version(),
+                nv2a_tex_pack_detile_count());
+    }
+    req_lock();
+    memcpy(s_pack_said, said, sizeof s_pack_said);
+    s_pack_seq++;
+    req_unlock();
 }
 
 unsigned nv2a_host_opts_apply(void)
 {
     struct nv2a_host_opts r;
     unsigned mask, changed = 0;
+    char pack[sizeof s_req_pack];
 
     if (!atomic_load_explicit(&s_req_pending, memory_order_acquire))
         return 0;
@@ -1095,7 +1151,13 @@ unsigned nv2a_host_opts_apply(void)
     r = s_req_opts;
     mask = s_req_mask;
     s_req_mask = 0;
+    memcpy(pack, s_req_pack, sizeof pack);
     req_unlock();
+
+    if (mask & NV2A_OPT_PACK_FILE) {
+        pack_apply_file(pack);
+        changed |= NV2A_OPT_PACK_FILE;
+    }
 
     /* Scale 0 and 1 both mean guest size: not a change. */
     if ((mask & NV2A_OPT_SCALE)

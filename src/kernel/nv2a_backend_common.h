@@ -1744,6 +1744,8 @@ struct nv2a_host_opts {
 #define NV2A_OPT_OVERSCAN   0x40u
 #define NV2A_OPT_SNAP2D     0x80u
 #define NV2A_OPT_DETILE     0x100u
+/* nv2a_host_pack_request's: the pack file itself, loaded at the flip. */
+#define NV2A_OPT_PACK_FILE  0x200u
 /* display.overscan's range (enhance.c clamps the key to it): 10% of a
  * 640-wide frame a side, past any TV's overscan. */
 #define NV2A_OVERSCAN_MAX   64u
@@ -1763,6 +1765,16 @@ void nv2a_host_opts_request(const struct nv2a_host_opts *o, unsigned mask);
  * of range or a non-zero overscan with a wide display.aspect is refused
  * with one line (the latter's 4:3 edges are inside the padded frame). */
 unsigned nv2a_host_opts_apply(void);
+/* Load the pack at `path` (resolved: absolute, or as the caller's working
+ * directory has it) at the next flip, or drop the loaded one for NULL or
+ * "" (any thread; the menu's pack picker). The walker swaps it in
+ * nv2a_host_opts_apply, which returns NV2A_OPT_PACK_FILE, logs one
+ * "[ENHANCE] textures.pack live: ..." line and bumps nv2a_tex_pack_gen().
+ * The pack_off bits carry over: they are the player's, not the file's. */
+void nv2a_host_pack_request(const char *path);
+/* How many such loads have been applied, and the last one's outcome into
+ * out ("none", "<n> entries" or the refusal's reason). */
+unsigned nv2a_host_pack_status(char *out, size_t n);
 /* Bumped by every apply that changed a field, after the fields are stored:
  * a reader on another thread (the SDL presenter) that sees a new gen with
  * acquire sees the new values. */

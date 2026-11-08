@@ -186,7 +186,8 @@ the stock settings, `present.pacing = "spin"` included.
 | `present.shader_lib` | string | the librashader library; relative to the executable's directory. Loaded as given, with no hash check (the sha256 pin covers only the build's own copy) | `librashader.dll` beside the executable; macOS `librashader.dylib` beside it, then `../Frameworks/librashader.dylib` | `RECOMP_PRESENT_SHADER_LIB` |
 | `present.shader_lines` | string | `"auto"`, `"guest"`, `"host"`: whether the shader chain gets the guest's line count or the frame at `render.scale` ([pass order](#presentshader)); `auto` decides by the preset's name. Over a profile's `lines` | `"auto"` | none |
 | `present.surface` | string | `"auto"`, `"window"`, `"internal"`: who scales the frame to the screen, the game or the compositor | `"auto"` | `RECOMP_PRESENT_SURFACE` |
-| `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
+| `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); a bare file name is looked for in the `textures` folder beside the user `config` folder (the parent of RECOMP_CONFIG's folder, else `<user root>`), then `<exe dir>/textures`; any other relative path is relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
+| `textures.art` | string | `"on"`, `"off"`: the pack's art entries (HUD pieces, other images) | `"on"` | `RECOMP_TEXTURES_ART` |
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
 | `textures.world` | string | `"on"`, `"off"`: the pack's world entries (version 3) | `"on"` | `RECOMP_TEXTURES_WORLD` |
@@ -807,10 +808,17 @@ declares `OriginalSize` in its uniform block) is not a read.
   Metal and D3D11 backends already compute for every upload. A relative
   path is resolved against the executable's directory, where
   `config.default.toml` is, so a bundle's defaults name `enhance/hud.pack`
-  (a `.app` keeps the pack beside the executable too). The layer
+  (a `.app` keeps the pack beside the executable too). A bare file name
+  (no `/` or `\`), as the menu's picker writes it, is looked for in the
+  `textures` folder beside the user `config` folder (the parent of
+  `RECOMP_CONFIG`'s folder, else `<user root>`), then `<exe dir>/textures`,
+  and falls back to the executable's directory. Not the working folder:
+  the macOS bundle and the SteamOS launcher run the game from a logs
+  folder, and a Windows shortcut from its Start-in. Only the key loads a pack: a file in those
+  folders is listed by the menu and nothing more, so stock stays no pack. The layer
   loads the pack's index at startup and logs one line after the settings
   line: `[ENHANCE] textures.pack=none` when unset, or
-  `[ENHANCE] textures.pack=enhance/hud.pack (41 entries: 30 ui, 1 font, 10 text, 0 world; v2; scale 4, text 2; 0 bc1, 10 bc3) textures.font=on textures.text=on textures.world=on`
+  `[ENHANCE] textures.pack=enhance/hud.pack (41 entries: 30 ui, 1 font, 10 text, 0 world; v2; scale 4, text 2; 0 bc1, 10 bc3) textures.art=on textures.font=on textures.text=on textures.world=on`
   (the path ends at the first space). A
   file that is missing, has another magic or version, a non-zero reserved
   field, flags the version does not define, an entry outside the file, an
@@ -850,10 +858,11 @@ declares `OriginalSize` in its uniform block) is not a read.
   cube, a snapped 2D stage and a hor+ read keep the stock sample; so does the
   basic shader (fixed-function draws) and the CPU backend. With it on, the
   pack line adds `textures.detile=on (N entries marked)`. Live: the next
-  draw follows the menu.
-- **`textures.font`, `textures.text`, `textures.world` = `"on" | "off"`.** A
+  draw follows the menu. A pack with marked entries does not turn it on:
+  only the key does (`tests/enhance_cfg`).
+- **`textures.art`, `textures.font`, `textures.text`, `textures.world` = `"on" | "off"`.** A
   pack marks each entry as art, the font atlas, baked text or (version 3) a
-  texture of the 3D scene; `textures.world` turns those off alone.
+  texture of the 3D scene; each key turns its kind off alone.
   `off` makes the pack skip that kind, so the game's own glyphs or text
   images are drawn, for a player who prefers them or a language the pack
   does not cover. Both are read whether or not a pack is set; with one
@@ -1571,13 +1580,29 @@ points, its live class; the footer names the selected row's:
 | Class | Takes effect | Items |
 |---|---|---|
 | live | at the next flip | `render.aniso`, `render.snap_2d`, `textures.detile`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `overlay.stats`, `overlay.ui_scale`, `overlay.ui_fit`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
-| at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text`, `textures.world` |
+| at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.art`, `textures.font`, `textures.text`, `textures.world` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
 | at restart | at the next start; the change is saved, not applied | `display.aspect`, `present.surface`, a mod without `on_enable` |
 
-The `textures.pack` toggle turns the loaded pack off for this session only
-and is never saved (the key names the pack's file). A title's items and a
+The Pack page's picker (`textures.pack`) lists `none` and the `.pack` files
+(any case; regular files only, so a folder or a dangling link named so is
+left out) of the `textures` folder beside the user `config` folder and of
+`<exe dir>/textures` (a name in both is the user folder's), up to 32 with
+a `More packs` row counting the rest, plus the value in force when it is
+neither. With no pack loaded the page shows both folders as absolute
+paths (`Packs folder`, `Also from`). A value in force longer than a menu
+row (95 bytes) is picked again by its whole configured path. A choice is
+loaded on the walker at the next flip (`nv2a_host_pack_request`): the old
+pack is dropped, the new one read, the pack gen bumped so both backends
+upload every texture again, and one line logged,
+`[ENHANCE] textures.pack live: <path> (N entries: ...; vN; N marked detile)`,
+`... live: <path>: <reason>; no pack` or `... live: none` (the golden check
+reads only the startup line). Save writes the bare name. The page shows the
+file, the format version, the kinds' rows (a kind the pack lacks says so),
+`Hide tile repeats` only when the pack marks tiles, and the counts. The
+`Use the pack` toggle (`textures.session`) turns the loaded pack off for
+this session only and is never saved. A title's items and a
 mod's items give their own class. Tests: `tests/enhance_menu` (ctest
 `enhance_menu`).
 
@@ -1837,6 +1862,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_PRESENT_SURFACE` | overrides `present.surface` |
 | `RECOMP_HOST_GAMESCOPE` | set by the SteamOS launcher (`1`) when it runs under gamescope; `present.surface = "auto"` then means `internal`. No file key binds it; a line in the bundle's `config/launch.env` overrides it |
 | `RECOMP_TEXTURES_PACK` | overrides `textures.pack` |
+| `RECOMP_TEXTURES_ART` | overrides `textures.art` |
 | `RECOMP_TEXTURES_FONT` | overrides `textures.font` |
 | `RECOMP_TEXTURES_TEXT` | overrides `textures.text` |
 | `RECOMP_TEXTURES_WORLD` | overrides `textures.world` |

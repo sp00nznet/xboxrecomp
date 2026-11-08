@@ -97,6 +97,7 @@ extern "C" {
     X(PRESENT_SHADER_LIB, CONFIG, "RECOMP_PRESENT_SHADER_LIB", NULL, "enhancements: present.shader_lib, the librashader library path (default: beside the executable)") \
     X(HOST_GAMESCOPE,    CONFIG, "RECOMP_HOST_GAMESCOPE",    NULL, "host: 1 when the launcher runs the game under gamescope (Steam Game Mode); present.surface=auto then means internal") \
     X(TEXTURES_PACK,     CONFIG, "RECOMP_TEXTURES_PACK",     NULL, "enhancements: textures.pack, a texture pack file (host-side texture replacements; unset = stock)") \
+    X(TEXTURES_ART,      CONFIG, "RECOMP_TEXTURES_ART",      NULL, "enhancements: textures.art, the pack's art entries (HUD pieces, other images), on (default) or off") \
     X(TEXTURES_FONT,     CONFIG, "RECOMP_TEXTURES_FONT",     NULL, "enhancements: textures.font, the pack's font-atlas entries, on (default) or off") \
     X(TEXTURES_TEXT,     CONFIG, "RECOMP_TEXTURES_TEXT",     NULL, "enhancements: textures.text, the pack's baked-text entries, on (default) or off") \
     X(TEXTURES_WORLD,    CONFIG, "RECOMP_TEXTURES_WORLD",    NULL, "enhancements: textures.world, the pack's world entries, on (default) or off") \

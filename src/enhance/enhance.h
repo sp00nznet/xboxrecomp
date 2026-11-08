@@ -35,6 +35,8 @@
 #ifndef XBOX_ENHANCE_H
 #define XBOX_ENHANCE_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -47,6 +49,19 @@ extern "C" {
  * -1 if a config file failed to parse (it is skipped whole; the other
  * files and the environment apply). */
 int xbox_enhance_init(const char *root, const char *title);
+
+/* textures.pack's value to the file it names, into out: 0 for "none" or
+ * empty (no pack), else 1. An absolute path is taken as is, a relative
+ * one with a folder in it from the executable's directory; a bare file
+ * name ("hex.pack", as the menu's picker writes it) from the user's
+ * textures folder, then <exe dir>/textures, then the executable's
+ * directory. */
+int xbox_enhance_pack_path(const char *value, char *out, size_t n);
+/* The two folders the menu lists packs from, both absolute: the user's,
+ * a textures folder beside the config folder (the parent of
+ * enhance_cfg_user_dir, else <root>), and <exe dir>/textures. Either may
+ * be NULL. Returns 0. */
+int xbox_enhance_pack_dirs(char *user, char *exe, size_t n);
 
 /* present.pacing changed while the game runs (the in-game menu): mode is
  * XBOX_PACING_SPIN or XBOX_PACING_SLEEP (kernel_pacing.h), anything else is

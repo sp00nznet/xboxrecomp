@@ -9,6 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 /* The 64-bit stat on Windows: the default one's st_size is 32 bits, and a
  * pack with an art tier is past 2 GB. */
@@ -23,6 +27,39 @@ typedef struct __stat64 pack_stat_t;
 typedef struct stat pack_stat_t;
 #define pack_fstat(f, st) fstat(fileno(f), (st))
 #endif
+
+/* Pack paths are UTF-8 (the menu lists folders through the wide API): on
+ * Windows they open through _wfopen, so a user folder under a non-ASCII
+ * name works. */
+#ifdef _WIN32
+static int pack_widen(const char *path, wchar_t *w, int n)
+{
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, w, n) > 0;
+}
+#endif
+
+static FILE *pack_fopen(const char *path)
+{
+#ifdef _WIN32
+    wchar_t w[1024];
+    return pack_widen(path, w, 1024) ? _wfopen(w, L"rb") : NULL;
+#else
+    return fopen(path, "rb");
+#endif
+}
+
+int nv2a_tex_pack_is_file(const char *path)
+{
+#ifdef _WIN32
+    struct __stat64 st;
+    wchar_t w[1024];
+    return path && *path && pack_widen(path, w, 1024) && !_wstat64(w, &st)
+        && (st.st_mode & _S_IFREG);
+#else
+    struct stat st;
+    return path && *path && !stat(path, &st) && S_ISREG(st.st_mode);
+#endif
+}
 
 static struct nv2a_tex_pack_entry *s_entries;
 static unsigned  s_count, s_scale, s_text_scale, s_version;
@@ -158,6 +195,9 @@ void nv2a_tex_pack_unload(void)
     memset(s_miss, 0, sizeof s_miss);
     s_miss_n = s_miss_next = 0;
     __atomic_store_n(&s_miss_total, 0, __ATOMIC_RELAXED);
+    /* What every hash matches changed (the menu loads or drops a pack at a
+     * flip): each backend's texture cache uploads again, as for a toggle. */
+    atomic_fetch_add_explicit(&s_gen, 1u, memory_order_relaxed);
 }
 
 int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
@@ -177,7 +217,7 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
         fail(err, errlen, "no path");
         return -1;
     }
-    f = fopen(path, "rb");
+    f = pack_fopen(path);
     if (!f) {
         fail(err, errlen, "cannot open");
         return -1;
@@ -324,6 +364,7 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
     s_bc1_count = bc1;
     s_bc3_count = bc3;
     s_detile_count = detile;
+    atomic_fetch_add_explicit(&s_gen, 1u, memory_order_relaxed);
     return (int)count;
 }
 

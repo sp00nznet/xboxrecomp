@@ -4,7 +4,9 @@
  *   write     a pack of two entries (a 2x2 single level, a 4x2 with two
  *             levels) written by this test, loaded: count, scale, both
  *             found, a miss, an entry of another aspect than the guest
- *             texture's not taken, texels read back, hits counted
+ *             texture's not taken, texels read back, hits counted;
+ *             nv2a_tex_pack_is_file takes the file, not a folder named
+ *             *.pack nor a missing name; a UTF-8 file name loads
  *   refuse    bad magic, bad version, index past the end, an entry past
  *             the end, an unsorted index, a truncated file, more levels
  *             than the size allows, non-zero reserved header bytes or entry
@@ -54,11 +56,16 @@
 #include <string.h>
 #include <sys/stat.h>
 #ifdef _WIN32
+#include <direct.h>
 #include <sys/utime.h>
 #define utime _utime
 #define utimbuf _utimbuf
+#define MKDIR(p) _mkdir(p)
+#define rmdir _rmdir
 #else
+#include <unistd.h>
 #include <utime.h>
+#define MKDIR(p) mkdir(p, 0755)
 #endif
 
 #include "nv2a_backend_common.h"
@@ -157,6 +164,33 @@ static void test_write(void)
     CHECK(nv2a_tex_pack_hits() == 2, "hits %llu", (unsigned long long)nv2a_tex_pack_hits());
     nv2a_tex_pack_unload();
     CHECK(nv2a_tex_pack_count() == 0, "unload");
+
+    /* The menu lists only a regular file: a folder named *.pack, or a
+     * name with nothing there, is not one. */
+    CHECK(nv2a_tex_pack_is_file("good.pack"), "good.pack not a file");
+    MKDIR("dir.pack");
+    CHECK(!nv2a_tex_pack_is_file("dir.pack"), "a folder taken for a pack");
+    CHECK(!nv2a_tex_pack_is_file("absent.pack"), "a missing file taken for a pack");
+    rmdir("dir.pack");
+
+    /* A UTF-8 name (a Windows user folder with an accent): opened wide. */
+    {
+        static const char utf8[] = "caf\xC3\xA9.pack";
+#ifdef _WIN32
+        FILE *f = _wfopen(L"caf\u00E9.pack", L"wb");
+        if (f) { fwrite(buf, 1, n, f); fclose(f); }
+#else
+        write_file(utf8, buf, n);
+#endif
+        CHECK(nv2a_tex_pack_is_file(utf8), "UTF-8 name not found");
+        rc = nv2a_tex_pack_load(utf8, err, sizeof err);
+        CHECK(rc == 2, "UTF-8 name: %d (%s)", rc, err);
+        nv2a_tex_pack_unload();
+        remove(utf8);
+#ifdef _WIN32
+        _wremove(L"caf\u00E9.pack");
+#endif
+    }
 }
 
 static void refuse(const char *path, const uint8_t *buf, size_t n, const char *want)

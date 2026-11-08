@@ -971,6 +971,9 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_backend_common.c | - | s_req_lock | file_static | keep | - | host spinlock |
 | src/kernel/nv2a_backend_common.c | - | s_req_pending | file_static | keep | - | enhance options and pending menu requests, host settings |
 | src/kernel/nv2a_backend_common.c | - | s_opts_gen | file_static | keep | - | options generation; backends cache it, must not go back |
+| src/kernel/nv2a_backend_common.c | - | s_req_pack | file_static | keep | - | pack file the menu asked for, host settings |
+| src/kernel/nv2a_backend_common.c | - | s_pack_said | file_static | keep | - | outcome of the last menu pack load, host files |
+| src/kernel/nv2a_backend_common.c | - | s_pack_seq | file_static | keep | - | count of menu pack loads, must not go back |
 | src/kernel/nv2a_backend_common.c | - | s_hud_state | file_static | reset | enhance | HUD layer active flag and guest target size |
 | src/kernel/nv2a_backend_common.c | - | s_frame_wh | file_static | reset | renderer.common | last guest frame size |
 | src/kernel/nv2a_backend_common.c | nv2a_bump_trace | seen | local_static | keep | - | trace dedupe list |
@@ -3006,6 +3009,12 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/enhance_actions.c | - | s_padrec_act | file_static | keep | - | padrec.* action ids and the request bits the menu takes |
 | src/enhance/enhance_actions.c | - | s_padrec_req | file_static | keep | - | padrec.* action ids and the request bits the menu takes |
 
+### src/enhance/enhance.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/enhance/enhance.c | - | s_root | file_static | keep | - | user root set once at init; the pack picker's folder |
+
 ### src/enhance/enhance_cfg.c
 
 | file | scope | name | kind | class | hook | why |
@@ -3042,6 +3051,10 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 |---|---|---|---|---|---|---|
 | src/enhance/enhance_menu.c | - | s_page_intro | file_static | keep | - | page intro texts |
 | src/enhance/enhance_menu.c | - | s_pack_off | file_static | keep | - | menu's texture-pack off bits |
+| src/enhance/enhance_menu.c | - | s_pack_name | file_static | keep | - | pack picker's listed file names, host files |
+| src/enhance/enhance_menu.c | - | s_pack_choice | file_static | keep | - | pack picker's choice list, host files |
+| src/enhance/enhance_menu.c | - | s_pack_more | file_static | keep | - | pack picker's count of packs past the list cap, host files |
+| src/enhance/enhance_menu.c | - | s_pack_pick | file_static | keep | - | pack picker item, menu settings |
 | src/enhance/enhance_menu.c | - | s_language | file_static | keep | - | language menu item |
 | src/enhance/enhance_menu.c | - | s_language_help | file_static | keep | - | language row help text |
 | src/enhance/enhance_menu.c | - | s_slot | file_static | keep | - | built menu slots |

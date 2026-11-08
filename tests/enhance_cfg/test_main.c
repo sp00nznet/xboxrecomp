@@ -1557,14 +1557,20 @@ static void test_present_surface(void)
 
 /* ── textures.pack: path resolution and the lines golden reads ────── */
 
-/* A one-entry pack: a 1x1 texel at scale 2. */
-static void write_pack(const char *path)
+/* A one-entry pack: a 1x1 texel at scale 2, of the given version and
+ * entry flags (v1's art entry is 0). */
+static void write_pack_v(const char *path, unsigned version, unsigned flags)
 {
     unsigned char b[68];
     FILE *f;
     memset(b, 0, sizeof b);
     memcpy(b, NV2A_TEX_PACK_MAGIC, 4);
-    b[4] = 1;                           /* version */
+    b[4] = (unsigned char)version;
+    b[52] = (unsigned char)flags;       /* entry flags */
+    if (version >= 3) {
+        b[24] = 2;                      /* text scale */
+        b[28] = (unsigned char)(1u << (flags & XRTP_KIND_MASK));    /* classes */
+    }
     b[8] = 1;                           /* count */
     b[12] = 2;                          /* scale */
     b[16] = 32;                         /* index offset */
@@ -1576,6 +1582,11 @@ static void write_pack(const char *path)
     if (!f) { fprintf(stderr, "cannot write %s\n", path); exit(2); }
     fwrite(b, 1, sizeof b, f);
     fclose(f);
+}
+
+static void write_pack(const char *path)
+{
+    write_pack_v(path, 1, 0);
 }
 
 static void test_tex_pack_key(void)
@@ -1613,7 +1624,7 @@ static void test_tex_pack_key(void)
     CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
     out = capture_end();
     CHECK(strstr(out, "[ENHANCE] textures.pack=ecfg_enhance/t.pack (1 entries: 1 ui, 0 font, 0 text, 0 world;"
-                      " v1; scale 2, text 2; 0 bc1, 0 bc3) textures.font=on textures.text=on"
+                      " v1; scale 2, text 2; 0 bc1, 0 bc3) textures.art=on textures.font=on textures.text=on"
                       " textures.world=on\n") != NULL);
     CHECK(nv2a_tex_pack_count() == 1 && nv2a_tex_pack_scale() == 2);
     CHECK(nv2a_host_opts()->pack_off == 0);
@@ -1633,6 +1644,14 @@ static void test_tex_pack_key(void)
     CHECK(strstr(out, "textures.font=on textures.text=off textures.world=on\n") != NULL);
     CHECK(nv2a_host_opts()->pack_off == NV2A_PACK_OFF_TEXT);
     recomp_env_set(RENV_TEXTURES_TEXT, NULL);
+    /* textures.art, the menu's "Pack art": its own bit. */
+    recomp_env_set(RENV_TEXTURES_ART, "off");
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "textures.art=off textures.font=on") != NULL);
+    CHECK(nv2a_host_opts()->pack_off == NV2A_PACK_OFF_ART);
+    recomp_env_set(RENV_TEXTURES_ART, NULL);
 
     /* A later "none" drops it. */
     recomp_env_set(RENV_TEXTURES_PACK, "none");
@@ -1647,7 +1666,7 @@ static void test_tex_pack_key(void)
     CHECK(xbox_enhance_init("ecfg_no_such_root", NULL) == 0);
     out = capture_end();
     snprintf(want, sizeof want, "[ENHANCE] textures.pack=%s (1 entries: 1 ui, 0 font, 0 text, 0 world;"
-             " v1; scale 2, text 2; 0 bc1, 0 bc3) textures.font=on textures.text=on"
+             " v1; scale 2, text 2; 0 bc1, 0 bc3) textures.art=on textures.font=on textures.text=on"
              " textures.world=on\n", abs);
     CHECK(strstr(out, want) != NULL);
     CHECK(nv2a_tex_pack_count() == 1);
@@ -1685,6 +1704,107 @@ static void test_tex_pack_key(void)
     remove_defaults();
     remove(abs);
 
+    enhance_reset_env();
+    recomp_env_set(RENV_TEXTURES_PACK, NULL);
+    recomp_env_set(RENV_CONFIG, NULL);
+    enhance_cfg_shutdown();
+    nv2a_tex_pack_unload();
+}
+
+/* A bare name, as the menu's pack picker writes it: the textures folder
+ * beside the config folder (<root>/textures here) first,
+ * then <exe dir>/textures, then the old rule (the exe dir itself). A file
+ * in those folders is only listed; nothing loads it but the key. */
+static void test_tex_pack_bare_name(void)
+{
+    char user[4200], exe[4200], ufile[4400], efile[4400], got[4400], want[4400];
+    const char *out;
+
+    enhance_reset_env();
+    recomp_env_set(RENV_TEXTURES_PACK, NULL);
+    MKDIR("ecfg_root");
+    MKDIR("ecfg_root/textures");
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    CHECK(xbox_enhance_pack_dirs(user, exe, sizeof user) == 0);
+    /* Beside <root>/config, made absolute: the Pack page shows it. */
+    CHECK(GETCWD(got, sizeof got) != NULL);
+    snprintf(want, sizeof want, "%s/ecfg_root/textures", got);
+    CHECK(!strcmp(user, want));
+    snprintf(want, sizeof want, "%s/textures", recomp_exe_dir());
+    CHECK(!strcmp(exe, want));
+    MKDIR(exe);
+    snprintf(ufile, sizeof ufile, "%s/u.pack", user);
+    snprintf(efile, sizeof efile, "%s/e.pack", exe);
+    write_pack(ufile);
+    write_pack(efile);
+
+    /* Present files, no key: stock, no pack. */
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] textures.pack=none\n") != NULL);
+    CHECK(nv2a_tex_pack_count() == 0);
+
+    CHECK(xbox_enhance_pack_path("none", got, sizeof got) == 0);
+    CHECK(xbox_enhance_pack_path("", got, sizeof got) == 0);
+    CHECK(xbox_enhance_pack_path("u.pack", got, sizeof got) == 1 && !strcmp(got, ufile));
+    CHECK(xbox_enhance_pack_path("e.pack", got, sizeof got) == 1 && !strcmp(got, efile));
+    /* The user root's copy wins over the exe dir's. */
+    snprintf(want, sizeof want, "%s/u.pack", exe);
+    write_pack(want);
+    CHECK(xbox_enhance_pack_path("u.pack", got, sizeof got) == 1 && !strcmp(got, ufile));
+    remove(want);
+    /* Found in neither: the old rule, beside the exe. */
+    snprintf(want, sizeof want, "%s/x.pack", recomp_exe_dir());
+    CHECK(xbox_enhance_pack_path("x.pack", got, sizeof got) == 1 && !strcmp(got, want));
+
+    recomp_env_set(RENV_TEXTURES_PACK, "e.pack");
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] textures.pack=e.pack (1 entries") != NULL);
+    CHECK(nv2a_tex_pack_count() == 1);
+
+    remove(ufile);
+    remove(efile);
+    enhance_reset_env();
+    recomp_env_set(RENV_TEXTURES_PACK, NULL);
+    enhance_cfg_shutdown();
+    nv2a_tex_pack_unload();
+}
+
+/* textures.detile stays its own switch (the user, 2026-11-08): a pack with
+ * marked world tiles does not turn it on; only the key does. */
+static void test_tex_pack_detile_default(void)
+{
+    char dir[4200], abs[4400];
+    const char *out;
+
+    enhance_reset_env();
+    MKDIR("ecfg_root");
+    snprintf(dir, sizeof dir, "%s/ecfg_enhance", recomp_exe_dir());
+    MKDIR(dir);
+    snprintf(abs, sizeof abs, "%s/marked.pack", dir);
+    write_pack_v(abs, 4, XRTP_KIND_WORLD | XRTP_FLAG_DETILE_HEX);
+    recomp_env_set(RENV_TEXTURES_PACK, abs);
+    recomp_env_set(RENV_CONFIG, "ecfg_root/ecfg_detile.toml");
+    write_file("ecfg_root/ecfg_detile.toml", "");
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(nv2a_tex_pack_count() == 1 && nv2a_tex_pack_version() == 4);
+    CHECK(nv2a_tex_pack_detile_count() == 1);
+    CHECK(nv2a_host_opts()->detile == 0);
+    CHECK(strstr(out, "textures.detile=on") == NULL);
+    /* The key turns it on. */
+    write_file("ecfg_root/ecfg_detile.toml", "[textures]\ndetile = \"on\"\n");
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(nv2a_host_opts()->detile == 1);
+    CHECK(strstr(out, "textures.detile=on (1 entries marked)") != NULL);
+
+    remove(abs);
     enhance_reset_env();
     recomp_env_set(RENV_TEXTURES_PACK, NULL);
     recomp_env_set(RENV_CONFIG, NULL);
@@ -2236,6 +2356,8 @@ int main(void)
     test_enhance_init();
     test_present_surface();
     test_tex_pack_key();
+    test_tex_pack_bare_name();
+    test_tex_pack_detile_default();
     test_input();
     test_input_pad();
     test_exe_dir();

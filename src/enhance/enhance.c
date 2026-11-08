@@ -7,6 +7,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <direct.h>
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
@@ -106,41 +113,150 @@ static void load_shader_params(void)
     }
 }
 
-/* textures.pack: a pack file, relative to the executable's directory,
- * where config.default.toml (which --hud-pack writes the key into) and the
- * pack ship, so a bundle names enhance/hud.pack; not relative to `root`,
- * the user data root. A bad or missing pack is said and the run stays
- * stock; nothing in the backends runs until nv2a_tex_pack_count() > 0. */
-static void load_tex_pack(const struct nv2a_host_opts *o)
+/* The user data root xbox_enhance_init was given: where the packs folder
+ * sits when there is no config folder to put it beside. */
+static char s_root[1024] = ".";
+
+/* The process's working folder, UTF-8 (wide on Windows, so a non-ASCII
+ * user name survives). */
+static int cwd_utf8(char *out, size_t n)
+{
+#ifdef _WIN32
+    wchar_t w[1024];
+    return _wgetcwd(w, 1024)
+        && WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)n, NULL, NULL) > 0;
+#else
+    return getcwd(out, n) != NULL;
+#endif
+}
+
+/* `d` made absolute against the working folder, for a row a player reads:
+ * "./textures" says nothing when the launcher's cwd is a logs folder. */
+static void abs_dir(const char *d, char *out, size_t n)
+{
+    char cwd[1024];
+    if (path_is_absolute(d) || !cwd_utf8(cwd, sizeof cwd)) {
+        snprintf(out, n, "%s", d);
+        return;
+    }
+    while (d[0] == '.' && (d[1] == '/' || d[1] == '\\'))
+        d += 2;
+    if (!*d || !strcmp(d, "."))
+        snprintf(out, n, "%s", cwd);
+    else
+        snprintf(out, n, "%s/%s", cwd, d);
+}
+
+/* The folder the config folder sits in: the parent of the user config's
+ * directory (RECOMP_CONFIG's, or <root>/config), so a pack goes in a
+ * textures folder beside config/ wherever the launcher keeps it (the
+ * macOS bundle and the SteamOS launcher run from a logs folder, a Windows
+ * shortcut from its Start-in). <root> when there is no user config. */
+static void user_base(char *out, size_t n)
+{
+    char d[1024];
+    size_t len;
+    if (!enhance_cfg_user_dir(d, sizeof d) || !d[0]) {
+        abs_dir(s_root, out, n);
+        return;
+    }
+    len = strlen(d);
+    while (len > 1 && (d[len - 1] == '/' || d[len - 1] == '\\'))
+        d[--len] = 0;
+    while (len > 0 && d[len - 1] != '/' && d[len - 1] != '\\')
+        len--;
+    if (!len)
+        snprintf(d, sizeof d, ".");
+    else
+        /* Keep a root's own slash: "/" or "C:\\". */
+        d[len > 1 && d[len - 2] != ':' ? len - 1 : len] = 0;
+    abs_dir(d, out, n);
+}
+
+static int file_present(const char *path)
+{
+    return nv2a_tex_pack_is_file(path);
+}
+
+int xbox_enhance_pack_dirs(char *user, char *exe, size_t n)
+{
+    const char *x = recomp_exe_dir();
+    char base[1024];
+    if (user && n) {
+        user_base(base, sizeof base);
+        snprintf(user, n, "%s/textures", base);
+    }
+    if (exe && n)
+        snprintf(exe, n, "%s/textures", x && *x ? x : ".");
+    return 0;
+}
+
+/* textures.pack's value to a file. A path (absolute, or relative with a
+ * folder in it) keeps the rule it always had: relative to the executable's
+ * directory, where config.default.toml (which --hud-pack writes the key
+ * into) and a bundle's enhance/hud.pack ship; never relative to the user
+ * data root. A bare file name, which the menu's picker writes, is looked
+ * for in the textures folder beside the config folder, then <exe
+ * dir>/textures, then beside the executable as before, so an older bare
+ * value still finds its file. */
+int xbox_enhance_pack_path(const char *v, char *out, size_t n)
 {
     const char *root = recomp_exe_dir();
+    char user[1024], exe[1024];
+
+    if (!v || !*v || !strcmp(v, "none"))
+        return 0;
+    if (path_is_absolute(v)) {
+        snprintf(out, n, "%s", v);
+        return 1;
+    }
+    if (!strchr(v, '/') && !strchr(v, '\\')) {
+        xbox_enhance_pack_dirs(user, exe, sizeof user);
+        snprintf(out, n, "%s/%s", user, v);
+        if (file_present(out))
+            return 1;
+        snprintf(out, n, "%s/%s", exe, v);
+        if (file_present(out))
+            return 1;
+    }
+    if (root && *root)
+        snprintf(out, n, "%s/%s", root, v);
+    else
+        snprintf(out, n, "%s", v);
+    return 1;
+}
+
+/* textures.pack (xbox_enhance_pack_path): a bad or missing pack is said
+ * and the run stays stock; nothing in the backends runs until
+ * nv2a_tex_pack_count() > 0. Only the key loads a pack: a file in a
+ * textures folder is listed by the menu, never loaded for being there. */
+static void load_tex_pack(const struct nv2a_host_opts *o)
+{
     const char *pack = enhance_cfg_string("textures.pack", "");
     char path[1024], err[128];
     int n;
 
-    if (!pack || !*pack || !strcmp(pack, "none")) {
+    /* Before the "none" return: a pack the menu loads later keeps it too. */
+    nv2a_tex_pack_set_keep(recomp_env_on(RENV_TEX_PACK_KEEP));
+    if (!xbox_enhance_pack_path(pack, path, sizeof path)) {
         nv2a_tex_pack_unload();     /* a re-init's "none" is true too */
         fprintf(stderr, LOGP "textures.pack=none\n");
         return;
     }
-    if (root && *root && !path_is_absolute(pack))
-        snprintf(path, sizeof path, "%s/%s", root, pack);
-    else
-        snprintf(path, sizeof path, "%s", pack);
-    nv2a_tex_pack_set_keep(recomp_env_on(RENV_TEX_PACK_KEEP));
     n = nv2a_tex_pack_load(path, err, sizeof err);
     if (n < 0)
         fprintf(stderr, LOGP "textures.pack=%s: %s (%s); no pack\n", pack, err, path);
     else
         fprintf(stderr, LOGP "textures.pack=%s (%d entries: %u ui, %u font, %u text, %u world;"
-                " v%u; scale %u, text %u; %u bc1, %u bc3) textures.font=%s textures.text=%s"
-                " textures.world=%s\n",
+                " v%u; scale %u, text %u; %u bc1, %u bc3) textures.art=%s textures.font=%s"
+                " textures.text=%s textures.world=%s\n",
                 pack, n, nv2a_tex_pack_kind_count(XRTP_KIND_ART),
                 nv2a_tex_pack_kind_count(XRTP_KIND_FONT),
                 nv2a_tex_pack_kind_count(XRTP_KIND_TEXT),
                 nv2a_tex_pack_kind_count(XRTP_KIND_WORLD), nv2a_tex_pack_version(),
                 nv2a_tex_pack_scale(), nv2a_tex_pack_text_scale(), nv2a_tex_pack_bc1_count(),
                 nv2a_tex_pack_bc3_count(),
+                (o->pack_off & NV2A_PACK_OFF_ART) ? "off" : "on",
                 (o->pack_off & NV2A_PACK_OFF_FONT) ? "off" : "on",
                 (o->pack_off & NV2A_PACK_OFF_TEXT) ? "off" : "on",
                 (o->pack_off & NV2A_PACK_OFF_WORLD) ? "off" : "on");
@@ -156,7 +272,7 @@ static const char *const s_pacing[] = { "spin", "sleep", NULL };
 static const char *const s_shader_lines[] = { "auto", "guest", "host", NULL };
 /* present.surface: "auto" (index 0) is resolved here, never stored. */
 static const char *const s_surface[] = { "auto", "window", "internal", NULL };
-/* textures.font, .text and .world: words, as the menu shows them. */
+/* textures.art, .font, .text and .world: words, as the menu shows them. */
 static const char *const s_onoff[] = { "off", "on", NULL };
 /* Indexes match enum nv2a_movie_mode. */
 static const char *const s_movie[] = { "black", "fit", "fill", NULL };
@@ -198,6 +314,7 @@ int xbox_enhance_init(const char *root, const char *title)
     int rc, pacing, surface, shader_lines;
     char surface_txt[48], overscan_txt[64] = "", hud_txt[96] = "", shader[512];
 
+    snprintf(s_root, sizeof s_root, "%s", root && *root ? root : ".");
     rc = enhance_cfg_init(root, title) < 0 ? -1 : 0;
     memset(&o, 0, sizeof o);
 
@@ -308,6 +425,8 @@ int xbox_enhance_init(const char *root, const char *title)
 
     /* The pack's kinds a player can turn off; read whether or not a pack
      * is configured, so the keys are never reported unused. */
+    if (!enhance_cfg_choice("textures.art", s_onoff, 1))
+        o.pack_off |= NV2A_PACK_OFF_ART;
     if (!enhance_cfg_choice("textures.font", s_onoff, 1))
         o.pack_off |= NV2A_PACK_OFF_FONT;
     if (!enhance_cfg_choice("textures.text", s_onoff, 1))
@@ -315,7 +434,9 @@ int xbox_enhance_init(const char *root, const char *title)
     if (!enhance_cfg_choice("textures.world", s_onoff, 1))
         o.pack_off |= NV2A_PACK_OFF_WORLD;
     /* Hex tiling of the entries the pack marks (nv2a_hex_tile.h): off is
-     * stock. Named in the pack line only when on. */
+     * stock, and a pack that marks entries does not turn it on: it is the
+     * player's own switch (the user, 2026-11-08). Named in the pack line
+     * only when on. */
     o.detile = enhance_cfg_choice("textures.detile", s_onoff, 0);
 
     nv2a_host_opts_set(&o);

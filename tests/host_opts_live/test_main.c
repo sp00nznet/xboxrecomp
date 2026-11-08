@@ -124,6 +124,83 @@ static void test_request(void)
     nv2a_tex_pack_unload();
 }
 
+struct pack_req { const char *path; };
+
+static void *pack_thread(void *arg)
+{
+    nv2a_host_pack_request(((const struct pack_req *)arg)->path);
+    return NULL;
+}
+
+/* The menu's pack picker: the file is asked for on the menu's thread and
+ * loaded at the flip, the gen bumped so every texture uploads again; the
+ * kind toggles (pack_off) survive the swap; a refused file leaves no
+ * pack; NULL drops it. The outcome reads back through the status. */
+static void test_pack_file(void)
+{
+    struct nv2a_host_opts o;
+    struct pack_req pr = { "live.pack" };
+    pthread_t t;
+    char said[160];
+    uint32_t pg;
+    unsigned seq, m;
+
+    write_pack("live.pack");
+    nv2a_tex_pack_unload();
+    o = *nv2a_host_opts();
+    o.pack_off = NV2A_PACK_OFF_ART;
+    nv2a_host_opts_request(&o, NV2A_OPT_PACK);
+    nv2a_host_opts_apply();
+    seq = nv2a_host_pack_status(NULL, 0);
+    pg = nv2a_tex_pack_gen();
+
+    /* A pack file in the plain request's mask is not a request. */
+    nv2a_host_opts_request(&o, NV2A_OPT_PACK_FILE);
+    CHECK(nv2a_host_opts_apply() == 0 && nv2a_tex_pack_count() == 0, "opts mask loaded a pack");
+
+    if (pthread_create(&t, NULL, pack_thread, &pr) != 0) {
+        fails++;
+        printf("FAIL pthread_create\n");
+        return;
+    }
+    pthread_join(t, NULL);
+    CHECK(nv2a_tex_pack_count() == 0, "loaded before the flip");
+    CHECK(nv2a_host_pack_status(NULL, 0) == seq, "status moved before the flip");
+    m = nv2a_host_opts_apply();
+    CHECK(m == NV2A_OPT_PACK_FILE, "mask %#x", m);
+    CHECK(nv2a_tex_pack_count() == 1, "count %u", nv2a_tex_pack_count());
+    CHECK(nv2a_tex_pack_gen() != pg, "load kept the pack gen");
+    CHECK(nv2a_host_pack_status(said, sizeof said) == seq + 1 && !strcmp(said, "1 entries"),
+          "status '%s'", said);
+    CHECK(nv2a_host_opts()->pack_off == NV2A_PACK_OFF_ART, "pack_off %#x", nv2a_host_opts()->pack_off);
+    CHECK(nv2a_tex_pack_find(0x55, 1, 1) != NULL, "text entry after the load");
+    CHECK(nv2a_host_opts_apply() == 0, "second apply");
+
+    /* Refused: no pack, the reason in the status. */
+    pg = nv2a_tex_pack_gen();
+    nv2a_host_pack_request("no_such.pack");
+    nv2a_host_opts_apply();
+    CHECK(nv2a_tex_pack_count() == 0 && nv2a_tex_pack_gen() != pg, "refused file kept a pack");
+    CHECK(nv2a_host_pack_status(said, sizeof said) == seq + 2 && !strcmp(said, "cannot open"),
+          "status '%s'", said);
+
+    /* Loaded again, then none. */
+    nv2a_host_pack_request("live.pack");
+    nv2a_host_opts_apply();
+    CHECK(nv2a_tex_pack_count() == 1, "reload");
+    pg = nv2a_tex_pack_gen();
+    nv2a_host_pack_request(NULL);
+    CHECK(nv2a_host_opts_apply() == NV2A_OPT_PACK_FILE, "none mask");
+    CHECK(nv2a_tex_pack_count() == 0 && nv2a_tex_pack_gen() != pg, "none kept the pack");
+    CHECK(nv2a_host_pack_status(said, sizeof said) == seq + 4 && !strcmp(said, "none"),
+          "status '%s'", said);
+
+    o.pack_off = 0;
+    nv2a_host_opts_request(&o, NV2A_OPT_PACK);
+    nv2a_host_opts_apply();
+    remove("live.pack");
+}
+
 static void test_merge(void)
 {
     struct nv2a_host_opts o;
@@ -321,6 +398,7 @@ static void test_r1(void)
 int main(void)
 {
     test_request();
+    test_pack_file();
     test_merge();
     test_race();
     test_r1();

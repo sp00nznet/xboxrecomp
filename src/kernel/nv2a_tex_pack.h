@@ -35,8 +35,9 @@
  * Held payloads stay within NV2A_TEX_PACK_RESIDENT_MAX, the least recently
  * used freed past it. Lives in the kernel library like nv2a_host_opts, so the backends
  * never link the enhancements layer: without a pack nv2a_tex_pack_count()
- * is 0 and nothing else runs. Not thread-safe: load at startup, use from
- * the thread that uploads textures.
+ * is 0 and nothing else runs. Not thread-safe: load at startup or at a
+ * flip on the walker (nv2a_host_opts_apply), use from the thread that
+ * uploads textures.
  */
 #ifndef NV2A_TEX_PACK_H
 #define NV2A_TEX_PACK_H
@@ -95,9 +96,14 @@ struct nv2a_tex_pack_entry {
 /* Load `path`: validates the header, the index bounds against the file
  * size and the sort order, and keeps the index. Returns the entry count,
  * or -1 with the reason in `err` (the file is then not loaded). A second
- * load replaces the first. */
+ * load replaces the first. Load and unload bump nv2a_tex_pack_gen(), so a
+ * pack changed at a flip on the walker thread (nv2a_host_pack_request,
+ * the menu's picker) re-uploads every cached texture. */
 int nv2a_tex_pack_load(const char *path, char *err, size_t errlen);
 void nv2a_tex_pack_unload(void);
+/* 1 if `path` (UTF-8, as the loader opens it) is a regular file: a folder
+ * or a dangling link named *.pack is not a pack. */
+int nv2a_tex_pack_is_file(const char *path);
 
 unsigned nv2a_tex_pack_count(void);
 unsigned nv2a_tex_pack_scale(void);
@@ -122,7 +128,8 @@ size_t nv2a_tex_pack_bc1_bytes(uint32_t w, uint32_t h, uint32_t levels);
  * returns NULL for it, and the guest texture is uploaded as without a
  * pack. Called at a flip (nv2a_host_opts_apply); a change of what matches
  * bumps nv2a_tex_pack_gen(), and a texture uploaded under another
- * generation is uploaded again. Unload is not offered at run time. */
+ * generation is uploaded again. A load or unload at run time goes through
+ * nv2a_host_pack_request, applied at a flip like these. */
 void nv2a_tex_pack_set_enabled(int on);
 void nv2a_tex_pack_set_kind_enabled(uint32_t kind, int on);
 uint32_t nv2a_tex_pack_gen(void);

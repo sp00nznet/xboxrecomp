@@ -98,7 +98,7 @@ static const char *s_page_intro[PAGE_COUNT];
 static const char *const k_page_intro[PAGE_COUNT] = {
     "How the game is drawn and shown: resolution, filtering, aspect and pacing.",
     "Post-processing shaders over the picture, saved as profiles.",
-    "The texture pack: replacement art, font and text.",
+    "A pack made from your game: world textures, art, font and text; a blend hides tile repeats.",
     "Options this game adds.",
     "Mods built into this game: turn them on or off and set their options.",
     "Live numbers: frame rate, frame time and the draw counts.",
@@ -122,7 +122,7 @@ static const char *const k_onoff[] = { "off", "on", NULL };
 /* input.mouse_capture in the menu's order; the enum's is focus, click, never. */
 static const char *const k_capture[] = { "click", "focus", "never", NULL };
 
-/* pack_off as the menu last asked for it: the pack toggle and the two kind
+/* pack_off as the menu last asked for it: the pack toggle and the kind
  * toggles share the field, and a request only lands at the next flip, so
  * reading nv2a_host_opts back between two changes would lose the first. */
 static unsigned s_pack_off;
@@ -192,6 +192,24 @@ static void set_pack_bit(const struct enhance_item *it, const char *v)
     else
         s_pack_off |= bit;
     req(e_pack, v, NV2A_OPT_PACK);
+}
+
+/* textures.pack, the picker: the file goes to the walker, which loads it
+ * at the next flip (nv2a_host_pack_request) and every texture uploads
+ * again; "none" drops the pack. Save keeps the choice for the next start. */
+static void status(const char *fmt, ...);
+static const char *pack_full(const char *v);
+static void set_pack_file(const struct enhance_item *it, const char *v)
+{
+    char path[1024];
+    (void)it;
+    if (xbox_enhance_pack_path(pack_full(v), path, sizeof path)) {
+        nv2a_host_pack_request(path);
+        status("Loading %s", v);
+    } else {
+        nv2a_host_pack_request(NULL);
+        status("No texture pack");
+    }
 }
 
 /* overlay.ui_scale and ui_fit: live, the atlas baked again between
@@ -504,11 +522,17 @@ static const struct enhance_item k_items[] = {
       .choices = k_ui_fit, .set = set_ui_fit, .def = "display",
       .help = "What the overlay's size follows: the display (larger on a handheld) or the "
               "picture's height alone" },
-    /* textures.pack names the file: the toggle is this session's only. */
-    { ITEM("textures.pack", "Texture pack", "Pack", ENHANCE_ITEM_TOGGLE), .set = set_pack_bit,
-      .get = get_pack_bit, .live = ENHANCE_LIVE_FLUSH, .flags = ENHANCE_ITEM_NOSAVE,
-      .def = "true", .user = (void *)(uintptr_t)NV2A_PACK_OFF_ALL,
-      .help = "Uses the replacement textures for this session" },
+    /* textures.pack (s_pack_pick) names the file; this toggle is the
+     * session's only, a quick look at the game without it. Its key is
+     * never saved nor read. */
+    { ITEM("textures.session", "Use the pack", "Pack", ENHANCE_ITEM_TOGGLE),
+      .set = set_pack_bit, .get = get_pack_bit, .live = ENHANCE_LIVE_FLUSH,
+      .flags = ENHANCE_ITEM_NOSAVE, .def = "true", .user = (void *)(uintptr_t)NV2A_PACK_OFF_ALL,
+      .help = "Turns the pack off and on for this session, to compare with the game's own" },
+    { ITEM("textures.art", "Pack art", "Pack", ENHANCE_ITEM_CHOICE), .choices = k_onoff,
+      .set = set_pack_bit, .get = get_pack_bit, .live = ENHANCE_LIVE_FLUSH, .def = "on",
+      .user = (void *)(uintptr_t)NV2A_PACK_OFF_ART,
+      .help = "Uses the pack's HUD pieces and other images in place of the game's" },
     { ITEM("textures.font", "Pack font", "Pack", ENHANCE_ITEM_CHOICE), .choices = k_onoff,
       .set = set_pack_bit, .get = get_pack_bit, .live = ENHANCE_LIVE_FLUSH, .def = "on",
       .user = (void *)(uintptr_t)NV2A_PACK_OFF_FONT,
@@ -549,6 +573,106 @@ static const struct enhance_item k_items[] = {
       .help = "The strip over the game while a record or playback runs" },
 };
 #define N_ITEMS ((int)(sizeof k_items / sizeof k_items[0]))
+
+/* The pack picker: "none", then the .pack files in <root>/textures and
+ * <exe dir>/textures by name (a name in both is the user root's, as
+ * xbox_enhance_pack_path finds it), then the value in force when it is
+ * none of those (a path from the defaults file), so it stays reachable.
+ * Listed at each open: a pack copied in while the game runs shows next
+ * time. A file is only ever listed here; the key alone loads one. */
+#define PACKS_MAX 32
+static char s_pack_name[PACKS_MAX + 2][VAL_MAX];
+static const char *s_pack_choice[PACKS_MAX + 4];
+static struct enhance_item s_pack_pick = {
+    ITEM("textures.pack", "Pack", "Pack", ENHANCE_ITEM_CHOICE), .choices = s_pack_choice,
+    .set = set_pack_file, .live = ENHANCE_LIVE_FLUSH, .def = "none",
+    .help = "The texture pack in use: the .pack files in the textures folder"
+};
+
+struct pack_list { int n, more; const char *dir; };
+static int s_pack_more;         /* .pack files past PACKS_MAX, not listed */
+
+static int pack_has(int n, const char *name)
+{
+    for (int i = 0; i < n; i++)
+        if (!strcmp(s_pack_name[i], name))
+            return 1;
+    return 0;
+}
+
+/* A value the slots cut at VAL_MAX (a long path in the config) back to the
+ * whole one: picking it again must load the file the config names, not a
+ * cut path. */
+static const char *pack_full(const char *v)
+{
+    const char *c = enhance_cfg_string("textures.pack", "none");
+    size_t l = strlen(v);
+    if (l == VAL_MAX - 1 && strlen(c) > l && !strncmp(c, v, l))
+        return c;
+    return v;
+}
+
+static int pack_ext(const char *x)
+{
+    for (int i = 0; i < 5; i++)
+        if (tolower((unsigned char)x[i]) != ".pack"[i])
+            return 0;
+    return 1;
+}
+
+static int pack_emit(void *ctx, const struct fb_entry *e)
+{
+    struct pack_list *l = (struct pack_list *)ctx;
+    size_t len = strlen(e->name);
+    char path[1024];
+    /* .PACK too: a Windows copy may come with any case. A folder, or a
+     * link to nothing, named *.pack is no pack. */
+    if (e->is_dir || e->name[0] == '.' || len < 6 || len >= VAL_MAX
+        || !pack_ext(e->name + len - 5) || pack_has(l->n, e->name))
+        return 0;
+    snprintf(path, sizeof path, "%s/%s", l->dir, e->name);
+    if (!e->link_ok || !nv2a_tex_pack_is_file(path))
+        return 0;
+    if (l->n >= PACKS_MAX) {
+        l->more++;
+        return 0;
+    }
+    snprintf(s_pack_name[l->n++], VAL_MAX, "%s", e->name);
+    return 0;
+}
+
+static int pack_cmp(const void *a, const void *b)
+{
+    return strcmp((const char *)a, (const char *)b);
+}
+
+static void pack_choices(const char *cur)
+{
+    char user[1024], exe[1024];
+    struct pack_list l = { 0 };
+    const char *keep[2];
+    int k = 0;
+    xbox_enhance_pack_dirs(user, exe, sizeof user);
+    l.dir = user;
+    fb_list_host(user, pack_emit, &l, NULL);
+    l.dir = exe;
+    fb_list_host(exe, pack_emit, &l, NULL);
+    s_pack_more = l.more;
+    qsort(s_pack_name, (size_t)l.n, sizeof s_pack_name[0], pack_cmp);
+    s_pack_choice[k++] = "none";
+    for (int i = 0; i < l.n; i++)
+        s_pack_choice[k++] = s_pack_name[i];
+    keep[0] = enhance_cfg_string("textures.pack", "none");
+    keep[1] = cur;
+    for (int j = 0; j < 2; j++) {
+        const char *v = keep[j];
+        if (!v || !*v || !strcmp(v, "none") || pack_has(l.n, v))
+            continue;
+        snprintf(s_pack_name[l.n], VAL_MAX, "%s", v);
+        s_pack_choice[k++] = s_pack_name[l.n++];
+    }
+    s_pack_choice[k] = NULL;
+}
 
 /* ---- slots ---------------------------------------------------------------- */
 
@@ -882,6 +1006,8 @@ static void build_slots(void)
     ao_items();
     for (int i = 0; i < (int)(sizeof s_ao / sizeof s_ao[0]); i++)
         slot_add(&s_ao[i], PAGE_RENDER, -1);
+    pack_choices(NULL);
+    slot_add(&s_pack_pick, PAGE_PACK, -1);
     if (xbox_LanguagesShipped()[0]) {
         language_item();
         slot_add(&s_language, PAGE_GAME, -1);
@@ -1434,6 +1560,17 @@ static void info(const char *label, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(r->value, sizeof r->value, fmt, ap);
     va_end(ap);
+}
+
+/* A folder a player reads: past a row's width its end shows, which names
+ * the place, not its start. */
+static void info_path(const char *label, const char *path)
+{
+    size_t len = strlen(path);
+    if (len < VAL_MAX)
+        info(label, "%s", path);
+    else
+        info(label, "...%s", path + len - (VAL_MAX - 4));
 }
 
 static void header(const char *label)
@@ -2618,12 +2755,38 @@ static void build_rows(void)
         break;
     case PAGE_PACK: {
         unsigned n = nv2a_tex_pack_count();
+        int pi = slot_find("textures.pack");
+        const char *cur = pi >= 0 ? s_slot[pi].cur : "none";
+        char said[160];
         if (!strcmp(backend_name(), "cpu"))
             info("CPU path", "pack ignored");
+        slot_row("textures.pack");
+        if (s_pack_more)
+            info("More packs", "%d not shown", s_pack_more);
         if (!n) {
-            info("No pack loaded", "textures.pack");
+            char user[1024], exe[1024];
+            if (strcmp(cur, "none") && nv2a_host_pack_status(said, sizeof said)
+                && strcmp(said, "none"))
+                info("Not loaded", "%s", said);
+            else if (strcmp(cur, "none"))
+                info("Not loaded", "see the log");
+            /* Where the picker looks, so a player knows where a pack goes. */
+            xbox_enhance_pack_dirs(user, exe, sizeof user);
+            info_path("Packs folder", user);
+            if (strcmp(user, exe))
+                info_path("Also from", exe);
         } else {
-            slot_row("textures.pack");
+            char path[1024];
+            const char *base = cur;
+            if (xbox_enhance_pack_path(pack_full(cur), path, sizeof path)) {
+                const char *a = strrchr(path, '/'), *b = strrchr(path, '\\');
+                base = a > b ? a + 1 : b ? b + 1 : path;
+            }
+            slot_row("textures.session");
+            if (nv2a_tex_pack_kind_count(XRTP_KIND_ART))
+                slot_row("textures.art");
+            else
+                info("Pack art", "none in this pack");
             if (nv2a_tex_pack_kind_count(XRTP_KIND_FONT))
                 slot_row("textures.font");
             else
@@ -2638,10 +2801,16 @@ static void build_rows(void)
                 info("Pack world", "none in this pack");
             if (nv2a_tex_pack_detile_count())
                 slot_row("textures.detile");
+            else
+                info("Hide tile repeats", "no tiles marked in this pack");
+            info("File", "%s", base);
+            info("Version", "%u", nv2a_tex_pack_version());
             info("Entries", "%u (%u art, %u font, %u text, %u world)", n,
                  nv2a_tex_pack_kind_count(XRTP_KIND_ART), nv2a_tex_pack_kind_count(XRTP_KIND_FONT),
                  nv2a_tex_pack_kind_count(XRTP_KIND_TEXT),
                  nv2a_tex_pack_kind_count(XRTP_KIND_WORLD));
+            if (nv2a_tex_pack_detile_count())
+                info("Marked tiles", "%u", nv2a_tex_pack_detile_count());
             info("Scale", "%ux, text %ux", nv2a_tex_pack_scale(), nv2a_tex_pack_text_scale());
             info("Block entries", "%u BC1, %u BC3", nv2a_tex_pack_bc1_count(),
                  nv2a_tex_pack_bc3_count());
@@ -5958,6 +6127,10 @@ int enhance_menu_open(uint64_t now_ms)
     s_now = now_ms;
     if (!s_built)
         build_slots();
+    else {
+        int i = slot_find("textures.pack");
+        pack_choices(i >= 0 ? s_slot[i].cur : NULL);
+    }
     shaders_check();
     /* What changed elsewhere since (the stats action, a mod's toggle)
      * shows as it is now; a change of the menu's own waits for Save. */
@@ -9220,4 +9393,7 @@ void enhance_menu_reset_for_test(void)
     s_built = 0;
     s_ntitle = 0;
     s_pack_off = 0;
+    memset(s_pack_name, 0, sizeof s_pack_name);
+    memset(s_pack_choice, 0, sizeof s_pack_choice);
+    s_pack_more = 0;
 }

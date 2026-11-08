@@ -89,6 +89,8 @@
 #include <sys/utime.h>
 #define MKDIR(p) _mkdir(p)
 #define rmdir _rmdir
+#define getcwd _getcwd
+#define chdir _chdir
 #define DUP _dup
 #define DUP2 _dup2
 #define CLOSE _close
@@ -439,6 +441,25 @@ static const char *selected_label(void)
     static char l[96];
     enhance_menu_row(enhance_menu_selected(), l, sizeof l, NULL, 0, NULL);
     return l;
+}
+
+/* A path row's value is `want`, or its end past the row's width. */
+static int shown_path(const char *v, const char *want)
+{
+    size_t len = strlen(want);
+    if (len < 96)
+        return !strcmp(v, want);
+    return !strncmp(v, "...", 3) && !strcmp(v + 3, want + len - 92);
+}
+
+/* `p` is <cwd>/<tail>, the working folder made absolute. */
+static int is_cwd_path(const char *p, const char *tail)
+{
+    char cwd[1024], want[1200];
+    if (!getcwd(cwd, sizeof cwd))
+        return 0;
+    snprintf(want, sizeof want, "%s/%s", cwd, tail);
+    return shown_path(p, want);
 }
 
 static void open_menu(void)
@@ -1189,7 +1210,10 @@ static void test_snapshot(void)
     nv2a_tex_pack_snapshot();
     CHECK(nv2a_tex_pack_misses_snapshot(m, 4) == 2);
     CHECK(m[0].hash == 0x2222 && m[0].count == 2 && m[1].hash == 0x1111);
-    CHECK(row_value("No pack loaded") != NULL);
+    CHECK(row_value("Pack") && !strcmp(row_value("Pack"), "none"));
+    /* Absolute: a launcher's cwd (a logs folder) says nothing to a player. */
+    CHECK(row_value("Packs folder") && is_cwd_path(row_value("Packs folder"), "textures"));
+    CHECK(row_value("Use the pack") == NULL);
     CHECK(row_value("Misses") && !strcmp(row_value("Misses"), "3"));
     CHECK(row_value("0000000000002222") != NULL
           && strstr(row_value("0000000000002222"), "128x32") != NULL);
@@ -1198,6 +1222,195 @@ static void test_snapshot(void)
     nv2a_tex_pack_miss(0x3333, 8, 8, 0x0C, 1);
     nv2a_tex_pack_snapshot();
     CHECK(nv2a_tex_pack_misses_snapshot(m, 4) == 2);
+}
+
+/* ---- 7b. the pack picker ------------------------------------------------- */
+
+/* A one-entry v1 pack, an art entry: a 1x1 texel at scale 2. */
+static void write_menu_pack(const char *path)
+{
+    unsigned char b[68];
+    FILE *f;
+    memset(b, 0, sizeof b);
+    memcpy(b, NV2A_TEX_PACK_MAGIC, 4);
+    b[4] = 1;                           /* version */
+    b[8] = 1;                           /* count */
+    b[12] = 2;                          /* scale */
+    b[16] = 32;                         /* index offset */
+    b[32] = 0x5A;                       /* hash */
+    b[40] = 1; b[44] = 1; b[48] = 1;    /* 1x1, one level */
+    b[56] = 64;                         /* texel offset */
+    b[64] = 0xFF; b[67] = 0xFF;
+    f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "cannot write %s\n", path); exit(2); }
+    fwrite(b, 1, sizeof b, f);
+    fclose(f);
+}
+
+static void shot(const char *name, int w, int h);
+
+/* The picker lists the .pack files of <root>/textures, and only the
+ * choice loads one: at the next flip, on the walker. "Pack art" is the
+ * art kind's own bit. "none" drops the pack. */
+static void test_pack_picker(void)
+{
+    unsigned gen;
+    MKDIR("textures");
+    write_menu_pack("textures/b.pack");
+    write_menu_pack("textures/a.pack");
+    write_file("textures/notes.txt", "not a pack");
+    start_with(ARMED, NULL);
+    CHECK(nv2a_tex_pack_count() == 0);              /* present, never loaded */
+    open_menu();
+    CHECK(enhance_menu_set_page("Pack"));
+    CHECK(row_value("Pack") && !strcmp(row_value("Pack"), "none"));
+    CHECK(enhance_menu_select_row("Pack"));
+    gen = nv2a_tex_pack_gen();
+    tap(0x27);
+    CHECK(!strcmp(row_value("Pack"), "a.pack"));
+    flip();
+    CHECK(nv2a_tex_pack_count() == 1);
+    CHECK(nv2a_tex_pack_gen() != gen);              /* every texture uploads again */
+    CHECK(enhance_menu_unsaved() == 1);
+    CHECK(row_value("File") && !strcmp(row_value("File"), "a.pack"));
+    CHECK(row_value("Version") && !strcmp(row_value("Version"), "1"));
+    CHECK(row_value("Use the pack") && !strcmp(row_value("Use the pack"), "true"));
+    CHECK(row_value("Pack art") && !strcmp(row_value("Pack art"), "on"));
+    CHECK(row_value("Hide tile repeats")
+          && !strcmp(row_value("Hide tile repeats"), "no tiles marked in this pack"));
+    if (s_ref_out)
+        shot("1080p-compact-pack", 1920, 1080);
+    /* The keys a player uses after a pick: the rows the load added are
+     * reachable from the picker. */
+    tap(0x28);
+    CHECK(!strcmp(selected_label(), "Use the pack"));
+    tap(0x28);
+    CHECK(!strcmp(selected_label(), "Pack art"));
+    CHECK(enhance_menu_select_row("Pack"));
+    /* The next choice, then a wrap back to none past the end. */
+    tap(0x27);
+    flip();
+    CHECK(!strcmp(row_value("Pack"), "b.pack") && nv2a_tex_pack_count() == 1);
+    CHECK(!strcmp(row_value("File"), "b.pack"));
+    tap(0x25);
+    flip();
+    CHECK(!strcmp(row_value("Pack"), "a.pack"));
+
+    /* Pack art off: the bit, live at the flip; on again. */
+    CHECK(enhance_menu_select_row("Pack art"));
+    tap(0x27);
+    flip();
+    CHECK(!strcmp(row_value("Pack art"), "off"));
+    CHECK(nv2a_host_opts()->pack_off & NV2A_PACK_OFF_ART);
+    tap(0x27);
+    flip();
+    CHECK(!(nv2a_host_opts()->pack_off & NV2A_PACK_OFF_ART));
+
+    /* none: dropped at the flip. */
+    CHECK(enhance_menu_select_row("Pack"));
+    tap(0x25);
+    flip();
+    CHECK(!strcmp(row_value("Pack"), "none"));
+    CHECK(nv2a_tex_pack_count() == 0);
+    CHECK(row_value("File") == NULL);
+    open_menu();
+    remove("textures/a.pack");
+    remove("textures/b.pack");
+    remove("textures/notes.txt");
+    start_with(ARMED, NULL);
+    nv2a_tex_pack_unload();
+}
+
+/* The packs folder sits beside the config folder, not in the cwd: the
+ * macOS bundle and the SteamOS launcher run from a logs folder, so a
+ * RECOMP_CONFIG elsewhere and another cwd must still find the pack. */
+static void test_pack_beside_config(void)
+{
+    char home[1024], cfg[1200], want[1200];
+    CHECK(getcwd(home, sizeof home) != NULL);
+    MKDIR("pk_user");
+    MKDIR("pk_user/config");
+    MKDIR("pk_user/textures");
+    MKDIR("pk_user/textures/dir.pack");     /* a folder is no pack */
+    MKDIR("pk_run");
+    write_menu_pack("pk_user/textures/c.pack");
+    write_menu_pack("pk_user/textures/D.PACK");
+    snprintf(cfg, sizeof cfg, "%s/pk_user/config/config.toml", home);
+    write_file(cfg, ARMED);
+    set_env("RECOMP_CONFIG", cfg);
+    CHECK(chdir("pk_run") == 0);
+    start_with(NULL, NULL);                         /* the menu armed by cfg */
+    open_menu();
+    CHECK(enhance_menu_set_page("Pack"));
+    snprintf(want, sizeof want, "%s/pk_user/textures", home);
+    CHECK(row_value("Packs folder") && shown_path(row_value("Packs folder"), want));
+    CHECK(enhance_menu_select_row("Pack"));
+    tap(0x27);
+    CHECK(!strcmp(row_value("Pack"), "D.PACK"));    /* any case of .pack */
+    tap(0x27);
+    CHECK(!strcmp(row_value("Pack"), "c.pack"));
+    flip();
+    CHECK(nv2a_tex_pack_count() == 1);
+    tap(0x27);
+    CHECK(!strcmp(row_value("Pack"), "none"));      /* dir.pack not listed */
+    flip();
+    CHECK(nv2a_tex_pack_count() == 0);
+    open_menu();
+    CHECK(chdir(home) == 0);
+    set_env("RECOMP_CONFIG", NULL);
+    remove("pk_user/textures/c.pack");
+    remove("pk_user/textures/D.PACK");
+    remove("pk_user/config/config.toml");
+    rmdir("pk_user/textures/dir.pack");
+    rmdir("pk_user/textures");
+    rmdir("pk_user/config");
+    rmdir("pk_user");
+    remove("pk_run/menu_stderr.txt");               /* start_with's capture */
+    rmdir("pk_run");
+    start_with(ARMED, NULL);
+    nv2a_tex_pack_unload();
+}
+
+/* A configured path longer than a slot holds: picking another pack and
+ * then the configured one again loads the whole path, not a cut one. */
+static void test_pack_long_path(void)
+{
+    char home[1024], dir[200], path[260], toml[1600];
+    int i;
+    CHECK(getcwd(home, sizeof home) != NULL);
+    for (i = 0; home[i]; i++)                       /* a TOML string: no escapes */
+        if (home[i] == '\\')
+            home[i] = '/';
+    snprintf(dir, sizeof dir, "pk_long_");
+    for (i = 0; i < 12; i++)
+        strncat(dir, "abcdefghij", sizeof dir - strlen(dir) - 1);
+    MKDIR(dir);
+    MKDIR("textures");
+    snprintf(path, sizeof path, "%s/long.pack", dir);
+    write_menu_pack(path);
+    write_menu_pack("textures/a.pack");
+    snprintf(toml, sizeof toml, ARMED "[textures]\npack = \"%s/%s\"\n", home, path);
+    CHECK(strlen(home) + 1 + strlen(path) >= 96);
+    start_with(toml, NULL);
+    CHECK(nv2a_tex_pack_count() == 1);
+    open_menu();
+    CHECK(enhance_menu_set_page("Pack"));
+    CHECK(row_value("File") && !strcmp(row_value("File"), "long.pack"));
+    CHECK(enhance_menu_select_row("Pack"));
+    tap(0x25);                                      /* back to a.pack */
+    flip();
+    CHECK(!strcmp(row_value("File"), "a.pack"));
+    tap(0x27);                                      /* the configured one */
+    flip();
+    CHECK(nv2a_tex_pack_count() == 1);
+    CHECK(row_value("File") && !strcmp(row_value("File"), "long.pack"));
+    CHECK(enhance_menu_unsaved() == 0);
+    open_menu();
+    remove(path);
+    remove("textures/a.pack");
+    rmdir(dir);
+    start_with(ARMED, NULL);
+    nv2a_tex_pack_unload();
 }
 
 /* ---- 8. each page's draw list -------------------------------------------- */
@@ -2720,11 +2933,15 @@ static void test_pages(void)
      * Recordings, Files. Saves with no title yet: its rows hold no dates;
      * Recordings with no folder yet: no file rows. */
     static const uint32_t k_sum[11] = {
-        0x6FDBE087u, 0xC58D4BA2u, 0xD06D4311u, 0x775B0691u, 0x109DEB36u,
+        0x6FDBE087u, 0xC58D4BA2u, 0x601BABF4u, 0x775B0691u, 0x109DEB36u,
         0x6930FCBFu, 0xC1417056u, 0xD09AF0E9u, 0xE13F4B8Bu, 0x5548E3AAu, 0xE2E461FFu };
-    /* Files shows Open exports folder only off Game Mode. */
+    /* Files shows Open exports folder only off Game Mode. Pack with a pack
+     * loaded: with none it names the packs folder, an absolute path that
+     * moves with the build folder. */
     set_env("RECOMP_HOST_GAMESCOPE", NULL);
-    start_with(ARMED, k_mods);
+    MKDIR("textures");
+    write_menu_pack("textures/sum.pack");
+    start_with(ARMED "[textures]\npack = \"sum.pack\"\n", k_mods);
     open_menu();
     CHECK(enhance_menu_is_open());
     for (int p = 0; p < enhance_menu_page_count(); p++) {
@@ -2751,6 +2968,9 @@ static void test_pages(void)
     }
     open_menu();
     CHECK(!(nv2a_overlay_visible() & (1u << NV2A_OVL_MENU)));
+    remove("textures/sum.pack");
+    start_with(ARMED, NULL);
+    nv2a_tex_pack_unload();
 }
 
 /* The library in force for every other test: the stand-in, loaded once,
@@ -6987,6 +7207,11 @@ int main(int argc, char **argv)
     test_padrec_setups();
     test_padrec_requires_mod();
     test_shots();
+    /* Last: its requests move the host options gen the Debug page's pinned
+     * sum draws. */
+    test_pack_picker();
+    test_pack_beside_config();
+    test_pack_long_path();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();
     enhance_actions_reset();
