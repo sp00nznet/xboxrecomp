@@ -510,6 +510,62 @@ void nv2a_present_chain_host(const char *name)
     unlock();
 }
 
+/* The paths the loader tries, in order: present.shader_lib, else the
+ * defaults. */
+static int lib_paths(char paths[][1024], int max)
+{
+    char over[512];
+    lock();
+    snprintf(over, sizeof over, "%s", s_lib_path);
+    unlock();
+    if (!over[0])
+        return lib_candidates(paths, max);
+    if (path_is_absolute(over))
+        snprintf(paths[0], 1024, "%s", over);
+    else
+        snprintf(paths[0], 1024, "%s/%s", recomp_exe_dir(), over);
+    return 1;
+}
+
+/* 1 when the library loaded, or has not been tried and one of its files is
+ * there; 0 with the reason once a load failed or no file exists. It never
+ * loads: the menu asks from the title's pad thread, and under Proton the
+ * pad went dead once librashader (or what it imports) loaded at the first
+ * menu open. The library loads on the present thread, once a
+ * shader is chosen. */
+static int lib_present(char *why, size_t cap)
+{
+    char paths[2][1024];
+    int state, n, i;
+    while (atomic_flag_test_and_set_explicit(&s_load_lock, memory_order_acquire))
+        ;
+    state = s_lib_state;
+    if (state < 0)
+        snprintf(why, cap, "%s", s_lib_why);
+    atomic_flag_clear_explicit(&s_load_lock, memory_order_release);
+    if (state)
+        return state > 0;
+    n = lib_paths(paths, 2);
+    for (i = 0; i < n; i++)
+        if (file_exists(paths[i]))
+            return 1;
+    snprintf(why, cap, "librashader not found");
+    return 0;
+}
+
+int nv2a_present_chain_lib_state(void)
+{
+    char why[256];
+    int state;
+    while (atomic_flag_test_and_set_explicit(&s_load_lock, memory_order_acquire))
+        ;
+    state = s_lib_state;
+    atomic_flag_clear_explicit(&s_load_lock, memory_order_release);
+    if (state)
+        return state;
+    return lib_present(why, sizeof why) ? 0 : -1;
+}
+
 int nv2a_present_chain_supported(char *why, size_t cap)
 {
     char host[sizeof s_host];
@@ -520,10 +576,8 @@ int nv2a_present_chain_supported(char *why, size_t cap)
         snprintf(why, cap, "this presenter runs no shader chain (Metal and D3D11 do)");
         return 0;
     }
-    if (!nv2a_present_chain_lib()) {
-        snprintf(why, cap, "%s", s_lib_why);
+    if (!lib_present(why, cap))
         return 0;
-    }
     if (cap)
         why[0] = 0;
     return 1;
@@ -542,24 +596,13 @@ void nv2a_present_chain_lib_reset_for_test(void)
 
 static const struct nv2a_lrs *lib_load(void)
 {
-    char paths[2][1024], why[512] = "", over[512];
+    char paths[2][1024], why[512] = "";
     PFN_libra_instance_abi_version abi;
     PFN_libra_instance_api_version api;
     int n, i;
 
     s_lib_state = -1;
-    lock();
-    snprintf(over, sizeof over, "%s", s_lib_path);
-    unlock();
-    if (over[0]) {
-        if (path_is_absolute(over))
-            snprintf(paths[0], sizeof paths[0], "%s", over);
-        else
-            snprintf(paths[0], sizeof paths[0], "%s/%s", recomp_exe_dir(), over);
-        n = 1;
-    } else {
-        n = lib_candidates(paths, 2);
-    }
+    n = lib_paths(paths, 2);
     for (i = 0; i < n; i++)
         if (open_lib(paths[i], why, sizeof why))
             break;
@@ -908,7 +951,7 @@ static void tag_files(const char *path, struct nv2a_present_param *t, int n)
     free(cx);
 }
 
-int nv2a_present_chain_describe(const char *request, struct nv2a_present_param *out, int cap)
+static int describe(const char *request, struct nv2a_present_param *out, int cap, int load)
 {
     PFN_libra_preset_create pc;
     PFN_libra_preset_free pf;
@@ -918,8 +961,11 @@ int nv2a_present_chain_describe(const char *request, struct nv2a_present_param *
     int n;
 
     /* The file first: a dump with no preset on disk loads no library. */
-    if (is_none(request) || preset_path(request, path, sizeof path, 0) < 0
-        || !nv2a_present_chain_lib())
+    if (is_none(request) || preset_path(request, path, sizeof path, 0) < 0)
+        return -1;
+    if (!load && nv2a_present_chain_lib_state() == 0)
+        return -2;
+    if (!nv2a_present_chain_lib())
         return -1;
     pc = (PFN_libra_preset_create)lrs_sym("libra_preset_create");
     pf = (PFN_libra_preset_free)lrs_sym("libra_preset_free");
@@ -935,6 +981,17 @@ int nv2a_present_chain_describe(const char *request, struct nv2a_present_param *
     pf(&preset);
     tag_files(path, out, n);
     return n;
+}
+
+int nv2a_present_chain_describe(const char *request, struct nv2a_present_param *out, int cap)
+{
+    return describe(request, out, cap, 1);
+}
+
+int nv2a_present_chain_describe_loaded(const char *request, struct nv2a_present_param *out,
+                                       int cap)
+{
+    return describe(request, out, cap, 0);
 }
 
 void nv2a_present_chain_error(void *err, char *out, size_t cap)

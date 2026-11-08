@@ -136,13 +136,22 @@ struct nv2a_lrs {
 };
 const struct nv2a_lrs *nv2a_present_chain_lib(void);
 
+/* Where the library stands, without loading it: 1 loaded; 0 not tried yet
+ * with one of its files there, so the first nv2a_present_chain_lib()
+ * would load it; -1 failed or missing. The menu runs on the title's pad
+ * thread, and under Proton the pad went dead once librashader loaded
+ * there: the menu asks this and leaves the load to the present
+ * thread. */
+int nv2a_present_chain_lib_state(void);
+
 /* The presenter that runs chains (Metal's, D3D11's) says so once it is up.
  * One that has none never does: the SDL renderer, or Windows' GDI window
  * under the CPU rasteriser. name: for the log ("Metal", "D3D11"). */
 void nv2a_present_chain_host(const char *name);
 
 /* 1 when a shader can run here: a chain presenter is up and the library
- * loads (loaded now if it was not tried yet). 0 with the reason in why. It
+ * loaded, or was not tried yet and its file is there. 0 with the reason in
+ * why. It never loads the library (the menu asks from the pad thread). It
  * does not look at the request: "none" is still supported. Any thread. */
 int nv2a_present_chain_supported(char *why, size_t cap);
 
@@ -336,6 +345,11 @@ void nv2a_present_chain_lib_reset_for_test(void);
  * path) parsed from its preset, with no GPU and no chain. The count, or -1
  * when the library or the preset is missing or does not parse. */
 int nv2a_present_chain_describe(const char *request, struct nv2a_present_param *out, int cap);
+
+/* The same, but never the first load: -2 while the library has not been
+ * tried yet (nv2a_present_chain_lib_state() 0). The menu's describes. */
+int nv2a_present_chain_describe_loaded(const char *request, struct nv2a_present_param *out,
+                                       int cap);
 
 /* The menu's "Exit without saving" (overlay-revamp D9a): every preset-scope
  * override back to what was loaded or saved last; one added since goes.

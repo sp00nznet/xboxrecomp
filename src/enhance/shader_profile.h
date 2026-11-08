@@ -253,7 +253,11 @@ const char *shader_profile_root(void);
  * xbox_path_shader_cache, p's values re-homed (shader_profile_rehome) and
  * loaded into the profile scope, then nv2a_present_chain_request_profile.
  * A failure requests stock, sets the profile error (the menu's red Chain
- * header) and logs one line. 0, or -1 with err (may be NULL) set. */
+ * header) and logs one line. 0, or -1 with err (may be NULL) set.
+ * While librashader has not loaded yet (nv2a_present_chain_lib_state() 0)
+ * none of this runs here: it waits for the next present, on the present
+ * thread, which then loads the library, and a failure there
+ * only sets the profile error; the call returns 0. */
 int shader_profile_request(const struct shader_profile *p, char *err, size_t errlen);
 
 /* The same with flags, for the menu's requests after an edit:
@@ -269,8 +273,9 @@ int shader_profile_request_with(const struct shader_profile *p, unsigned flags, 
 
 /* Before Save writes p: each stage described for the names it declares
  * and p's values re-homed under their owners (shader_profile_rehome). 0,
- * or -1 when a stage could not be found or described (its names are then
- * unknown and its values stay where they are). */
+ * or -1 when a stage could not be found or described, or librashader has
+ * not loaded yet (its names are then unknown and its values stay where
+ * they are). It never loads the library. */
 int shader_profile_place(struct shader_profile *p);
 
 /* Composed-file cleanup. renamed: from's file stays while the chain may run

@@ -24,6 +24,7 @@
 /* ======================================================================== */
 
 #include <xinput.h>
+#include <stdio.h>
 #pragma comment(lib, "xinput.lib")
 
 /* The keyboard on port 0 is shared with the SDL backend (keyboard.c); the
@@ -68,6 +69,44 @@ static xi_get_state_ex_fn xi_reader(void)
     return __atomic_load_n(&g_xi_ex, __ATOMIC_ACQUIRE);
 }
 
+/* XInput has no device events, so a slot's first answer after a run of
+ * failures is its arrival: the same [INPUT] lines as the SDL backend's, or
+ * a Proton log has no word on whether Steam's pad was ever seen. 0 never
+ * answered, 1 connected, 2 gone, 3 port 0 said it has none; port 0 says so
+ * once, ports 1-3 that were never there say nothing. */
+static int g_xi_seen[XUSER_MAX_COUNT]; /* atomic */
+
+static void xi_note(DWORD port, DWORD rc)
+{
+    int connected = rc == ERROR_SUCCESS, was;
+
+    if (port >= XUSER_MAX_COUNT)
+        return;
+    if (!connected && port == 0) {
+        was = 0;
+        if (__atomic_compare_exchange_n(&g_xi_seen[0], &was, 3, 0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            fprintf(stderr, "[INPUT] host pad: none on port 0 yet (XInput error %lu)\n",
+                    (unsigned long)rc);
+            fflush(stderr);
+            return;
+        }
+    }
+    if (connected) {
+        if (__atomic_exchange_n(&g_xi_seen[port], 1, __ATOMIC_ACQ_REL) != 1) {
+            fprintf(stderr, "[INPUT] host pad added port=%lu \"XInput\"\n", (unsigned long)port);
+            fflush(stderr);
+        }
+        return;
+    }
+    was = 1;
+    if (__atomic_compare_exchange_n(&g_xi_seen[port], &was, 2, 0, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE)) {
+        fprintf(stderr, "[INPUT] host pad removed port=%lu\n", (unsigned long)port);
+        fflush(stderr);
+    }
+}
+
 /* Any thread: XInput is thread safe. */
 static DWORD xi_get_raw(DWORD port, InputRaw *raw, DWORD *packet_out, int extras)
 {
@@ -89,6 +128,7 @@ static DWORD xi_get_raw(DWORD port, InputRaw *raw, DWORD *packet_out, int extras
         g = xi.Gamepad;
         packet = xi.dwPacketNumber;
     }
+    xi_note(port, rc);
     if (rc != ERROR_SUCCESS)
         return rc;
     memcpy(&pad, &g, sizeof pad);

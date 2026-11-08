@@ -2827,6 +2827,127 @@ static void test_shaders_hidden(void)
     shaders_supported();
 }
 
+/* Opening the menu never loads librashader: it runs on the title's pad
+ * thread, and under Proton the Deck's pad went dead once the library
+ * loaded at the first open. The page shows while the file is
+ * there; the library loads when a shader is chosen, and a file that then
+ * fails to load hides the page from the next open. */
+static void test_shaders_no_load_on_open(void)
+{
+    char bad[1024];
+    const char *out;
+    FILE *f;
+    int sp = page_index("Shaders");
+
+    nv2a_present_chain_lib_reset_for_test();
+    nv2a_present_chain_host("test");
+    start_with(ARMED "[present]\nshader_lib = \"" FAKE_LRS_PARAMS "\"\n", NULL);
+    capture_begin();
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    open_menu();
+    open_menu();
+    out = capture_end();
+    CHECK(enhance_menu_page_shown(sp));
+    CHECK(!strstr(out, "librashader ABI"));
+    CHECK(!strstr(out, "Shaders page is hidden"));
+    open_menu();
+    /* The same library, asked for by a backend, does load (and says so). */
+    capture_begin();
+    CHECK(nv2a_present_chain_lib() != NULL);
+    out = capture_end();
+    CHECK(strstr(out, "librashader ABI") != NULL);
+
+    /* A file that is there but no library: shown until a load fails. A
+     * relative shader_lib is under the exe's folder. */
+    snprintf(bad, sizeof bad, "%s/not_librashader.bin", recomp_exe_dir());
+    f = fopen(bad, "wb");
+    CHECK(f != NULL);
+    if (f) {
+        fputs("not a library\n", f);
+        fclose(f);
+    }
+    nv2a_present_chain_lib_reset_for_test();
+    nv2a_present_chain_host("test");
+    start_with(ARMED "[present]\nshader_lib = \"not_librashader.bin\"\n", NULL);
+    capture_begin();
+    open_menu();
+    out = capture_end();
+    CHECK(enhance_menu_page_shown(sp));
+    CHECK(!strstr(out, "present.shader off"));
+    open_menu();
+    capture_begin();
+    CHECK(nv2a_present_chain_lib() == NULL);
+    open_menu();
+    out = capture_end();
+    CHECK(strstr(out, "Shaders page is hidden: librashader failed to load") != NULL);
+    CHECK(!enhance_menu_page_shown(sp));
+    open_menu();
+    remove(bad);
+
+    shaders_supported();
+}
+
+/* Choosing a profile before the library has loaded loads nothing on the
+ * menu's (the pad's) thread: the request waits for the present thread,
+ * whose first describe loads it, then the chain and its names are there. */
+static void test_shaders_pick_no_load(void)
+{
+    const char *out;
+
+    MKDIR(PROFILES);
+    MKDIR(CACHE);
+    MKDIR(CACHE "/slangp");
+    s_cache_root = CACHE;
+    write_file(PROFILES "/mine.toml", "version = 1\nname = \"Mine\"\n"
+                                      "stages = [\"user:stage_a\", \"user:stage_b\"]\n"
+                                      "[params.stage_a]\nA1 = 1.5\n");
+    nv2a_present_chain_lib_reset_for_test();
+    nv2a_present_chain_host("test");
+    start_with(CFG_PROF, NULL);
+    capture_begin();
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(enhance_menu_select_row("Profile"));
+    tap(0x27);   /* a bundled preset, then back */
+    tap(0x25);
+    tap(0x25);   /* Off wraps to Mine */
+    CHECK(!strcmp(row_value("Profile"), "Mine"));
+    CHECK(enhance_menu_select_row("1  user:stage_a"));
+    tap(0x0D);   /* the stage's list reads its names */
+    tap(0x1B);
+    out = capture_end();
+    CHECK(!strstr(out, "librashader ABI"));
+    CHECK(nv2a_present_chain_lib_state() == 0);
+    CHECK(nv2a_present_chain_wanted());
+
+    /* The present thread: its next present runs the request, which loads. */
+    capture_begin();
+    nv2a_present_chain_gen();
+    out = capture_end();
+    CHECK(strstr(out, "librashader ABI") != NULL);
+    CHECK(nv2a_present_chain_lib_state() == 1);
+    chain_up();
+    CHECK(row_value("Chain") && !strcmp(row_value("Chain"), "2 passes"));
+    CHECK(row_value("a one") == NULL);   /* stage_a's names are known now */
+    CHECK(row_value("orphan") != NULL);
+    open_menu();
+    if (enhance_menu_is_open() && enhance_menu_dialog() >= 0) {
+        advance(160);
+        tap(0x0D);
+    }
+
+    remove(PROFILES "/mine.toml");
+    rmdir(PROFILES);
+    remove(CACHE "/slangp/mine.slangp");
+    remove(CACHE "/slangp/~unsaved.slangp");
+    rmdir(CACHE "/slangp");
+    rmdir(CACHE);
+    s_cache_root = NULL;
+    nv2a_present_chain_params_clear();
+    shaders_supported();
+}
+
 /* Save under a root whose folders do not exist yet makes all of them (N7). */
 static void test_save_deep(void)
 {
@@ -6273,6 +6394,8 @@ int main(int argc, char **argv)
     test_save_tables();
     test_stage_row();
     test_shaders_hidden();
+    test_shaders_no_load_on_open();
+    test_shaders_pick_no_load();
     test_badges();
     test_revert();
     test_revert_shaders();

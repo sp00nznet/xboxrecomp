@@ -57,10 +57,25 @@ static atomic_int s_start_loaded;
  * said so. Each start clears it before its pending request; only that
  * request's prepare, under s_req_lock, sets it. */
 static int s_start_waiting;
+/* A menu request made before librashader has loaded: the menu runs on the
+ * title's pad thread, and describing a stage would load the library there,
+ * which left the pad dead under Proton. The request waits for the
+ * present thread like the start's, with its flags and its generation. */
+static struct shader_profile s_later;
+static unsigned s_later_flags;
+static unsigned s_later_gen;
 
 /* The start's deferred request: its stock fallback and its request go
  * through the generation check (request_profile_at). Not in the header. */
 #define REQ_START 0x100u
+/* The menu's request, deferred to the present thread (s_later). */
+#define REQ_LATER 0x200u
+#define REQ_DEFERRED (REQ_START | REQ_LATER)
+
+static unsigned deferred_gen(unsigned flags)
+{
+    return flags & REQ_START ? s_start_gen : s_later_gen;
+}
 
 /* Composed files a rename left under the old slug. The running chain may
  * still read one (rekey keeps its path), so each goes once a request has
@@ -171,16 +186,18 @@ static void fail(const char *slug, const char *err, int said)
  * generation check: a menu request made meanwhile keeps its chain. */
 static void failed(const char *slug, unsigned flags, const char *err, int said)
 {
-    if (!(flags & REQ_START)) {
+    if (!(flags & REQ_DEFERRED)) {
         fail(slug, err, said);
         return;
     }
-    if (nv2a_present_chain_request_profile_at(s_start_gen, slug, NULL, NULL, 0, err) && !said)
+    if (nv2a_present_chain_request_profile_at(deferred_gen(flags), slug, NULL, NULL, 0, err)
+        && !said)
         fprintf(stderr, LOGP "profile %s: %s; the present stays stock\n", slug, err);
 }
 
 static int request_locked(const struct shader_profile *p, unsigned flags, char *err,
                           size_t errlen);
+static void later_prepare(void);
 
 int shader_profile_request(const struct shader_profile *p, char *err, size_t errlen)
 {
@@ -192,9 +209,30 @@ int shader_profile_request_with(const struct shader_profile *p, unsigned flags, 
 {
     int rc;
     req_lock();
-    rc = request_locked(p, flags & ~REQ_START, err, errlen);
+    flags &= ~REQ_DEFERRED;
+    if (nv2a_present_chain_lib_state() == 0) {
+        if (p != &s_later)
+            s_later = *p;
+        s_later_flags = flags;
+        nv2a_present_chain_request_pending(s_later.slug, later_prepare);
+        s_later_gen = nv2a_present_chain_request_gen();
+        req_unlock();
+        if (err && errlen)
+            err[0] = 0;
+        return 0;
+    }
+    rc = request_locked(p, flags, err, errlen);
     req_unlock();
     return rc;
+}
+
+/* The menu's deferred request, on the present thread at its next present:
+ * the first describe there loads the library. */
+static void later_prepare(void)
+{
+    req_lock();
+    request_locked(&s_later, s_later_flags | REQ_LATER, NULL, 0);
+    req_unlock();
 }
 
 static int request_locked(const struct shader_profile *p, unsigned flags, char *err,
@@ -233,8 +271,11 @@ static int request_locked(const struct shader_profile *p, unsigned flags, char *
         paths[s] = path[s];
         labels[s] = p->stage[s];
         /* The names each stage declares, for the rows' stage tags (D4):
-         * without the library there is no chain to tag, so none. */
-        k = nv2a_present_chain_describe(path[s], rows, NV2A_PRESENT_PARAMS_MAX);
+         * without the library there is no chain to tag, so none. Only a
+         * deferred request (present thread) may be the first load. */
+        k = flags & REQ_DEFERRED
+            ? nv2a_present_chain_describe(path[s], rows, NV2A_PRESENT_PARAMS_MAX)
+            : nv2a_present_chain_describe_loaded(path[s], rows, NV2A_PRESENT_PARAMS_MAX);
         shader_profile_stage_key(p->stage[s], s_stage[s].key, sizeof s_stage[s].key);
         /* The first stage sees the frame: the profile's choice, else a
          * preset under a crt folder, which its key alone cannot show. */
@@ -270,7 +311,7 @@ static int request_locked(const struct shader_profile *p, unsigned flags, char *
     }
     /* A menu request since the start's pending one: it stands, and the
      * store keeps what the menu put there. */
-    if ((flags & REQ_START) && nv2a_present_chain_request_gen() != s_start_gen)
+    if ((flags & REQ_DEFERRED) && nv2a_present_chain_request_gen() != deferred_gen(flags))
         return 0;
     /* Values under their owners, then into the profile scope keyed by
      * name: one value per name drives every stage that declares it. */
@@ -280,12 +321,15 @@ static int request_locked(const struct shader_profile *p, unsigned flags, char *
         for (int i = 0; i < p->nvalues; i++)
             nv2a_present_chain_profile_value_load(p->slug, p->value[i].name, p->value[i].v);
     }
-    if (!(flags & REQ_START))
+    if (!(flags & REQ_DEFERRED))
         nv2a_present_chain_request_profile(p->slug, out, s_stage, n);
-    else if (nv2a_present_chain_request_profile_at(s_start_gen, p->slug, out, s_stage, n, NULL))
-        atomic_store(&s_start_loaded, 1);
-    else
+    else if (nv2a_present_chain_request_profile_at(deferred_gen(flags), p->slug, out, s_stage,
+                                                   n, NULL)) {
+        if (flags & REQ_START)
+            atomic_store(&s_start_loaded, 1);
+    } else {
         return 0;
+    }
     stale_sweep(flags & SHADER_PROFILE_REQ_UNSAVED ? "" : p->slug);
     return 0;
 }
@@ -304,7 +348,7 @@ int shader_profile_place(struct shader_profile *p)
         int k = -1;
         if (shader_profile_stage_path(p->stage[s], s_root, NULL, path, sizeof path, e,
                                       sizeof e) > 0)
-            k = nv2a_present_chain_describe(path, rows, NV2A_PRESENT_PARAMS_MAX);
+            k = nv2a_present_chain_describe_loaded(path, rows, NV2A_PRESENT_PARAMS_MAX);
         if (k < 0)
             ok = 0;
         sp[s].n = k > 0 ? k : 0;

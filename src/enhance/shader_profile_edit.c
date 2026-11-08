@@ -35,6 +35,9 @@ static char s_info_err[SHADER_PROFILE_ERR_MAX];
 static int s_missing[SHADER_PROFILE_STAGES_MAX];
 static char s_names[SHADER_PROFILE_STAGES_MAX][NV2A_PRESENT_PARAMS_MAX][64];
 static int s_nnames[SHADER_PROFILE_STAGES_MAX];
+/* 1 when analyse() ran before librashader loaded: the stages' names are
+ * not known yet, and the next read after the load finds them. */
+static int s_info_later;
 
 /* Large scratch, one use at a time. */
 static struct shader_profile_entry s_list[SHADER_PROFILE_LIST_MAX];
@@ -189,6 +192,7 @@ static void analyse(void)
     memset(&s_info, 0, sizeof s_info);
     memset(s_missing, 0, sizeof s_missing);
     memset(s_nnames, 0, sizeof s_nnames);
+    s_info_later = 0;
     s_info_ok = 0;
     s_info_err[0] = 0;
     if (e->kind == SHADER_EDIT_OFF || e->state != SHADER_PROFILE_OK)
@@ -205,7 +209,11 @@ static void analyse(void)
             ok = 0;
             continue;
         }
-        k = nv2a_present_chain_describe(path[s], s_rows, NV2A_PRESENT_PARAMS_MAX);
+        /* The menu runs on the title's pad thread: never the first
+         * librashader load here, the present thread does it. */
+        k = nv2a_present_chain_describe_loaded(path[s], s_rows, NV2A_PRESENT_PARAMS_MAX);
+        if (k == -2)
+            s_info_later = 1;
         s_nnames[s] = k > 0 ? k : 0;
         for (int i = 0; i < s_nnames[s]; i++)
             snprintf(s_names[s][i], sizeof s_names[s][i], "%s", s_rows[i].name);
@@ -456,8 +464,17 @@ int shader_edit_step(int dir, char *msg, size_t n)
     return -1;
 }
 
+/* The names analyse() could not read before the library loaded, once it
+ * has. */
+static void names_due(void)
+{
+    if (s_info_later && nv2a_present_chain_lib_state() != 0)
+        analyse();
+}
+
 int shader_edit_info(struct shader_profile_compose *info, char *err, size_t errlen)
 {
+    names_due();
     if (info)
         *info = s_info;
     if (err && errlen)
@@ -476,6 +493,7 @@ const char (*shader_edit_stage_names(int s, int *n))[64]
         *n = 0;
         return NULL;
     }
+    names_due();
     *n = s_nnames[s];
     return s_names[s];
 }
@@ -696,8 +714,11 @@ int shader_edit_add(const char *ref, char *msg, size_t n)
         paths[k] = path[k];
         labels[k] = r;
     }
-    /* Parsed by the library as the descriptor dump does, with no GPU. */
-    if (nv2a_present_chain_describe(path[e->nstages], s_rows, NV2A_PRESENT_PARAMS_MAX) < 0) {
+    /* Parsed by the library as the descriptor dump does, with no GPU; not
+     * before the present thread has loaded it, and then the
+     * chain's own request finds a stage that does not parse. */
+    if (nv2a_present_chain_describe_loaded(path[e->nstages], s_rows, NV2A_PRESENT_PARAMS_MAX)
+        == -1) {
         say(msg, n, "%s does not parse (see the log)", ref);
         return -1;
     }
@@ -1154,4 +1175,5 @@ void shader_edit_reset_for_test(void)
     memset(&s_info, 0, sizeof s_info);
     s_info_ok = 0;
     s_info_err[0] = 0;
+    s_info_later = 0;
 }

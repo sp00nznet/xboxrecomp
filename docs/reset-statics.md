@@ -2560,6 +2560,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/input/xinput_device.c | - | g_ready_cv | file_static | keep | - | host pad slots stay connected |
 | src/input/xinput_device.c | - | g_main_pump | file_static | keep | - | host pad slots stay connected |
 | src/input/xinput_device.c | - | g_packet | file_static | keep | - | host pad slots stay connected |
+| src/input/xinput_device.c | - | g_xi_seen | file_static | keep | - | host pad log state; slots stay connected |
 
 ### src/platform/host_prof.c
 
@@ -3371,6 +3372,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/shader_profile_edit.c | - | s_missing | file_static | keep | - | stages whose shader file is missing |
 | src/enhance/shader_profile_edit.c | - | s_names | file_static | keep | - | per-stage param names |
 | src/enhance/shader_profile_edit.c | - | s_nnames | file_static | keep | - | per-stage param counts |
+| src/enhance/shader_profile_edit.c | - | s_info_later | file_static | keep | - | stage names wait for librashader |
 | src/enhance/shader_profile_edit.c | - | s_list | file_static | keep | - | profile list from disk |
 | src/enhance/shader_profile_edit.c | - | s_p | file_static | keep | - | profile being edited |
 | src/enhance/shader_profile_edit.c | - | s_fp | file_static | keep | - | profile as on disk |
@@ -3398,6 +3400,9 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/shader_profile_req.c | - | s_start_gen | file_static | keep | - | present chain generation at start |
 | src/enhance/shader_profile_req.c | - | s_start_loaded | file_static | keep | - | start profile loaded flag |
 | src/enhance/shader_profile_req.c | - | s_start_waiting | file_static | keep | - | start request waits for first present |
+| src/enhance/shader_profile_req.c | - | s_later | file_static | keep | - | menu profile waiting for the present thread |
+| src/enhance/shader_profile_req.c | - | s_later_flags | file_static | keep | - | menu deferred request flags |
+| src/enhance/shader_profile_req.c | - | s_later_gen | file_static | keep | - | present chain generation at the menu's deferred request |
 | src/enhance/shader_profile_req.c | - | s_stale | file_static | keep | - | stale profile names reported |
 | src/enhance/shader_profile_req.c | - | s_nstale | file_static | keep | - | stale name count |
 | src/enhance/shader_profile_req.c | request_locked | names | local_static | keep | - | scratch param name pointers |
