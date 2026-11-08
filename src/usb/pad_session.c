@@ -145,6 +145,7 @@ typedef struct PadSession {
     int boot;                   /* origin boot: counts from the run's start */
     int trust;                  /* its !<action> steps may fire */
     int quit;                   /* the env chain's last: pad_quit at its end */
+    int env;                    /* the env chain's head (RECOMP_PAD_SCRIPT) */
 
     /* a playback */
     PadStep *steps;
@@ -502,11 +503,20 @@ static void record_signal(int sig)
 
 static void padrec_exit(void)
 {
-    PadSession *s;
+    PadSession *s, *p;
     /* An armed record that never reached the pad thread: its file holds
      * nothing, so it goes rather than stay listed and be refused. The
-     * exchange needs no lock. */
-    pending_drop(__atomic_exchange_n(&s_pending, NULL, __ATOMIC_ACQ_REL));
+     * exchange is under the lock, as a file open may be reading the env
+     * chain's pending head (padrec_file_open); after a signal the lock
+     * could be held by the thread exiting, and record_signal took it. */
+    if (!s_in_signal) {
+        pad_lock();
+        p = __atomic_exchange_n(&s_pending, NULL, __ATOMIC_ACQ_REL);
+        pad_unlock();
+    } else {
+        p = __atomic_exchange_n(&s_pending, NULL, __ATOMIC_ACQ_REL);
+    }
+    pending_drop(p);
     /* A record waiting behind a setup that never ended holds nothing
      * either. Under the lock: the pad thread retires and frees the active
      * session. After a signal record_signal already removed its file, and
@@ -857,7 +867,19 @@ void padrec_file_open(const char *path, const PadrecClocks *c, char *log, size_t
     FILE *f;
     int w;
 
-    if (!s || __atomic_load_n(&s->ended, __ATOMIC_ACQUIRE))
+    if (!s) {
+        /* The env chain's head waits in s_pending until the first port-0
+         * poll, but a game may open its first movie before it polls. A
+         * boot head counts from 0, so its anchors take the open now, as a
+         * plain script's do. Only the env head: nothing else publishes
+         * while an env key is set, and padrec_stop and padrec_exit take it
+         * out under this lock, so it cannot be freed under us. */
+        PadSession *p = __atomic_load_n(&s_pending, __ATOMIC_ACQUIRE);
+        if (p && p->env && p->boot && p->kind == KIND_PLAY && p->anchors->n)
+            pad_anchors_open(p->anchors, path, clock_now(p, c), log, logn);
+        return;
+    }
+    if (__atomic_load_n(&s->ended, __ATOMIC_ACQUIRE))
         return;
     if (s->kind == KIND_PLAY) {
         if (s->anchors->n)
@@ -1325,6 +1347,7 @@ int padrec_play_chain(const PadrecSeg *segs, int n, unsigned flags, const char *
             ;
         s->quit = 1;
     }
+    head->env = (flags & PADREC_ENV) != 0;
     if (!(flags & PADREC_ENV)) {
         s_last_n = n;
         s_last_flags = flags & PADREC_BOOT;
@@ -1428,7 +1451,13 @@ int padrec_again(unsigned flags, char *why, size_t whyn)
 
 void padrec_stop(void)
 {
-    PadSession *p = __atomic_exchange_n(&s_pending, NULL, __ATOMIC_ACQ_REL);
+    PadSession *p;
+
+    /* Under the lock: a file open may be reading the env chain's pending
+     * head (padrec_file_open). Freed after it, once no one can reach it. */
+    pad_lock();
+    p = __atomic_exchange_n(&s_pending, NULL, __ATOMIC_ACQ_REL);
+    pad_unlock();
 
     __atomic_store_n(&s_pending_pads, 0, __ATOMIC_RELEASE);
     if (p) {

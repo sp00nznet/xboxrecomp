@@ -1278,11 +1278,35 @@ void usb_gamepad_file_open(const char *path, uint32_t status)
         padrec_file_open(path, &pc, log, sizeof log);
         pad_unlock();
     } else {
+        /* A chain in RECOMP_PAD_SCRIPT (@a.pad;@b.pad) is played by the
+         * session code, with its own anchors: they see the open as a menu
+         * playback's do, or a head that waits on a movie never fires.
+         * A plain script never starts a session, so it pays
+         * one load here and its anchors are unchanged. */
+        char clog[512];
+        int chain;
         pad_script_load();
+        chain = padrec_any();
+        if (chain)
+            padrec_open_name(path);
         pad_lock();
         pad_anchors_open(&s_anchors, path, script_clock(), log, sizeof log);
         pad_record_open(path, log, sizeof log);
+        if (chain) {
+            /* Its own buffer: pad_anchors_open starts its log afresh, and
+             * the record's line above must still print. */
+            PadrecClocks pc = { 0, 0, 0, 0 };
+            pc.polls = polls_now();
+            pc.flip = flip_now();
+            pc.ms = pad_ms();
+            clog[0] = 0;
+            padrec_file_open(path, &pc, clog, sizeof clog);
+        }
         pad_unlock();
+        if (chain && clog[0]) {
+            size_t used = strlen(log);
+            snprintf(log + used, sizeof log - used, "%s", clog);
+        }
     }
     /* Printed unlocked: a slow stderr must not hold the pad threads. */
     if (log[0]) {

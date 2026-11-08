@@ -23,3 +23,12 @@ target_include_directories(usb_pad_game_session PRIVATE
 target_link_libraries(usb_pad_game_session PRIVATE xboxrecomp)
 add_test(NAME usb_pad_game_session COMMAND usb_pad_game_session
          WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+# test_env_chain: RECOMP_PAD_SCRIPT=@a.pad;@b.pad, a chain the session code
+# plays, whose @open anchors see the game's file opens.
+add_executable(usb_pad_game_env_chain test_env_chain.c)
+target_include_directories(usb_pad_game_env_chain PRIVATE
+    ../../src/kernel ../../src/usb ../../src/input ../../src/platform)
+target_link_libraries(usb_pad_game_env_chain PRIVATE xboxrecomp)
+add_test(NAME usb_pad_game_env_chain COMMAND usb_pad_game_env_chain
+         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})

@@ -467,7 +467,12 @@ or after it count their flips from the replay's open of that file and press
 nothing before it; while the open is late, the replay taps the retry
 `<buttons>` for half of every `<period>` flips (2 to 300), eight times, then
 only waits. Anchors match in order, and the kernel's `NtCreateFile` reports
-each successful open through `usb_gamepad_file_open`. An open that matches
+each successful open through `usb_gamepad_file_open`, to a plain script and
+to a chain in `RECOMP_PAD_SCRIPT` (`@a.pad;@b.pad`) alike; a chain's head
+takes opens from the run's start, before the first pad poll. A later
+segment of a chain (env or menu) starts on the poll after the one before it
+ends, so an open in that one-poll gap reaches neither and the new segment's
+first anchor waits for the next one. An open that matches
 a later anchor gives up the ones between and is taken: one on the armed
 anchor's record flip at any time, one up to 1800 record flips on once the
 armed anchor is late. A re-open of the last matched file is not a later
