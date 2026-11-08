@@ -24,6 +24,9 @@
  *             in the CLI encodes decoding through d3d8_dxt_decode_texel; the
  *             word at +28 not refused; bit 6 and both block flags refused; v1
  *             and v2 still read
+ *   v4        bit 6 (XRTP_FLAG_DETILE_HEX) read and counted on a world
+ *             entry, refused on any other kind; v3 still reads; bit 7
+ *             refused
  *   release   frees the payload, a later read brings back the same bytes;
  *             under set_keep it does nothing
  *   bc3       a BC3 entry's payload is its block count x 16, bounds-checked
@@ -559,6 +562,45 @@ static void test_v3(void)
     nv2a_tex_pack_unload();
 }
 
+/* v4: v3's build with the detile mark. */
+static void test_v4(void)
+{
+    uint8_t buf[512];
+    char err[128] = "";
+    struct nv2a_tex_pack_entry *e;
+    size_t n;
+
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_BC1 | XRTP_FLAG_DETILE_HEX, 8, 4);
+    wr32(buf + 4, 4);
+    write_file("v4.pack", buf, n);
+    CHECK(nv2a_tex_pack_load("v4.pack", err, sizeof err) == 1, "v4 load: '%s'", err);
+    CHECK(nv2a_tex_pack_version() == 4, "v4 version %u", nv2a_tex_pack_version());
+    CHECK(nv2a_tex_pack_detile_count() == 1 && nv2a_tex_pack_bc1_count() == 1
+          && nv2a_tex_pack_kind_count(XRTP_KIND_WORLD) == 1, "v4 counts");
+    e = nv2a_tex_pack_find(HASH_C, 4, 2);
+    CHECK(e && (e->flags & XRTP_FLAG_DETILE_HEX) && e->kind == XRTP_KIND_WORLD
+          && e->bc == XRTP_BC_1, "v4 entry");
+    nv2a_tex_pack_unload();
+    CHECK(nv2a_tex_pack_detile_count() == 0, "detile count after unload");
+    /* Unmarked v4 and v3 files: no mark. */
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_BC1, 8, 4);
+    write_file("v3_plain.pack", buf, n);
+    CHECK(nv2a_tex_pack_load("v3_plain.pack", err, sizeof err) == 1
+          && nv2a_tex_pack_detile_count() == 0, "v3 under v4: '%s'", err);
+    nv2a_tex_pack_unload();
+    /* The mark on art (a HUD piece, text) is refused, and on v3 it is an
+     * unknown bit. */
+    n = build_v3(buf, XRTP_KIND_ART | XRTP_FLAG_DETILE_HEX, 8, 4);
+    wr32(buf + 4, 4);
+    refuse("v4_art.pack", buf, n, "non-world");
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_DETILE_HEX | 0x80u, 8, 4);
+    wr32(buf + 4, 4);
+    refuse("v4_bit7.pack", buf, n, "unknown flags");
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_DETILE_HEX, 8, 4);
+    wr32(buf + 4, 5);
+    refuse("v5.pack", buf, n, "version");
+}
+
 static void test_misses(void)
 {
     struct nv2a_tex_pack_miss m[NV2A_TEX_PACK_MISSES + 4];
@@ -764,6 +806,7 @@ int main(void)
     test_v2();
     test_bc3();
     test_v3();
+    test_v4();
     test_misses();
     test_resident();
     if (fails) {

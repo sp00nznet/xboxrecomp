@@ -144,6 +144,9 @@ static void load_tex_pack(const struct nv2a_host_opts *o)
                 (o->pack_off & NV2A_PACK_OFF_FONT) ? "off" : "on",
                 (o->pack_off & NV2A_PACK_OFF_TEXT) ? "off" : "on",
                 (o->pack_off & NV2A_PACK_OFF_WORLD) ? "off" : "on");
+    if (n >= 0 && o->detile)
+        fprintf(stderr, LOGP "textures.detile=on (%u entries marked)\n",
+                nv2a_tex_pack_detile_count());
 }
 
 static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };
@@ -311,6 +314,9 @@ int xbox_enhance_init(const char *root, const char *title)
         o.pack_off |= NV2A_PACK_OFF_TEXT;
     if (!enhance_cfg_choice("textures.world", s_onoff, 1))
         o.pack_off |= NV2A_PACK_OFF_WORLD;
+    /* Hex tiling of the entries the pack marks (nv2a_hex_tile.h): off is
+     * stock. Named in the pack line only when on. */
+    o.detile = enhance_cfg_choice("textures.detile", s_onoff, 0);
 
     nv2a_host_opts_set(&o);
     fprintf(stderr, LOGP "render.scale=%u render.aniso=%u present.filter=%s"

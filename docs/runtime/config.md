@@ -190,6 +190,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
 | `textures.world` | string | `"on"`, `"off"`: the pack's world entries (version 3) | `"on"` | `RECOMP_TEXTURES_WORLD` |
+| `textures.detile` | string | `"on"`, `"off"`: hex-tile sampling of the world entries the pack marks (version 4) | `"off"` | `RECOMP_TEXTURES_DETILE` |
 | `overlay.stats` | bool | the stats strip in the window's top right corner: fps, frame ms (average and worst of the last second), pacing, scale and backend, at 2 Hz; never in a frame dump | `false` | `RECOMP_OVERLAY_STATS` |
 | `overlay.ui_scale` | number | the menu's and the overlays' size over the automatic scale (`overlay.ui_fit`), 0.75 to 2 in quarter steps: larger for a TV across the room. Live from the menu: the font atlas is baked again between frames | `1` | `RECOMP_OVERLAY_UI_SCALE` |
 | `overlay.ui_fit` | string | what the automatic scale follows: `"display"` (the larger of the output height over 1080 and the display's floor: the OS's UI scale, and on a Steam Deck's own 1280x800 panel (`SteamDeck=1` or its SMBIOS names) its 216 ppi over 160, held to the output height over 600; [Overlay scale](#overlay-scale)) or `"output"` (the output height over 1080 alone, the rule before the display floor; the height shown, so under gamescope the window's lines after the compositor's fit to the screen). Live from the menu, like `overlay.ui_scale` | `"display"` | `RECOMP_OVERLAY_UI_FIT` |
@@ -837,6 +838,19 @@ declares `OriginalSize` in its uniform block) is not a read.
   ` (text off)` (or art, font), ` (pack off)`, or ` (entry refused)` when
   the backend could not take the entry (a GPU without BC3, such as an
   older iPad, says so once; a texture too large; a failed read).
+- **`textures.detile` = `"on" | "off"`, default `"off"`.** A version 4 pack
+  can mark world entries `detile = hex` (organic ground: rock, sand, grass;
+  never bricks or planks, whose lines would break). With `on`, a combiner
+  draw that binds a marked entry as a plain 2D stage samples it hex-tiled
+  (Mikkelsen 2022, offsets only): three copies of the texture, each moved by
+  an offset fixed per cell of a triangle grid, blended by weight and
+  brightness, so the repeat of an upscaled tile stops showing. The stage
+  costs three gradient fetches and about 30 ALU; every other stage and draw
+  keeps the stock shader, and `off` is the stock render. A render target, a
+  cube, a snapped 2D stage and a hor+ read keep the stock sample; so does the
+  basic shader (fixed-function draws) and the CPU backend. With it on, the
+  pack line adds `textures.detile=on (N entries marked)`. Live: the next
+  draw follows the menu.
 - **`textures.font`, `textures.text`, `textures.world` = `"on" | "off"`.** A
   pack marks each entry as art, the font atlas, baked text or (version 3) a
   texture of the 3D scene; `textures.world` turns those off alone.
@@ -1556,7 +1570,7 @@ points, its live class; the footer names the selected row's:
 
 | Class | Takes effect | Items |
 |---|---|---|
-| live | at the next flip | `render.aniso`, `render.snap_2d`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `overlay.stats`, `overlay.ui_scale`, `overlay.ui_fit`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
+| live | at the next flip | `render.aniso`, `render.snap_2d`, `textures.detile`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `overlay.stats`, `overlay.ui_scale`, `overlay.ui_fit`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
 | at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text`, `textures.world` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
@@ -1826,6 +1840,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_TEXTURES_FONT` | overrides `textures.font` |
 | `RECOMP_TEXTURES_TEXT` | overrides `textures.text` |
 | `RECOMP_TEXTURES_WORLD` | overrides `textures.world` |
+| `RECOMP_TEXTURES_DETILE` | overrides `textures.detile` |
 | `RECOMP_OVERLAY_STATS` | overrides `overlay.stats` |
 | `RECOMP_MENU` | overrides `menu.enabled` |
 | `RECOMP_KEYBOARD` | overrides `input.keyboard` (an older name, outside the naming rule) |

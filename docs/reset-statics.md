@@ -1445,6 +1445,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_tex_pack.c | read_failed | said | local_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_version | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_bc1_count | file_static | keep | - | texture pack keyed by content hash |
+| src/kernel/nv2a_tex_pack.c | - | s_detile_count | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_keep | file_static | keep | - | texture pack keyed by content hash |
 
 ### src/nv2a/nv2a_core.c
@@ -1790,6 +1791,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | setup_pixel | bump_trace | local_static | keep | - | cached env read |
 | src/d3d/nv2a_pb_d3d11.c | setup_pixel | lm | local_static | reset | renderer.d3d11 | stage-loop memo of s_tc views, keyed on flips |
 | src/d3d/nv2a_pb_d3d11.c | setup_pixel | memo | local_static | keep | - | keyed by combiner register content, kept s_rc |
+| src/d3d/nv2a_pb_d3d11.c | setup_pixel | sh | local_static | keep | - | scratch copy of s_last_rc for the hex-tile compile fallback, rewritten before each use |
 | src/d3d/nv2a_pb_d3d11.c | setup_pixel | st0 | local_static | keep | - | scratch copy of s_last_rc for the W fallback, rewritten before each use |
 | src/d3d/nv2a_pb_d3d11.c | read_tex_pixel | st | local_static | keep | - | debug staging texture |
 | src/d3d/nv2a_pb_d3d11.c | trace_stream_out | buf | local_static | keep | - | debug stream-out buffer |
@@ -1937,6 +1939,9 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_cur | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_copied | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_state | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_detile_cb | file_static | keep | - | textures.detile flags buffer, a device object made once |
+| src/d3d/nv2a_pb_d3d11.c | - | s_detile_mask | file_static | keep | - | textures.detile, what the flags buffer holds; rewritten when a draw's mask differs |
+| src/d3d/nv2a_pb_d3d11.c | - | s_detile_state | file_static | keep | - | textures.detile flags buffer, a device object made once |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_hash | file_static | keep | - | the tex_mag trace and the dump's facts, debug figures keyed by content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_scale | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao | file_static | reset | renderer.d3d11 | render.ao trigger: candidate points into s_rt (rt_release drops it), memo and fit of the running boot |
@@ -2167,11 +2172,14 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_mag_cur | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/d3d/nv2a_pb_metal.m | - | s_mag_state | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/d3d/nv2a_pb_metal.m | - | s_fs_mag | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_metal.m | - | s_fs_hex | file_static | keep | - | textures.detile, the batch's hex stages, set again on each draw |
 | src/d3d/nv2a_pb_metal.m | - | s_up_scale | file_static | keep | - | the upload just made, read back by its caller |
+| src/d3d/nv2a_pb_metal.m | - | s_up_detile | file_static | keep | - | the upload just made, read back by its caller |
 | src/d3d/nv2a_pb_metal.m | - | s_up_levels | file_static | keep | - | the upload just made, read back by its caller |
 | src/d3d/nv2a_pb_metal.m | - | s_tex_last | file_static | keep | - | the entry tex_bind just bound, set again on each bind |
 | src/d3d/nv2a_pb_metal.m | - | s_stage_pack | file_static | keep | - | the entry each stage just bound, set again on each draw |
 | src/d3d/nv2a_pb_metal.m | - | s_stage_hash | file_static | keep | - | the entry each stage just bound, set again on each draw |
+| src/d3d/nv2a_pb_metal.m | - | s_stage_detile | file_static | keep | - | the entry each stage just bound, set again on each draw |
 | src/d3d/nv2a_pb_metal.m | - | s_ao | file_static | reset | renderer.metal | render.ao trigger: candidate points into s_rt (rt_free drops it), memo and fit of the running boot |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_on | file_static | keep | - | render.ao, latched at each flip |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_cfg | file_static | keep | - | render.ao settings, latched at each flip from the menu's |

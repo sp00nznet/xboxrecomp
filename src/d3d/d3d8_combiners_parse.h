@@ -327,6 +327,14 @@ typedef struct NV2ACombinerState {
      * flag, set only under the trace, so the stock shader text is unchanged;
      * in the cache key. 3D, cube, bump and dot stages are not measured. */
     int tex_mag;
+
+    /* 1: textures.detile, a draw that binds a pack entry marked
+     * XRTP_FLAG_DETILE_HEX: plain 2D stages branch on their tex_detile
+     * flag (its own constant buffer, HLSL b4, MSL buffer(3)) to
+     * nv2a_hex's three-copy blend (nv2a_hex_tile.h). A backend flag, set
+     * only for such draws, so the stock shader text is unchanged; in the
+     * cache key. */
+    int hex_tile;
 } NV2ACombinerState;
 
 /**

@@ -40,21 +40,22 @@ empty input to `0x40500CA3D9E617F3`; 64 zero bytes to `0x69597731194007AB`.
 
 All fields little-endian. Version 2 adds entry kinds, BC3 payloads and a
 text scale. Version 3 adds kind 3 (world), BC1 payloads and the `classes`
-word. The reader takes all three, each by its own rules.
+word. Version 4 adds the `XRTP_FLAG_DETILE_HEX` mark on world entries
+(`textures.detile`). The reader takes all four, each by its own rules.
 
 ```
 offset  size  field
 0       4     magic "XRTP"
-4       4     version, 1, 2 or 3
+4       4     version, 1, 2, 3 or 4
 8       4     count
 12      4     scale: the factor the art entries were made at (informational;
               logged as "scale N")
 16      8     index offset (>= 32)
 24      8     v1: reserved, 0 (a reader refuses any other value)
-24      4     v2, v3: text scale, the factor the TEXT entries were made at
+24      4     v2 to v4: text scale, the factor the TEXT entries were made at
               (informational; 0 means the header scale)
 28      4     v2: reserved, 0
-28      4     v3: classes, a bit per kind present (1 << kind); informational,
+28      4     v3, v4: classes, a bit per kind present (1 << kind); informational,
               the reader does not check it
 
 index: count entries of 32 bytes, sorted by hash, strictly increasing
@@ -62,7 +63,7 @@ index: count entries of 32 bytes, sorted by hash, strictly increasing
 8       4     width  (1..16384)
 12      4     height (1..16384)
 16      4     levels (1 .. 1 + floor(log2(max(w, h))))
-20      4     flags: v1 0; v2 and v3 below (a reader refuses any other value)
+20      4     flags: v1 0; v2 to v4 below (a reader refuses any other value)
 24      8     payload offset (>= 32)
 
 payload: per entry, every level, level 0 first, each further level
@@ -80,13 +81,16 @@ Entry flags:
 
 | Bits | Name | Meaning |
 |---|---|---|
-| 0-1 | kind | `0` art (HUD pieces and other images), `1` font (the atlas the glyphs are drawn from), `2` text (an image of pre-rendered text); `3` world (textures of the 3D scene), v3 only |
+| 0-1 | kind | `0` art (HUD pieces and other images), `1` font (the atlas the glyphs are drawn from), `2` text (an image of pre-rendered text); `3` world (textures of the 3D scene), v3 and v4 |
 | 4 | `XRTP_FLAG_BC3` | the payload is BC3 blocks |
-| 5 | `XRTP_FLAG_BC1` | the payload is BC1 blocks, v3 only; never with bit 4 |
+| 5 | `XRTP_FLAG_BC1` | the payload is BC1 blocks, v3 and v4; never with bit 4 |
+| 6 | `XRTP_FLAG_DETILE_HEX` | v4 only, world entries only (a reader refuses it on another kind): with `textures.detile` on, the entry samples hex-tiled (`src/d3d/nv2a_hex_tile.h`). The payload is unchanged; a writer marks only organic tiles, never bricks or planks. Only a stage that wraps on both axes samples hex-tiled (`nv2a_hex_wrap_ok`); clamp, mirror and border keep the stock read. If the hex shader does not compile, the draw keeps the stock shader |
 
 Each version refuses what it does not define (a v2 file with kind 3 or bit 5,
 any file with another bit), so a later meaning is never misread by this
-reader. The kind is the unit a player turns off (`textures.font`,
+reader. A runtime from before v4 refuses a v4 pack whole (bit 6 is a flag it
+does not know), so a toolkit that reads v4 must ship before, or with, the
+tool that writes it. The kind is the unit a player turns off (`textures.font`,
 `textures.text`, `textures.world`, [config.md](../runtime/config.md)): a
 turned-off entry is not found, and the guest texture goes up as without a
 pack. The header scale describes the art; each entry carries its own size,

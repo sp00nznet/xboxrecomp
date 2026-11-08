@@ -5,6 +5,7 @@
  */
 
 #include "d3d8_msl.h"
+#include "nv2a_hex_tile.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -225,6 +226,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
              "    atomic_fetch_max_explicit(o + 2u, q.y + 1u, memory_order_relaxed);\n"
              "    atomic_fetch_max_explicit(o + 3u, 33554432u - q.y, memory_order_relaxed);\n"
              "}\n");
+    if (state->hex_tile)
+        EMIT("%s", D3D8_MSL_HEX);
     EMIT("fragment %s fs_main(VOut i [[stage_in]],\n"
          "                        constant PsConsts &pc [[buffer(0)]]",
          state->w_depth ? "FOut" : "float4");
@@ -232,6 +235,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
         EMIT(",\n                        constant WDepth &wd [[buffer(1)]]");
     if (state->tex_mag)
         EMIT(",\n                        device atomic_uint *mag [[buffer(2)]]");
+    if (state->hex_tile)
+        EMIT(",\n                        constant uint4 &tex_detile [[buffer(3)]]");
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
         int m = (int)state->tex_mode[i];
         if (m == NV2A_TEXMODE_NONE || m == NV2A_TEXMODE_PASSTHRU
@@ -312,6 +317,9 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                      8 + i, 8 + in, i, i);
             EMIT("    }\n");
         } else {
+            /* As the HLSL: only a stage declared texture2d. */
+            int hex = state->hex_tile
+                      && !nv2a_texmode_cube_decl(m, state->bump_on && state->tex_cube[i]);
             EMIT("    {\n");
             EMIT("        float2 uv = i.t%d.xy;\n", i);
             if (m == NV2A_TEXMODE_2D)
@@ -325,6 +333,12 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                      " mag_uv[%d]);\n", i, i, i, i, i, i);
                 spans |= 1u << i;
             }
+            /* As the HLSL, with the stage's LOD bias in the gradients as
+             * the snap's (gradient2d takes no bias()). */
+            if (hex)
+                EMIT("        float2 hex_t = uv * pc.tex_scale[%d].xy;\n"
+                     "        float2 hex_dx = dfdx(hex_t) * exp2(pc.tex_bias[%d]),"
+                     " hex_dy = dfdy(hex_t) * exp2(pc.tex_bias[%d]);\n", i, i, i);
             if (state->rect_snap && state->snap_2d) {
                 /* As the HLSL: a .z < 0 stage samples with the 1x
                  * gradients. gradient2d takes no bias(), so the stage's
@@ -338,12 +352,21 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                 else
                     EMIT("        uv *= pc.tex_scale[%d].xy;\n", i);
                 EMIT("        if (pc.tex_scale[%d].z < 0.0)"
-                     " x%d = tex%d.sample(samp%d, uv, gradient2d(g.xy, g.zw));\n"
-                     "        else x%d = tex%d.sample(samp%d, uv, bias(pc.tex_bias[%d]));\n",
-                     i, 8 + i, i, i, 8 + i, i, i, i);
+                     " x%d = tex%d.sample(samp%d, uv, gradient2d(g.xy, g.zw));\n",
+                     i, 8 + i, i, i);
+                if (hex)
+                    EMIT("        else if (tex_detile[%d] != 0u)"
+                         " x%d = nv2a_hex(tex%d, samp%d, hex_t, hex_dx, hex_dy);\n",
+                         i, 8 + i, i, i);
+                EMIT("        else x%d = tex%d.sample(samp%d, uv, bias(pc.tex_bias[%d]));\n",
+                     8 + i, i, i, i);
             } else {
                 if (state->rect_snap)
                     EMIT("        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[%d]);\n", i);
+                if (hex)
+                    EMIT("        if (tex_detile[%d] != 0u)"
+                         " x%d = nv2a_hex(tex%d, samp%d, hex_t, hex_dx, hex_dy);\n"
+                         "        else\n", i, 8 + i, i, i);
                 if (state->rt_offset)
                     /* hor+: tex_scale.w moves a centred batch's read into the
                      * guest columns of a padded render target (0 elsewhere). */

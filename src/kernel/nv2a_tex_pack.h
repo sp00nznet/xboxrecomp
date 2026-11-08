@@ -9,9 +9,9 @@
  * view, and a texture the game rewrites stops matching.
  *
  * File format (docs/formats/texture-pack.md), little-endian:
- *   header  "XRTP", u32 version (1, 2 or 3), u32 count, u32 scale,
+ *   header  "XRTP", u32 version (1 to 4), u32 count, u32 scale,
  *           u64 index offset, v1: u64 reserved; v2: u32 text scale,
- *           u32 reserved; v3: u32 text scale, u32 classes
+ *           u32 reserved; v3 and v4: u32 text scale, u32 classes
  *   index   count x 32 bytes, sorted by hash: u64 hash, u32 width,
  *           u32 height, u32 levels, u32 flags, u64 payload offset
  *   payload per entry, level 0 then each further level, one A8R8G8B8
@@ -21,7 +21,10 @@
  * v1 flags are 0. v2 flags: bits 0-1 the kind (art, font atlas, baked
  * text: the unit a player turns off), bit 4 a BC3 payload. v3 adds kind 3
  * (world) and bit 5 (a BC1 payload), and gives the header word at +28 to
- * `classes`, a bit per kind present, informational. Each version refuses
+ * `classes`, a bit per kind present, informational. v4 adds bit 6, a world
+ * entry the backends sample hex-tiled under textures.detile
+ * (nv2a_hex_tile.h); the CLI writes v4 only for a pack that marks one, so
+ * a stock pack stays v3. Each version refuses
  * what it does not define, so a later meaning is never misread. The header
  * scale is the art scale; each entry carries its own size, so text built
  * at 2x and art at 4x share one pack.
@@ -46,7 +49,7 @@ extern "C" {
 #endif
 
 #define NV2A_TEX_PACK_MAGIC   "XRTP"
-#define NV2A_TEX_PACK_VERSION 3u   /* the newest read; 1 and 2 are read too */
+#define NV2A_TEX_PACK_VERSION 4u   /* the newest read; 1 to 3 are read too */
 #define NV2A_TEX_PACK_HDR     32u
 #define NV2A_TEX_PACK_ENTRY   32u
 #define NV2A_TEX_PACK_MAX_DIM 16384u   /* D3D11 and Metal texture limit */
@@ -67,7 +70,9 @@ extern "C" {
 #define XRTP_FLAG_BC3   0x10u /* payload is BC3 blocks, not A8R8G8B8 texels */
 #define XRTP_FLAG_BC1   0x20u /* v3: payload is BC1 blocks, always opaque */
 #define XRTP_FLAGS_KNOWN_V2 (XRTP_KIND_MASK | XRTP_FLAG_BC3)
+#define XRTP_FLAG_DETILE_HEX 0x40u /* v4: a world entry, hex-tiled (textures.detile) */
 #define XRTP_FLAGS_KNOWN_V3 (XRTP_KIND_MASK | XRTP_FLAG_BC3 | XRTP_FLAG_BC1)
+#define XRTP_FLAGS_KNOWN_V4 (XRTP_FLAGS_KNOWN_V3 | XRTP_FLAG_DETILE_HEX)
 
 /* nv2a_tex_pack_entry.bc: the payload's block format. */
 #define XRTP_BC_NONE 0
@@ -102,6 +107,9 @@ unsigned nv2a_tex_pack_version(void);
 unsigned nv2a_tex_pack_kind_count(uint32_t kind);
 unsigned nv2a_tex_pack_bc1_count(void);
 unsigned nv2a_tex_pack_bc3_count(void);
+/* Entries marked XRTP_FLAG_DETILE_HEX, for the log line and the backends:
+ * 0, and no draw takes the hex variant. */
+unsigned nv2a_tex_pack_detile_count(void);
 /* The scale the TEXT entries were built at: the u32 at header +24 from v2
  * on (0 in the file means the header scale). Informational, like the scale. */
 unsigned nv2a_tex_pack_text_scale(void);

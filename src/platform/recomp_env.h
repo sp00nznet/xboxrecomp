@@ -100,6 +100,7 @@ extern "C" {
     X(TEXTURES_FONT,     CONFIG, "RECOMP_TEXTURES_FONT",     NULL, "enhancements: textures.font, the pack's font-atlas entries, on (default) or off") \
     X(TEXTURES_TEXT,     CONFIG, "RECOMP_TEXTURES_TEXT",     NULL, "enhancements: textures.text, the pack's baked-text entries, on (default) or off") \
     X(TEXTURES_WORLD,    CONFIG, "RECOMP_TEXTURES_WORLD",    NULL, "enhancements: textures.world, the pack's world entries, on (default) or off") \
+    X(TEXTURES_DETILE,   CONFIG, "RECOMP_TEXTURES_DETILE",   NULL, "enhancements: textures.detile, world entries the pack marks detile = hex sample hex-tiled to hide their repeat, off (default) or on") \
     X(INPUT_PAD_SQUARE_LEFT,  CONFIG, "RECOMP_INPUT_PAD_SQUARE_LEFT",  NULL, "enhancements: input.pad_square_left, circle-to-square mapping of the left host stick so a full diagonal reads about (1,1) like the Duke's square gate (full diagonal movement), blended in from 0.7 of full so drift and partial tilts keep their length; ramped left-stick keys keep their diagonal at (1,1) too (1/0, default 0)") \
     X(INPUT_PAD_SQUARE_RIGHT, CONFIG, "RECOMP_INPUT_PAD_SQUARE_RIGHT", NULL, "enhancements: input.pad_square_right, the same for the right host stick (1/0, default 0)") \
     X(INPUT_CHORD_DELAY_MS, CONFIG, "RECOMP_INPUT_CHORD_DELAY_MS", NULL, "enhancements: input.chord_delay_ms, ms a host-action chord member is held back from the game after its press, 0 (default) to 100") \

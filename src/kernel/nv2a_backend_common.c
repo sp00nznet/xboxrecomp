@@ -1076,6 +1076,8 @@ void nv2a_host_opts_request(const struct nv2a_host_opts *o, unsigned mask)
         s_req_opts.overscan = o->overscan;
     if (mask & NV2A_OPT_SNAP2D)
         s_req_opts.snap_2d = o->snap_2d;
+    if (mask & NV2A_OPT_DETILE)
+        s_req_opts.detile = o->detile;
     s_req_mask |= mask;
     req_unlock();
     atomic_store_explicit(&s_req_pending, 1u, memory_order_release);
@@ -1146,6 +1148,10 @@ unsigned nv2a_host_opts_apply(void)
     if ((mask & NV2A_OPT_SNAP2D) && !r.snap_2d != !s_host_opts.snap_2d) {
         s_host_opts.snap_2d = r.snap_2d != 0;
         changed |= NV2A_OPT_SNAP2D;
+    }
+    if ((mask & NV2A_OPT_DETILE) && !r.detile != !s_host_opts.detile) {
+        s_host_opts.detile = r.detile != 0;
+        changed |= NV2A_OPT_DETILE;
     }
     if (changed)
         atomic_fetch_add_explicit(&s_opts_gen, 1u, memory_order_release);

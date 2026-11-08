@@ -93,6 +93,7 @@
 #include "nv2a_basic_msl.h"
 #include "nv2a_scene_ao.h"
 #include "nv2a_scene_ao_shaders.h"
+#include "nv2a_hex_tile.h"   /* nv2a_hex_wrap_ok */
 #include "metal_compile.h"
 #ifdef XBOXRECOMP_ENHANCE
 #include "nv2a_dbg_draw.h"
@@ -1243,6 +1244,9 @@ typedef struct {
     /* What the sampler follows (nv2a_stage_lod): the entry's scale over the
      * guest texture, and its chain. 1 and the guest's levels for guest texels. */
     uint32_t       pack_scale, pack_levels;
+    /* The pack entry it holds is marked XRTP_FLAG_DETILE_HEX: kept whatever
+     * textures.detile says, so the menu's toggle needs no re-upload. */
+    int            pack_detile;
     uint64_t       hash;
     int            live;
     id<MTLTexture> tex;
@@ -1458,8 +1462,10 @@ static id<MTLTexture> tex_make_cube(uint32_t size, uint32_t levels, const uint32
  * refuses a texture of the entry's size, the guest texels go up instead:
  * the pack only ever adds detail, never a black texture. */
 static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube);
-/* What the last tex_upload left (TexEntry.pack_scale, .pack_levels). */
+/* What the last tex_upload left (TexEntry.pack_scale, .pack_levels,
+ * .pack_detile). */
 static uint32_t s_up_scale, s_up_levels;
+static int      s_up_detile;
 
 static id<MTLTexture> tex_upload(const Stage *t, uint64_t hash, int cube)
 {
@@ -1500,6 +1506,7 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
 
     s_up_scale = 1;
     s_up_levels = t->levels;
+    s_up_detile = 0;
     if (cube) {
         /* No pack entry is a cube map: the six faces go up from the guest.
          * tex_dump writes face 0, the first texels decoded. */
@@ -1529,6 +1536,7 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
         if (tex) {
             s_up_scale = nv2a_stage_pack_scale(t->width, pe->width);
             s_up_levels = pe->levels;
+            s_up_detile = (pe->flags & XRTP_FLAG_DETILE_HEX) != 0;
             nv2a_tex_pack_release(pe);
         }
         /* A refused entry is a miss too, tagged so in the trace. */
@@ -1665,6 +1673,7 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
                 e->pack_gen = pg;
                 e->pack_scale = s_up_scale;
                 e->pack_levels = s_up_levels;
+                e->pack_detile = s_up_detile;
                 [e->tex release];
                 e->tex = nt;
             }
@@ -1693,6 +1702,7 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
         e->pack_gen = nv2a_tex_pack_gen();
         e->pack_scale = s_up_scale;
         e->pack_levels = s_up_levels;
+        e->pack_detile = s_up_detile;
         e->tex = nt;
         e->live = 1;
     }
@@ -1750,6 +1760,9 @@ static int border_colour(uint32_t argb)
  * entry). */
 static uint32_t s_stage_pack[4][2];
 static uint64_t s_stage_hash[4];
+/* The bound entry is marked detile (TexEntry.pack_detile); 0 for anything
+ * else. */
+static int      s_stage_detile[4];
 
 static void stage_from_cache(int k)
 {
@@ -1757,6 +1770,7 @@ static void stage_from_cache(int k)
         s_stage_pack[k][0] = s_tex_last->pack_scale;
         s_stage_pack[k][1] = s_tex_last->pack_levels;
         s_stage_hash[k] = s_tex_last->hash;
+        s_stage_detile[k] = s_tex_last->pack_detile;
     }
 }
 
@@ -2160,6 +2174,26 @@ static int s_fs_w;
  * D3D11, in the same terms. */
 static int s_fs_mag;
 
+/* textures.detile: the stages of this batch that sample hex-tiled, as the
+ * D3D11 detile_mask; non-zero selects the hex variant, whose flags go in
+ * fragment buffer 3 (nv2a_hex_tile.h). */
+static unsigned s_fs_hex;
+
+static unsigned detile_mask(const RenderTarget *const srcs[4], const struct nv2a_ps_consts *pc)
+{
+    unsigned mask = 0;
+    int k;
+    if (!nv2a_host_opts()->detile || !nv2a_tex_pack_detile_count() || !s_fs_comb)
+        return 0;
+    for (k = 0; k < 4; k++)
+        if (s_stage_detile[k] && !srcs[k]
+            && !nv2a_stage_cube_bind(&s_stage[k], nv2a_stage_ps_mode(&s_stage[k], k))
+            && nv2a_hex_wrap_ok(s_stage[k].addr_u, s_stage[k].addr_v)
+            && pc->tex_scale[k][2] == 0.0f && pc->tex_scale[k][3] == 0.0f)
+            mask |= 1u << k;
+    return mask;
+}
+
 static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w);
 
 /* The fragment function for the batch: its register combiners when they
@@ -2200,7 +2234,8 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
             | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u)
             | (w ? 8u : 0u)    /* W-buffered: the w_depth variant */
-            | (s_fs_mag ? 16u : 0u);   /* the trace's variant */
+            | (s_fs_mag ? 16u : 0u)    /* the trace's variant */
+            | (s_fs_hex ? 32u : 0u);   /* textures.detile: nv2a_hex */
     key[37] = inputs;
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.fn;
@@ -2214,6 +2249,7 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
     st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */
     st.tex_mag = (int)(key[36] >> 4 & 1u);     /* RECOMP_TRACE=tex_mag */
+    st.hex_tile = (int)(key[36] >> 5 & 1u);    /* textures.detile */
     for (n = 0; n < 4; n++) {
         st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
         st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
@@ -2920,6 +2956,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     RenderTarget *rt;
     id<MTLRenderPipelineState> pso;
     id<MTLFunction> vfn, ffn;
+    int fs_wd = 0;   /* fs_select's w, for the detile re-pick */
     struct nv2a_vp_consts vc;
     MsPsConsts mpc;
     NSUInteger vb_off, ib_off, vbytes;
@@ -3008,8 +3045,9 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         /* The variant declares the buffer: no buffer, no variant. */
         s_fs_mag = nv2a_tex_mag_on() && d->program && mag_init();
-        ffn = fs_select(v, nv2a_w_depth_on(v, d->program != 0,
-                                           v->rc_set && (v->rc_ctl & 0xFF)));
+        s_fs_hex = 0;   /* known once the stages are bound, below */
+        fs_wd = nv2a_w_depth_on(v, d->program != 0, v->rc_set && (v->rc_ctl & 0xFF));
+        ffn = fs_select(v, fs_wd);
         for (i = 0; i < d->idx_count; i++) {
             if (d->idx[i] < lo) lo = d->idx[i];
             if (d->idx[i] > hi) hi = d->idx[i];
@@ -3145,6 +3183,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 stex[k] = s_black;
                 s_stage_pack[k][0] = s_stage_pack[k][1] = 1;
                 s_stage_hash[k] = 0;
+                s_stage_detile[k] = 0;
                 if (!t->mode || t->mode == 4)
                     continue;
                 textured = 1;
@@ -3276,6 +3315,21 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             mpc.b.tex_scale[k][0] *= sc;
             mpc.b.tex_scale[k][3] = off;
         }
+        /* The variant follows the bound entries, so it is picked again
+         * here; the stage loop's choices (s_fs_comb) do not change with it.
+         * A hex variant that does not compile keeps the stock function the
+         * stages were bound for, never fs_basic (as D3D11's retry). */
+        if ((s_fs_hex = detile_mask(srcs, &mpc.b)) != 0) {
+            int comb = s_fs_comb, fw = s_fs_w;
+            id<MTLFunction> hfn = fs_select(v, fs_wd);
+            if (s_fs_comb) {
+                ffn = hfn;
+            } else {
+                s_fs_hex = 0;
+                s_fs_comb = comb;
+                s_fs_w = fw;
+            }
+        }
         nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
         nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
         nv2a_vp_tie_fill(&vc, rt->hw, rt->hh);
@@ -3369,6 +3423,12 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             struct nv2a_wdepth_consts wc;
             nv2a_wdepth_consts_fill(v, d->prim, g->format, nv2a_host_render_scale(), &wc);
             [s_enc setFragmentBytes:&wc length:sizeof wc atIndex:1];
+        }
+        if (s_fs_hex && s_fs_comb) {
+            uint32_t hf[4];
+            for (k = 0; k < 4; k++)
+                hf[k] = s_fs_hex >> k & 1u;
+            [s_enc setFragmentBytes:hf length:sizeof hf atIndex:3];
         }
         for (k = 0; k < 4; k++) {
             [s_enc setFragmentTexture:stex[k] atIndex:k];

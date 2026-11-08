@@ -63,6 +63,7 @@
 #include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
 #include "nv2a_scene_ao.h"
 #include "nv2a_scene_ao_shaders.h"
+#include "nv2a_hex_tile.h"   /* nv2a_hex_wrap_ok */
 #include "shader_cache.h"
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
 #include "video/video_player.h"   /* xbox_FramebufferWindowTitleText */
@@ -1801,6 +1802,9 @@ typedef struct {
     /* What the sampler follows (nv2a_stage_lod): the entry's scale over the
      * guest texture, and its chain. 1 and tex_levels for guest texels. */
     uint32_t pack_scale, pack_levels;
+    /* The pack entry it holds is marked XRTP_FLAG_DETILE_HEX: kept whatever
+     * textures.detile says, so the menu's toggle needs no re-upload. */
+    int      pack_detile;
     ID3D11Texture2D          *tex;
     ID3D11ShaderResourceView *srv;
 } TexEntry;
@@ -2046,6 +2050,7 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
             }
         e->pack_scale = 1;
         e->pack_levels = levels;
+        e->pack_detile = 0;
         s_tex_uploads++;
         nv2a_stats_add(NV2A_STAT_TEX_UPLOADS, 1);
         if (levels > 1)
@@ -2098,6 +2103,7 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
     /* src is the guest's when the entry was refused above. */
     e->pack_scale = src != s_texels ? nv2a_stage_pack_scale(t->width, width) : 1u;
     e->pack_levels = levels;
+    e->pack_detile = pe && src != s_texels && (pe->flags & XRTP_FLAG_DETILE_HEX);
     if (pe && src != s_texels)
         nv2a_tex_pack_release(pe);
     s_tex_uploads++;
@@ -2312,6 +2318,68 @@ static int mag_init(void)
     else
         fprintf(stderr, LOGP "tex_mag: no device buffer; the trace reads nothing\n");
     return ok;
+}
+
+/* textures.detile: the hex variant's per-stage flags (b4, TexDetile in
+ * nv2a_hex_tile.h). Their own buffer, so PsConsts and the stock layout stay
+ * as they are; written only when the mask changes. */
+static ID3D11Buffer *s_detile_cb;
+static unsigned      s_detile_mask = ~0u;   /* what s_detile_cb holds */
+static int           s_detile_state;        /* 0 not tried, 1 ok, -1 failed */
+
+/* The stages of this draw that sample hex-tiled: those bound to a pack entry
+ * marked detile, read as plain 2D at their own coordinate with wrap on both
+ * axes (nv2a_hex_wrap_ok). A render target, a cube (flat_mask), a snapped or
+ * rect stage (tex_scale.z), a hor+ read (tex_scale.w) and a clamped or
+ * mirrored stage keep the stock sample. */
+static unsigned detile_mask(TexEntry *const e[4], RenderTarget *const rt[4], unsigned flat_mask,
+                            const PsConsts *pc)
+{
+    unsigned mask = 0;
+    int n;
+    if (!nv2a_host_opts()->detile || !nv2a_tex_pack_detile_count())
+        return 0;
+    for (n = 0; n < 4; n++)
+        if (e[n] && e[n]->pack_detile && !rt[n] && !(flat_mask >> n & 1)
+            && nv2a_hex_wrap_ok(s_stage[n].addr_u, s_stage[n].addr_v)
+            && pc->tex_scale[n][2] == 0.0f && pc->tex_scale[n][3] == 0.0f)
+            mask |= 1u << n;
+    return mask;
+}
+
+/* Binds the flags for a hex draw; 0 when the buffer could not be made, and
+ * the draw then takes the stock variant. */
+static int detile_bind(unsigned mask)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (!s_detile_state) {
+        D3D11_BUFFER_DESC bd;
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = 16;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        s_detile_state = SUCCEEDED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_detile_cb))
+                         ? 1 : -1;
+        if (s_detile_state < 0)
+            fprintf(stderr, LOGP "textures.detile: no constant buffer; stock sampling\n");
+    }
+    if (s_detile_state < 0)
+        return 0;
+    if (mask != s_detile_mask) {
+        uint32_t f[4];
+        int n;
+        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_detile_cb, 0,
+                                           D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            return 0;
+        for (n = 0; n < 4; n++)
+            f[n] = mask >> n & 1u;
+        memcpy(m.pData, f, sizeof f);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_detile_cb, 0);
+        s_detile_mask = mask;
+    }
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 4, 1, &s_detile_cb);
+    return 1;
 }
 
 /* Reads one vertex's position (surface pixels) and stage k's texcoord. */
@@ -3236,6 +3304,9 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         } memo;
         uint32_t key[38];
         int hit;
+        unsigned hexmask = detile_mask(lm.e, s_stage_rt, flat_mask, &pc);
+        if (hexmask && !detile_bind(hexmask))
+            hexmask = 0;
         memcpy(key, v->rc_cicw, 32);
         memcpy(key + 8, v->rc_aicw, 32);
         memcpy(key + 16, v->rc_cocw, 32);
@@ -3248,7 +3319,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
                 | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u)
                 | (w ? 8u : 0u)    /* W-buffered: the w_depth variant */
-                | (mag_shader(d) ? 16u : 0u);   /* the trace's variant */
+                | (mag_shader(d) ? 16u : 0u)    /* the trace's variant */
+                | (hexmask ? 32u : 0u);         /* textures.detile: nv2a_hex */
         key[37] = inputs;
         hit = memo_on() && memo.key_ok && !memcmp(memo.r, key, sizeof key);
         if (!hit) {
@@ -3261,6 +3333,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
             st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
             st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */
             st.tex_mag = (int)(key[36] >> 4 & 1u);     /* RECOMP_TRACE=tex_mag */
+            st.hex_tile = (int)(key[36] >> 5 & 1u);    /* textures.detile */
             for (n = 0; n < 4; n++) {
                 st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
                 st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
@@ -3288,6 +3361,17 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
             memo.compiles = s_rc_compiles;
             memo.ps_ok = 1;
         }
+        int hex_failed = 0;
+        if (!ps && s_last_rc.hex_tile) {
+            /* The hex variant did not compile: the same state's stock text,
+             * which reads the textures already bound, rather than
+             * stages_flat. combiner_ps remembers the failure. */
+            static NV2ACombinerState sh;
+            sh = s_last_rc;
+            sh.hex_tile = 0;
+            ps = combiner_ps(&sh);
+            hex_failed = 1;
+        }
         if (ps && (!w || st_w_on(w, d))) {
             s_ps_w = w;
             return ps;
@@ -3299,6 +3383,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
             static NV2ACombinerState st0;
             st0 = s_last_rc;
             st0.w_depth = 0;
+            if (hex_failed)
+                st0.hex_tile = 0;
             ps = combiner_ps(&st0);
             if (ps)
                 return ps;

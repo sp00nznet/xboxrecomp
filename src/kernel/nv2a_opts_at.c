@@ -73,6 +73,9 @@ int nv2a_opts_at_parse(const char *p, struct nv2a_opts_at *out)
                 } else if (OPTS_AT_KEY("snap_2d")) {
                     e.o.snap_2d = n != 0;
                     e.mask = NV2A_OPT_SNAP2D;
+                } else if (OPTS_AT_KEY("detile")) {
+                    e.o.detile = n != 0;
+                    e.mask = NV2A_OPT_DETILE;
                 } else {
                     ok = 0;
                 }

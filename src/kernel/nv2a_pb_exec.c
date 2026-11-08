@@ -1369,6 +1369,7 @@ static void opts_at_flip(uint32_t flip)
         if (e->mask & NV2A_OPT_MOVIE) o.movie_mode = e->o.movie_mode;
         if (e->mask & NV2A_OPT_OVERSCAN) o.overscan = e->o.overscan;
         if (e->mask & NV2A_OPT_SNAP2D) o.snap_2d = e->o.snap_2d;
+        if (e->mask & NV2A_OPT_DETILE) o.detile = e->o.detile;
         nv2a_host_opts_request(&o, e->mask);
     }
 }

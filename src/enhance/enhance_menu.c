@@ -146,6 +146,7 @@ static void e_snap(struct nv2a_host_opts *o, const char *v) { o->snap_2d = on_te
 static void e_full(struct nv2a_host_opts *o, const char *v) { o->fullscreen = on_text(v); }
 static void e_overscan(struct nv2a_host_opts *o, const char *v) { o->overscan = (unsigned)atoi(v); }
 static void e_pack(struct nv2a_host_opts *o, const char *v) { (void)v; o->pack_off = s_pack_off; }
+static void e_detile(struct nv2a_host_opts *o, const char *v) { o->detile = on_text(v); }
 
 static int index_of(const char *const *c, const char *v)
 {
@@ -170,6 +171,7 @@ static void e_movie(struct nv2a_host_opts *o, const char *v)
 static void set_scale(const struct enhance_item *it, const char *v) { (void)it; req(e_scale, v, NV2A_OPT_SCALE); }
 static void set_aniso(const struct enhance_item *it, const char *v) { (void)it; req(e_aniso, v, NV2A_OPT_ANISO); }
 static void set_snap(const struct enhance_item *it, const char *v) { (void)it; req(e_snap, v, NV2A_OPT_SNAP2D); }
+static void set_detile(const struct enhance_item *it, const char *v) { (void)it; req(e_detile, v, NV2A_OPT_DETILE); }
 static void set_filter(const struct enhance_item *it, const char *v) { (void)it; req(e_filter, v, NV2A_OPT_FILTER); }
 static void set_full(const struct enhance_item *it, const char *v) { (void)it; req(e_full, v, NV2A_OPT_FULLSCREEN); }
 static void set_overscan(const struct enhance_item *it, const char *v) { (void)it; req(e_overscan, v, NV2A_OPT_OVERSCAN); }
@@ -246,6 +248,13 @@ static const char *get_snap(const struct enhance_item *it, char *b, size_t n)
 {
     (void)it;
     snprintf(b, n, "%s", nv2a_host_opts()->snap_2d ? "true" : "false");
+    return b;
+}
+
+static const char *get_detile(const struct enhance_item *it, char *b, size_t n)
+{
+    (void)it;
+    snprintf(b, n, "%s", nv2a_host_opts()->detile ? "on" : "off");
     return b;
 }
 
@@ -512,6 +521,10 @@ static const struct enhance_item k_items[] = {
       .set = set_pack_bit, .get = get_pack_bit, .live = ENHANCE_LIVE_FLUSH, .def = "on",
       .user = (void *)(uintptr_t)NV2A_PACK_OFF_WORLD,
       .help = "Uses the pack's world textures in place of the game's" },
+    { ITEM("textures.detile", "Hide tile repeats", "Pack", ENHANCE_ITEM_CHOICE),
+      .choices = k_onoff, .set = set_detile, .get = get_detile, .def = "off",
+      .help = "Blends shifted copies of the ground textures the pack marks, so their "
+              "repeat does not show" },
     { ITEM("overlay.stats", "Stats strip", "Stats", ENHANCE_ITEM_TOGGLE), .set = set_stats,
       .get = get_stats, .def = "false",
       .help = "Shows frame time and rate in a strip over the game" },
@@ -2623,6 +2636,8 @@ static void build_rows(void)
                 slot_row("textures.world");
             else
                 info("Pack world", "none in this pack");
+            if (nv2a_tex_pack_detile_count())
+                slot_row("textures.detile");
             info("Entries", "%u (%u art, %u font, %u text, %u world)", n,
                  nv2a_tex_pack_kind_count(XRTP_KIND_ART), nv2a_tex_pack_kind_count(XRTP_KIND_FONT),
                  nv2a_tex_pack_kind_count(XRTP_KIND_TEXT),

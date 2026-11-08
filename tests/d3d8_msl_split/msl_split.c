@@ -444,6 +444,74 @@ static int wdepth_check(void)
     return bad;
 }
 
+/* hex_tile (textures.detile): the helper beside mag_span, the stage's
+ * coordinate and derivatives before the branch, the uniform branch on
+ * tex_detile, the stock sample in its else; under snap_2d after the .z < 0
+ * SampleGrad. Without the flag none of it, so the hashed cases above stay
+ * the stock text. */
+static int hex_check(void)
+{
+    static const uint32_t zero[8];
+    static char text[256 * 1024];
+    NV2ACombinerState st;
+    int bad = 0;
+
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u, 1u, &st);
+    st.hex_tile = 1;
+    if (d3d8_combiners_generate_msl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (!strstr(text, "constant uint4 &tex_detile [[buffer(3)]]")
+            || !strstr(text, "static inline float4 nv2a_hex(texture2d<float> tx, sampler sm, float2 t, float2 dx,")
+            || !strstr(text, "gradient2d(dx, dy));")
+            || !strstr(text, "uint n = (q.x ^ q.y) * 1597334673u;")
+            || !strstr(text, "float2 hex_dx = dfdx(hex_t) * exp2(pc.tex_bias[0]), hex_dy = dfdy(hex_t) * exp2(pc.tex_bias[0]);")
+            || !strstr(text, "        if (tex_detile[0] != 0u) x8 = nv2a_hex(tex0, samp0, hex_t, hex_dx, hex_dy);\n        else\n        x8 = tex0.sample(samp0, uv * pc.tex_scale[0].xy, bias(pc.tex_bias[0]));")) {
+        printf("FAIL: the hex_tile variant's text\n");
+        bad = 1;
+    }
+    st.rect_snap = 1;
+    st.snap_2d = 1;
+    if (d3d8_combiners_generate_msl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (!strstr(text, "        else if (tex_detile[0] != 0u) x8 = nv2a_hex(tex0, samp0, hex_t, hex_dx, hex_dy);\n        else x8 = tex0.sample(samp0, uv, bias(pc.tex_bias[0]));")) {
+        printf("FAIL: the hex_tile variant's snap_2d branch\n");
+        bad = 1;
+    }
+    st.hex_tile = 0;
+    if (d3d8_combiners_generate_msl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (strstr(text, "hex") || strstr(text, "detile")) {
+        printf("FAIL: hex_tile text without the flag\n");
+        bad = 1;
+    }
+    /* Every hex variant the key can ask for compiles: one stage or four,
+     * with rect_snap, snap_2d, hor+'s rt_offset and the W epilogue. */
+    for (int v = 0; v < 32; v++) {
+        int before = s_compile_bad;
+        memset(&st, 0, sizeof st);
+        d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u,
+                                 (v & 8) ? (1u | 1u << 5 | 1u << 10 | 1u << 15) : 1u, &st);
+        st.fog_input = 1;
+        st.bump_on = 1;
+        st.hex_tile = 1;
+        st.rect_snap = v & 1;
+        st.snap_2d = (v >> 1) & st.rect_snap;
+        st.rt_offset = (v >> 2) & 1;
+        st.w_depth = (v >> 4) & 1;
+        int n = d3d8_combiners_generate_msl(&st, text, (int)sizeof text);
+        if (n <= 0 || !strstr(text, "nv2a_hex(tex0")) {
+            printf("FAIL: hex variant %d has no hex read\n", v);
+            bad = 1;
+            continue;
+        }
+        compile_case("rc-hex", v, text, n, "fs_main");
+        if (s_compile_bad != before)
+            bad = 1;
+    }
+    return bad;
+}
+
 int main(void)
 {
     static uint32_t prog[NV2A_VS_MAX_INSTRUCTIONS * 4];
@@ -524,6 +592,8 @@ int main(void)
     if (dot_check())
         return 1;
     if (tex_mag_check())
+        return 1;
+    if (hex_check())
         return 1;
     if (wdepth_check())
         return 1;

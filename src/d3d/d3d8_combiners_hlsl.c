@@ -3,6 +3,7 @@
  */
 
 #include "d3d8_hlsl.h"
+#include "nv2a_hex_tile.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -247,6 +248,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
              "    InterlockedMax(mag_buf[o + 2u], q.y + 1u, was);\n"
              "    InterlockedMax(mag_buf[o + 3u], 33554432u - q.y, was);\n"
              "}\n");
+    if (state->hex_tile)
+        EMIT("%s", D3D8_HLSL_HEX);
     if (state->rect_snap)
         EMIT("%s", D3D8_HLSL_SNAP_UV);
     if (state->rect_snap && state->snap_2d)
@@ -333,6 +336,9 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                      8 + i, 8 + in, i, i);
             EMIT("    }\n");
         } else {
+            /* textures.detile: only a stage declared Texture2D. */
+            int hex = state->hex_tile
+                      && !nv2a_texmode_cube_decl(m, state->bump_on && state->tex_cube[i]);
             EMIT("    {\n");
             EMIT("        float2 uv = i.tc%d.xy;\n", i);
             if (m == NV2A_TEXMODE_2D)
@@ -351,6 +357,13 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                      " mag_uv[%d]);\n", i, i, i, i, i, i);
                 spans |= 1u << i;
             }
+            /* The coordinate nv2a_hex samples and its derivatives, here in
+             * uniform flow. The CPU sets tex_detile only where no snap or
+             * offset applies (tex_scale .z and .w 0), so it is the one the
+             * stock sample reads. */
+            if (hex)
+                EMIT("        float2 hex_t = uv * tex_scale[%d].xy;\n"
+                     "        float2 hex_dx = ddx(hex_t), hex_dy = ddy(hex_t);\n", i);
             if (state->rect_snap && state->snap_2d) {
                 /* A 2D-snapped stage (.z < 0) samples with the 1x
                  * gradients, so its mip level and min/mag choice are the
@@ -363,12 +376,21 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                          i, i);
                 else
                     EMIT("        uv *= tex_scale[%d].xy;\n", i);
-                EMIT("        if (tex_scale[%d].z < 0.0) x%d = tex%d.SampleGrad(samp%d, uv, g.xy, g.zw);\n"
-                     "        else x%d = tex%d.Sample(samp%d, uv);\n",
-                     i, 8 + i, i, i, 8 + i, i, i);
+                EMIT("        if (tex_scale[%d].z < 0.0) x%d = tex%d.SampleGrad(samp%d, uv, g.xy, g.zw);\n",
+                     i, 8 + i, i, i);
+                if (hex)
+                    EMIT("        else if (tex_detile[%d] != 0u)"
+                         " x%d = nv2a_hex(tex%d, samp%d, hex_t, hex_dx, hex_dy);\n",
+                         i, 8 + i, i, i);
+                EMIT("        else x%d = tex%d.Sample(samp%d, uv);\n", 8 + i, i, i);
             } else {
                 if (state->rect_snap)
                     EMIT("        uv = nv2a_snap_uv(uv, i.pos.xy, tex_scale[%d]);\n", i);
+                /* A uniform branch, as the snap's on tex_scale.z. */
+                if (hex)
+                    EMIT("        if (tex_detile[%d] != 0u)"
+                         " x%d = nv2a_hex(tex%d, samp%d, hex_t, hex_dx, hex_dy);\n"
+                         "        else\n", i, 8 + i, i, i);
                 if (state->rt_offset)
                     /* hor+: tex_scale.w moves a centred batch's read into the
                      * guest columns of a padded render target (0 elsewhere). */

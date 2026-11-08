@@ -26,7 +26,7 @@ typedef struct stat pack_stat_t;
 
 static struct nv2a_tex_pack_entry *s_entries;
 static unsigned  s_count, s_scale, s_text_scale, s_version;
-static unsigned  s_kind_count[XRTP_KIND_COUNT], s_bc1_count, s_bc3_count;
+static unsigned  s_kind_count[XRTP_KIND_COUNT], s_bc1_count, s_bc3_count, s_detile_count;
 static char     *s_path;
 static uint64_t  s_hits;
 
@@ -152,6 +152,7 @@ void nv2a_tex_pack_unload(void)
     s_version = 0;
     memset(s_kind_count, 0, sizeof s_kind_count);
     s_bc1_count = 0;
+    s_detile_count = 0;
     s_bc3_count = 0;
     s_hits = 0;
     memset(s_miss, 0, sizeof s_miss);
@@ -167,7 +168,7 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
     long long size;
     uint64_t index_off;
     uint32_t count, version, scale, text_scale = 0, known = 0, kinds_read = 0;
-    unsigned i, kinds[XRTP_KIND_COUNT] = {0}, bc1 = 0, bc3 = 0;
+    unsigned i, kinds[XRTP_KIND_COUNT] = {0}, bc1 = 0, bc3 = 0, detile = 0;
     struct nv2a_tex_pack_entry *entries = NULL;
     const char *why = NULL;
 
@@ -210,6 +211,9 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
         kinds_read = 3u;
     } else if (version == 3u) {
         known = XRTP_FLAGS_KNOWN_V3;
+        kinds_read = 4u;
+    } else if (version == 4u) {
+        known = XRTP_FLAGS_KNOWN_V4;
         kinds_read = 4u;
     }
     if (version < 1u || version > NV2A_TEX_PACK_VERSION)
@@ -267,6 +271,11 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
             why = "entry with unknown flags";
         else if (version >= 2u && (e->flags & XRTP_KIND_MASK) >= kinds_read)
             why = "entry with an unknown kind";
+        /* Hex tiling breaks a straight-lined image (text, a HUD frame):
+         * only the scene's textures carry it. */
+        else if ((e->flags & XRTP_FLAG_DETILE_HEX)
+                 && (e->flags & XRTP_KIND_MASK) != XRTP_KIND_WORLD)
+            why = "detile mark on a non-world entry";
         else if ((e->flags & XRTP_FLAG_BC3) && (e->flags & XRTP_FLAG_BC1))
             why = "entry with two block formats";
         /* D3D11 refuses a block-compressed texture whose top level is not
@@ -289,6 +298,7 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
             kinds[e->kind]++;
             bc1 += e->bc == XRTP_BC_1 ? 1u : 0u;
             bc3 += e->bc == XRTP_BC_3 ? 1u : 0u;
+            detile += (e->flags & XRTP_FLAG_DETILE_HEX) ? 1u : 0u;
         }
     }
     free(index);
@@ -313,6 +323,7 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
     memcpy(s_kind_count, kinds, sizeof kinds);
     s_bc1_count = bc1;
     s_bc3_count = bc3;
+    s_detile_count = detile;
     return (int)count;
 }
 
@@ -349,6 +360,11 @@ unsigned nv2a_tex_pack_bc1_count(void)
 unsigned nv2a_tex_pack_bc3_count(void)
 {
     return s_bc3_count;
+}
+
+unsigned nv2a_tex_pack_detile_count(void)
+{
+    return s_detile_count;
 }
 
 uint64_t nv2a_tex_pack_hits(void)

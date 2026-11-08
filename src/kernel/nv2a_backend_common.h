@@ -1717,6 +1717,9 @@ struct nv2a_host_opts {
                                  * side edge at present, 0 = stock (nv2a_present_crop) */
     int      snap_2d;           /* render.snap_2d: above scale 1, 2D batches sample
                                  * on the guest grid (nv2a_snap_flat2d); 0 = off */
+    int      detile;            /* textures.detile: stages bound to a pack entry
+                                 * marked XRTP_FLAG_DETILE_HEX sample hex-tiled
+                                 * (nv2a_hex_tile.h); 0 = off */
 };
 
 /* pack_off bits: the whole pack, or one kind of entry (nv2a_tex_pack.h). */
@@ -1730,7 +1733,8 @@ struct nv2a_host_opts {
  * OVERSCAN need nothing from a backend at the flip: the samplers are keyed
  * on the aniso value, the movie placement is read at each movie draw and the
  * crop at each present, so the stored value is the whole change. SNAP2D
- * is read at each draw (nv2a_snap_flat2d) the same way. */
+ * is read at each draw (nv2a_snap_flat2d) the same way, and DETILE at each
+ * draw's stage setup (the texture cache keeps the pack's mark either way). */
 #define NV2A_OPT_SCALE      0x1u
 #define NV2A_OPT_FILTER     0x2u
 #define NV2A_OPT_FULLSCREEN 0x4u
@@ -1739,6 +1743,7 @@ struct nv2a_host_opts {
 #define NV2A_OPT_MOVIE      0x20u
 #define NV2A_OPT_OVERSCAN   0x40u
 #define NV2A_OPT_SNAP2D     0x80u
+#define NV2A_OPT_DETILE     0x100u
 /* display.overscan's range (enhance.c clamps the key to it): 10% of a
  * 640-wide frame a side, past any TV's overscan. */
 #define NV2A_OVERSCAN_MAX   64u
