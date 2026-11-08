@@ -17,18 +17,22 @@
  *    glow pass reading the 3D), and at the flip. After an event it re-arms
  *    after rearm_draws more depth-writing draws. A frame drawn in chunks
  *    (BLiNX 2) or one whose world is split by a lone 2D draw (JSRF) has
- *    several events; the occlusion runs at the last one, whose ordinal the
- *    previous frames left (the memo), since the last is only known at the
- *    flip. The memo is the count of the frame one period back: a game whose
- *    count cycles (N, N, N + 1 on the Deck) would otherwise fire
- *    early or miss on two frames in three. After a scene change the memo
- *    lags by up to the period (4 frames), unless a loading screen (a frame
- *    with no events and no 3D) clears the history. One event short of the
- *    memo, an event that looks like that frame's last one (same cause after
- *    the same cause, as many depth draws since, and clearly unlike the
- *    event before the last) fires too: a frame that lost a chunk then
- *    still gets its occlusion. "The first 2D draw after 3D" does not work:
- *    Burnout 3 draws its 3D offscreen and its HUD is not classified as 2D.
+ *    several events; the occlusion runs at the last one, which is only
+ *    known at the flip, so it runs first at the ordinal the previous
+ *    frames left (the memo: the fewest events of the last 8 frames) and
+ *    again at each later event of the same target and at its flip (a
+ *    top-up: the backend occludes the pixels whose depth changed since its
+ *    last pass and corrects the others for the depth drawn since). Early costs a
+ *    pass, late a frame with no occlusion: no event follows the HUD. A
+ *    game whose count cycles or wanders (N, N, N + 1 on the Deck;
+ *    3, 2, 2 with slips at BLiNX 2's hub) so stays covered. A
+ *    loading screen (a frame with no events and no 3D) clears the
+ *    history. One event short of the memo, an event that looks like that
+ *    frame's last one (same cause after the same cause, as many depth
+ *    draws since, and clearly unlike the event before the last) fires
+ *    too: a frame that lost a chunk then still gets its occlusion. "The
+ *    first 2D draw after 3D" does not work: Burnout 3 draws its 3D
+ *    offscreen and its HUD is not classified as 2D.
  *  - The depth fit: the buffer stores z / zmax (oPos.z after the XDK
  *    epilogue's divide), d = A + B / w. FOV and planes are unknown, so the
  *    vertex programs' own output is sampled (the backend runs a few
@@ -97,7 +101,7 @@ int nv2a_ao_fit_z(const float *d, const float *iw, unsigned n, float min_conf,
 enum { NV2A_AO_WHY_RT = 1, NV2A_AO_WHY_NOZ, NV2A_AO_WHY_NODEPTH, NV2A_AO_WHY_SAMPLE,
        NV2A_AO_WHY_FLIP };
 #define NV2A_AO_EVENTS 16
-/* Event counts of the last frames that had any, for the memo's period
+/* Event counts of the last frames that had any, for the memo
  * (nv2a_ao_frame_end). */
 #define NV2A_AO_HIST 16
 
@@ -107,7 +111,9 @@ struct nv2a_ao_trig {
     uint32_t    disp_w, disp_h;   /* the last shown target's guest size */
     const void *cand;
     unsigned    zdraws, since;
-    int         armed, fired;
+    int         armed;
+    unsigned    fired;            /* passes this frame: above 1, a top-up */
+    const void *fired_rt;         /* the target the first pass occluded */
     unsigned    ord, want;        /* this frame's events; the memo */
     /* Samples of this frame: d = z / zmax and 1 / w (Z), w (W). */
     float       sd[NV2A_AO_SAMPLES], siw[NV2A_AO_SAMPLES], sw[NV2A_AO_SAMPLES];
@@ -118,15 +124,18 @@ struct nv2a_ao_trig {
     float       zmax;
     uint32_t    rng;
     struct nv2a_ao_fit fit;       /* the previous frame's, used by this one */
-    /* Totals for the trace: frames, frames that fired, fit refusals. */
-    uint64_t    frames, fired_frames, no_fit, missed;
+    /* Totals for the trace: frames, frames that fired, fit refusals,
+     * frames with none, top-up passes. */
+    uint64_t    frames, fired_frames, no_fit, missed, topups;
     /* This frame's events for the ao_frames trace (nv2a_ao_frame_str):
      * why each fired (NV2A_AO_WHY_*), the candidate's depth-writing draws
-     * by then, and the ordinal the occlusion ran at (0: none). */
+     * by then, the ordinal the first pass ran at (0: none) and a bit per
+     * event that ran a pass. */
     uint8_t     ev_why[NV2A_AO_EVENTS];
     uint16_t    ev_zd[NV2A_AO_EVENTS];
     const void *ev_rt[NV2A_AO_EVENTS];
     unsigned    fired_at;
+    uint16_t    ev_fired;
     uint8_t     hist[NV2A_AO_HIST];  /* ring of event counts, newest at nhist - 1 */
     unsigned    nhist;
     /* The same frames' last event: its cause, the one before it (0: none)
@@ -151,7 +160,9 @@ void nv2a_ao_forget(struct nv2a_ao_trig *t, const void *rt);
 /* Before a draw is encoded. rt and its guest size, whether it has a depth
  * buffer attached, whether this draw writes depth (depth test and mask on)
  * and whether one of its stages samples the current candidate. Returns the
- * target to occlude now, before this draw, or NULL. */
+ * target to occlude now, before this draw, or NULL; with t->fired above 1
+ * the pass is a top-up of the same target (the backend kept the depth and
+ * occlusion of its last pass to tell what changed). */
 const void *nv2a_ao_draw(struct nv2a_ao_trig *t, const void *rt, uint32_t w, uint32_t h,
                          int has_depth, int zwrite, int samples_cand);
 
@@ -170,7 +181,8 @@ int nv2a_ao_display_like(const struct nv2a_ao_trig *t, uint32_t w, uint32_t h);
 void nv2a_ao_sample_put(struct nv2a_ao_trig *t, int slot, float z, float w, float zmax);
 
 /* At the flip, before the frame is shown: the target to occlude now (an
- * armed candidate whose event is the memo's), or NULL. Then the backend
+ * armed candidate that has not fired, or a top-up as nv2a_ao_draw's), or
+ * NULL. Then the backend
  * calls nv2a_ao_frame_end, which fits this frame's samples for the next one
  * and resets the per-frame state; shown_w x shown_h is the shown target's
  * guest size (0 x 0: none). */
@@ -189,7 +201,7 @@ void nv2a_ao_frame_str(const struct nv2a_ao_trig *t, char *buf, size_t cap,
 /* The two passes' constants: float4 only, so the MSL and HLSL layouts are
  * the C one. p0 = (a, b, wmode, zmax); p1 = (radius in host pixels,
  * 1 / wref, fade_lo, fade_hi); p2 = (host w, host h, tan x, tan y) of the
- * assumed 60 degree vertical field; p3 = (strength, bias, view, 0). */
+ * assumed 60 degree vertical field; p3 = (strength, bias, view, top-up). */
 struct nv2a_ao_consts {
     float p0[4];
     float p1[4];
@@ -201,6 +213,14 @@ struct nv2a_ao_consts {
 void nv2a_ao_consts_fill(const struct nv2a_ao_trig *t, const struct nv2a_ao_cfg *c,
                          uint32_t hw, uint32_t hh, uint32_t guest_h, unsigned n,
                          struct nv2a_ao_consts *o);
+
+/* One pixel of ao_comp_fs after its filter (nv2a_scene_ao_shaders.h; the
+ * shaders do the same, this is for the tests): filt is this pass's
+ * occlusion, d the pixel's depth now, top a top-up outside ao_view, and
+ * (prev_t, prev_d) the pixel's record from the frame's last pass. Returns
+ * the factor the colour is multiplied by and sets *t to the new record's
+ * total, the occlusion the pixel now carries. */
+float nv2a_ao_comp_px(float filt, float d, int top, float prev_t, float prev_d, float *t);
 
 /* The ao_dump value DIR[:FROM[:N]] into dir (cap bytes), *from and *n
  * (default 300). A drive letter (D:/x) stays in DIR: the PC's dumps go to

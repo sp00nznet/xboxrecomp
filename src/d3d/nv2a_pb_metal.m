@@ -2530,7 +2530,12 @@ static void aspect_log_post(uint32_t hash, const RenderTarget *rt, int place)
  * (stock), metal_on_draw and metal_flip test s_ao_on and do nothing else. */
 static int s_ao_bad;          /* the passes failed to build: off for the run */
 static id<MTLRenderPipelineState> s_ao_pso, s_ao_mul_pso, s_ao_rep_pso;
-static id<MTLTexture> s_ao_tex;
+/* The R8 occlusion map, and the RG32F records (total occlusion, depth) of
+ * this frame's last two passes on s_ao_rec_rt, s_ao_i the newest: a top-up
+ * reads one and writes the other. */
+static id<MTLTexture> s_ao_tex, s_ao_rec[2];
+static unsigned s_ao_i;
+static const void *s_ao_rec_rt;
 static id<MTLCommandBuffer> s_ao_cmd;   /* ao trace: the last passes' own buffer */
 static uint64_t s_ao_runs, s_ao_gpu_ns, s_ao_gpu_n;
 static int s_ao_trace = -1;
@@ -2606,6 +2611,7 @@ static int ao_build(void)
     s_ao_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
     pd.fragmentFunction = cs;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pd.colorAttachments[1].pixelFormat = MTLPixelFormatRG32Float; /* the record, unblended */
     /* ao_view: the map replaces the colour, alpha kept. */
     pd.colorAttachments[0].writeMask = MTLColorWriteMaskRed | MTLColorWriteMaskGreen
                                      | MTLColorWriteMaskBlue;
@@ -2701,22 +2707,38 @@ static void ao_apply(RenderTarget *rt)
     MTLRenderPassDescriptor *rp;
     id<MTLRenderCommandEncoder> e;
     id<MTLBuffer> pre = nil, post = nil;
-    int dump, timed = ao_trace();
+    int dump, timed = ao_trace(), top = s_ao.fired > 1, i;
+    unsigned cur;
 
     if (!dt || !dt->readable || dt->hw != rt->hw || dt->hh != rt->hh || !ao_build())
         return;
-    if (!s_ao_tex || [s_ao_tex width] != rt->hw || [s_ao_tex height] != rt->hh) {
-        MTLTextureDescriptor *td = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:rt->hw height:rt->hh
-                                     mipmapped:NO];
-        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-        td.storageMode = MTLStorageModePrivate;
-        [s_ao_tex release];
-        s_ao_tex = [s_dev newTextureWithDescriptor:td];
-        if (!s_ao_tex)
-            return;
+    /* A top-up continues this frame's last pass on rt. With none (it was
+     * dropped) this one is the first; with one whose record no longer fits
+     * (rt regrown since) the pixels moved under it and it is skipped, since
+     * a full pass would occlude them twice. */
+    if (top && s_ao_rec_rt != rt)
+        top = 0;
+    if (top && ([s_ao_rec[0] width] != rt->hw || [s_ao_rec[0] height] != rt->hh))
+        return;
+    for (i = 0; i < 3; i++) {
+        id<MTLTexture> *tp = i ? &s_ao_rec[i - 1] : &s_ao_tex;
+        if (!*tp || [*tp width] != rt->hw || [*tp height] != rt->hh) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:i ? MTLPixelFormatRG32Float
+                                                     : MTLPixelFormatR8Unorm
+                                             width:rt->hw height:rt->hh mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+            td.storageMode = MTLStorageModePrivate;
+            [*tp release];
+            *tp = [s_dev newTextureWithDescriptor:td];
+            if (!*tp)
+                return;
+        }
     }
+    /* The first pass writes record 0; each top-up the other one. */
+    cur = top ? s_ao_i ^ 1u : 0u;
     nv2a_ao_consts_fill(&s_ao, c, rt->hw, rt->hh, rt->h, rt->n, &k);
+    k.p3[3] = (float)top;
     dump = ao_dump_due();
     end_encoder();
     if (timed) {
@@ -2742,13 +2764,21 @@ static void ao_apply(RenderTarget *rt)
     rp.colorAttachments[0].texture = rt->tex;
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.colorAttachments[1].texture = s_ao_rec[cur];
+    rp.colorAttachments[1].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[1].storeAction = MTLStoreActionStore;
     e = [s_cmd renderCommandEncoderWithDescriptor:rp];
     [e setRenderPipelineState:c->view ? s_ao_rep_pso : s_ao_mul_pso];
     [e setFragmentTexture:dt->tex atIndex:0];
     [e setFragmentTexture:s_ao_tex atIndex:1];
+    /* The previous record; the first pass reads none, so any texture but
+     * the attachment it writes stands in. */
+    [e setFragmentTexture:top ? s_ao_rec[s_ao_i] : s_ao_tex atIndex:2];
     [e setFragmentBytes:&k length:sizeof k atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
+    s_ao_i = cur;
+    s_ao_rec_rt = rt;
     rt->dirty = 1;
     s_ao_runs++;
     if (dump)
@@ -2764,8 +2794,12 @@ static void ao_apply(RenderTarget *rt)
         flush(1);
     }
     if (dump && pre && post) {
-        ao_dump_write(pre, rt, "pre");
-        ao_dump_write(post, rt, "post");
+        char tag[16];
+        /* A top-up's pair beside the first pass's: pre2, post2, ... */
+        snprintf(tag, sizeof tag, top ? "pre%u" : "pre", s_ao.fired);
+        ao_dump_write(pre, rt, tag);
+        snprintf(tag, sizeof tag, top ? "post%u" : "post", s_ao.fired);
+        ao_dump_write(post, rt, tag);
     }
     [pre release];
     [post release];
@@ -2849,15 +2883,17 @@ static void ao_flip(RenderTarget *shown)
             }
         }
         nv2a_ao_frame_end(&s_ao, shown ? shown->w : 0, shown ? shown->h : 0);
+        s_ao_rec_rt = NULL;     /* a top-up is of this frame's pass only */
         if (ao_trace() && s_presents % 300 == 0) {
             ao_gpu_collect();
             fprintf(stderr, LOGP "ao: flip %llu: %llu frames, %llu occluded, %llu missed,"
                     " %llu refused fits; fit a=%.6f b=%.6g conf=%.2f wmode=%d wref=%.4g;"
-                    " %llu passes, GPU %.3f ms each\n", (unsigned long long)s_presents,
+                    " %llu passes (%llu top-ups), GPU %.3f ms each\n",
+                    (unsigned long long)s_presents,
                     (unsigned long long)s_ao.frames, (unsigned long long)s_ao.fired_frames,
                     (unsigned long long)s_ao.missed, (unsigned long long)s_ao.no_fit,
                     s_ao.fit.a, s_ao.fit.b, s_ao.fit.conf, s_ao.fit.wmode, s_ao.fit.wref,
-                    (unsigned long long)s_ao_runs,
+                    (unsigned long long)s_ao_runs, (unsigned long long)s_ao.topups,
                     s_ao_gpu_n ? (double)s_ao_gpu_ns / (double)s_ao_gpu_n / 1e6 : 0.0);
             s_ao_gpu_ns = s_ao_gpu_n = 0;
         }

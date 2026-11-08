@@ -4026,10 +4026,15 @@ static ID3D11VertexShader *s_ao_vs;
 static ID3D11PixelShader *s_ao_ps, *s_ao_comp_ps;
 static ID3D11BlendState *s_ao_mul_bs, *s_ao_rep_bs;
 static ID3D11Buffer *s_ao_cb;
-static ID3D11Texture2D *s_ao_tex;
-static ID3D11RenderTargetView *s_ao_rtv;
-static ID3D11ShaderResourceView *s_ao_srv;
+/* Index 0 the R8 occlusion map; 1 and 2 the RG32F records (total
+ * occlusion, depth) of this frame's last two passes on s_ao_rec_rt,
+ * s_ao_i (0 or 1) the newest: a top-up reads one and writes the other. */
+static ID3D11Texture2D *s_ao_tex[3];
+static ID3D11RenderTargetView *s_ao_rtv[3];
+static ID3D11ShaderResourceView *s_ao_srv[3];
 static UINT s_ao_w, s_ao_h;
+static unsigned s_ao_i;
+static const void *s_ao_rec_rt;
 /* ao trace: one pair of timestamps in flight, read without waiting. */
 static ID3D11Query *s_ao_q[3];
 static int s_ao_q_busy;
@@ -4125,14 +4130,21 @@ static int ao_build(void)
         ok = 0;
     /* ao_view: the map replaces the colour, alpha kept. */
     memset(&bd, 0, sizeof bd);
-    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
-    bd.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
-    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
-    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    /* Valid factors on every slot: with independent blend on, a zeroed
+     * (invalid) slot may fail CreateBlendState on some drivers. */
+    for (int i = 0; i < 8; i++) {
+        bd.RenderTarget[i].SrcBlend = D3D11_BLEND_ONE;
+        bd.RenderTarget[i].DestBlend = D3D11_BLEND_ZERO;
+        bd.RenderTarget[i].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[i].SrcBlendAlpha = D3D11_BLEND_ONE;
+        bd.RenderTarget[i].DestBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[i].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    }
     bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED
         | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
+    /* Target 1 is the record, written as is. */
+    bd.IndependentBlendEnable = TRUE;
+    bd.RenderTarget[1].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     ok &= SUCCEEDED(ID3D11Device_CreateBlendState(s_dev, &bd, &s_ao_rep_bs));
     /* The occlusion multiplies the colour (dst * src); alpha is the
      * title's (a glow or a later pass may read it), so it is not written. */
@@ -4235,47 +4247,70 @@ static void ao_apply(RenderTarget *rt)
     struct nv2a_ao_consts k;
     D3D11_MAPPED_SUBRESOURCE m;
     D3D11_VIEWPORT vp;
-    ID3D11ShaderResourceView *srv[2], *none[2] = {NULL, NULL};
-    int dump, timed = ao_trace() && !s_ao_q_busy;
+    ID3D11ShaderResourceView *srv[3], *none[3] = {NULL, NULL, NULL};
+    ID3D11RenderTargetView *rtv[2];
+    int dump, timed = ao_trace() && !s_ao_q_busy, top = s_ao.fired > 1;
+    unsigned cur;
+    char tag[16];
 
     if (!dt || !ao_build())
         return;
-    if (!s_ao_tex || s_ao_w != rt->hw || s_ao_h != rt->hh) {
+    /* A top-up continues this frame's last pass on rt. With none (it was
+     * dropped) this one is the first; with one whose record no longer fits
+     * (rt regrown since) the pixels moved under it and it is skipped, since
+     * a full pass would occlude them twice. */
+    if (top && s_ao_rec_rt != rt)
+        top = 0;
+    if (top && (s_ao_w != rt->hw || s_ao_h != rt->hh))
+        return;
+    if (!s_ao_tex[2] || s_ao_w != rt->hw || s_ao_h != rt->hh) {
         D3D11_TEXTURE2D_DESC td;
-        if (s_ao_srv) ID3D11ShaderResourceView_Release(s_ao_srv);
-        if (s_ao_rtv) ID3D11RenderTargetView_Release(s_ao_rtv);
-        if (s_ao_tex) ID3D11Texture2D_Release(s_ao_tex);
-        s_ao_srv = NULL;
-        s_ao_rtv = NULL;
-        s_ao_tex = NULL;
+        int i, bad = 0;
+        for (i = 0; i < 3; i++) {
+            if (s_ao_srv[i]) ID3D11ShaderResourceView_Release(s_ao_srv[i]);
+            if (s_ao_rtv[i]) ID3D11RenderTargetView_Release(s_ao_rtv[i]);
+            if (s_ao_tex[i]) ID3D11Texture2D_Release(s_ao_tex[i]);
+            s_ao_srv[i] = NULL;
+            s_ao_rtv[i] = NULL;
+            s_ao_tex[i] = NULL;
+        }
+        s_ao_rec_rt = NULL;
+        s_ao_w = s_ao_h = 0;
         memset(&td, 0, sizeof td);
         td.Width = rt->hw;
         td.Height = rt->hh;
         td.MipLevels = td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_R8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ao_tex))
-                || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_ao_tex,
-                                                              NULL, &s_ao_rtv))
-                || FAILED(ID3D11Device_CreateShaderResourceView(
-                        s_dev, (ID3D11Resource *)s_ao_tex, NULL, &s_ao_srv))) {
-            s_ao_w = s_ao_h = 0;
-            return;
+        for (i = 0; i < 3 && !bad; i++) {
+            td.Format = i ? DXGI_FORMAT_R32G32_FLOAT : DXGI_FORMAT_R8_UNORM;
+            bad = FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ao_tex[i]))
+                  || FAILED(ID3D11Device_CreateRenderTargetView(
+                          s_dev, (ID3D11Resource *)s_ao_tex[i], NULL, &s_ao_rtv[i]))
+                  || FAILED(ID3D11Device_CreateShaderResourceView(
+                          s_dev, (ID3D11Resource *)s_ao_tex[i], NULL, &s_ao_srv[i]));
         }
+        if (bad)
+            return;             /* s_ao_w 0: rebuilt on the next pass */
         s_ao_w = rt->hw;
         s_ao_h = rt->hh;
     }
+    /* The first pass writes record 0; each top-up the other one. */
+    cur = top ? s_ao_i ^ 1u : 0u;
     nv2a_ao_consts_fill(&s_ao, c, rt->hw, rt->hh, rt->h, rt->n, &k);
+    k.p3[3] = (float)top;
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ao_cb, 0,
                                        D3D11_MAP_WRITE_DISCARD, 0, &m)))
         return;
     memcpy(m.pData, &k, sizeof k);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ao_cb, 0);
     dump = ao_dump_due();
-    if (dump)
-        ao_dump_write(rt, "pre");
+    /* A top-up's pair beside the first pass's: pre2, post2, ... */
+    if (dump) {
+        snprintf(tag, sizeof tag, top ? "pre%u" : "pre", s_ao.fired);
+        ao_dump_write(rt, tag);
+    }
     if (timed) {
         if (!s_ao_q[0]) {
             D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
@@ -4297,7 +4332,7 @@ static void ao_apply(RenderTarget *rt)
     vp.MaxDepth = 1;
     /* Pass 1 into the R8 map. The depth buffer is unbound first: a view
      * bound for writing cannot also be read. */
-    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_ao_rtv, NULL);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_ao_rtv[0], NULL);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
     ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFF);
     ID3D11DeviceContext_RSSetState(s_ctx, s_rs[0][0]);
@@ -4308,19 +4343,28 @@ static void ao_apply(RenderTarget *rt)
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ao_ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_ao_cb);
     srv[0] = dt->srv;
-    srv[1] = NULL;
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, srv);
+    srv[1] = srv[2] = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 3, srv);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
-    /* Pass 2 over the colour. */
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, none);
-    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, NULL);
+    /* Pass 2 over the colour, and the record. */
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 3, none);
+    rtv[0] = rt->rtv;
+    rtv[1] = s_ao_rtv[1 + cur];
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 2, rtv, NULL);
     ID3D11DeviceContext_OMSetBlendState(s_ctx, c->view ? s_ao_rep_bs : s_ao_mul_bs, NULL,
                                         0xFFFFFFFF);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ao_comp_ps, NULL, 0);
-    srv[1] = s_ao_srv;
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, srv);
+    srv[1] = s_ao_srv[0];
+    /* The previous record; the first pass reads none (the one it writes
+     * cannot also be bound for reading). */
+    srv[2] = top ? s_ao_srv[1 + s_ao_i] : NULL;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 3, srv);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, none);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 3, none);
+    rtv[1] = NULL;      /* the record is read by the next top-up */
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 2, rtv, NULL);
+    s_ao_i = cur;
+    s_ao_rec_rt = rt;
     if (timed) {
         ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_ao_q[2]);
         ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_ao_q[0]);
@@ -4328,8 +4372,10 @@ static void ao_apply(RenderTarget *rt)
     }
     s_state_gen++;              /* the next draw rebinds everything */
     s_ao_runs++;
-    if (dump)
-        ao_dump_write(rt, "post");
+    if (dump) {
+        snprintf(tag, sizeof tag, top ? "post%u" : "post", s_ao.fired);
+        ao_dump_write(rt, tag);
+    }
 }
 
 /* Before a draw on rt: the trigger's step, and the passes if it fires. */
@@ -4413,16 +4459,18 @@ static void ao_flip(RenderTarget *shown)
             }
         }
         nv2a_ao_frame_end(&s_ao, shown ? shown->w : 0, shown ? shown->h : 0);
+        s_ao_rec_rt = NULL;     /* a top-up is of this frame's pass only */
         if (ao_trace()) {
             ao_gpu_collect();
             if (s_presents % 300 == 0) {
                 fprintf(stderr, LOGP "ao: flip %llu: %llu frames, %llu occluded, %llu missed,"
                         " %llu refused fits; fit a=%.6f b=%.6g conf=%.2f wmode=%d wref=%.4g;"
-                        " %llu passes, GPU %.3f ms each\n", (unsigned long long)s_presents,
+                        " %llu passes (%llu top-ups), GPU %.3f ms each\n",
+                        (unsigned long long)s_presents,
                         (unsigned long long)s_ao.frames, (unsigned long long)s_ao.fired_frames,
                         (unsigned long long)s_ao.missed, (unsigned long long)s_ao.no_fit,
                         s_ao.fit.a, s_ao.fit.b, s_ao.fit.conf, s_ao.fit.wmode, s_ao.fit.wref,
-                        (unsigned long long)s_ao_runs,
+                        (unsigned long long)s_ao_runs, (unsigned long long)s_ao.topups,
                         s_ao_gpu_n ? (double)s_ao_gpu_ns / (double)s_ao_gpu_n / 1e6 : 0.0);
                 s_ao_gpu_ns = s_ao_gpu_n = 0;
             }

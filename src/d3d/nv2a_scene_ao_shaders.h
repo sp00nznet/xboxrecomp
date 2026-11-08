@@ -17,8 +17,30 @@
  *  2. ao_comp_fs, drawn over the 3D target with a multiply blend (colour
  *     times the result, alpha untouched): the 4 x 4 window, each tap
  *     weighted by its depth's closeness to the centre's (a bilateral blur:
- *     foliage speckle smooths out, an edge does not bleed). Under ao_view
- *     the same output replaces the colour.
+ *     foliage speckle smooths out, an edge does not bleed). Its second
+ *     target (RG32F) records each pixel's total occlusion so far this
+ *     frame and its depth then. A top-up (p3.w, a later chunk of the same
+ *     frame: nv2a_scene_ao.h) reads the last pass's record (texture 2):
+ *     where the depth is unchanged the pixel already carries that total,
+ *     so it is multiplied by new / old only (never above 1: a multiply
+ *     cannot brighten, and the record keeps what was applied, so a chain
+ *     of top-ups stays exact). Draws without depth writes since (a
+ *     translucent chunk, particles, glows) so get no second occlusion. A
+ *     pixel whose depth changed was drawn again and gets the new map in
+ *     full. The costs, all of them keyed on depth alone:
+ *     - a decal drawn since at the same depth keeps the ratio's light
+ *       touch, not its own full occlusion; so does an opaque draw with
+ *       depth writes off;
+ *     - a draw without depth writes over a pixel whose filtered occlusion
+ *       deepened since (new geometry nearby) still gets the ratio
+ *       (new / old < 1), which is the occlusion it was owed;
+ *     - a blended draw that writes depth, or a polygon-offset decal, moves
+ *       the depth and takes the full occlusion, so the background seen
+ *       through it is occluded twice;
+ *     - a depth buffer swapped on the same target between passes makes
+ *       every depth compare miss, and the top-up runs as a full pass.
+ *     nv2a_ao_comp_px is this step in C, for the tests. Under ao_view the
+ *     new map replaces the colour.
  *
  * Nothing samples with a sampler: integer reads, clamped to the target,
  * so the passes are exact at every render scale and need no state.
@@ -51,9 +73,7 @@
 "    return ao_pos(float2(p) + 0.5, ao_w(ao_d(t, p, c), c), c);\n" \
 "}\n" \
 "constant uint ao_bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };\n" \
-"fragment float ao_fs(AoV i [[stage_in]], depth2d<float> dt [[texture(0)]],\n" \
-"                     constant AoC &c [[buffer(0)]]) {\n" \
-"    int2 p = int2(i.pos.xy);\n" \
+"static float ao_occ(depth2d<float> dt, int2 p, constant AoC &c) {\n" \
 "    float d = ao_d(dt, p, c);\n" \
 "    if (d >= 0.99999) return 1.0;\n" \
 "    float3 P = ao_at(dt, p, c);\n" \
@@ -86,29 +106,48 @@
 "    float fade = 1.0 - smoothstep(c.p1.z, c.p1.w, P.z * c.p1.y);\n" \
 "    return mix(1.0, ao, fade);\n" \
 "}\n" \
-"fragment float4 ao_comp_fs(AoV i [[stage_in]], depth2d<float> dt [[texture(0)]],\n" \
-"                           texture2d<float> at [[texture(1)]], constant AoC &c [[buffer(0)]]) {\n" \
+"fragment float ao_fs(AoV i [[stage_in]], depth2d<float> dt [[texture(0)]],\n" \
+"                     constant AoC &c [[buffer(0)]]) {\n" \
+"    return ao_occ(dt, int2(i.pos.xy), c);\n" \
+"}\n" \
+"struct AoO { float4 c [[color(0)]]; float2 s [[color(1)]]; };\n" \
+"fragment AoO ao_comp_fs(AoV i [[stage_in]], depth2d<float> dt [[texture(0)]],\n" \
+"                        texture2d<float> at [[texture(1)]],\n" \
+"                        texture2d<float> st [[texture(2)]], constant AoC &c [[buffer(0)]]) {\n" \
 "    int2 p = int2(i.pos.xy);\n" \
-"    float d = ao_d(dt, p, c);\n" \
-"    if (d >= 0.99999) return float4(1.0);\n" \
-"    float wc = ao_w(d, c), sum = 0.0, ws = 0.0;\n" \
-"    for (int y = -2; y < 2; y++)\n" \
-"        for (int x = -2; x < 2; x++) {\n" \
-"            int2 q = clamp(p + int2(x, y), int2(0), int2(c.p2.xy) - 1);\n" \
-"            float sd = dt.read(uint2(q));\n" \
-"            float wt = sd >= 0.99999 ? 0.0\n" \
-"                     : max(0.0, 1.0 - abs(ao_w(sd, c) - wc) / (0.04 * wc)) + 1e-4;\n" \
-"            sum += at.read(uint2(q)).r * wt;\n" \
-"            ws += wt;\n" \
+"    float d = ao_d(dt, p, c), a = 1.0;\n" \
+"    if (d < 0.99999) {\n" \
+"        float wc = ao_w(d, c), sum = 0.0, ws = 0.0;\n" \
+"        for (int y = -2; y < 2; y++)\n" \
+"            for (int x = -2; x < 2; x++) {\n" \
+"                int2 q = clamp(p + int2(x, y), int2(0), int2(c.p2.xy) - 1);\n" \
+"                float sd = dt.read(uint2(q));\n" \
+"                float wt = sd >= 0.99999 ? 0.0\n" \
+"                         : max(0.0, 1.0 - abs(ao_w(sd, c) - wc) / (0.04 * wc)) + 1e-4;\n" \
+"                sum += at.read(uint2(q)).r * wt;\n" \
+"                ws += wt;\n" \
+"            }\n" \
+"        a = ws > 0.0 ? sum / ws : 1.0;\n" \
+"    }\n" \
+"    float t = a;\n" \
+"    if (c.p3.w > 0.5 && c.p3.z < 0.5) {\n" \
+"        float2 pv = st.read(uint2(p)).rg;\n" \
+"        if (pv.y == d) {\n" \
+"            t = min(a, pv.x);\n" \
+"            a = a < pv.x ? a / pv.x : 1.0;\n" \
 "        }\n" \
-"    float a = ws > 0.0 ? sum / ws : 1.0;\n" \
-"    return float4(a, a, a, 1.0);\n" \
+"    }\n" \
+"    AoO o;\n" \
+"    o.c = float4(a, a, a, 1.0);\n" \
+"    o.s = float2(t, d);\n" \
+"    return o;\n" \
 "}\n"
 
 #define NV2A_AO_HLSL \
 "cbuffer AoC : register(b0) { float4 p0, p1, p2, p3; };\n" \
 "Texture2D<float> dt : register(t0);\n" \
 "Texture2D<float> at : register(t1);\n" \
+"Texture2D<float2> st : register(t2);\n" \
 "float4 ao_vs(uint vid : SV_VertexID) : SV_Position {\n" \
 "    float2 p = float2(float((vid << 1) & 2u), float(vid & 2u));\n" \
 "    return float4(p * 2.0 - 1.0, 0.0, 1.0);\n" \
@@ -127,8 +166,7 @@
 "}\n" \
 "float3 ao_at(int2 p) { return ao_pos(float2(p) + 0.5, ao_w(ao_d(p))); }\n" \
 "static const uint ao_bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };\n" \
-"float ao_fs(float4 pos : SV_Position) : SV_Target {\n" \
-"    int2 p = int2(pos.xy);\n" \
+"float ao_occ(int2 p) {\n" \
 "    float d = ao_d(p);\n" \
 "    if (d >= 0.99999) return 1.0;\n" \
 "    float3 P = ao_at(p);\n" \
@@ -161,22 +199,38 @@
 "    float fade = 1.0 - smoothstep(p1.z, p1.w, P.z * p1.y);\n" \
 "    return lerp(1.0, ao, fade);\n" \
 "}\n" \
-"float4 ao_comp_fs(float4 pos : SV_Position) : SV_Target {\n" \
+"float ao_fs(float4 pos : SV_Position) : SV_Target {\n" \
+"    return ao_occ(int2(pos.xy));\n" \
+"}\n" \
+"struct AoO { float4 c : SV_Target0; float2 s : SV_Target1; };\n" \
+"AoO ao_comp_fs(float4 pos : SV_Position) {\n" \
 "    int2 p = int2(pos.xy);\n" \
-"    float d = ao_d(p);\n" \
-"    if (d >= 0.99999) return float4(1.0, 1.0, 1.0, 1.0);\n" \
-"    float wc = ao_w(d), sum = 0.0, ws = 0.0;\n" \
-"    [unroll] for (int y = -2; y < 2; y++)\n" \
-"        [unroll] for (int x = -2; x < 2; x++) {\n" \
-"            int2 q = clamp(p + int2(x, y), int2(0, 0), int2(p2.xy) - 1);\n" \
-"            float sd = dt.Load(int3(q, 0));\n" \
-"            float wt = sd >= 0.99999 ? 0.0\n" \
-"                     : max(0.0, 1.0 - abs(ao_w(sd) - wc) / (0.04 * wc)) + 1e-4;\n" \
-"            sum += at.Load(int3(q, 0)) * wt;\n" \
-"            ws += wt;\n" \
+"    float d = ao_d(p), a = 1.0;\n" \
+"    if (d < 0.99999) {\n" \
+"        float wc = ao_w(d), sum = 0.0, ws = 0.0;\n" \
+"        [unroll] for (int y = -2; y < 2; y++)\n" \
+"            [unroll] for (int x = -2; x < 2; x++) {\n" \
+"                int2 q = clamp(p + int2(x, y), int2(0, 0), int2(p2.xy) - 1);\n" \
+"                float sd = dt.Load(int3(q, 0));\n" \
+"                float wt = sd >= 0.99999 ? 0.0\n" \
+"                         : max(0.0, 1.0 - abs(ao_w(sd) - wc) / (0.04 * wc)) + 1e-4;\n" \
+"                sum += at.Load(int3(q, 0)) * wt;\n" \
+"                ws += wt;\n" \
+"            }\n" \
+"        a = ws > 0.0 ? sum / ws : 1.0;\n" \
+"    }\n" \
+"    float t = a;\n" \
+"    if (p3.w > 0.5 && p3.z < 0.5) {\n" \
+"        float2 pv = st.Load(int3(p, 0));\n" \
+"        if (pv.y == d) {\n" \
+"            t = min(a, pv.x);\n" \
+"            a = a < pv.x ? a / pv.x : 1.0;\n" \
 "        }\n" \
-"    float a = ws > 0.0 ? sum / ws : 1.0;\n" \
-"    return float4(a, a, a, 1.0);\n" \
+"    }\n" \
+"    AoO o;\n" \
+"    o.c = float4(a, a, a, 1.0);\n" \
+"    o.s = float2(t, d);\n" \
+"    return o;\n" \
 "}\n"
 
 #endif /* NV2A_SCENE_AO_SHADERS_H */

@@ -30,6 +30,9 @@ static void check(int ok, const char *what)
 }
 
 static int A, S; /* two targets: the 3D one and a shadow map */
+/* The frame helpers return the draw of the frame's last pass (a top-up
+ * after the first, if any); g_first holds the first's, g_passes the count. */
+static int g_first, g_passes;
 #define RT_3D ((const void *)&A)
 #define RT_SHADOW ((const void *)&S)
 
@@ -46,6 +49,14 @@ static void put_proj(struct nv2a_ao_trig *t, float w, float n, float f, int wmod
     nv2a_ao_sample_put(t, s, z, w, 16777215.0f);
 }
 
+/* Ends the frame: g_first and g_passes from the trigger's own record. */
+static void frame_done(struct nv2a_ao_trig *t)
+{
+    g_passes = (int)t->fired;
+    g_first = t->fired ? (int)t->fired_at : 0;
+    nv2a_ao_frame_end(t, 640, 480);
+}
+
 /* A frame: 3D (n draws), then HUD (h non-depth draws). Returns the index
  * of the draw that fired (n = first HUD draw), -1 for the flip, -2 none. */
 static int frame_3d_hud(struct nv2a_ao_trig *t, unsigned n, unsigned h)
@@ -54,11 +65,11 @@ static int frame_3d_hud(struct nv2a_ao_trig *t, unsigned n, unsigned h)
     unsigned i;
     for (i = 0; i < n + h; i++) {
         int zw = i < n;
-        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, zw, 0) && at == -2) at = (int)i;
+        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, zw, 0)) at = (int)i;
         if (zw) put_proj(t, 2.0f + (float)(i * 53 % 900), 0.5f, 2000.0f, 0);
     }
-    if (nv2a_ao_flip(t) && at == -2) at = -1;
-    nv2a_ao_frame_end(t, 640, 480);
+    if (nv2a_ao_flip(t)) at = -1;
+    frame_done(t);
     return at;
 }
 
@@ -184,14 +195,16 @@ static void test_growing(void)
             if (zw) put_proj(&t, 2.0f + (float)(i * 53 % 900), 0.5f, 2000.0f, 0);
         }
         a1 = at;
-        if (nv2a_ao_flip(&t) && at == -2) a1 = -1;
-        nv2a_ao_frame_end(&t, 640, 480);
+        if (nv2a_ao_flip(&t)) a1 = a1 == 30 ? -1 : -3;
+        frame_done(&t);
     }
+    check(a1 == -1 && g_passes == 2,
+          "a new early event fires on the memo, the flip tops up the 3D after it");
     a2 = frame_3d_hud(&t, 60, 10);
     a3 = frame_3d_hud(&t, 60, 10);
-    check(a1 == 30, "a new early event fires on the stale memo (one frame)");
-    check(a2 == -2 && t.missed == 1, "fewer events than the memo: one frame missed, counted");
-    check(a3 == 60, "then back on the memo");
+    check(a2 == 60 && g_passes == 1 && t.missed == 0,
+          "fewer events again: the memo kept the low, no frame missed");
+    check(a3 == 60, "and stays on it");
 }
 
 /* A frame of k chunks of 30 depth draws, each ended by 2 non-depth draws
@@ -203,32 +216,38 @@ static int frame_chunks(struct nv2a_ao_trig *t, unsigned k, int *last)
     unsigned c, j;
     for (c = 0; c < k; c++) {
         for (j = 0; j < 30; j++, i++) {
-            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0) && at == -2) at = i;
+            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0)) at = i;
             put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
         }
         *last = i;
         for (j = 0; j < 2; j++, i++)
-            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
+            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0)) at = i;
     }
     for (j = 0; j < 5; j++, i++)
-        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
-    if (nv2a_ao_flip(t) && at == -2) at = -1;
-    nv2a_ao_frame_end(t, 640, 480);
+        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0)) at = i;
+    if (nv2a_ao_flip(t)) at = -1;
+    frame_done(t);
     return at;
 }
 
+static int frame_sizes(struct nv2a_ao_trig *t, const unsigned *sz, unsigned k, int *last);
+
 /* The Deck's event count cycled N, N, N + 1. The previous frame's
  * count fired early on the long frame and missed the frame after it; the
- * period memo locks on to the cycle once the window has seen it. */
-static unsigned cycle_bad(const unsigned *pat, unsigned plen, unsigned frames, unsigned from)
+ * memo keeps the low and the long frame is topped up. bad: frames whose
+ * last event got no pass; *extra: the top-ups. */
+static unsigned cycle_bad(const unsigned *pat, unsigned plen, unsigned frames, unsigned from,
+                          unsigned *extra)
 {
     struct nv2a_ao_trig t;
-    unsigned f, bad = 0;
+    unsigned f, bad = 0, x = 0;
     nv2a_ao_reset(&t);
     for (f = 0; f < frames; f++) {
         int last, at = frame_chunks(&t, pat[f % plen], &last);
         if (f >= from && at != last) bad++;
+        if (f >= from && g_passes > 1) x += (unsigned)g_passes - 1u;
     }
+    if (extra) *extra = x;
     return bad;
 }
 
@@ -236,14 +255,105 @@ static void test_cycle(void)
 {
     static const unsigned n_n_n1[] = { 2, 2, 3 }, n_n1[] = { 3, 4 }, n4[] = { 2, 2, 2, 3 },
                           flat[] = { 3 };
-    check(cycle_bad(n_n_n1, 3, 60, 16) == 0, "N, N, N+1: every frame fires at its last event");
-    check(cycle_bad(n_n1, 2, 60, 16) == 0, "N, N+1: every frame fires at its last event");
-    check(cycle_bad(n4, 4, 60, 16) == 0, "N, N, N, N+1: every frame fires at its last event");
-    check(cycle_bad(flat, 1, 60, 2) == 0, "a steady count: every frame after the first fit");
+    unsigned x;
+    check(cycle_bad(n_n_n1, 3, 60, 16, &x) == 0 && x == 15,
+          "N, N, N+1: every frame covered, a top-up on each long one");
+    check(cycle_bad(n_n1, 2, 60, 16, NULL) == 0, "N, N+1: every frame covered");
+    check(cycle_bad(n4, 4, 60, 16, NULL) == 0, "N, N, N, N+1: every frame covered");
+    check(cycle_bad(flat, 1, 60, 2, &x) == 0 && x == 0,
+          "a steady count: every frame after the first fit, no top-up");
+}
+
+/* Longer periods, both ways: one short or one long frame in k.
+ * Up to one in eight the memo's window holds the short frame. */
+static void test_one_in_k(void)
+{
+    unsigned k, bad = 0;
+    for (k = 5; k <= 8; k++) {
+        unsigned pat[8], i;
+        for (i = 0; i < k; i++) pat[i] = i + 1 < k ? 3 : 2;
+        bad += cycle_bad(pat, k, 80, 16, NULL);
+        for (i = 0; i < k; i++) pat[i] = i + 1 < k ? 2 : 3;
+        bad += cycle_bad(pat, k, 80, 16, NULL);
+    }
+    check(bad == 0, "one short or long frame in 5 to 8: every frame covered");
+}
+
+/* BLiNX 2's hub on the Deck: chunks of 291, about 344 and about
+ * 333 depth draws, the third present on about one frame in three, the
+ * counts as the trace had them (3, 2, 2 with slips: 3, 3, 3 and 3, 2, 3, 2).
+ * The old period memo missed 235 of 1305 such frames; the chunks are
+ * alike, so the tail rule cannot tell the third from the second. */
+static void test_deck_hub(void)
+{
+    static const char seq[] =
+        "322322322333222322322322323223332232232232233322232232232232"
+        "322333223223223223332223223223223232233322322322322333222322";
+    struct nv2a_ao_trig t;
+    unsigned f, bad = 0, extra = 0, seed = 7;
+    uint64_t missed = 0;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 2 * (sizeof seq - 1); f++) {
+        if (f == 8) missed = t.missed;
+        unsigned sz[3], k = (unsigned)(seq[f % (sizeof seq - 1)] - '0');
+        int last, at;
+        seed = seed * 1103515245u + 12345u;
+        sz[0] = 291;
+        sz[1] = 340 + (seed >> 16) % 13;
+        sz[2] = 329 + (seed >> 20) % 13;
+        at = frame_sizes(&t, sz, k, &last);
+        if (f >= 8 && at != last) bad++;
+        if (f >= 8 && g_passes > 1) extra++;
+    }
+    check(bad == 0 && t.missed == missed, "Deck hub counts: every frame covered, none missed");
+    check(extra > 0 && extra < f / 2, "Deck hub counts: the long frames topped up");
+}
+
+/* A top-up is for the target the first pass occluded: a later chunk on
+ * another display-sized target (a second 3D view) runs nothing, and a
+ * forgotten target is never topped up. */
+static void test_topup_target(void)
+{
+    static int B;
+    struct nv2a_ao_trig t;
+    unsigned i, f;
+    int got = 0, freed = 0;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 4; f++) {
+        for (i = 0; i < 40; i++) {
+            nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 1, 0);
+            put_proj(&t, 2.0f + (float)(i * 31 % 500), 0.5f, 2000.0f, 0);
+        }
+        nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 0, 0);
+        if (f < 3) {
+            nv2a_ao_flip(&t);
+            frame_done(&t);
+            continue;
+        }
+        /* Fired on RT_3D at its event; then 40 depth draws on B. */
+        for (i = 0; i < 40; i++)
+            got |= nv2a_ao_draw(&t, (const void *)&B, 640, 480, 1, 1, 0) != NULL;
+        got |= nv2a_ao_draw(&t, (const void *)&B, 640, 480, 1, 0, 0) != NULL;
+        got |= nv2a_ao_flip(&t) != NULL;
+        frame_done(&t);
+    }
+    check(!got && g_passes == 1, "top-up: another target's chunk runs nothing");
+    for (i = 0; i < 40; i++) {
+        nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 1, 0);
+        put_proj(&t, 2.0f + (float)(i * 31 % 500), 0.5f, 2000.0f, 0);
+    }
+    nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 0, 0);
+    freed = t.fired == 1;
+    nv2a_ao_forget(&t, RT_3D);
+    for (i = 0; i < 40; i++)
+        got |= nv2a_ao_draw(&t, RT_3D, 640, 480, 1, 1, 0) != NULL;
+    got |= nv2a_ao_flip(&t) != NULL;
+    frame_done(&t);
+    check(freed && !got, "top-up: a forgotten target is not topped up");
 }
 
 /* One frame in thirty with an extra event (the PC's wander): the memo stays
- * on the previous frame, so only the odd frame and the one after it are off. */
+ * on the usual count and the odd frame is topped up. */
 static void test_wander(void)
 {
     struct nv2a_ao_trig t;
@@ -253,7 +363,7 @@ static void test_wander(void)
         int last, at = frame_chunks(&t, f % 30 == 29 ? 3 : 2, &last);
         if (f >= 2 && at != last) bad++;
     }
-    check(bad == 4, "each lone extra event costs two frames, no period is found");
+    check(bad == 0, "a lone extra event is topped up, no frame off");
     check(t.want == 2, "and the memo is back on the usual count");
 }
 
@@ -266,17 +376,17 @@ static int frame_tail(struct nv2a_ao_trig *t, unsigned k, int *last)
     unsigned c, j;
     for (c = 0; c <= k; c++) {
         for (j = 0; j < (c < k ? 30u : 12u); j++, i++) {
-            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0) && at == -2) at = i;
+            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0)) at = i;
             put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
         }
         *last = i;
         for (j = 0; j < 2; j++, i++)
-            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
+            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0)) at = i;
     }
     for (j = 0; j < 5; j++, i++)
-        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
-    if (nv2a_ao_flip(t) && at == -2) at = -1;
-    nv2a_ao_frame_end(t, 640, 480);
+        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0)) at = i;
+    if (nv2a_ao_flip(t)) at = -1;
+    frame_done(t);
     return at;
 }
 
@@ -300,8 +410,7 @@ static void test_lost_chunk(void)
         if (at != last) bad++;
     }
     check(t.missed == missed, "a frame one chunk short is not missed");
-    /* Short frames 4, 9, 14 and 19; the last has no frame after it. */
-    check(bad == 3, "only the frame after a short one fires early, on its memo");
+    check(bad == 0, "and the frames after a short one fire early and are topped up");
 }
 
 /* Frames of chunks of the given sizes, each ended by 2 non-depth draws,
@@ -312,17 +421,17 @@ static int frame_sizes(struct nv2a_ao_trig *t, const unsigned *sz, unsigned k, i
     unsigned c, j;
     for (c = 0; c < k; c++) {
         for (j = 0; j < sz[c]; j++, i++) {
-            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0) && at == -2) at = i;
+            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 1, 0)) at = i;
             put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
         }
         *last = i;
         for (j = 0; j < 2; j++, i++)
-            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
+            if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0)) at = i;
     }
     for (j = 0; j < 5; j++, i++)
-        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0) && at == -2) at = i;
-    if (nv2a_ao_flip(t) && at == -2) at = -1;
-    nv2a_ao_frame_end(t, 640, 480);
+        if (nv2a_ao_draw(t, RT_3D, 640, 480, 1, 0, 0)) at = i;
+    if (nv2a_ao_flip(t)) at = -1;
+    frame_done(t);
     return at;
 }
 
@@ -344,8 +453,8 @@ static void test_tail_jitter(void)
             sz[1] = base[b][0] + (seed >> 16) % 5;
             sz[2] = base[b][1] + (seed >> 20) % 5;
             at = frame_sizes(&t, sz, 3, &last);
-            if (f >= 2 && at >= 0 && at < last) early++;
-            if (f >= 2 && at == -2) missed++;
+            if (f >= 2 && g_passes > 1) early++;
+            if (f >= 2 && at != last) missed++;
         }
     }
     check(early == 0 && missed == 0, "close, jittered last chunks: never early, never missed");
@@ -455,6 +564,79 @@ static void test_consts(void)
     check(fabsf(k1.p2[2] / k1.p2[3] - 640.0f / 480.0f) < 1e-4f, "tan x follows the aspect");
 }
 
+/* ao_comp_fs's step in C (nv2a_ao_comp_px): the colour's factors multiply
+ * up to the record's total, through any chain of top-ups. */
+static void test_comp(void)
+{
+    float t, c, a;
+    unsigned i, k, bad = 0, seed = 7;
+    /* A later pass that wants less occlusion (0.8 after 0.5): the multiply
+     * cannot brighten, so the pixel keeps 0.5, and the next top-up (0.6)
+     * divides by the 0.5 applied, not by the 0.8 wanted (that left it at
+     * 0.5 * 0.6 / 0.8, darker with each top-up). */
+    c = nv2a_ao_comp_px(0.5f, 0.3f, 0, 1.0f, 0.0f, &t);
+    a = nv2a_ao_comp_px(0.8f, 0.3f, 1, t, 0.3f, &t);
+    c *= a;
+    check(a == 1.0f && t == 0.5f, "comp: a lighter top-up leaves the pixel as it was");
+    c *= nv2a_ao_comp_px(0.6f, 0.3f, 1, t, 0.3f, &t);
+    check(fabsf(c - 0.5f) < 1e-6f && t == 0.5f, "comp: and the next one divides by what was applied");
+    c *= nv2a_ao_comp_px(0.2f, 0.3f, 1, t, 0.3f, &t);
+    check(fabsf(c - 0.2f) < 1e-6f && t == 0.2f, "comp: a darker one brings the pixel to it");
+    a = nv2a_ao_comp_px(0.4f, 0.3f, 1, 0.0f, 0.3f, &t);
+    check(a == 1.0f && t == 0.0f, "comp: a pixel at no light divides by nothing");
+    a = nv2a_ao_comp_px(0.4f, 0.25f, 1, 0.5f, 0.3f, &t);
+    check(a == 0.4f && t == 0.4f, "comp: new depth (drawn again) takes the map in full");
+    a = nv2a_ao_comp_px(0.4f, 0.3f, 0, 0.5f, 0.3f, &t);
+    check(a == 0.4f && t == 0.4f, "comp: a first pass takes the map in full");
+    /* Random chains: some passes over new depth (the colour drawn again,
+     * so it starts over at 1), the others over the same. */
+    for (i = 0; i < 2000; i++) {
+        float d = 0.5f;
+        c = nv2a_ao_comp_px(0.3f + 0.7f * (float)(i % 97) / 96.0f, d, 0, 1.0f, 0.0f, &t);
+        for (k = 0; k < 6; k++) {
+            float pd = d, f;
+            seed = seed * 1103515245u + 12345u;
+            f = (float)((seed >> 8) & 1023u) / 1023.0f;
+            if ((seed >> 20) % 4 == 0) {
+                d = pd - 0.01f;
+                c = 1.0f;
+            }
+            c *= nv2a_ao_comp_px(f, d, 1, t, pd, &t);
+        }
+        bad += fabsf(c - t) > 1e-5f;
+    }
+    check(bad == 0, "comp: the colour carries the record's total through top-ups");
+}
+
+/* A HUD in the middle of the frame, then the 3D again on some frames: the
+ * memo fires at the HUD and the flip tops up the 3D drawn after it, so the
+ * frame's last depth-writing draw always has a pass after it. */
+static void test_hud_then_3d(void)
+{
+    struct nv2a_ao_trig t;
+    unsigned f, i, bad = 0, extra = 0;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 40; f++) {
+        int more = f % 3 == 1, at = -2;
+        for (i = 0; i < 70 + (more ? 20u : 0u); i++) {
+            int zw = i < 60 || i >= 70;
+            if (nv2a_ao_draw(&t, RT_3D, 640, 480, 1, zw, 0)) at = (int)i;
+            if (zw) put_proj(&t, 2.0f + (float)(i * 53 % 900), 0.5f, 2000.0f, 0);
+        }
+        if (nv2a_ao_flip(&t)) at = -1;
+        frame_done(&t);
+        if (f < 4)
+            continue;
+        if (more)
+            bad += at != -1 || g_passes != 2 || g_first != 1;
+        else
+            bad += at != 60 || g_passes != 1;
+        extra += g_passes > 1;
+    }
+    check(bad == 0, "HUD then 3D: the HUD fires, the flip tops up the 3D after it");
+    check(extra == 12, "HUD then 3D: a top-up only on the frames with 3D after the HUD");
+}
+
 static void test_dump_parse(void)
 {
     char d[64];
@@ -516,6 +698,9 @@ int main(void)
     test_shadow_and_flip();
     test_growing();
     test_cycle();
+    test_one_in_k();
+    test_deck_hub();
+    test_topup_target();
     test_wander();
     test_lost_chunk();
     test_tail_jitter();
@@ -524,6 +709,8 @@ int main(void)
     test_fit_two_projections();
     test_wmode();
     test_consts();
+    test_comp();
+    test_hud_then_3d();
     test_dump_parse();
     test_forget();
     printf("%s (%d failed)\n", failures ? "FAIL" : "PASS", failures);

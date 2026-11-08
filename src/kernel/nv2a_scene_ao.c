@@ -119,43 +119,30 @@ int nv2a_ao_display_like(const struct nv2a_ao_trig *t, uint32_t w, uint32_t h)
     return fabs(l - r) <= 0.05 * r;
 }
 
-/* The memo: the event count the next frame should end on. The previous
- * frame's, unless the recent counts repeat with a longer period: a frame
- * with one more event every third frame (BLiNX 2 on the Deck)
- * made the previous frame's count fire early on the long frame and miss
- * the next one. A longer period has to explain clearly more of the window
- * than the previous frame does, so counts that only wander (the PC: 2%
- * of frames off by one) keep the previous frame's. */
-#define AO_PERIOD_MAX 4
-#define AO_PERIOD_WIN 12
-#define AO_PERIOD_MARGIN 4
+/* The memo: the event count the next frame should fire at first, the
+ * fewest of the last AO_MEMO_WIN frames. Firing early costs a pass, since
+ * the same target's later events and the flip top it up (event); firing
+ * late is a frame with no occlusion, as no event comes after the HUD. The
+ * counts of BLiNX 2's hub on the Deck went 3, 2, 2 with slips
+ * (3, 3, 2 and 3, 2, 3, 2): no period fitted them, and the period memo of
+ * an earlier fix missed a frame in six. Eight frames cover a short frame up to
+ * one in eight; the PC's wander (an extra event one frame in thirty, a
+ * lost chunk now and then) costs a top-up on the frames above the low. */
+#define AO_MEMO_WIN 8
 
 static unsigned hist_at(const struct nv2a_ao_trig *t, unsigned back)
 {
     return t->hist[(t->nhist - 1u - back) % NV2A_AO_HIST];
 }
 
-static unsigned period_hits(const struct nv2a_ao_trig *t, unsigned p)
-{
-    unsigned n = t->nhist < NV2A_AO_HIST ? t->nhist : NV2A_AO_HIST, i, hits = 0;
-    for (i = 0; i < AO_PERIOD_WIN && i + p < n; i++)
-        hits += hist_at(t, i) == hist_at(t, i + p);
-    return hits;
-}
-
-/* Frames back from the newest to the one the next frame should repeat. */
+/* Frames back from the newest to the newest one with the fewest events. */
 static unsigned memo_back(const struct nv2a_ao_trig *t)
 {
-    unsigned p, best = 1, best_hits = period_hits(t, 1);
-    for (p = 2; p <= AO_PERIOD_MAX && p <= t->nhist; p++) {
-        unsigned h = period_hits(t, p);
-        if (h >= best_hits + AO_PERIOD_MARGIN) {
-            best = p;
-            best_hits = h;
-        }
-    }
-    /* Period p: this frame repeats the one p back, the newest being 0. */
-    return best - 1u;
+    unsigned i, best = 0, n = t->nhist < AO_MEMO_WIN ? t->nhist : AO_MEMO_WIN;
+    for (i = 1; i < n; i++)
+        if (hist_at(t, i) < hist_at(t, best))
+            best = i;
+    return best;
 }
 
 /* The tail rule (event): an event within AO_TAIL_GAP_TOL depth draws of
@@ -215,12 +202,26 @@ static const void *event(struct nv2a_ao_trig *t, int why)
     }
     t->armed = 0;
     t->since = 0;
-    if (!t->fired && t->fit.ok &&
-        (t->ord == t->want || (t->ord + 1u == t->want && tail_match(t, t->ord)))) {
+    if (!t->fit.ok)
+        return NULL;
+    if (!t->fired) {
+        if (t->ord == t->want || (t->ord + 1u == t->want && tail_match(t, t->ord))) {
+            fire = t->cand;
+            t->fired = 1;
+            t->fired_at = t->ord;
+            t->fired_rt = t->cand;
+        }
+    } else if (t->cand && t->cand == t->fired_rt) {
+        /* A top-up: the occluded target took a chunk more after its pass
+         * (an event needs rearm_draws depth-writing draws since the last),
+         * so the memo fired early. The backend occludes the pixels whose
+         * depth changed since its last pass and corrects the rest. */
         fire = t->cand;
-        t->fired = 1;
-        t->fired_at = t->ord;
+        t->fired++;
+        t->topups++;
     }
+    if (fire && t->ord <= NV2A_AO_EVENTS)
+        t->ev_fired |= (uint16_t)(1u << (t->ord - 1u));
     return fire;
 }
 
@@ -232,6 +233,8 @@ void nv2a_ao_forget(struct nv2a_ao_trig *t, const void *rt)
         t->zdraws = 0;
         t->since = 0;
     }
+    if (rt && t->fired_rt == rt)
+        t->fired_rt = NULL;
 }
 
 const void *nv2a_ao_draw(struct nv2a_ao_trig *t, const void *rt, uint32_t w, uint32_t h,
@@ -295,9 +298,10 @@ void nv2a_ao_sample_put(struct nv2a_ao_trig *t, int slot, float z, float w, floa
 
 const void *nv2a_ao_flip(struct nv2a_ao_trig *t)
 {
-    /* The flip ends the frame's last pass. The memo can lag a frame when
-     * the pass count changes; an armed candidate that has not fired yet
-     * fires here, since nothing after the flip can be HUD. */
+    /* The flip ends the frame's last pass. An armed candidate that has not
+     * fired yet fires here (the memo was too high, or the frame is the
+     * first), and one that fired tops up the chunk drawn since, since
+     * nothing after the flip can be HUD. */
     if (!t->armed)
         return NULL;
     t->want = t->fired ? t->want : t->ord + 1;
@@ -392,6 +396,8 @@ void nv2a_ao_frame_end(struct nv2a_ao_trig *t, uint32_t shown_w, uint32_t shown_
     t->armed = 0;
     t->fired = 0;
     t->fired_at = 0;
+    t->fired_rt = NULL;
+    t->ev_fired = 0;
     t->cand = NULL;
     t->zdraws = 0;
     t->since = 0;
@@ -420,7 +426,7 @@ void nv2a_ao_frame_str(const struct nv2a_ao_trig *t, char *buf, size_t cap,
         uint32_t rid = id ? id(t->ev_rt[i]) : (uint32_t)((uintptr_t)t->ev_rt[i] & 0xFFFFFu);
         o += (size_t)snprintf(buf + o, cap - o, "%s%c%u@%x%s", i ? "," : "",
                               why[t->ev_why[i] < sizeof why - 1 ? t->ev_why[i] : 0],
-                              (unsigned)t->ev_zd[i], rid, i + 1 == t->fired_at ? "*" : "");
+                              (unsigned)t->ev_zd[i], rid, (t->ev_fired >> i) & 1u ? "*" : "");
     }
     if (o >= cap)
         buf[cap - 1] = 0;
@@ -450,6 +456,21 @@ void nv2a_ao_consts_fill(const struct nv2a_ao_trig *t, const struct nv2a_ao_cfg 
     o->p3[0] = c->strength;
     o->p3[1] = 0.1f; /* angle bias: flat ground shades itself without it */
     o->p3[2] = (float)c->view;
+    o->p3[3] = t->fired > 1 ? 1.0f : 0.0f; /* a top-up (nv2a_ao_draw) */
+}
+
+float nv2a_ao_comp_px(float filt, float d, int top, float prev_t, float prev_d, float *t)
+{
+    float a = filt;
+    *t = filt;
+    /* Unchanged depth: the pixel has prev_t already. The total only falls
+     * (a multiply cannot brighten), and the record is what was applied,
+     * so the next top-up divides by the truth. */
+    if (top && d == prev_d) {
+        *t = filt < prev_t ? filt : prev_t;
+        a = filt < prev_t ? filt / prev_t : 1.0f;
+    }
+    return a;
 }
 
 void nv2a_ao_dump_parse(const char *v, char *dir, size_t cap, unsigned long *from,

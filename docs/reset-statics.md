@@ -1943,7 +1943,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_on | file_static | keep | - | render.ao, latched at each flip |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_cfg | file_static | keep | - | render.ao settings, latched at each flip from the menu's |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_bad | file_static | keep | - | render.ao passes failed to build, host |
-| src/d3d/nv2a_pb_d3d11.c | - | s_ao_tex | file_static | keep | - | render.ao occlusion target, host, remade on size change |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_tex | file_static | keep | - | render.ao occlusion map (R8) and the two RG32F records (total occlusion, depth), host, remade on size change |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_runs | file_static | keep | - | ao trace totals |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_gpu_ns | file_static | keep | - | ao trace totals |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_gpu_n | file_static | keep | - | ao trace totals |
@@ -1954,11 +1954,13 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_vs | file_static | keep | - | render.ao shader from fixed source |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_ps | file_static | keep | - | render.ao shader from fixed source |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_comp_ps | file_static | keep | - | render.ao shader from fixed source |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_i | file_static | keep | - | render.ao top-up: record the last pass wrote, set before each read |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_rec_rt | file_static | keep | - | render.ao top-up: target of the last pass and its record, cleared at each flip |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_mul_bs | file_static | keep | - | render.ao blend state |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_rep_bs | file_static | keep | - | render.ao blend state |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_cb | file_static | keep | - | render.ao constant buffer |
-| src/d3d/nv2a_pb_d3d11.c | - | s_ao_rtv | file_static | keep | - | view of s_ao_tex |
-| src/d3d/nv2a_pb_d3d11.c | - | s_ao_srv | file_static | keep | - | view of s_ao_tex |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_rtv | file_static | keep | - | views of s_ao_tex |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_srv | file_static | keep | - | views of s_ao_tex |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_w | file_static | keep | - | size of s_ao_tex |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_h | file_static | keep | - | size of s_ao_tex |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_q | file_static | keep | - | ao trace timestamp queries, host |
@@ -2174,7 +2176,10 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_ao_on | file_static | keep | - | render.ao, latched at each flip |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_cfg | file_static | keep | - | render.ao settings, latched at each flip from the menu's |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_bad | file_static | keep | - | render.ao passes failed to build, host |
-| src/d3d/nv2a_pb_metal.m | - | s_ao_tex | file_static | keep | - | render.ao occlusion target, host, remade on size change |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_tex | file_static | keep | - | render.ao occlusion map (R8), host, remade on size change |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_rec | file_static | keep | - | render.ao records (total occlusion, depth) of the last two passes, host, remade on size change |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_i | file_static | keep | - | render.ao top-up: record the last pass wrote, set before each read |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_rec_rt | file_static | keep | - | render.ao top-up: target of the last pass and its record, cleared at each flip |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_runs | file_static | keep | - | ao trace totals |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_gpu_ns | file_static | keep | - | ao trace totals |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_gpu_n | file_static | keep | - | ao trace totals |
