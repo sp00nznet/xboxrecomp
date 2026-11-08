@@ -1255,10 +1255,11 @@ struct nv2a_ps_consts {
 float nv2a_uv_snap(const struct nv2a_stage *t, unsigned n, int flat2d);
 
 /* Every stage's .z (nv2a_uv_snap at n, the target's render scale) but the
- * render-target ones (rt_mask bit k): their texels are at host scale
- * already, and nv2a_ps_consts_rt leaves them 0. */
+ * ones in keep (bit k), which keep the .z they had: a render target's,
+ * whose texels are at host scale already (nv2a_ps_consts_rt leaves it 0),
+ * and a texture pack's (nv2a_snap_pack_aside). */
 void nv2a_ps_consts_snap(struct nv2a_ps_consts *pc, const struct nv2a_stage st[4],
-                         unsigned rt_mask, unsigned n, int flat2d);
+                         unsigned keep, unsigned n, int flat2d);
 
 /* Fill pc from the combiner registers and the four stages. A stage that
  * samples a render target instead of guest memory is then corrected with
@@ -1968,6 +1969,21 @@ static inline int nv2a_snap_flat2d(int two_d, int place)
 static inline int nv2a_snap_2d_on(unsigned n)
 {
     return n > 1 && nv2a_host_opts()->snap_2d;
+}
+
+/* Whether render.snap_2d leaves a stage as it is with the snap off: the
+ * texture pack replaced its texture at 2x to 15x its width (the entry's
+ * nv2a_stage_pack_scale, above 1; it reads the width only). The snap takes one bilinear sample at the guest pixel's 1x
+ * point, which on an N-times entry falls between pack texels: the 4x font
+ * goes hard-edged with uneven strokes (BLiNX 2's LOAD GAME names), 2x text
+ * loses what the pack added and 3x art fringes. The seam the
+ * snap is for, WRAP pulling a tile's far edge into its edge pixels, spans
+ * half a texel: on an N-times entry a half pack texel, 1/N of the stock
+ * line; on BLiNX 2's loading screen the stages it leaves show only the
+ * faint line the pack shows with the snap off. */
+static inline int nv2a_snap_pack_aside(uint32_t pack_scale)
+{
+    return pack_scale > 1;
 }
 
 /* Hor+: how a batch that is not stretched reads a padded render target.

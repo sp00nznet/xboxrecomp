@@ -1234,6 +1234,39 @@ int main(void)
         CHECK(pc.tex_scale[0][2] == -2.0f && pc.tex_scale[2][2] == -2.0f);
     }
     {
+        /* The snap leaves a texture pack's stages as they are
+         * with it off. Only an entry the pack scaled (nv2a_stage_pack_scale
+         * above 1: 2x text, 3x art, 4x font) steps aside; stock, a pack
+         * entry at the guest size and one off a whole multiple snap. */
+        static const uint32_t ew[4] = { 64, 128, 192, 256 };   /* guest 64 wide */
+        struct nv2a_stage st[4];
+        struct nv2a_ps_consts pc;
+        unsigned keep = 0;
+        int k;
+        CHECK(!nv2a_snap_pack_aside(0) && !nv2a_snap_pack_aside(1));
+        CHECK(nv2a_snap_pack_aside(2) && nv2a_snap_pack_aside(3) && nv2a_snap_pack_aside(4));
+        CHECK(!nv2a_snap_pack_aside(nv2a_stage_pack_scale(64, 64)));
+        CHECK(!nv2a_snap_pack_aside(nv2a_stage_pack_scale(64, 100)));
+        CHECK(!nv2a_snap_pack_aside(nv2a_stage_pack_scale(64, 64 * 16)));
+        /* As the backends build the mask: a render target's or a pack's.
+         * Stage 1 is a pack entry and a rect, whose fill .z (the unity
+         * blit's N) is what it keeps; stage 2 a swizzled 4x font (fill 0). */
+        for (k = 0; k < 4; k++) {
+            st[k] = stage(1, k == 1 ? 0x12 : 0x06, 2u << 16 | 2u << 24);
+            if (nv2a_snap_pack_aside(nv2a_stage_pack_scale(64, ew[k])))
+                keep |= 1u << k;
+        }
+        CHECK(keep == 0xEu);
+        memset(&pc, 0, sizeof pc);
+        pc.tex_scale[1][2] = 3.0f;
+        nv2a_ps_consts_snap(&pc, st, keep, 3, 1);
+        CHECK(pc.tex_scale[0][2] == -3.0f);                 /* stock: snapped */
+        CHECK(pc.tex_scale[1][2] == 3.0f && pc.tex_scale[2][2] == 0.0f
+              && pc.tex_scale[3][2] == 0.0f);
+        nv2a_ps_consts_snap(&pc, st, keep, 3, 0);           /* 3D */
+        CHECK(pc.tex_scale[0][2] == 0.0f && pc.tex_scale[1][2] == 3.0f);
+    }
+    {
         /* Through the fill: .z follows the host scale; a render-target
          * stage gets 1/size and .z = 0; .w stays 0. */
         static struct nv2a_pb_vsh v;

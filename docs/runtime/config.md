@@ -171,7 +171,7 @@ the stock settings, `present.pacing = "spin"` included.
 |---|---|---|---|---|
 | `render.scale` | int | internal resolution factor: 1, 2, 3, ... | `1` | `RECOMP_RENDER_SCALE` |
 | `render.aniso` | int | anisotropic filtering on mipmapped textures: `0` (off), `2`..`16` | `0` | `RECOMP_RENDER_ANISO` |
-| `render.snap_2d` | bool | above `render.scale` 1, 2D batches sample their textures on the guest grid, as at 1x (no seams between tiles, blockier 2D art) | `false` | `RECOMP_RENDER_SNAP_2D` |
+| `render.snap_2d` | bool | above `render.scale` 1, 2D batches sample their textures on the guest grid, as at 1x (no seams between tiles, blockier 2D art); textures a texture pack replaced at a whole multiple of their width, 2x to 15x, are left as with it off | `false` | `RECOMP_RENDER_SNAP_2D` |
 | `display.aspect` | string | `"W:H"`: `"4:3"` (stock) or a wider ratio such as `"16:9"`, `"16:10"`, `"21:9"`: Hor+ on Metal and D3D11 ([Hor+](#hor-widescreen-displayaspect)); the CPU rasteriser ignores it with a log line | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
 | `display.movie` | string | `"black"`, `"fit"`, `"fill"`: with a wide aspect, a full-screen movie or still is pillarboxed, stretched to the width, or scaled to cover it (top and bottom cropped) | `"black"` | `RECOMP_DISPLAY_MOVIE` |
 | `display.overscan` | int | guest pixels cropped from each left and right edge at present, top and bottom in proportion: `0` (stock) to `64` ([Overscan](#display-overscan-displayoverscan)); ignored with a wide `display.aspect` and by the CPU rasteriser, each with a log line | `0` | `RECOMP_DISPLAY_OVERSCAN` |
@@ -384,8 +384,14 @@ same requests at given flips, to check a switch without the menu.
   such textures look as at 1x, in N x N blocks, not with host-rate
   bilinear smoothing, and keep the 1x mip level and min/mag filter through
   explicit gradients. 3D batches and render-target textures are left
-  alone. With it on, the walker does not merge back-to-back batches (as
-  under Hor+), since each batch is classed from its own vertices. The frame the
+  alone, and so is a texture a texture pack replaced at a whole multiple
+  of its width, 2x to 15x (`textures.pack`; another width, or 16x and
+  above, still snaps): its one 1x sample would fall between pack texels,
+  hard-edging a re-rendered font, fringing upscaled art and dropping
+  what upscaled text gained, while its seam is a half pack texel wide,
+  so such a stage samples as with the snap off. With it on, the walker
+  does not merge back-to-back batches (as under Hor+), since each batch
+  is classed from its own vertices. The frame the
   guest sees is still guest-sized: Metal box-filters its write-back to
   guest memory, so `RECOMP_FB_DUMP` and `fb_dump_at` frames stay 640x480.
   The box filter averages the stored (gamma-encoded) values, not linear

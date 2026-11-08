@@ -3235,12 +3235,13 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
     }
     if (s_cur && nv2a_snap_2d_on(s_cur->n)) {
         /* render.snap_2d: a centred 2D batch samples guest textures at its
-         * guest pixels' 1x points (nv2a_uv_snap), as metal_on_draw. */
-        unsigned rt_mask = 0;
+         * guest pixels' 1x points (nv2a_uv_snap), as metal_on_draw; but
+         * not a render target's or a texture pack's. */
+        unsigned keep = 0;
         for (n = 0; n < 4; n++)
-            if (s_stage_rt[n])
-                rt_mask |= 1u << n;
-        nv2a_ps_consts_snap(&pc, s_stage, rt_mask, s_cur->n,
+            if (s_stage_rt[n] || nv2a_snap_pack_aside(lm.scale[n]))
+                keep |= 1u << n;
+        nv2a_ps_consts_snap(&pc, s_stage, keep, s_cur->n,
                             nv2a_snap_flat2d(hp->two_d && !hp->vary_z, hp->place));
     }
     /* A batch sampling a padded target the stock way reads it whole, pads

@@ -415,12 +415,12 @@ float nv2a_uv_snap(const struct nv2a_stage *t, unsigned n, int flat2d)
 }
 
 void nv2a_ps_consts_snap(struct nv2a_ps_consts *pc, const struct nv2a_stage st[4],
-                         unsigned rt_mask, unsigned n, int flat2d)
+                         unsigned keep, unsigned n, int flat2d)
 {
     int k;
 
     for (k = 0; k < 4; k++)
-        if (!(rt_mask >> k & 1u))
+        if (!(keep >> k & 1u))
             pc->tex_scale[k][2] = nv2a_uv_snap(&st[k], n, flat2d);
 }
 

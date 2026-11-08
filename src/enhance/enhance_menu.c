@@ -486,7 +486,8 @@ static const struct enhance_item k_items[] = {
       .help = "Draws the 3D at a multiple of the Xbox resolution: sharper, slower" },
     { ITEM("render.snap_2d", "2D on guest grid", "Render", ENHANCE_ITEM_TOGGLE),
       .note = "scale 2+", .set = set_snap, .get = get_snap, .def = "false",
-      .help = "Keeps 2D art on the Xbox pixel grid so scaled menus do not shimmer" },
+      .help = "Keeps stock 2D art on the Xbox pixel grid so scaled menus do not"
+               " shimmer; art a texture pack upscaled 2x to 15x keeps its detail" },
     { ITEM("render.aniso", "Anisotropic filtering", "Render", ENHANCE_ITEM_CHOICE),
       .choices = k_aniso, .set = set_aniso, .get = get_aniso, .flags = ENHANCE_ITEM_NUMERIC,
       .def = "0", .help = "Sharper textures on surfaces seen at an angle" },

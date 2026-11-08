@@ -3353,12 +3353,13 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         if (nv2a_snap_2d_on(rt->n)) {
             /* render.snap_2d: a centred 2D batch samples guest textures at
-             * its guest pixels' 1x points (nv2a_uv_snap), as setup_pixel. */
-            unsigned rt_mask = 0;
+             * its guest pixels' 1x points (nv2a_uv_snap), as setup_pixel;
+             * but not a render target's or a texture pack's. */
+            unsigned keep = 0;
             for (k = 0; k < 4; k++)
-                if (srcs[k])
-                    rt_mask |= 1u << k;
-            nv2a_ps_consts_snap(&mpc.b, s_stage, rt_mask, rt->n,
+                if (srcs[k] || nv2a_snap_pack_aside(s_stage_pack[k][0]))
+                    keep |= 1u << k;
+            nv2a_ps_consts_snap(&mpc.b, s_stage, keep, rt->n,
                                 nv2a_snap_flat2d(two_d && !vary_z, place));
         }
         if (place != NV2A_PLACE_CENTRE)
