@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nv2a_backend.h"
+#include "nv2a_backend_fixture.h"
 
 #define MEM_BYTES 0x10000u
 static uint8_t s_mem[MEM_BYTES];
@@ -54,41 +55,7 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 }
 
 /* ---- the fake back end ------------------------------------------------- */
-static struct {
-    int draws, clears, flips;
-    Nv2aSurface surf;
-    Nv2aRenderState rs;
-    uint32_t count;
-    Nv2aVertex v[8];
-    int textured;
-    uint32_t clear_flags, clear_argb;
-} s_be;
-
-static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
-                     uint32_t flags, uint32_t argb, uint32_t zstencil)
-{
-    (void)s; (void)rs; (void)zstencil;
-    s_be.clears++;
-    s_be.clear_flags = flags;
-    s_be.clear_argb = argb;
-}
-
-static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
-{
-    uint32_t i;
-
-    s_be.draws++;
-    s_be.surf = *s;
-    s_be.rs = *b->state;
-    s_be.count = b->count;
-    s_be.textured = b->texture != NULL;
-    for (i = 0; i < b->count && i < 8; i++)
-        s_be.v[i] = b->vertices[i];
-}
-
-static void be_flip(void) { s_be.flips++; }
-
-static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip };
+static Nv2aBackendFixture s_be;
 
 /* ---- driving the executor ---------------------------------------------- */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
@@ -106,7 +73,8 @@ int main(void)
 {
     uint32_t i;
 
-    nv2a_backend_register(&s_backend);
+    nv2a_backend_fixture_init(&s_be);
+    nv2a_backend_register(nv2a_backend_fixture_bind(&s_be));
 
     /* The flip hold is opt-in: unset, RECOMP_FLIP_PACING leaves every flip
      * completing at once and method 0x100 an unhandled no-op, as before. */
@@ -299,6 +267,7 @@ int main(void)
     CHECK(s_be.flips == 0);
     m(0x0130, 0);                                     /* FLIP_STALL */
     CHECK(s_be.flips == 1);
+    CHECK(s_be.thread_mismatches == 0 && s_be.dropped_events == 0);
 
     if (!s_fail)
         printf("nv2a fixed-function path through a back end: ok\n");
