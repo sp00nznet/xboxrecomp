@@ -11,7 +11,7 @@
 #include <string.h>
 
 static struct nv2a_ao_cfg s_cfg = {
-    0, 1.5f, 20.0f, 0.6f, 1.2f, 16, 8, 0.6f, 0,
+    0, 1.5f, 20.0f, 0.6f, 1.2f, 16, 8, 0.6f, 0, 0,
 };
 
 void nv2a_ao_cfg_default(struct nv2a_ao_cfg *c)
@@ -31,6 +31,7 @@ void nv2a_ao_cfg_default(struct nv2a_ao_cfg *c)
     /* JSRF's menus fitted at 0.23, every 3D scene at 0.9 or more. */
     c->min_conf = 0.6f;
     c->view = 0;
+    c->fb_force = 0;
 }
 
 void nv2a_ao_cfg_set(const struct nv2a_ao_cfg *c) { s_cfg = *c; }
@@ -145,6 +146,55 @@ static unsigned memo_back(const struct nv2a_ao_trig *t)
     return best;
 }
 
+/* Below the memo, does this event look like the last frame's end? A frame
+ * one event short of the memo has no pass by its last 3D chunk and takes
+ * the flip's fallback, whose colour mask also drops the occlusion under
+ * anything translucent drawn after the copy (water, a full-screen dim), so
+ * those pixels blink; two short, it gets none. Short frames come every 10
+ * to 250 frames, often just past the memo's 8 (the Deck's Stage 1: about
+ * 11), so the memo alone sees each one as new. The last event
+ * is not marked, so: the kinds so far end with the shortest tail of the
+ * last frame's kinds found nowhere else in it (Stage 1: an 'r' then a
+ * 'z'). Only a frame with no such tail (the hub's are all 'z') falls back
+ * to depth draws: the candidate has as many as the last frame had by its
+ * last event, as the hub's short frames draw their 3D in fewer, larger
+ * chunks. Not where a tail exists: a frame whose last chunk is small
+ * reaches the count one event early (Stage 1 after a long frame, PC
+ * flip 1479), a top-up more. And only on a target that ended one of the
+ * last two frames (the shown one, double-buffered in BLiNX 2): a
+ * display-sized offscreen target drawn first (a reflection, Burnout 3's
+ * composited scene) may hold more depth draws than the shown one and
+ * would take every first pass, leaving the scene with none. A frame that
+ * goes on after all is topped up by its later events, a pass more. */
+static int looks_last(const struct nv2a_ao_trig *t)
+{
+    unsigned n, i, k, m = t->prev_n, o = t->ord;
+    if (!m || !o || o > NV2A_AO_EVENTS)
+        return 0;
+    /* The whole sequence is always unique and never fits (o < want <= m),
+     * so only proper tails count. */
+    for (n = 1; n < m; n++) {
+        /* The tail of n kinds: unique if no earlier prefix ends with it. */
+        int uniq = 1;
+        for (i = n; i < m && uniq; i++) {
+            for (k = 0; k < n && t->prev_why[i - n + k] == t->prev_why[m - n + k]; k++)
+                ;
+            uniq = k < n;
+        }
+        if (!uniq)
+            continue;
+        if (n > o)
+            return 0;
+        for (k = 0; k < n && t->ev_why[o - n + k] == t->prev_why[m - n + k]; k++)
+            ;
+        return k == n;
+    }
+    /* No proper tail is unique only when every event of the last frame
+     * had the same kind. */
+    return t->prev_zd && t->zdraws >= t->prev_zd && t->ev_why[o - 1] == t->prev_why[m - 1]
+           && (t->cand == t->prev_rt[0] || t->cand == t->prev_rt[1]);
+}
+
 static const void *event(struct nv2a_ao_trig *t, int why)
 {
     const void *fire = NULL;
@@ -159,8 +209,11 @@ static const void *event(struct nv2a_ao_trig *t, int why)
     if (!t->fit.ok)
         return NULL;
     if (!t->fired && !t->gave_up) {
-        if (t->ord == t->want) {
+        int early = t->ord < t->want && t->cand && !s_cfg.fb_force && looks_last(t);
+        if (t->ord == t->want || early) {
             fire = t->cand;
+            t->earlies += early ? 1u : 0u;
+            t->early_now = early;
             t->fired = 1;
             t->fired_at = t->ord;
             t->fired_rt = t->cand;
@@ -204,6 +257,18 @@ void nv2a_ao_dropped(struct nv2a_ao_trig *t)
         t->topups--;
         return;
     }
+    if (t->early_now) {
+        t->early_now = 0;
+        t->earlies--;
+        /* Fired at the event one short of the memo, so no colour copy was
+         * asked for: ask now (the backend copies after the pass), or a
+         * frame that ends here would get neither its pass nor the flip's
+         * fallback. */
+        if (t->ord + 1u == t->want && t->fired_rt) {
+            t->snap_rt = t->fired_rt;
+            t->snap_req = 1;
+        }
+    }
     /* The first pass: the next event on a candidate takes its place, as
      * nothing of this frame was occluded yet. Once only: a second decline
      * is likely the same missing depth, and the event after it may come
@@ -231,6 +296,12 @@ void nv2a_ao_forget(struct nv2a_ao_trig *t, const void *rt)
         t->snap_rt = NULL;
         t->snap_req = 0;
     }
+    /* The backend reuses its target slots: a retired shown buffer's
+     * pointer can come back as an offscreen target, which the depth-draw
+     * test must not take for the shown one (looks_last). */
+    for (unsigned i = 0; rt && i < 2; i++)
+        if (t->prev_rt[i] == rt)
+            t->prev_rt[i] = NULL;
 }
 
 const void *nv2a_ao_snap(struct nv2a_ao_trig *t)
@@ -388,13 +459,22 @@ void nv2a_ao_frame_end(struct nv2a_ao_trig *t, uint32_t shown_w, uint32_t shown_
     if (t->ord) {
         unsigned j = t->nhist++ % NV2A_AO_HIST, o = t->ord;
         t->hist[j] = (uint8_t)(o > 255u ? 255u : o);
-        t->want = hist_at(t, memo_back(t));
+        t->want = hist_at(t, memo_back(t)) + (s_cfg.fb_force ? 1u : 0u);
+        t->prev_n = o <= NV2A_AO_EVENTS ? o : 0;
+        memcpy(t->prev_why, t->ev_why, t->prev_n);
+        t->prev_zd = t->prev_n ? t->ev_zd[o - 1] : 0;
+        t->prev_rt[1] = t->prev_rt[0];
+        t->prev_rt[0] = t->prev_n ? t->ev_rt[o - 1] : NULL;
     } else {
         t->want = 0;
         /* No events and no 3D at all (a loading screen): what follows is
          * another scene, and the old one's period must not steer it. */
-        if (!t->ns)
+        if (!t->ns) {
             t->nhist = 0;
+            t->prev_n = 0;
+            t->prev_zd = 0;
+            t->prev_rt[0] = t->prev_rt[1] = NULL;
+        }
     }
     t->memo = t->want;
     t->ord = 0;
@@ -409,6 +489,7 @@ void nv2a_ao_frame_end(struct nv2a_ao_trig *t, uint32_t shown_w, uint32_t shown_
     t->snap_rt = NULL;
     t->snap_req = 0;
     t->fallback = 0;
+    t->early_now = 0;
     t->ev_fired = 0;
     t->cand = NULL;
     t->zdraws = 0;

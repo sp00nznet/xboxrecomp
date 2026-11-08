@@ -300,6 +300,7 @@ static void load_ao(void)
                 " clamped to %g and %g (0..2, 2..32)\n", v, r, vc, rc);
     (void)enhance_cfg_bool("render.ao_suited", 1);
     c.view = recomp_env_on(RENV_AO_VIEW);
+    c.fb_force = recomp_env_on(RENV_AO_FB_FORCE);
     nv2a_ao_cfg_set(&c);
     if (c.on)
         fprintf(stderr, LOGP "render.ao=1 render.ao_strength=%g render.ao_radius=%g%s\n",

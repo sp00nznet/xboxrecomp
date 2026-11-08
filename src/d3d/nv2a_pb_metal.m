@@ -2681,8 +2681,8 @@ static int ao_build(void)
     return 1;
 }
 
-/* A shared copy of rt's colour, for ao_dump (written after the wait). */
-static id<MTLBuffer> ao_dump_copy(RenderTarget *rt)
+/* A shared copy of tex (rt's size), for ao_dump (written after the wait). */
+static id<MTLBuffer> ao_dump_copy(id<MTLTexture> tex, const RenderTarget *rt)
 {
     NSUInteger bpr = (NSUInteger)rt->hw * 4u;
     id<MTLBuffer> b = [s_dev newBufferWithLength:bpr * rt->hh options:MTLResourceStorageModeShared];
@@ -2691,7 +2691,7 @@ static id<MTLBuffer> ao_dump_copy(RenderTarget *rt)
         return nil;
     ensure_cmd();
     bl = [s_cmd blitCommandEncoder];
-    [bl copyFromTexture:rt->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+    [bl copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
              sourceSize:MTLSizeMake(rt->hw, rt->hh, 1) toBuffer:b destinationOffset:0
  destinationBytesPerRow:bpr destinationBytesPerImage:bpr * rt->hh];
     [bl endEncoding];
@@ -2775,7 +2775,7 @@ static void ao_apply(RenderTarget *rt)
     struct nv2a_ao_consts k;
     MTLRenderPassDescriptor *rp;
     id<MTLRenderCommandEncoder> e;
-    id<MTLBuffer> pre = nil, post = nil;
+    id<MTLBuffer> pre = nil, post = nil, snap = nil;
     int dump, timed = ao_trace(), top = s_ao.fired > 1, fb = s_ao.fallback, i;
     unsigned cur;
 
@@ -2827,7 +2827,9 @@ static void ao_apply(RenderTarget *rt)
     }
     ensure_cmd();
     if (dump)
-        pre = ao_dump_copy(rt);
+        pre = ao_dump_copy(rt->tex, rt);
+    if (dump && fb)
+        snap = ao_dump_copy(s_ao_snap[0], rt);
     rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = s_ao_tex;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -2863,7 +2865,7 @@ static void ao_apply(RenderTarget *rt)
     rt->dirty = 1;
     s_ao_runs++;
     if (dump)
-        post = ao_dump_copy(rt);
+        post = ao_dump_copy(rt->tex, rt);
     if (timed) {
         /* A second pass in one frame, or the last one's GPU still running:
          * its time is dropped rather than its buffer leaked. */
@@ -2882,9 +2884,12 @@ static void ao_apply(RenderTarget *rt)
         ao_dump_write(pre, rt, tag);
         snprintf(tag, sizeof tag, fb ? "postfb" : top ? "post%u" : "post", s_ao.fired);
         ao_dump_write(post, rt, tag);
+        if (snap)
+            ao_dump_write(snap, rt, "snapfb");
     }
     [pre release];
     [post release];
+    [snap release];
 }
 
 /* A pass the trigger fired; one ao_apply declines (no readable depth of
@@ -2989,7 +2994,7 @@ static void ao_flip(RenderTarget *shown)
                     " %llu refused fits; fit a=%.6f b=%.6g conf=%.2f wmode=%d wref=%.4g;"
                     " %llu passes (%llu top-ups, %llu dropped, %llu of them top-ups that"
                     " no longer fit), GPU %.3f ms each;"
-                    " %llu late frames (%llu draws), %llu fallbacks\n",
+                    " %llu late frames (%llu draws), %llu fallbacks, %llu fired early\n",
                     (unsigned long long)s_presents,
                     (unsigned long long)s_ao.frames, (unsigned long long)s_ao.fired_frames,
                     (unsigned long long)s_ao.missed, (unsigned long long)s_ao.no_fit,
@@ -2998,7 +3003,7 @@ static void ao_flip(RenderTarget *shown)
                     (unsigned long long)s_ao.drop_total, (unsigned long long)s_ao_skips,
                     s_ao_gpu_n ? (double)s_ao_gpu_ns / (double)s_ao_gpu_n / 1e6 : 0.0,
                     (unsigned long long)s_ao.late_frames, (unsigned long long)s_ao.late_draws,
-                    (unsigned long long)s_ao.fallbacks);
+                    (unsigned long long)s_ao.fallbacks, (unsigned long long)s_ao.earlies);
             s_ao_gpu_ns = s_ao_gpu_n = 0;
         }
     } else if (s_ao_on) {

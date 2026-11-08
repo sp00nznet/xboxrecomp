@@ -72,6 +72,7 @@ struct nv2a_ao_cfg {
     unsigned rearm_draws;   /* and after an event, before it arms again */
     float    min_conf;      /* the fit's inlier share below which AO is off */
     int      view;          /* debug: 1 shows the occlusion map in place of the scene */
+    int      fb_force;      /* debug: the memo one event high, every short frame a fallback */
 };
 
 /* The defaults above, render.ao off. */
@@ -164,6 +165,16 @@ struct nv2a_ao_trig {
     int         snap_req;
     int         fallback;
     uint64_t    fallbacks;
+    /* The last frame's end, for firing below the memo: its
+     * event kinds (prev_n of them, 0 past NV2A_AO_EVENTS), the depth
+     * draws by its last event, and the targets the last two frames ended
+     * on (newest first). earlies: first passes fired that way;
+     * early_now: this frame's was one. */
+    uint8_t     prev_why[NV2A_AO_EVENTS];
+    unsigned    prev_n, prev_zd;
+    const void *prev_rt[2];
+    uint64_t    earlies;
+    int         early_now;
 };
 
 void nv2a_ao_reset(struct nv2a_ao_trig *t);

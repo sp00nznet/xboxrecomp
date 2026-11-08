@@ -15,8 +15,13 @@
  * W-buffer frames (no fit, wref from w), the constants' radius scaling,
  * the ao_dump parse, a freed candidate (never handed back), a frame one
  * event short of the memo (the colour copied at the event before, the
- * flip's fallback pass, only on the shown target) and passes the
- * backend declines (one retry a frame).
+ * flip's fallback pass, only on the shown target), passes the
+ * backend declines (one retry a frame), and frames one event short of the
+ * memo past its window: fired at their last event by the last
+ * frame's unique tail of event kinds or, with none, by its depth draws,
+ * never at an earlier event that reaches the count, on a display-sized
+ * offscreen target drawn first, or with an alternating shown buffer lost;
+ * an early pass declined still leaves the fallback.
  */
 #include "nv2a_scene_ao.h"
 #include "nv2a_scene_ao_shaders.h"
@@ -594,6 +599,308 @@ static int frame_sizes(struct nv2a_ao_trig *t, const unsigned *sz, unsigned k, i
     return at;
 }
 
+/* Chunks of the given sizes on the 3D target, each ended by 2 non-depth
+ * draws (a 'z' event) or, where rt[c] is set, by a draw to the shadow map
+ * (an 'r'), then a HUD of 5. Returns as frame_chunks. */
+static int frame_kinds(struct nv2a_ao_trig *t, const unsigned *sz, const char *rt, unsigned k,
+                       int *last)
+{
+    int at = -2, i = 0;
+    unsigned c, j;
+    g_snap = -1;
+    for (c = 0; c < k; c++) {
+        for (j = 0; j < sz[c]; j++, i++) {
+            if (draw3d(t, 1, i)) at = i;
+            put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
+        }
+        *last = i;
+        if (rt[c]) {
+            if (nv2a_ao_draw(t, RT_SHADOW, 512, 512, 1, 1, 0)) at = i;
+            i++;
+        } else {
+            for (j = 0; j < 2; j++, i++)
+                if (draw3d(t, 0, i)) at = i;
+        }
+    }
+    for (j = 0; j < 5; j++, i++)
+        if (draw3d(t, 0, i)) at = i;
+    if (nv2a_ao_flip(t, RT_3D)) at = -1;
+    frame_done(t);
+    return at;
+}
+
+/* A frame one event short every 11, just past the memo's 8 (the
+ * Deck's Stage 1), saw a memo one high each time and took the flip's
+ * fallback, whose mask drops the occlusion under translucent water: a
+ * blink. Stage 1's kinds end 'r' then 'z' (zzzzrz, short zzzrz), which
+ * nothing else in the frame does, so the short frame fires at its last
+ * event; the hub's are all 'z' (zzzz, short zzz) and its short frames draw
+ * the same 3D in fewer chunks, so they fire once the candidate has the
+ * last frame's depth draws. Either way one pass, never a second. */
+static void test_short_past_memo(void)
+{
+    static const unsigned st_long[] = { 30, 30, 30, 30, 30, 30 }, st_short[] = { 30, 30, 30, 30, 30 };
+    static const char st_rl[] = { 0, 0, 0, 0, 1, 0 }, st_rs[] = { 0, 0, 0, 1, 0 };
+    static const unsigned hub_long[] = { 30, 30, 30, 30 }, hub_short[] = { 40, 40, 40 };
+    static const char none[6] = { 0 };
+    struct nv2a_ao_trig t;
+    unsigned f, bad = 0, dbl = 0, shorts = 0;
+    uint64_t fb0 = 0, missed = 0, early0 = 0;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 120; f++) {
+        int sh = f % 11 == 10, last, at;
+        if (f == 8) {
+            fb0 = t.fallbacks;
+            missed = t.missed;
+            early0 = t.earlies;
+        }
+        at = sh ? frame_kinds(&t, st_short, st_rs, 5, &last) : frame_kinds(&t, st_long, st_rl, 6, &last);
+        if (f < 8)
+            continue;
+        shorts += sh;
+        bad += at != last || g_fb;
+        dbl += sh && g_passes != 1;
+    }
+    check(bad == 0 && t.fallbacks == fb0 && t.missed == missed,
+          "Stage 1, a short frame in 11: each fires at its last event, no fallback");
+    check(dbl == 0 && t.earlies - early0 == shorts, "Stage 1: the short ones by their tail, one pass");
+    nv2a_ao_reset(&t);
+    bad = dbl = shorts = 0;
+    for (f = 0; f < 120; f++) {
+        int sh = f % 11 == 10, last, at;
+        if (f == 8) {
+            fb0 = t.fallbacks;
+            missed = t.missed;
+            early0 = t.earlies;
+        }
+        at = sh ? frame_kinds(&t, hub_short, none, 3, &last) : frame_kinds(&t, hub_long, none, 4, &last);
+        if (f < 8)
+            continue;
+        shorts += sh;
+        bad += at != last || g_fb;
+        dbl += sh && g_passes != 1;
+    }
+    check(bad == 0 && t.fallbacks == fb0 && t.missed == missed,
+          "hub, a short frame in 11: each fires at its last event, no fallback");
+    check(dbl == 0 && t.earlies - early0 == shorts, "hub: the short ones by their depth draws, one pass");
+}
+
+/* A frame on the shown target `shown`, after `off` depth draws on a
+ * display-sized offscreen target (a reflection; 0 none) ended by 2
+ * non-depth draws, so its event is a 'z' like the chunks': chunks of the
+ * given sizes, each ended by 2 non-depth draws or (rt[c]) a draw to the
+ * shadow map, then a HUD of 5 and the flip. *first_rt: the target of the
+ * first pass. With drop set, the backend declines an early first pass
+ * (nv2a_ao_dropped) and copies the colour if asked (g_snap). Returns as
+ * frame_chunks. */
+static int g_off, g_a2; /* the offscreen target, the shown one's twin */
+static int frame_on(struct nv2a_ao_trig *t, const void *shown, unsigned off, const unsigned *sz,
+                    const char *rt, unsigned k, int drop, int *last, const void **first_rt)
+{
+    int at = -2, i = 0;
+    unsigned c, j;
+    const void *f;
+    g_snap = -1;
+    *first_rt = NULL;
+    for (j = 0; j < off + (off ? 2u : 0u); j++, i++) {
+        f = nv2a_ao_draw(t, &g_off, 640, 480, 1, j < off, 0);
+        if (f && !*first_rt) *first_rt = f;
+        if (j < off) put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
+    }
+    for (c = 0; c < k; c++) {
+        for (j = 0; j < sz[c] + 2u; j++, i++) {
+            int zw = j < sz[c];
+            if (rt && rt[c] && !zw) {
+                if (j == sz[c]) {
+                    f = nv2a_ao_draw(t, RT_SHADOW, 512, 512, 1, 1, 0);
+                    if (f && !*first_rt) *first_rt = f;
+                    if (f) at = i;
+                }
+                continue;
+            }
+            f = nv2a_ao_draw(t, shown, 640, 480, 1, zw, 0);
+            if (f && !*first_rt) {
+                *first_rt = f;
+                if (drop && t->early_now) {
+                    nv2a_ao_dropped(t);
+                    f = NULL;
+                    *first_rt = NULL;
+                }
+            }
+            if (f) at = i;
+            if (nv2a_ao_snap(t) == shown) g_snap = i;
+            if (zw) put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
+        }
+        *last = i - 2;
+    }
+    for (j = 0; j < 5; j++, i++) {
+        f = nv2a_ao_draw(t, shown, 640, 480, 1, 0, 0);
+        if (f && !*first_rt) *first_rt = f;
+        if (f) at = i;
+    }
+    f = nv2a_ao_flip(t, shown);
+    if (f && !*first_rt) *first_rt = f;
+    if (f) at = -1;
+    frame_done(t);
+    return at;
+}
+
+/* Review of the tail rule: where the last frame has a unique tail, the depth
+ * draws must not decide. The PC's Stage 1 after a long frame
+ * (a PC run, flips 1479 and 4655): the long frame
+ * zzzzrz ends at 163 draws on a last chunk of 13, the short zzzrz's 'r'
+ * comes at 163 too, and firing there ran a top-up at the real last 'z'. */
+static void test_short_tail_first(void)
+{
+    static const unsigned lng[] = { 30, 30, 30, 30, 30, 13 }, sht[] = { 40, 40, 40, 43, 13 };
+    static const char rl[] = { 0, 0, 0, 0, 1, 0 }, rs[] = { 0, 0, 0, 1, 0 };
+    struct nv2a_ao_trig t;
+    const void *frt;
+    unsigned f, bad = 0, dbl = 0, ord = 0, shorts = 0;
+    uint64_t early0 = 0, fb0 = 0;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 120; f++) {
+        int sh = f % 11 == 10, last, at;
+        if (f == 8) {
+            early0 = t.earlies;
+            fb0 = t.fallbacks;
+        }
+        at = sh ? frame_on(&t, RT_3D, 0, sht, rs, 5, 0, &last, &frt)
+                : frame_on(&t, RT_3D, 0, lng, rl, 6, 0, &last, &frt);
+        if (f < 8 || !sh)
+            continue;
+        shorts++;
+        bad += at != last || g_fb;
+        dbl += g_passes != 1;
+        ord += g_first != 5;
+    }
+    check(bad == 0 && dbl == 0 && t.fallbacks == fb0, "short zzzrz at the long's count: one pass, at the end");
+    check(ord == 0 && t.earlies - early0 == shorts, "short zzzrz: fires at its last 'z', not the 'r'");
+}
+
+/* Review 2 of the tail rule: the order of the two tests and the depth-draw
+ * test's kind check, each against a short frame its depth draws would
+ * fire early. (a) After zzzzrz ending at 163 draws, a short zzrz
+ * (z80, z163, r173, z183) reaches 163 at its second event: the tail
+ * test must decide, at the fourth, in one pass. (b) After an all-'z'
+ * frame ending at 120, a short zrz (z60, r120, z130) reaches 120 at its
+ * 'r': only a 'z' may fire, at the third, in one pass. */
+static void test_short_order_kind(void)
+{
+    static const unsigned la[] = { 30, 30, 30, 30, 30, 13 }, sa[] = { 80, 83, 10, 10 };
+    static const char rla[] = { 0, 0, 0, 0, 1, 0 }, rsa[] = { 0, 0, 1, 0 };
+    static const unsigned lb[] = { 30, 30, 30, 30 }, sb[] = { 60, 60, 10 };
+    static const char rsb[] = { 0, 1, 0 };
+    struct nv2a_ao_trig t;
+    const void *frt;
+    unsigned f, bad = 0, shorts = 0, pass;
+    for (pass = 0; pass < 2; pass++) {
+        nv2a_ao_reset(&t);
+        bad = shorts = 0;
+        for (f = 0; f < 120; f++) {
+            int sh = f % 11 == 10, last, at;
+            if (pass == 0)
+                at = sh ? frame_on(&t, RT_3D, 0, sa, rsa, 4, 0, &last, &frt)
+                        : frame_on(&t, RT_3D, 0, la, rla, 6, 0, &last, &frt);
+            else
+                at = sh ? frame_on(&t, RT_3D, 0, sb, rsb, 3, 0, &last, &frt)
+                        : frame_on(&t, RT_3D, 0, lb, NULL, 4, 0, &last, &frt);
+            if (f < 8 || !sh)
+                continue;
+            shorts++;
+            bad += at != last || g_fb || g_passes != 1 || g_first != (pass == 0 ? 4 : 3);
+        }
+        check(shorts && bad == 0,
+              pass == 0 ? "short zzrz past the long's count early: the tail decides, one pass"
+                        : "after all 'z', a short frame's 'r' at the count: fires at the 'z'");
+    }
+}
+
+/* Review of the tail rule: a display-sized offscreen target drawn first (B,
+ * 150 depth draws) then the shown one, double-buffered (A and its twin swap
+ * each frame, as BLiNX 2's @8313c000 and @83268000), in 4 chunks of 30: every
+ * event a 'z', so only the depth-draw test can fire early. B has more
+ * than the shown target's 120 at its event, but ended no frame: it must
+ * never take the first pass, or the scene goes without. Short frames (3
+ * chunks of 40, one in 11) still fire early on the shown buffer, which
+ * ended the frame before last. */
+static void test_short_offscreen(void)
+{
+    static const unsigned lng[] = { 30, 30, 30, 30 }, sht[] = { 40, 40, 40 };
+    struct nv2a_ao_trig t;
+    const void *frt;
+    unsigned f, onb = 0, bad = 0, dbl = 0, shorts = 0, steady_bad = 0;
+    uint64_t early0 = 0, fb0 = 0, miss0 = 0;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 60; f++) {
+        const void *shown = f & 1 ? (const void *)&g_a2 : RT_3D;
+        int last, at = frame_on(&t, shown, 150, lng, NULL, 4, 0, &last, &frt);
+        if (f < 8)
+            continue;
+        onb += frt == &g_off;
+        steady_bad += frt != shown || at != last || g_passes != 1;
+    }
+    check(onb == 0 && steady_bad == 0 && t.earlies == 0,
+          "offscreen first, steady: every pass on the shown buffer, at its end");
+    nv2a_ao_reset(&t);
+    onb = 0;
+    for (f = 0; f < 120; f++) {
+        const void *shown = f & 1 ? (const void *)&g_a2 : RT_3D;
+        int sh = f % 11 == 10, last, at;
+        if (f == 8) {
+            early0 = t.earlies;
+            fb0 = t.fallbacks;
+            miss0 = t.missed;
+        }
+        at = sh ? frame_on(&t, shown, 150, sht, NULL, 3, 0, &last, &frt)
+                : frame_on(&t, shown, 150, lng, NULL, 4, 0, &last, &frt);
+        if (f < 8)
+            continue;
+        onb += frt == &g_off;
+        if (!sh)
+            continue;
+        shorts++;
+        bad += frt != shown || at != last || g_fb;
+        dbl += g_passes != 1;
+    }
+    check(onb == 0 && bad == 0 && dbl == 0 && t.fallbacks == fb0 && t.missed == miss0,
+          "offscreen first, a short frame in 11: one pass on the shown");
+    check(t.earlies - early0 == shorts, "alternating shown buffers: the short ones fire early");
+}
+
+/* Review of the tail rule: an early first pass the backend declines is not
+ * counted, and one fired at the event one short of the memo still copies
+ * the colour, so a frame that ends there takes the flip's fallback. */
+static void test_short_early_dropped(void)
+{
+    static const unsigned lng[] = { 30, 30, 30, 30, 30, 30 }, sht[] = { 30, 30, 30, 30, 30 };
+    static const char rl[] = { 0, 0, 0, 0, 1, 0 }, rs[] = { 0, 0, 0, 1, 0 };
+    struct nv2a_ao_trig t;
+    const void *frt;
+    unsigned f, fb = 0, snap = 0, shorts = 0;
+    uint64_t early0 = 0, miss0 = 0;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 120; f++) {
+        int sh = f % 11 == 10, last;
+        if (f == 8) {
+            early0 = t.earlies;
+            miss0 = t.missed;
+        }
+        if (sh)
+            frame_on(&t, RT_3D, 0, sht, rs, 5, 1, &last, &frt);
+        else
+            frame_on(&t, RT_3D, 0, lng, rl, 6, 0, &last, &frt);
+        if (f < 8 || !sh)
+            continue;
+        shorts++;
+        fb += g_fb;
+        snap += g_snap == last;
+    }
+    check(shorts && t.earlies == early0, "early pass declined: not counted as fired early");
+    check(fb == shorts && snap == shorts && t.missed == miss0,
+          "early pass declined one short: colour copied, the flip's fallback");
+}
+
 /* A steady count of chunks whose sizes jitter by a few draws, the last
  * two close (review of the memo fix): the memo counts events, not draws, so
  * no frame fires a chunk early (a top-up) or misses its last. */
@@ -832,8 +1139,11 @@ static void test_forget(void)
     check(t.cand == RT_3D && t.armed, "forget: candidate armed before the free");
     nv2a_ao_forget(&t, RT_SHADOW);
     check(t.cand == RT_3D, "forget: another target leaves it");
+    check(t.prev_rt[0] == RT_3D, "forget: the last frame ended on the target");
     nv2a_ao_forget(&t, RT_3D);
     check(t.cand == NULL && !t.armed, "forget: freed candidate cleared");
+    check(t.prev_rt[0] != RT_3D && t.prev_rt[1] != RT_3D,
+          "forget: freed target no longer a last frame's end");
     got = nv2a_ao_draw(&t, RT_SHADOW, 512, 512, 1, 1, 0);
     stale |= got == RT_3D;
     check(got == NULL, "forget: a draw elsewhere fires nothing");
@@ -993,6 +1303,11 @@ int main(void)
     test_wander();
     test_lost_chunk();
     test_mac_hub();
+    test_short_past_memo();
+    test_short_tail_first();
+    test_short_order_kind();
+    test_short_offscreen();
+    test_short_early_dropped();
     test_fallback_edges();
     test_fallback_mask();
     test_jittered_chunks();

@@ -4269,7 +4269,8 @@ static DepthTarget *ao_depth(const RenderTarget *rt)
     return NULL;
 }
 
-static void ao_dump_write(const RenderTarget *rt, const char *tag)
+/* tex (rt's size: rt's colour or a copy of it) as DIR/ao-<flip>-<tag>.ppm. */
+static void ao_dump_write(ID3D11Texture2D *tex, const RenderTarget *rt, const char *tag)
 {
     D3D11_TEXTURE2D_DESC td;
     ID3D11Texture2D *st = NULL;
@@ -4277,14 +4278,14 @@ static void ao_dump_write(const RenderTarget *rt, const char *tag)
     char path[600];
     FILE *f;
     uint8_t *row;
-    ID3D11Texture2D_GetDesc(rt->tex, &td);
+    ID3D11Texture2D_GetDesc(tex, &td);
     td.Usage = D3D11_USAGE_STAGING;
     td.BindFlags = 0;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     td.MiscFlags = 0;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
         return;
-    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)rt->tex);
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)tex);
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0,
                                           &m))) {
         snprintf(path, sizeof path, "%s/ao-%06llu-%s.ppm", s_ao_dump.dir,
@@ -4446,7 +4447,9 @@ static void ao_apply(RenderTarget *rt)
      * fallback's prefb, postfb. */
     if (dump) {
         snprintf(tag, sizeof tag, fb ? "prefb" : top ? "pre%u" : "pre", s_ao.fired);
-        ao_dump_write(rt, tag);
+        ao_dump_write(rt->tex, rt, tag);
+        if (fb)
+            ao_dump_write(s_ao_snap[0], rt, "snapfb");
     }
     if (timed) {
         if (!s_ao_q[0]) {
@@ -4514,7 +4517,7 @@ static void ao_apply(RenderTarget *rt)
     s_ao_runs++;
     if (dump) {
         snprintf(tag, sizeof tag, fb ? "postfb" : top ? "post%u" : "post", s_ao.fired);
-        ao_dump_write(rt, tag);
+        ao_dump_write(rt->tex, rt, tag);
     }
 }
 
@@ -4624,7 +4627,7 @@ static void ao_flip(RenderTarget *shown)
                         " %llu refused fits; fit a=%.6f b=%.6g conf=%.2f wmode=%d wref=%.4g;"
                         " %llu passes (%llu top-ups, %llu dropped, %llu of them top-ups that"
                         " no longer fit), GPU %.3f ms each;"
-                        " %llu late frames (%llu draws), %llu fallbacks\n",
+                        " %llu late frames (%llu draws), %llu fallbacks, %llu fired early\n",
                         (unsigned long long)s_presents,
                         (unsigned long long)s_ao.frames, (unsigned long long)s_ao.fired_frames,
                         (unsigned long long)s_ao.missed, (unsigned long long)s_ao.no_fit,
@@ -4633,7 +4636,7 @@ static void ao_flip(RenderTarget *shown)
                         (unsigned long long)s_ao.drop_total, (unsigned long long)s_ao_skips,
                         s_ao_gpu_n ? (double)s_ao_gpu_ns / (double)s_ao_gpu_n / 1e6 : 0.0,
                         (unsigned long long)s_ao.late_frames, (unsigned long long)s_ao.late_draws,
-                        (unsigned long long)s_ao.fallbacks);
+                        (unsigned long long)s_ao.fallbacks, (unsigned long long)s_ao.earlies);
                 s_ao_gpu_ns = s_ao_gpu_n = 0;
             }
         }
