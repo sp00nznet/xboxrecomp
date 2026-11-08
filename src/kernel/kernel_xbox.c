@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -72,6 +73,19 @@ XBOX_ANSI_STRING xbox_XeImageFileName = {
  * Allocated dynamically and zeroed for normal game boot. */
 static XBOX_LAUNCH_DATA_PAGE g_launch_data_page = {0};
 XBOX_LAUNCH_DATA_PAGE* xbox_LaunchDataPage = &g_launch_data_page;
+
+static ULONG video_flags(void)
+{
+    ULONG flags = XC_VIDEO_FLAGS_60Hz;
+    const char *widescreen = getenv("RECOMP_VIDEO_WIDESCREEN");
+    const char *progressive = getenv("RECOMP_VIDEO_480P");
+
+    if (widescreen && strcmp(widescreen, "1") == 0)
+        flags |= XC_VIDEO_FLAGS_WIDESCREEN;
+    if (progressive && strcmp(progressive, "1") == 0)
+        flags |= XC_VIDEO_FLAGS_HDTV_480p;
+    return flags;
+}
 
 /* ============================================================================
  * Section Loading
@@ -220,9 +234,9 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_VIDEO:
-        /* NTSC 4:3, 480i at 60 Hz. The old low-half-word value read as 0 (#301). */
+        /* NTSC 4:3, 480i at 60 Hz unless the host advertises opt-in modes. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_60Hz;
+            *(PULONG)Value = video_flags();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -313,7 +327,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         memcpy(blk + 0x28, &s_tz.std_bias, 4);
         memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
         { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
-        { ULONG v = XC_VIDEO_FLAGS_60Hz; memcpy(blk + 0x34, &v, 4); }
+        { ULONG v = video_flags(); memcpy(blk + 0x34, &v, 4); }
         /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
         { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */
         if (Type) *Type = 3;
