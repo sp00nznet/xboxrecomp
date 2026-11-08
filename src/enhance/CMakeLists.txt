@@ -29,6 +29,8 @@
 #                  reader, the manifest (saves_zip.h)
 #   saves_store.c  the Saves page's file work: list, export, staged import
 #                  with rollback (saves_store.h)
+#   saves_sign.c   saves made under other console keys re-signed for this
+#                  build by saves-signing.toml's recipes (saves_sign.h)
 #   enhance_files.c the menu's import and export texts: the export marker
 #                  and header, a config value as TOML (enhance_files.h)
 #   shader_param_kinds.c a parameter as a toggle, a choice or a slider: the
@@ -60,7 +62,7 @@ target_include_directories(xbox_enhance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_enhance PUBLIC recomp_env xbox_kernel xbox_input xbox_usb)
 target_sources(xbox_enhance PRIVATE enhance_text.c enhance_menu_layout.c)
 target_sources(xbox_enhance PRIVATE enhance_mod_status.c enhance_menu_input.c enhance_osk.c)
-target_sources(xbox_enhance PRIVATE saves_zip.c saves_store.c)
+target_sources(xbox_enhance PRIVATE saves_zip.c saves_store.c saves_sign.c)
 target_sources(xbox_enhance PRIVATE enhance_display.c)
 target_sources(xbox_enhance PRIVATE enhance_padrec.c)
 if(WIN32)

@@ -137,6 +137,14 @@ typedef struct PadSession {
     int ended;                  /* retire at the next poll */
     int end_state;
     char warn[PADREC_WARN_MAX];
+    /* A chain (R6): the segment after this one, started on the poll after
+     * this one ends, and this one's place in it (1-based) for the strip. */
+    struct PadSession *next;
+    int seg, segs;
+    uint32_t pads_all;          /* its pads and every later segment's */
+    int boot;                   /* origin boot: counts from the run's start */
+    int trust;                  /* its !<action> steps may fire */
+    int quit;                   /* the env chain's last: pad_quit at its end */
 
     /* a playback */
     PadStep *steps;
@@ -161,15 +169,17 @@ typedef struct PadSession {
 
 static void session_free(PadSession *s)
 {
-    if (!s)
-        return;
-    if (s->f)
-        fclose(s->f);
-    free(s->path);
-    free(s->steps);
-    free(s->anchors);
-    free(s->hdr);
-    free(s);
+    while (s) {
+        PadSession *next = s->next;
+        if (s->f)
+            fclose(s->f);
+        free(s->path);
+        free(s->steps);
+        free(s->anchors);
+        free(s->hdr);
+        free(s);
+        s = next;
+    }
 }
 
 /* Published by the menu thread, taken by the pad thread with an exchange:
@@ -191,6 +201,9 @@ static uint32_t s_play_pads, s_pending_pads;
 static uint32_t s_serial;
 /* The record the signal handler ends, and its length offset. */
 static PadSession *s_sig_rec;
+/* Set once record_signal ran: the exit that follows may come on a thread
+ * that holds the pad lock, so padrec_exit then takes no lock. */
+static volatile sig_atomic_t s_in_signal;
 
 /* The last poll padrec_sync ran for. */
 static int s_synced;
@@ -255,6 +268,8 @@ static void status_of(const PadSession *s, int state, uint32_t count, PadrecStat
     st->step = s->stepped;
     st->nsteps = s->nsteps;
     st->full = s->full;
+    st->seg = s->seg;
+    st->segs = s->segs;
     snprintf(st->name, sizeof st->name, "%s", s->name);
     snprintf(st->warn, sizeof st->warn, "%s", s->warn);
 }
@@ -447,15 +462,27 @@ static void record_signal(int sig)
     FILE *f = s ? __atomic_exchange_n(&s->f, NULL, __ATOMIC_ACQ_REL) : NULL;
     PadSession *p = __atomic_exchange_n(&s_pending, NULL, __ATOMIC_ACQ_REL);
 
+    s_in_signal = 1;
     /* An armed record that never started holds no steps: its empty file
      * would be listed, then refused. Leaked, not freed: no free() here. */
-    if (p && p->kind == KIND_REC && p->path) {
+    for (; p; p = p->next)
+        if (p->kind == KIND_REC && p->path) {
 #ifdef _WIN32
-        utf8_remove(p->path);
+            utf8_remove(p->path);
 #else
-        unlink(p->path);
+            unlink(p->path);
 #endif
-    }
+        }
+    /* "Play setup, then record": the record waits behind the setup. */
+    p = __atomic_load_n(&s_active, __ATOMIC_ACQUIRE);
+    for (p = p ? p->next : NULL; p; p = p->next)
+        if (p->kind == KIND_REC && p->path) {
+#ifdef _WIN32
+            utf8_remove(p->path);
+#else
+            unlink(p->path);
+#endif
+        }
     if (f) {
         char lines[512], end[32], len[LEN_WIDTH];
         uint32_t rel = rel_now(s, &s_sig_clock);
@@ -480,6 +507,18 @@ static void padrec_exit(void)
      * nothing, so it goes rather than stay listed and be refused. The
      * exchange needs no lock. */
     pending_drop(__atomic_exchange_n(&s_pending, NULL, __ATOMIC_ACQ_REL));
+    /* A record waiting behind a setup that never ended holds nothing
+     * either. Under the lock: the pad thread retires and frees the active
+     * session. After a signal record_signal already removed its file, and
+     * the lock could be held by the thread exiting. */
+    if (!s_in_signal) {
+        PadSession *nx = NULL;
+        pad_lock();
+        if (s_active)
+            nx = __atomic_exchange_n(&s_active->next, NULL, __ATOMIC_ACQ_REL);
+        pad_unlock();
+        pending_drop(nx);
+    }
     /* No lock once the record has ended: a handler chained after ours may
      * exit() on a thread that holds it, and it is not recursive. */
     if (!__atomic_load_n(&s_sig_rec, __ATOMIC_ACQUIRE))
@@ -525,6 +564,9 @@ static void end_active(int state, const PadrecClocks *c)
         return;
     if (s->kind == KIND_REC)
         record_end(s, rel_now(s, c));
+    /* The chain's segments not reached: a stop ends them all, and a
+     * record waiting behind a setup leaves no empty file. */
+    pending_drop(__atomic_exchange_n(&s->next, NULL, __ATOMIC_ACQ_REL));
     status_of(s, state, rel_now(s, c), &st);
     st.end_ms = (uint32_t)GetTickCount();
     status_put(&st);
@@ -578,33 +620,50 @@ static void activate(PadSession *s, const PadrecClocks *c)
     PadrecStatus st;
 
     s->host0 = GetTickCount();
-    s->ms0 = c->ms;
+    s->ms0 = s->boot ? 0 : c->ms;
     if (s->kind == KIND_REC)
         record_begin(s, c);
-    s->origin = clock_now(s, c);
+    /* A boot file counts from the run's start, as RECOMP_PAD_SCRIPT plays
+     * it: only the first segment of a chain started at boot is one. */
+    s->origin = s->boot ? 0 : clock_now(s, c);
     if (s->kind == KIND_PLAY) {
         char open[PAD_ANCHOR_TEXT];
         padrec_last_open(open, sizeof open);
         if (s->want_open[0] && open[0] && strcmp(open, s->want_open))
             snprintf(s->warn, sizeof s->warn, "recorded after %s, this run last opened %s",
                      s->want_open, open);
-        fprintf(stderr, "[PADREC] play %s: %d step(s), %d anchor(s), %s clock from %u\n",
-                s->name, s->nsteps, s->anchors->n,
-                s->clock == 2 ? "poll" : s->clock == 1 ? "flip" : "ms",
-                (unsigned)s->origin);
+        if (s->segs > 1)
+            fprintf(stderr, "[PADREC] play %s (%d/%d): %d step(s), %d anchor(s), %s clock"
+                    " from %u\n", s->name, s->seg, s->segs, s->nsteps, s->anchors->n,
+                    s->clock == 2 ? "poll" : s->clock == 1 ? "flip" : "ms",
+                    (unsigned)s->origin);
+        else
+            fprintf(stderr, "[PADREC] play %s: %d step(s), %d anchor(s), %s clock from %u\n",
+                    s->name, s->nsteps, s->anchors->n,
+                    s->clock == 2 ? "poll" : s->clock == 1 ? "flip" : "ms",
+                    (unsigned)s->origin);
         fflush(stderr);
     }
     __atomic_store_n(&s_active, s, __ATOMIC_RELEASE);
     __atomic_store_n(&s_live, 1, __ATOMIC_RELEASE);
-    __atomic_store_n(&s_play_pads, s->kind == KIND_PLAY ? s->pads : 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_play_pads, s->kind == KIND_PLAY ? s->pads_all : 0, __ATOMIC_RELEASE);
     __atomic_store_n(&s_playing, s->kind == KIND_PLAY, __ATOMIC_RELEASE);
     status_of(s, s->kind == KIND_REC ? PADREC_REC : PADREC_PLAY, 0, &st);
     status_put(&st);
 }
 
+/* The env chain's pad_quit (usb_gamepad.c), set by the env path. */
+static void (*s_quit_fn)(void);
+
+void padrec_set_quit(void (*fn)(void))
+{
+    s_quit_fn = fn;
+}
+
 void padrec_sync(const PadrecClocks *c)
 {
     PadSession *s, *p;
+    int quit = 0;
 
     if (!__atomic_load_n(&s_ever, __ATOMIC_ACQUIRE))
         return;
@@ -612,13 +671,23 @@ void padrec_sync(const PadrecClocks *c)
         return;
     s_synced = 1;
     s_sync_poll = c->polls;
-    s_sig_clock = *c;
     pad_lock();
+    /* Under the lock: an action fired on another thread writes its record
+     * line at this poll's count (padrec_action_fired). */
+    s_sig_clock = *c;
     if (__atomic_exchange_n(&s_stop, 0, __ATOMIC_ACQ_REL))
         end_active(PADREC_STOPPED, c);
     s = s_active;
-    if (s && __atomic_load_n(&s->ended, __ATOMIC_ACQUIRE))
+    if (s && __atomic_load_n(&s->ended, __ATOMIC_ACQUIRE)) {
+        /* A chain's next segment starts on this poll, the one after the
+         * end (R6); a stop or a full record ends the chain. */
+        PadSession *next = s->end_state == PADREC_ENDED
+                           ? __atomic_exchange_n(&s->next, NULL, __ATOMIC_ACQ_REL) : NULL;
+        quit = !next && s->quit && s->end_state == PADREC_ENDED;
         end_active(s->end_state, c);
+        if (next)
+            activate(next, c);
+    }
     if (!__atomic_load_n(&s_hold, __ATOMIC_ACQUIRE)
         && (p = __atomic_exchange_n(&s_pending, NULL, __ATOMIC_ACQ_REL))) {
         __atomic_store_n(&s_pending_pads, 0, __ATOMIC_RELEASE);
@@ -640,6 +709,10 @@ void padrec_sync(const PadrecClocks *c)
         status_put(&st);
     }
     pad_unlock();
+    /* Off the lock: the quit runs the exit hooks on its own thread or the
+     * window's, and padrec_exit takes this lock. */
+    if (quit && s_quit_fn)
+        s_quit_fn();
 }
 
 /* ---- playback and record on the pad thread --------------------------------- */
@@ -666,6 +739,8 @@ void padrec_press(int pad, uint8_t *report, const PadrecClocks *c)
         if (!st->announced) {
             st->announced = 1;
             s->stepped++;
+            if (st->action)
+                pad_step_fire(st, s->anchors, s->trust);
         }
         pad_step_press(st, report);
     }
@@ -698,9 +773,10 @@ void padrec_press(int pad, uint8_t *report, const PadrecClocks *c)
     }
     s->end_state = PADREC_ENDED;
     __atomic_store_n(&s->ended, 1, __ATOMIC_RELEASE);
-    fprintf(stderr, "[PADREC] play %s ended (%s %u)\n", s->name,
+    fprintf(stderr, "[PADREC] play %s ended (%s %u)%s\n", s->name,
             s->clock == 2 ? "poll" : s->clock == 1 ? "flip" : "ms",
-            (unsigned)(s->clock ? rel : (uint32_t)t));
+            (unsigned)(s->clock ? rel : (uint32_t)t),
+            s->next ? "; the next segment starts" : "");
     fflush(stderr);
 }
 
@@ -811,6 +887,40 @@ void padrec_file_open(const char *path, const PadrecClocks *c, char *log, size_t
     s->lines++;
 }
 
+/* A host action fired (enhance_actions.c, any thread): a record writes its
+ * step at the last poll's count, so a replay fires it there. An
+ * env record (RECOMP_DEBUG=pad_record) gets it too. */
+void padrec_action_fired(const char *name)
+{
+    PadSession *s;
+    char line[96];
+    FILE *f;
+    int w;
+
+    usb_gamepad_record_action(name);
+    if (!__atomic_load_n(&s_ever, __ATOMIC_ACQUIRE))
+        return;
+    pad_lock();
+    s = s_active;
+    if (s && s->kind == KIND_REC && !__atomic_load_n(&s->ended, __ATOMIC_ACQUIRE)
+        && (f = __atomic_load_n(&s->f, __ATOMIC_ACQUIRE)) != NULL
+        && s->lines < PAD_STEPS_MAX - 4 * USB_GAMEPAD_MAX - 8) {
+        w = pad_recorder_action(s->clock == 2, rel_now(s, &s_sig_clock), name, line,
+                                sizeof line);
+        if (w > 0) {
+            fputs(line, f);
+            fflush(f);
+            s->lines++;
+        }
+    }
+    pad_unlock();
+}
+
+void padrec_set_action_hook(int (*fire)(const char *name, char *why, size_t n))
+{
+    pad_action_set_hook(fire);
+}
+
 /* ---- the menu thread ---------------------------------------------------------- */
 
 /* A pending session that never reached the pad thread: a record's file
@@ -818,11 +928,12 @@ void padrec_file_open(const char *path, const PadrecClocks *c, char *log, size_t
  * replaced before the menu closed). */
 static void pending_drop(PadSession *s)
 {
-    if (s && s->kind == KIND_REC && s->f && s->path) {
-        fclose(s->f);
-        s->f = NULL;
-        utf8_remove(s->path);
-    }
+    for (PadSession *p = s; p; p = p->next)
+        if (p->kind == KIND_REC && p->f && p->path) {
+            fclose(p->f);
+            p->f = NULL;
+            utf8_remove(p->path);
+        }
     session_free(s);
 }
 
@@ -866,33 +977,30 @@ static const char *host_os(void)
 #endif
 }
 
-int padrec_record_start(const char *path, const PadrecMeta *m, unsigned flags,
-                        char *why, size_t whyn)
+/* A record's session, its file created and its header filled; not
+ * published. NULL with why. */
+static PadSession *rec_new(const char *path, const PadrecMeta *m, char *why, size_t whyn)
 {
-    const char *env = padrec_env_driven();
     PadSession *s;
     char stamp[32];
     time_t now = time(NULL);
     struct tm tm;
 
-    if (env) {
-        snprintf(why, whyn, "driven by %s", env);
-        return -1;
-    }
     s = calloc(1, sizeof *s);
     if (!s || !(s->hdr = calloc(1, sizeof *s->hdr))) {
         session_free(s);
         snprintf(why, whyn, "out of memory");
-        return -1;
+        return NULL;
     }
     s->kind = KIND_REC;
+    s->seg = s->segs = 1;
     s->f = utf8_fopen(path, "wb");
     if ((s->path = malloc(strlen(path) + 1)) != NULL)
         memcpy(s->path, path, strlen(path) + 1);
     if (!s->f || !s->path) {
-        session_free(s);
+        pending_drop(s);
         snprintf(why, whyn, "cannot write %s", pad_path_name(path));
-        return -1;
+        return NULL;
     }
     name_of(s->name, sizeof s->name, path);
     pad_header_init(s->hdr);
@@ -925,16 +1033,43 @@ int padrec_record_start(const char *path, const PadrecMeta *m, unsigned flags,
     if (m && m->notes && *m->notes)
         pad_header_set_text(s->hdr, "notes", m->notes);
     pad_header_set_int(s->hdr, "deterministic", xbox_GuestTimeVirtual() ? 1 : 0);
+    if (m && m->setup && *m->setup)
+        pad_header_set_text(s->hdr, "setup", m->setup);
+    return s;
+}
+
+int padrec_record_start(const char *path, const PadrecMeta *m, unsigned flags,
+                        char *why, size_t whyn)
+{
+    const char *env = padrec_env_driven();
+    PadSession *s;
+
+    if (env) {
+        snprintf(why, whyn, "driven by %s", env);
+        return -1;
+    }
+    if (!(s = rec_new(path, m, why, whyn)))
+        return -1;
     install_exit();
     publish(s, flags, 0);
     return 0;
 }
 
-/* The last playback's paths, for padrec_again. */
-static char s_last_path[1024];
+/* The last playback's chain, for padrec_again: its paths, and whether
+ * each was trusted, so Play again asks nothing new. */
+static char s_last_path[PADREC_CHAIN_MAX][1024];
+static int s_last_trust[PADREC_CHAIN_MAX];
+/* The confirmed actions each was played with ("" none); listed 0: any. */
+static char s_last_allowed[PADREC_CHAIN_MAX][256];
+static int s_last_listed[PADREC_CHAIN_MAX];
+static int s_last_n;
+static unsigned s_last_flags;      /* PADREC_BOOT */
 /* The running title, for padrec_play's check (padrec_set_title). */
 static uint32_t s_title_id;
 static char s_title[64];
+/* Whether a requires key is on (the menu's config), and the last unmet. */
+static int (*s_req_fn)(const char *key);
+static char s_unmet[PAD_HDR_VALUE_MAX + 1];
 
 void padrec_set_title(uint32_t title_id, const char *title)
 {
@@ -942,85 +1077,169 @@ void padrec_set_title(uint32_t title_id, const char *title)
     snprintf(s_title, sizeof s_title, "%s", title ? title : "");
 }
 
-void padrec_path_moved(const char *from, const char *to)
+void padrec_set_requires_hook(int (*on)(const char *key))
 {
-    if (!from || strcmp(s_last_path, from))
-        return;
-    snprintf(s_last_path, sizeof s_last_path, "%s", to ? to : "");
+    s_req_fn = on;
 }
 
-int padrec_play(const char *const *paths, int n, unsigned flags, char *why, size_t whyn)
+const char *padrec_unmet(void)
 {
-    const char *env = padrec_env_driven();
+    return s_unmet;
+}
+
+void padrec_path_moved(const char *from, const char *to)
+{
+    int i;
+    for (i = 0; from && i < s_last_n; i++) {
+        if (strcmp(s_last_path[i], from))
+            continue;
+        if (to) {
+            snprintf(s_last_path[i], sizeof s_last_path[i], "%s", to);
+        } else {
+            /* A chain without one of its files is not the chain played. */
+            s_last_n = 0;
+            return;
+        }
+    }
+}
+
+int padrec_requires(const char *text, char *unmet, size_t n)
+{
+    char keys[PADREC_REQUIRES_MAX][PAD_HDR_KEY_MAX * 4];
+    PadHeader *h = malloc(sizeof *h);
+    int k, i;
+
+    if (unmet && n)
+        unmet[0] = 0;
+    if (!h || pad_header_read(text, h) < 0) {
+        free(h);
+        return 0;
+    }
+    k = pad_header_list(h, "requires", &keys[0][0], sizeof keys[0], PADREC_REQUIRES_MAX);
+    free(h);
+    if (k < 0) {
+        snprintf(unmet, n, "requires (not a list of keys)");
+        return -1;
+    }
+    for (i = 0; i < k && i < PADREC_REQUIRES_MAX; i++)
+        if (!s_req_fn || !s_req_fn(keys[i])) {
+            snprintf(unmet, n, "%s", keys[i]);
+            return -1;
+        }
+    return 0;
+}
+
+/* A !<action> of text missing from allowed (", " joined), named into
+ * out: 1; 0 when every one was confirmed. */
+static int actions_unconfirmed(const char *text, const char *allowed, char *out, size_t on)
+{
+    char names[PAD_ACTION_MAX][PAD_ACTION_NAME];
+    int k = pad_script_action_names(text, names, PAD_ACTION_MAX);
+
+    for (int i = 0; i < k; i++) {
+        size_t len = strlen(names[i]);
+        const char *p = allowed;
+        int found = 0;
+        while (*p) {
+            size_t w = strcspn(p, ",");
+            if (w == len && !memcmp(p, names[i], len)) {
+                found = 1;
+                break;
+            }
+            p += w;
+            while (*p == ',' || *p == ' ')
+                p++;
+        }
+        if (!found) {
+            snprintf(out, on, "!%s", names[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* One segment of a chain: read, checked and parsed, its steps counted
+ * against the room the chain has left. NULL with why. */
+static PadSession *seg_new(const PadrecSeg *sg, int first, unsigned flags, int room,
+                           char *why, size_t whyn)
+{
+    const char *path = sg->path, *name = pad_path_name(sg->path);
     PadSession *s;
     PadHeader *h;
     PadStep *steps;
-    char *text;
-    int rc, i, anchors;
+    char *text, unmet[sizeof s_unmet];
+    int rc, i, anchors, boot;
 
-    if (env) {
-        snprintf(why, whyn, "driven by %s", env);
-        return -1;
-    }
-    if (n != 1 || !paths || !paths[0]) {
-        /* Setups and chains come with phase 3 (R6). */
-        snprintf(why, whyn, n > 1 ? "chains come later" : "no recording");
-        return -1;
-    }
-    if (!(text = read_text(paths[0], why, whyn)))
-        return -1;
+    if (!(text = read_text(path, why, whyn)))
+        return NULL;
     h = malloc(sizeof *h);
     if (!h) {
         free(text);
         snprintf(why, whyn, "out of memory");
-        return -1;
+        return NULL;
     }
     rc = pad_header_read(text, h);
-    if (rc < 0 || strcmp(pad_header_origin(h), "session")) {
-        if (rc < 0)
-            snprintf(why, whyn, "%s: %s", pad_path_name(paths[0]), pad_header_error(rc));
-        else
-            /* Counted from boot: it plays only from the start of a run. */
-            snprintf(why, whyn, "%s was recorded from boot (RECOMP_PAD_SCRIPT)",
-                     pad_path_name(paths[0]));
-        free(h);
-        free(text);
-        return -1;
+    if (rc < 0) {
+        snprintf(why, whyn, "%s: %s", name, pad_header_error(rc));
+        goto fail;
+    }
+    boot = strcmp(pad_header_origin(h), "session") != 0;
+    /* Counted from boot: it plays only from the start of a run, so only
+     * as the first segment of a chain started there (R6). */
+    if (boot && !(first && (flags & PADREC_BOOT))) {
+        snprintf(why, whyn, first ? "%s was recorded from boot (RECOMP_PAD_SCRIPT)"
+                                  : "%s was recorded from boot: only first in a chain",
+                 name);
+        goto fail;
     }
     /* Another game's file copied into recordings/ by hand: its presses
      * mean nothing to this title. */
-    if (pad_header_title_check(h, s_title_id, s_title, why, whyn) < 0) {
+    if (pad_header_title_check(h, s_title_id, s_title, why, whyn) < 0)
+        goto fail;
+    if (padrec_requires(text, unmet, sizeof unmet) < 0) {
+        snprintf(s_unmet, sizeof s_unmet, "%s", unmet);
+        snprintf(why, whyn, "%s needs %s on", name, unmet);
         free(h);
         free(text);
-        return -1;
+        return NULL;
+    }
+    /* The file changed between the confirm and the play (or Play again):
+     * its new actions were never shown, so it does not play (R6). */
+    if (sg->trusted && sg->allowed && actions_unconfirmed(text, sg->allowed, unmet, sizeof unmet)) {
+        snprintf(why, whyn, "%s changed: %s was not confirmed", name, unmet);
+        goto fail;
     }
     if ((anchors = pad_script_anchor_lines(text)) > PAD_ANCHOR_MAX) {
-        snprintf(why, whyn, "%d anchors, over %d", anchors, PAD_ANCHOR_MAX);
-        free(h);
-        free(text);
-        return -1;
+        snprintf(why, whyn, "%s: %d anchors, over %d", name, anchors, PAD_ANCHOR_MAX);
+        goto fail;
     }
     s = calloc(1, sizeof *s);
-    steps = malloc((size_t)(PAD_STEPS_MAX + 1) * sizeof *steps);
+    steps = malloc((size_t)(room + 1) * sizeof *steps);
     if (!s || !steps || !(s->anchors = calloc(1, sizeof *s->anchors))) {
         if (s)
             free(s->anchors);
         free(s);
         free(steps);
-        free(h);
-        free(text);
         snprintf(why, whyn, "out of memory");
-        return -1;
+        goto fail;
     }
     s->kind = KIND_PLAY;
-    s->nsteps = pad_script_parse_anchored(text, steps, 0, PAD_STEPS_MAX + 1, s->anchors);
+    s->boot = boot;
+    s->trust = sg->trusted;
+    s->nsteps = pad_script_parse_anchored(text, steps, 0, room + 1, s->anchors);
     free(text);
-    if (s->nsteps > PAD_STEPS_MAX || s->nsteps <= 0) {
-        snprintf(why, whyn, s->nsteps > 0 ? "over %d steps" : "no steps", PAD_STEPS_MAX);
+    text = NULL;
+    if (s->nsteps > room || s->nsteps <= 0) {
+        /* The cap bounds what a session holds: the whole chain's (R5). */
+        if (s->nsteps <= 0)
+            snprintf(why, whyn, "%s: no steps", name);
+        else if (room < PAD_STEPS_MAX)
+            snprintf(why, whyn, "the chain is over %d steps", PAD_STEPS_MAX);
+        else
+            snprintf(why, whyn, "over %d steps", PAD_STEPS_MAX);
         free(steps);
-        free(h);
         session_free(s);
-        return -1;
+        goto fail;
     }
     s->steps = realloc(steps, (size_t)s->nsteps * sizeof *steps);
     if (!s->steps)
@@ -1037,27 +1256,174 @@ int padrec_play(const char *const *paths, int n, unsigned flags, char *why, size
         if (nm && *nm)
             snprintf(s->name, sizeof s->name, "%s", nm);
         else
-            name_of(s->name, sizeof s->name, paths[0]);
+            name_of(s->name, sizeof s->name, path);
         if (so)
             snprintf(s->want_open, sizeof s->want_open, "%s", so);
     }
     free(h);
-    snprintf(s_last_path, sizeof s_last_path, "%s", paths[0]);
-    publish(s, flags, s->pads);
+    return s;
+fail:
+    free(h);
+    free(text);
+    return NULL;
+}
+
+int padrec_play_chain(const PadrecSeg *segs, int n, unsigned flags, const char *rec_path,
+                      const PadrecMeta *meta, char *why, size_t whyn)
+{
+    const char *env = (flags & PADREC_ENV) ? NULL : padrec_env_driven();
+    PadSession *head = NULL, **tail = &head, *s;
+    int i, room = PAD_STEPS_MAX, total = n + (rec_path != NULL);
+    uint32_t pads = 0;
+
+    s_unmet[0] = 0;
+    if (env) {
+        snprintf(why, whyn, "driven by %s", env);
+        return -1;
+    }
+    if (n < 1 || !segs || !segs[0].path) {
+        snprintf(why, whyn, "no recording");
+        return -1;
+    }
+    if (total > PADREC_CHAIN_MAX) {
+        snprintf(why, whyn, "a chain of %d files, over %d", total, PADREC_CHAIN_MAX);
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        if (!segs[i].path || !(s = seg_new(&segs[i], i == 0, flags, room, why, whyn))) {
+            if (!segs[i].path)
+                snprintf(why, whyn, "no recording");
+            session_free(head);
+            return s_unmet[0] ? PADREC_E_REQUIRES : -1;
+        }
+        room -= s->nsteps;
+        s->seg = i + 1;
+        s->segs = total;
+        *tail = s;
+        tail = &s->next;
+    }
+    if (rec_path) {
+        if (!(s = rec_new(rec_path, meta, why, whyn))) {
+            session_free(head);
+            return -1;
+        }
+        s->seg = s->segs = total;
+        *tail = s;
+        install_exit();
+    }
+    /* Each segment's pads with every later one's, so a pad the USB model
+     * plugs in stays on the bus until the chain ends. */
+    for (i = n - 1; i >= 0; i--) {
+        PadSession *p = head;
+        for (int k = 0; k < i; k++)
+            p = p->next;
+        pads |= p->pads;
+        p->pads_all = pads;
+    }
+    if (flags & PADREC_QUIT) {
+        for (s = head; s->next; s = s->next)
+            ;
+        s->quit = 1;
+    }
+    if (!(flags & PADREC_ENV)) {
+        s_last_n = n;
+        s_last_flags = flags & PADREC_BOOT;
+        for (i = 0; i < n; i++) {
+            snprintf(s_last_path[i], sizeof s_last_path[i], "%s", segs[i].path);
+            s_last_trust[i] = segs[i].trusted;
+            s_last_listed[i] = segs[i].allowed != NULL;
+            snprintf(s_last_allowed[i], sizeof s_last_allowed[i], "%s",
+                     segs[i].allowed ? segs[i].allowed : "");
+        }
+    }
+    publish(head, flags, head->pads_all);
     return 0;
+}
+
+int padrec_play(const char *const *paths, int n, unsigned flags, char *why, size_t whyn)
+{
+    PadrecSeg segs[PADREC_CHAIN_MAX];
+    int i;
+
+    if (n < 1 || !paths) {
+        snprintf(why, whyn, "no recording");
+        return -1;
+    }
+    if (n > PADREC_CHAIN_MAX) {
+        snprintf(why, whyn, "a chain of %d files, over %d", n, PADREC_CHAIN_MAX);
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        segs[i].path = paths[i];
+        segs[i].trusted = (flags & PADREC_TRUST) != 0;
+        segs[i].allowed = NULL;
+    }
+    return padrec_play_chain(segs, n, flags, NULL, NULL, why, whyn);
+}
+
+int padrec_env_chain(const char *spec, char *why, size_t whyn)
+{
+    PadrecSeg segs[PADREC_CHAIN_MAX];
+    char paths[PADREC_CHAIN_MAX][1024];
+    const char *p = spec;
+    int n = 0;
+
+    while (*p) {
+        size_t len = strcspn(p, ";");
+        while (len && (*p == ' ' || *p == '\t')) {
+            p++;
+            len--;
+        }
+        while (len && (p[len - 1] == ' ' || p[len - 1] == '\t'))
+            len--;
+        if (len) {
+            /* Each entry is a file (@path): an inline script has no
+             * header, and a chain is made of recordings. */
+            if (*p != '@' || len < 2 || len - 1 >= sizeof paths[0]) {
+                snprintf(why, whyn, "chain entry \"%.*s\" is not @<file>", (int)(len > 40 ? 40 : len), p);
+                return -1;
+            }
+            if (n == PADREC_CHAIN_MAX) {
+                snprintf(why, whyn, "a chain of more than %d files", PADREC_CHAIN_MAX);
+                return -1;
+            }
+            memcpy(paths[n], p + 1, len - 1);
+            paths[n][len - 1] = 0;
+            segs[n].path = paths[n];
+            /* The command line is the player's own word, so its chain is
+             * trusted as given. The CLI's report replay sets this key too;
+             * its confirm of a report's actions comes with phase 4 (R6). */
+            segs[n].trusted = 1;
+            segs[n].allowed = NULL;
+            n++;
+        }
+        p += strcspn(p, ";");
+        if (*p == ';')
+            p++;
+    }
+    return padrec_play_chain(segs, n,
+                             PADREC_ENV | PADREC_BOOT
+                                 | (recomp_env_on(RENV_PAD_QUIT) ? PADREC_QUIT : 0u),
+                             NULL, NULL, why, whyn);
 }
 
 int padrec_again(unsigned flags, char *why, size_t whyn)
 {
-    char path[sizeof s_last_path];
-    const char *p = path;
+    PadrecSeg segs[PADREC_CHAIN_MAX];
+    char paths[PADREC_CHAIN_MAX][1024];
+    int i, n = s_last_n;
 
-    if (!s_last_path[0]) {
+    if (!n) {
         snprintf(why, whyn, "nothing played yet");
         return -1;
     }
-    memcpy(path, s_last_path, sizeof path);
-    return padrec_play(&p, 1, flags, why, whyn);
+    for (i = 0; i < n; i++) {
+        memcpy(paths[i], s_last_path[i], sizeof paths[i]);
+        segs[i].path = paths[i];
+        segs[i].trusted = s_last_trust[i];
+        segs[i].allowed = s_last_listed[i] ? s_last_allowed[i] : NULL;
+    }
+    return padrec_play_chain(segs, n, flags | s_last_flags, NULL, NULL, why, whyn);
 }
 
 void padrec_stop(void)
@@ -1103,7 +1469,9 @@ void padrec_reset_for_test(void)
     s_play_pads = s_pending_pads = 0;
     s_stop = s_hold = 0;
     s_synced = 0;
-    s_last_path[0] = 0;
+    s_last_n = 0;
+    s_last_flags = 0;
+    s_unmet[0] = 0;
     s_title_id = 0;
     s_title[0] = 0;
     pad_unlock();

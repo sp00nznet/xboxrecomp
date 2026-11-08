@@ -60,6 +60,20 @@ void enhance_actions_drop_owner(int owner);
  * never fires, consumes an input or reads as down. */
 void enhance_actions_set_dormant(int owner, int on);
 int enhance_action_dormant(int id);
+/* A pad script may fire the action with a !<name> step, and a record
+ * writes its fires (pad-recording-ui R5): a mod opts in per action, for
+ * its own actions only (owner: the mod table index, -1 the toolkit; an
+ * action of another owner is refused). The menu's, screenshots', the
+ * recorder's, saves', files' and overlay toggles are refused (-1), as is an
+ * unknown id. */
+int enhance_action_set_pad_fireable(int id, int owner, int on);
+int enhance_action_pad_fireable(int id);
+/* A !<name> step: the action fires as its binding would (its pressed
+ * count), when it exists, is live and pad-fireable. 0, or -1 with why.
+ * Any thread (the pad thread). */
+int enhance_action_fire_by_pad(const char *name, char *why, size_t n);
+/* Called with the name on each fire of a pad-fireable action. */
+void enhance_actions_set_fired_hook(void (*fn)(const char *name));
 /* Whose action it is, for the Controls page's groups: the mod table index,
  * ENHANCE_ACT_TOOLKIT for enhance_actions_init's own, ENHANCE_ACT_GAME for
  * one the title registered with no owner. */

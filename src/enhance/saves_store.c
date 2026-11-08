@@ -525,34 +525,73 @@ fail:
     return -1;
 }
 
+/* The title's two trees into s: the folders and files a saves zip holds,
+ * under "hdd/". 0, or -1 with err set. */
+static int gather_trees(const struct saves_paths *p, struct items *s, time_t now, char *err,
+                        size_t errn)
+{
+    int any = 0;
+    for (int t = 0; t < 2; t++) {
+        char dir[FB_PATH_MAX], prefix[64];
+        if (tid_dir(p, t, dir, sizeof dir) || path_kind(dir, NULL) != 1)
+            continue;
+        if (!any && items_add(s, "hdd/", NULL, 0, (int64_t)now, 1))
+            goto oom;
+        any = 1;
+        snprintf(prefix, sizeof prefix, "hdd/%s/", k_tree[t]);
+        if (items_add(s, prefix, NULL, 0, (int64_t)now, 1))
+            goto oom;
+        snprintf(prefix, sizeof prefix, "hdd/%s/%08x/", k_tree[t], (unsigned)p->tid);
+        if (gather(dir, prefix, 3, s, err, errn))
+            return -1;
+    }
+    return 0;
+oom:
+    snprintf(err, errn, "Out of memory collecting the saves");
+    return -1;
+}
+
+/* The trees after a manifest into a zip; the items freed. 0, or -1. */
+static int write_zip(struct items *s, const char *mname, const char *man, int ml,
+                     const struct report_pad *pads, int npads, time_t now, unsigned char **zip,
+                     size_t *len, char *err, size_t errn)
+{
+    struct sz_writer w;
+    sz_writer_init(&w);
+    sz_add_file(&w, mname, man, (size_t)ml, (int64_t)now);
+    if (npads)
+        sz_add_dir(&w, REPORT_PAD_DIR, (int64_t)now);
+    for (int i = 0; i < npads; i++)
+        sz_add_file(&w, pads[i].name, pads[i].data, pads[i].len, (int64_t)now);
+    for (int i = 0; i < s->n; i++) {
+        if (s->v[i].dir)
+            sz_add_dir(&w, s->v[i].name, s->v[i].mtime);
+        else
+            sz_add_file(&w, s->v[i].name, s->v[i].data, s->v[i].len, s->v[i].mtime);
+    }
+    items_free(s);
+    if (sz_finish(&w, zip, len)) {
+        snprintf(err, errn, "The saves are too big for one zip");
+        return -1;
+    }
+    return 0;
+}
+
 int saves_export(const struct saves_paths *p, const struct saves_manifest *base,
                  unsigned char **zip, size_t *len, char *err, size_t errn)
 {
     struct items s;
-    struct sz_writer w;
     struct saves_manifest m = *base;
     char man[SZ_MANIFEST_MAX];
-    int ml, any = 0;
+    int ml;
     time_t now = time(NULL);
 
     memset(&s, 0, sizeof s);
     *zip = NULL;
     *len = 0;
-    for (int t = 0; t < 2; t++) {
-        char dir[FB_PATH_MAX], prefix[64];
-        if (tid_dir(p, t, dir, sizeof dir) || path_kind(dir, NULL) != 1)
-            continue;
-        if (!any && items_add(&s, "hdd/", NULL, 0, (int64_t)now, 1))
-            goto oom;
-        any = 1;
-        snprintf(prefix, sizeof prefix, "hdd/%s/", k_tree[t]);
-        if (items_add(&s, prefix, NULL, 0, (int64_t)now, 1))
-            goto oom;
-        snprintf(prefix, sizeof prefix, "hdd/%s/%08x/", k_tree[t], (unsigned)p->tid);
-        if (gather(dir, prefix, 3, &s, err, errn)) {
-            items_free(&s);
-            return -1;
-        }
+    if (gather_trees(p, &s, now, err, errn)) {
+        items_free(&s);
+        return -1;
     }
     if (!s.files) {
         items_free(&s);
@@ -568,24 +607,67 @@ int saves_export(const struct saves_paths *p, const struct saves_manifest *base,
         snprintf(err, errn, "The manifest does not fit");
         return -1;
     }
-    sz_writer_init(&w);
-    sz_add_file(&w, SZ_MANIFEST, man, (size_t)ml, (int64_t)now);
-    for (int i = 0; i < s.n; i++) {
-        if (s.v[i].dir)
-            sz_add_dir(&w, s.v[i].name, s.v[i].mtime);
-        else
-            sz_add_file(&w, s.v[i].name, s.v[i].data, s.v[i].len, s.v[i].mtime);
-    }
-    items_free(&s);
-    if (sz_finish(&w, zip, len)) {
-        snprintf(err, errn, "The saves are too big for one zip");
+    if (write_zip(&s, SZ_MANIFEST, man, ml, NULL, 0, now, zip, len, err, errn))
+        return -1;
+    return m.files;
+}
+
+int report_export(const struct saves_paths *p, const struct report_manifest *base,
+                  const struct report_pad *pads, int npads, unsigned char **zip, size_t *len,
+                  char *err, size_t errn)
+{
+    struct items s;
+    struct report_manifest *m;
+    char man[SZ_MANIFEST_MAX];
+    int ml, files;
+    time_t now = time(NULL);
+
+    memset(&s, 0, sizeof s);
+    *zip = NULL;
+    *len = 0;
+    if (npads < 1 || npads > REPORT_CHAIN_MAX) {
+        snprintf(err, errn, "A report holds 1 to %d recordings", REPORT_CHAIN_MAX);
         return -1;
     }
-    return m.files;
-oom:
-    items_free(&s);
-    snprintf(err, errn, "Out of memory collecting the saves");
-    return -1;
+    for (int i = 0; i < npads; i++) {
+        const char *why;
+        if (strncmp(pads[i].name, REPORT_PAD_DIR, sizeof REPORT_PAD_DIR - 1)
+            || sz_name_ok(pads[i].name, &why) || pads[i].len > REPORT_PAD_MAX) {
+            snprintf(err, errn, "A recording cannot go in the report (%s)", pads[i].name);
+            return -1;
+        }
+    }
+    if (!(m = malloc(sizeof *m))) {
+        snprintf(err, errn, "Out of memory");
+        return -1;
+    }
+    *m = *base;
+    if (gather_trees(p, &s, now, err, errn)) {
+        items_free(&s);
+        free(m);
+        return -1;
+    }
+    /* All of the title's saves, none at all included: a bug before the
+     * first save still gets its report. */
+    m->s.format = REPORT_FORMAT;
+    snprintf(m->s.kind, sizeof m->s.kind, "report");
+    m->s.title_id = p->tid;
+    m->s.files = s.files;
+    m->s.bytes = s.bytes;
+    m->nchain = npads;
+    for (int i = 0; i < npads; i++)
+        snprintf(m->chain[i], sizeof m->chain[i], "%s", pads[i].name);
+    ml = report_manifest_write(m, man, sizeof man);
+    files = m->s.files;
+    free(m);
+    if (ml < 0) {
+        items_free(&s);
+        snprintf(err, errn, "The report's manifest does not fit");
+        return -1;
+    }
+    if (write_zip(&s, SZ_REPORT, man, ml, pads, npads, now, zip, len, err, errn))
+        return -1;
+    return files;
 }
 
 /* ---- import ---- */

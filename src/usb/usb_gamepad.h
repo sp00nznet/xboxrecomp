@@ -132,4 +132,8 @@ uint32_t usb_gamepad_game_pads(void);
 #define USB_GAMEPAD_HAVE_FILE_OPEN 1
 void usb_gamepad_file_open(const char *path, uint32_t status);
 
+/* A host action fired: the env record (RECOMP_DEBUG=pad_record) writes it
+ * as a !<action> line at its clock's count. Nothing without one. */
+void usb_gamepad_record_action(const char *name);
+
 #endif /* XBOX_USB_GAMEPAD_H */

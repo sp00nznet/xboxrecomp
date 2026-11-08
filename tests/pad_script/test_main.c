@@ -1134,6 +1134,110 @@ static void check_files(int argc, char **argv)
     }
 }
 
+/* !<action> steps (pad-recording-ui R5): parsed on a clock with
+ * anchors, the names deduped into the table; refused as live lines, with
+ * a pad prefix, a bad name, or no clock. The recorder writes the same
+ * line, and a fire's refusal is logged once per name. */
+static int s_fired;
+static char s_fired_name[PAD_ACTION_NAME];
+static int fire_hook(const char *name, char *why, size_t n)
+{
+    if (!strcmp(name, "debug_menu.open")) {
+        s_fired++;
+        snprintf(s_fired_name, sizeof s_fired_name, "%s", name);
+        return 0;
+    }
+    snprintf(why, n, "no such action in this run");
+    return -1;
+}
+
+static void test_actions(void)
+{
+    static PadAnchors an;
+    PadStep s[16];
+    char line[96], names[4][PAD_ACTION_NAME];
+    uint8_t r[20];
+    int n;
+
+    memset(&an, 0, sizeof an);
+    n = pad_script_parse_anchored("g10:!debug_menu.open\ng12:a:3\ng40:!debug_menu.open\n"
+                                  "g50:!other.thing\n", s, 0, 16, &an);
+    CHECK(n == 4);
+    CHECK(an.nact == 2 && !strcmp(an.act[0], "debug_menu.open")
+          && !strcmp(an.act[1], "other.thing"));
+    CHECK(s[0].action == 1 && s[0].at == 10 && s[0].hold == 1);
+    CHECK(s[1].action == 0 && s[1].digital == 0 && s[1].analog == 0x01);
+    CHECK(s[2].action == 1 && s[3].action == 2);
+    /* An action step presses nothing. */
+    memset(r, 0, sizeof r);
+    pad_step_press(&s[0], r);
+    for (n = 0; n < 20; n++)
+        CHECK(r[n] == 0);
+
+    /* Refused: no clock, a pad prefix, a bad name, live lines (no anchors). */
+    memset(&an, 0, sizeof an);
+    CHECK(pad_script_parse_anchored("10:!debug_menu.open", s, 0, 16, &an) == 0);
+    CHECK(pad_script_parse_anchored("g10:p1:!debug_menu.open", s, 0, 16, &an) == 0);
+    CHECK(pad_script_parse_anchored("g10:!Debug-Menu", s, 0, 16, &an) == 0);
+    CHECK(pad_script_parse_anchored("g10:!", s, 0, 16, &an) == 0);
+    CHECK(pad_script_parse("g10:!debug_menu.open", s, 0, 16) == 0);
+    CHECK(pad_action_name_ok("a.b_c9", 6) && !pad_action_name_ok("a b", 3)
+          && !pad_action_name_ok("", 0));
+
+    /* The recorder's line, both clocks, and a refusal of a bad name. */
+    CHECK(pad_recorder_action(1, 120, "debug_menu.open", line, sizeof line) > 0
+          && !strcmp(line, "g120:!debug_menu.open\n"));
+    CHECK(pad_recorder_action(0, 7, "x.y", line, sizeof line) > 0 && !strcmp(line, "f7:!x.y\n"));
+    CHECK(pad_recorder_action(1, 7, "X Y", line, sizeof line) == 0);
+    CHECK(pad_recorder_action(1, 7, "x.y", line, 4) < 0);
+
+    /* The names a confirm lists: comments skipped, deduped. */
+    n = pad_script_action_names("# g1:!not.this\ng10:!debug_menu.open\ng12:a\n"
+                                "g40:!debug_menu.open\nf50:!other.thing\n", names, 4);
+    CHECK(n == 2 && !strcmp(names[0], "debug_menu.open") && !strcmp(names[1], "other.thing"));
+
+    /* Firing: untrusted never fires; no hook says so; a refusal logs once. */
+    memset(&an, 0, sizeof an);
+    n = pad_script_parse_anchored("g10:!debug_menu.open\ng20:!other.thing\ng30:!other.thing\n",
+                                  s, 0, 16, &an);
+    CHECK(n == 3);
+    pad_action_set_hook(NULL);
+    CHECK(pad_step_fire(&s[0], &an, 1) == 0);
+    pad_action_set_hook(fire_hook);
+    s_fired = 0;
+    CHECK(pad_step_fire(&s[0], &an, 0) == 0 && s_fired == 0);
+    CHECK(pad_step_fire(&s[0], &an, 1) == 1 && s_fired == 1
+          && !strcmp(s_fired_name, "debug_menu.open"));
+    CHECK(pad_step_fire(&s[1], &an, 1) == 0);
+    CHECK(an.act_logged & 2u);
+    CHECK(pad_step_fire(&s[2], &an, 1) == 0);
+    pad_action_set_hook(NULL);
+}
+
+/* requires = ["a.b", 'c'] in a header: an array of strings, read back by
+ * pad_header_list; a bad array is a bad header. */
+static void test_header_list(void)
+{
+    static PadHeader h;
+    char keys[4][64];
+
+    CHECK(pad_header_read("# xbr-export: pad 1\n"
+                          "# xbr-pad: requires = [\"mods.debug_menu.enable\", 'x.y'] # why\n"
+                          "# xbr-pad: kind = \"setup\"\ng0:@end\n", &h) == PAD_HDR_OK);
+    CHECK(pad_header_list(&h, "requires", &keys[0][0], sizeof keys[0], 4) == 2);
+    CHECK(!strcmp(keys[0], "mods.debug_menu.enable") && !strcmp(keys[1], "x.y"));
+    CHECK(pad_header_list(&h, "kind", &keys[0][0], sizeof keys[0], 4) == -1);
+    CHECK(pad_header_list(&h, "absent", &keys[0][0], sizeof keys[0], 4) == 0);
+    CHECK(!strcmp(pad_header_get(&h, "kind"), "setup"));
+    CHECK(pad_header_list_parse("[]", NULL, 0, 0) == 0);
+    CHECK(pad_header_list_parse("[\"a\",]", NULL, 0, 0) < 0
+          || pad_header_list_parse("[\"a\",]", NULL, 0, 0) == 1);
+    CHECK(pad_header_list_parse("[\"a\\n\"]", NULL, 0, 0) < 0);
+    CHECK(pad_header_list_parse("[a]", NULL, 0, 0) < 0);
+    CHECK(pad_header_read("# xbr-export: pad 1\n# xbr-pad: requires = [\"a\"\n", &h)
+          != PAD_HDR_OK);
+}
+
 int main(int argc, char **argv)
 {
     test_parse();
@@ -1161,6 +1265,8 @@ int main(int argc, char **argv)
     test_anchor_lines();
     test_file_check();
     test_header_replace();
+    test_actions();
+    test_header_list();
     check_files(argc, argv);
     if (fails) {
         fprintf(stderr, "pad_script: %d failure(s)\n", fails);

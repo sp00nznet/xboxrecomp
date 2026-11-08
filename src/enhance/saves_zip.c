@@ -587,12 +587,13 @@ static int put_str(char *out, size_t n, size_t *at, const char *key, const char 
     return 0;
 }
 
-int saves_manifest_write(const struct saves_manifest *m, char *out, size_t n)
+/* The saves manifest's lines after a first comment line, at *at. */
+static int manifest_body(const struct saves_manifest *m, const char *comment, char *out,
+                         size_t n, size_t *atp)
 {
     size_t at = 0;
     char tid[16];
-    int k = snprintf(out, n, "# Saves exported by the in-game menu (xboxrecomp)\nformat = %d\n",
-                     m->format);
+    int k = snprintf(out, n, "# %s (xboxrecomp)\nformat = %d\n", comment, m->format);
     if (k < 0 || (size_t)k >= n) return -1;
     at = (size_t)k;
     snprintf(tid, sizeof tid, "%08x", (unsigned)m->title_id);
@@ -605,6 +606,15 @@ int saves_manifest_write(const struct saves_manifest *m, char *out, size_t n)
     if (k < 0 || (size_t)k >= n - at) return -1;
     at += (size_t)k;
     if (put_str(out, n, &at, "toolkit", m->toolkit))
+        return -1;
+    *atp = at;
+    return 0;
+}
+
+int saves_manifest_write(const struct saves_manifest *m, char *out, size_t n)
+{
+    size_t at = 0;
+    if (manifest_body(m, "Saves exported by the in-game menu", out, n, &at))
         return -1;
     return (int)at;
 }
@@ -698,6 +708,11 @@ int saves_manifest_parse(const char *text, size_t len, struct saves_manifest *m,
 
 /* ---- a saves zip ---- */
 
+int saves_zip_keys_differ(const struct saves_manifest *m, const char *keys)
+{
+    return strcmp(m->keys, keys ? keys : "") != 0;
+}
+
 const char *saves_zip_rest(const char *name, uint32_t tid, int *tree)
 {
     char t[16];
@@ -719,6 +734,39 @@ const char *saves_zip_rest(const char *name, uint32_t tid, int *tree)
     if (*name == 0)
         return NULL;       /* "hdd/UDATA/<tid>" without the slash is a file */
     return *name == '/' ? name + 1 : NULL;
+}
+
+/* The saves rules over every entry but the manifest me (and pad/ when
+ * pads): each under the title's two trees, the skeleton folders "hdd/",
+ * "hdd/UDATA/" and "hdd/TDATA/" passed over. The trees present, the files
+ * and their bytes counted. */
+static int tree_entries(const struct sz_archive *a, uint32_t tid, const struct sz_entry *me,
+                        int pads, int *trees, int *files, uint64_t *bytes, char *err,
+                        size_t errn)
+{
+    for (int i = 0; i < a->n; i++) {
+        const struct sz_entry *e = &a->e[i];
+        const char *rest;
+        int tree = 0;
+        if (e == me)
+            continue;
+        if (pads && !strncmp(e->name, REPORT_PAD_DIR, sizeof REPORT_PAD_DIR - 1))
+            continue;
+        if (e->is_dir && (!strcmp(e->name, "hdd/") || !strcmp(e->name, "hdd/UDATA/")
+                          || !strcmp(e->name, "hdd/TDATA/")))
+            continue;
+        if (!(rest = saves_zip_rest(e->name, tid, &tree)))
+            return fail(err, errn, "This zip holds a file outside the game's saves (%s)",
+                        e->name);
+        *trees |= tree;
+        if (!e->is_dir) {
+            if (!*rest)
+                return fail(err, errn, "This zip is damaged (%s)", e->name);
+            (*files)++;
+            *bytes += e->size;
+        }
+    }
+    return 0;
 }
 
 int saves_zip_check(const struct sz_archive *a, uint32_t tid, const char *keys,
@@ -752,34 +800,263 @@ int saves_zip_check(const struct sz_archive *a, uint32_t tid, const char *keys,
         snprintf(buf, sizeof buf, "%08x", (unsigned)m->title_id);
         return fail(err, errn, "This zip is for another game (title %s)", buf);
     }
-    if (strcmp(m->keys, keys))
-        return fail(err, errn, "These saves were made with different console keys "
-                    "and would not load here%s", NULL);
-    for (int i = 0; i < a->n; i++) {
-        const struct sz_entry *e = &a->e[i];
-        const char *rest;
-        int tree = 0;
-        if (e == me)
-            continue;
-        if (e->is_dir && (!strcmp(e->name, "hdd/") || !strcmp(e->name, "hdd/UDATA/")
-                          || !strcmp(e->name, "hdd/TDATA/")))
-            continue;
-        if (!(rest = saves_zip_rest(e->name, tid, &tree)))
-            return fail(err, errn, "This zip holds a file outside the game's saves (%s)",
-                        e->name);
-        *trees |= tree;
-        if (!e->is_dir) {
-            if (!*rest)
-                return fail(err, errn, "This zip is damaged (%s)", e->name);
-            files++;
-            bytes += e->size;
-        }
-    }
+    /* other console keys are no refusal: the caller re-signs the saves
+     * (saves_sign.h; pad-recording-ui R6) */
+    (void)keys;
+    if (tree_entries(a, tid, me, 0, trees, &files, &bytes, err, errn))
+        return -1;
     if (files != m->files || bytes != m->bytes)
         return fail(err, errn, "This zip is incomplete (its file count does not match "
                     "xbr-saves.toml)%s", NULL);
     if (!*trees)
         return fail(err, errn, "This zip holds no saves%s", NULL);
+    return 0;
+}
+
+/* ---- a bug-report bundle (pad-recording-ui R6) ---- */
+
+int report_manifest_write(const struct report_manifest *m, char *out, size_t n)
+{
+    size_t at = 0;
+    if (manifest_body(&m->s, "A bug report from the in-game menu", out, n, &at)
+        || put_str(out, n, &at, "game", m->game) || put_str(out, n, &at, "host_os", m->host_os)
+        || put_str(out, n, &at, "note", m->note))
+        return -1;
+    if (at + 10 >= n) return -1;
+    memcpy(out + at, "chain = [", 9);
+    at += 9;
+    for (int i = 0; i < m->nchain; i++) {
+        if (i) {
+            if (at + 2 >= n) return -1;
+            out[at++] = ',';
+            out[at++] = ' ';
+        }
+        if (at + 1 >= n) return -1;
+        out[at++] = '"';
+        /* names that passed sz_name_ok: no '"', '\\' or control character */
+        for (const char *c = m->chain[i]; *c; c++) {
+            if (at + 1 >= n) return -1;
+            out[at++] = *c;
+        }
+        if (at + 1 >= n) return -1;
+        out[at++] = '"';
+    }
+    if (at + 2 >= n) return -1;
+    out[at++] = ']';
+    out[at++] = '\n';
+    out[at] = 0;
+    return (int)at;
+}
+
+/* A "string" at v (\" and \\ escapes) into s: the byte after its closing
+ * quote, or NULL when it is not one or does not fit. */
+static const char *read_qstr(const char *v, const char *end, char *s, size_t sn)
+{
+    size_t at = 0;
+    if (v >= end || *v != '"')
+        return NULL;
+    v++;
+    while (v < end && *v != '"') {
+        if (*v == '\\' && v + 1 < end)
+            v++;
+        if (at + 1 >= sn) return NULL;
+        s[at++] = *v++;
+    }
+    if (v >= end) return NULL;
+    s[at] = 0;
+    return v + 1;
+}
+
+/* Nothing but blanks or a comment from v to end. */
+static int line_done(const char *v, const char *end)
+{
+    while (v < end && (*v == ' ' || *v == '\t')) v++;
+    return v == end || *v == '#';
+}
+
+int report_manifest_parse(const char *text, size_t len, struct report_manifest *m,
+                          const char **why)
+{
+    /* the report's own keys here; every other line goes to the saves
+     * manifest's parser, which checks the shared keys as it does a saves
+     * zip's */
+    char rest[SZ_MANIFEST_MAX + 1];
+    size_t rn = 0;
+    const char *p = text, *end = text + len;
+    int chain = 0;
+    memset(m, 0, sizeof *m);
+    *why = NULL;
+    if (len > SZ_MANIFEST_MAX) { *why = "too many lines"; return -1; }
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        const char *next = eol ? eol + 1 : end, *le = eol ? eol : end, *k = p, *ke, *v;
+        while (k < le && (*k == ' ' || *k == '\t')) k++;
+        ke = k;
+        while (ke < le && *ke != '=' && *ke != ' ' && *ke != '\t') ke++;
+        v = ke;
+        while (v < le && (*v == ' ' || *v == '\t')) v++;
+        if (v < le && *v == '=') v++;
+        while (v < le && (*v == ' ' || *v == '\t')) v++;
+        if (le > v && le[-1] == '\r') le--;
+#define KEY(s) ((size_t)(ke - k) == sizeof(s) - 1 && !memcmp(k, s, sizeof(s) - 1))
+        if (KEY("game") || KEY("host_os") || KEY("note")) {
+            char *dst = KEY("game") ? m->game : KEY("host_os") ? m->host_os : m->note;
+            size_t dn = KEY("game") ? sizeof m->game
+                        : KEY("host_os") ? sizeof m->host_os : sizeof m->note;
+            const char *after = read_qstr(v, le, dst, dn);
+            size_t o = 0;
+            if (!after || !line_done(after, le)) { *why = "a value it cannot read"; return -1; }
+            /* The zip is someone else's: control bytes (ESC, newlines) would
+             * reach the preview rows and stderr. Dropped, as the writer
+             * drops them (review 1, F3). */
+            for (size_t i = 0; dst[i]; i++)
+                if ((unsigned char)dst[i] >= 0x20 && dst[i] != 0x7f)
+                    dst[o++] = dst[i];
+            dst[o] = 0;
+        } else if (KEY("chain")) {
+            if (v >= le || *v != '[') { *why = "a chain that is not a list"; return -1; }
+            v++;
+            m->nchain = 0;
+            for (;;) {
+                while (v < le && (*v == ' ' || *v == '\t')) v++;
+                if (v < le && *v == ']' && !m->nchain) break;
+                if (m->nchain == REPORT_CHAIN_MAX) {
+                    *why = "a chain of more than 8 recordings"; return -1;
+                }
+                v = read_qstr(v, le, m->chain[m->nchain], sizeof m->chain[0]);
+                if (!v) { *why = "a chain it cannot read"; return -1; }
+                m->nchain++;
+                while (v < le && (*v == ' ' || *v == '\t')) v++;
+                if (v < le && *v == ',') { v++; continue; }
+                if (v < le && *v == ']') break;
+                *why = "a chain it cannot read";
+                return -1;
+            }
+            if (!line_done(v + 1, le)) { *why = "a chain it cannot read"; return -1; }
+            chain = 1;
+        } else {
+            memcpy(rest + rn, p, (size_t)(next - p));
+            rn += (size_t)(next - p);
+        }
+#undef KEY
+        p = next;
+    }
+    rest[rn] = 0;
+    if (saves_manifest_parse(rest, rn, &m->s, why))
+        return -1;
+    if (!chain || !m->nchain) { *why = "no chain"; return -1; }
+    return 0;
+}
+
+int report_pad_name(int pos, const char *name, char *out, size_t n)
+{
+    char pre[16];
+    size_t pl, sl = strlen(name), room;
+    const char *why;
+    if (sl < 5 || ascii_lower((unsigned char)name[sl - 4]) != '.'
+        || ascii_lower((unsigned char)name[sl - 3]) != 'p'
+        || ascii_lower((unsigned char)name[sl - 2]) != 'a'
+        || ascii_lower((unsigned char)name[sl - 1]) != 'd')
+        return -1;
+    sl -= 4;
+    pl = (size_t)snprintf(pre, sizeof pre, "%d-", pos);
+    if (pl + 4 >= SZ_NAME_MAX)
+        return -1;
+    room = SZ_NAME_MAX - pl - 4;
+    if (sl > room) {
+        /* cut at a character: the name is UTF-8 */
+        sl = room;
+        while (sl && ((unsigned char)name[sl] & 0xC0) == 0x80)
+            sl--;
+    }
+    if (snprintf(out, n, REPORT_PAD_DIR "%s%.*s.pad", pre, (int)sl, name) >= (int)n)
+        return -1;
+    return sz_name_ok(out, &why) ? -1 : 0;
+}
+
+const char *report_pad_file(const char *entry)
+{
+    const char *s = entry, *d;
+    if (!strncmp(s, REPORT_PAD_DIR, sizeof REPORT_PAD_DIR - 1))
+        s += sizeof REPORT_PAD_DIR - 1;
+    for (d = s; *d >= '0' && *d <= '9'; d++)
+        ;
+    return d > s && *d == '-' && d[1] ? d + 1 : s;
+}
+
+int report_zip_check(const struct sz_archive *a, uint32_t tid, struct report_manifest *m,
+                     int *trees, char *err, size_t errn)
+{
+    const struct sz_entry *me = sz_find(a, SZ_REPORT);
+    const size_t pn = sizeof REPORT_PAD_DIR - 1;
+    const char *why;
+    int files = 0;
+    uint64_t bytes = 0;
+    char buf[32];
+    *trees = 0;
+    if (!me || me->is_dir)
+        return fail(err, errn, "This zip is not a bug report (no " SZ_REPORT ")%s", NULL);
+    if (me->size > SZ_MANIFEST_MAX)
+        return fail(err, errn, "This zip's " SZ_REPORT " is too big%s", NULL);
+    if (report_manifest_parse((const char *)me->data, me->size, m, &why)) {
+        if (err && errn) snprintf(err, errn, "This zip's " SZ_REPORT " has %s", why);
+        return -1;
+    }
+    if (strcmp(m->s.kind, "report"))
+        return fail(err, errn, "This zip is not a bug report (kind \"%s\")", m->s.kind);
+    if (m->s.format > REPORT_FORMAT)
+        return fail(err, errn, "This report comes from a newer build; update the game first%s",
+                    NULL);
+    if (m->s.format < 1)
+        return fail(err, errn, "This zip's " SZ_REPORT " has a bad format%s", NULL);
+    if (m->s.title_id != tid) {
+        snprintf(buf, sizeof buf, "%08x", (unsigned)m->s.title_id);
+        return fail(err, errn, "This report is for another game (title %s)", buf);
+    }
+    /* each chain entry names one file under pad/, once */
+    for (int i = 0; i < m->nchain; i++) {
+        const struct sz_entry *e = sz_find(a, m->chain[i]);
+        if (strncmp(m->chain[i], REPORT_PAD_DIR, pn) || !e || e->is_dir)
+            return fail(err, errn, "This report's chain names a recording it does not hold "
+                        "(%s)", m->chain[i]);
+        for (int j = 0; j < i; j++)
+            if (!strcmp(m->chain[i], m->chain[j]))
+                return fail(err, errn, "This report's chain names %s twice", m->chain[i]);
+    }
+    /* and every file under pad/ is in the chain, one level deep, capped */
+    for (int i = 0; i < a->n; i++) {
+        const struct sz_entry *e = &a->e[i];
+        const char *rest = e->name + pn;
+        size_t rl;
+        int named = 0;
+        if (strncmp(e->name, REPORT_PAD_DIR, pn))
+            continue;
+        if (e->is_dir) {
+            if (*rest)
+                return fail(err, errn, "This report holds a folder inside pad/ (%s)", e->name);
+            continue;
+        }
+        rl = strlen(rest);
+        if (strchr(rest, '/') || rl < 5 || strcmp(rest + rl - 4, ".pad"))
+            return fail(err, errn, "This report holds a file in pad/ that is not a recording "
+                        "(%s)", e->name);
+        /* "pad/1-.pad" would import as ".pad": a file the page lists with
+         * no name (review 1, F4). The writer never makes one. */
+        if (strlen(report_pad_file(e->name)) < 5)
+            return fail(err, errn, "This report holds a recording with no name (%s)", e->name);
+        if (e->size > REPORT_PAD_MAX)
+            return fail(err, errn, "This report's %s is over 4 MB", e->name);
+        for (int j = 0; j < m->nchain && !named; j++)
+            named = !strcmp(m->chain[j], e->name);
+        if (!named)
+            return fail(err, errn, "This report holds %s, which its chain does not name",
+                        e->name);
+    }
+    if (tree_entries(a, tid, me, 1, trees, &files, &bytes, err, errn))
+        return -1;
+    if (files != m->s.files || bytes != m->s.bytes)
+        return fail(err, errn, "This report is incomplete (its file count does not match "
+                    SZ_REPORT ")%s", NULL);
     return 0;
 }
 

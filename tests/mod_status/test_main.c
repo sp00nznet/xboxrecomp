@@ -447,7 +447,7 @@ static void test_status(void)
     s = mod_index("second");
     CHECK(p == 0 && s == 1);
     CHECK(xbox_mod_state(p) == XBOX_MOD_ON && xbox_mod_state(s) == XBOX_MOD_ON);
-    CHECK(s_papi && s_papi->version == 9u && s_papi->glyph_name && s_papi->status);
+    CHECK(s_papi && s_papi->version == 10u && s_papi->glyph_name && s_papi->status);
     /* The one second's init set, kept once it started. */
     CHECK(!strcmp(panel(s), "Second\nline"));
 

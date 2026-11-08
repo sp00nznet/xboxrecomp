@@ -197,6 +197,68 @@ static int hexval(char c)
          : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
 }
 
+int pad_header_list_parse(const char *v, char *out, size_t width, int max)
+{
+    int n = 0;
+
+    while (*v == ' ' || *v == '\t')
+        v++;
+    if (*v++ != '[')
+        return -1;
+    for (;;) {
+        const char *s;
+        char q;
+        size_t len;
+        while (*v == ' ' || *v == '\t')
+            v++;
+        if (*v == ']')
+            break;
+        if (*v != '"' && *v != '\'')
+            return -1;
+        q = *v++;
+        for (s = v; *v && *v != q; v++)
+            /* No escapes: a config key needs none, and a list read here
+             * must mean what tomllib reads. */
+            if (*v == '\\' && q == '"')
+                return -1;
+        if (*v != q)
+            return -1;
+        len = (size_t)(v - s);
+        v++;
+        if (out && n < max) {
+            char *o = out + (size_t)n * width;
+            if (len >= width)
+                len = width - 1;
+            memcpy(o, s, len);
+            o[len] = 0;
+        }
+        n++;
+        while (*v == ' ' || *v == '\t')
+            v++;
+        if (*v == ',') {
+            v++;
+            continue;
+        }
+        while (*v == ' ' || *v == '\t')
+            v++;
+        if (*v != ']')
+            return -1;
+        break;
+    }
+    v++;
+    while (*v == ' ' || *v == '\t')
+        v++;
+    return *v ? -1 : n;
+}
+
+int pad_header_list(const PadHeader *h, const char *key, char *out, size_t width, int max)
+{
+    for (int i = 0; i < h->n; i++)
+        if (!strcmp(h->k[i].key, key))
+            return h->k[i].text ? -1 : pad_header_list_parse(h->k[i].value, out, width, max);
+    return 0;
+}
+
 /* One "key = value" (the text after "# xbr-pad:"), len bytes. */
 static int read_key(PadHeader *h, const char *p, size_t len)
 {
@@ -265,6 +327,33 @@ static int read_key(PadHeader *h, const char *p, size_t len)
             return PAD_HDR_SYNTAX;
         for (v++; v < e && (*v == ' ' || *v == '\t'); v++)
             ;
+        if (v < e && *v != '#')
+            return PAD_HDR_SYNTAX;
+    } else if (p < e && *p == '[') {
+        /* An array of strings (requires = ["mods.debug_menu.enable"]),
+         * kept as written and checked by the list reader, so the writer
+         * puts back what it read. */
+        char q = 0;
+        for (v = p; v < e; v++) {
+            if (q) {
+                if (*v == q)
+                    q = 0;
+            } else if (*v == '"' || *v == '\'') {
+                q = *v;
+            } else if (*v == ']' || *v == '#') {
+                break;
+            }
+            if ((unsigned char)*v >= 0x20 && *v != 0x7F)
+                val[o++] = *v;
+        }
+        if (v >= e || *v != ']')
+            return PAD_HDR_SYNTAX;
+        val[o++] = *v++;
+        val[o] = 0;
+        if (pad_header_list_parse(val, NULL, 0, 0) < 0)
+            return PAD_HDR_SYNTAX;
+        while (v < e && (*v == ' ' || *v == '\t'))
+            v++;
         if (v < e && *v != '#')
             return PAD_HDR_SYNTAX;
     } else {

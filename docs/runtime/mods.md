@@ -113,6 +113,7 @@ thread.
 | [`glyph_name`, `status`](config.md#glyphs-and-the-status-panel-v7) | 7 | Any | Name a binding; the mod's status panel. |
 | [`draw3d_*`](config.md#3d-debug-draw-v8) | 8 | Frame | World-space triangles and lines over the frame. |
 | `input_capture_try`, `on_capture_lost` | 9 | Any, init | Take port 0 with an answer (refused while a pad recording plays); told when a playback takes it away. |
+| `action_pad_fireable` | 10 | Any | Let a pad recording fire an action (`!<name>`) and a record write its fires. |
 
 `mod.h` heads each version's members "check size before using these", and
 `config.md` asks it of `glyph_name` and `status`. At or below a mod's guard

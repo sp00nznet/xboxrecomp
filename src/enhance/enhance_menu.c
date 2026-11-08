@@ -38,6 +38,8 @@
 #include "enhance_osk.h"
 #include "enhance_padrec.h"
 #include "pad_script.h"
+#include "recomp_exe_dir.h"
+#include "saves_sign.h"
 #include "enhance_text.h"
 #include "file_browser.h"
 #include "host_open.h"
@@ -2113,7 +2115,7 @@ static const char *s_pchoice[NV2A_PRESENT_PARAMS_MAX][SHADER_PARAM_CHOICES_MAX +
  * record's start point or a recording's new name; the name being edited
  * and the cursor, in bytes. An export's name may carry its extension,
  * which fb_name_check takes off. */
-enum { NAME_RENAME, NAME_EXPORT, NAME_START, NAME_PADREC };
+enum { NAME_RENAME, NAME_EXPORT, NAME_START, NAME_PADREC, NAME_NOTE };
 static int s_name_on, s_name_for;
 static char s_name[FB_NAME_MAX + FB_EXT_MAX + 1];
 static int s_name_cur, s_name_dir;
@@ -3281,7 +3283,7 @@ static void reset_all(void)
  * "Replace <name>?", and an import's preview. */
 enum { FBV_OFF, FBV_BROWSE, FBV_ASK, FBV_PREVIEW };
 enum { FBJ_IMPORT, FBJ_EXPORT_CFG, FBJ_EXPORT_SHADER, FBJ_SAVES_EXPORT, FBJ_SAVES_IMPORT,
-       FBJ_PADREC_IMPORT, FBJ_PADREC_EXPORT };
+       FBJ_PADREC_IMPORT, FBJ_PADREC_EXPORT, FBJ_PADREC_REPORT };
 #define FILES_LIST_MAX 160      /* bytes of a preview's key list */
 #define IMP_BAD_MAX 32
 
@@ -3345,21 +3347,77 @@ static int s_saves_read;            /* 0 unread, 1 read, -1 failed */
 static int s_saves_quit;            /* imported, and no window took the quit */
 
 /* An import between the pick and "Import and quit". Nothing changes
- * before it: the archive is checked whole at the pick. */
+ * before it: the archive is checked whole at the pick. Under a keys
+ * mismatch a is the re-signed archive (saves_sign.h) and read the zip as
+ * read; a's entries point into zip or blob. */
 static struct {
     char file[FB_ENTRY_NAME_MAX];
     char *zip;                      /* the file; s_simp.a points into it */
-    struct sz_archive a;
+    struct sz_archive a, read;
+    unsigned char *blob;            /* the re-signed files' bytes */
     struct saves_manifest m;
     int trees;
+    int keys_differ;
+    struct saves_resign_report rep;
     struct saves_info info;
 } s_simp;
 
+/* A bug report between the pick and Import (pad-recording-ui R6): its
+ * manifest; s_simp holds the archive and, under a keys mismatch, the
+ * re-signed saves, which Import then hands to the saves preview. */
+static struct {
+    int on;
+    struct report_manifest m;
+} s_rimp;
+static void report_preview_rows(void);
+static void report_import_apply(void);
+static void report_pick(int i);
+
 static void simp_drop(void)
 {
+    memset(&s_rimp, 0, sizeof s_rimp);
     sz_archive_free(&s_simp.a);
+    sz_archive_free(&s_simp.read);
+    free(s_simp.blob);
     free(s_simp.zip);
     memset(&s_simp, 0, sizeof s_simp);
+}
+
+/* saves-signing.toml beside the exe (or in a macOS bundle's Resources),
+ * which the CLI writes from game.toml [saves]. Never from a zip. A missing
+ * or refused file gives no recipes: every signed save is then skipped
+ * under a keys mismatch, and the log says why once. */
+static void saves_signing_load(struct saves_signing *sg)
+{
+    static int said;
+    char path[FB_PATH_MAX], err[256];
+    char *text = NULL;
+    size_t len = 0;
+    int rc;
+    memset(sg, 0, sizeof *sg);
+    snprintf(path, sizeof path, "%s/" SAVES_SIGN_FILE, recomp_exe_dir());
+    rc = fb_read_file(path, SAVES_SIGN_FILE_MAX, &text, &len);
+#ifdef __APPLE__
+    if (rc != FB_OK) {
+        snprintf(path, sizeof path, "%s/../Resources/" SAVES_SIGN_FILE, recomp_exe_dir());
+        rc = fb_read_file(path, SAVES_SIGN_FILE_MAX, &text, &len);
+    }
+#endif
+    if (rc != FB_OK) {
+        if (!said++)
+            fprintf(stderr, LOGP "menu: no " SAVES_SIGN_FILE " beside the exe: saves made "
+                    "under other console keys are skipped\n");
+        return;
+    }
+    if (saves_signing_parse(text, len, sg, err, sizeof err)) {
+        if (!said++)
+            fprintf(stderr, LOGP "menu: %s refused (%s): saves made under other console keys "
+                    "are skipped\n", path, err);
+    } else if (sg->mode == SAVES_SIGNING_UNKNOWN && !said++) {
+        fprintf(stderr, LOGP "menu: %s names no signing: saves made under other console "
+                "keys are skipped\n", path);
+    }
+    free(text);
 }
 
 static int saves_paths(struct saves_paths *p)
@@ -3477,6 +3535,8 @@ static PadFileInfo *s_pr_info;
 static int s_pr_info_rc;
 static char s_pr_info_why[96];
 static int s_pr_del, s_pr_back_sel;
+/* The open recording's !<action> names, for Info. */
+static char s_pr_info_acts[256];
 
 static struct {
     char file[FB_ENTRY_NAME_MAX];
@@ -3506,7 +3566,8 @@ static void padrec_info_rows(const PadFileInfo *in)
     static const char *const k_keys[][2] = {
         { "start_point", "Start point" }, { "clock", "Clock" }, { "toolkit", "Toolkit" },
         { "game_build", "Game build" }, { "created", "Created" }, { "host_os", "Made on" },
-        { "notes", "Notes" },
+        { "notes", "Notes" }, { "kind", "Kind" }, { "setup", "After setup" },
+        { "requires", "Requires" },
     };
     const PadHeader *h = &in->h;
     const char *title = pad_header_get(h, "title"), *tid = pad_header_get(h, "title_id");
@@ -3911,7 +3972,9 @@ static void files_browse(int job)
     s_fb_ready = 1;
     fb_add_default_roots(&s_fb, dir, NULL);
     s_fb_page = job == FBJ_SAVES_EXPORT || job == FBJ_SAVES_IMPORT ? PAGE_SAVES
-                : job == FBJ_PADREC_IMPORT || job == FBJ_PADREC_EXPORT ? PAGE_RECORDINGS
+                : job == FBJ_PADREC_IMPORT || job == FBJ_PADREC_EXPORT
+                          || job == FBJ_PADREC_REPORT
+                      ? PAGE_RECORDINGS
                                                                        : PAGE_FILES;
     s_fb_job = job;
     fb_set_filter(&s_fb, files_ext());
@@ -3937,7 +4000,11 @@ static void files_size_text(uint64_t b, char *out, size_t n)
 
 static const char *files_ext(void)
 {
-    return s_fb_page == PAGE_SAVES ? ".zip" : s_fb_page == PAGE_RECORDINGS ? ".pad" : ".toml";
+    /* Recordings' Import takes a bug report too (pad-recording-ui R6). */
+    return s_fb_page == PAGE_SAVES || s_fb_job == FBJ_PADREC_REPORT ? ".zip"
+           : s_fb_job == FBJ_PADREC_IMPORT                       ? ".pad,.zip"
+           : s_fb_page == PAGE_RECORDINGS                        ? ".pad"
+                                                                 : ".toml";
 }
 
 static void files_default_name(char *out, size_t n)
@@ -3946,6 +4013,12 @@ static void files_default_name(char *out, size_t n)
     if (s_fb_job == FBJ_SAVES_EXPORT) {
         char kind[64];
         saves_kind("saves", kind, sizeof kind);
+        fb_default_name(kind, time(NULL), ".zip", out, n);
+        return;
+    }
+    if (s_fb_job == FBJ_PADREC_REPORT) {
+        char kind[64];
+        saves_kind("report", kind, sizeof kind);
         fb_default_name(kind, time(NULL), ".zip", out, n);
         return;
     }
@@ -3995,6 +4068,9 @@ static void files_browse_rows(void)
                          ? "A names the file: this game's saves, as one .zip"
                      : s_fb_job == FBJ_PADREC_EXPORT
                          ? "A names the file: the recording as it is, header and all"
+                     : s_fb_job == FBJ_PADREC_REPORT
+                         ? "A names the file: the recordings, all of the game's saves and "
+                           "the note, as one .zip"
                          : "A names the file: the active shader profile as saved");
         }
     }
@@ -4035,7 +4111,8 @@ static void files_browse_rows(void)
                  e->is_dir ? "A opens the folder"
                  : s_fb_job == FBJ_IMPORT ? "A reads the file and shows what it changes"
                  : s_fb_job == FBJ_SAVES_IMPORT ? "A checks the zip and shows the saves in it"
-                 : s_fb_job == FBJ_PADREC_IMPORT ? "A checks the recording and shows its header"
+                 : s_fb_job == FBJ_PADREC_IMPORT
+                     ? "A checks the recording or bug report and shows what it holds"
                                           : "A writes over this file (asks first)");
     }
 }
@@ -4103,6 +4180,19 @@ static void saves_preview_rows(void)
          s_simp.info.saves == 1 ? "" : "s", s_simp.info.files,
          s_simp.info.files == 1 ? "" : "s", size);
     saves_list_rows(&s_simp.info);
+    if (s_simp.keys_differ) {
+        const struct saves_resign_report *rp = &s_simp.rep;
+        info("Console keys", "other than this build's: %d re-signed, %d skipped",
+             rp->resigned, rp->skipped);
+        for (int i = 0; i < rp->n && i < SAVES_RESIGN_MAX_SAVES; i++) {
+            if (rp->s[i].verdict == SAVES_RESIGNED)
+                info(rp->s[i].sid, SAVES_SAID_MARK ": " SAVES_SAID_RESIGNED);
+            else if (rp->s[i].verdict == SAVES_SKIPPED)
+                info(rp->s[i].sid, SAVES_SAID_SKIPPED);
+        }
+        if (rp->skipped)
+            info("Skipped", SAVES_SAID_WITHOUT);
+    }
     if (s_saves_read > 0 && s_saves.files)
         info("Replaces", "the %d save%s here now (backed up first)", s_saves.saves,
              s_saves.saves == 1 ? "" : "s");
@@ -4140,6 +4230,8 @@ static int files_view_rows(void)
     case FBV_PREVIEW:
         if (s_fb_job == FBJ_SAVES_IMPORT)
             saves_preview_rows();
+        else if (s_fb_job == FBJ_PADREC_IMPORT && s_rimp.on)
+            report_preview_rows();
         else if (s_fb_job == FBJ_PADREC_IMPORT)
             padrec_preview_rows();
         else
@@ -4266,9 +4358,21 @@ static void files_rows(void)
 
 /* The export's bytes: the config as Save would write it, or the profile's
  * file. 0 with the status set. */
+static int padrec_report_data(char **data, size_t *len);
+
+/* A file name ending in ".zip", any case. */
+static int ends_zip(const char *name)
+{
+    size_t n = strlen(name);
+    return n > 4 && name[n - 4] == '.' && (name[n - 3] | 32) == 'z'
+           && (name[n - 2] | 32) == 'i' && (name[n - 1] | 32) == 'p';
+}
+
 static int files_export_data(char **data, size_t *len, int *unsaved)
 {
     *unsaved = 0;
+    if (s_fb_job == FBJ_PADREC_REPORT)
+        return padrec_report_data(data, len);
     if (s_fb_job == FBJ_PADREC_EXPORT) {
         char why[160];
         /* The bytes as they are: the header goes out unchanged. */
@@ -4494,6 +4598,46 @@ static int files_import_plan(const char *file, char *text, size_t len)
     return 1;
 }
 
+/* Other console keys: each save of the checked s_simp re-signed for this
+ * build or skipped, with its plain-words line (pad-recording-ui R6,
+ * safeguard 2); s_simp.a then holds what goes in. Matching keys change
+ * nothing. 0, or -1 with err set. */
+static int simp_resign(const char *file, char *err, size_t errn)
+{
+    struct saves_signing *sg;
+    char *lines;
+    int trees = 0, rc = -1;
+    if (!saves_zip_keys_differ(&s_simp.m, xbox_saves_keys_id()))
+        return 0;
+    if ((sg = malloc(sizeof *sg)) != NULL) {
+        saves_signing_load(sg);
+        rc = saves_resign_archive(&s_simp.a, xbox_path_title_id(), s_simp.trees, sg,
+                                  &s_simp.read, &s_simp.blob, &trees, &s_simp.rep, err, errn);
+        free(sg);
+    } else {
+        snprintf(err, errn, "Out of memory");
+    }
+    /* Sized for 64 saves with their reasons, so the log never cuts the
+     * list (review 1, F6). */
+    if ((lines = malloc(SAVES_RESIGN_LINES_MAX)) != NULL) {
+        saves_resign_lines(&s_simp.rep, 1, lines, SAVES_RESIGN_LINES_MAX);
+        fprintf(stderr, LOGP "menu: %s was made under other console keys (%s):\n%s", file,
+                s_simp.m.keys, lines);
+        free(lines);
+    }
+    if (rc)
+        return -1;
+    /* a: what goes in; read: the zip as read */
+    {
+        struct sz_archive t = s_simp.a;
+        s_simp.a = s_simp.read;
+        s_simp.read = t;
+    }
+    s_simp.trees = trees;
+    s_simp.keys_differ = 1;
+    return 0;
+}
+
 /* A picked .zip: read and checked whole (saves_zip_check) before the
  * preview, so a refused one changes nothing. */
 static void saves_pick(int i)
@@ -4522,11 +4666,165 @@ static void saves_pick(int i)
         simp_drop();
         return;
     }
+    if (simp_resign(e->name, err, sizeof err)) {
+        status("Not imported: %s", err);
+        simp_drop();
+        return;
+    }
     saves_scan_archive(&s_simp.a, xbox_path_title_id(), &s_simp.info);
     saves_refresh();
     s_fb_view = FBV_PREVIEW;
     s_sel[s_fb_page] = 0;
     s_scroll[s_fb_page] = 0;
+}
+
+/* A chain entry's bytes as a NUL-ended copy, as a .pad read from disk
+ * is. NULL when out of memory. */
+static char *report_text(const struct sz_entry *e)
+{
+    char *t = malloc((size_t)e->size + 1);
+    if (t) {
+        memcpy(t, e->data, e->size);
+        t[e->size] = 0;
+    }
+    return t;
+}
+
+/* A bug report picked on Recordings' Import (pad-recording-ui R6): read
+ * and checked whole, every recording of its chain checked as an import,
+ * and its saves re-signed under a keys mismatch, before the preview. A
+ * refused one writes nothing. */
+static void report_pick(int i)
+{
+    const struct fb_entry *e = &s_fb.entries[i];
+    char *data = NULL, err[SZ_ERR_MAX];
+    size_t len = 0;
+    int rc = fb_import_entry(&s_fb, i, SZ_MAX_ZIP, &data, &len);
+    pimp_drop();
+    if (rc == FB_E_TOO_BIG) {
+        status("%s is over %u MB: not a bug report", e->name, SZ_MAX_ZIP >> 20);
+        return;
+    }
+    if (rc != FB_OK) {
+        status("%s cannot be read", e->name);
+        free(data);
+        return;
+    }
+    simp_drop();
+    snprintf(s_simp.file, sizeof s_simp.file, "%s", e->name);
+    s_simp.zip = data;
+    if (sz_read(data, len, &s_simp.a, err, sizeof err) != 0
+        || report_zip_check(&s_simp.a, xbox_path_title_id(), &s_rimp.m, &s_simp.trees, err,
+                            sizeof err) != 0) {
+        fprintf(stderr, LOGP "menu: bug report %s refused: %s\n", e->name, err);
+        status("Not imported: %s", err);
+        simp_drop();
+        return;
+    }
+    s_simp.m = s_rimp.m.s;
+    for (int k = 0; k < s_rimp.m.nchain; k++) {
+        const struct sz_entry *pe = sz_find(&s_simp.a, s_rimp.m.chain[k]);
+        PadFileInfo *info = malloc(sizeof *info);
+        char *text = pe ? report_text(pe) : NULL, why[160];
+        int bad = !info || !text
+                  || enhance_padrec_check(text, pe->size, info, why, sizeof why) < 0;
+        if (bad && (!info || !text))
+            snprintf(why, sizeof why, "out of memory");
+        free(info);
+        free(text);
+        if (bad) {
+            fprintf(stderr, LOGP "menu: bug report %s refused: %s: %s\n", e->name,
+                    s_rimp.m.chain[k], why);
+            status("Not imported: %s: %s", report_pad_file(s_rimp.m.chain[k]), why);
+            simp_drop();
+            return;
+        }
+    }
+    if (s_simp.trees && simp_resign(e->name, err, sizeof err)) {
+        status("Not imported: %s", err);
+        simp_drop();
+        return;
+    }
+    saves_scan_archive(&s_simp.a, xbox_path_title_id(), &s_simp.info);
+    saves_refresh();
+    s_rimp.on = 1;
+    s_fb_view = FBV_PREVIEW;
+    s_sel[s_fb_page] = 0;
+    s_scroll[s_fb_page] = 0;
+}
+
+static void report_preview_rows(void)
+{
+    const struct report_manifest *m = &s_rimp.m;
+    struct row *r;
+    header("Import a bug report");
+    info("File", "%s", s_simp.file);
+    if (m->s.title[0])
+        info("Game", "%s", m->s.title);
+    if (strlen(m->s.created) >= 16)
+        info("Exported", "%.10s %.5s UTC", m->s.created, m->s.created + 11);
+    if (m->host_os[0])
+        info("Made on", "%s", m->host_os);
+    if (m->note[0])
+        info("Note", "%s", m->note);
+    for (int i = 0; i < m->nchain; i++) {
+        char k[24];
+        snprintf(k, sizeof k, i ? "Then" : m->nchain > 1 ? "Chain" : "Recording");
+        info(k, "%s", report_pad_file(m->chain[i]));
+    }
+    if (s_simp.trees)
+        info("Saves", "%d save%s, imported after the recordings (asks first)",
+             s_simp.info.saves, s_simp.info.saves == 1 ? "" : "s");
+    else
+        info("Saves", "none in the report: the saves here are kept");
+    r = row_add(R_FBPREV, 0, 1, "Import");
+    if (r)
+        snprintf(r->help, sizeof r->help, "%s",
+                 s_simp.trees ? "Copies the recordings in, then shows the saves to import"
+                              : "Copies the recordings in; nothing is replaced");
+    r = row_add(R_FBPREV, 1, 1, "Cancel");
+    if (r)
+        snprintf(r->help, sizeof r->help, "Nothing changes");
+}
+
+/* Import on a bug report: its recordings copied into the folder (under
+ * free names, nothing replaced), then its saves handed to the Saves
+ * page's preview as they are: backup, confirm, quit. */
+static void report_import_apply(void)
+{
+    int n = 0;
+    for (int k = 0; k < s_rimp.m.nchain; k++) {
+        const struct sz_entry *pe = sz_find(&s_simp.a, s_rimp.m.chain[k]);
+        char name[FB_ENTRY_NAME_MAX], why[160], *text = pe ? report_text(pe) : NULL;
+        if (!pe)   /* a re-signed archive keeps only the trees */
+            pe = sz_find(&s_simp.read, s_rimp.m.chain[k]), text = pe ? report_text(pe) : NULL;
+        if (!text || enhance_padrec_import(report_pad_file(s_rimp.m.chain[k]), text, pe->size,
+                                           name, sizeof name, why, sizeof why) < 0) {
+            free(text);
+            status("Import failed after %d recording%s: %s", n, n == 1 ? "" : "s",
+                   text ? why : "out of memory");
+            padrec_relist();
+            s_fb_view = FBV_BROWSE;
+            simp_drop();
+            return;
+        }
+        free(text);
+        fprintf(stderr, LOGP "menu: bug report %s: imported %s as %s\n", s_simp.file,
+                s_rimp.m.chain[k], name);
+        n++;
+    }
+    padrec_relist();
+    if (!s_simp.trees) {
+        status("Imported %d recording%s; the report has no saves", n, n == 1 ? "" : "s");
+        files_close();
+        return;
+    }
+    /* the saves: the Saves page's own preview and import, unchanged */
+    s_rimp.on = 0;
+    s_fb_job = FBJ_SAVES_IMPORT;
+    s_sel[s_fb_page] = 0;
+    s_scroll[s_fb_page] = 0;
+    status("Imported %d recording%s; now the saves", n, n == 1 ? "" : "s");
 }
 
 static void files_pick(int i)
@@ -4552,7 +4850,10 @@ static void files_pick(int i)
         return;
     }
     if (s_fb_job == FBJ_PADREC_IMPORT) {
-        padrec_pick(i);
+        if (ends_zip(e->name))
+            report_pick(i);
+        else
+            padrec_pick(i);
         return;
     }
     if (s_fb_job != FBJ_IMPORT) {
@@ -4677,6 +4978,9 @@ static void saves_apply(void)
     }
     fprintf(stderr, LOGP "menu: imported saves from %s (%d files)\n", s_simp.file,
             s_simp.info.files);
+    if (s_simp.keys_differ)
+        fprintf(stderr, LOGP "menu: %d save%s re-signed (keys differed), %d skipped\n",
+                s_simp.rep.resigned, s_simp.rep.resigned == 1 ? "" : "s", s_simp.rep.skipped);
     files_close();
     saves_refresh();
     s_need_draw = 1;
@@ -4801,6 +5105,8 @@ static int files_event(const struct row *r, int ok)
             return 1;
         if (r->ref == 0 && s_fb_job == FBJ_SAVES_IMPORT) {
             saves_apply();
+        } else if (r->ref == 0 && s_fb_job == FBJ_PADREC_IMPORT && s_rimp.on) {
+            report_import_apply();
         } else if (r->ref == 0 && s_fb_job == FBJ_PADREC_IMPORT) {
             padrec_import_apply();
         } else if (r->ref == 0) {
@@ -4827,7 +5133,8 @@ static int files_event(const struct row *r, int ok)
  * page only reads: Info and Export still work. */
 
 enum { PR_RECORD, PR_START, PR_STOP, PR_AGAIN, PR_IMPORT, PR_PLAY, PR_RENAME, PR_EXPORT,
-       PR_DELETE, PR_DEL_NO, PR_DEL_YES, PR_FILE = 16 };
+       PR_DELETE, PR_DEL_NO, PR_DEL_YES, PR_SETUP, PR_SETUP_REC, PR_ACT_NO, PR_ACT_YES,
+       PR_REQ_ON, PR_NOTE, PR_REPORT, PR_FILE = 32 };
 static struct enhance_padrec_file s_prf[ENHANCE_PADREC_FILES];
 static int s_nprf;                  /* the files listed; -1 unreadable */
 /* The status the list was read at: a new session or a state change (a
@@ -4835,10 +5142,149 @@ static int s_nprf;                  /* the files listed; -1 unreadable */
 static uint32_t s_prf_serial;
 static int s_prf_state = -1;
 static char s_rec_start[sizeof s_name];
+/* The setup played first (R6), one for the page: Play on a recording's
+ * page and "Play setup, then record" both start with it. A copy, so a
+ * relist never moves the pick. */
+static struct enhance_padrec_setup s_pr_setup;
+static int s_pr_setup_on;
+/* A play that waits for the player to allow its files' !<action> steps:
+ * PR_PLAY or PR_SETUP_REC, with the names it lists. */
+static int s_pr_confirm;
+static char s_pr_acts[256];
+/* The key a refused play needed (requires), for the page's "Turn on". */
+static char s_pr_unmet[96];
 
 static void padrec_relist(void)
 {
     s_prf_state = -1;
+}
+
+/* A on Setup: the next one, then none again. The folders are read here,
+ * not per draw. */
+static void padrec_setup_next(void)
+{
+    struct enhance_padrec_setup *all = malloc(sizeof *all * ENHANCE_PADREC_SETUPS);
+    int n = all ? enhance_padrec_setups(all, ENHANCE_PADREC_SETUPS) : 0, at = -1;
+    for (int i = 0; s_pr_setup_on && i < n; i++)
+        if (all[i].shipped == s_pr_setup.shipped && !strcmp(all[i].name, s_pr_setup.name))
+            at = i;
+    if (at + 1 < n) {
+        s_pr_setup = all[at + 1];
+        s_pr_setup_on = 1;
+        status("Setup: %s%s", s_pr_setup.name, s_pr_setup.shipped ? "" : " (yours)");
+    } else {
+        s_pr_setup_on = 0;
+        status(n ? "No setup" : "No setups: none beside the game, none of yours "
+                                "with kind = \"setup\"");
+    }
+    s_pr_unmet[0] = 0;
+    free(all);
+}
+
+static void padrec_setup_row(int env)
+{
+    struct row *r = row_add(R_PADREC, PR_SETUP, 1, "Setup");
+    if (!r)
+        return;
+    snprintf(r->value, sizeof r->value, "%s", s_pr_setup_on ? s_pr_setup.name : "none");
+    r->dim = env;
+    snprintf(r->help, sizeof r->help,
+             "Played first (the debug menu, a stage): A picks the next one");
+}
+
+/* The key a play needs, and the row that turns it on. */
+static void padrec_unmet_row(void)
+{
+    struct row *r;
+    if (!s_pr_unmet[0])
+        return;
+    if (!enhance_padrec_require_turnable(s_pr_unmet)) {
+        /* Not a mod's switch: the key came from the file, so the page
+         * names it and never writes it (review 1, F1). */
+        r = row_add(R_PADREC, PR_REQ_ON, 0, "Needs");
+        if (!r)
+            return;
+        snprintf(r->value, sizeof r->value, "%s", s_pr_unmet);
+        r->tint = TINT_WARN;
+        snprintf(r->help, sizeof r->help,
+                 "Not a mod's switch: set it in your config yourself if you trust the file");
+        return;
+    }
+    r = row_add(R_PADREC, PR_REQ_ON, 1, "Turn on");
+    if (!r)
+        return;
+    snprintf(r->value, sizeof r->value, "%s", s_pr_unmet);
+    r->tint = TINT_WARN;
+    snprintf(r->help, sizeof r->help,
+             "The setup needs this mod: written to your config (some apply at restart)");
+}
+
+/* Play (what PR_PLAY: the setup, then the open recording) or "Play setup,
+ * then record" (PR_SETUP_REC). A chain whose files name !<action> steps,
+ * and are not setups shipped with the game, asks first (R6). */
+static void padrec_go(int what, int confirmed)
+{
+    const struct enhance_padrec_setup *su = s_pr_setup_on ? &s_pr_setup : NULL;
+    const char *name = what == PR_PLAY ? s_pr_sub : NULL;
+    const char *verb = what == PR_PLAY ? "Play" : "Setup, then record";
+    int armed = enhance_padrec_start_on_close(), rc;
+    char why[160];
+
+    why[0] = 0;
+    s_pr_confirm = 0;
+    if (!confirmed) {
+        int k = enhance_padrec_chain_actions(su, name, s_pr_acts, sizeof s_pr_acts, why,
+                                             sizeof why);
+        if (k < 0) {
+            status("%s: %s", verb, why);
+            return;
+        }
+        if (k > 0) {
+            s_pr_confirm = what;
+            s_sel[PAGE_RECORDINGS] = 0;
+            return;
+        }
+    }
+    /* The list the player confirmed: a file edited since then plays
+     * nothing it did not show (R6). */
+    rc = enhance_padrec_play_chain(su, name, what == PR_SETUP_REC, s_rec_start, armed,
+                                   confirmed ? s_pr_acts : NULL, why, sizeof why);
+    if (rc == PADREC_E_REQUIRES) {
+        snprintf(s_pr_unmet, sizeof s_pr_unmet, "%s", padrec_unmet());
+        status("%s: %s", verb, why);
+        return;
+    }
+    if (rc < 0) {
+        status("%s: %s", verb, why);
+        return;
+    }
+    s_pr_unmet[0] = 0;
+    if (what == PR_PLAY)
+        status(armed ? "Plays when the menu closes" : "Playing");
+    else
+        status(armed ? "Plays the setup when the menu closes, then records"
+                     : "Playing the setup; the record starts at its end");
+}
+
+/* The confirm of a play's actions, as the delete's: the focus on No. */
+static void padrec_confirm_rows(void)
+{
+    struct row *r;
+    header("Allow its actions?");
+    r = row_add(R_INFO, -1, 0, "Actions");
+    if (r) {
+        snprintf(r->value, sizeof r->value, "%s", s_pr_acts);
+        r->tint = TINT_WARN;
+        snprintf(r->help, sizeof r->help, "%s", s_pr_acts);
+    }
+    r = row_add(R_PADREC, PR_ACT_NO, 1, "No");
+    if (r)
+        snprintf(r->help, sizeof r->help, "Nothing plays");
+    r = row_add(R_PADREC, PR_ACT_YES, 1,
+                s_pr_confirm == PR_PLAY ? "Yes, play it" : "Yes, play and record");
+    if (r)
+        snprintf(r->help, sizeof r->help,
+                 "Its steps fire these actions, as if you pressed their keys");
 }
 
 static void padrec_start_keep(const char *text)
@@ -4850,6 +5296,99 @@ static void padrec_start_keep(const char *text)
 static void padrec_sub_open(const char *name);
 
 /* Enter on a recording's new name: 1 closes the field. */
+/* A bug report's note (R6): one line for the page, kept until changed. */
+static char s_pr_note[sizeof s_name];
+
+static void padrec_note_keep(const char *text)
+{
+    snprintf(s_pr_note, sizeof s_pr_note, "%s", text);
+    status(s_pr_note[0] ? "The report says \"%s\"" : "No note", s_pr_note);
+}
+
+/* The OS the report was made on: the name only, never a host or a user. */
+static const char *report_host_os(void)
+{
+#if defined(_WIN32)
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
+#else
+    return "linux";
+#endif
+}
+
+/* Export bug report (R6): the chosen setup (if any), then the open
+ * recording, then all of the saves, read at the export as the Saves
+ * page's export is. 1 with *data, or 0 with the status said. */
+static int padrec_report_data(char **data, size_t *len)
+{
+    struct saves_paths p;
+    struct report_manifest *m;
+    struct report_pad pads[2];
+    char names[2][SZ_PATH_MAX], *texts[2] = { NULL, NULL }, why[160], err[SZ_ERR_MAX];
+    size_t tl[2];
+    unsigned char *zip = NULL;
+    unsigned gen = xbox_saves_gen();
+    int np = 0, n = -1;
+
+    if (xbox_saves_busy()) {
+        status(SAVES_BUSY);
+        return 0;
+    }
+    if (!saves_paths(&p)) {
+        status("Export failed: the save folder is not known yet");
+        return 0;
+    }
+    if (s_pr_setup_on) {
+        if (enhance_padrec_read_setup(&s_pr_setup, &texts[np], &tl[np], why, sizeof why) < 0
+            || report_pad_name(np + 1, s_pr_setup.name, names[np], sizeof names[np]) < 0) {
+            status("Export failed: %s: %s", s_pr_setup.name, texts[np] ? "no zip name fits" : why);
+            goto out;
+        }
+        np++;
+    }
+    if (enhance_padrec_read(s_pr_sub, &texts[np], &tl[np], why, sizeof why) < 0
+        || report_pad_name(np + 1, s_pr_sub, names[np], sizeof names[np]) < 0) {
+        status("Export failed: %s: %s", s_pr_sub, texts[np] ? "no zip name fits" : why);
+        goto out;
+    }
+    np++;
+    for (int i = 0; i < np; i++) {
+        pads[i].name = names[i];
+        pads[i].data = texts[i];
+        pads[i].len = tl[i];
+    }
+    if ((m = calloc(1, sizeof *m)) == NULL) {
+        status("Export failed: out of memory");
+        goto out;
+    }
+    saves_base(&m->s);
+    if (!shader_profile_slug(xbox_path_title_name(), m->game, sizeof m->game))
+        snprintf(m->game, sizeof m->game, "%08x", (unsigned)xbox_path_title_id());
+    snprintf(m->host_os, sizeof m->host_os, "%s", report_host_os());
+    snprintf(m->note, sizeof m->note, "%s", s_pr_note);
+    n = report_export(&p, m, pads, np, &zip, len, err, sizeof err);
+    free(m);
+    if (n < 0) {
+        fprintf(stderr, LOGP "menu: bug report export failed: %s\n", err);
+        status("Export failed: %s", err);
+        goto out;
+    }
+    if (saves_busy_cb(&gen)) {   /* the game saved while it was read */
+        free(zip);
+        status(SAVES_BUSY);
+        n = -1;
+        goto out;
+    }
+    fprintf(stderr, LOGP "menu: bug report: %d recording%s, %d save file%s\n", np,
+            np == 1 ? "" : "s", n, n == 1 ? "" : "s");
+    *data = (char *)zip;
+out:
+    free(texts[0]);
+    free(texts[1]);
+    return n >= 0;
+}
+
 static int padrec_rename_keep(const char *typed)
 {
     char name[sizeof s_pr_sub], why[160];
@@ -4889,6 +5428,7 @@ static void padrec_sub_open(const char *name)
 {
     snprintf(s_pr_sub, sizeof s_pr_sub, "%s", name);
     s_pr_del = 0;
+    s_pr_unmet[0] = 0;
     if (!s_pr_info)
         s_pr_info = malloc(sizeof *s_pr_info);
     s_pr_info_why[0] = 0;
@@ -4897,12 +5437,21 @@ static void padrec_sub_open(const char *name)
                              : -1;
     if (!s_pr_info)
         snprintf(s_pr_info_why, sizeof s_pr_info_why, "out of memory");
+    {
+        char why[96];
+        if (enhance_padrec_chain_actions(NULL, name, s_pr_info_acts, sizeof s_pr_info_acts,
+                                         why, sizeof why) < 0)
+            s_pr_info_acts[0] = 0;
+    }
 }
 
 static void padrec_sub_close(void)
 {
     s_pr_sub[0] = 0;
     s_pr_del = 0;
+    s_pr_confirm = 0;
+    s_pr_unmet[0] = 0;
+    s_pr_info_acts[0] = 0;
     free(s_pr_info);
     s_pr_info = NULL;
 }
@@ -4911,6 +5460,12 @@ static void padrec_sub_close(void)
  * recording's page back to the list). */
 static int padrec_back(void)
 {
+    if (s_pr_confirm) {
+        s_pr_confirm = 0;
+        s_sel[PAGE_RECORDINGS] = 0;
+        status("Not played");
+        return 1;
+    }
     if (s_pr_del) {
         s_pr_del = 0;
         s_sel[PAGE_RECORDINGS] = 0;
@@ -4949,6 +5504,7 @@ static void padrec_file_rows(const PadrecStatus *st, const char *env)
         return;
     }
     header(s_pr_sub);
+    padrec_setup_row(env != NULL);
     r = row_add(R_PADREC, PR_PLAY, 1, "Play");
     if (r) {
         char why[sizeof r->help];
@@ -4962,8 +5518,10 @@ static void padrec_file_rows(const PadrecStatus *st, const char *env)
                  env ? "Read only while the command line drives the pad"
                  : live ? (rec ? "Stop the record first" : "Stop the playback first")
                  : !ok  ? why
+                 : s_pr_setup_on ? "The setup, then this: from where the setup starts"
                         : "Plays it from where it started: go to its start point first");
     }
+    padrec_unmet_row();
     r = row_add(R_PADREC, PR_RENAME, 1, "Rename");
     if (r) {
         if (s_name_on && s_name_for == NAME_PADREC) {
@@ -4983,6 +5541,24 @@ static void padrec_file_rows(const PadrecStatus *st, const char *env)
         snprintf(r->help, sizeof r->help, "%s",
                  writing ? "Stop the record first"
                          : "A copy in Exports (or another folder), header unchanged");
+    }
+    r = row_add(R_PADREC, PR_NOTE, 1, "Report note");
+    if (r) {
+        if (s_name_on && s_name_for == NAME_NOTE)
+            snprintf(r->value, sizeof r->value, "%.*s|%s", s_name_cur, s_name,
+                     s_name + s_name_cur);
+        else
+            snprintf(r->value, sizeof r->value, "%s", s_pr_note[0] ? s_pr_note : "none");
+        r->tint = s_name_on && s_name_for == NAME_NOTE ? TINT_WARN : TINT_NONE;
+        snprintf(r->help, sizeof r->help, "What went wrong, in a line: the bug report carries it");
+    }
+    r = row_add(R_PADREC, PR_REPORT, 1, "Export bug report");
+    if (r) {
+        r->dim = writing;
+        snprintf(r->help, sizeof r->help, "%s",
+                 writing ? "Stop the record first"
+                 : s_pr_setup_on ? "One zip: the setup, this recording, your saves and the note"
+                                 : "One zip: this recording, your saves and the note");
     }
     r = row_add(R_PADREC, PR_DELETE, 1, "Delete");
     if (r) {
@@ -5004,6 +5580,14 @@ static void padrec_file_rows(const PadrecStatus *st, const char *env)
         return;
     }
     padrec_info_rows(s_pr_info);
+    if (s_pr_info_acts[0]) {
+        r = row_add(R_INFO, -1, 0, "Actions");
+        if (r) {
+            snprintf(r->value, sizeof r->value, "%s", s_pr_info_acts);
+            snprintf(r->help, sizeof r->help,
+                     "Its steps fire these; Play asks first unless it ships with the game");
+        }
+    }
 }
 
 static void padrec_rows(void)
@@ -5023,6 +5607,10 @@ static void padrec_rows(void)
     }
     rec = st.state == PADREC_REC || st.state == PADREC_ARMED_REC;
     live = padrec_live(st.state);
+    if (s_pr_confirm) {
+        padrec_confirm_rows();
+        return;
+    }
     if (s_pr_sub[0]) {
         padrec_file_rows(&st, env);
         return;
@@ -5080,6 +5668,19 @@ static void padrec_rows(void)
                  : live ? "Stop the playback first"
                         : "Records the pad into a new file, named after the time");
     }
+    padrec_setup_row(env != NULL);
+    if (s_pr_setup_on && !rec) {
+        r = row_add(R_PADREC, PR_SETUP_REC, 1, "Play setup, then record");
+        if (r) {
+            r->dim = env || !on || live;
+            snprintf(r->help, sizeof r->help, "%s",
+                     env ? "Read only while the command line drives the pad"
+                     : !on ? "Off with RECOMP_CONFIG=none"
+                     : live ? "Stop the playback first"
+                            : "The record starts at the setup's end and holds only yours");
+        }
+    }
+    padrec_unmet_row();
     r = row_add(R_PADREC, PR_START, 1, "Start point");
     if (r) {
         if (s_name_on && s_name_for == NAME_START) {
@@ -5116,7 +5717,7 @@ static void padrec_rows(void)
         snprintf(r->help, sizeof r->help, "%s",
                  env ? "Read only while the command line drives the pad"
                  : !on ? "Off with RECOMP_CONFIG=none"
-                       : "A .pad from another folder or machine, checked before it is copied");
+                       : "A .pad or a bug report (.zip), checked whole before anything is copied");
     }
     if (!on) {
         info("Folder", "off (RECOMP_CONFIG=none)");
@@ -5185,6 +5786,7 @@ static int padrec_event(const struct row *r, int ok)
     why[0] = 0;
     /* Read only: a recording's page and its export still open. */
     if (env && r->ref != PR_STOP && r->ref != PR_EXPORT && r->ref != PR_DEL_NO
+        && r->ref != PR_ACT_NO && r->ref != PR_NOTE && r->ref != PR_REPORT
         && r->ref < PR_FILE) {
         status("Read only: %s drives the pad", env);
         return 1;
@@ -5199,10 +5801,38 @@ static int padrec_event(const struct row *r, int ok)
         } else if (!enhance_padrec_playable(s_pr_info, s_pr_info_rc, s_pr_info_why, why,
                                             sizeof why)) {
             status("Play: %s", why);
-        } else if (enhance_padrec_play_file(s_pr_sub, armed != 0, why, sizeof why) < 0) {
-            status("Play: %s", why);
         } else {
-            status(armed ? "Plays when the menu closes" : "Playing");
+            padrec_go(PR_PLAY, 0);
+        }
+        break;
+    case PR_SETUP:
+        padrec_setup_next();
+        break;
+    case PR_SETUP_REC:
+        if (padrec_live(st.state))
+            status("Stop the %s first", st.nsteps > 0 ? "playback" : "record");
+        else
+            padrec_go(PR_SETUP_REC, 0);
+        break;
+    case PR_ACT_NO:
+        padrec_back();
+        return 1;
+    case PR_ACT_YES:
+        padrec_go(s_pr_confirm, 1);
+        break;
+    case PR_REQ_ON:
+        switch (enhance_padrec_require_on(s_pr_unmet, why, sizeof why)) {
+        case -1:
+            status("Not turned on: %s", why);
+            break;
+        case 0:
+            status("%s is on: Play again", s_pr_unmet);
+            s_pr_unmet[0] = 0;
+            break;
+        default:
+            status("%s is on at the next start: restart, then Play", s_pr_unmet);
+            s_pr_unmet[0] = 0;
+            break;
         }
         break;
     case PR_RENAME:
@@ -5214,6 +5844,15 @@ static int padrec_event(const struct row *r, int ok)
             snprintf(stem, sizeof stem, "%.*s", (int)(strlen(s_pr_sub) - 4), s_pr_sub);
             name_begin(NAME_PADREC, stem);
         }
+        return 1;
+    case PR_NOTE:
+        if (!s_name_on)
+            name_begin(NAME_NOTE, s_pr_note);
+        return 1;
+    case PR_REPORT:
+        if (padrec_writing_sub(&st))
+            return 1;
+        files_browse(FBJ_PADREC_REPORT);
         return 1;
     case PR_EXPORT:
         if (padrec_writing_sub(&st))
@@ -6795,6 +7434,7 @@ static void name_cut(int from, int to)
 
 static int files_name_keep(const char *name);
 static void padrec_start_keep(const char *text);
+static void padrec_note_keep(const char *text);
 static int padrec_rename_keep(const char *typed);
 
 static void name_keep(void)
@@ -6803,6 +7443,11 @@ static void name_keep(void)
     msg[0] = 0;
     if (s_name_for == NAME_START) {
         padrec_start_keep(s_name);
+        name_end();
+        return;
+    }
+    if (s_name_for == NAME_NOTE) {
+        padrec_note_keep(s_name);
         name_end();
         return;
     }
@@ -6831,6 +7476,7 @@ static void name_cancel(void)
     name_end();
     status(s_name_for == NAME_EXPORT  ? "Export cancelled"
            : s_name_for == NAME_START ? "Start point unchanged"
+           : s_name_for == NAME_NOTE  ? "Note unchanged"
                                       : "Rename cancelled");
 }
 

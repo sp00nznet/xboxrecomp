@@ -157,6 +157,9 @@ struct action {
     char envb[ENHANCE_ACTION_BINDS][TEXT_MAX];   /* the env row, split; s_reg_lock */
     int  src;               /* ENHANCE_ACT_SRC_* of the last config_texts */
     char srckey[sizeof PREFIX + NAME_MAX_];      /* the file key it came from */
+    /* A pad script may fire it (!<name>), and a record writes its fires
+     * (pad-recording-ui R5). Atomic: the pad thread reads it. */
+    int  pad_fireable;
 };
 
 static struct action s_act[ENHANCE_ACTIONS_MAX];
@@ -646,11 +649,81 @@ static int pad_inside(const struct binding *a, const struct binding *c)
         && a->port == c->port && (a->bits & c->bits) == a->bits && a->bits != c->bits;
 }
 
+/* The pad recorder's ear (enhance_padrec.c sets it): a pad-fireable
+ * action's fire becomes a !<action> line in a running record. */
+static void (*volatile s_fired_hook)(const char *name);
+
+void enhance_actions_set_fired_hook(void (*fn)(const char *name))
+{
+    s_fired_hook = fn;
+}
+
 static void fire(const struct binding *b, uint64_t now)
 {
+    void (*hook)(const char *) = s_fired_hook;
     __atomic_add_fetch(&s_act[b->action].pressed, 1, __ATOMIC_ACQ_REL);
     fire_log(b, now);
     toolkit_fire(b);
+    if (hook && __atomic_load_n(&s_act[b->action].pad_fireable, __ATOMIC_ACQUIRE))
+        hook(s_act[b->action].name);
+}
+
+/* The toolkit's own actions a file never fires: the menu, screenshots,
+ * the recorder itself, saves and files. A replay that opens the menu or
+ * starts a record would act on the player's machine, not on the game. */
+static int pad_fire_refused(const char *name)
+{
+    static const char *const no[] = { "menu.", "shot.", "padrec.", "saves.", "files.",
+                                      "overlay.", NULL };
+    for (int i = 0; no[i]; i++)
+        if (!strncmp(name, no[i], strlen(no[i])))
+            return 1;
+    return 0;
+}
+
+int enhance_action_set_pad_fireable(int id, int owner, int on)
+{
+    int n = __atomic_load_n(&s_nact, __ATOMIC_ACQUIRE);
+    /* Only the action's own owner marks it: mod A must not make mod B's
+     * actions, or a later toolkit action, fireable from a file (review 1,
+     * F2). The denylist stays for the toolkit's own. */
+    if (id < 0 || id >= n || !s_act[id].live || s_act[id].owner != owner ||
+        (on && pad_fire_refused(s_act[id].name)))
+        return -1;
+    __atomic_store_n(&s_act[id].pad_fireable, !!on, __ATOMIC_RELEASE);
+    return 0;
+}
+
+int enhance_action_pad_fireable(int id)
+{
+    int n = __atomic_load_n(&s_nact, __ATOMIC_ACQUIRE);
+    return id >= 0 && id < n && s_act[id].live
+        && __atomic_load_n(&s_act[id].pad_fireable, __ATOMIC_ACQUIRE);
+}
+
+int enhance_action_fire_by_pad(const char *name, char *why, size_t n)
+{
+    int id = enhance_action_find(name);
+    void (*hook)(const char *) = s_fired_hook;
+
+    if (id < 0) {
+        snprintf(why, n, "no such action in this run");
+        return -1;
+    }
+    if (s_act[id].dormant) {
+        snprintf(why, n, "its mod is off");
+        return -1;
+    }
+    if (!__atomic_load_n(&s_act[id].pad_fireable, __ATOMIC_ACQUIRE)) {
+        snprintf(why, n, "a pad script cannot fire it");
+        return -1;
+    }
+    __atomic_add_fetch(&s_act[id].pressed, 1, __ATOMIC_ACQ_REL);
+    /* A replay's fire is written to a record running beside it (the env
+     * record), as a press would be. */
+    if (hook)
+        hook(s_act[id].name);
+    return 0;
 }
 
 /* One step of port's bindings with the host pad's bits. tick: the flip's

@@ -697,6 +697,51 @@ static void test_scripts(void)
     xbox_InputKbmScriptReset();
 }
 
+/* ---- pad-fireable: a mod marks its own actions only (review 1, F2) ---- */
+
+static int s_pf_own = -2, s_pf_other = -2, s_pf_tool = -2, s_pf_menu = -2;
+static const struct xbox_mod_api *s_pf_api;
+static int pfa_init(const struct xbox_mod_api *api)
+{
+    s_pf_api = api;
+    static const char *const defs[] = { "F7", NULL };
+    int id = api->action_register("pfa.go", "PF A", defs);
+    s_pf_own = api->action_pad_fireable(id);
+    return 0;
+}
+static int pfb_init(const struct xbox_mod_api *api)
+{
+    /* Mod B tries mod A's action, a toolkit action and an unknown id. */
+    s_pf_other = api->action_pad_fireable(enhance_action_find("pfa.go"));
+    s_pf_tool = api->action_pad_fireable(enhance_action_find("padrec.record"));
+    s_pf_menu = api->action_pad_fireable(-1);
+    return 0;
+}
+static const struct xbox_mod k_pfa = { "pfa", pfa_init, NULL, NULL };
+static const struct xbox_mod k_pfb = { "pfb", pfb_init, NULL, NULL };
+
+static void test_pad_fireable_owner(void)
+{
+    static const struct xbox_mod *const mods[] = { &k_pfa, &k_pfb, NULL };
+    int a;
+
+    printf("pad_fireable_owner\n");
+    start_with(ARMED, &k_fake, mods);
+    a = enhance_action_find("pfa.go");
+    CHECK(a >= 0);
+    CHECK(s_pf_own == 0 && enhance_action_pad_fireable(a));
+    CHECK(s_pf_other == -1 && s_pf_tool == -1 && s_pf_menu == -1);
+    /* Past init the mod API knows no caller: refused. */
+    CHECK(s_pf_api && s_pf_api->action_pad_fireable(a) == -1);
+    /* Straight: only the owner, and the denylist holds for the toolkit. */
+    CHECK(enhance_action_set_pad_fireable(a, -1, 1) == -1);
+    CHECK(enhance_action_set_pad_fireable(a, 1, 1) == -1);
+    CHECK(enhance_action_set_pad_fireable(a, 0, 0) == 0 && !enhance_action_pad_fireable(a));
+    CHECK(enhance_action_find("padrec.record") < 0 ||
+          enhance_action_set_pad_fireable(enhance_action_find("padrec.record"), -1, 1) == -1);
+    xbox_mod_shutdown();
+}
+
 /* ---- 8. disarmed: hook=off, nothing filtered or fired ------------------ */
 
 static int s_probe_id = -2;
@@ -1121,7 +1166,7 @@ static void test_mod_api(void)
     const char *out;
     int id;
 
-    CHECK(XBOX_MOD_API_VERSION == 9u);
+    CHECK(XBOX_MOD_API_VERSION == 10u);
     out = start_with("[camera]\nfree = true\n", &k_fake, mods);
     CHECK(strstr(out, "[ENHANCE] actions hook=on (camera.free)\n") != NULL);
     CHECK(s_cam_armed == 1);
@@ -2528,6 +2573,7 @@ int main(void)
     test_tick_rules();
     test_quiet();
     test_dormant();
+    test_pad_fireable_owner();
 #ifndef _WIN32
     test_live_arm();
 #endif

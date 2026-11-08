@@ -18,6 +18,41 @@ static PadrecStatus s_st;
 static const char *s_env;
 static char s_last[1024];
 static char s_meta_name[PADREC_NAME_MAX];
+/* The last chain's files and flags, and the record at its tail, for the
+ * page's tests (padrec_stub_chain). */
+static char s_chain[PADREC_CHAIN_MAX][1024];
+static int s_chain_trust[PADREC_CHAIN_MAX];
+static int s_nchain;
+static unsigned s_chain_flags;
+static char s_chain_rec[1024];
+static int (*s_req)(const char *key);
+static char s_unmet[96];
+
+/* The real check reads the header (pad_header.c, which not every test
+ * links): here the first key of a `requires = ["..."]` line is enough for
+ * the page's "Turn on". 0, or -1 with the key in s_unmet. */
+static int stub_requires(const char *path)
+{
+    char buf[4096], *p, *q;
+    size_t n;
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    if (!(p = strstr(buf, "requires = [\"")))
+        return 0;
+    p += strlen("requires = [\"");
+    if (!(q = strchr(p, '"')) || (size_t)(q - p) >= sizeof s_unmet)
+        return 0;
+    snprintf(s_unmet, sizeof s_unmet, "%.*s", (int)(q - p), p);
+    if (s_req && s_req(s_unmet)) {
+        s_unmet[0] = 0;
+        return 0;
+    }
+    return -1;
+}
 
 /* The header name the last record was given, to check it is the stem. */
 const char *padrec_stub_meta_name(void)
@@ -40,6 +75,9 @@ void padrec_stub_reset(void)
     memset(&s_st, 0, sizeof s_st);
     s_env = NULL;
     s_last[0] = 0;
+    s_nchain = 0;
+    s_chain_rec[0] = 0;
+    s_unmet[0] = 0;
 }
 
 void padrec_set_title(uint32_t title_id, const char *title)
@@ -102,17 +140,114 @@ int padrec_record_start(const char *path, const PadrecMeta *meta, unsigned flags
     return 0;
 }
 
-int padrec_play(const char *const *paths, int n, unsigned flags, char *why, size_t whyn)
+
+int padrec_stub_chain(int i, const char **path, int *trusted, unsigned *flags,
+                      const char **rec)
+{
+    if (path)
+        *path = i >= 0 && i < s_nchain ? s_chain[i] : NULL;
+    if (trusted)
+        *trusted = i >= 0 && i < s_nchain ? s_chain_trust[i] : 0;
+    if (flags)
+        *flags = s_chain_flags;
+    if (rec)
+        *rec = s_chain_rec;
+    return s_nchain;
+}
+
+int padrec_play_chain(const PadrecSeg *segs, int n, unsigned flags, const char *rec_path,
+                      const PadrecMeta *meta, char *why, size_t whyn)
 {
     FILE *f;
-    if (n != 1 || !(f = fopen(paths[0], "rb"))) {
+    int i;
+    if (s_env) {
+        snprintf(why, whyn, "driven by %s", s_env);
+        return -1;
+    }
+    if (n < 1 || n > PADREC_CHAIN_MAX) {
         snprintf(why, whyn, "cannot read");
         return -1;
     }
-    fclose(f);
-    snprintf(s_last, sizeof s_last, "%s", paths[0]);
-    start(paths[0], PADREC_PLAY, flags);
+    s_unmet[0] = 0;
+    for (i = 0; i < n; i++) {
+        if (!(f = fopen(segs[i].path, "rb"))) {
+            snprintf(why, whyn, "cannot read");
+            return -1;
+        }
+        fclose(f);
+        if (stub_requires(segs[i].path) < 0) {
+            snprintf(why, whyn, "needs %s on", s_unmet);
+            return PADREC_E_REQUIRES;
+        }
+    }
+    s_nchain = n;
+    s_chain_flags = flags;
+    for (i = 0; i < n; i++) {
+        snprintf(s_chain[i], sizeof s_chain[i], "%s", segs[i].path);
+        s_chain_trust[i] = segs[i].trusted;
+    }
+    snprintf(s_chain_rec, sizeof s_chain_rec, "%s", rec_path ? rec_path : "");
+    if (rec_path) {
+        snprintf(s_meta_name, sizeof s_meta_name, "%s", meta && meta->name ? meta->name : "");
+        if ((f = fopen(rec_path, "wb"))) {
+            fputs("# xbr-export: pad 1\n# xbr-pad: origin = \"session\"\nf1:@end\n", f);
+            fclose(f);
+        }
+    }
+    snprintf(s_last, sizeof s_last, "%s", segs[n - 1].path);
+    start(segs[0].path, PADREC_PLAY, flags);
+    s_st.seg = 1;
+    s_st.segs = n + (rec_path != NULL);
     return 0;
+}
+
+int padrec_play(const char *const *paths, int n, unsigned flags, char *why, size_t whyn)
+{
+    PadrecSeg segs[PADREC_CHAIN_MAX];
+    if (n < 1 || n > PADREC_CHAIN_MAX || !paths) {
+        snprintf(why, whyn, "cannot read");
+        return -1;
+    }
+    for (int i = 0; i < n; i++) {
+        segs[i].path = paths[i];
+        segs[i].trusted = (flags & PADREC_TRUST) != 0;
+        segs[i].allowed = NULL;
+    }
+    return padrec_play_chain(segs, n, flags, NULL, NULL, why, whyn);
+}
+
+void padrec_set_requires_hook(int (*on)(const char *key))
+{
+    s_req = on;
+}
+
+const char *padrec_unmet(void)
+{
+    return s_unmet;
+}
+
+/* The real one reads the header; the page's tests need only "none". */
+int padrec_requires(const char *text, char *unmet, size_t n)
+{
+    (void)text;
+    if (unmet && n)
+        unmet[0] = 0;
+    return 0;
+}
+
+void padrec_set_quit(void (*fn)(void))
+{
+    (void)fn;
+}
+
+void padrec_action_fired(const char *name)
+{
+    (void)name;
+}
+
+void padrec_set_action_hook(int (*fire)(const char *name, char *why, size_t n))
+{
+    (void)fire;
 }
 
 int padrec_again(unsigned flags, char *why, size_t whyn)

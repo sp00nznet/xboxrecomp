@@ -1641,10 +1641,10 @@ hdd/TDATA/<tid>/...      the title's own data, when it has any
   before showing anything: the structure, every name (the FATX rules:
   42 bytes a component, no `..`, no device names, at most 8 deep), the
   sizes (16 MB a file, 64 MB in all, 4096 entries), each CRC, and the
-  manifest. A zip for another title, in a newer format, or made with other
-  console keys is refused, and nothing changes. The preview names the
-  file, the game, when it was exported, the saves in it, and what it
-  replaces.
+  manifest. A zip for another title or in a newer format is refused, and
+  nothing changes. A zip made under other console keys is re-signed (see
+  **Keys**). The preview names the file, the game, when it was exported,
+  the saves in it, and what it replaces.
 - **Import and quit** first exports the saves here to
   `<user dir>/exports/save-backups/<title slug>-saves-backup-<stamp>.zip`
   (a failed backup stops the import), then writes the zip's trees beside
@@ -1662,9 +1662,41 @@ hdd/TDATA/<tid>/...      the title's own data, when it has any
   without saving.
 
 **Keys.** The saves are signed with the console's keys, which this runtime
-leaves at zero, so a save moves between hosts as it is and is never
-re-signed. The manifest's `keys` is `zero`, or a fingerprint of the keys
-in force (`xbox_saves_keys_id`); an import needs the same value.
+leaves at zero (`kernel_keys.c`; the `saves_keys` ctest pins them), so a
+save moves between hosts as it is. The manifest's `keys` is `zero`, or a
+fingerprint of the keys in force (`xbox_saves_keys_id`).
+
+A zip whose `keys` differ (a console's saves, or a hand-edited zip) is
+not refused: each save is re-signed for this build or skipped
+(`saves_sign.c`; openspec pad-recording-ui R6). The recipes come from
+`saves-signing.toml` beside the exe (on macOS also the bundle's
+`Resources`), which `xbr` writes from game.toml `[saves]`; a file of
+that name inside a zip is never read.
+
+```
+format = 1
+signing = "resign"            # or "none": every save imports as it is
+[[signed]]                    # at most 64
+glob = "*/blinx2data.bin"     # below UDATA/<tid>/, any case, at most 128 bytes
+size = 81920                  # the file's exact size
+data = [0, 33972]             # the signed range; 0 <= start < end <= size
+digest = 33972                # 20 bytes, inside the file, outside every range
+key = "roamable"              # any other key is console-locked: skipped
+```
+
+A save with a roamable recipe file gets each recipe's HMAC-SHA1 over its
+range under the zero key at its digest, as `xbr saves import` does. A
+save is skipped when a recipe is not roamable, a file's size is not the
+recipe's, none of its files has a recipe, or there is no usable file (no
+file, no `signing`, or a file refused whole by a bounds check; the log
+says so once). The preview shows each save's line, "re-signed (keys
+differed): re-signed for this build; it may not load on the console it
+came from" or "skipped: this game's non-roamable (console-locked) saves
+aren't supported yet", and "the replay runs without the skipped saves"
+when any was; the log adds a skip's reason. A skipped save is not
+imported, and the import still replaces the whole title folder (after
+the backup); when no save is left, the saves tree is not touched and,
+with no game data either, the zip is refused.
 
 **A save in progress.** The kernel keeps a table of open handles under a
 title's save trees (`xbox_saves_busy`, `kernel_file.c`): export and
@@ -1678,8 +1710,10 @@ handle `NtDuplicateObject` closes with `DUPLICATE_CLOSE_SOURCE` leaves
 the table too.
 
 Tests: `tests/saves_zip` (the zip, the manifest, the checks, the export,
-the swap, its rollback with renames failed on purpose, and a failed
-undo), `tests/kernel_directory_posix` (the busy table and the
+the swap, its rollback with renames failed on purpose, a failed undo,
+and the re-sign: each recipe bound, the C port against Python's `hmac`
+on BLiNX 2's layout over a synthetic file, the derived archive and its
+import), `tests/saves_keys` (the keys stay zero), `tests/kernel_directory_posix` (the busy table and the
 generation), `tests/enhance_menu` (the page).
 
 ### Pad recordings
@@ -1708,6 +1742,44 @@ title, the start point typed on the page, its length.
   (`@open:`) wait for the game's own file opens, as for an env script.
 - **Limits.** A record stops itself at `PAD_STEPS_MAX` steps, with room
   for its `@end`, so it plays back whole ("recording full" on the strip).
+- **Chains.** Files play one after another, each counted from its own
+  first poll or flip, under one `PAD_STEPS_MAX` for the whole chain (a
+  chain over it is refused before it plays): the page's setup before a
+  recording, "Play setup, then record", and `RECOMP_PAD_SCRIPT=@a.pad;@b.pad`
+  from the command line, whose first file may count from boot (`pad_quit`
+  then waits for the chain's end). A file counted from boot is refused
+  anywhere else. The strip shows `n/m`.
+- **Actions.** `g<poll>:!<name>` (or `f<flip>:!<name>`) fires a host action
+  as its binding would, and presses nothing; a record writes the fires of
+  the actions a mod made pad-fireable (`action_pad_fireable`, mod API v10).
+  The menu's, screenshots', the recorder's, saves', files' and overlay
+  actions never are. A file's actions fire only once the player has
+  confirmed them on Play (the page lists them; a shipped setup and the
+  command line are trusted); otherwise they are skipped with one line each.
+- **Requires.** `# xbr-pad: requires = ["mods.debug_menu.enable"]` names
+  config keys that must be on: Play refuses the file with the key named,
+  and the page offers to turn it on (written to the user file). A mod's
+  switch (its enable setting, `"on"` for a choice, or `mods.<name>`) goes
+  through the Mods page's toggle: it counts only while the mod runs, so a
+  mod that cannot switch live stays unmet until the next start.
+- **Setups.** The page's Setup row picks one (or none): the files of
+  `<exe dir>/pad-setups/` (`../Resources/pad-setups` in a macOS bundle;
+  the CLI stages a game repo's `config/pad-setups/` there), read only and
+  trusted, then the player's recordings whose header says
+  `kind = "setup"`. Play on a recording plays the setup first;
+  "Play setup, then record" records from the setup's `@end`, and the new
+  file's header names the setup.
+- **Bug reports.** A recording's page has "Report note" (one line) and
+  "Export bug report": one zip (`<game>-report-<time>.zip`) holding
+  `xbr-report.toml` (the game, the OS name, the note, the chain), the
+  chain's files under `pad/<n>-<name>.pad` (the page's setup, then the
+  recording) and all of the title's saves as a saves zip lays them out.
+  Import on the page takes it too: checked whole first (every chain file
+  as a `.pad` import, the saves as the Saves page checks and re-signs
+  them), then the recordings are copied in under free names (players'
+  files: their actions are confirmed on Play), then the Saves page's
+  preview imports the saves (backup, confirm, quit). The Saves page reads
+  a bug report as a saves zip for its saves only.
 - **The strip** (`overlay.padrec_hud`) shows the state, name, times, step
   and count at the bottom of the screen, at the top while the menu is
   open, and stays 5 s after a playback ends.
@@ -1717,8 +1789,9 @@ recordings need the menu (menu.enabled)" and does nothing.
 
 Tests: `tests/pad_script` (the header), `tests/pad_session` (the session,
 its threads under TSan, the cap), `tests/usb_pad_game` (a session on the
-game's own pad poll), `tests/enhance_menu` (the page), `tests/input_actions`
-(the defaults), `tests/mod_status` (API v9).
+game's own pad poll), `tests/enhance_menu` (the page, a bug report out and back),
+`tests/saves_zip` (the report's manifest and checks), `tests/input_actions`
+(the defaults), `tests/mod_status` (API v10).
 
 ### Naming rule
 
@@ -1869,7 +1942,7 @@ The title's glue calls two entries:
 - `xbox_mod_input_captured()` from its pad read. While it returns true, the
   title must see a released pad.
 
-`struct xbox_mod_api` (version 9, `XBOX_MOD_API_VERSION`) holds:
+`struct xbox_mod_api` (version 10, `XBOX_MOD_API_VERSION`) holds:
 
 | Member | What it gives |
 | --- | --- |
@@ -1900,6 +1973,7 @@ The title's glue calls two entries:
 | `draw3d_begin(mod, view, proj)`, `draw3d_tris(v, n, flags)`, `draw3d_lines(v, n, flags)`, `draw3d_end(mod)` | v8. World-space triangles and lines drawn over the game's 3D frame ([3D debug draw](#3d-debug-draw-v8)). The guest's thread, once a frame. |
 | `input_capture_try(on)` | v9. `input_capture` with an answer: 0 when done, -1 when refused. A pad recording playing back holds port 0 ([Pad recordings](#pad-recordings)), so a capture is refused then (off never is), and `input_capture(1)` is ignored: a v8 mod keeps working, its capture simply does not take. Any thread. |
 | `on_capture_lost(fn, user)` | v9. `fn(user)` once when a playback starts while the mod holds port 0: the toolkit drops the capture, and `xbox_enhance_pad_seen` returns 0 while the recording plays. Called from the next `xbox_mod_frame`, on the guest's thread; a free camera lands there and says so with a toast. Init only; up to `XBOX_MOD_MAX_FRAME` across mods. |
+| `action_pad_fireable(id)` | v10. Lets a pad recording fire the action with a `!<name>` step, and a record write its fires ([Pad recordings](#pad-recordings)). 0, or -1 for an unknown id or a refused action: the menu's, screenshots', the recorder's, saves', files' and overlay toggles never are. Any thread. |
 
 `struct xbox_mod` gained two fields in v4, after `desc`:
 

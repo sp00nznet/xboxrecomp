@@ -78,6 +78,63 @@ int enhance_padrec_playable(const PadFileInfo *info, int rc, const char *rc_why,
 /* The last file played or recorded ("" for none), for the play action. */
 const char *enhance_padrec_last(void);
 
+/* ---- setups and chains (R6) ---------------------------------------------- */
+
+/* A setup: a file of <exe dir>/pad-setups/ (shipped with the game, read
+ * only, its !<action> steps trusted), or a recording of the folder whose
+ * header says kind = "setup" (the player's: its actions are confirmed on
+ * Play, as any other file's). */
+#define ENHANCE_PADREC_SETUPS 32
+struct enhance_padrec_setup {
+    char name[128];             /* the file name, UTF-8 */
+    int shipped;                /* 1: <exe dir>/pad-setups/ */
+};
+
+/* <exe dir>/pad-setups (../Resources/pad-setups in a macOS bundle) into
+ * out: 1 when the folder exists. */
+int enhance_padrec_setups_dir(char *out, size_t n);
+
+/* The setups, shipped ones first, each group by name, at most max. The
+ * count (0 for none). Reads the header of every recording of the folder:
+ * on the page's request, never per draw. */
+int enhance_padrec_setups(struct enhance_padrec_setup *out, int max);
+
+/* What a chain of setup (NULL: none) then name (NULL: none) would fire
+ * and the player has not confirmed: the distinct !<action> names of its
+ * untrusted files (every file but a shipped setup), ", " joined into out.
+ * Their count; -1 with why when a file cannot be read. */
+int enhance_padrec_chain_actions(const struct enhance_padrec_setup *setup, const char *name,
+                                 char *out, size_t on, char *why, size_t n);
+
+/* Play setup (NULL: none) then the folder's file name (NULL: none) as a
+ * chain, now or armed. record: a new record starts at the chain's end
+ * ("Play setup, then record", R3), its header naming the setup and the
+ * start point. confirmed: the actions the player saw and confirmed
+ * (enhance_padrec_chain_actions' list), so every file's fire, and a file
+ * that names another since is refused; NULL: none confirmed. 0; -1 with
+ * why; PADREC_E_REQUIRES when a file needs a key that is off
+ * (padrec_unmet names it). */
+int enhance_padrec_play_chain(const struct enhance_padrec_setup *setup, const char *name,
+                              int record, const char *start_point, int armed,
+                              const char *confirmed, char *why, size_t n);
+
+/* A setup's file read whole, as enhance_padrec_read reads the folder's
+ * (a bug report carries it). 0, or -1 with why. */
+int enhance_padrec_read_setup(const struct enhance_padrec_setup *s, char **text, size_t *len,
+                              char *why, size_t n);
+
+/* 1 when a requires key is an installed mod's switch (mods.<id>, or the
+ * mod's enable setting): the only keys the page offers to turn on, since
+ * the key comes from a file that may be someone else's. */
+int enhance_padrec_require_turnable(const char *key);
+
+/* Turn a requires key on in the user file, at once and alone, as the
+ * menu's layout keys are: a mod's switch through the mod layer (live when
+ * the mod can switch live) with its setting's literal. Any other key is
+ * refused (-1). 0 when it is on now, 1 when it applies at the next start,
+ * -1 with why. */
+int enhance_padrec_require_on(const char *key, char *why, size_t n);
+
 /* ---- the files (R5): import, export, rename, delete, Info ---------------- */
 
 /* A new recording's stem: "<game>-<yyyymmdd-hhmm>" at local time t, the

@@ -70,6 +70,8 @@
 #include "pointer.h"
 #include "recomp_env.h"
 #include "recomp_exe_dir.h"
+#include "saves_sign.h"
+#include "saves_zip.h"
 #include "shader_param_kinds.h"
 #include "shader_profile_edit.h"
 #include "text_input.h"
@@ -2719,7 +2721,7 @@ static void test_pages(void)
      * Recordings with no folder yet: no file rows. */
     static const uint32_t k_sum[11] = {
         0x6FDBE087u, 0xC58D4BA2u, 0xD06D4311u, 0x775B0691u, 0x109DEB36u,
-        0x6930FCBFu, 0xC1417056u, 0xD09AF0E9u, 0xE13F4B8Bu, 0xDAE05AEAu, 0xE2E461FFu };
+        0x6930FCBFu, 0xC1417056u, 0xD09AF0E9u, 0xE13F4B8Bu, 0x5548E3AAu, 0xE2E461FFu };
     /* Files shows Open exports folder only off Game Mode. */
     set_env("RECOMP_HOST_GAMESCOPE", NULL);
     start_with(ARMED, k_mods);
@@ -5885,9 +5887,95 @@ static void test_saves(void)
     files_quit();
 
     remove(backup);
-    rmdir(EXPORTS "/save-backups");
     remove(EXPORTS "/sv.zip");
     remove(EXPORTS "/bad.zip");
+
+    /* A zip made under other console keys (pad-recording-ui R6): no longer
+     * refused. The save with a recipe file is re-signed for this build by
+     * saves-signing.toml beside the exe, the one with none is skipped, and
+     * the preview says so in plain words. */
+    {
+        static const char *const sign =
+            "format = 1\nsigning = \"resign\"\n[[signed]]\nglob = \"*/progress.bin\"\n"
+            "size = 64\ndata = [0, 40]\ndigest = 40\nkey = \"roamable\"\n";
+        /* Python: hmac.new(bytes(16), bytes((i*13+1)&255 for i in range(40)), sha1) */
+        static const unsigned char want[20] = {
+            0x25, 0xbe, 0x16, 0x65, 0x20, 0x18, 0x5d, 0x50, 0x9e, 0x0f,
+            0xe3, 0x09, 0x54, 0x91, 0x58, 0x59, 0xaf, 0xec, 0x07, 0xfd };
+        struct saves_manifest m = { 0 };
+        struct sz_writer w;
+        unsigned char data[64], *zip, meta[64];
+        char man[512], spath[512], *got = NULL;
+        size_t zl, gl = 0, ml = 0;
+        int mn;
+        for (int i = 0; i < 64; i++)
+            data[i] = (unsigned char)((i * 13 + 1) & 0xff);
+        meta[ml++] = 0xFF; meta[ml++] = 0xFE;
+        for (const char *c = "Name=Slot B"; *c; c++) {
+            meta[ml++] = (unsigned char)*c;
+            meta[ml++] = 0;
+        }
+        m.format = 1;
+        snprintf(m.kind, sizeof m.kind, "saves");
+        m.title_id = 0x4d530065;
+        snprintf(m.title, sizeof m.title, "Test Title");
+        snprintf(m.keys, sizeof m.keys, "0123abcd");
+        m.files = 3;
+        m.bytes = 64 + ml + ml;
+        mn = saves_manifest_write(&m, man, sizeof man);
+        sz_writer_init(&w);
+        sz_add_file(&w, SZ_MANIFEST, man, (size_t)mn, 0);
+        sz_add_file(&w, "hdd/UDATA/4d530065/0123456789AB/SaveMeta.xbx", meta, ml, 0);
+        sz_add_file(&w, "hdd/UDATA/4d530065/0123456789AB/progress.bin", data, 64, 0);
+        sz_add_file(&w, "hdd/UDATA/4d530065/FFFFFFFFFFFF/SaveMeta.xbx", meta, ml, 0);
+        CHECK(sz_finish(&w, &zip, &zl) == 0);
+        CHECK(fb_write_atomic(EXPORTS "/console.zip", zip, zl) == FB_OK);
+        free(zip);
+        snprintf(spath, sizeof spath, "%s/" SAVES_SIGN_FILE, recomp_exe_dir());
+        write_file(spath, sign);
+
+        start_with(ARMED, k_mods);
+        open_menu();
+        CHECK(enhance_menu_set_page("Saves"));
+        CHECK(enhance_menu_select_row("Import saves"));
+        tap(0x0D);
+        CHECK(enhance_menu_select_row("console.zip"));
+        tap(0x0D);
+        CHECK(row_value("Import and quit") != NULL);
+        CHECK(row_value("Console keys") && strstr(s_val, "1 re-signed, 1 skipped"));
+        CHECK(row_value("0123456789AB") && strstr(s_val, "re-signed (keys differed)"));
+        CHECK(row_value("FFFFFFFFFFFF") && strstr(s_val, "skipped: this game's non-roamable"));
+        CHECK(row_value("Skipped") && strstr(s_val, "runs without the skipped saves"));
+        CHECK(enhance_menu_select_row("Import and quit"));
+        tap(0x0D);
+        CHECK(status_has("Saves imported"));
+        CHECK(fb_read_file(SV_SAVE "/progress.bin", 1 << 16, &got, &gl) == FB_OK && gl == 64
+              && !memcmp(got, data, 40) && !memcmp(got + 40, want, 20)
+              && !memcmp(got + 60, data + 60, 4));
+        free(got);
+        CHECK(!fb_exists(SV_U "/4d530065/FFFFFFFFFFFF"));
+        files_quit();
+
+        /* no saves-signing.toml beside the exe: every save is skipped, so
+         * nothing is left to import and the zip is refused at the pick */
+        remove(spath);
+        start_with(ARMED, k_mods);
+        open_menu();
+        CHECK(enhance_menu_set_page("Saves"));
+        CHECK(enhance_menu_select_row("Import saves"));
+        tap(0x0D);
+        CHECK(enhance_menu_select_row("console.zip"));
+        tap(0x0D);
+        CHECK(status_has("Not imported: None of these saves can be re-signed"));
+        files_quit();
+        remove(EXPORTS "/console.zip");
+        remove(SV_SAVE "/SaveMeta.xbx");
+        while ((backup[0] = 0, fb_list_host(EXPORTS "/save-backups", sv_backup_emit, backup,
+                                            NULL) == 0 && backup[0]))
+            remove(backup);
+    }
+
+    rmdir(EXPORTS "/save-backups");
     sv_tree_remove();
     rmdir(EXPORTS);
     s_tid = 0;
@@ -6135,6 +6223,285 @@ static int64_t recs_mtime(const char *name)
     return -1;
 }
 
+int padrec_stub_chain(int i, const char **path, int *trusted, unsigned *flags,
+                      const char **rec);
+
+/* Setups and chains (pad-recording-ui R6, tasks 3.2-3.3): the Setup pick
+ * (shipped ones first, then the player's kind = "setup" files), Play as a
+ * chain, "Play setup, then record", the actions' confirm and the requires
+ * row. The session side is padrec_stub's; tests/pad_session plays them. */
+static void test_padrec_setups(void)
+{
+    static const char hdr[] = "# xbr-export: pad 1\n# xbr-pad: title_id = \"4d530065\"\n"
+                              "# xbr-pad: origin = \"session\"\n# xbr-pad: clock = \"poll\"\n";
+    char dir[1024], shipped[1100], head[160], times[160];
+    const char *path, *rec;
+    int trusted;
+    unsigned flags;
+    PadrecStatus st;
+
+    padrec_stub_reset();
+    recs_clear();
+    s_tid = 0x4d530065;
+    snprintf(dir, sizeof dir, "%s/pad-setups", recomp_exe_dir());
+    MKDIR(dir);
+    snprintf(shipped, sizeof shipped, "%s/stage.pad", dir);
+    {
+        char t[512];
+        snprintf(t, sizeof t, "%s# xbr-pad: kind = \"setup\"\n"
+                              "# xbr-pad: requires = [\"mods.test_need.enable\"]\n"
+                              "g0:!test.open\ng5:@end\n", hdr);
+        write_file(shipped, t);
+    }
+    MKDIR("config");
+    MKDIR(RECS);
+    {
+        char t[512];
+        snprintf(t, sizeof t, "%s# xbr-pad: kind = \"setup\"\ng0:!mine.act\ng3:@end\n", hdr);
+        write_file(RECS "/mine.pad", t);
+        snprintf(t, sizeof t, "%sg1:a\ng2:!run.act\ng3:!mine.act\ng9:@end\n", hdr);
+        write_file(RECS "/run.pad", t);
+    }
+
+    start_with(ARMED, k_mods);
+    nv2a_overlay_set_game("BLiNX 2");
+    open_menu();
+    CHECK(enhance_menu_set_page("Recordings"));
+    CHECK(row_value("Setup") && !strcmp(s_val, "none"));
+    CHECK(row_value("Play setup, then record") == NULL);
+
+    /* Shipped first. */
+    CHECK(enhance_menu_select_row("Setup"));
+    tap(0x0D);
+    CHECK(row_value("Setup") && !strcmp(s_val, "stage.pad"));
+    CHECK(row_value("Play setup, then record") != NULL);
+
+    /* Its requires is off: refused and named. The key is no installed
+     * mod's switch, so the page offers no Turn on and never writes it,
+     * since the file may be someone else's (review 1, F1). */
+    CHECK(enhance_menu_select_row("Play setup, then record"));
+    tap(0x0D);
+    CHECK(status_has("mods.test_need.enable"));
+    CHECK(padrec_stub_chain(0, NULL, NULL, NULL, NULL) == 0);
+    CHECK(pr_state() == PADREC_IDLE);
+    CHECK(row_value("Turn on") == NULL);
+    CHECK(row_value("Needs") && !strcmp(s_val, "mods.test_need.enable"));
+    CHECK(!enhance_menu_select_row("Needs"));
+    {
+        char why[160];
+        const char *f;
+        CHECK(!enhance_padrec_require_turnable("mods.test_need.enable"));
+        CHECK(!enhance_padrec_require_turnable("debug.unsafe"));
+        CHECK(enhance_padrec_require_turnable("mods.testmod"));
+        CHECK(enhance_padrec_require_on("debug.unsafe", why, sizeof why) == -1);
+        CHECK(strstr(why, "not a mod's switch") != NULL);
+        CHECK(enhance_padrec_require_on("mods.test_need.enable", why, sizeof why) == -1);
+        f = read_file("config/config.toml");
+        CHECK(!f || (!strstr(f, "unsafe") && !strstr(f, "test_need")));
+        CHECK(enhance_cfg_bool("mods.test_need.enable", 0) == 0);
+    }
+    /* The rest plays it with that requires gone. */
+    {
+        char t[512];
+        snprintf(t, sizeof t, "%s# xbr-pad: kind = \"setup\"\ng0:!test.open\ng5:@end\n", hdr);
+        write_file(shipped, t);
+    }
+
+    /* A shipped setup's actions fire unasked; the record waits at its end. */
+    CHECK(enhance_menu_select_row("Play setup, then record"));
+    tap(0x0D);
+    CHECK(status_has("then records"));
+    CHECK(padrec_stub_chain(0, &path, &trusted, &flags, &rec) == 1);
+    CHECK(!strcmp(path, shipped) && trusted == 1 && (flags & PADREC_ARMED));
+    CHECK(strstr(rec, "recordings") && strstr(rec, ".pad"));
+    CHECK(fb_exists(rec));
+    CHECK(pr_state() == PADREC_ARMED_PLAY);
+    padrec_stop();
+
+    /* The player's setup next, then none again. */
+    CHECK(enhance_menu_select_row("Setup"));
+    tap(0x0D);
+    CHECK(row_value("Setup") && !strcmp(s_val, "mine.pad"));
+
+    /* Play on run.pad: the setup, then it. Their actions are asked
+     * first, the focus on No; B and No play nothing. */
+    CHECK(enhance_menu_select_row("run.pad"));
+    tap(0x0D);
+    CHECK(row_value("Actions") && !strcmp(s_val, "run.act, mine.act"));
+    CHECK(row_value("Setup") && !strcmp(s_val, "mine.pad"));
+    CHECK(enhance_menu_select_row("Play"));
+    tap(0x0D);
+    CHECK(row_value("Yes, play it") != NULL && row_value("Rename") == NULL);
+    CHECK(row_value("Actions") && !strcmp(s_val, "mine.act, run.act"));
+    tap(0x0D);                                    /* No */
+    CHECK(status_has("Not played"));
+    CHECK(row_value("Rename") != NULL);
+    CHECK(pr_state() == PADREC_STOPPED);
+    CHECK(enhance_menu_select_row("Play"));
+    tap(0x0D);
+    tap(0x08);
+    CHECK(status_has("Not played") && row_value("Rename") != NULL);
+    CHECK(enhance_menu_select_row("Play"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Yes, play it"));
+    tap(0x0D);
+    CHECK(status_has("Plays when the menu closes"));
+    CHECK(padrec_stub_chain(0, &path, &trusted, &flags, &rec) == 2);
+    CHECK(strstr(path, "mine.pad") && trusted == 1 && !rec[0]);
+    CHECK(padrec_stub_chain(1, &path, &trusted, NULL, NULL) == 2);
+    CHECK(strstr(path, "run.pad") && trusted == 1);
+    padrec_status(&st);
+    CHECK(st.segs == 2);
+    padrec_stop();
+
+    /* The player's setup's page: its kind in Info. */
+    tap(0x08);
+    CHECK(enhance_menu_select_row("mine.pad"));
+    tap(0x0D);
+    CHECK(row_value("Kind") && !strcmp(s_val, "setup"));
+    tap(0x08);
+
+    /* none again; Play is then the file alone, untrusted with no actions
+     * asked: a file with none plays at once. */
+    CHECK(enhance_menu_select_row("Setup"));
+    tap(0x0D);
+    CHECK(row_value("Setup") && !strcmp(s_val, "none"));
+    CHECK(row_value("Play setup, then record") == NULL);
+    open_menu();
+
+    /* The strip names the chain's place (R4). */
+    memset(&st, 0, sizeof st);
+    st.state = PADREC_PLAY;
+    st.seg = 2;
+    st.segs = 2;
+    st.nsteps = 3;
+    snprintf(st.name, sizeof st.name, "run");
+    enhance_padrec_strip_text(&st, head, sizeof head, times, sizeof times);
+    CHECK(strstr(head, "2/2 run") != NULL);
+    st.segs = 1;
+    enhance_padrec_strip_text(&st, head, sizeof head, times, sizeof times);
+    CHECK(strstr(head, "/") == NULL && strstr(head, "run"));
+
+    padrec_stub_reset();
+    recs_clear();
+    remove(shipped);
+    rmdir(dir);
+}
+
+/* A requires key that is a mod's switch goes through the mod layer: the
+ * enable setting's "off"/"on" choice counts (enhance_cfg_bool alone would
+ * refuse it as not a bool), Turn on writes its literal and switches it live
+ * when the mod can, and a mod that only switches at the next start stays
+ * unmet until then, since its actions would be refused at their step. */
+static int rm_init(const struct xbox_mod_api *api)
+{
+    (void)api;
+    return 0;
+}
+static const struct xbox_mod_setting k_rm_set[] = {
+    { "enable", "rmod.enable", NULL, NULL, "Restart mod", NULL, NULL,
+      XBOX_SET_ENUM, ENHANCE_LIVE, XBOX_SET_ENABLE, 0, 0, 0, 0, k_dm_offon },
+};
+static const struct xbox_mod_desc k_rm_desc = {
+    XBOX_MOD_DESC_VERSION, sizeof(struct xbox_mod_desc),
+    "Restart mod", NULL, NULL, NULL, k_rm_set, 1, NULL, 0
+};
+static const struct xbox_mod k_rm = { "rmod", rm_init, NULL, &k_rm_desc };
+static const struct xbox_mod *const k_rqmods[] = { &k_dm, &k_rm, NULL };
+
+/* The Setup row on stage.pad: the choice outlives a restart of the menu. */
+static void pick_stage_setup(void)
+{
+    CHECK(enhance_menu_select_row("Setup"));
+    for (int k = 0; k < 4 && row_value("Setup") && strcmp(s_val, "stage.pad"); k++)
+        tap(0x0D);
+    CHECK(row_value("Setup") && !strcmp(s_val, "stage.pad"));
+}
+
+static void test_padrec_requires_mod(void)
+{
+    static const char hdr[] = "# xbr-export: pad 1\n# xbr-pad: title_id = \"4d530065\"\n"
+                              "# xbr-pad: origin = \"session\"\n# xbr-pad: clock = \"poll\"\n"
+                              "# xbr-pad: kind = \"setup\"\n";
+    char dir[1024], shipped[1100], t[512];
+    const char *f;
+
+    padrec_stub_reset();
+    recs_clear();
+    s_tid = 0x4d530065;
+    snprintf(dir, sizeof dir, "%s/pad-setups", recomp_exe_dir());
+    MKDIR(dir);
+    snprintf(shipped, sizeof shipped, "%s/stage.pad", dir);
+    snprintf(t, sizeof t, "%s# xbr-pad: requires = [\"dmod.enabled\"]\ng0:!test.open\ng5:@end\n",
+             hdr);
+    write_file(shipped, t);
+    MKDIR("config");
+    MKDIR(RECS);
+
+    /* Already on in the file as the choice text: met. */
+    start_with(ARMED "[dmod]\nenabled = \"on\"\n", k_rqmods);
+    nv2a_overlay_set_game("BLiNX 2");
+    open_menu();
+    CHECK(enhance_menu_set_page("Recordings"));
+    pick_stage_setup();
+    CHECK(enhance_menu_select_row("Play setup, then record"));
+    tap(0x0D);
+    CHECK(status_has("then records"));
+    CHECK(padrec_stub_chain(0, NULL, NULL, NULL, NULL) == 1);
+    padrec_stop();
+    open_menu();
+
+    /* Off: Turn on switches it live and writes "on". */
+    padrec_stub_reset();
+    start_with(ARMED, k_rqmods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Recordings"));
+    pick_stage_setup();
+    CHECK(enhance_menu_select_row("Play setup, then record"));
+    tap(0x0D);
+    CHECK(row_value("Turn on") && !strcmp(s_val, "dmod.enabled"));
+    CHECK(enhance_menu_select_row("Turn on"));
+    tap(0x0D);
+    CHECK(status_has("is on: Play again"));
+    xbox_mod_frame();
+    CHECK(xbox_mod_enabled(0) && xbox_mod_state(0) == XBOX_MOD_ON);
+    f = read_file("config/config.toml");
+    CHECK(f && strstr(f, "[dmod]\nenabled = \"on\"") != NULL);
+    CHECK(enhance_menu_select_row("Play setup, then record"));
+    tap(0x0D);
+    CHECK(status_has("then records"));
+    CHECK(padrec_stub_chain(0, NULL, NULL, NULL, NULL) == 1);
+    padrec_stop();
+    open_menu();
+
+    /* A mod with no live switch: on at the next start, unmet until then. */
+    snprintf(t, sizeof t, "%s# xbr-pad: requires = [\"rmod.enable\"]\ng0:!test.open\ng5:@end\n",
+             hdr);
+    write_file(shipped, t);
+    padrec_stub_reset();
+    start_with(ARMED, k_rqmods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Recordings"));
+    pick_stage_setup();
+    CHECK(enhance_menu_select_row("Play setup, then record"));
+    tap(0x0D);
+    CHECK(row_value("Turn on") && !strcmp(s_val, "rmod.enable"));
+    CHECK(enhance_menu_select_row("Turn on"));
+    tap(0x0D);
+    CHECK(status_has("at the next start"));
+    CHECK(xbox_mod_state(1) == XBOX_MOD_RESTART);
+    CHECK(enhance_menu_select_row("Play setup, then record"));
+    tap(0x0D);
+    CHECK(status_has("rmod.enable"));
+    CHECK(padrec_stub_chain(0, NULL, NULL, NULL, NULL) == 0);
+    open_menu();
+
+    padrec_stub_reset();
+    recs_clear();
+    remove(shipped);
+    rmdir(dir);
+}
+
 /* Import, Info, rename, export and delete (pad-recording-ui R5, R6): a
  * recording made on another host, CRLF and all, with the game's title. */
 static void test_padrec_files(void)
@@ -6346,6 +6713,189 @@ static void test_padrec_files(void)
     s_tid = 0;
 }
 
+/* A bug report from a recording's page, then imported on another machine:
+ * the recordings copied in first, then the saves through the Saves
+ * preview (pad-recording-ui R6). */
+static int rp_emit(void *ctx, const struct fb_entry *e)
+{
+    char *out = ctx;
+    if (!e->is_dir && strstr(e->name, "-report-") && strstr(e->name, ".zip"))
+        snprintf(out, 160, "%s", e->name);
+    return 0;
+}
+
+/* A report zip by hand: the chain's files under pad/, no saves. */
+static void rp_write(const char *path, const char *pad_name, const char *pad)
+{
+    struct report_manifest *m = calloc(1, sizeof *m);
+    struct sz_writer w;
+    unsigned char *zip;
+    char man[2048];
+    size_t zl;
+    int mn;
+    CHECK(m != NULL);
+    if (!m)
+        return;
+    m->s.format = 1;
+    snprintf(m->s.kind, sizeof m->s.kind, "report");
+    m->s.title_id = 0x4d530065;
+    snprintf(m->s.title, sizeof m->s.title, "Test Title");
+    snprintf(m->s.keys, sizeof m->s.keys, "zero");
+    snprintf(m->game, sizeof m->game, "test-title");
+    snprintf(m->host_os, sizeof m->host_os, "linux");
+    m->nchain = 1;
+    snprintf(m->chain[0], sizeof m->chain[0], "%s", pad_name);
+    mn = report_manifest_write(m, man, sizeof man);
+    CHECK(mn > 0);
+    sz_writer_init(&w);
+    sz_add_file(&w, SZ_REPORT, man, (size_t)mn, 0);
+    sz_add_dir(&w, "pad/", 0);
+    sz_add_file(&w, pad_name, pad, strlen(pad), 0);
+    CHECK(sz_finish(&w, &zip, &zl) == 0);
+    CHECK(fb_write_atomic(path, zip, zl) == FB_OK);
+    free(zip);
+    free(m);
+}
+
+static void test_padrec_report(void)
+{
+    static const char run[] = "# xbr-export: pad 1\n# xbr-pad: title = \"BLiNX 2\"\n"
+                              "# xbr-pad: title_id = \"4d530065\"\n"
+                              "# xbr-pad: origin = \"session\"\n"
+                              "# xbr-pad: name = \"run\"\nf10:a:5\nf60:@end\n";
+    char zipname[160] = "", path[256], backup[160] = "", err[SZ_ERR_MAX];
+    struct report_manifest *m = calloc(1, sizeof *m);
+    struct sz_archive a = { 0 };
+    char *zip = NULL;
+    size_t zl = 0;
+    int trees = 0;
+
+    CHECK(m != NULL);
+    if (!m)
+        return;
+    padrec_stub_reset();
+    recs_clear();
+    s_tid = 0x4d530065;
+    s_save_root[0] = SV_U;
+    s_save_root[1] = SV_T;
+    MKDIR(EXPORTS);
+    sv_tree("first");
+    MKDIR(RECS);
+    write_file(RECS "/run.pad", run);
+
+    /* The note, then the export: the recording and the saves in one zip. */
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Recordings"));
+    CHECK(enhance_menu_select_row("run.pad"));
+    tap(0x0D);
+    CHECK(row_value("Report note") && !strcmp(s_val, "none"));
+    CHECK(enhance_menu_select_row("Report note"));
+    tap(0x0D);
+    name_type("falls through the floor");
+    CHECK(status_has("The report says"));
+    CHECK(row_value("Report note") && !strcmp(s_val, "falls through the floor"));
+    CHECK(enhance_menu_select_row("Export bug report"));
+    tap(0x0D);
+    CHECK(row_value("Export here as") && !strncmp(s_val, "test-title-report-", 18)
+          && strstr(s_val, ".zip"));
+    CHECK(enhance_menu_select_row("Export here as"));
+    tap(0x0D);
+    tap(0x0D);
+    CHECK(status_has("Exported to "));
+    files_quit();
+    CHECK(fb_list_host(EXPORTS, rp_emit, zipname, NULL) == 0 && zipname[0]);
+    snprintf(path, sizeof path, EXPORTS "/%s", zipname);
+    CHECK(fb_read_file(path, SZ_MAX_ZIP, &zip, &zl) == FB_OK);
+    CHECK(sz_read(zip, zl, &a, err, sizeof err) == 0);
+    CHECK(report_zip_check(&a, 0x4d530065, m, &trees, err, sizeof err) == 0);
+    CHECK(m->nchain == 1 && !strcmp(m->chain[0], "pad/1-run.pad"));
+    CHECK(!strcmp(m->note, "falls through the floor"));
+    CHECK(m->host_os[0] && !strcmp(m->game, "test-title"));
+    CHECK(trees & SAVES_TREE_UDATA);
+    {
+        const struct sz_entry *e = sz_find(&a, "pad/1-run.pad");
+        CHECK(e && e->size == strlen(run) && !memcmp(e->data, run, e->size));
+    }
+    sz_archive_free(&a);
+    free(zip);
+
+    /* Another machine: no recording, other saves. */
+    recs_clear();
+    write_file(SV_SAVE "/progress.bin", "second");
+    rp_write(EXPORTS "/bad.zip", "pad/1-other.pad",
+             "# xbr-export: pad 1\n# xbr-pad: title = \"BLiNX\"\n"
+             "# xbr-pad: title_id = \"4d530018\"\nf10:a\n");
+    rp_write(EXPORTS "/nosaves.zip", "pad/1-solo.pad", run);
+    start_with(ARMED, k_mods);
+    nv2a_overlay_set_game("BLiNX 2");
+    open_menu();
+    CHECK(enhance_menu_set_page("Recordings"));
+    CHECK(enhance_menu_select_row("Import"));
+    tap(0x0D);
+    CHECK(row_value(zipname) != NULL && row_value("bad.zip") != NULL);
+    /* A chain file for another game: the whole report refused. */
+    CHECK(enhance_menu_select_row("bad.zip"));
+    tap(0x0D);
+    CHECK(status_has("Not imported: other.pad: a recording of BLiNX"));
+    CHECK(!fb_exists(RECS "/other.pad"));
+    /* No saves: the recording only. */
+    CHECK(enhance_menu_select_row("nosaves.zip"));
+    tap(0x0D);
+    CHECK(row_value("Recording") && !strcmp(s_val, "solo.pad"));
+    CHECK(row_value("Saves") && strstr(s_val, "none"));
+    CHECK(enhance_menu_select_row("Import"));
+    tap(0x0D);
+    CHECK(status_has("Imported 1 recording; the report has no saves"));
+    CHECK(!strcmp(read_file(RECS "/solo.pad"), run));
+    CHECK(!strcmp(read_file(SV_SAVE "/progress.bin"), "second"));
+    /* The full one: its preview, Cancel changes nothing. */
+    CHECK(enhance_menu_select_row("Import"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row(zipname));
+    tap(0x0D);
+    CHECK(row_value("Note") && !strcmp(s_val, "falls through the floor"));
+    CHECK(row_value("Recording") && !strcmp(s_val, "run.pad"));
+    CHECK(row_value("Saves") && strstr(s_val, "1 save,"));
+    if (s_ref_out)
+        shot("1080p-compact-report-import", 1920, 1080);
+    CHECK(enhance_menu_select_row("Cancel"));
+    tap(0x0D);
+    CHECK(!fb_exists(RECS "/run.pad"));
+    /* Import: the recording in, then the Saves page's own preview. */
+    CHECK(enhance_menu_select_row(zipname));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Import"));
+    tap(0x0D);
+    CHECK(status_has("Imported 1 recording; now the saves"));
+    CHECK(!strcmp(read_file(RECS "/run.pad"), run));
+    CHECK(row_value("Import and quit") != NULL && row_value("Slot A") != NULL);
+    CHECK(!strcmp(read_file(SV_SAVE "/progress.bin"), "second"));
+    CHECK(enhance_menu_select_row("Import and quit"));
+    tap(0x0D);
+    CHECK(status_has("Saves imported"));
+    CHECK(!strcmp(read_file(SV_SAVE "/progress.bin"), "first"));
+    files_quit();
+
+    while ((backup[0] = 0, fb_list_host(EXPORTS "/save-backups", sv_backup_emit, backup,
+                                        NULL) == 0 && backup[0]))
+        remove(backup);
+    rmdir(EXPORTS "/save-backups");
+    remove(path);
+    remove(EXPORTS "/bad.zip");
+    remove(EXPORTS "/nosaves.zip");
+    remove(SV_SAVE "/progress.bin");
+    sv_tree_remove();
+    rmdir(EXPORTS);
+    padrec_stub_reset();
+    recs_clear();
+    remove("config/config.toml");
+    nv2a_overlay_set_game(NULL);
+    s_save_root[0] = s_save_root[1] = NULL;
+    s_tid = 0;
+    free(m);
+}
+
 int main(int argc, char **argv)
 {
     s_pin = argc > 1 && !strcmp(argv[1], "--pin");
@@ -6433,6 +6983,9 @@ int main(int argc, char **argv)
     test_saves();
     test_padrec_page();
     test_padrec_files();
+    test_padrec_report();
+    test_padrec_setups();
+    test_padrec_requires_mod();
     test_shots();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();

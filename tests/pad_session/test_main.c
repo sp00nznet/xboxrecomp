@@ -296,6 +296,224 @@ static void test_title_and_moves(void)
     padrec_set_title(0, NULL);
 }
 
+/* ---- chains, requires, actions (pad-recording-ui R5) -------------------- */
+
+#define SEG1_PATH "pad_session_seg1.pad"
+#define SEG2_PATH "pad_session_seg2.pad"
+#define BIG1_PATH "pad_session_big1.pad"
+#define BIG2_PATH "pad_session_big2.pad"
+#define REQ_PATH "pad_session_req.pad"
+#define ACT_PATH "pad_session_act.pad"
+#define TAIL_PATH "pad_session_tail.pad"
+
+static void put(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fputs(text, f);
+        fclose(f);
+    }
+}
+
+#define SESSION_HDR "# xbr-export: pad 1\n# xbr-pad: origin = \"session\"\n"
+
+/* One port-0 poll with the flip at half the poll, so a flip file and a
+ * poll file both move. The A and B bytes the title got. */
+static int poll_fb(uint32_t poll, int *b)
+{
+    PadrecClocks c = at(poll);
+    uint8_t r[20];
+    memset(r, 0, sizeof r);
+    r[1] = 20;
+    c.flip = poll / 2;
+    padrec_sync(&c);
+    padrec_press(0, r, &c);
+    padrec_feed(0, r, &c);
+    if (b)
+        *b = r[5];
+    return r[4];
+}
+
+static void test_chain(void)
+{
+    const char *two[2] = { SEG1_PATH, SEG2_PATH };
+    PadrecStatus st;
+    char why[160];
+    uint32_t p, a_last = 0, b_first = 0;
+    int b, seg_at_b = 0;
+
+    printf("a chain: a flip file, then a poll file\n");
+    put(SEG1_PATH, SESSION_HDR "f0:A:2\nf3:@end\n");
+    put(SEG2_PATH, SESSION_HDR "g0:B:2\ng4:@end\n");
+    check(padrec_play(two, 2, 0, why, sizeof why) == 0, "the chain plays");
+    for (p = 8000; p < 8040 && state() != PADREC_ENDED; p++) {
+        int a = poll_fb(p, &b);
+        if (a)
+            a_last = p;
+        if (b && !b_first) {
+            b_first = p;
+            padrec_status(&st);
+            seg_at_b = st.seg * 10 + st.segs;
+        }
+    }
+    check(a_last >= 8000 && a_last < 8006, "the first file's A, from its own first flip");
+    check(b_first > a_last, "the second file's B after the first ended");
+    check(seg_at_b == 22, "the strip reads 2/2 during the second");
+    check(state() == PADREC_ENDED, "the chain ends with its last file");
+    padrec_status(&st);
+    check(st.seg == 2 && st.segs == 2, "ended on 2/2");
+}
+
+static void test_chain_refusals(void)
+{
+    const char *boot2[2] = { SEG1_PATH, BOOT_PATH };
+    const char *boot1[2] = { BOOT_PATH, SEG1_PATH };
+    const char *big[2] = { BIG1_PATH, BIG2_PATH };
+    char why[160], *text;
+    size_t at_ = 0, cap = (size_t)70000 * 16 + 128;
+    int i;
+
+    printf("chain refusals\n");
+    put(BOOT_PATH, "f10:A:5\n");
+    why[0] = 0;
+    check(padrec_play(boot2, 2, 0, why, sizeof why) < 0 && strstr(why, "only first"),
+          "a boot file second in a chain is refused");
+    check(padrec_play(boot1, 2, PADREC_BOOT, why, sizeof why) == 0,
+          "a boot file first in a chain started at boot plays");
+    padrec_stop();
+    poll0(8100, 0, 0);
+    text = malloc(cap);
+    at_ = (size_t)snprintf(text, cap, SESSION_HDR);
+    for (i = 0; i < 70000; i++)
+        at_ += (size_t)snprintf(text + at_, cap - at_, "g%d:A:1\n", i * 2);
+    put(BIG1_PATH, text);
+    put(BIG2_PATH, text);
+    free(text);
+    why[0] = 0;
+    check(padrec_play(big, 2, 0, why, sizeof why) < 0 && strstr(why, "the chain is over"),
+          "a chain over the step cap is refused before it plays");
+    check(state() != PADREC_PLAY && state() != PADREC_ARMED_PLAY, "nothing plays");
+    remove(BIG1_PATH);
+    remove(BIG2_PATH);
+}
+
+static int s_req_on;
+static int req_hook(const char *key)
+{
+    return s_req_on && !strcmp(key, "mods.test.enable");
+}
+
+static void test_requires(void)
+{
+    const char *one[1] = { REQ_PATH };
+    char why[160];
+
+    printf("requires\n");
+    put(REQ_PATH, SESSION_HDR "# xbr-pad: requires = [\"mods.test.enable\"]\ng0:A:1\ng3:@end\n");
+    padrec_set_requires_hook(req_hook);
+    s_req_on = 0;
+    why[0] = 0;
+    check(padrec_play(one, 1, 0, why, sizeof why) == PADREC_E_REQUIRES
+              && strstr(why, "needs mods.test.enable on"),
+          "an unmet requires is refused, naming the key");
+    check(!strcmp(padrec_unmet(), "mods.test.enable"), "padrec_unmet names it");
+    s_req_on = 1;
+    check(padrec_play(one, 1, 0, why, sizeof why) == 0 && !padrec_unmet()[0],
+          "it plays once the key is on");
+    padrec_stop();
+    poll0(8200, 0, 0);
+    padrec_set_requires_hook(NULL);
+}
+
+static int s_fires;
+static int fire_hook(const char *name, char *why, size_t n)
+{
+    (void)why;
+    (void)n;
+    if (!strcmp(name, "test.act"))
+        s_fires++;
+    return 0;
+}
+
+static void test_actions(void)
+{
+    const char *one[1] = { ACT_PATH };
+    PadrecMeta m;
+    PadrecSeg seg;
+    char why[160], *txt;
+    uint32_t p;
+
+    printf("!<action> steps and play-then-record\n");
+    put(ACT_PATH, SESSION_HDR "g1:!test.act\ng4:@end\n");
+    padrec_set_action_hook(fire_hook);
+    s_fires = 0;
+    check(padrec_play(one, 1, 0, why, sizeof why) == 0, "an untrusted file plays");
+    for (p = 8300; p < 8320 && state() != PADREC_ENDED; p++)
+        poll0(p, 0, 0);
+    check(s_fires == 0, "its action does not fire");
+    check(padrec_play(one, 1, PADREC_TRUST, why, sizeof why) == 0, "a trusted one plays");
+    poll0(8320, 0, 0);
+    for (p = 8321; p < 8340 && state() != PADREC_ENDED; p++)
+        poll0(p, 0, 0);
+    check(s_fires == 1, "its action fires once");
+
+    /* Play the file, then record: the record starts when it ends, counted
+     * from its own first poll, and writes the setup's name and a fire. */
+    remove(TAIL_PATH);
+    memset(&m, 0, sizeof m);
+    m.setup = "pad_session_act";
+    seg.path = ACT_PATH;
+    seg.trusted = 1;
+    seg.allowed = NULL;
+    s_fires = 0;
+    check(padrec_play_chain(&seg, 1, 0, TAIL_PATH, &m, why, sizeof why) == 0,
+          "play then record starts");
+    for (p = 8400; p < 8420 && state() != PADREC_REC; p++)
+        poll0(p, 0, 0);
+    check(state() == PADREC_REC && s_fires == 1, "the record runs after the setup");
+    poll0(p++, 1, 0);
+    poll0(p++, 1, 0);
+    padrec_action_fired("test.act");
+    poll0(p++, 0, 0);
+    padrec_record_stop();
+    poll0(p++, 0, 0);
+    poll0(p++, 0, 0);
+    txt = slurp(TAIL_PATH);
+    check(txt != NULL, "the record's file is there");
+    if (txt) {
+        check(strstr(txt, "setup = \"pad_session_act\"") != NULL, "its header names the setup");
+        check(strstr(txt, "\ng1:a:2") != NULL,
+              "its first press near g0, not the setup's counts");
+        check(strstr(txt, ":!test.act\n") != NULL, "the fire is a !test.act line");
+        check(count_of(txt, "@end") == 1, "one @end");
+        free(txt);
+    }
+
+    /* Confirmed, then the file changed (R6): what plays, and what Play
+     * again plays, is only what the player saw. */
+    padrec_stop();
+    poll0(p++, 0, 0);
+    put(ACT_PATH, SESSION_HDR "g1:!test.act\ng4:@end\n");
+    seg.allowed = "other.act";
+    check(padrec_play_chain(&seg, 1, 0, NULL, NULL, why, sizeof why) < 0 &&
+              strstr(why, "!test.act was not confirmed"),
+          "an action outside the confirmed list is refused");
+    seg.allowed = "other.act, test.act";
+    check(padrec_play_chain(&seg, 1, 0, NULL, NULL, why, sizeof why) == 0,
+          "the confirmed list plays");
+    for (; p < 8600 && state() != PADREC_ENDED; p++)
+        poll0(p, 0, 0);
+    put(ACT_PATH, SESSION_HDR "g1:!test.act\ng2:!evil.act\ng4:@end\n");
+    check(padrec_again(0, why, sizeof why) < 0 && strstr(why, "!evil.act was not confirmed"),
+          "Play again re-checks the file it confirmed");
+    put(ACT_PATH, SESSION_HDR "g1:!test.act\ng4:@end\n");
+    check(padrec_again(0, why, sizeof why) == 0, "Play again plays it unchanged");
+    padrec_stop();
+    poll0(p++, 0, 0);
+    padrec_set_action_hook(NULL);
+    remove(TAIL_PATH);
+}
+
 int main(void)
 {
     recomp_env_init();
@@ -307,12 +525,20 @@ int main(void)
     test_armed_exit();
     test_refusals();
     test_title_and_moves();
+    test_chain();
+    test_chain_refusals();
+    test_requires();
+    test_actions();
     padrec_reset_for_test();
     remove(REC_PATH);
     remove(ARMED_PATH);
     remove(BOOT_PATH);
     remove(OTHER_PATH);
     remove(MOVED_PATH);
+    remove(SEG1_PATH);
+    remove(SEG2_PATH);
+    remove(REQ_PATH);
+    remove(ACT_PATH);
     printf("%s (%d failure%s)\n", failures ? "FAIL" : "PASS", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

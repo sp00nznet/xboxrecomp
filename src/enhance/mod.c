@@ -1686,6 +1686,15 @@ static void api_input_capture(int on)
     enhance_input_capture(on);
 }
 
+/* Version 10. During the mod's init, for an action it registered: the
+ * caller is known only then (s_init_owner). */
+static int api_action_pad_fireable(int id)
+{
+    if (s_init_owner < 0)
+        return -1;
+    return enhance_action_set_pad_fireable(id, s_init_owner, 1);
+}
+
 /* Version 9. */
 static int api_input_capture_try(int on)
 {
@@ -2005,6 +2014,7 @@ static int mod_init(int describe)
     s_api.control_value = api_control_value;
     s_api.input_capture_try = api_input_capture_try;
     s_api.on_capture_lost = api_on_capture_lost;
+    s_api.action_pad_fireable = api_action_pad_fireable;
     /* The record and the neutral pad: input_core.c calls this on every
      * port-0 poll, and it is one load while no mod captures. */
     xbox_InputSetPadSeen(xbox_enhance_pad_seen);

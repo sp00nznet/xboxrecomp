@@ -94,15 +94,66 @@ typedef struct {
     const char *game, *title, *toolkit, *game_build;
     uint32_t title_id;
     const char *name, *start_point, *notes;
+    const char *setup;      /* the setup played before it ("play setup, then record") */
 } PadrecMeta;
 
 /* Flags for padrec_record_start and padrec_play. */
 #define PADREC_ARMED 1u      /* wait for padrec_release (the menu closing) */
+#define PADREC_BOOT  2u      /* started at boot: the first file may count from boot */
+#define PADREC_TRUST 4u      /* the files' !<action> steps fire (the player confirmed) */
+#define PADREC_QUIT  8u      /* quit the run when the chain ends (RECOMP_PAD_QUIT) */
+#define PADREC_ENV   16u     /* the env chain itself: not refused as env-driven */
+
+/* At most this many files in one chain (R5): setup, recordings, and a
+ * record at its tail. */
+#define PADREC_CHAIN_MAX 8
+/* Keys one file's `requires` may name. */
+#define PADREC_REQUIRES_MAX 8
+/* padrec_play's return when a file needs a config key off now
+ * (padrec_unmet names it). */
+#define PADREC_E_REQUIRES (-2)
+
+/* One file of a chain, and whether its !<action> steps may fire: a setup
+ * shipped beside the exe is, a file from elsewhere only once the player
+ * confirmed its actions. allowed: the actions the player saw and
+ * confirmed, ", " joined; a trusted file naming one outside it was
+ * changed after the confirm and is refused. NULL: any (a shipped setup,
+ * the command line). */
+typedef struct {
+    const char *path;
+    int trusted;
+    const char *allowed;
+} PadrecSeg;
 
 /* Return 0, or -1 with a reason in why (for a toast). */
 int padrec_record_start(const char *path, const PadrecMeta *meta, unsigned flags,
                         char *why, size_t whyn);
 int padrec_play(const char *const *paths, int n, unsigned flags, char *why, size_t whyn);
+/* A chain: the files play one after another, each counted from its own
+ * first poll or flip, under one cap of PAD_STEPS_MAX steps in all (R5).
+ * With rec_path a record starts when the last file ends ("Play setup, then
+ * record", R5b), its header from meta. 0; -1 with why; PADREC_E_REQUIRES
+ * when a file's requires names a key that is off. */
+int padrec_play_chain(const PadrecSeg *segs, int n, unsigned flags, const char *rec_path,
+                      const PadrecMeta *meta, char *why, size_t whyn);
+/* RECOMP_PAD_SCRIPT with ';': "@a.pad;@b.pad" plays the files as a chain
+ * from boot, the first one may count from boot (usb_gamepad.c). */
+int padrec_env_chain(const char *spec, char *why, size_t whyn);
+/* `requires = ["key", ...]` in a file's header: each key must be on in
+ * this run (the hook, the menu's config read). 0 when all are, or the
+ * file names none; -1 with the first unmet key in unmet. */
+int padrec_requires(const char *text, char *unmet, size_t n);
+void padrec_set_requires_hook(int (*on)(const char *key));
+/* The key the last refused play needed, "" when none. */
+const char *padrec_unmet(void);
+/* The pad thread at the end of a chain under PADREC_QUIT. */
+void padrec_set_quit(void (*fn)(void));
+/* A host action fired (enhance_actions): a record writes it as a
+ * !<action> line, the env record too (usb_gamepad_record_action). */
+void padrec_action_fired(const char *name);
+/* Who fires a playback's !<action> steps (enhance_action_fire_by_pad):
+ * 0, or -1 with why. NULL: none fire (the log says why). */
+void padrec_set_action_hook(int (*fire)(const char *name, char *why, size_t n));
 /* The last playback again, from the next padrec_release (it does not
  * rewind the game: the player goes back to the start point first). */
 int padrec_again(unsigned flags, char *why, size_t whyn);
@@ -151,6 +202,7 @@ typedef struct {
     uint32_t end_ms;            /* pad ms when it ended (ENDED, STOPPED) */
     int step, nsteps;           /* a playback's steps started, and all */
     int full;                   /* the record reached PAD_STEPS_MAX */
+    int seg, segs;              /* a chain: this file's place, and the count */
     char name[PADREC_NAME_MAX];
     char warn[PADREC_WARN_MAX];
 } PadrecStatus;

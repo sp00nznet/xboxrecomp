@@ -25,6 +25,7 @@ set(KERNEL_SOURCES
     kernel_reset_probe.c
     kernel_guest_unwind.c
     kernel_xbox.c
+    kernel_keys.c
     kernel_language.c
     kernel_ob.c
     kernel_io.c

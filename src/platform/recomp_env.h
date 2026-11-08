@@ -334,7 +334,7 @@ extern "C" {
     X(WATCHDOG_SECS,     DEBUG, "watchdog",        "RECOMP_WATCHDOG_SECS",     "=s: dump and exit after s seconds") \
     /* from upstream (merge of origin/main 1409a7d), appended */ \
     X(USB_PADS,          CONFIG, "RECOMP_USB_PADS",          NULL, "emulated USB pads plugged in, 1..4 (default 1)") \
-    X(PAD_SCRIPT,        DEBUG, "pad_script",      "RECOMP_PAD_SCRIPT",        "=ms:btn[+btn][:hold],... f<flip>:btn[:flips] or g<poll>:btn[:polls], <clock>:@open:<name>[:btn/period] anchors, <clock>:@end, or =@file: timed pad presses") \
+    X(PAD_SCRIPT,        DEBUG, "pad_script",      "RECOMP_PAD_SCRIPT",        "=ms:btn[+btn][:hold],... f<flip>:btn[:flips] or g<poll>:btn[:polls], <clock>:@open:<name>[:btn/period] anchors, <clock>:@end, <clock>:!<action>, =@file, or =@a.pad;@b.pad (a chain): timed pad presses") \
     X(PAD_LIVE,          DEBUG, "pad_live",        "RECOMP_PAD_LIVE",          "=file: press each line appended to it (btn[+btn][:hold], or f<flip>:/g<poll>: on the script's clock)") \
     X(PAD_RECORD,        DEBUG, "pad_record",      "RECOMP_PAD_RECORD",        "=file: write the pads' presses as a pad_script timed by flip or poll (pad_clock), ending in @end") \
     X(PAD_ANCHOR,        DEBUG, "pad_anchor",      NULL,                       "=text[|text...]: pad_record writes an anchor (f<flip>: or g<poll>:@open:<name>) for each open whose path holds one") \

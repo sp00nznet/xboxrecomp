@@ -60,6 +60,23 @@ void saves_scan_archive(const struct sz_archive *a, uint32_t tid, struct saves_i
 int saves_export(const struct saves_paths *p, const struct saves_manifest *base,
                  unsigned char **zip, size_t *len, char *err, size_t errn);
 
+/* A chain file of a bug report: its zip name ("pad/<pos>-<name>", from
+ * report_pad_name) and its bytes as they are. */
+struct report_pad {
+    const char *name;
+    const void *data;
+    size_t len;
+};
+
+/* A bug report (pad-recording-ui R6): the chain's files in order and all
+ * of the live saves, its manifest from base (title, created, keys,
+ * toolkit, game, host_os, note; kind, format, title_id, files, bytes and
+ * the chain are filled here). A title with no saves yet still gets one.
+ * The save file count, or -1 with err set. */
+int report_export(const struct saves_paths *p, const struct report_manifest *base,
+                  const struct report_pad *pads, int npads, unsigned char **zip, size_t *len,
+                  char *err, size_t errn);
+
 /* Replace the trees a checked archive carries (trees, from
  * saves_zip_check). Each is written to a new folder
  * .saves-import-<stamp>-<pid>-<n>-<TREE> beside its root (made exclusively,

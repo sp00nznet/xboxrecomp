@@ -56,7 +56,7 @@
 extern "C" {
 #endif
 
-#define XBOX_MOD_API_VERSION 9u
+#define XBOX_MOD_API_VERSION 10u
 
 struct xbox_mod_api;
 
@@ -521,6 +521,16 @@ struct xbox_mod_api {
      * the guest's thread (xbox_mod_frame), once per loss: a free camera
      * lands and says so. Init only; up to XBOX_MOD_MAX_FRAME across mods. */
     void (*on_capture_lost)(void (*fn)(void *user), void *user);
+
+    /* ---- version 10 (check size before using these) --------------------
+     * Pad scripts fire host actions (pad-recording-ui R5): a !<name> step
+     * in a recording fires the action as its binding would, and a record
+     * writes the action's fires. A mod opts in per action; the toolkit's
+     * menu, screenshot, recorder, saves and files actions never are. */
+
+    /* 0, or -1 for an unknown id, a refused action or another mod's
+     * action. During the mod's init only (its own actions). */
+    int (*action_pad_fireable)(int id);
 };
 
 /* glyph_name's flags: one of the two. */

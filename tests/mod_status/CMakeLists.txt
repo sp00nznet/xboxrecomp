@@ -30,6 +30,11 @@ add_custom_command(
 
 set(_vendored ${XR_TP}/microui/microui.c ${XR_SRC}/kernel/nv2a_overlay_stb.c)
 set_source_files_properties(${_vendored} PROPERTIES COMPILE_OPTIONS "-w")
+if(NOT MSVC)
+    # the saves re-sign's HMAC (kernel_crypto.c): its comment banners nest
+    set_source_files_properties(${XR_SRC}/kernel/kernel_crypto.c PROPERTIES
+        COMPILE_OPTIONS "-Wno-comment")
+endif()
 add_executable(mod_status_test
     test_main.c
     ${XR_SRC}/enhance/recomp_cfg.c
@@ -49,6 +54,9 @@ add_executable(mod_status_test
     ${XR_SRC}/enhance/file_browser.c
     ${XR_SRC}/enhance/saves_zip.c
     ${XR_SRC}/enhance/saves_store.c
+    ${XR_SRC}/enhance/saves_sign.c
+    ${XR_SRC}/kernel/kernel_crypto.c
+    ${XR_ROOT}/tests/saves_keys/crypto_stubs.c
     ${XR_SRC}/enhance/enhance_menu_layout.c
     ${XR_SRC}/enhance/enhance_menu_input.c
     ${XR_SRC}/enhance/enhance_osk.c

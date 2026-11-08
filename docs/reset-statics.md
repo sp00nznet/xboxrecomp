@@ -618,17 +618,23 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/kernel_user_apc.c | - | t_count | file_static | reset | kernel | per-thread user APC ring with guest routine VAs |
 | src/kernel/kernel_user_apc.c | - | t_seq | file_static | reset | kernel | per-thread user APC ring with guest routine VAs |
 
+### src/kernel/kernel_keys.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/kernel/kernel_keys.c | - | xbox_EEPROMKey | global | constant | - | host-native kernel data; bridge uses guest copies instead |
+| src/kernel/kernel_keys.c | - | xbox_HDKey | global | constant | - | host-native kernel data; bridge uses guest copies instead |
+| src/kernel/kernel_keys.c | - | xbox_SignatureKey | global | constant | - | host-native kernel data; bridge uses guest copies instead |
+| src/kernel/kernel_keys.c | - | xbox_LANKey | global | constant | - | host-native kernel data; bridge uses guest copies instead |
+| src/kernel/kernel_keys.c | - | xbox_AlternateSignatureKeys | global | constant | - | host-native kernel data; bridge uses guest copies instead |
+| src/kernel/kernel_keys.c | xbox_saves_keys_id | id | local_static | constant | - | key id string, the same on every boot |
+
 ### src/kernel/kernel_xbox.c
 
 | file | scope | name | kind | class | hook | why |
 |---|---|---|---|---|---|---|
 | src/kernel/kernel_xbox.c | - | xbox_HardwareInfo | global | constant | - | host-native kernel data; bridge uses guest copies instead |
 | src/kernel/kernel_xbox.c | - | xbox_KrnlVersion | global | constant | - | host-native kernel data; bridge uses guest copies instead |
-| src/kernel/kernel_xbox.c | - | xbox_EEPROMKey | global | constant | - | host-native kernel data; bridge uses guest copies instead |
-| src/kernel/kernel_xbox.c | - | xbox_HDKey | global | constant | - | host-native kernel data; bridge uses guest copies instead |
-| src/kernel/kernel_xbox.c | - | xbox_SignatureKey | global | constant | - | host-native kernel data; bridge uses guest copies instead |
-| src/kernel/kernel_xbox.c | - | xbox_LANKey | global | constant | - | host-native kernel data; bridge uses guest copies instead |
-| src/kernel/kernel_xbox.c | - | xbox_AlternateSignatureKeys | global | constant | - | host-native kernel data; bridge uses guest copies instead |
 | src/kernel/kernel_xbox.c | - | xbox_XePublicKeyData | global | constant | - | host-native kernel data; bridge uses guest copies instead |
 | src/kernel/kernel_xbox.c | - | g_image_filename | file_static | constant | - | host-native kernel data; bridge uses guest copies instead |
 | src/kernel/kernel_xbox.c | - | xbox_XeImageFileName | global | constant | - | host-native kernel data; bridge uses guest copies instead |
@@ -636,7 +642,6 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/kernel_xbox.c | - | xbox_LaunchDataPage | global | constant | - | host-native kernel data; bridge uses guest copies instead |
 | src/kernel/kernel_xbox.c | - | s_tz | file_static | constant | - | host time zone, read once |
 | src/kernel/kernel_xbox.c | tz_init | done | local_static | constant | - | time zone read-once guard |
-| src/kernel/kernel_xbox.c | xbox_saves_keys_id | id | local_static | constant | - | key id string, the same on every boot |
 
 ### src/kernel/recomp_hook.c
 
@@ -2781,6 +2786,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/usb/pad_session.c | - | s_pending_pads | file_static | keep | - | pad session: host automation like the env script, survives a reset |
 | src/usb/pad_session.c | - | s_serial | file_static | keep | - | pad session: host automation like the env script, survives a reset |
 | src/usb/pad_session.c | - | s_sig_rec | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_in_signal | file_static | keep | - | pad session: set by the record's signal handler just before the process dies |
 | src/usb/pad_session.c | - | s_synced | file_static | keep | - | pad session: host automation like the env script, survives a reset |
 | src/usb/pad_session.c | - | s_sync_poll | file_static | keep | - | pad session: host automation like the env script, survives a reset |
 | src/usb/pad_session.c | - | s_cfg_clock | file_static | keep | - | pad session: host automation like the env script, survives a reset |
@@ -2795,6 +2801,15 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/usb/pad_session.c | - | s_sig_clock | file_static | keep | - | pad session: host automation like the env script, survives a reset |
 | src/usb/pad_session.c | padrec_wants_opens | anchor | local_static | keep | - | pad session: host automation like the env script, survives a reset |
 | src/usb/pad_session.c | - | s_last_path | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_last_trust | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_last_allowed | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_last_listed | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_last_n | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_last_flags | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_session.c | - | s_quit_fn | file_static | keep | - | pad session hook (the env chain's pad_quit), set by the env path |
+| src/usb/pad_session.c | - | s_req_fn | file_static | keep | - | pad session hook (requires keys), set by the layer at start |
+| src/usb/pad_session.c | - | s_unmet | file_static | keep | - | pad session: host automation like the env script, survives a reset |
+| src/usb/pad_script.c | - | s_action_fire | file_static | keep | - | pad script hook (fires a !<action>), set by the layer at start |
 | src/usb/pad_session.c | - | s_title_id | file_static | keep | - | pad session: the running title, set before each play |
 | src/usb/pad_session.c | - | s_title | file_static | keep | - | pad session: the running title, set before each play |
 
@@ -2945,6 +2960,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/enhance_actions.c | - | s_act | file_static | keep | - | action registry: names, defaults, menu overrides |
 | src/enhance/enhance_actions.c | - | s_nact | file_static | keep | - | registered action count |
 | src/enhance/enhance_actions.c | - | s_ntoolkit | file_static | keep | - | count of toolkit-owned actions |
+| src/enhance/enhance_actions.c | - | s_fired_hook | file_static | keep | - | the pad recorder's ear for fired actions, set by the layer at start |
 | src/enhance/enhance_actions.c | - | s_started | once | keep | - | no rerun: actions start arms keys, host-side only |
 | src/enhance/enhance_actions.c | - | s_table | file_static | keep | - | built bindings table, host pad sources |
 | src/enhance/enhance_actions.c | - | s_port | file_static | keep | - | host pad held/consumed bits per port |
@@ -3129,6 +3145,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/enhance_menu.c | - | s_lay_pages | file_static | keep | - | per-page layout cache |
 | src/enhance/enhance_menu.c | enhance_menu_draw | kinds | local_static | keep | - | scratch row kinds |
 | src/enhance/enhance_menu.c | enhance_menu_draw | vw | local_static | keep | - | scratch row widths |
+| src/enhance/enhance_menu.c | saves_signing_load | said | local_static | keep | - | the missing saves-signing.toml logged once per process |
 | src/enhance/enhance_menu.c | - | s_ao | file_static | keep | - | the AO menu items; note and help set from render.ao_suited |
 | src/enhance/enhance_menu.c | - | s_prf | file_static | keep | - | Recordings page state (file list, start point text) |
 | src/enhance/enhance_menu.c | - | s_nprf | file_static | keep | - | Recordings page state (file list, start point text) |
@@ -3142,6 +3159,14 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/enhance_menu.c | - | s_pr_del | file_static | keep | - | open recording page (delete confirm) |
 | src/enhance/enhance_menu.c | - | s_pr_back_sel | file_static | keep | - | open recording page (list row to return to) |
 | src/enhance/enhance_menu.c | - | s_pimp | file_static | keep | - | recording import preview (text and header) |
+| src/enhance/enhance_menu.c | - | s_rimp | file_static | keep | - | bug-report import (its manifest; the saves ride in s_simp) |
+| src/enhance/enhance_menu.c | - | s_pr_info_acts | file_static | keep | - | open recording page (its !<action> names, read on open) |
+| src/enhance/enhance_menu.c | - | s_pr_setup | file_static | keep | - | Recordings page setup pick (a copy, survives a relist) |
+| src/enhance/enhance_menu.c | - | s_pr_setup_on | file_static | keep | - | Recordings page setup pick (a copy, survives a relist) |
+| src/enhance/enhance_menu.c | - | s_pr_confirm | file_static | keep | - | Recordings page action confirm (the play waiting on it) |
+| src/enhance/enhance_menu.c | - | s_pr_acts | file_static | keep | - | Recordings page action confirm (the play waiting on it) |
+| src/enhance/enhance_menu.c | - | s_pr_unmet | file_static | keep | - | Recordings page requires key a refused play needed |
+| src/enhance/enhance_menu.c | - | s_pr_note | file_static | keep | - | Recordings page bug-report note |
 
 ### src/enhance/enhance_padrec.c
 

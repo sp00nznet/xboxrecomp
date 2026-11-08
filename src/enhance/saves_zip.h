@@ -121,16 +121,75 @@ int saves_manifest_parse(const char *text, size_t len, struct saves_manifest *m,
 #define SAVES_TREE_UDATA 1
 #define SAVES_TREE_TDATA 2
 
-/* Validate a read archive as a saves zip for title tid built with the
- * running keys fingerprint (D3 content rules): the manifest, its title,
- * kind, format, keys and counts; every other entry under the title's two
- * trees. 0 with *m and *trees set, -1 with err set. */
+/* Validate a read archive as a saves zip for title tid (D3 content
+ * rules): the manifest, its title, kind, format and counts; every other
+ * entry under the title's two trees. 0 with *m and *trees set, -1 with err
+ * set. Saves made under other console keys than keys (the running build's
+ * fingerprint) pass: saves_zip_keys_differ tells the caller, which
+ * re-signs them (saves_sign.h; pad-recording-ui R6, safeguard 2). */
 int saves_zip_check(const struct sz_archive *a, uint32_t tid, const char *keys,
                     struct saves_manifest *m, int *trees, char *err, size_t errn);
+
+/* 1 when a checked manifest's keys are not the running build's. */
+int saves_zip_keys_differ(const struct saves_manifest *m, const char *keys);
 
 /* The part of an entry name below "hdd/<TREE>/<tid>/" ("" for the tid
  * folder itself), and its tree; NULL when the name is not under one. */
 const char *saves_zip_rest(const char *name, uint32_t tid, int *tree);
+
+/* ---- a bug-report bundle (pad-recording-ui R6) ----
+ *
+ * A saves zip with xbr-report.toml instead of xbr-saves.toml, and the
+ * chain's recordings beside the trees:
+ *     xbr-report.toml
+ *     pad/1-<setup>.pad        the chain, in order (one level, capped)
+ *     pad/2-<recording>.pad
+ *     hdd/UDATA/<tid>/...      all of the title's saves, as a saves zip
+ *     hdd/TDATA/<tid>/...
+ * The manifest is a saves manifest (kind "report"; its files and bytes
+ * count the trees only) with the game, the host OS, the note and the
+ * chain added. */
+#define SZ_REPORT          "xbr-report.toml"
+#define REPORT_FORMAT      1
+#define REPORT_CHAIN_MAX   8
+#define REPORT_PAD_MAX     (4u << 20)   /* pad_script.h PAD_FILE_MAX */
+#define REPORT_NOTE_MAX    256          /* bytes of UTF-8 */
+#define REPORT_PAD_DIR     "pad/"
+
+struct report_manifest {
+    struct saves_manifest s;            /* kind "report" */
+    char game[64];                      /* the title's slug */
+    char host_os[32];                   /* "windows", "macos", "linux" */
+    char note[REPORT_NOTE_MAX];
+    int nchain;
+    char chain[REPORT_CHAIN_MAX][SZ_PATH_MAX];  /* "pad/<name>" each */
+};
+
+/* The manifest as TOML into out (control characters of the note dropped).
+ * Its length, or -1 when it does not fit. */
+int report_manifest_write(const struct report_manifest *m, char *out, size_t n);
+/* Parse one: the saves manifest's keys and rules, plus game, host_os,
+ * note and chain (a one-line array of strings). 0, or -1 with *why. */
+int report_manifest_parse(const char *text, size_t len, struct report_manifest *m,
+                          const char **why);
+
+/* A chain entry's zip name for file name (a recording or setup's file
+ * name) at position pos (from 1): "pad/<pos>-<name>", the name cut at a
+ * character so the component stays within SZ_NAME_MAX bytes and keeps
+ * ".pad". 0, or -1 when no such name fits. */
+int report_pad_name(int pos, const char *name, char *out, size_t n);
+
+/* The file name to import a chain entry as: its "pad/<pos>-" taken off. */
+const char *report_pad_file(const char *entry);
+
+/* Validate a read archive as a bug report for title tid: the manifest
+ * (kind, format, title, counts), every chain entry naming exactly one
+ * pad/ file and every pad/ file in the chain, pad/ one level deep and
+ * each file within REPORT_PAD_MAX, then the saves rules over the two
+ * trees. A report may hold no saves (*trees 0). Other console keys pass,
+ * as in saves_zip_check. 0 with *m and *trees set, -1 with err set. */
+int report_zip_check(const struct sz_archive *a, uint32_t tid, struct report_manifest *m,
+                     int *trees, char *err, size_t errn);
 
 /* The Name= line of a SaveMeta.xbx (UTF-16LE, optional BOM) as UTF-8. 0,
  * or -1 when it has none. */

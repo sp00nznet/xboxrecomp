@@ -53,6 +53,15 @@
  * nothing and ends on its own count, so RECOMP_DEBUG=pad_quit waits for it
  * and a replay runs on through the idle time after the last release. A
  * record without one ends with its last step, as before.
+ *
+ * f<flip>:!<action> or g<poll>:!<action> fires a host action by name
+ * (enhance_actions.h; pad-recording-ui R6), e.g.
+ * g0:!debug_menu.open: what a pad chord did in the record, since a
+ * scripted pad's chord fires nothing. It presses no button and lasts one
+ * count. Only an action marked pad-fireable at registration fires, and
+ * only from a file the player trusts (pad_session.h, PADREC_TRUST); a
+ * refused one is skipped and logged once with its name. The names live in
+ * the PadAnchors table, so they need the anchored parser.
  */
 #ifndef XBOX_USB_PAD_SCRIPT_H
 #define XBOX_USB_PAD_SCRIPT_H
@@ -94,6 +103,8 @@ typedef struct {
                                 clock */
     uint16_t anchor;         /* 0, or 1 + the anchor it counts from */
     uint8_t end;             /* the record's end (@end): hold 0, no buttons */
+    uint8_t action;          /* 0, or 1 + its name's index in the PadAnchors
+                                action table (!<action>) */
     int announced;
 } PadStep;
 
@@ -129,10 +140,19 @@ typedef struct {
     unsigned long skip_clock; /* the clock it was given up on */
 } PadAnchor;
 
+/* !<action> steps: the distinct names one script may fire, and a name's
+ * length with its NUL (enhance_actions.c's NAME_MAX_). */
+#define PAD_ACTION_MAX  32
+#define PAD_ACTION_NAME 48
+
 /* Sorted by at. Only `armed`, the first one not seen, takes an open: the
  * anchors match in the order the record saw them. */
 typedef struct {
     PadAnchor a[PAD_ANCHOR_MAX];
+    /* The !<action> names, in the order the script names them. */
+    char act[PAD_ACTION_MAX][PAD_ACTION_NAME];
+    int nact;
+    uint32_t act_logged;     /* bit per name: its refusal was logged */
     int n, armed;
     int skip;                /* some anchor's skip is set */
     uint8_t clock;           /* 0 none yet, else the script's by_flip */
@@ -287,6 +307,34 @@ int pad_recorder_end_line(const PadRecorder *recs, int n, uint32_t flip,
 int pad_recorder_anchor(const PadRecorder *recs, int n, const char *path,
                         uint32_t flip, uint32_t since, char *out, size_t size,
                         uint32_t *at);
+
+/* A fired action's step, "g<at>:!<name>\n" (f<at> on the flip clock), for
+ * a record. Returns the line's length, 0 for a name that cannot
+ * be one (empty, too long, outside [a-z0-9_.]) or -1 when out is too
+ * small. */
+int pad_recorder_action(int poll, uint32_t at, const char *name, char *out, size_t size);
+
+/* Whether name can be an action step's: 1..PAD_ACTION_NAME-1 bytes of
+ * [a-z0-9_.]. */
+int pad_action_name_ok(const char *name, size_t n);
+
+/* Who fires an action step: the input layer (enhance_actions.c) sets it at
+ * its start. fire returns 0 when the action fired, else -1 with why ("not
+ * pad-fireable", "its mod is off"). Without it every action step is
+ * skipped. Any thread. */
+typedef int (*pad_action_fire_fn)(const char *name, char *why, size_t n);
+void pad_action_set_hook(pad_action_fire_fn fire);
+
+/* An action step's first poll: its action fired when trusted, else, or
+ * when the hook refuses it, skipped and logged once per name for this
+ * script (the anchors' act_logged). 1 when it fired. On the pad thread of
+ * the script's owner. */
+int pad_step_fire(const PadStep *st, PadAnchors *anchors, int trusted);
+
+/* The distinct !<action> names text names, comments left out, in order,
+ * at most max of them into names: what Play asks the player to confirm
+ * and Info shows. The count found (it may pass max). */
+int pad_script_action_names(const char *text, char names[][PAD_ACTION_NAME], int max);
 
 /* The file name in a guest path ("d:\\movie\\x.sfd" -> "x.sfd"). */
 const char *pad_path_name(const char *path);

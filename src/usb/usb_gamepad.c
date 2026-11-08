@@ -426,12 +426,29 @@ static uint32_t flip_now(void) { return __atomic_load_n(&s_flip, __ATOMIC_RELAXE
 static uint32_t script_clock(void) { return s_script_poll ? polls_now() : flip_now(); }
 static uint32_t rec_clock(void) { return rec_poll() ? polls_now() : flip_now(); }
 
+static void pad_quit_post(void);
+
 static void pad_script_read(void)
 {
     const char *spec = recomp_env(RENV_PAD_SCRIPT);
     const char *live = recomp_env(RENV_PAD_LIVE);
 
     s_script_len = 0;
+    /* "@setup.pad;@route.pad": a chain of recordings (R5), played by the
+     * session code, each file from its own first poll. The env script
+     * itself stays empty; the live file still works beside it. */
+    if (spec && spec[0] == '@' && strchr(spec, ';')) {
+        char why[256];
+        padrec_set_quit(pad_quit_post);
+        if (padrec_env_chain(spec, why, sizeof why) < 0)
+            fprintf(stderr, "  PAD: the chain in RECOMP_PAD_SCRIPT is not played: %s\n", why);
+        else
+            fprintf(stderr, "  PAD: a chain of recordings from RECOMP_PAD_SCRIPT\n");
+        fflush(stderr);
+        spec = NULL;
+        if (!live || !*live)
+            return;
+    }
     if ((!spec || !*spec) && (!live || !*live))
         return;
     s_script = malloc((size_t)PAD_STEPS_MAX * sizeof *s_script);
@@ -658,6 +675,12 @@ static void pad_script_quit(unsigned long t, uint32_t clock)
     fprintf(stderr, "  PAD: the script's last step has ended (%s %u): quitting"
             " (pad_quit)\n", s_script_poll ? "poll" : "flip", (unsigned)clock);
     fflush(stderr);
+    pad_quit_post();
+}
+
+/* The env script's or chain's end under pad_quit. */
+static void pad_quit_post(void)
+{
     /* A post the window refused (a full SDL queue, a window already gone)
      * would lose the quit, which is asked only once: the quit thread ends
      * the run then, as without a window. */
@@ -706,6 +729,9 @@ static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
             fprintf(stderr, "  PAD: t=%lu ms %s %u step %d (digital 0x%02X analog 0x%02X)\n",
                     t, s_script_poll ? "poll" : "flip", (unsigned)flip, i, st->digital, st->analog);
             fflush(stderr);
+            /* The command line is the player's own word: its actions fire. */
+            if (st->action)
+                pad_step_fire(st, &s_anchors, 1);
         }
         pad_step_press(st, out);
     }
@@ -1006,6 +1032,22 @@ static void pad_record(int pad, const uint8_t *out, uint32_t flip)
     if (f && pad_recorder_feed(&s_rec[pad], pad_bits_from_report(out), flip,
                                lines, sizeof lines)) {
         fputs(lines, f);
+        fflush(f);
+    }
+    pad_unlock();
+}
+
+void usb_gamepad_record_action(const char *name)
+{
+    FILE *f;
+    char line[96];
+
+    if (!__atomic_load_n(&s_rec_file, __ATOMIC_ACQUIRE))
+        return;
+    pad_lock();
+    f = __atomic_load_n(&s_rec_file, __ATOMIC_ACQUIRE);
+    if (f && pad_recorder_action(rec_poll(), rec_clock(), name, line, sizeof line) > 0) {
+        fputs(line, f);
         fflush(f);
     }
     pad_unlock();

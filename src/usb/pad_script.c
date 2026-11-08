@@ -321,6 +321,41 @@ int pad_script_parse_anchored(const char *text, PadStep *steps, int len,
             p = b + 4;
             continue;
         }
+        if (*b == '!') {
+            size_t n = strcspn(b + 1, ", \t\r\n#");
+            int k;
+            if (!st.by_flip || st.pad || !pad_action_name_ok(b + 1, n)) {
+                fprintf(stderr, "  PAD: an action step needs f<flip> or g<poll>, no pad"
+                        " prefix and a name of [a-z0-9_.]: at \"%.20s\"; skipped\n", p);
+                p = b + 1 + n;
+                continue;
+            }
+            if (!anchors) {
+                fprintf(stderr, "  PAD: action \"%.*s\" where actions are not read"
+                        " (live lines); skipped\n", (int)n, b + 1);
+                p = b + 1 + n;
+                continue;
+            }
+            for (k = 0; k < anchors->nact; k++)
+                if (strlen(anchors->act[k]) == n && !memcmp(anchors->act[k], b + 1, n))
+                    break;
+            if (k == anchors->nact) {
+                if (k == PAD_ACTION_MAX) {
+                    fprintf(stderr, "  PAD: more than %d action names; !%.*s skipped\n",
+                            PAD_ACTION_MAX, (int)n, b + 1);
+                    p = b + 1 + n;
+                    continue;
+                }
+                memcpy(anchors->act[k], b + 1, n);
+                anchors->act[k][n] = 0;
+                anchors->nact++;
+            }
+            st.action = (uint8_t)(k + 1);
+            st.hold = 1;
+            steps[len++] = st;
+            p = b + 1 + n;
+            continue;
+        }
         if (*b == '@') {
             if (st.pad) {
                 /* An anchor is an event, for every pad: a pad goes on its
@@ -687,6 +722,102 @@ void pad_step_not_before(PadStep *st, uint32_t flip)
 {
     if (st->by_flip && st->at < (unsigned long)flip)
         st->at = flip;
+}
+
+int pad_action_name_ok(const char *name, size_t n)
+{
+    size_t i;
+    if (!n || n >= PAD_ACTION_NAME)
+        return 0;
+    for (i = 0; i < n; i++)
+        if (!((name[i] >= 'a' && name[i] <= 'z') || (name[i] >= '0' && name[i] <= '9')
+              || name[i] == '_' || name[i] == '.'))
+            return 0;
+    return 1;
+}
+
+static pad_action_fire_fn s_action_fire;
+
+void pad_action_set_hook(pad_action_fire_fn fire)
+{
+    __atomic_store_n(&s_action_fire, fire, __ATOMIC_RELEASE);
+}
+
+int pad_step_fire(const PadStep *st, PadAnchors *a, int trusted)
+{
+    pad_action_fire_fn fire = __atomic_load_n(&s_action_fire, __ATOMIC_ACQUIRE);
+    const char *name;
+    char why[96];
+    uint32_t bit;
+    int k;
+
+    if (!st->action || !a || st->action > a->nact)
+        return 0;
+    k = st->action - 1;
+    name = a->act[k];
+    why[0] = 0;
+    if (!trusted)
+        /* An imported or bundled file presses buttons, never more, until
+         * the player has seen what it fires (pad-recording-ui R6). */
+        snprintf(why, sizeof why, "the file is not trusted (confirm its actions on Play)");
+    else if (!fire)
+        snprintf(why, sizeof why, "no host actions in this run");
+    else if (fire(name, why, sizeof why) == 0) {
+        fprintf(stderr, "  PAD: fired !%s\n", name);
+        fflush(stderr);
+        return 1;
+    }
+    bit = 1u << (k & 31);
+    if (!(a->act_logged & bit)) {
+        a->act_logged |= bit;
+        fprintf(stderr, "  PAD: !%s skipped: %s\n", name, why[0] ? why : "refused");
+        fflush(stderr);
+    }
+    return 0;
+}
+
+int pad_script_action_names(const char *text, char names[][PAD_ACTION_NAME], int max)
+{
+    char seen[PAD_ACTION_MAX][PAD_ACTION_NAME];
+    int n = 0, nseen = 0;
+
+    for (const char *p = text; *p; ) {
+        const char *nl = strchr(p, '\n'), *e = nl ? nl : p + strlen(p);
+        for (; p + 1 < e && *p != '#'; p++) {
+            size_t len;
+            int k;
+            if (p[0] != ':' || p[1] != '!')
+                continue;
+            len = strcspn(p + 2, ", \t\r\n#");
+            if (p + 2 + len > e || !pad_action_name_ok(p + 2, len))
+                continue;
+            for (k = 0; k < nseen; k++)
+                if (strlen(seen[k]) == len && !memcmp(seen[k], p + 2, len))
+                    break;
+            if (k < nseen)
+                continue;
+            if (nseen < PAD_ACTION_MAX) {
+                memcpy(seen[nseen], p + 2, len);
+                seen[nseen++][len] = 0;
+            }
+            if (n < max) {
+                memcpy(names[n], p + 2, len);
+                names[n][len] = 0;
+            }
+            n++;
+        }
+        p = nl ? nl + 1 : e;
+    }
+    return n;
+}
+
+int pad_recorder_action(int poll, uint32_t at, const char *name, char *out, size_t size)
+{
+    int w;
+    if (!name || !pad_action_name_ok(name, strlen(name)))
+        return 0;
+    w = snprintf(out, size, "%c%u:!%s\n", poll ? 'g' : 'f', (unsigned)at, name);
+    return w < 0 || (size_t)w >= size ? -1 : w;
 }
 
 void pad_step_press(const PadStep *st, uint8_t *out)

@@ -74,6 +74,15 @@ long long pad_header_get_int(const PadHeader *h, const char *key, long long dflt
  * header or no origin key (an env record, counted from boot). */
 const char *pad_header_origin(const PadHeader *h);
 
+/* A TOML array of strings, as a key's value (requires = ["a", 'b']): the
+ * strings into out, rows of width bytes (cut to fit), at most max of
+ * them. The count (it may pass max), 0 when the key is absent, -1 when the
+ * value is no such array. A basic string with an escape is refused: the
+ * keys a list holds need none. */
+int pad_header_list(const PadHeader *h, const char *key, char *out, size_t width, int max);
+/* The same over one value's text; out NULL only checks it. */
+int pad_header_list_parse(const char *v, char *out, size_t width, int max);
+
 /* The marker and one line per key, LF ended, into out. Returns the length,
  * or -1 when n is too small. */
 int pad_header_write(const PadHeader *h, char *out, size_t n);

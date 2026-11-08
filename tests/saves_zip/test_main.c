@@ -16,6 +16,7 @@
 #endif
 
 #include "file_browser.h"
+#include "saves_sign.h"
 #include "saves_store.h"
 #include "saves_zip.h"
 
@@ -191,7 +192,9 @@ static void test_round_trip(void)
     CHECK(saves_zip_check(&a, TID, "zero", &back, &trees, s_err, sizeof s_err) == 0);
     CHECK(trees == (SAVES_TREE_UDATA | SAVES_TREE_TDATA));
     CHECK(saves_zip_check(&a, 0x4d530004u, "zero", &back, &trees, s_err, sizeof s_err) && has("another game"));
-    CHECK(saves_zip_check(&a, TID, "0123abcd", &back, &trees, s_err, sizeof s_err) && has("console keys"));
+    /* other keys pass and are reported: the import re-signs (saves_sign) */
+    CHECK(saves_zip_check(&a, TID, "0123abcd", &back, &trees, s_err, sizeof s_err) == 0);
+    CHECK(saves_zip_keys_differ(&back, "0123abcd") && !saves_zip_keys_differ(&back, "zero"));
     sz_archive_free(&a);
 
     /* a damaged copy: one data byte flipped */
@@ -724,6 +727,657 @@ static void test_many_saves(void)
     free(zip);
 }
 
+/* ---- the re-sign under a keys mismatch (saves_sign.h; pad-recording-ui R6) ---- */
+
+static const char *const SIGN_OK =
+    "# saves-signing.toml\nformat = 1\nsigning = \"resign\"\n\n"
+    "[[signed]]\nglob = \"*/Game.BIN\"\nsize = 64\ndata = [0, 40]\ndigest = 40\nkey = \"roamable\"\n";
+
+static int sign_parse(const char *text, struct saves_signing *sg)
+{
+    s_err[0] = 0;
+    return saves_signing_parse(text, strlen(text), sg, s_err, sizeof s_err);
+}
+
+static void hex(const unsigned char *b, size_t n, char *out)
+{
+    for (size_t i = 0; i < n; i++)
+        snprintf(out + 2 * i, 3, "%02x", b[i]);
+}
+
+static void test_sign_parse(void)
+{
+    struct saves_signing sg;
+    char buf[8192];
+    int idx[4];
+
+    CHECK(sign_parse(SIGN_OK, &sg) == 0);
+    CHECK(sg.mode == SAVES_SIGNING_RESIGN && sg.n == 1 && sg.r[0].size == 64
+          && sg.r[0].start == 0 && sg.r[0].end == 40 && sg.r[0].digest == 40 && sg.r[0].roamable);
+    /* globs match any case, '*' spans '/' as fnmatch's does */
+    CHECK(!strcmp(sg.r[0].glob, "*/game.bin"));
+    CHECK(saves_recipes_for(&sg, "ABC123/game.bin", idx, 4) == 1);
+    CHECK(saves_recipes_for(&sg, "abc/def/GAME.BIN", idx, 4) == 1);
+    CHECK(saves_recipes_for(&sg, "game.bin", idx, 4) == 0);
+    CHECK(saves_glob_match("[!a]?/x[0-9]", "b1/x7") && !saves_glob_match("[!a]?/x[0-9]", "a1/x7"));
+    CHECK(saves_glob_match("a[b", "a[b") && !saves_glob_match("a[b]", "a[b"));
+    CHECK(sign_parse("format = 1\nsigning = \"none\"\n", &sg) == 0 && sg.mode == SAVES_SIGNING_NONE);
+    CHECK(sign_parse("format = 1\n", &sg) == 0 && sg.mode == SAVES_SIGNING_UNKNOWN);
+    CHECK(sign_parse("format = 1\r\nsigning = \"resign\"\r\n[[signed]]\r\nglob = \"*/a\"\r\n"
+                     "size = 0x40\r\ndata = [ 0 , 40 ]  # range\r\ndigest = 40\r\nkey = \"roamable\"\r\n",
+                     &sg) == 0 && sg.n == 1 && sg.r[0].size == 64);
+
+    /* each bound refuses the whole file, and leaves no recipe behind */
+#define BAD(text, word)                                                                    \
+    do {                                                                                   \
+        memset(&sg, 0x55, sizeof sg);                                                      \
+        CHECK(sign_parse(text, &sg) == -1 && sg.n == 0 && sg.mode == SAVES_SIGNING_UNKNOWN \
+              && has(word));                                                               \
+    } while (0)
+#define REC(glob, size, data, digest)                                                      \
+    "format = 1\nsigning = \"resign\"\n[[signed]]\nglob = \"" glob "\"\nsize = " size     \
+    "\ndata = " data "\ndigest = " digest "\nkey = \"roamable\"\n"
+    BAD(REC("*/a", "64", "[40, 40]", "0"), "data range");     /* start == end */
+    BAD(REC("*/a", "64", "[0, 65]", "44"), "data range");     /* end past size */
+    BAD(REC("*/a", "64", "[0, 40]", "45"), "digest is not inside");  /* 45 + 20 > 64 */
+    BAD(REC("*/a", "64", "[0, 40]", "20"), "inside recipe");  /* digest in its data */
+    BAD(REC("*/a", "64", "[30, 50]", "15"), "inside recipe"); /* overlaps the range's start */
+    BAD(REC("*/a", "0", "[0, 1]", "0"), "size");
+    BAD(REC("/abs", "64", "[0, 40]", "40"), "glob");
+    BAD(REC("../a", "64", "[0, 40]", "40"), "glob");
+    BAD(REC("*/a", "64", "[0, 40]", "99999999999"), "digest");
+    BAD("format = 2\nsigning = \"none\"\n", "newer");
+    BAD("signing = \"none\"\n", "format");
+    BAD("format = 1\nsigning = \"resign\"\n", "no [[signed]]");
+    BAD("format = 1\nsigning = \"maybe\"\n", "signing");
+    BAD("format = 1\nsigning = \"resign\"\n[[signed]]\nglob = \"*/a\"\nsize = 64\n", "lacks");
+    BAD("format = 1\nsigning = \"resign\"\n[[signed]]\nglob = \"*/a\"\nglob = \"*/b\"\n", "twice");
+    BAD("format = 1\nsigning = \"resign\"\n[[signed]]\nwhat = 1\n", "unknown key");
+    BAD("format = 1\n[other]\n", "unknown table");
+    BAD("format = 1\nsigning = \"none\"\n" "[[signed]]\nglob = \"*/a\"\nsize = 64\ndata = [0, 40]\n"
+        "digest = 40\nkey = \"roamable\"\n", "without");
+    /* two recipes of one glob: one size, digests apart and outside each
+     * other's data */
+    BAD("format = 1\nsigning = \"resign\"\n"
+        "[[signed]]\nglob = \"*/a\"\nsize = 64\ndata = [0, 20]\ndigest = 40\nkey = \"roamable\"\n"
+        "[[signed]]\nglob = \"*/A\"\nsize = 80\ndata = [0, 20]\ndigest = 20\nkey = \"roamable\"\n",
+        "not a size");
+    BAD("format = 1\nsigning = \"resign\"\n"
+        "[[signed]]\nglob = \"*/a\"\nsize = 100\ndata = [0, 20]\ndigest = 40\nkey = \"roamable\"\n"
+        "[[signed]]\nglob = \"*/a\"\nsize = 100\ndata = [0, 20]\ndigest = 50\nkey = \"roamable\"\n",
+        "overlap");
+    BAD("format = 1\nsigning = \"resign\"\n"
+        "[[signed]]\nglob = \"*/a\"\nsize = 100\ndata = [0, 50]\ndigest = 60\nkey = \"roamable\"\n"
+        "[[signed]]\nglob = \"*/a\"\nsize = 100\ndata = [0, 20]\ndigest = 30\nkey = \"roamable\"\n",
+        "inside recipe");
+    /* two globs that can match one file are checked as one glob would be
+     * ("s1/game.bin" matches both), and two that cannot are not (review 1,
+     * F5); a set and a '?' meet too, a literal apart does not */
+    BAD("format = 1\nsigning = \"resign\"\n"
+        "[[signed]]\nglob = \"*/game.bin\"\nsize = 100\ndata = [0, 20]\ndigest = 40\nkey = \"roamable\"\n"
+        "[[signed]]\nglob = \"S1/*\"\nsize = 100\ndata = [0, 20]\ndigest = 50\nkey = \"roamable\"\n",
+        "overlap");
+    BAD("format = 1\nsigning = \"resign\"\n"
+        "[[signed]]\nglob = \"s[0-9]/a?\"\nsize = 100\ndata = [0, 50]\ndigest = 60\nkey = \"roamable\"\n"
+        "[[signed]]\nglob = \"s?/[!b]x\"\nsize = 100\ndata = [0, 20]\ndigest = 30\nkey = \"roamable\"\n",
+        "inside recipe");
+    CHECK(sign_parse("format = 1\nsigning = \"resign\"\n"
+        "[[signed]]\nglob = \"*/game.bin\"\nsize = 100\ndata = [0, 20]\ndigest = 40\nkey = \"roamable\"\n"
+        "[[signed]]\nglob = \"*/other.bin\"\nsize = 100\ndata = [0, 20]\ndigest = 40\nkey = \"roamable\"\n"
+        "[[signed]]\nglob = \"s[0-9]/a\"\nsize = 100\ndata = [0, 20]\ndigest = 40\nkey = \"roamable\"\n"
+        "[[signed]]\nglob = \"s[!0-9]/a\"\nsize = 100\ndata = [0, 20]\ndigest = 40\nkey = \"roamable\"\n",
+        &sg) == 0 && sg.n == 4);
+    /* ASCII globs only: the match folds case in ASCII (review 1, F7) */
+    BAD(REC("*/caf\xc3\xa9", "64", "[0, 40]", "40"), "not ASCII");
+    /* a glob of 129 bytes, and 65 recipes */
+    {
+        char g[140];
+        memset(g, 'g', 129);
+        g[129] = 0;
+        snprintf(buf, sizeof buf, REC("%s", "64", "[0, 40]", "40"), g);
+        BAD(buf, "128 bytes");
+        g[128] = 0;
+        snprintf(buf, sizeof buf, REC("%s", "64", "[0, 40]", "40"), g);
+        CHECK(sign_parse(buf, &sg) == 0);
+    }
+    {
+        static char many[SAVES_SIGN_FILE_MAX];
+        size_t k = (size_t)snprintf(many, sizeof many, "format = 1\nsigning = \"resign\"\n");
+        for (int i = 0; i < SAVES_SIGN_MAX + 1; i++)
+            k += (size_t)snprintf(many + k, sizeof many - k,
+                                  "[[signed]]\nglob = \"*/f%d\"\nsize = 64\ndata = [0, 40]\n"
+                                  "digest = 40\nkey = \"roamable\"\n", i);
+        BAD(many, "more than 64");
+        /* the first 64 alone pass */
+        *strstr(many, "[[signed]]\nglob = \"*/f64\"") = 0;
+        CHECK(sign_parse(many, &sg) == 0 && sg.n == SAVES_SIGN_MAX);
+    }
+#undef REC
+#undef BAD
+}
+
+/* The C port against importer.py resign on BLiNX 2's recipe (81920 bytes,
+ * data [0, 33972), digest at 33972) over a synthetic file, no game data.
+ * The expected digest is Python's:
+ *   b = bytes(((i * 31 + 7) & 0xff) for i in range(81920))
+ *   hmac.new(bytes(16), b[0:33972], hashlib.sha1).hexdigest() */
+static void test_sign_blinx2(void)
+{
+    static const char *const want = "fe9bcf74c6510a8d92b3f58e1ffbd6f38b2cdab6";
+    struct saves_signing sg;
+    unsigned char *b = malloc(81920), *orig = malloc(81920);
+    char got[41];
+    int idx[4], n;
+    CHECK(sign_parse("format = 1\nsigning = \"resign\"\n[[signed]]\n"
+                     "glob = \"*/blinx2data.bin\"\nsize = 81920\ndata = [0, 33972]\n"
+                     "digest = 33972\nkey = \"roamable\"\n", &sg) == 0);
+    for (int i = 0; i < 81920; i++)
+        b[i] = (unsigned char)((i * 31 + 7) & 0xff);
+    memcpy(orig, b, 81920);
+    n = saves_recipes_for(&sg, "13C91777168C/BLiNX2DATA.bin", idx, 4);
+    CHECK(n == 1);
+    CHECK(saves_resign(b, 81920, &sg, idx, n) == 0);
+    hex(b + 33972, 20, got);
+    CHECK(!strcmp(got, want));
+    /* only the digest changed */
+    CHECK(!memcmp(b, orig, 33972) && !memcmp(b + 33992, orig + 33992, 81920 - 33992));
+    /* idempotent: a save this build wrote comes back byte for byte */
+    memcpy(orig, b, 81920);
+    CHECK(saves_resign(b, 81920, &sg, idx, n) == 0 && !memcmp(b, orig, 81920));
+    /* the size is checked before any write */
+    CHECK(saves_resign(b, 81919, &sg, idx, n) == -1 && !memcmp(b, orig, 81920));
+    free(b);
+    free(orig);
+}
+
+/* A saves zip with three saves of a fake game: one with a recipe file
+ * (64 bytes, data [0, 40), digest at 40), one with a file of the wrong
+ * size, one with no recipe file; and a TDATA file. */
+static unsigned char *sign_zip(size_t *len, const char *keys)
+{
+    struct sz_writer w;
+    struct saves_manifest m = { 0 };
+    unsigned char good[64], *z;
+    char man[512];
+    int ml;
+    for (int i = 0; i < 64; i++)
+        good[i] = (unsigned char)((i * 13 + 1) & 0xff);
+    m.format = 1;
+    snprintf(m.kind, sizeof m.kind, "saves");
+    m.title_id = TID;
+    snprintf(m.keys, sizeof m.keys, "%s", keys);
+    m.files = 7;
+    m.bytes = 64 + 2 + 63 + 2 + 2 + 2 + 2;
+    ml = saves_manifest_write(&m, man, sizeof man);
+    sz_writer_init(&w);
+    sz_add_file(&w, SZ_MANIFEST, man, (size_t)ml, 0);
+    sz_add_dir(&w, "hdd/UDATA/4d530065/", 0);
+    sz_add_file(&w, "hdd/UDATA/4d530065/TitleMeta.xbx", "tm", 2, 0);
+    sz_add_dir(&w, "hdd/UDATA/4d530065/GOOD/", 0);
+    sz_add_file(&w, "hdd/UDATA/4d530065/GOOD/Game.bin", good, 64, 0);
+    sz_add_file(&w, "hdd/UDATA/4d530065/GOOD/SaveMeta.xbx", "sm", 2, 0);
+    sz_add_file(&w, "hdd/UDATA/4d530065/SHORT/game.bin", good, 63, 0);
+    sz_add_file(&w, "hdd/UDATA/4d530065/SHORT/SaveMeta.xbx", "sm", 2, 0);
+    sz_add_file(&w, "hdd/UDATA/4d530065/NONE/SaveMeta.xbx", "sm", 2, 0);
+    sz_add_file(&w, "hdd/TDATA/4d530065/t.bin", "td", 2, 0);
+    CHECK(sz_finish(&w, &z, len) == 0);
+    return z;
+}
+
+static const struct saves_resign_save *verdict_of(const struct saves_resign_report *r,
+                                                   const char *sid)
+{
+    for (int i = 0; i < r->n && i < SAVES_RESIGN_MAX_SAVES; i++)
+        if (!strcmp(r->s[i].sid, sid))
+            return &r->s[i];
+    return NULL;
+}
+
+static void test_sign_archive(void)
+{
+    static const char *const want = "25be166520185d509e0fe30954915859afec07fd";
+    struct saves_signing sg;
+    struct sz_archive a, out;
+    struct saves_manifest m;
+    struct saves_resign_report rep;
+    const struct sz_entry *e;
+    unsigned char *z, *blob;
+    size_t len;
+    int trees, ot;
+    char got[41], lines[2048];
+
+    z = sign_zip(&len, "0123abcd");
+    CHECK(sz_read(z, len, &a, s_err, sizeof s_err) == 0);
+    CHECK(saves_zip_check(&a, TID, "zero", &m, &trees, s_err, sizeof s_err) == 0);
+    CHECK(saves_zip_keys_differ(&m, "zero") && trees == 3);
+
+    /* resign: GOOD re-signed, SHORT and NONE skipped with their reasons */
+    CHECK(sign_parse(SIGN_OK, &sg) == 0);
+    CHECK(saves_resign_archive(&a, TID, trees, &sg, &out, &blob, &ot, &rep, s_err,
+                               sizeof s_err) == 0);
+    CHECK(ot == 3 && rep.n == 3 && rep.resigned == 1 && rep.skipped == 2 && rep.kept == 0);
+    CHECK(verdict_of(&rep, "GOOD") && verdict_of(&rep, "GOOD")->verdict == SAVES_RESIGNED);
+    CHECK(verdict_of(&rep, "SHORT") && verdict_of(&rep, "SHORT")->verdict == SAVES_SKIPPED
+          && strstr(verdict_of(&rep, "SHORT")->why, "63 bytes, not 64"));
+    CHECK(verdict_of(&rep, "NONE") && verdict_of(&rep, "NONE")->verdict == SAVES_SKIPPED
+          && strstr(verdict_of(&rep, "NONE")->why, "no recipe"));
+    CHECK((e = sz_find(&out, "hdd/UDATA/4d530065/GOOD/Game.bin")) && e->size == 64);
+    if (e) {
+        hex(e->data + 40, 20, got);
+        CHECK(!strcmp(got, want));
+        CHECK(e->crc == sz_crc32(0, e->data, 64));
+        CHECK(e->data != sz_find(&a, "hdd/UDATA/4d530065/GOOD/Game.bin")->data);
+    }
+    CHECK(sz_find(&out, "hdd/UDATA/4d530065/GOOD/SaveMeta.xbx"));
+    CHECK(sz_find(&out, "hdd/UDATA/4d530065/TitleMeta.xbx"));
+    CHECK(sz_find(&out, "hdd/TDATA/4d530065/t.bin"));
+    CHECK(!sz_find(&out, "hdd/UDATA/4d530065/SHORT/game.bin"));
+    CHECK(!sz_find(&out, "hdd/UDATA/4d530065/NONE/SaveMeta.xbx"));
+    /* the input is left as it was */
+    hex(sz_find(&a, "hdd/UDATA/4d530065/GOOD/Game.bin")->data + 40, 20, got);
+    CHECK(strcmp(got, want));
+    saves_resign_lines(&rep, 0, lines, sizeof lines);
+    CHECK(strstr(lines, "GOOD: " SAVES_SAID_RESIGNED " [" SAVES_SAID_MARK "]"));
+    CHECK(strstr(lines, "SHORT: " SAVES_SAID_SKIPPED "\n"));
+    CHECK(strstr(lines, SAVES_SAID_WITHOUT));
+    saves_resign_lines(&rep, 1, lines, sizeof lines);
+    CHECK(strstr(lines, "NONE: " SAVES_SAID_SKIPPED " (no recipe matches its files)"));
+    /* a short buffer keeps whole lines and never runs past its end (review
+     * 1, F6) */
+    {
+        char small[40];
+        memset(small, 'x', sizeof small);
+        CHECK(saves_resign_lines(&rep, 1, small, sizeof small - 8) == strlen(small)
+              && strlen(small) < sizeof small - 8 && small[sizeof small - 1] == 'x');
+        memset(small, 'x', sizeof small);
+        CHECK(saves_resign_lines(&rep, 1, small, 0) == 0 && small[0] == 'x');
+    }
+    /* the worst case fits SAVES_RESIGN_LINES_MAX: 64 saves skipped with a
+     * reason of 95 bytes, more past them, and the closing line */
+    {
+        static struct saves_resign_report big;
+        static char all[SAVES_RESIGN_LINES_MAX];
+        memset(&big, 0, sizeof big);
+        big.n = SAVES_RESIGN_MAX_SAVES + 5;
+        big.skipped = big.n;
+        for (int i = 0; i < SAVES_RESIGN_MAX_SAVES; i++) {
+            memset(big.s[i].sid, 'S', SZ_NAME_MAX);
+            big.s[i].verdict = SAVES_SKIPPED;
+            memset(big.s[i].why, 'w', sizeof big.s[i].why - 1);
+        }
+        CHECK(saves_resign_lines(&big, 1, all, sizeof all) < sizeof all - 1);
+        CHECK(strstr(all, "and 5 more\n") && strstr(all, SAVES_SAID_WITHOUT "\n"));
+    }
+    sz_archive_free(&out);
+    free(blob);
+
+    /* a console-locked recipe skips its save */
+    CHECK(sign_parse("format = 1\nsigning = \"resign\"\n[[signed]]\nglob = \"*/game.bin\"\n"
+                     "size = 64\ndata = [0, 40]\ndigest = 40\nkey = \"console\"\n", &sg) == 0);
+    CHECK(saves_resign_archive(&a, TID, trees, &sg, &out, &blob, &ot, &rep, s_err,
+                               sizeof s_err) == 0);
+    CHECK(rep.resigned == 0 && rep.skipped == 3 && ot == SAVES_TREE_TDATA
+          && strstr(verdict_of(&rep, "GOOD")->why, "console-locked"));
+    /* no save left: UDATA is dropped whole, so the live saves stay */
+    CHECK(!sz_find(&out, "hdd/UDATA/4d530065/TitleMeta.xbx") && sz_find(&out, "hdd/TDATA/4d530065/t.bin"));
+    sz_archive_free(&out);
+    free(blob);
+
+    /* signing = "none": every save goes in as it is */
+    CHECK(sign_parse("format = 1\nsigning = \"none\"\n", &sg) == 0);
+    CHECK(saves_resign_archive(&a, TID, trees, &sg, &out, &blob, &ot, &rep, s_err,
+                               sizeof s_err) == 0);
+    CHECK(rep.kept == 3 && rep.skipped == 0 && ot == 3 && out.n == a.n && !blob);
+    saves_resign_lines(&rep, 1, lines, sizeof lines);
+    CHECK(!strstr(lines, SAVES_SAID_WITHOUT));
+    sz_archive_free(&out);
+
+    /* no file (or no signing key): every save is skipped */
+    memset(&sg, 0, sizeof sg);
+    CHECK(saves_resign_archive(&a, TID, trees, &sg, &out, &blob, &ot, &rep, s_err,
+                               sizeof s_err) == 0);
+    CHECK(rep.skipped == 3 && ot == SAVES_TREE_TDATA
+          && strstr(verdict_of(&rep, "NONE")->why, "saves-signing.toml"));
+    sz_archive_free(&out);
+    free(blob);
+    sz_archive_free(&a);
+    free(z);
+
+    /* a saves-signing.toml inside a zip is never read: the saves rules
+     * refuse it as an entry outside the save trees, so it can never reach
+     * the parser (the menu reads the file only from beside the exe) */
+    {
+        struct sz_writer w;
+        unsigned char *zz;
+        size_t zl;
+        char man[512];
+        struct saves_manifest mm = { 0 };
+        int ml;
+        mm.format = 1;
+        snprintf(mm.kind, sizeof mm.kind, "saves");
+        mm.title_id = TID;
+        snprintf(mm.keys, sizeof mm.keys, "0123abcd");
+        mm.files = 2;
+        mm.bytes = 2 + (uint64_t)strlen(SIGN_OK);
+        ml = saves_manifest_write(&mm, man, sizeof man);
+        sz_writer_init(&w);
+        sz_add_file(&w, SZ_MANIFEST, man, (size_t)ml, 0);
+        sz_add_file(&w, SAVES_SIGN_FILE, SIGN_OK, strlen(SIGN_OK), 0);
+        sz_add_file(&w, "hdd/UDATA/4d530065/GOOD/SaveMeta.xbx", "sm", 2, 0);
+        CHECK(sz_finish(&w, &zz, &zl) == 0);
+        CHECK(sz_read(zz, zl, &a, s_err, sizeof s_err) == 0);
+        CHECK(saves_zip_check(&a, TID, "zero", &m, &trees, s_err, sizeof s_err) == -1
+              && has("outside the game's saves"));
+        sz_archive_free(&a);
+        free(zz);
+    }
+}
+
+/* The Saves page's mismatch path on disk: the derived archive imported,
+ * the re-signed bytes on the disk, the skipped saves gone with the tree
+ * they were in (the import replaces the title's saves whole, after the
+ * page's backup). */
+static void test_sign_store(void)
+{
+    static const char *const want = "25be166520185d509e0fe30954915859afec07fd";
+    struct saves_paths d;
+    struct saves_signing sg;
+    struct sz_archive a, out;
+    struct saves_manifest m;
+    struct saves_resign_report rep;
+    unsigned char *z, *blob;
+    char p[FB_PATH_MAX], *buf, got[41];
+    size_t len, bl;
+    int trees, ot;
+
+    memset(&d, 0, sizeof d);
+    path(d.root[0], "K/hdd/UDATA");
+    path(d.root[1], "K/hdd/TDATA");
+    d.tid = TID;
+    put("K/hdd/UDATA/4d530065/OLD/SaveMeta.xbx", "old", 3);
+    z = sign_zip(&len, "0123abcd");
+    CHECK(sz_read(z, len, &a, s_err, sizeof s_err) == 0);
+    CHECK(saves_zip_check(&a, TID, "zero", &m, &trees, s_err, sizeof s_err) == 0);
+    CHECK(sign_parse(SIGN_OK, &sg) == 0);
+    CHECK(saves_resign_archive(&a, TID, trees, &sg, &out, &blob, &ot, &rep, s_err,
+                               sizeof s_err) == 0);
+    CHECK(saves_import(&d, &out, ot, NULL, NULL, s_err, sizeof s_err) == 0);
+    path(p, "K/hdd/UDATA/4d530065/GOOD/Game.bin");
+    CHECK(fb_read_file(p, 1 << 20, &buf, &bl) == FB_OK && bl == 64);
+    if (bl == 64) {
+        hex((unsigned char *)buf + 40, 20, got);
+        CHECK(!strcmp(got, want));
+        free(buf);
+    }
+    CHECK(!there("K/hdd/UDATA/4d530065/SHORT") && !there("K/hdd/UDATA/4d530065/NONE"));
+    CHECK(!there("K/hdd/UDATA/4d530065/OLD"));
+    CHECK(same("K/hdd/TDATA/4d530065/t.bin", "td"));
+    CHECK(!stage_left("K/hdd"));
+    sz_archive_free(&out);
+    free(blob);
+    sz_archive_free(&a);
+    free(z);
+}
+
+/* ---- a bug-report bundle (pad-recording-ui R6, task 3.7) ---- */
+
+/* sz_read then report_zip_check; 0 when both pass */
+static int check_report(const unsigned char *z, size_t len, uint32_t tid,
+                        struct report_manifest *m, int *trees)
+{
+    struct sz_archive a;
+    int r;
+    s_err[0] = 0;
+    if (sz_read(z, len, &a, s_err, sizeof s_err))
+        return -1;
+    r = report_zip_check(&a, tid, m, trees, s_err, sizeof s_err);
+    sz_archive_free(&a);
+    return r;
+}
+
+/* a raw report: the manifest with chain, then the entries given */
+static int raw_report(const char *chain, int files, int bytes, const struct raw *more, int n)
+{
+    static struct report_manifest m;
+    char man[1024];
+    struct raw e[8];
+    size_t len;
+    unsigned char *z;
+    int trees, r;
+    snprintf(man, sizeof man,
+             "format = 1\nkind = \"report\"\ntitle_id = \"4d530065\"\nkeys = \"zero\"\n"
+             "files = %d\nbytes = %d\nchain = [%s]\n", files, bytes, chain);
+    e[0] = (struct raw){ SZ_REPORT, man, (uint32_t)strlen(man), 0, 0, 0, 0 };
+    for (int i = 0; i < n; i++)
+        e[i + 1] = more[i];
+    z = raw_zip(e, n + 1, &len);
+    r = check_report(z, len, TID, &m, &trees);
+    free(z);
+    return r;
+}
+
+static void test_report(void)
+{
+    struct report_manifest m, back;
+    struct saves_paths p, q;
+    struct report_pad pads[2];
+    struct sz_archive arch;
+    char man[2048], name[SZ_PATH_MAX];
+    const char *why;
+    unsigned char *zip;
+    size_t len;
+    int ml, trees;
+    static const char setup[] = "# xbr-export: pad 1\ng0:!debug_menu.open\ng1:@end\n";
+    static const char run[] = "# xbr-export: pad 1\ng0:a:4\ng9:@end\n";
+
+    /* the manifest, both ways */
+    memset(&m, 0, sizeof m);
+    m.s.format = 1;
+    snprintf(m.s.kind, sizeof m.s.kind, "report");
+    m.s.title_id = TID;
+    snprintf(m.s.title, sizeof m.s.title, "BLiNX 2");
+    snprintf(m.s.keys, sizeof m.s.keys, "zero");
+    m.s.files = 2;
+    m.s.bytes = 9;
+    snprintf(m.game, sizeof m.game, "blinx-2");
+    snprintf(m.host_os, sizeof m.host_os, "macos");
+    snprintf(m.note, sizeof m.note, "falls \"through\" the floor \\ at 2-1\nafter the gate");
+    m.nchain = 2;
+    snprintf(m.chain[0], sizeof m.chain[0], "pad/1-stage-select.pad");
+    snprintf(m.chain[1], sizeof m.chain[1], "pad/2-blinx-2-20261107-1200.pad");
+    ml = report_manifest_write(&m, man, sizeof man);
+    CHECK(ml > 0 && strstr(man, "note = \"falls \\\"through"));
+    CHECK(report_manifest_parse(man, (size_t)ml, &back, &why) == 0);
+    CHECK(back.s.title_id == TID && back.s.files == 2 && back.s.bytes == 9
+          && !strcmp(back.s.kind, "report") && !strcmp(back.game, "blinx-2")
+          && !strcmp(back.host_os, "macos") && back.nchain == 2
+          && !strcmp(back.chain[1], m.chain[1]));
+    /* the note's newline dropped, its quotes and backslash kept */
+    CHECK(!strcmp(back.note, "falls \"through\" the floor \\ at 2-1after the gate"));
+    CHECK(report_manifest_write(&m, man, 64) == -1);
+    {
+        const char *t = "format = 1\nkind = \"report\"\ntitle_id = \"4d530065\"\n"
+                        "keys = \"zero\"\nfiles = 0\nbytes = 0\n";
+        CHECK(report_manifest_parse(t, strlen(t), &back, &why) && strstr(why, "chain"));
+        t = "format = 1\nkind = \"report\"\ntitle_id = \"4d530065\"\nkeys = \"zero\"\n"
+                        "files = 0\nbytes = 0\nchain = [\"pad/1-a.pad\" \"pad/2-b.pad\"]\n";
+        CHECK(report_manifest_parse(t, strlen(t), &back, &why) && strstr(why, "chain"));
+        t = "format = 1\nkind = \"report\"\ntitle_id = \"4d530065\"\nkeys = \"zero\"\n"
+            "files = 0\nbytes = 0\nchain = \"pad/1-a.pad\"\n";
+        CHECK(report_manifest_parse(t, strlen(t), &back, &why) && strstr(why, "not a list"));
+        t = "format = 1\nkind = \"report\"\ntitle_id = \"4d530065\"\nkeys = \"zero\"\n"
+            "files = 0\nbytes = 0\nchain = [\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\"]\n";
+        CHECK(report_manifest_parse(t, strlen(t), &back, &why) && strstr(why, "more than 8"));
+        /* control bytes in the strings are dropped on read, as the writer
+         * drops them: an ESC from someone else's zip never reaches a row */
+        t = "format = 1\nkind = \"report\"\ntitle_id = \"4d530065\"\nkeys = \"zero\"\n"
+            "files = 0\nbytes = 0\nchain = [\"pad/1-a.pad\"]\n"
+            "note = \"a\x1b[2Jb\x07" "c\x7f\"\ngame = \"g\x01x\"\nhost_os = \"\tmac\x1bos\"\n";
+        CHECK(report_manifest_parse(t, strlen(t), &back, &why) == 0
+              && !strcmp(back.note, "a[2Jbc") && !strcmp(back.game, "gx")
+              && !strcmp(back.host_os, "macos"));
+        /* the saves manifest's rules still hold: keys missing */
+        t = "format = 1\nkind = \"report\"\ntitle_id = \"4d530065\"\n"
+            "files = 0\nbytes = 0\nchain = [\"pad/1-a.pad\"]\n";
+        CHECK(report_manifest_parse(t, strlen(t), &back, &why) && strstr(why, "missing"));
+    }
+
+    /* the pad names: one component of at most 42 bytes, ".pad" kept */
+    CHECK(report_pad_name(1, "stage-select.pad", name, sizeof name) == 0
+          && !strcmp(name, "pad/1-stage-select.pad"));
+    CHECK(report_pad_name(2, "a-very-long-recording-name-the-player-typed-in.pad", name,
+                          sizeof name) == 0
+          && strlen(name) == 4 + SZ_NAME_MAX && !strcmp(name + strlen(name) - 4, ".pad")
+          && !strncmp(name, "pad/2-a-very", 12));
+    /* a cut never splits a character: e-acute is two bytes */
+    CHECK(report_pad_name(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\xc3\xa9x.pad", name, sizeof name)
+          == 0 && strlen(name) == 4 + 2 + 35 + 4);
+    CHECK(report_pad_name(1, "notes.txt", name, sizeof name) == -1);
+    CHECK(!strcmp(report_pad_file("pad/2-run.pad"), "run.pad"));
+    CHECK(!strcmp(report_pad_file("pad/run.pad"), "run.pad"));
+    CHECK(!strcmp(report_pad_file("pad/12-3-x.pad"), "3-x.pad"));
+
+    /* the store: a report of R's saves, checked, then its saves imported
+     * onto S as a saves zip's are (pad/ passed over) */
+    put("R/hdd/UDATA/4d530065/13C91777168C/blinx2data.bin", "progress-R", 10);
+    put("R/hdd/TDATA/4d530065/settings.bin", "tdata-R", 7);
+    put("S/hdd/UDATA/4d530065/AAAAAAAAAAAA/blinx2data.bin", "progress-S", 10);
+    memset(&p, 0, sizeof p);
+    path(p.root[0], "R/hdd/UDATA");
+    path(p.root[1], "R/hdd/TDATA");
+    p.tid = TID;
+    q = p;
+    path(q.root[0], "S/hdd/UDATA");
+    path(q.root[1], "S/hdd/TDATA");
+    pads[0] = (struct report_pad){ "pad/1-stage-select.pad", setup, sizeof setup - 1 };
+    pads[1] = (struct report_pad){ "pad/2-run.pad", run, sizeof run - 1 };
+    CHECK(report_export(&p, &m, pads, 2, &zip, &len, s_err, sizeof s_err) == 2);
+    CHECK(check_report(zip, len, TID, &back, &trees) == 0);
+    CHECK(trees == 3 && back.s.files == 2 && back.s.bytes == 17 && back.nchain == 2
+          && !strcmp(back.chain[0], "pad/1-stage-select.pad")
+          && !strcmp(back.chain[1], "pad/2-run.pad") && !strncmp(back.note, "falls", 5)
+          && !strcmp(back.game, "blinx-2"));
+    /* another title's report, and the Saves page's check, refuse it */
+    CHECK(check_report(zip, len, 0x4d530004u, &back, &trees) && has("another game"));
+    CHECK(check_zip(zip, len) && has("not exported from the Saves menu"));
+    CHECK(sz_read(zip, len, &arch, s_err, sizeof s_err) == 0);
+    {
+        const struct sz_entry *e = sz_find(&arch, "pad/2-run.pad");
+        CHECK(e && e->size == sizeof run - 1 && !memcmp(e->data, run, e->size));
+    }
+    CHECK(saves_import(&q, &arch, 3, NULL, NULL, s_err, sizeof s_err) == 0);
+    CHECK(same("S/hdd/UDATA/4d530065/13C91777168C/blinx2data.bin", "progress-R"));
+    CHECK(!there("S/hdd/UDATA/4d530065/AAAAAAAAAAAA"));
+    CHECK(!there("S/hdd/pad") && !there("S/hdd/UDATA/pad"));
+    sz_archive_free(&arch);
+    free(zip);
+
+    /* a title with no saves yet still reports */
+    memset(&p, 0, sizeof p);
+    path(p.root[0], "R0/hdd/UDATA");
+    path(p.root[1], "R0/hdd/TDATA");
+    p.tid = TID;
+    CHECK(report_export(&p, &m, pads + 1, 1, &zip, &len, s_err, sizeof s_err) == 0);
+    CHECK(check_report(zip, len, TID, &back, &trees) == 0 && trees == 0 && back.nchain == 1);
+    free(zip);
+    CHECK(report_export(&p, &m, pads, 0, &zip, &len, s_err, sizeof s_err) == -1);
+    {
+        struct report_pad bad = { "hdd/x.pad", run, sizeof run - 1 };
+        CHECK(report_export(&p, &m, &bad, 1, &zip, &len, s_err, sizeof s_err) == -1);
+    }
+
+    /* each refusal */
+    {
+        static const char pd[] = "g0:@end\n";
+        struct raw a1 = { "pad/1-a.pad", pd, sizeof pd - 1, 0, 0, 0, 0 };
+        struct raw a2 = { "pad/2-b.pad", pd, sizeof pd - 1, 0, 0, 0, 0 };
+        struct raw sv = { "hdd/UDATA/4d530065/S/f", "abc", 3, 0, 0, 0, 0 };
+        struct raw v[4];
+        CHECK(raw_report("\"pad/1-a.pad\"", 0, 0, &a1, 1) == 0);
+        v[0] = a1; v[1] = sv;
+        CHECK(raw_report("\"pad/1-a.pad\"", 1, 3, v, 2) == 0);
+        /* the counts cover the trees only */
+        CHECK(raw_report("\"pad/1-a.pad\"", 2, 11, v, 2) && has("incomplete"));
+        /* a chain entry with no pad/ file */
+        CHECK(raw_report("\"pad/1-a.pad\", \"pad/2-b.pad\"", 0, 0, &a1, 1)
+              && has("does not hold") && has("pad/2-b.pad"));
+        /* a stray pad/ file the chain does not name */
+        v[0] = a1; v[1] = a2;
+        CHECK(raw_report("\"pad/1-a.pad\"", 0, 0, v, 2) && has("chain does not name")
+              && has("pad/2-b.pad"));
+        /* a recording with an empty name would import as ".pad" */
+        {
+            struct raw e0 = { "pad/1-.pad", pd, sizeof pd - 1, 0, 0, 0, 0 };
+            CHECK(raw_report("\"pad/1-.pad\"", 0, 0, &e0, 1) && has("no name"));
+        }
+        /* the same entry twice */
+        CHECK(raw_report("\"pad/1-a.pad\", \"pad/1-a.pad\"", 0, 0, &a1, 1) && has("twice"));
+        /* the chain outside pad/ */
+        CHECK(raw_report("\"hdd/UDATA/4d530065/S/f\"", 1, 3, &sv, 1) && has("does not hold"));
+        /* pad/ one level deep, recordings only */
+        {
+            struct raw d = { "pad/x/1-a.pad", pd, sizeof pd - 1, 0, 0, 0, 0 };
+            struct raw t = { "pad/notes.txt", pd, sizeof pd - 1, 0, 0, 0, 0 };
+            struct raw f = { "pad/x/", "", 0, 0, 0, 040755, 0 };
+            v[0] = a1; v[1] = d;
+            CHECK(raw_report("\"pad/1-a.pad\", \"pad/x/1-a.pad\"", 0, 0, v, 2)
+                  && has("not a recording"));
+            v[1] = t;
+            CHECK(raw_report("\"pad/1-a.pad\"", 0, 0, v, 2) && has("not a recording"));
+            v[1] = f;
+            CHECK(raw_report("\"pad/1-a.pad\"", 0, 0, v, 2) && has("folder inside pad/"));
+        }
+        /* entries outside pad/ and the trees: a saves manifest is one */
+        {
+            struct raw sm = { SZ_MANIFEST, MAN_OK, (uint32_t)strlen(MAN_OK), 0, 0, 0, 0 };
+            struct raw sg = { "saves-signing.toml", "x", 1, 0, 0, 0, 0 };
+            v[0] = a1; v[1] = sm;
+            CHECK(raw_report("\"pad/1-a.pad\"", 0, 0, v, 2) && has("outside the game's saves"));
+            v[1] = sg;
+            CHECK(raw_report("\"pad/1-a.pad\"", 0, 0, v, 2) && has("outside the game's saves"));
+        }
+        /* a saves zip is no report */
+        {
+            struct raw e[2] = {
+                { SZ_MANIFEST, MAN_OK, (uint32_t)strlen(MAN_OK), 0, 0, 0, 0 },
+                { "hdd/UDATA/4d530065/A/f", "abc", 3, 0, 0, 0, 0 },
+            };
+            unsigned char *z = raw_zip(e, 2, &len);
+            CHECK(check_report(z, len, TID, &back, &trees) && has("not a bug report"));
+            free(z);
+        }
+    }
+    /* the cap: a pad/ file over 4 MB */
+    {
+        struct sz_writer w;
+        char *big = calloc(1, REPORT_PAD_MAX + 1);
+        char mt[512];
+        int k = snprintf(mt, sizeof mt,
+                         "format = 1\nkind = \"report\"\ntitle_id = \"4d530065\"\n"
+                         "keys = \"zero\"\nfiles = 0\nbytes = 0\nchain = [\"pad/1-a.pad\"]\n");
+        sz_writer_init(&w);
+        sz_add_file(&w, SZ_REPORT, mt, (size_t)k, 0);
+        sz_add_file(&w, "pad/1-a.pad", big, REPORT_PAD_MAX + 1, 0);
+        CHECK(sz_finish(&w, &zip, &len) == 0);
+        CHECK(check_report(zip, len, TID, &back, &trees) && has("over 4 MB"));
+        free(zip);
+        free(big);
+    }
+    /* a newer format and another kind */
+    {
+        static const char nf[] = "format = 2\nkind = \"report\"\ntitle_id = \"4d530065\"\n"
+                                 "keys = \"zero\"\nfiles = 0\nbytes = 0\nchain = [\"pad/1-a.pad\"]\n";
+        static const char pd[] = "g0:@end\n";
+        struct raw e[2] = {
+            { SZ_REPORT, nf, sizeof nf - 1, 0, 0, 0, 0 },
+            { "pad/1-a.pad", pd, sizeof pd - 1, 0, 0, 0, 0 },
+        };
+        unsigned char *z = raw_zip(e, 2, &len);
+        CHECK(check_report(z, len, TID, &back, &trees) && has("newer build"));
+        free(z);
+    }
+}
+
 int main(void)
 {
     make_temp();
@@ -736,6 +1390,11 @@ int main(void)
     test_store();
     test_rollback();
     test_many_saves();
+    test_sign_parse();
+    test_sign_blinx2();
+    test_sign_archive();
+    test_sign_store();
+    test_report();
     printf("%d checks, %d failed\n", s_checks, s_failed);
     return s_failed ? 1 : 0;
 }

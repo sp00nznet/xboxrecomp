@@ -24,9 +24,11 @@
 #include "file_browser.h"
 #include "host_pad.h"
 #include "kernel.h"
+#include "mod.h"
 #include "nv2a_overlay.h"
 #include "nv2a_overlay_int.h"
 #include "pad_script.h"
+#include "recomp_exe_dir.h"
 #include "shader_profile.h"
 
 #define LOGP "[PADREC] "
@@ -41,6 +43,40 @@ static int s_on_close = 1;
 static int s_hud = PADREC_HUD_AUTO;
 static char s_last[128];
 
+/* The mod a requires key switches: its descriptor's enable setting
+ * (mods.debug_menu.enable, an "off"/"on" choice that enhance_cfg_bool
+ * would refuse as not a bool) or its mods.<name> key. -1 for any other key;
+ * *idx the enable setting's index, -1 for mods.<name>. */
+static int mod_of_key(const char *key, int *idx)
+{
+    int i, e;
+    for (i = 0; i < xbox_mod_count(); i++) {
+        const char *name = xbox_mod_name(i), *k;
+        e = xbox_mod_enable_setting(i);
+        k = e >= 0 ? xbox_mod_setting_key(i, (uint32_t)e) : NULL;
+        if (k && !strcmp(k, key)) {
+            *idx = e;
+            return i;
+        }
+        if (name && !strncmp(key, "mods.", 5) && !strcmp(key + 5, name)) {
+            *idx = -1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* A file's requires key is on in this run. A mod's switch counts only
+ * while the mod runs: a !<action> of a mod switched on for the next start
+ * would be refused at its step. Any other key is a bool of the config. */
+static int requires_on(const char *key)
+{
+    int idx, m = mod_of_key(key, &idx);
+    if (m >= 0)
+        return xbox_mod_enabled(m) && xbox_mod_state(m) == XBOX_MOD_ON;
+    return enhance_cfg_bool(key, 0);
+}
+
 void enhance_padrec_start(void)
 {
     int c = enhance_cfg_choice("padrec.clock", k_clock, 0);
@@ -51,6 +87,11 @@ void enhance_padrec_start(void)
     /* The env key is read by enhance_cfg too (bound), so the session takes
      * the resolved value and never reads RECOMP_PADREC_CLOCK past it. */
     padrec_set_clock_key(k_clock[c]);
+    /* !<action> steps fire the actions a mod made pad-fireable, and a
+     * record writes their fires (R5); requires reads the config. */
+    padrec_set_action_hook(enhance_action_fire_by_pad);
+    enhance_actions_set_fired_hook(padrec_action_fired);
+    padrec_set_requires_hook(requires_on);
 }
 
 int enhance_padrec_start_on_close(void)
@@ -465,17 +506,15 @@ int enhance_padrec_delete(const char *name, char *why, size_t n)
     return 0;
 }
 
-int enhance_padrec_record(int armed, const char *start_point, char *why, size_t n)
+/* A new record's file in the folder: "<game>-<yyyymmdd-hhmm>", then -2,
+ * -3 within the minute. The empty file takes the name as an import does
+ * (R5): two records in one minute, or names apart only by case on a
+ * case-insensitive volume, never share a file. Its name and path, and the
+ * header's name (the stem). 0, or -1 with why. */
+static int record_file(char *name, size_t nn, char *path, size_t pn, char *stem, size_t sn,
+                       char *why, size_t n)
 {
-    char dir[FB_PATH_MAX], name[FB_NAME_MAX + FB_EXT_MAX + 1], stem[FB_NAME_MAX + 1];
-    char path[FB_PATH_MAX];
-    PadrecMeta m;
-    const char *env = padrec_env_driven();
-
-    if (env) {
-        snprintf(why, n, "Driven by %s", env);
-        return -1;
-    }
+    char dir[FB_PATH_MAX];
     if (!enhance_padrec_dir(dir, sizeof dir)) {
         snprintf(why, n, "No user folder (RECOMP_CONFIG=none)");
         return -1;
@@ -484,22 +523,33 @@ int enhance_padrec_record(int armed, const char *start_point, char *why, size_t 
         snprintf(why, n, "The recordings folder cannot be made");
         return -1;
     }
-    /* "<game>-<yyyymmdd-hhmm>", then -2, -3 within the minute. The empty
-     * file takes the name as an import does (R5): two records in one
-     * minute, or names apart only by case on a case-insensitive volume,
-     * never share a file. */
-    enhance_padrec_default_stem(time(NULL), stem, sizeof stem);
-    if (fb_import_unique(dir, stem, ".pad", "", 0, name, sizeof name) != FB_OK
-        || fb_path_join(dir, name, path, sizeof path) != FB_OK) {
+    enhance_padrec_default_stem(time(NULL), stem, sn);
+    if (fb_import_unique(dir, stem, ".pad", "", 0, name, nn) != FB_OK
+        || fb_path_join(dir, name, path, pn) != FB_OK) {
         snprintf(why, n, "No free file name in the recordings folder");
         return -1;
     }
+    /* The header's name is the stem: the strip and the page's "playing"
+     * match compare it with the file name up to its extension. */
+    snprintf(stem, sn, "%.*s", (int)(strlen(name) - 4), name);
+    return 0;
+}
+
+int enhance_padrec_record(int armed, const char *start_point, char *why, size_t n)
+{
+    char name[FB_NAME_MAX + FB_EXT_MAX + 1], stem[FB_NAME_MAX + 1], path[FB_PATH_MAX];
+    PadrecMeta m;
+    const char *env = padrec_env_driven();
+
+    if (env) {
+        snprintf(why, n, "Driven by %s", env);
+        return -1;
+    }
+    if (record_file(name, sizeof name, path, sizeof path, stem, sizeof stem, why, n) < 0)
+        return -1;
     memset(&m, 0, sizeof m);
     m.title = nv2a_overlay_game();
     m.title_id = xbox_path_title_id();
-    /* The header's name is the stem: the strip and the page's "playing"
-     * match compare it with the file name up to its extension. */
-    snprintf(stem, sizeof stem, "%.*s", (int)(strlen(name) - 4), name);
     m.name = stem;
     m.start_point = start_point;
     if (padrec_record_start(path, &m, armed ? PADREC_ARMED : 0, why, n) < 0) {
@@ -541,6 +591,295 @@ int enhance_padrec_again(int armed, char *why, size_t n)
 {
     padrec_set_title(xbox_path_title_id(), nv2a_overlay_game());
     return padrec_again(armed ? PADREC_ARMED : 0, why, n);
+}
+
+/* ---- setups and chains (R6) ---------------------------------------------- */
+
+int enhance_padrec_setups_dir(char *out, size_t n)
+{
+    snprintf(out, n, "%s/pad-setups", recomp_exe_dir());
+    if (fb_exists(out))
+        return 1;
+#ifdef __APPLE__
+    /* A .app keeps what the CLI stages beside the exe in Resources. */
+    snprintf(out, n, "%s/../Resources/pad-setups", recomp_exe_dir());
+    if (fb_exists(out))
+        return 1;
+#endif
+    return 0;
+}
+
+struct setup_ctx {
+    struct enhance_padrec_setup *out;
+    int max, n, shipped;
+    const char *dir;
+};
+
+/* A recording whose header says kind = "setup". Only the header is
+ * needed, but the file is read whole (at most PAD_FILE_MAX): the folder
+ * holds the player's own files, and this runs on the page's request. */
+static int user_setup(const char *path)
+{
+    char *text = NULL;
+    size_t len = 0;
+    PadHeader *h;
+    const char *k;
+    int yes = 0;
+    if (fb_read_file(path, (size_t)PAD_FILE_MAX, &text, &len) != FB_OK)
+        return 0;
+    h = malloc(sizeof *h);
+    if (h && pad_header_read(text, h) == PAD_HDR_OK && (k = pad_header_get(h, "kind")))
+        yes = !strcmp(k, "setup");
+    free(h);
+    free(text);
+    return yes;
+}
+
+static int setup_emit(void *ctx, const struct fb_entry *e)
+{
+    struct setup_ctx *c = ctx;
+    char path[FB_PATH_MAX];
+    if (e->is_dir || e->hidden || e->name[0] == '.' || !ends_with_pad(e->name)
+        || strlen(e->name) >= sizeof c->out[0].name || c->n >= c->max)
+        return 0;
+    if (!c->shipped
+        && (fb_path_join(c->dir, e->name, path, sizeof path) != FB_OK || !user_setup(path)))
+        return 0;
+    snprintf(c->out[c->n].name, sizeof c->out[0].name, "%s", e->name);
+    c->out[c->n].shipped = c->shipped;
+    c->n++;
+    return 0;
+}
+
+static int setup_by_name(const void *a, const void *b)
+{
+    const struct enhance_padrec_setup *x = a, *y = b;
+    if (x->shipped != y->shipped)
+        return y->shipped - x->shipped;
+    return strcmp(x->name, y->name);
+}
+
+int enhance_padrec_setups(struct enhance_padrec_setup *out, int max)
+{
+    char dir[FB_PATH_MAX];
+    struct setup_ctx c = { out, max, 0, 1, dir };
+    if (max <= 0)
+        return 0;
+    if (enhance_padrec_setups_dir(dir, sizeof dir))
+        fb_list_host(dir, setup_emit, &c, NULL);
+    c.shipped = 0;
+    if (enhance_padrec_dir(dir, sizeof dir) && fb_exists(dir))
+        fb_list_host(dir, setup_emit, &c, NULL);
+    qsort(out, (size_t)c.n, sizeof *out, setup_by_name);
+    return c.n;
+}
+
+static int setup_path(const struct enhance_padrec_setup *s, char *path, size_t pn, char *why,
+                      size_t n)
+{
+    char dir[FB_PATH_MAX];
+    if (!s->shipped)
+        return file_path(s->name, path, pn, why, n);
+    if (!enhance_padrec_setups_dir(dir, sizeof dir)
+        || fb_path_join(dir, s->name, path, pn) != FB_OK) {
+        snprintf(why, n, "The setup %s is gone", s->name);
+        return -1;
+    }
+    return 0;
+}
+
+int enhance_padrec_read_setup(const struct enhance_padrec_setup *s, char **text, size_t *len,
+                              char *why, size_t n)
+{
+    char path[FB_PATH_MAX];
+    int rc;
+    if (setup_path(s, path, sizeof path, why, n) < 0)
+        return -1;
+    rc = fb_read_file(path, (size_t)PAD_FILE_MAX, text, len);
+    if (rc == FB_E_TOO_BIG)
+        snprintf(why, n, "Over %ld MB", PAD_FILE_MAX >> 20);
+    else if (rc != FB_OK)
+        snprintf(why, n, "%s cannot be read", s->name);
+    return rc == FB_OK ? 0 : -1;
+}
+
+/* Append the !<action> names of the file at path to out (", " joined,
+ * each once). The names added; -1 when it cannot be read. */
+static int actions_of(const char *path, char *out, size_t on)
+{
+    char names[PAD_ACTION_MAX][PAD_ACTION_NAME];
+    char *text = NULL;
+    size_t len = 0;
+    int k, added = 0;
+    if (fb_read_file(path, (size_t)PAD_FILE_MAX, &text, &len) != FB_OK)
+        return -1;
+    k = pad_script_action_names(text, names, PAD_ACTION_MAX);
+    free(text);
+    for (int i = 0; i < k && i < PAD_ACTION_MAX; i++) {
+        size_t at = strlen(out), nl = strlen(names[i]);
+        const char *p = out;
+        int dup = 0;
+        /* Once each across the chain: a name already listed is skipped. */
+        while ((p = strstr(p, names[i])) != NULL) {
+            if ((p == out || p[-1] == ' ') && (p[nl] == ',' || !p[nl])) {
+                dup = 1;
+                break;
+            }
+            p += nl;
+        }
+        if (dup)
+            continue;
+        snprintf(out + at, on > at ? on - at : 0, "%s%s", at ? ", " : "", names[i]);
+        added++;
+    }
+    return added;
+}
+
+int enhance_padrec_chain_actions(const struct enhance_padrec_setup *setup, const char *name,
+                                 char *out, size_t on, char *why, size_t n)
+{
+    char path[FB_PATH_MAX];
+    int k, total = 0;
+    if (on)
+        out[0] = 0;
+    if (setup && !setup->shipped) {
+        if (setup_path(setup, path, sizeof path, why, n) < 0)
+            return -1;
+        if ((k = actions_of(path, out, on)) < 0) {
+            snprintf(why, n, "%s cannot be read", setup->name);
+            return -1;
+        }
+        total += k;
+    }
+    if (name && name[0]) {
+        if (file_path(name, path, sizeof path, why, n) < 0)
+            return -1;
+        if ((k = actions_of(path, out, on)) < 0) {
+            snprintf(why, n, "%s cannot be read", name);
+            return -1;
+        }
+        total += k;
+    }
+    return total;
+}
+
+int enhance_padrec_play_chain(const struct enhance_padrec_setup *setup, const char *name,
+                              int record, const char *start_point, int armed,
+                              const char *confirmed, char *why, size_t n)
+{
+    char paths[2][FB_PATH_MAX], rec[FB_PATH_MAX];
+    char rname[FB_NAME_MAX + FB_EXT_MAX + 1], stem[FB_NAME_MAX + 1];
+    PadrecSeg segs[2];
+    PadrecMeta m;
+    int k = 0, rc;
+    const char *env = padrec_env_driven();
+
+    if (env) {
+        snprintf(why, n, "Driven by %s", env);
+        return -1;
+    }
+    if (setup) {
+        if (setup_path(setup, paths[k], sizeof paths[k], why, n) < 0)
+            return -1;
+        segs[k].path = paths[k];
+        segs[k].trusted = setup->shipped || confirmed;
+        segs[k].allowed = setup->shipped ? NULL : confirmed;
+        k++;
+    }
+    if (name && name[0]) {
+        if (file_path(name, paths[k], sizeof paths[k], why, n) < 0)
+            return -1;
+        segs[k].path = paths[k];
+        segs[k].trusted = confirmed != NULL;
+        segs[k].allowed = confirmed;
+        k++;
+    }
+    if (!k) {
+        snprintf(why, n, "No recording yet");
+        return -1;
+    }
+    memset(&m, 0, sizeof m);
+    if (record) {
+        if (record_file(rname, sizeof rname, rec, sizeof rec, stem, sizeof stem, why, n) < 0)
+            return -1;
+        m.title = nv2a_overlay_game();
+        m.title_id = xbox_path_title_id();
+        m.name = stem;
+        m.start_point = start_point;
+        m.setup = setup ? setup->name : NULL;
+    }
+    padrec_set_title(xbox_path_title_id(), nv2a_overlay_game());
+    rc = padrec_play_chain(segs, k, armed ? PADREC_ARMED : 0, record ? rec : NULL, &m, why, n);
+    if (rc < 0) {
+        if (record)
+            host_remove(rec);
+        if (rc == PADREC_E_REQUIRES)
+            snprintf(why, n, "It needs %s on", padrec_unmet());
+        return rc;
+    }
+    if (record)
+        snprintf(s_last, sizeof s_last, "%s", rname);
+    else if (name && name[0] && name != s_last)
+        snprintf(s_last, sizeof s_last, "%s", name);
+    return 0;
+}
+
+/* The key names comes from the file, which may be an imported .pad or a
+ * shared bug report: one click must not write an arbitrary key (a debug or
+ * unsafe option) into the player's config. Only an installed mod's switch
+ * is turned on here, as the Mods page would; any other key stays unmet and
+ * the player sets it by hand if they trust it (review 1, F1). */
+int enhance_padrec_require_turnable(const char *key)
+{
+    int idx;
+    return key && key[0] && mod_of_key(key, &idx) >= 0;
+}
+
+int enhance_padrec_require_on(const char *key, char *why, size_t n)
+{
+    const char *path = enhance_cfg_user_path(), *val = "true";
+    char dir[FB_PATH_MAX], err[256], lit[64];
+    char *sep;
+    int idx = -1, m = key ? mod_of_key(key, &idx) : -1, later = 0;
+    if (!key || !key[0]) {
+        snprintf(why, n, "No key");
+        return -1;
+    }
+    if (m < 0) {
+        snprintf(why, n, "%s is not a mod's switch: set it yourself if you trust it", key);
+        return -1;
+    }
+    if (!path) {
+        snprintf(why, n, "Off with RECOMP_CONFIG=none: set %s yourself", key);
+        return -1;
+    }
+    snprintf(dir, sizeof dir, "%s", path);
+    sep = strrchr(dir, '/');
+#ifdef _WIN32
+    if (strrchr(dir, '\\') > sep)
+        sep = strrchr(dir, '\\');
+#endif
+    if (sep) {
+        *sep = 0;
+        fb_mkdirs(dir);     /* a failure is the patch's to name */
+    }
+    if (m >= 0) {
+        /* Through the mod layer, as the Mods page's switch: it goes live
+         * when the mod can (on_enable), and the file gets the setting's own
+         * literal ("on" for a choice). */
+        later = xbox_mod_set_enabled(m, 1) != XBOX_MOD_ON;
+        if (idx >= 0 &&
+            xbox_mod_setting_literal(m, (uint32_t)idx,
+                                     xbox_mod_setting_value(m, (uint32_t)idx), lit, sizeof lit))
+            val = lit;
+    }
+    if (enhance_cfg_patch(path, &key, &val, 1, err, sizeof err) != 0) {
+        snprintf(why, n, "%s", err);
+        return -1;
+    }
+    fprintf(stderr, LOGP "%s = %s for a recording's requires (%s)%s\n", key, val, path,
+            later ? ", at restart" : "");
+    return later;
 }
 
 int enhance_padrec_playable(const PadFileInfo *info, int rc, const char *rc_why, char *why,
@@ -656,7 +995,11 @@ void enhance_padrec_strip_text(const PadrecStatus *st, char *head, size_t hn, ch
     const char unit = st->clock == 1 ? 'f' : st->clock == 2 ? 'g' : 't';
     int play = st->nsteps > 0;
 
-    snprintf(head, hn, "%s  %s", state_word(st->state), st->name);
+    /* A chain names its place, setup first (R4): "PLAY  2/2 my-run". */
+    if (st->segs > 1)
+        snprintf(head, hn, "%s  %d/%d %s", state_word(st->state), st->seg, st->segs, st->name);
+    else
+        snprintf(head, hn, "%s  %s", state_word(st->state), st->name);
     clock_text(st->ms, el, sizeof el);
     if (st->state == PADREC_ARMED_REC || st->state == PADREC_ARMED_PLAY) {
         snprintf(times, tn, "Starts when the menu closes");
