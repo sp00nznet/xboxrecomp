@@ -53,6 +53,77 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
+/* The utility drive is the exception. XAPI formats a title's cache partition
+ * (Harddisk0\Partition3-5, the Z: drive) with the cluster size the XBE asks
+ * for: the top two bits of the header's init flags (0x10124) scale 16 KB, so
+ * 0, 1, 2 give 16, 32 and 64 KB. After formatting, XMountUtilityDrive checks
+ * SectorsPerAllocationUnit * BytesPerSector against that same size and fails
+ * with STATUS_UNRECOGNIZED_VOLUME otherwise, and XAPI then boots to the
+ * dashboard with an error before the title's main runs. Turok: Evolution
+ * (init flags 0x80000007, 64 KB) does exactly that against a fixed 16 KB.
+ *
+ * A title whose flags leave those bits clear gets 16 KB, as before. Only the
+ * cache partitions get it; E: and the rest keep the 16 KB above. */
+static ULONG s_utility_sectors_per_cluster = XBOX_SECTORS_PER_CLUSTER;
+
+/* Called by xbox_MemoryLayoutInit with the XBE header's init flags, so this
+ * file needs no guest memory of its own. Until then, 16 KB. */
+void xbox_file_set_init_flags(uint32_t init_flags)
+{
+    s_utility_sectors_per_cluster = XBOX_SECTORS_PER_CLUSTER << (init_flags >> 30);
+}
+
+static ULONG xbox_utility_sectors_per_cluster(void)
+{
+    return s_utility_sectors_per_cluster;
+}
+
+/* "PartitionN.img" with N in 3..5: the image kernel_path.c backs
+ * \Device\Harddisk0\PartitionN with, i.e. a cache partition. `name` is the
+ * last path component. */
+static int xbox_is_cache_partition_image(const char *name)
+{
+    static const char head[] = "partition";
+    static const char tail[] = ".img";
+    int i;
+    for (i = 0; i < 9; i++)
+        if ((name[i] | 0x20) != head[i]) return 0;
+    if (name[9] < '3' || name[9] > '5') return 0;
+    for (i = 0; i < 4; i++)
+        if ((name[10 + i] | (tail[i] == '.' ? 0 : 0x20)) != tail[i]) return 0;
+    return name[14] == '\0';
+}
+
+/* Volume handles opened on a cache partition. The free-space open of a
+ * partition is redirected to the directory holding its image (see
+ * NtCreateFile), so by the time NtQueryVolumeInformationFile sees the handle
+ * nothing about it says which partition it was. NtCreateFile records it here
+ * while it still knows, and NtClose forgets it before the handle value can be
+ * reused. A full table only means a later query reports 16 KB, which is what
+ * every handle got before. */
+#define XBOX_CACHE_VOL_MAX 16
+static PVOID volatile s_cache_vol[XBOX_CACHE_VOL_MAX];
+
+static void cache_vol_mark(HANDLE h)
+{
+    int i;
+    for (i = 0; i < XBOX_CACHE_VOL_MAX; i++)
+        if (InterlockedCompareExchangePointer(&s_cache_vol[i], (PVOID)h, NULL) == NULL)
+            return;
+}
+
+static int cache_vol_take(HANDLE h, int remove)
+{
+    int i;
+    for (i = 0; i < XBOX_CACHE_VOL_MAX; i++)
+        if (s_cache_vol[i] == (PVOID)h) {
+            if (remove)
+                InterlockedCompareExchangePointer(&s_cache_vol[i], NULL, (PVOID)h);
+            return 1;
+        }
+    return 0;
+}
+
 /* ======================================================================== */
 /* Shared by both backends. kernel_bridge.c calls xbox_LastFileError()
  * unconditionally, so defining it only under _WIN32 leaves every POSIX link
@@ -294,11 +365,18 @@ NTSTATUS __stdcall xbox_NtCreateFile(
      * the failure as fatal. Redirecting to the directory that holds the image
      * gives a handle that is valid for exactly what the caller is going to do
      * with it, which is NtQueryVolumeInformationFile. */
+    int cache_volume = 0;
     if ((CreateOptions & XBOX_FILE_DIRECTORY_FILE) &&
         GetFileAttributesW(win_path) != INVALID_FILE_ATTRIBUTES &&
         !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY)) {
         WCHAR *slash = wcsrchr(win_path, L'\\');
         if (slash && slash != win_path) {
+            /* Partition3-5.img: the utility drive, whose cluster size the
+             * title chose (see xbox_utility_sectors_per_cluster). */
+            char leaf[16];
+            if (wcslen(slash + 1) < sizeof leaf &&
+                WideCharToMultiByte(CP_ACP, 0, slash + 1, -1, leaf, sizeof leaf, NULL, NULL))
+                cache_volume = xbox_is_cache_partition_image(leaf);
             *slash = 0;
             xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
                      "NtCreateFile: directory open of a device image, "
@@ -320,6 +398,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (cache_volume && h != INVALID_HANDLE_VALUE)
+            cache_vol_mark(h);
     } else {
         if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
@@ -480,6 +560,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         overwrite_settle(Handle);
         xbox_dir_context_drop(Handle);
+        cache_vol_take(Handle, 1);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -709,7 +790,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
@@ -717,15 +798,17 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
+            ULONG spc = cache_vol_take(FileHandle, 0)
+                      ? xbox_utility_sectors_per_cluster() : XBOX_SECTORS_PER_CLUSTER;
             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
-                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+                info->SectorsPerAllocationUnit = spc;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
             } else {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
-                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+                info->SectorsPerAllocationUnit = spc;
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
@@ -1195,6 +1278,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     int fd;
+    int cache_volume = 0;
     /* A partition device opened as a directory: the volume, for a free-space
      * query, rather than the image's bytes. As in the Win32 backend, the
      * directory holding the image answers that. */
@@ -1203,6 +1287,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         if (stat(host_path, &st) == 0 && S_ISREG(st.st_mode)) {
             char *slash = strrchr(host_path, '/');
             if (slash && slash != host_path) {
+                cache_volume = xbox_is_cache_partition_image(slash + 1);
                 *slash = '\0';
                 xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
                          "NtCreateFile: directory open of a device image, "
@@ -1265,6 +1350,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     *FileHandle = w32_open_handle(fd, host_path);
+    if (cache_volume && *FileHandle && *FileHandle != INVALID_HANDLE_VALUE)
+        cache_vol_mark(*FileHandle);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -1351,6 +1438,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
         /* Before CloseHandle: once the object is freed its address can come
          * back as the next handle, which must not inherit this search. */
         xbox_dir_context_drop(Handle);
+        cache_vol_take(Handle, 1);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1618,7 +1706,8 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             /* Xbox geometry, not the host's -- see the note on
              * XBOX_SECTORS_PER_CLUSTER above. */
             info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
-            info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+            info->SectorsPerAllocationUnit = cache_vol_take(FileHandle, 0)
+                ? xbox_utility_sectors_per_cluster() : XBOX_SECTORS_PER_CLUSTER;
             if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
