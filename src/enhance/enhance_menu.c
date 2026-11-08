@@ -1838,6 +1838,7 @@ static const char *miss_why(uint32_t w)
     case NV2A_TEX_PACK_MISS_PACK_OFF: return "pack off";
     case NV2A_TEX_PACK_MISS_KIND_OFF: return "kind off";
     case NV2A_TEX_PACK_MISS_REFUSED: return "refused";
+    case NV2A_TEX_PACK_MISS_VOLATILE: return "palette volatile";
     default: return "absent";
     }
 }
@@ -2812,6 +2813,8 @@ static void build_rows(void)
                  nv2a_tex_pack_kind_count(XRTP_KIND_WORLD));
             if (nv2a_tex_pack_detile_count())
                 info("Marked tiles", "%u", nv2a_tex_pack_detile_count());
+            if (nv2a_tex_pack_recolour_count())
+                info("Recolour entries", "%u", nv2a_tex_pack_recolour_count());
             info("Scale", "%ux, text %ux", nv2a_tex_pack_scale(), nv2a_tex_pack_text_scale());
             info("Block entries", "%u BC1, %u BC3", nv2a_tex_pack_bc1_count(),
                  nv2a_tex_pack_bc3_count());

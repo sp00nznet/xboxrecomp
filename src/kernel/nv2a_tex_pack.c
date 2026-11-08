@@ -64,6 +64,31 @@ int nv2a_tex_pack_is_file(const char *path)
 static struct nv2a_tex_pack_entry *s_entries;
 static unsigned  s_count, s_scale, s_text_scale, s_version;
 static unsigned  s_kind_count[XRTP_KIND_COUNT], s_bc1_count, s_bc3_count, s_detile_count;
+static unsigned  s_recolour_count;
+/* nv2a_tex_pack_recolour's output, grown to the largest entry recoloured,
+ * freed past NV2A_TEX_PACK_RECOLOUR_KEEP at release; in s_resident. */
+static uint32_t *s_recolour_buf;
+static size_t    s_recolour_cap;
+/* The flip clock (nv2a_tex_pack_flip), the flip of the latest generation
+ * bump, and the planes turned volatile. */
+static uint32_t  s_flip, s_bump_flip;
+static unsigned  s_volatile;
+/* The latest find_recolour that found an entry: the full hash it stood
+ * for, why it was not taken (NV2A_TEX_PACK_MISS_REFUSED if it was, for a
+ * backend that then refuses it) and the entry's kind, so a miss of that
+ * hash says why although the miss ring has no plane hash. */
+static int       s_rc_set;
+static uint64_t  s_rc_hash;
+static uint32_t  s_rc_why, s_rc_kind;
+
+/* A recolour entry's palette changes (nv2a_tex_pack_find_recolour). */
+struct nv2a_tex_pack_palettes {
+    uint64_t last;                /* the palette of its latest upload */
+    uint32_t win_flip, win_new;   /* the window's first flip; changes in it */
+    uint32_t last_new;            /* the flip of the latest change */
+    uint32_t quiet;               /* flips without a change that end it */
+    int      vol, any;
+};
 static char     *s_path;
 static uint64_t  s_hits;
 
@@ -102,6 +127,14 @@ static int s_snap_want;                     /* atomic: users */
 static char s_snap_lock;                    /* atomic flag */
 static unsigned s_snap_n;
 static struct nv2a_tex_pack_miss s_snap[NV2A_TEX_PACK_MISSES];
+
+/* Every cached texture goes up again. Its re-uploads, all within the
+ * next flips, are not a palette animation (palette_volatile). */
+static void bump_gen(void)
+{
+    atomic_fetch_add_explicit(&s_gen, 1u, memory_order_relaxed);
+    s_bump_flip = s_flip;
+}
 
 static uint32_t rd32(const uint8_t *p)
 {
@@ -171,8 +204,10 @@ static void fail(char *err, size_t errlen, const char *msg)
 void nv2a_tex_pack_unload(void)
 {
     unsigned i;
-    for (i = 0; i < s_count; i++)
+    for (i = 0; i < s_count; i++) {
         free(s_entries[i].data);
+        free(s_entries[i].pal);
+    }
     free(s_entries);
     free(s_path);
     s_entries = NULL;
@@ -190,6 +225,12 @@ void nv2a_tex_pack_unload(void)
     memset(s_kind_count, 0, sizeof s_kind_count);
     s_bc1_count = 0;
     s_detile_count = 0;
+    s_recolour_count = 0;
+    free(s_recolour_buf);
+    s_recolour_buf = NULL;
+    s_recolour_cap = 0;
+    s_volatile = 0;
+    s_rc_set = 0;
     s_bc3_count = 0;
     s_hits = 0;
     memset(s_miss, 0, sizeof s_miss);
@@ -197,7 +238,7 @@ void nv2a_tex_pack_unload(void)
     __atomic_store_n(&s_miss_total, 0, __ATOMIC_RELAXED);
     /* What every hash matches changed (the menu loads or drops a pack at a
      * flip): each backend's texture cache uploads again, as for a toggle. */
-    atomic_fetch_add_explicit(&s_gen, 1u, memory_order_relaxed);
+    bump_gen();
 }
 
 int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
@@ -208,7 +249,7 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
     long long size;
     uint64_t index_off;
     uint32_t count, version, scale, text_scale = 0, known = 0, kinds_read = 0;
-    unsigned i, kinds[XRTP_KIND_COUNT] = {0}, bc1 = 0, bc3 = 0, detile = 0;
+    unsigned i, kinds[XRTP_KIND_COUNT] = {0}, bc1 = 0, bc3 = 0, detile = 0, recolour = 0;
     struct nv2a_tex_pack_entry *entries = NULL;
     const char *why = NULL;
 
@@ -254,6 +295,9 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
         kinds_read = 4u;
     } else if (version == 4u) {
         known = XRTP_FLAGS_KNOWN_V4;
+        kinds_read = 4u;
+    } else if (version == 5u) {
+        known = XRTP_FLAGS_KNOWN_V5;
         kinds_read = 4u;
     }
     if (version < 1u || version > NV2A_TEX_PACK_VERSION)
@@ -318,6 +362,9 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
             why = "detile mark on a non-world entry";
         else if ((e->flags & XRTP_FLAG_BC3) && (e->flags & XRTP_FLAG_BC1))
             why = "entry with two block formats";
+        /* Index pairs are per texel: a block format would blend indices. */
+        else if ((e->flags & XRTP_FLAG_RECOLOUR) && (e->flags & (XRTP_FLAG_BC3 | XRTP_FLAG_BC1)))
+            why = "recolour entry with a block format";
         /* D3D11 refuses a block-compressed texture whose top level is not
          * whole blocks; the CLI writes blocks only for such sizes. */
         else if ((e->flags & (XRTP_FLAG_BC3 | XRTP_FLAG_BC1)) && ((e->width | e->height) & 3u))
@@ -339,6 +386,7 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
             bc1 += e->bc == XRTP_BC_1 ? 1u : 0u;
             bc3 += e->bc == XRTP_BC_3 ? 1u : 0u;
             detile += (e->flags & XRTP_FLAG_DETILE_HEX) ? 1u : 0u;
+            recolour += (e->flags & XRTP_FLAG_RECOLOUR) ? 1u : 0u;
         }
     }
     free(index);
@@ -364,7 +412,8 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
     s_bc1_count = bc1;
     s_bc3_count = bc3;
     s_detile_count = detile;
-    atomic_fetch_add_explicit(&s_gen, 1u, memory_order_relaxed);
+    s_recolour_count = recolour;
+    bump_gen();
     return (int)count;
 }
 
@@ -408,6 +457,11 @@ unsigned nv2a_tex_pack_detile_count(void)
     return s_detile_count;
 }
 
+unsigned nv2a_tex_pack_recolour_count(void)
+{
+    return s_recolour_count;
+}
+
 uint64_t nv2a_tex_pack_hits(void)
 {
     return s_hits;
@@ -416,7 +470,7 @@ uint64_t nv2a_tex_pack_hits(void)
 static void set_mask(unsigned m)
 {
     if (atomic_exchange_explicit(&s_mask, m, memory_order_relaxed) != m)
-        atomic_fetch_add_explicit(&s_gen, 1u, memory_order_relaxed);
+        bump_gen();
 }
 
 void nv2a_tex_pack_set_enabled(int on)
@@ -461,6 +515,9 @@ static struct nv2a_tex_pack_entry *lookup(uint64_t hash, uint32_t guest_w, uint3
     return NULL;
 }
 
+/* A plane hash and a full hash are both nv2a_tex_hash values, so one could
+ * name the other kind of entry by chance (a uniform fill): find takes no
+ * recolour entry and find_recolour only one. */
 struct nv2a_tex_pack_entry *nv2a_tex_pack_find(uint64_t hash, uint32_t guest_w,
                                                uint32_t guest_h)
 {
@@ -469,10 +526,157 @@ struct nv2a_tex_pack_entry *nv2a_tex_pack_find(uint64_t hash, uint32_t guest_w,
     if (!(m & PACK_ON))
         return NULL;
     e = lookup(hash, guest_w, guest_h);
-    if (!e || !(m & (1u << e->kind)))
+    if (!e || !(m & (1u << e->kind)) || (e->flags & XRTP_FLAG_RECOLOUR))
         return NULL;
     s_hits++;
     return e;
+}
+
+void nv2a_tex_pack_flip(void)
+{
+    size_t i;
+    unsigned back = 0;
+    s_flip++;
+    if (!s_volatile)
+        return;
+    /* Here and not at the next upload: a plane whose animation stopped may
+     * never go up again while its guest copies stay cached, so the bump
+     * that brings its recolour back has to come from the clock. */
+    for (i = 0; i < s_count; i++) {
+        struct nv2a_tex_pack_palettes *p = s_entries[i].pal;
+        if (p && p->vol && s_flip - p->last_new >= p->quiet) {
+            p->vol = 0;
+            /* Each return bumps the generation, which re-uploads every
+             * cached texture: a fade that recurs waits twice as long each
+             * time before it is recoloured again. */
+            if (p->quiet < NV2A_TEX_PACK_RECOLOUR_QUIET_MAX)
+                p->quiet *= 2u;
+            p->win_flip = s_flip;
+            p->win_new = 0;
+            s_volatile--;
+            back++;
+        }
+    }
+    if (back)
+        bump_gen();
+}
+
+unsigned nv2a_tex_pack_volatile_count(void)
+{
+    return s_volatile;
+}
+
+/* 1 while e's plane is volatile (NV2A_TEX_PACK_RECOLOUR_BURST). Every
+ * upload under a palette other than the last one counts, palettes seen
+ * before included: the backends keep one cache slot per texture, so a
+ * short palette cycle re-uploads (and would recolour) at every step. */
+static int palette_volatile(struct nv2a_tex_pack_entry *e, uint64_t palette_hash)
+{
+    struct nv2a_tex_pack_palettes *p = e->pal;
+    if (!p) {
+        /* Without the record the plane is recoloured as if never volatile. */
+        if (!(p = e->pal = (struct nv2a_tex_pack_palettes *)calloc(1, sizeof *p)))
+            return 0;
+        p->win_flip = s_flip;
+        p->quiet = NV2A_TEX_PACK_RECOLOUR_QUIET;
+    }
+    if (p->any && p->last == palette_hash)
+        return p->vol;
+    p->any = 1;
+    p->last = palette_hash;
+    p->last_new = s_flip;
+    if (s_flip - p->win_flip >= NV2A_TEX_PACK_RECOLOUR_WINDOW) {
+        p->win_flip = s_flip;
+        p->win_new = 0;
+    }
+    /* The flips after a bump re-upload every cached copy at once, each
+     * texture of the plane under its own palette: not an animation. */
+    if (s_flip - s_bump_flip > 2u)
+        p->win_new++;
+    if (!p->vol && p->win_new > NV2A_TEX_PACK_RECOLOUR_BURST) {
+        p->vol = 1;
+        s_volatile++;
+        /* Its palettes so far went up recoloured: up again from the guest,
+         * or a cycle would flicker between the two. */
+        bump_gen();
+    }
+    return p->vol;
+}
+
+struct nv2a_tex_pack_entry *nv2a_tex_pack_find_recolour(uint64_t plane_hash,
+                                                        uint64_t palette_hash,
+                                                        uint32_t guest_w, uint32_t guest_h)
+{
+    unsigned m = atomic_load_explicit(&s_mask, memory_order_relaxed);
+    struct nv2a_tex_pack_entry *e;
+    if (!s_recolour_count)
+        return NULL;
+    e = lookup(plane_hash, guest_w, guest_h);
+    if (!e || !(e->flags & XRTP_FLAG_RECOLOUR))
+        return NULL;
+    s_rc_set = 1;
+    s_rc_hash = plane_hash ^ palette_hash * 31u;
+    s_rc_kind = e->kind;
+    s_rc_why = !(m & PACK_ON)                 ? NV2A_TEX_PACK_MISS_PACK_OFF
+             : !(m & (1u << e->kind))         ? NV2A_TEX_PACK_MISS_KIND_OFF
+             : palette_volatile(e, palette_hash) ? NV2A_TEX_PACK_MISS_VOLATILE
+             :                                  NV2A_TEX_PACK_MISS_REFUSED;
+    if (s_rc_why != NV2A_TEX_PACK_MISS_REFUSED)
+        return NULL;
+    s_hits++;
+    return e;
+}
+
+/* (a * (255 - w) + b * w + 127) / 255 per byte, red and blue in one word
+ * and alpha and green in another: each lane's sum is at most 255 * 255, so
+ * the lanes never carry into each other. t / 255 rounded is
+ * (t + 128 + ((t + 128) >> 8)) >> 8, exact over that range (tests/tex_pack
+ * checks every sum). w = 0 gives a, 255 gives b, so a 1x entry with w = 0
+ * reproduces the guest decode exactly. */
+static uint32_t lerp_argb(uint32_t a, uint32_t b, uint32_t w)
+{
+    uint32_t iw = 255u - w;
+    uint32_t rb = (a & 0x00FF00FFu) * iw + (b & 0x00FF00FFu) * w + 0x00800080u;
+    uint32_t ag = ((a >> 8) & 0x00FF00FFu) * iw + ((b >> 8) & 0x00FF00FFu) * w + 0x00800080u;
+    rb = ((rb + ((rb >> 8) & 0x00FF00FFu)) >> 8) & 0x00FF00FFu;
+    ag = (ag + ((ag >> 8) & 0x00FF00FFu)) & 0xFF00FF00u;
+    return rb | ag;
+}
+
+/* Same as nv2a_backend_common.h's NV2A_TEX_MAGENTA, which this reader does
+ * not include. */
+#define RECOLOUR_MAGENTA 0xFFFF00FFu
+
+void nv2a_tex_pack_recolour_texels(const uint32_t *idx, size_t n, const uint32_t *pal,
+                                   uint32_t pal_len, uint32_t *out)
+{
+    size_t i;
+    if (!pal)
+        pal_len = 0;
+    for (i = 0; i < n; i++) {
+        uint32_t v = idx[i], i0 = v & 0xFFu, i1 = (v >> 8) & 0xFFu, w = (v >> 16) & 0xFFu;
+        uint32_t c0 = i0 < pal_len ? pal[i0] : RECOLOUR_MAGENTA;
+        uint32_t c1 = i1 < pal_len ? pal[i1] : RECOLOUR_MAGENTA;
+        out[i] = c0 == c1 || w == 0 ? c0 : w == 255u ? c1 : lerp_argb(c0, c1, w);
+    }
+}
+
+const uint32_t *nv2a_tex_pack_recolour(struct nv2a_tex_pack_entry *e, const uint32_t *pal,
+                                       uint32_t pal_len)
+{
+    const uint32_t *idx;
+    if (!e || !(e->flags & XRTP_FLAG_RECOLOUR) || !(idx = nv2a_tex_pack_texels(e)))
+        return NULL;
+    if (e->texels > s_recolour_cap) {
+        uint32_t *p = (uint32_t *)realloc(s_recolour_buf, e->texels * 4u);
+        if (!p)
+            return NULL;
+        s_resident += (e->texels - s_recolour_cap) * 4u;
+        s_recolour_buf = p;
+        s_recolour_cap = e->texels;
+    }
+    nv2a_tex_pack_recolour_texels(idx, e->texels, pal, pal_len, s_recolour_buf);
+    return s_recolour_buf;
 }
 
 static void lru_unlink(struct nv2a_tex_pack_entry *e)
@@ -596,7 +800,18 @@ void nv2a_tex_pack_set_keep(int keep)
 
 void nv2a_tex_pack_release(struct nv2a_tex_pack_entry *e)
 {
-    if (!e || !e->data || s_keep)
+    /* A recolour entry's payload serves each palette of its plane: the hub
+     * swaps 7 on one plane within 30 flips, and each would read it again.
+     * The buffer its texels went up from is done with: a large one is not
+     * kept for the next. */
+    if (e && (e->flags & XRTP_FLAG_RECOLOUR)
+            && s_recolour_cap * 4u > NV2A_TEX_PACK_RECOLOUR_KEEP) {
+        s_resident -= s_recolour_cap * 4u;
+        free(s_recolour_buf);
+        s_recolour_buf = NULL;
+        s_recolour_cap = 0;
+    }
+    if (!e || !e->data || s_keep || (e->flags & XRTP_FLAG_RECOLOUR))
         return;
     lru_unlink(e);
     s_resident -= e->bytes;
@@ -624,6 +839,9 @@ void nv2a_tex_pack_miss(uint64_t hash, uint32_t w, uint32_t h, uint32_t color,
         why = !(mask & PACK_ON)              ? NV2A_TEX_PACK_MISS_PACK_OFF
             : !(mask & (1u << e->kind))      ? NV2A_TEX_PACK_MISS_KIND_OFF
             :                                  NV2A_TEX_PACK_MISS_REFUSED;
+    /* A P8 texture whose plane's recolour entry was found just before. */
+    else if (s_rc_set && s_rc_hash == hash)
+        why = s_rc_why;
     for (i = 0; i < s_miss_n; i++) {
         m = &s_miss[i];
         if (m->hash == hash && m->width == w && m->height == h && m->color == color) {
@@ -645,7 +863,7 @@ void nv2a_tex_pack_miss(uint64_t hash, uint32_t w, uint32_t h, uint32_t color,
     m->levels = levels;
     m->count = 1;
     m->why = why;
-    m->kind = e ? e->kind : 0;
+    m->kind = e ? e->kind : (s_rc_set && s_rc_hash == hash) ? s_rc_kind : 0;
     /* What a pack can hold: the texture dump writes the decoded texels of
      * any swizzled or DXT upload, palette or mips included, under this very
      * hash. A linear upload is a render target or a movie frame, which a
@@ -740,6 +958,7 @@ static const char *why_name(const struct nv2a_tex_pack_miss *m)
     case NV2A_TEX_PACK_MISS_KIND_OFF:
         return m->kind < XRTP_KIND_COUNT ? kind_off[m->kind] : " (kind off)";
     case NV2A_TEX_PACK_MISS_REFUSED:  return " (entry refused)";
+    case NV2A_TEX_PACK_MISS_VOLATILE: return " (palette volatile)";
     default:                          return "";
     }
 }

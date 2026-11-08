@@ -19,6 +19,8 @@ upper-case hex digits. A dumped `<hash>` is the key of the pack entry that
 would replace that texture. A P8 texture's hash has its palette folded in
 (`nv2a_stage_hash`), so an entry built from its dump replaces that one palette:
 the same indices under another palette are another hash and another dump.
+Its sidecar also names the index plane's own hash (`plane_hash`), the key of
+a recolour pack entry that serves every palette.
 
 ## Files
 
@@ -26,6 +28,22 @@ Per hash:
 
 - `<hash>.xtd`: a 64-byte header, then the decoded texels.
 - `<hash>.json`: the facts about the texture (below).
+
+Per P8 index plane, with the first dumped texture of that plane:
+
+- `<plane_hash>.xti`: the `.xtd` header with magic `XRTI`, the plane hash at
+  +8 and the byte count at +48, then the guest's index bytes exactly as
+  `plane_hash` hashed them (swizzled, every level packed, `nv2a_tex_extent`
+  bytes). A reader checks the key with `nv2a_tex_hash` and unswizzles them
+  itself. The indices cannot be read back from the decoded texels where a
+  palette repeats a colour, and some games keep no readable file of the plane
+  (a packed archive), so a recolour entry is built from this file. It is
+  written once per plane; a later palette of the plane adds a `.json` and an
+  `.xtd`, not a second `.xti`. Dumps from before it lack the file, and so
+  can a reused directory: a plane whose address had already reached
+  `NV2A_TEX_DUMP_VOLATILE` in the earlier run is skipped before the `.xti`
+  write. A pack builder treats a missing `.xti` as "no recolour entry for
+  this plane" and falls back to exact entries.
 
 Rewritten at each summary (every 600 flips and at a normal exit), when
 anything changed; a run stopped by a signal (SIGINT from a bench timeout)
@@ -92,6 +110,12 @@ entry, so a dumped texture goes into a pack unchanged.
 - `format`: the D3D name of the guest format, `LIN_` for the linear ones,
   `fmtXX` for one without a name; `format_id` is the register value.
 - `layout`: `swizzled`, `linear` or `dxt`.
+- `plane_hash`, `palette_argb`: a P8 texture's only (`"palette": true`),
+  between `palette_len` and `wrap_u`. `plane_hash` is the hash of its index
+  bytes alone (`nv2a_stage_plane_hash`, the key of a v5 recolour entry in
+  texture-pack.md), 16 hex digits written like `hash`; `palette_argb` is the palette bound at the upload, one
+  string of 8 hex digits (`AARRGGBB`) per entry, `palette_len` entries (256 at
+  most). Older dumps lack both.
 - `wrap_u`, `wrap_v`: `wrap`, `mirror`, `clamp_edge`, `border`, `clamp`, as
   sampled.
 - `min_filter`: `point`, `linear`, `point_mip_point`, `linear_mip_point`,

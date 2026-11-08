@@ -560,13 +560,75 @@ static int write_xtd(const struct nv2a_stage *t, uint64_t hash, const uint32_t *
 static void print_facts(FILE *f, uint64_t hash);
 static MagSlot *mag_slot(uint64_t hash, int add);
 
-static int write_json(const struct nv2a_stage *t, uint64_t hash, int texels)
+/* A P8 upload's index plane and live palette (nv2a_tex_dump_upload_p8). */
+struct p8_facts {
+    uint64_t plane_hash;
+    const uint8_t *plane;
+    uint32_t plane_bytes;
+    const uint32_t *pal;
+    uint32_t pal_len;
+};
+
+/* <plane_hash>.xti once per plane: the guest's index bytes as
+ * nv2a_stage_plane_hash read them (swizzled, every level), so a reader
+ * checks the key and unswizzles them itself. Decoded texels cannot give
+ * the indices back where a palette repeats a colour. Returns the bytes
+ * written, 0 when the file was already there or on an error. */
+static uint64_t write_xti(const struct nv2a_stage *t, const struct p8_facts *p8)
+{
+    uint8_t hdr[NV2A_TEX_DUMP_HDR];
+    char name[48], tmp[sizeof s_dir + 64], path[sizeof s_dir + 64];
+    FILE *f;
+
+    if (!p8->plane || !p8->plane_bytes)
+        return 0;
+    snprintf(name, sizeof name, "%016llX.xti", (unsigned long long)p8->plane_hash);
+    snprintf(path, sizeof path, "%s/%s", s_dir, name);
+    if ((f = fopen(path, "rb")) != NULL) {
+        fclose(f);
+        return 0;
+    }
+    memset(hdr, 0, sizeof hdr);
+    memcpy(hdr, NV2A_TEX_DUMP_XTI_MAGIC, 4);
+    wr32(hdr + 4, NV2A_TEX_DUMP_VERSION);
+    wr64(hdr + 8, p8->plane_hash);
+    wr32(hdr + 16, t->width);
+    wr32(hdr + 20, t->height);
+    wr32(hdr + 24, t->levels);
+    wr32(hdr + 28, t->color);
+    wr32(hdr + 32, t->pitch);
+    wr32(hdr + 36, layout_flags(t));
+    wr32(hdr + 40, (uint32_t)s_flip);
+    wr32(hdr + 44, NV2A_TEX_DUMP_HDR);
+    wr64(hdr + 48, (uint64_t)p8->plane_bytes);
+    if (!(f = open_tmp(tmp, sizeof tmp, name)))
+        return 0;
+    fwrite(hdr, 1, sizeof hdr, f);
+    fwrite(p8->plane, 1, p8->plane_bytes, f);
+    return commit_tmp(tmp, name, f) ? NV2A_TEX_DUMP_HDR + (uint64_t)p8->plane_bytes : 0;
+}
+
+static int write_json(const struct nv2a_stage *t, uint64_t hash, int texels,
+                      const struct p8_facts *p8)
 {
     char name[48], tmp[sizeof s_dir + 64], fbuf[8];
+    /* The P8 lines: the plane's key and the palette as one hex string, 8
+     * digits (AARRGGBB) per entry; 256 entries at most. */
+    static char p8buf[96 + 8 * 256];
     const char *fn = fmt_name(t->color);
     uint32_t fl = layout_flags(t);
     FILE *f;
 
+    p8buf[0] = '\0';
+    if (p8 && (fl & XTD_FLAG_PALETTE)) {
+        uint32_t i, n = p8->pal ? (p8->pal_len < 256u ? p8->pal_len : 256u) : 0u;
+        int k = snprintf(p8buf, sizeof p8buf, "  \"plane_hash\": \"%016llX\",\n"
+                                              "  \"palette_argb\": \"",
+                         (unsigned long long)p8->plane_hash);
+        for (i = 0; i < n; i++)
+            k += snprintf(p8buf + k, sizeof p8buf - (size_t)k, "%08X", p8->pal[i]);
+        snprintf(p8buf + k, sizeof p8buf - (size_t)k, "\",\n");
+    }
     if (!fn) {
         snprintf(fbuf, sizeof fbuf, "fmt%02X", t->color & 0xFFu);
         fn = fbuf;
@@ -586,6 +648,7 @@ static int write_json(const struct nv2a_stage *t, uint64_t hash, int texels)
             "  \"layout\": \"%s\",\n"
             "  \"palette\": %s,\n"
             "  \"palette_len\": %u,\n"
+            "%s"
             "  \"wrap_u\": \"%s\",\n"
             "  \"wrap_v\": \"%s\",\n"
             "  \"min_filter\": \"%s\",\n"
@@ -601,6 +664,7 @@ static int write_json(const struct nv2a_stage *t, uint64_t hash, int texels)
             fl & XTD_FLAG_DXT ? "dxt" : fl & XTD_FLAG_SWIZZLED ? "swizzled" : "linear",
             fl & XTD_FLAG_PALETTE ? "true" : "false",
             fl & XTD_FLAG_PALETTE ? t->pal_len : 0u,
+            p8buf,
             wrap_name(t->addr_u), wrap_name(t->addr_v), min_name(t->filter),
             mag_name(t->filter), t->lod_min, t->lod_max, t->cube ? "true" : "false",
             t->offset, (unsigned long long)s_flip, texels ? "true" : "false");
@@ -637,8 +701,44 @@ static int rt_bound(uint32_t offset, uint32_t width, uint32_t height)
     return 0;
 }
 
+static void dump_upload(const struct nv2a_stage *t, uint64_t hash, const uint32_t *levels,
+                        const struct p8_facts *p8);
+
 void nv2a_tex_dump_upload(const struct nv2a_stage *t, uint64_t hash,
                           const uint32_t *levels)
+{
+    dump_upload(t, hash, levels, NULL);
+}
+
+void nv2a_tex_dump_upload_p8(const struct nv2a_stage *t, uint64_t hash,
+                             const uint32_t *levels, uint64_t plane_hash,
+                             const uint8_t *plane, uint32_t plane_bytes,
+                             const uint32_t *pal, uint32_t pal_len)
+{
+    struct p8_facts p8;
+    p8.plane_hash = plane_hash;
+    p8.plane = plane;
+    p8.plane_bytes = plane_bytes;
+    p8.pal = pal;
+    p8.pal_len = pal_len;
+    dump_upload(t, hash, levels, &p8);
+}
+
+void nv2a_stage_dump_upload(const uint8_t *mem, const struct nv2a_stage *t, uint64_t hash,
+                            const uint32_t *levels)
+{
+    if (t->color == NV2A_TEX_P8 && nv2a_tex_dump_wants(t, hash))
+        nv2a_tex_dump_upload_p8(t, hash, levels, nv2a_stage_plane_hash(mem, t),
+                                mem + t->offset,
+                                nv2a_tex_extent(t->color, t->width, t->height, t->pitch,
+                                                t->levels),
+                                (const uint32_t *)(mem + t->palette), t->pal_len);
+    else
+        nv2a_tex_dump_upload(t, hash, levels);
+}
+
+static void dump_upload(const struct nv2a_stage *t, uint64_t hash, const uint32_t *levels,
+                        const struct p8_facts *p8)
 {
     AddrSlot *a;
     HashSlot *h;
@@ -695,7 +795,7 @@ void nv2a_tex_dump_upload(const struct nv2a_stage *t, uint64_t hash,
         return;
     }
     if (c == UP_LINEAR) {
-        if (write_json(t, hash, 0)) {
+        if (write_json(t, hash, 0, p8)) {
             h->done = 1;
             s_st.linear++;
         } else {
@@ -721,7 +821,7 @@ void nv2a_tex_dump_upload(const struct nv2a_stage *t, uint64_t hash,
         } else if (!write_xtd(t, hash, levels, n)) {
             h->tries++;
             s_st.errors++;
-        } else if (!write_json(t, hash, 1)) {
+        } else if (!write_json(t, hash, 1, p8)) {
             /* An .xtd without its sidecar is not a dump entry; the next
              * upload of the hash writes both again. */
             remove_file(hash, "xtd");
@@ -732,6 +832,9 @@ void nv2a_tex_dump_upload(const struct nv2a_stage *t, uint64_t hash,
             s_st.written++;
             s_st.texels += n;
             s_st.bytes += bytes;
+            /* A missing .xti only loses the indices: the texture is dumped. */
+            if (p8 && p8->plane_hash)
+                s_st.bytes += write_xti(t, p8);
         }
     }
     unlock();
@@ -1254,8 +1357,9 @@ static void rewrite_sidecar(uint64_t hash)
         return;
     n = fread(buf, 1, sizeof buf, f);
     fclose(f);
-    /* The dump's own sidecars are under 500 bytes. A longer file is not one of
-     * them, and rewriting a cut copy would leave the inventory corrupt JSON. */
+    /* The dump's own sidecars are under 500 bytes, about 3 KB with a
+     * 256-entry palette and every fact. A longer file is not one of them,
+     * and rewriting a cut copy would leave the inventory corrupt JSON. */
     if (n == sizeof buf) {
         fprintf(stderr, "[TEXDUMP] %s: over %zu bytes, facts not written\n",
                 name, sizeof buf - 1);

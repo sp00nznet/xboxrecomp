@@ -1131,6 +1131,9 @@ static void pack_apply_file(const char *path)
                 nv2a_tex_pack_kind_count(XRTP_KIND_TEXT),
                 nv2a_tex_pack_kind_count(XRTP_KIND_WORLD), nv2a_tex_pack_version(),
                 nv2a_tex_pack_detile_count());
+        if (nv2a_tex_pack_recolour_count())
+            fprintf(stderr, "[ENHANCE] textures.pack live: %u recolour entries\n",
+                    nv2a_tex_pack_recolour_count());
     }
     req_lock();
     memcpy(s_pack_said, said, sizeof s_pack_said);
@@ -1252,12 +1255,42 @@ unsigned nv2a_bump_sources(const struct nv2a_stage st[4], int combiner,
     return m;
 }
 
+uint64_t nv2a_stage_palette_hash(const uint8_t *mem, const struct nv2a_stage *t)
+{
+    return nv2a_tex_hash(mem + t->palette, t->pal_len * 4u, NV2A_TEX_HASH_SEED);
+}
+
 uint64_t nv2a_stage_hash(const uint8_t *mem, const struct nv2a_stage *t, uint32_t bytes)
 {
     uint64_t h = nv2a_tex_hash(mem + t->offset, bytes, NV2A_TEX_HASH_SEED);
     if (t->color == NV2A_TEX_P8)
-        h ^= nv2a_tex_hash(mem + t->palette, t->pal_len * 4u, NV2A_TEX_HASH_SEED) * 31u;
+        h ^= nv2a_stage_palette_hash(mem, t) * 31u;
     return h;
+}
+
+uint64_t nv2a_stage_plane_hash(const uint8_t *mem, const struct nv2a_stage *t)
+{
+    return nv2a_tex_hash(mem + t->offset,
+                         nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels),
+                         NV2A_TEX_HASH_SEED);
+}
+
+struct nv2a_tex_pack_entry *nv2a_stage_pack_find(const uint8_t *mem, const struct nv2a_stage *t,
+                                                 uint64_t hash)
+{
+    struct nv2a_tex_pack_entry *e = nv2a_tex_pack_find(hash, t->width, t->height);
+    if (!e && t->color == NV2A_TEX_P8 && !t->cube && nv2a_tex_pack_recolour_count())
+        e = nv2a_tex_pack_find_recolour(nv2a_stage_plane_hash(mem, t),
+                                        nv2a_stage_palette_hash(mem, t), t->width, t->height);
+    return e;
+}
+
+const uint32_t *nv2a_stage_pack_texels(const uint8_t *mem, const struct nv2a_stage *t,
+                                       struct nv2a_tex_pack_entry *e)
+{
+    if (e && (e->flags & XRTP_FLAG_RECOLOUR))
+        return nv2a_tex_pack_recolour(e, (const uint32_t *)(mem + t->palette), t->pal_len);
+    return nv2a_tex_pack_texels(e);
 }
 
 unsigned nv2a_stage_aniso(const struct nv2a_stage *t, int mip, int min_linear,

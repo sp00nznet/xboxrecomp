@@ -1503,6 +1503,7 @@ static int tex_decode_guest(const Stage *t, uint32_t faces)
 static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
 {
     id<MTLTexture> tex = nil;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
 
     s_up_scale = 1;
     s_up_levels = t->levels;
@@ -1521,7 +1522,9 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
         return tex;
     }
     if (nv2a_tex_pack_count()) {
-        struct nv2a_tex_pack_entry *pe = nv2a_tex_pack_find(hash, t->width, t->height);
+        /* The exact entry, else a P8 plane's recolour entry under the
+         * palette bound now. */
+        struct nv2a_tex_pack_entry *pe = nv2a_stage_pack_find(mem, t, hash);
         const uint32_t *src = NULL;
         if (pe && pe->bc && !s_bc) {
             static int said;
@@ -1529,7 +1532,7 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
                 fprintf(stderr, LOGP "textures.pack: this GPU has no BC textures; BC1 and BC3"
                                      " entries go up from the guest\n");
         } else if (pe) {
-            src = nv2a_tex_pack_texels(pe);
+            src = nv2a_stage_pack_texels(mem, t, pe);
         }
         if (src)
             tex = tex_make(pe->width, pe->height, pe->levels, src, pe->bc);
@@ -1538,6 +1541,10 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
             s_up_levels = pe->levels;
             s_up_detile = (pe->flags & XRTP_FLAG_DETILE_HEX) != 0;
             nv2a_tex_pack_release(pe);
+        } else if (src && (pe->flags & XRTP_FLAG_RECOLOUR)) {
+            /* Refused: the recolour output buffer is done with all the
+             * same, and past its threshold release frees it. */
+            nv2a_tex_pack_release(pe);
         }
         /* A refused entry is a miss too, tagged so in the trace. */
         if (!tex)
@@ -1545,14 +1552,14 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
         /* RECOMP_DEBUG=tex_dump writes the guest's texels, never the
          * pack's: under a hit they are decoded for it alone, once. */
         else if (nv2a_tex_dump_on())
-            nv2a_tex_dump_upload(t, hash, nv2a_tex_dump_wants(t, hash)
-                                          && tex_decode_guest(t, 1) ? s_texels : NULL);
+            nv2a_stage_dump_upload(mem, t, hash, nv2a_tex_dump_wants(t, hash)
+                                                 && tex_decode_guest(t, 1) ? s_texels : NULL);
     }
     if (!tex) {
         if (!tex_decode_guest(t, 1))
             return nil;
         if (nv2a_tex_dump_on())
-            nv2a_tex_dump_upload(t, hash, s_texels);
+            nv2a_stage_dump_upload(mem, t, hash, s_texels);
         tex = tex_make(t->width, t->height, t->levels, s_texels, 0);
         if (!tex)
             return nil;

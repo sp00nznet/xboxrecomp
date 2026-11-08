@@ -9,9 +9,9 @@
  * view, and a texture the game rewrites stops matching.
  *
  * File format (docs/formats/texture-pack.md), little-endian:
- *   header  "XRTP", u32 version (1 to 4), u32 count, u32 scale,
+ *   header  "XRTP", u32 version (1 to 5), u32 count, u32 scale,
  *           u64 index offset, v1: u64 reserved; v2: u32 text scale,
- *           u32 reserved; v3 and v4: u32 text scale, u32 classes
+ *           u32 reserved; v3 to v5: u32 text scale, u32 classes
  *   index   count x 32 bytes, sorted by hash: u64 hash, u32 width,
  *           u32 height, u32 levels, u32 flags, u64 payload offset
  *   payload per entry, level 0 then each further level, one A8R8G8B8
@@ -24,7 +24,13 @@
  * `classes`, a bit per kind present, informational. v4 adds bit 6, a world
  * entry the backends sample hex-tiled under textures.detile
  * (nv2a_hex_tile.h); the CLI writes v4 only for a pack that marks one, so
- * a stock pack stays v3. Each version refuses
+ * a stock pack stays v3. v5 adds bit 7, a recolour entry: keyed by a P8
+ * texture's index plane alone (nv2a_stage_plane_hash), its payload one
+ * (i0, i1, w) per upscaled texel that nv2a_tex_pack_recolour turns into
+ * texels with whatever palette the game has bound, so one entry serves
+ * every palette of the plane (BLiNX 2's custom characters). The exact
+ * entry of a (plane, palette) still wins (nv2a_stage_pack_find). Each
+ * version refuses
  * what it does not define, so a later meaning is never misread. The header
  * scale is the art scale; each entry carries its own size, so text built
  * at 2x and art at 4x share one pack.
@@ -50,7 +56,7 @@ extern "C" {
 #endif
 
 #define NV2A_TEX_PACK_MAGIC   "XRTP"
-#define NV2A_TEX_PACK_VERSION 4u   /* the newest read; 1 to 3 are read too */
+#define NV2A_TEX_PACK_VERSION 5u   /* the newest read; 1 to 4 are read too */
 #define NV2A_TEX_PACK_HDR     32u
 #define NV2A_TEX_PACK_ENTRY   32u
 #define NV2A_TEX_PACK_MAX_DIM 16384u   /* D3D11 and Metal texture limit */
@@ -60,6 +66,25 @@ extern "C" {
  * an art tier (KUF's, 2.5 GB) would otherwise end up whole in memory over
  * a long session. A small pack (BLiNX 2's) never reaches it. */
 #define NV2A_TEX_PACK_RESIDENT_MAX ((size_t)512u << 20)
+/* A recolour entry's plane whose palette keeps changing (a fade, a cycling
+ * palette: water, fire, a flashing HUD) would be recoloured on the CPU at
+ * every change and add an upscaled copy to the GPU cache each time. More
+ * than BURST uploads under a palette other than the plane's previous one
+ * within WINDOW flips mark it volatile: its palettes then go up from the
+ * guest, as with no pack, until QUIET flips pass with no change; the flip
+ * that ends it bumps the generation so its guest copies go up recoloured
+ * again. Each later return doubles the plane's quiet time, up to
+ * QUIET_MAX, since each bump re-uploads every cached texture. A player
+ * picking colours in a menu changes a few a second at most; an animation
+ * changes one each frame. */
+#define NV2A_TEX_PACK_RECOLOUR_BURST     12u
+#define NV2A_TEX_PACK_RECOLOUR_WINDOW    30u
+#define NV2A_TEX_PACK_RECOLOUR_QUIET     60u
+#define NV2A_TEX_PACK_RECOLOUR_QUIET_MAX 1920u
+/* The recolour buffer is kept between uploads up to this size (a 512x512
+ * plane at 2x with mips) and freed after the upload of a larger one; it
+ * counts in the resident bytes. */
+#define NV2A_TEX_PACK_RECOLOUR_KEEP ((size_t)8u << 20)
 
 /* Entry flags: v2's, and v3's on top. */
 #define XRTP_KIND_MASK  0x3u
@@ -74,6 +99,11 @@ extern "C" {
 #define XRTP_FLAG_DETILE_HEX 0x40u /* v4: a world entry, hex-tiled (textures.detile) */
 #define XRTP_FLAGS_KNOWN_V3 (XRTP_KIND_MASK | XRTP_FLAG_BC3 | XRTP_FLAG_BC1)
 #define XRTP_FLAGS_KNOWN_V4 (XRTP_FLAGS_KNOWN_V3 | XRTP_FLAG_DETILE_HEX)
+/* v5: the hash is a P8 index plane's, and each payload texel (u32, little-
+ * endian) holds two palette indices and a weight: bits 0-7 i0, 8-15 i1,
+ * 16-23 w, 24-31 zero. Never with a block format. */
+#define XRTP_FLAG_RECOLOUR 0x80u
+#define XRTP_FLAGS_KNOWN_V5 (XRTP_FLAGS_KNOWN_V4 | XRTP_FLAG_RECOLOUR)
 
 /* nv2a_tex_pack_entry.bc: the payload's block format. */
 #define XRTP_BC_NONE 0
@@ -91,6 +121,9 @@ struct nv2a_tex_pack_entry {
     uint32_t *data;           /* read on use; NULL until then or once freed */
     /* Read entries, most recently used first (the resident budget). */
     struct nv2a_tex_pack_entry *lru_prev, *lru_next;
+    /* A recolour entry's recent palettes and volatile state, allocated at
+     * its first find_recolour. */
+    struct nv2a_tex_pack_palettes *pal;
 };
 
 /* Load `path`: validates the header, the index bounds against the file
@@ -116,6 +149,9 @@ unsigned nv2a_tex_pack_bc3_count(void);
 /* Entries marked XRTP_FLAG_DETILE_HEX, for the log line and the backends:
  * 0, and no draw takes the hex variant. */
 unsigned nv2a_tex_pack_detile_count(void);
+/* Entries marked XRTP_FLAG_RECOLOUR: 0, and no upload computes a plane
+ * hash or looks one up. */
+unsigned nv2a_tex_pack_recolour_count(void);
 /* The scale the TEXT entries were built at: the u32 at header +24 from v2
  * on (0 in the file means the header scale). Informational, like the scale. */
 unsigned nv2a_tex_pack_text_scale(void);
@@ -141,9 +177,40 @@ uint64_t nv2a_tex_pack_hits(void);
  * texture's folds its palette in, so an entry built from a dump matches
  * that one palette (the pack holds decoded texels, never a palette, and the
  * archive path cannot name such a hash). An entry whose aspect differs from the guest texture's (guest_w x guest_h) is
- * not taken, nor counted as a hit. */
+ * not taken, nor counted as a hit. A recolour entry is never returned here. */
 struct nv2a_tex_pack_entry *nv2a_tex_pack_find(uint64_t hash, uint32_t guest_w,
                                                uint32_t guest_h);
+/* The recolour entry for a P8 index plane's hash (nv2a_stage_plane_hash)
+ * under the palette whose hash is palette_hash (nv2a_stage_palette_hash),
+ * or NULL; the same switches and aspect rule as find, and NULL while the
+ * plane is volatile (NV2A_TEX_PACK_RECOLOUR_BURST). A plane turning
+ * volatile bumps nv2a_tex_pack_gen(), so the copies it went up with
+ * recoloured go up again from the guest and an animation never mixes the
+ * two. The backends go through nv2a_stage_pack_find, which tries the exact
+ * hash first. */
+struct nv2a_tex_pack_entry *nv2a_tex_pack_find_recolour(uint64_t plane_hash,
+                                                        uint64_t palette_hash,
+                                                        uint32_t guest_w, uint32_t guest_h);
+/* The pack's flip clock for the volatile test, called once a flip on the
+ * walker (nv2a_pb_exec's flip, beside nv2a_tex_pack_snapshot). While a
+ * plane is volatile it also ends the ones quiet for QUIET flips. */
+void nv2a_tex_pack_flip(void);
+/* Planes volatile now, for the tests (the trace tags each miss instead). */
+unsigned nv2a_tex_pack_volatile_count(void);
+/* A recolour entry's texels under palette pal[0..pal_len): per texel
+ * (c0 * (255 - w) + c1 * w + 127) / 255 on each A8R8G8B8 channel of
+ * pal[i0] and pal[i1], an index past the palette magenta as in the decode.
+ * Written to a buffer the pack owns, good until the next call, the
+ * release of a recolour entry or unload; NULL if the payload cannot be
+ * read or the buffer cannot grow. The payload stays held under the
+ * resident budget (release keeps it): the plane's next palette reads it
+ * again. */
+const uint32_t *nv2a_tex_pack_recolour(struct nv2a_tex_pack_entry *e, const uint32_t *pal,
+                                       uint32_t pal_len);
+/* The recolour of n texels, for the tests and the CLI's reference: out[i]
+ * from idx[i] as above. */
+void nv2a_tex_pack_recolour_texels(const uint32_t *idx, size_t n, const uint32_t *pal,
+                                   uint32_t pal_len, uint32_t *out);
 
 /* The entry's payload (e->bytes of it, level 0 first), read from the
  * file when it is not held: e->texels A8R8G8B8 texels, or blocks when
@@ -158,7 +225,9 @@ struct nv2a_tex_pack_entry *nv2a_tex_pack_find(uint64_t hash, uint32_t guest_w,
  * load. */
 const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e);
 /* The backend's GPU copy of the entry exists: the payload is freed, and a
- * later upload reads it again. */
+ * later upload reads it again. A recolour entry's is kept (see
+ * nv2a_tex_pack_recolour), and the recolour buffer is freed when it is
+ * past NV2A_TEX_PACK_RECOLOUR_KEEP. */
 void nv2a_tex_pack_release(struct nv2a_tex_pack_entry *e);
 /* Release does nothing and the payloads stay held under the budget, for A/B
  * (RECOMP_DEBUG=tex_pack_keep, set by the layer that loads a pack). Kept
@@ -181,6 +250,7 @@ void nv2a_tex_pack_set_resident_max(size_t bytes);
 #define NV2A_TEX_PACK_MISS_PACK_OFF 1u   /* it has one; the pack is off */
 #define NV2A_TEX_PACK_MISS_KIND_OFF 2u   /* it has one of a kind turned off */
 #define NV2A_TEX_PACK_MISS_REFUSED  3u   /* it has one the backend could not use */
+#define NV2A_TEX_PACK_MISS_VOLATILE 4u   /* a recolour entry; its palette keeps changing */
 
 struct nv2a_tex_pack_miss {
     uint64_t hash;

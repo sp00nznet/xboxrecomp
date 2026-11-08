@@ -7741,8 +7741,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* The menu's copy of the pack's miss ring, taken here on the
          * walker thread that writes the ring (one load while nothing reads
          * it), then the host actions' tick (enhancements layer, when
-         * armed), which may draw the menu from it. */
+         * armed), which may draw the menu from it. The pack's flip clock
+         * times its volatile palettes. */
         nv2a_tex_pack_snapshot();
+        nv2a_tex_pack_flip();
         nv2a_flip_hook_run();
         /* The window title's FPS and draws: one call per flip, with the
          * draws of the frame just finished. */

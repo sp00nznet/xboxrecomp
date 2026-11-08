@@ -263,6 +263,10 @@ static void load_tex_pack(const struct nv2a_host_opts *o)
     if (n >= 0 && o->detile)
         fprintf(stderr, LOGP "textures.detile=on (%u entries marked)\n",
                 nv2a_tex_pack_detile_count());
+    /* A line of its own, so the load line a tool parses keeps its shape. */
+    if (n >= 0 && nv2a_tex_pack_recolour_count())
+        fprintf(stderr, LOGP "textures.pack: %u recolour entries (P8 planes, any palette)\n",
+                nv2a_tex_pack_recolour_count());
 }
 
 static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };

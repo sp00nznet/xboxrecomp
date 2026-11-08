@@ -50,6 +50,9 @@ struct nv2a_stage;
 #define NV2A_TEX_DUMP_MAGIC    "XRTD"
 #define NV2A_TEX_DUMP_VERSION  1u
 #define NV2A_TEX_DUMP_HDR      64u
+/* <plane_hash>.xti: a P8 index plane, the .xtd header (hash = the plane
+ * hash, +48 = byte count) then the guest's bytes unchanged. */
+#define NV2A_TEX_DUMP_XTI_MAGIC "XRTI"
 /* Distinct hashes one (offset, width, height) may take before it is
  * volatile. A texture a title loads once has one; a palette or a few
  * animation frames swapped in place stay under it. */
@@ -83,6 +86,23 @@ int nv2a_tex_dump_wants(const struct nv2a_stage *t, uint64_t hash);
  * <hash>.json. `levels` may be NULL only when wants said 0. */
 void nv2a_tex_dump_upload(const struct nv2a_stage *t, uint64_t hash,
                           const uint32_t *levels);
+/* The same for a P8 texture, whose sidecar then also names its index
+ * plane's hash (nv2a_stage_plane_hash, a recolour entry's key) and the
+ * palette bound at the upload (pal[0..pal_len), A8R8G8B8): a dump joins a
+ * game file's plane by key, and a recolour pack is checked against the
+ * palettes the game really used. With the dump's first texture of a plane
+ * it also writes <plane_hash>.xti, the guest's index bytes as hashed
+ * (plane[0..plane_bytes)), for a plane no game file holds readably. The
+ * backends call it through nv2a_stage_dump_upload. */
+void nv2a_tex_dump_upload_p8(const struct nv2a_stage *t, uint64_t hash,
+                             const uint32_t *levels, uint64_t plane_hash,
+                             const uint8_t *plane, uint32_t plane_bytes,
+                             const uint32_t *pal, uint32_t pal_len);
+/* What the backends call: nv2a_tex_dump_upload, or for a P8 texture the
+ * dump would write, nv2a_tex_dump_upload_p8 with its plane hash and the
+ * palette at guest memory `mem`. */
+void nv2a_stage_dump_upload(const uint8_t *mem, const struct nv2a_stage *t, uint64_t hash,
+                            const uint32_t *levels);
 
 /* A stage sampling a render target instead of guest texels: counted per
  * bind and per distinct target (offset, size, format), listed in

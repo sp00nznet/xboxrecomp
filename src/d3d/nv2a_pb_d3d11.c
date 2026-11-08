@@ -2032,6 +2032,7 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
     uint32_t l, f;
     int bc = XRTP_BC_NONE;
     struct nv2a_tex_pack_entry *pe = NULL;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     if (e->cube) {
         /* No pack entry is a cube map: the six faces go up from the guest.
          * tex_dump writes face 0, the first texels decoded. */
@@ -2058,8 +2059,10 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
         return 1;
     }
     if (nv2a_tex_pack_count()) {
-        pe = nv2a_tex_pack_find(hash, t->width, t->height);
-        if (pe && (src = nv2a_tex_pack_texels(pe)) != NULL) {
+        /* The exact entry, else a P8 plane's recolour entry under the
+         * palette bound now (into the pack's buffer, never s_texels). */
+        pe = nv2a_stage_pack_find(mem, t, hash);
+        if (pe && (src = nv2a_stage_pack_texels(mem, t, pe)) != NULL) {
             width = pe->width;
             height = pe->height;
             levels = pe->levels;
@@ -2069,8 +2072,12 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
         }
     }
     if (src && !tex_alloc(e, width, height, levels, bc, 0)) {
-        /* A refused entry is a miss too, tagged so in the trace. */
+        /* A refused entry is a miss too, tagged so in the trace. A
+         * recolour entry's output buffer is done with all the same: past
+         * its threshold, release frees it. */
         nv2a_tex_pack_miss(hash, t->width, t->height, t->color, t->levels);
+        if (pe->flags & XRTP_FLAG_RECOLOUR)
+            nv2a_tex_pack_release(pe);
         src = NULL;
         width = t->width;
         height = t->height;
@@ -2081,14 +2088,14 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
      * under a hit they are decoded for it alone, once. s_texels is free
      * for that, since src points into the pack's buffer. */
     if (src && nv2a_tex_dump_on())
-        nv2a_tex_dump_upload(t, hash, nv2a_tex_dump_wants(t, hash) && decode_texture(t, 1)
-                                      ? s_texels : NULL);
+        nv2a_stage_dump_upload(mem, t, hash, nv2a_tex_dump_wants(t, hash) && decode_texture(t, 1)
+                                             ? s_texels : NULL);
     if (!src) {
         if (!decode_texture(t, 1) || !tex_alloc(e, width, height, levels, 0, 0))
             return 0;
         src = s_texels;
         if (nv2a_tex_dump_on())
-            nv2a_tex_dump_upload(t, hash, s_texels);
+            nv2a_stage_dump_upload(mem, t, hash, s_texels);
     }
     /* Block levels go up as they are, one row of 4x4 blocks per pitch. */
     p = (const uint8_t *)src;

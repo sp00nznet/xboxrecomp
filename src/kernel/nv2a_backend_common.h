@@ -1806,6 +1806,25 @@ unsigned nv2a_bump_sources(const struct nv2a_stage st[4], int combiner,
  * pack's key and the dump's file name. A P8 texture's folds its palette in:
  * the same indices under another palette are other texels. */
 uint64_t nv2a_stage_hash(const uint8_t *mem, const struct nv2a_stage *t, uint32_t bytes);
+/* The two halves of a P8 texture's nv2a_stage_hash: the index plane's hash
+ * over nv2a_tex_extent's bytes (a recolour entry's key, the first term of
+ * the stage hash) and the palette's; the stage hash is
+ * plane ^ palette * 31. A 2D stage only: a cube map is never recoloured. */
+uint64_t nv2a_stage_plane_hash(const uint8_t *mem, const struct nv2a_stage *t);
+uint64_t nv2a_stage_palette_hash(const uint8_t *mem, const struct nv2a_stage *t);
+struct nv2a_tex_pack_entry;
+/* The pack entry for a 2D stage whose full hash is `hash`: the exact entry
+ * first (the one a dump of this very palette built), then, for a P8 texture
+ * and a pack holding recolour entries, the recolour entry of its index
+ * plane. NULL when neither; without a recolour entry in the pack this is
+ * nv2a_tex_pack_find and no plane hash is computed. */
+struct nv2a_tex_pack_entry *nv2a_stage_pack_find(const uint8_t *mem, const struct nv2a_stage *t,
+                                                 uint64_t hash);
+/* The entry's payload for stage t: the texels, or for a recolour entry the
+ * texels under the palette t has bound now. NULL when it cannot be read
+ * (the guest texels go up). */
+const uint32_t *nv2a_stage_pack_texels(const uint8_t *mem, const struct nv2a_stage *t,
+                                       struct nv2a_tex_pack_entry *e);
 
 unsigned nv2a_stage_aniso(const struct nv2a_stage *t, int mip, int min_linear,
                           int bump_source);

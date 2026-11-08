@@ -33,6 +33,19 @@
  *   p8        a P8 stage's hash folds its palette; the file the dump writes
  *             under it and a v3 pack built with that hash match the upload,
  *             and the same indices under another palette miss
+ *   recolour  the stage hash is plane ^ palette * 31; the plane hash is the
+ *             index bytes' alone; a P8 sidecar names it and the palette,
+ *             a non-P8 one neither; <plane>.xti holds the bytes it hashed,
+ *             a non-P8 upload writes none; nv2a_stage_pack_find takes the exact
+ *             entry for its palette and the plane's recolour entry for any
+ *             other, never for a non-P8 stage of the same bytes, nor with
+ *             the pack or the kind off; a 1x recolour entry (w = 0) gives
+ *             the guest decode bit for bit under two palettes
+ *   recolour mips  a swizzled 16x8 P8 plane with three levels: the 1x
+ *             recolour entry, found through nv2a_stage_pack_find, gives the
+ *             guest decode of every level; a palette changing every flip
+ *             turns the plane volatile (the guest texels go up, the miss
+ *             says why) and it recolours again once quiet
  */
 #include "nv2a_tex_dump.h"
 #include "nv2a_backend_common.h"
@@ -1066,6 +1079,273 @@ static void test_p8(void)
     remove("tex_dump_p8.pack");
 }
 
+/* v5 pack image: an exact entry for `exact` (2x2 opaque white over the
+ * 4x4 texture's aspect: any texels do) and a 4x4 recolour entry for
+ * `plane` whose payload is `idx`, sorted by hash. */
+static size_t build_v5(uint8_t *buf, uint64_t exact, uint64_t plane, const uint32_t idx[16])
+{
+    size_t idx_off = NV2A_TEX_PACK_HDR, pay = idx_off + 2 * NV2A_TEX_PACK_ENTRY;
+    size_t pay_e = pay, pay_r = pay + 4 * 4, end = pay_r + 16 * 4;
+    int exact_first = exact < plane;
+    uint8_t *ie = buf + idx_off + (exact_first ? 0 : NV2A_TEX_PACK_ENTRY);
+    uint8_t *ir = buf + idx_off + (exact_first ? NV2A_TEX_PACK_ENTRY : 0);
+    unsigned i;
+    memset(buf, 0, end);
+    memcpy(buf, NV2A_TEX_PACK_MAGIC, 4);
+    buf[4] = 5;
+    buf[8] = 2;
+    buf[12] = 1;
+    buf[16] = (uint8_t)idx_off;
+    buf[28] = 1u << XRTP_KIND_WORLD;
+    for (i = 0; i < 8; i++) {
+        ie[i] = (uint8_t)(exact >> (i * 8));
+        ir[i] = (uint8_t)(plane >> (i * 8));
+    }
+    ie[8] = 2; ie[12] = 2; ie[16] = 1; ie[20] = XRTP_KIND_WORLD; ie[24] = (uint8_t)pay_e;
+    ir[8] = 4; ir[12] = 4; ir[16] = 1; ir[20] = XRTP_KIND_WORLD | XRTP_FLAG_RECOLOUR;
+    ir[24] = (uint8_t)pay_r;
+    for (i = 0; i < 4 * 4; i++)
+        buf[pay_e + i] = 0xFF;
+    for (i = 0; i < 16; i++) {
+        buf[pay_r + i * 4] = (uint8_t)idx[i];
+        buf[pay_r + i * 4 + 1] = (uint8_t)(idx[i] >> 8);
+        buf[pay_r + i * 4 + 2] = (uint8_t)(idx[i] >> 16);
+    }
+    return end;
+}
+
+static void test_recolour(void)
+{
+    static uint32_t mem_words[0x4000];   /* palettes are read as words */
+    uint8_t *mem = (uint8_t *)mem_words;
+    static uint32_t ident[256];
+    uint8_t pack[NV2A_TEX_PACK_HDR + 2 * NV2A_TEX_PACK_ENTRY + 4 * 4 + 16 * 4];
+    struct nv2a_stage t = stage(0x1000, NV2A_TEX_P8, 4, 4, 1), a = stage(0x1000, 0x06, 2, 2, 1);
+    uint32_t idx[16], want[16], texels[16] = { 0 };
+    const uint32_t *got;
+    struct nv2a_tex_pack_entry *e;
+    char name[64], err[128] = "", *b;
+    uint64_t plane, h, h2;
+    unsigned i, p;
+    long len;
+    FILE *f;
+
+    t.palette = 0x2000;
+    t.pal_len = 256;
+    for (i = 0; i < 16; i++)
+        mem[0x1000 + i] = (uint8_t)(i * 13 + 5);
+    for (i = 0; i < 256 * 4; i++)
+        mem[0x2000 + i] = (uint8_t)(i * 7 + 1);
+    plane = nv2a_stage_plane_hash(mem, &t);
+    h = nv2a_stage_hash(mem, &t, 16);
+    CHECK(plane == nv2a_tex_hash(mem + 0x1000, 16, NV2A_TEX_HASH_SEED));
+    CHECK(h == (plane ^ nv2a_stage_palette_hash(mem, &t) * 31u));
+
+    /* The sidecar: plane hash and the palette, P8 only. */
+    nv2a_stage_dump_upload(mem, &t, h, texels);
+    name_of(name, sizeof name, h, "json");
+    b = slurp(name, &len);
+    CHECK(b != NULL);
+    if (b) {
+        char want_plane[64], want_pal[32];
+        snprintf(want_plane, sizeof want_plane, "\"plane_hash\": \"%016llX\",\n",
+                 (unsigned long long)plane);
+        snprintf(want_pal, sizeof want_pal, "\"palette_argb\": \"%08X%08X",
+                 (unsigned)rd32(mem + 0x2000), (unsigned)rd32(mem + 0x2004));
+        CHECK(strstr(b, want_plane) != NULL);
+        CHECK(strstr(b, want_pal) != NULL);
+        CHECK(strstr(b, "\"palette_len\": 256,\n  \"plane_hash\"") != NULL);
+        CHECK(len < 4096);
+        free(b);
+    }
+    /* The index plane: the guest's bytes as hashed, after a 64-byte header
+     * keyed by the plane hash. */
+    name_of(name, sizeof name, plane, "xti");
+    b = slurp(name, &len);
+    CHECK(b != NULL && len == NV2A_TEX_DUMP_HDR + 16);
+    if (b && len == NV2A_TEX_DUMP_HDR + 16) {
+        const uint8_t *u = (const uint8_t *)b;
+        CHECK(memcmp(u, NV2A_TEX_DUMP_XTI_MAGIC, 4) == 0);
+        CHECK(rd32(u + 8) == (uint32_t)plane && rd32(u + 12) == (uint32_t)(plane >> 32));
+        CHECK(rd32(u + 16) == 4 && rd32(u + 20) == 4 && rd32(u + 28) == NV2A_TEX_P8);
+        CHECK(rd32(u + 44) == NV2A_TEX_DUMP_HDR && rd32(u + 48) == 16);
+        CHECK(memcmp(u + NV2A_TEX_DUMP_HDR, mem + 0x1000, 16) == 0);
+        CHECK(nv2a_tex_hash(u + NV2A_TEX_DUMP_HDR, 16, NV2A_TEX_HASH_SEED) == plane);
+    }
+    free(b);
+    nv2a_stage_dump_upload(mem, &a, 0x5151ull, texels);
+    name_of(name, sizeof name, 0x5151ull, "xti");
+    CHECK(slurp(name, NULL) == NULL);
+    name_of(name, sizeof name, 0x5151ull, "json");
+    b = slurp(name, NULL);
+    CHECK(b && !strstr(b, "plane_hash") && !strstr(b, "palette_argb"));
+    free(b);
+
+    /* The guest's indices in decode order: the decode under palette[i] = i. */
+    for (i = 0; i < 256; i++)
+        ident[i] = i;
+    nv2a_tex_decode(mem + 0x1000, NV2A_TEX_P8, 4, 4, 0, 1, ident, 256, idx);
+    f = fopen("tex_dump_v5.pack", "wb");
+    CHECK(f != NULL);
+    if (!f)
+        return;
+    fwrite(pack, 1, build_v5(pack, h, plane, idx), f);
+    fclose(f);
+    CHECK(nv2a_tex_pack_load("tex_dump_v5.pack", err, sizeof err) == 2);
+    CHECK(nv2a_tex_pack_recolour_count() == 1);
+
+    /* The exact entry for this palette; the recolour one for another. */
+    e = nv2a_stage_pack_find(mem, &t, h);
+    CHECK(e && !(e->flags & XRTP_FLAG_RECOLOUR) && e->width == 2);
+    for (p = 0; p < 2; p++) {
+        /* First a full hash the pack has no exact entry for, then a
+         * palette the dump never saw. */
+        if (p)
+            mem[0x2000 + 4 * idx[3]] ^= 0x5A;
+        h2 = p ? nv2a_stage_hash(mem, &t, 16) : h ^ 1u;
+        CHECK(h2 != h);
+        e = nv2a_stage_pack_find(mem, &t, h2);
+        CHECK(e && (e->flags & XRTP_FLAG_RECOLOUR) && e->width == 4);
+        got = nv2a_stage_pack_texels(mem, &t, e);
+        nv2a_tex_decode(mem + 0x1000, NV2A_TEX_P8, 4, 4, 0, 1, (const uint32_t *)(mem + 0x2000),
+                        256, want);
+        CHECK(got && memcmp(got, want, sizeof want) == 0);
+        nv2a_tex_pack_release(e);
+        CHECK(e->data != NULL);   /* kept for the plane's next palette */
+    }
+    /* A non-P8 texture whose full hash is the plane's (the same bytes) is
+     * never recoloured. */
+    a.width = a.height = 4;
+    CHECK(nv2a_stage_pack_find(mem, &a, plane) == NULL);
+    /* Switches apply to recolour entries too. */
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_WORLD, 0);
+    CHECK(nv2a_stage_pack_find(mem, &t, h ^ 1u) == NULL);
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_WORLD, 1);
+    nv2a_tex_pack_set_enabled(0);
+    CHECK(nv2a_stage_pack_find(mem, &t, h ^ 1u) == NULL);
+    nv2a_tex_pack_set_enabled(1);
+    CHECK(nv2a_stage_pack_find(mem, &t, h ^ 1u) != NULL);
+    nv2a_tex_pack_unload();
+    CHECK(nv2a_tex_pack_recolour_count() == 0);
+    remove("tex_dump_v5.pack");
+}
+
+/* A v5 pack of one w x h recolour entry of `levels` for `plane`, payload
+ * `idx` (texels of it); returns the file size. */
+static size_t build_v5_one(uint8_t *buf, uint64_t plane, uint32_t w, uint32_t h,
+                           uint32_t levels, const uint32_t *idx, size_t texels)
+{
+    size_t ix = NV2A_TEX_PACK_HDR, pay = ix + NV2A_TEX_PACK_ENTRY, i;
+    memset(buf, 0, pay);
+    memcpy(buf, NV2A_TEX_PACK_MAGIC, 4);
+    buf[4] = 5;
+    buf[8] = 1;
+    buf[12] = 1;
+    buf[16] = (uint8_t)ix;
+    buf[28] = 1u << XRTP_KIND_WORLD;
+    for (i = 0; i < 8; i++)
+        buf[ix + i] = (uint8_t)(plane >> (i * 8));
+    buf[ix + 8] = (uint8_t)w;
+    buf[ix + 12] = (uint8_t)h;
+    buf[ix + 16] = (uint8_t)levels;
+    buf[ix + 20] = XRTP_KIND_WORLD | XRTP_FLAG_RECOLOUR;
+    buf[ix + 24] = (uint8_t)pay;
+    for (i = 0; i < texels; i++) {
+        buf[pay + i * 4] = (uint8_t)idx[i];
+        buf[pay + i * 4 + 1] = (uint8_t)(idx[i] >> 8);
+        buf[pay + i * 4 + 2] = (uint8_t)(idx[i] >> 16);
+        buf[pay + i * 4 + 3] = 0;
+    }
+    return pay + texels * 4;
+}
+
+static void test_recolour_mips(void)
+{
+    enum { W = 16, H = 8, LV = 3, N = 16 * 8 + 8 * 4 + 4 * 2 };
+    static uint32_t mem_words[0x4000];
+    static uint8_t pack[NV2A_TEX_PACK_HDR + NV2A_TEX_PACK_ENTRY + N * 4];
+    static uint32_t ident[256], idx[N], want[N];
+    uint8_t *mem = (uint8_t *)mem_words;
+    struct nv2a_stage t = stage(0x1000, NV2A_TEX_P8, W, H, LV);
+    struct nv2a_tex_pack_entry *e;
+    const uint32_t *got;
+    char err[128] = "";
+    uint64_t plane, h;
+    unsigned i, k, vol0;
+    FILE *f;
+
+    t.palette = 0x2000;
+    t.pal_len = 256;
+    CHECK(nv2a_tex_extent(NV2A_TEX_P8, W, H, 0, LV) == N);
+    for (i = 0; i < N; i++)
+        mem[0x1000 + i] = (uint8_t)(i * 29 + 3);
+    for (i = 0; i < 256 * 4; i++)
+        mem[0x2000 + i] = (uint8_t)(i * 11 + 7);
+    for (i = 0; i < 256; i++)
+        ident[i] = i;
+    /* The indices in decode order, every level unswizzled on its own. */
+    nv2a_tex_decode(mem + 0x1000, NV2A_TEX_P8, W, H, 0, LV, ident, 256, idx);
+    plane = nv2a_stage_plane_hash(mem, &t);
+    f = fopen("tex_dump_v5_mips.pack", "wb");
+    CHECK(f != NULL);
+    if (!f)
+        return;
+    fwrite(pack, 1, build_v5_one(pack, plane, W, H, LV, idx, N), f);
+    fclose(f);
+    CHECK(nv2a_tex_pack_load("tex_dump_v5_mips.pack", err, sizeof err) == 1);
+    for (i = 0; i < 4; i++)
+        nv2a_tex_pack_flip();   /* past the load's bump */
+
+    h = nv2a_stage_hash(mem, &t, N);
+    e = nv2a_stage_pack_find(mem, &t, h);
+    CHECK(e && (e->flags & XRTP_FLAG_RECOLOUR) && e->levels == LV && e->texels == N);
+    got = nv2a_stage_pack_texels(mem, &t, e);
+    nv2a_tex_decode(mem + 0x1000, NV2A_TEX_P8, W, H, 0, LV, (const uint32_t *)(mem + 0x2000),
+                    256, want);
+    CHECK(got && memcmp(got, want, sizeof want) == 0);
+    nv2a_tex_pack_release(e);
+
+    /* A fade: a new palette every flip. BURST of them in the window (the
+     * first palette included) are recoloured; the next turns the plane
+     * volatile. */
+    vol0 = nv2a_tex_pack_volatile_count();
+    for (k = 1; k < NV2A_TEX_PACK_RECOLOUR_BURST; k++) {
+        mem[0x2000] = (uint8_t)(0x80u + k);
+        nv2a_tex_pack_flip();
+        CHECK(nv2a_stage_pack_find(mem, &t, nv2a_stage_hash(mem, &t, N)) != NULL);
+    }
+    mem[0x2000] = 0xEE;
+    nv2a_tex_pack_flip();
+    h = nv2a_stage_hash(mem, &t, N);
+    {
+        uint32_t gen = nv2a_tex_pack_gen();
+        CHECK(nv2a_stage_pack_find(mem, &t, h) == NULL);
+        CHECK(nv2a_tex_pack_volatile_count() == vol0 + 1 && nv2a_tex_pack_gen() != gen);
+    }
+    {
+        struct nv2a_tex_pack_miss m[NV2A_TEX_PACK_MISSES];
+        unsigned n, found = 0;
+        nv2a_tex_pack_miss(h, W, H, NV2A_TEX_P8, LV);
+        n = nv2a_tex_pack_misses(m, NV2A_TEX_PACK_MISSES);
+        for (i = 0; i < n; i++)
+            found |= m[i].hash == h && m[i].why == NV2A_TEX_PACK_MISS_VOLATILE
+                     && m[i].kind == XRTP_KIND_WORLD;
+        CHECK(found);
+    }
+    /* Quiet: QUIET flips with no new palette, then it recolours again. */
+    for (i = 0; i < NV2A_TEX_PACK_RECOLOUR_QUIET; i++)
+        nv2a_tex_pack_flip();
+    mem[0x2000] = 0xEF;
+    e = nv2a_stage_pack_find(mem, &t, nv2a_stage_hash(mem, &t, N));
+    CHECK(e != NULL);
+    got = e ? nv2a_stage_pack_texels(mem, &t, e) : NULL;
+    nv2a_tex_decode(mem + 0x1000, NV2A_TEX_P8, W, H, 0, LV, (const uint32_t *)(mem + 0x2000),
+                    256, want);
+    CHECK(got && memcmp(got, want, sizeof want) == 0);
+    nv2a_tex_pack_unload();
+    remove("tex_dump_v5_mips.pack");
+}
+
 #ifndef _WIN32
 /* The exit lines with the trace on and no dump, from a child that exits:
  * a span-only slot prints its spans and no magnification of 0, and is not
@@ -1119,6 +1399,8 @@ int main(void)
     test_facts();
     test_older_sidecar();
     test_p8();
+    test_recolour();
+    test_recolour_mips();
 #ifndef _WIN32
     test_retry();   /* rename onto a directory fails the POSIX way */
     test_mag_exit_lines();

@@ -28,7 +28,28 @@
  *             and v2 still read
  *   v4        bit 6 (XRTP_FLAG_DETILE_HEX) read and counted on a world
  *             entry, refused on any other kind; v3 still reads; bit 7
- *             refused
+ *             refused, alone or with bit 6, and version 6
+ *   v5        bit 7 (XRTP_FLAG_RECOLOUR) read and counted; find never takes
+ *             a recolour entry and find_recolour only one, each under the
+ *             switches and the aspect rule; the recolour test vector of
+ *             texture-pack.md, through the pack under two palettes; release
+ *             keeps a recolour payload; a block format on one refused;
+ *             with bit 6 on a world entry it loads and keeps both; the
+ *             two-lane blend equals (c0 * (255 - w) + c1 * w + 127) / 255
+ *             for every c0, c1, w on every channel
+ *   volatile  a plane taking more than BURST new palettes within WINDOW
+ *             flips is volatile (find_recolour NULL, the generation bumped,
+ *             a known palette refused too, the miss tagged), and recolours
+ *             again from the flip that ends QUIET flips without a new one,
+ *             which bumps the generation; one new palette every 3 flips never
+ *             is, nor a burst of re-uploads right after a bump; a recolour
+ *             entry switched off by its kind is a "kind off" miss
+ *   volatile cycles  an 8-step and a 16-step palette cycle (palettes it has
+ *             seen) turn volatile and stay so while they play; a recurring
+ *             fade's return waits 2x longer each time, up to QUIET_MAX;
+ *             editor picks every 10 flips stay recoloured
+ *   recolour buffer  counts in the resident bytes; a buffer past
+ *             NV2A_TEX_PACK_RECOLOUR_KEEP is freed at the release
  *   release   frees the payload, a later read brings back the same bytes;
  *             under set_keep it does nothing
  *   bc3       a BC3 entry's payload is its block count x 16, bounds-checked
@@ -630,9 +651,358 @@ static void test_v4(void)
     n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_DETILE_HEX | 0x80u, 8, 4);
     wr32(buf + 4, 4);
     refuse("v4_bit7.pack", buf, n, "unknown flags");
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_RECOLOUR, 8, 4);
+    wr32(buf + 4, 4);
+    refuse("v4_recolour.pack", buf, n, "unknown flags");
     n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_DETILE_HEX, 8, 4);
+    wr32(buf + 4, 6);
+    refuse("v6.pack", buf, n, "version");
+}
+
+/* texture-pack.md's vector: bytes i0, i1, w, 0 under FF000000, FFFFFFFF,
+ * 80FF0000. */
+static const uint32_t RC_PAL[3] = { 0xFF000000u, 0xFFFFFFFFu, 0x80FF0000u };
+static const uint32_t RC_IDX[6] = { 0x00000100u, 0x00FF0100u, 0x00800100u,
+                                    0x00400202u, 0x00000300u, 0x00000003u };
+static const uint32_t RC_OUT[6] = { 0xFF000000u, 0xFFFFFFFFu, 0xFF808080u,
+                                    0x80FF0000u, 0xFF000000u, 0xFFFF00FFu };
+
+static void test_v5(void)
+{
+    uint8_t buf[512];
+    char err[128] = "";
+    uint32_t out[TEXELS_B], pal2[3];
+    const uint32_t *px;
+    struct nv2a_tex_pack_entry *e;
+    size_t n, pay_b, held;
+    unsigned i;
+
+    nv2a_tex_pack_recolour_texels(RC_IDX, 6, RC_PAL, 3, out);
+    for (i = 0; i < 6; i++)
+        CHECK(out[i] == RC_OUT[i], "vector %u: %08X, want %08X", i, out[i], RC_OUT[i]);
+    nv2a_tex_pack_recolour_texels(RC_IDX, 1, NULL, 3, out);
+    CHECK(out[0] == 0xFFFF00FFu, "no palette: %08X", out[0]);
+
+    /* A: a 2x2 exact world entry; B: a 4x2 two-level recolour entry. */
+    n = build_pack(buf, HASH_A, HASH_B, 5);
+    pay_b = n - TEXELS_B * 4;
+    wr32(buf + NV2A_TEX_PACK_HDR + 20, XRTP_KIND_WORLD);
+    wr32(buf + NV2A_TEX_PACK_HDR + 52, XRTP_KIND_WORLD | XRTP_FLAG_RECOLOUR);
+    for (i = 0; i < TEXELS_B; i++)
+        wr32(buf + pay_b + i * 4, i < 6 ? RC_IDX[i] : 0x00000001u);
+    write_file("v5.pack", buf, n);
+    CHECK(nv2a_tex_pack_load("v5.pack", err, sizeof err) == 2, "v5 load: '%s'", err);
+    CHECK(nv2a_tex_pack_version() == 5 && nv2a_tex_pack_recolour_count() == 1, "v5 counts");
+    CHECK(nv2a_tex_pack_find(HASH_A, 2, 2) != NULL, "exact entry");
+    CHECK(nv2a_tex_pack_find(HASH_B, 4, 2) == NULL, "find took a recolour entry");
+    CHECK(nv2a_tex_pack_find_recolour(HASH_A, 1, 2, 2) == NULL, "find_recolour took an exact entry");
+    CHECK(nv2a_tex_pack_find_recolour(HASH_B, 1, 4, 4) == NULL, "recolour of another aspect");
+    e = nv2a_tex_pack_find_recolour(HASH_B, 1, 2, 1);
+    CHECK(e && e->width == 4 && e->levels == 2 && e->bytes == TEXELS_B * 4u, "recolour entry");
+    px = nv2a_tex_pack_recolour(e, RC_PAL, 3);
+    CHECK(px != NULL, "recolour read");
+    if (px) {
+        for (i = 0; i < 6; i++)
+            CHECK(px[i] == RC_OUT[i], "pack vector %u: %08X", i, px[i]);
+        CHECK(px[6] == RC_PAL[1] && px[9] == RC_PAL[1], "second level");
+    }
+    held = nv2a_tex_pack_resident_bytes();
+    nv2a_tex_pack_release(e);
+    CHECK(e->data != NULL && nv2a_tex_pack_resident_bytes() == held, "recolour payload released");
+    /* Another palette, the same entry. */
+    pal2[0] = 0xFF102030u;
+    pal2[1] = 0xFF405060u;
+    pal2[2] = 0x00000000u;
+    px = nv2a_tex_pack_recolour(e, pal2, 3);
+    CHECK(px && px[0] == pal2[0] && px[1] == pal2[1] && px[3] == pal2[2]
+          && px[5] == 0xFFFF00FFu, "second palette");
+    CHECK(nv2a_tex_pack_recolour(nv2a_tex_pack_find(HASH_A, 2, 2), pal2, 3) == NULL,
+          "recolour of an exact entry");
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_WORLD, 0);
+    CHECK(nv2a_tex_pack_find_recolour(HASH_B, 1, 4, 2) == NULL, "world off");
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_WORLD, 1);
+    nv2a_tex_pack_unload();
+    CHECK(nv2a_tex_pack_recolour_count() == 0, "recolour count after unload");
+    CHECK(nv2a_tex_pack_find_recolour(HASH_B, 1, 4, 2) == NULL, "after unload");
+
+    /* A block format would blend indices. */
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_BC1 | XRTP_FLAG_RECOLOUR, 8, 4);
     wr32(buf + 4, 5);
-    refuse("v5.pack", buf, n, "version");
+    refuse("v5_bc1.pack", buf, n, "block format");
+    /* Hex tiling samples the recoloured texels: both marks stand. */
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_RECOLOUR | XRTP_FLAG_DETILE_HEX, 8, 4);
+    wr32(buf + 4, 5);
+    /* Index texels, not blocks: 4 bytes each. */
+    memset(buf + n, 0, 8u * 4u * 4u - (n - NV2A_TEX_PACK_HDR - NV2A_TEX_PACK_ENTRY));
+    n = NV2A_TEX_PACK_HDR + NV2A_TEX_PACK_ENTRY + 8u * 4u * 4u;
+    write_file("v5_detile.pack", buf, n);
+    CHECK(nv2a_tex_pack_load("v5_detile.pack", err, sizeof err) == 1
+          && nv2a_tex_pack_recolour_count() == 1 && nv2a_tex_pack_detile_count() == 1,
+          "v5 recolour + detile: '%s'", err);
+    e = nv2a_tex_pack_find_recolour(HASH_C, 1, 4, 2);
+    CHECK(e && (e->flags & XRTP_FLAG_DETILE_HEX) && e->bc == XRTP_BC_NONE
+          && e->bytes == 8u * 4u * 4u, "v5 recolour + detile entry");
+    nv2a_tex_pack_unload();
+    /* v4 and older files still read as before, with no recolour entry. */
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_BC1 | XRTP_FLAG_DETILE_HEX, 8, 4);
+    wr32(buf + 4, 4);
+    write_file("v4_under_v5.pack", buf, n);
+    CHECK(nv2a_tex_pack_load("v4_under_v5.pack", err, sizeof err) == 1
+          && nv2a_tex_pack_recolour_count() == 0, "v4 under v5: '%s'", err);
+    nv2a_tex_pack_unload();
+}
+
+/* Every (c0, c1, w) on all four channels at once: pal[k] puts k, 255 - k,
+ * k ^ 0x5A and k * 7 in the four bytes, so each lane sees another pair. */
+static void test_blend_exhaustive(void)
+{
+    static uint32_t pal[256], idx[65536], out[65536];
+    unsigned w, i0, i1, s, bad = 0;
+    for (i0 = 0; i0 < 256; i0++)
+        pal[i0] = i0 | ((255u - i0) << 8) | ((i0 ^ 0x5Au) << 16) | (((i0 * 7u) & 255u) << 24);
+    for (w = 0; w < 256; w++) {
+        for (i0 = 0; i0 < 256; i0++)
+            for (i1 = 0; i1 < 256; i1++)
+                idx[i0 * 256 + i1] = i0 | (i1 << 8) | (w << 16);
+        nv2a_tex_pack_recolour_texels(idx, 65536, pal, 256, out);
+        for (i0 = 0; i0 < 256; i0++)
+            for (i1 = 0; i1 < 256; i1++)
+                for (s = 0; s < 32; s += 8) {
+                    uint32_t a = (pal[i0] >> s) & 255u, b = (pal[i1] >> s) & 255u;
+                    uint32_t want = (a * (255u - w) + b * w + 127u) / 255u;
+                    if (((out[i0 * 256 + i1] >> s) & 255u) != want && bad++ < 4)
+                        CHECK(0, "blend %02X %02X w %u lane %u: %08X", a, b, w, s,
+                              out[i0 * 256 + i1]);
+                }
+    }
+    CHECK(bad == 0, "blend: %u texels off", bad);
+}
+
+/* v5 pack of HASH_B as a 4x2 recolour entry (two levels), for the volatile
+ * cases. */
+static void load_recolour_b(const char *path)
+{
+    uint8_t buf[512];
+    char err[128] = "";
+    size_t n = build_pack(buf, HASH_A, HASH_B, 5);
+    wr32(buf + NV2A_TEX_PACK_HDR + 20, XRTP_KIND_WORLD);
+    wr32(buf + NV2A_TEX_PACK_HDR + 52, XRTP_KIND_WORLD | XRTP_FLAG_RECOLOUR);
+    write_file(path, buf, n);
+    CHECK(nv2a_tex_pack_load(path, err, sizeof err) == 2, "%s: '%s'", path, err);
+}
+
+static void flips(unsigned n)
+{
+    while (n--)
+        nv2a_tex_pack_flip();
+}
+
+static unsigned miss_why_of(uint64_t hash, uint32_t *kind)
+{
+    struct nv2a_tex_pack_miss m[NV2A_TEX_PACK_MISSES];
+    unsigned n = nv2a_tex_pack_misses(m, NV2A_TEX_PACK_MISSES), i;
+    for (i = 0; i < n; i++)
+        if (m[i].hash == hash) {
+            *kind = m[i].kind;
+            return m[i].why;
+        }
+    return 99;
+}
+
+static void test_volatile(void)
+{
+    uint64_t p;
+    uint32_t gen, kind = 0;
+
+    load_recolour_b("volatile.pack");
+    flips(3);   /* past the load's bump */
+    /* A burst: BURST new palettes go up recoloured, the next does not, and
+     * the generation is bumped so their copies go up again. */
+    for (p = 1; p <= NV2A_TEX_PACK_RECOLOUR_BURST; p++) {
+        flips(1);
+        CHECK(nv2a_tex_pack_find_recolour(HASH_B, p, 4, 2) != NULL, "burst palette %llu",
+              (unsigned long long)p);
+    }
+    gen = nv2a_tex_pack_gen();
+    flips(1);
+    CHECK(nv2a_tex_pack_find_recolour(HASH_B, 100, 4, 2) == NULL, "volatile still recoloured");
+    CHECK(nv2a_tex_pack_volatile_count() == 1 && nv2a_tex_pack_gen() != gen,
+          "volatile count %u", nv2a_tex_pack_volatile_count());
+    /* Re-uploads of a palette it went up with: from the guest now. */
+    CHECK(nv2a_tex_pack_find_recolour(HASH_B, 3, 4, 2) == NULL, "known palette while volatile");
+    nv2a_tex_pack_miss(HASH_B ^ 3u * 31u, 2, 1, 0x0B, 1);
+    CHECK(miss_why_of(HASH_B ^ 3u * 31u, &kind) == NV2A_TEX_PACK_MISS_VOLATILE
+          && kind == XRTP_KIND_WORLD, "volatile miss tag");
+    /* Still changing: the quiet time restarts. */
+    flips(NV2A_TEX_PACK_RECOLOUR_QUIET - 1);
+    CHECK(nv2a_tex_pack_find_recolour(HASH_B, 101, 4, 2) == NULL, "quiet too early");
+    flips(NV2A_TEX_PACK_RECOLOUR_QUIET - 1);
+    CHECK(nv2a_tex_pack_find_recolour(HASH_B, 102, 4, 2) == NULL, "quiet restarted");
+    gen = nv2a_tex_pack_gen();
+    flips(NV2A_TEX_PACK_RECOLOUR_QUIET - 1);
+    CHECK(nv2a_tex_pack_volatile_count() == 1 && nv2a_tex_pack_gen() == gen, "back too early");
+    /* The flip ends it, with no upload, and bumps the generation so the
+     * guest copies go up recoloured again. */
+    flips(1);
+    CHECK(nv2a_tex_pack_volatile_count() == 0 && nv2a_tex_pack_gen() != gen,
+          "quiet: volatile %u", nv2a_tex_pack_volatile_count());
+    CHECK(nv2a_tex_pack_find_recolour(HASH_B, 3, 4, 2) != NULL, "quiet: recolours again");
+    /* Not volatile at once again: it counts afresh. */
+    CHECK(nv2a_tex_pack_find_recolour(HASH_B, 103, 4, 2) != NULL, "quiet: new palette");
+    nv2a_tex_pack_unload();
+    CHECK(nv2a_tex_pack_volatile_count() == 0, "volatile count after unload");
+
+    /* A player picking colours: one new palette every 3 flips, 40 of them. */
+    load_recolour_b("volatile.pack");
+    flips(3);
+    for (p = 1; p <= 40; p++) {
+        flips(3);
+        CHECK(nv2a_tex_pack_find_recolour(HASH_B, p, 4, 2) != NULL, "slow palette %llu",
+              (unsigned long long)p);
+    }
+    /* A bump re-uploads every cached copy at once, a palette change at each
+     * one: not an animation. */
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_ART, 0);
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_ART, 1);
+    flips(1);
+    for (p = 1; p <= 40; p++)
+        CHECK(nv2a_tex_pack_find_recolour(HASH_B, p, 4, 2) != NULL, "re-upload %llu",
+              (unsigned long long)p);
+    CHECK(nv2a_tex_pack_volatile_count() == 0, "slow palettes turned volatile");
+    /* Switched off by its kind: the miss says so, not "absent". */
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_WORLD, 0);
+    CHECK(nv2a_tex_pack_find_recolour(HASH_B, 7, 4, 2) == NULL, "world off");
+    nv2a_tex_pack_miss(HASH_B ^ 7u * 31u, 2, 1, 0x0B, 1);
+    CHECK(miss_why_of(HASH_B ^ 7u * 31u, &kind) == NV2A_TEX_PACK_MISS_KIND_OFF
+          && kind == XRTP_KIND_WORLD, "kind off miss tag");
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_WORLD, 1);
+    nv2a_tex_pack_set_enabled(0);
+    CHECK(nv2a_tex_pack_find_recolour(HASH_B, 8, 4, 2) == NULL, "pack off");
+    nv2a_tex_pack_miss(HASH_B ^ 8u * 31u, 2, 1, 0x0B, 1);
+    CHECK(miss_why_of(HASH_B ^ 8u * 31u, &kind) == NV2A_TEX_PACK_MISS_PACK_OFF, "pack off tag");
+    nv2a_tex_pack_set_enabled(1);
+    /* A full hash no recolour lookup stood for stays "absent". */
+    nv2a_tex_pack_miss(0x4444ull, 2, 1, 0x0B, 1);
+    CHECK(miss_why_of(0x4444ull, &kind) == NV2A_TEX_PACK_MISS_ABSENT, "absent tag");
+    nv2a_tex_pack_unload();
+    remove("volatile.pack");
+}
+
+/* One upload a flip under a cycle of n palettes, for `count` flips; the
+ * number of them recoloured. */
+static unsigned cycle(unsigned n, unsigned count, unsigned *step)
+{
+    unsigned k, got = 0;
+    for (k = 0; k < count; k++) {
+        flips(1);
+        got += nv2a_tex_pack_find_recolour(HASH_B, 1000u + (*step)++ % n, 4, 2) != NULL;
+    }
+    return got;
+}
+
+static void test_volatile_cycles(void)
+{
+    unsigned step = 0, got;
+    uint32_t gen;
+
+    /* An 8-step cycle: every palette is one it has seen, but each step is
+     * an upload (one cache slot per texture), so it turns volatile within
+     * the first window and stays so while it plays. */
+    load_recolour_b("cycles.pack");
+    flips(3);
+    got = cycle(8, NV2A_TEX_PACK_RECOLOUR_BURST + 1u, &step);
+    CHECK(got == NV2A_TEX_PACK_RECOLOUR_BURST && nv2a_tex_pack_volatile_count() == 1,
+          "8-step cycle: %u recoloured, volatile %u", got, nv2a_tex_pack_volatile_count());
+    got = cycle(8, 4u * NV2A_TEX_PACK_RECOLOUR_QUIET, &step);
+    CHECK(got == 0 && nv2a_tex_pack_volatile_count() == 1, "8-step cycle past quiet: %u", got);
+    nv2a_tex_pack_unload();
+
+    /* A 16-step cycle that keeps playing past the quiet window. */
+    load_recolour_b("cycles.pack");
+    flips(3);
+    step = 0;
+    cycle(16, NV2A_TEX_PACK_RECOLOUR_BURST + 1u, &step);
+    got = cycle(16, 4u * NV2A_TEX_PACK_RECOLOUR_QUIET, &step);
+    CHECK(got == 0 && nv2a_tex_pack_volatile_count() == 1, "16-step cycle past quiet: %u", got);
+
+    /* It stops: back after QUIET, then a recurring fade waits twice as long
+     * each time (each return bumps the generation). */
+    gen = nv2a_tex_pack_gen();
+    flips(NV2A_TEX_PACK_RECOLOUR_QUIET);
+    CHECK(nv2a_tex_pack_volatile_count() == 0 && nv2a_tex_pack_gen() != gen, "first return");
+    flips(NV2A_TEX_PACK_RECOLOUR_WINDOW);
+    cycle(16, NV2A_TEX_PACK_RECOLOUR_BURST + 1u, &step);
+    CHECK(nv2a_tex_pack_volatile_count() == 1, "fade again");
+    flips(NV2A_TEX_PACK_RECOLOUR_QUIET);
+    CHECK(nv2a_tex_pack_volatile_count() == 1, "second return after QUIET");
+    flips(NV2A_TEX_PACK_RECOLOUR_QUIET);
+    CHECK(nv2a_tex_pack_volatile_count() == 0, "second return after 2x QUIET");
+    /* The wait stops growing at QUIET_MAX. */
+    for (got = 0; got < 8; got++) {
+        flips(NV2A_TEX_PACK_RECOLOUR_WINDOW);
+        cycle(16, NV2A_TEX_PACK_RECOLOUR_BURST + 1u, &step);
+        flips(NV2A_TEX_PACK_RECOLOUR_QUIET_MAX);
+    }
+    CHECK(nv2a_tex_pack_volatile_count() == 0, "back after QUIET_MAX");
+
+    /* The same plane under one palette per character, changed only when the
+     * player picks (every 10 flips): the change count stays low. */
+    nv2a_tex_pack_unload();
+    load_recolour_b("cycles.pack");
+    flips(3);
+    for (got = 0; got < 60; got++) {
+        flips(10);
+        CHECK(nv2a_tex_pack_find_recolour(HASH_B, 2000u + got % 4u, 4, 2) != NULL,
+              "editor pick %u", got);
+    }
+    CHECK(nv2a_tex_pack_volatile_count() == 0, "editor picks turned volatile");
+    nv2a_tex_pack_unload();
+    remove("cycles.pack");
+}
+
+/* The recolour buffer: in the resident bytes, freed past KEEP. */
+static void test_recolour_buffer(void)
+{
+    const uint32_t w = 2048, h = 1040;   /* 8.1 MiB of texels: past KEEP */
+    size_t pay = NV2A_TEX_PACK_HDR + NV2A_TEX_PACK_ENTRY, n = pay + (size_t)w * h * 4u;
+    uint8_t *buf = (uint8_t *)calloc(1, n);
+    uint32_t pal[1] = { 0xFF123456u };
+    char err[128] = "";
+    struct nv2a_tex_pack_entry *e;
+    const uint32_t *px;
+    size_t held;
+
+    CHECK((size_t)w * h * 4u > NV2A_TEX_PACK_RECOLOUR_KEEP, "case not past KEEP");
+    if (!buf)
+        return;
+    memcpy(buf, NV2A_TEX_PACK_MAGIC, 4);
+    wr32(buf + 4, 5);
+    wr32(buf + 8, 1);
+    wr32(buf + 12, 1);
+    wr64(buf + 16, NV2A_TEX_PACK_HDR);
+    wr32(buf + 28, 1u << XRTP_KIND_WORLD);
+    wr64(buf + NV2A_TEX_PACK_HDR, HASH_C);
+    wr32(buf + NV2A_TEX_PACK_HDR + 8, w);
+    wr32(buf + NV2A_TEX_PACK_HDR + 12, h);
+    wr32(buf + NV2A_TEX_PACK_HDR + 16, 1);
+    wr32(buf + NV2A_TEX_PACK_HDR + 20, XRTP_KIND_WORLD | XRTP_FLAG_RECOLOUR);
+    wr64(buf + NV2A_TEX_PACK_HDR + 24, pay);
+    write_file("rc_big.pack", buf, n);
+    free(buf);
+    CHECK(nv2a_tex_pack_load("rc_big.pack", err, sizeof err) == 1, "rc_big: '%s'", err);
+    e = nv2a_tex_pack_find_recolour(HASH_C, 1, w, h);
+    px = e ? nv2a_tex_pack_recolour(e, pal, 1) : NULL;
+    CHECK(px && px[0] == pal[0] && px[(size_t)w * h - 1] == pal[0], "big recolour");
+    held = nv2a_tex_pack_resident_bytes();
+    CHECK(held == 2u * (size_t)w * h * 4u, "payload + buffer held: %zu", held);
+    nv2a_tex_pack_release(e);
+    CHECK(nv2a_tex_pack_resident_bytes() == (size_t)w * h * 4u,
+          "buffer kept past KEEP: %zu", nv2a_tex_pack_resident_bytes());
+    px = nv2a_tex_pack_recolour(e, pal, 1);
+    CHECK(px && px[17] == pal[0], "recolour after the buffer was freed");
+    nv2a_tex_pack_unload();
+    CHECK(nv2a_tex_pack_resident_bytes() == 0, "resident after unload");
+    remove("rc_big.pack");
 }
 
 static void test_misses(void)
@@ -841,6 +1211,11 @@ int main(void)
     test_bc3();
     test_v3();
     test_v4();
+    test_v5();
+    test_blend_exhaustive();
+    test_volatile();
+    test_volatile_cycles();
+    test_recolour_buffer();
     test_misses();
     test_resident();
     if (fails) {

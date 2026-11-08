@@ -1408,7 +1408,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_tex_dump.c | - | s_rt | file_static | keep | - | debug dump catalog, content-hash keyed |
 | src/kernel/nv2a_tex_dump.c | - | s_rt_n | file_static | keep | - | debug dump catalog, content-hash keyed |
 | src/kernel/nv2a_tex_dump.c | hook_exit_once | hooked | local_static | keep | - | exit hook registered once |
-| src/kernel/nv2a_tex_dump.c | nv2a_tex_dump_upload | why | local_static | keep | - | stop-reason text for log |
+| src/kernel/nv2a_tex_dump.c | dump_upload | why | local_static | keep | - | stop-reason text for log |
+| src/kernel/nv2a_tex_dump.c | write_json | p8buf | local_static | keep | - | scratch text of a P8 sidecar, rewritten at each write |
 | src/kernel/nv2a_tex_dump.c | - | s_mag | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/kernel/nv2a_tex_dump.c | - | s_mag_tab | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/kernel/nv2a_tex_dump.c | - | s_mag_cap | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
@@ -1425,6 +1426,9 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_tex_pack.c | - | s_text_scale | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_kind_count | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_bc3_count | file_static | keep | - | texture pack keyed by content hash |
+| src/kernel/nv2a_tex_pack.c | - | s_recolour_count | file_static | keep | - | texture pack keyed by content hash |
+| src/kernel/nv2a_tex_pack.c | - | s_recolour_buf | file_static | keep | - | recolour output, rewritten at each upload from the bound palette |
+| src/kernel/nv2a_tex_pack.c | - | s_recolour_cap | file_static | keep | - | recolour output, rewritten at each upload from the bound palette |
 | src/kernel/nv2a_tex_pack.c | - | s_path | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_hits | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_lru_head | file_static | keep | - | texture pack keyed by content hash |
@@ -1450,6 +1454,13 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_tex_pack.c | - | s_bc1_count | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_detile_count | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_keep | file_static | keep | - | texture pack keyed by content hash |
+| src/kernel/nv2a_tex_pack.c | - | s_flip | file_static | keep | - | recolour volatile clock, host-side pack state |
+| src/kernel/nv2a_tex_pack.c | - | s_bump_flip | file_static | keep | - | recolour volatile clock, host-side pack state |
+| src/kernel/nv2a_tex_pack.c | - | s_volatile | file_static | keep | - | recolour volatile planes, reset at unload |
+| src/kernel/nv2a_tex_pack.c | - | s_rc_set | file_static | keep | - | last recolour lookup, for the miss tag |
+| src/kernel/nv2a_tex_pack.c | - | s_rc_hash | file_static | keep | - | last recolour lookup, for the miss tag |
+| src/kernel/nv2a_tex_pack.c | - | s_rc_why | file_static | keep | - | last recolour lookup, for the miss tag |
+| src/kernel/nv2a_tex_pack.c | - | s_rc_kind | file_static | keep | - | last recolour lookup, for the miss tag |
 
 ### src/nv2a/nv2a_core.c
 
