@@ -51,6 +51,7 @@
 #include <process.h>
 #else
 #include <unistd.h>
+#include <sys/wait.h>
 #endif
 
 static int s_fail;
@@ -431,9 +432,107 @@ static void test_mag_quantile(void)
     }
 }
 
+/* The shader's span slots for a coordinate range [lo, hi] on one axis. */
+static void span_slots_for(uint32_t *sp, double lo, double hi)
+{
+    uint32_t qlo = (uint32_t)((int32_t)floor(lo * NV2A_TEX_SPAN_ONE) + (int32_t)NV2A_TEX_SPAN_BIAS);
+    uint32_t qhi = (uint32_t)((int32_t)floor(hi * NV2A_TEX_SPAN_ONE) + (int32_t)NV2A_TEX_SPAN_BIAS);
+    sp[0] = qhi + 1u;
+    sp[1] = 2u * NV2A_TEX_SPAN_BIAS - qlo;
+}
+
+/* The repeat span: a draw's slots after its four LOD ones, per stage u then
+ * v, decoded into repeats of the texture; a p90 per axis over the draws, a
+ * maximum, and the sidecar keys. A cleared or impossible pair is no reading,
+ * and a pre-transformed draw's span comes from its vertices. */
+static void test_span(void)
+{
+    static uint32_t slots[NV2A_TEX_MAG_SLOTS * 16];
+    static struct nv2a_tex_mag_draw draws[16];
+    const uint64_t TILE = 0x7171ull, ONCE = 0x7272ull, STRIP = 0x7373ull, PRE = 0x7474ull;
+    uint64_t hash[4] = { TILE, ONCE, STRIP, 0 }, n_draws = 0;
+    uint32_t scale[4] = { 2, 1, 1, 1 };
+    double mx[2], p90[2];
+    struct nv2a_tex_span sp;
+    struct nv2a_stage t = stage(0x48000, 0x06, 4, 4, 1);
+    uint32_t texels[16] = { 0 };
+    char name[64], *b;
+    unsigned n = 0, i;
+    long len;
+
+    CHECK(NV2A_TEX_MAG_SLOTS == 20u && NV2A_TEX_MAG_BYTES == NV2A_TEX_MAG_DRAWS * 80u);
+    nv2a_tex_mag_set_on(1);
+    memset(slots, 0, sizeof slots);
+    for (i = 0; i < 10; i++) {
+        uint32_t *d = slots + (size_t)nv2a_tex_mag_draw_id(draws, &n, hash, scale)
+                      * NV2A_TEX_MAG_SLOTS;
+        d[0] = mag_slot_for(0);
+        /* TILE: four repeats across, -1.5 to 2.5, three down; one draw in ten
+         * eight across. Repeats are the texture's, whatever the entry scale. */
+        span_slots_for(d + 4, -1.5, i == 9 ? 6.5 : 2.5);
+        span_slots_for(d + 6, 0.0, 3.0);
+        /* ONCE: inside one repeat, from 0.02 to 0.98. */
+        span_slots_for(d + 8, 0.02, 0.98);
+        span_slots_for(d + 10, 0.02, 0.98);
+        /* STRIP: u wraps, v stays in one (a joint strip). */
+        span_slots_for(d + 12, 3.0, 9.0);
+        span_slots_for(d + 14, 0.0, 0.5);
+        /* Stage 3 has no hash: its slots are not read. */
+        span_slots_for(d + 16, 0.0, 100.0);
+        span_slots_for(d + 18, 0.0, 100.0);
+    }
+    /* A cleared pair, and a high below a low: no span reading for TILE. */
+    {
+        uint32_t *d = slots + (size_t)nv2a_tex_mag_draw_id(draws, &n, hash, scale)
+                      * NV2A_TEX_MAG_SLOTS;
+        d[4] = 0;
+        d[5] = 1;
+        span_slots_for(d + 6, 1.0, 0.0);
+    }
+    nv2a_tex_mag_fold(draws, n, slots, 1);
+    CHECK(nv2a_tex_span_get(TILE, mx, p90, &n_draws) && n_draws == 10);
+    CHECK(FEQ(p90[0], 4.0) && FEQ(p90[1], 3.0) && FEQ(mx[0], 8.0) && FEQ(mx[1], 3.0));
+    CHECK(nv2a_tex_span_get(ONCE, mx, p90, &n_draws) && n_draws == 10);
+    CHECK(p90[0] < 1.0 && p90[1] < 1.0 && mx[0] < 1.0);
+    CHECK(nv2a_tex_span_get(STRIP, mx, p90, NULL) && FEQ(p90[0], 6.0) && p90[1] <= 0.5);
+    CHECK(!nv2a_tex_span_get(0, NULL, NULL, NULL));
+
+    /* From vertices: texel coordinates on a 64 x 32 texture. */
+    nv2a_tex_span_begin(&sp);
+    {
+        const float a[2] = { -32.0f, 0.0f }, c[2] = { 160.0f, 16.0f }, far[2] = { 1e30f, 8.0f };
+        nv2a_tex_span_take(&sp, a, 64, 32);
+        nv2a_tex_span_take(&sp, c, 64, 32);
+        nv2a_tex_span_take(&sp, far, 64, 32);   /* u not taken, v is */
+        nv2a_tex_span_take(&sp, a, 0, 32);      /* no size: nothing */
+    }
+    nv2a_tex_span_end(&sp, PRE);
+    CHECK(nv2a_tex_span_get(PRE, mx, NULL, NULL) && FEQ(mx[0], 3.0) && FEQ(mx[1], 0.5));
+    /* A span alone is no magnification: the sidecar must not read 0. */
+    CHECK(!nv2a_tex_mag_get(PRE, NULL, NULL, NULL));
+    nv2a_tex_span_begin(&sp);
+    nv2a_tex_span_end(&sp, PRE + 1);
+    CHECK(!nv2a_tex_span_get(PRE + 1, NULL, NULL, NULL));
+
+    nv2a_tex_dump_upload(&t, TILE, texels);
+    nv2a_tex_dump_summary();
+    name_of(name, sizeof name, TILE, "json");
+    b = slurp(name, &len);
+    CHECK(b != NULL);
+    if (b) {
+        CHECK(strstr(b, "\"mag_draws\": 10,\n") != NULL);
+        CHECK(strstr(b, "\"uv_span_u\": 4.000,\n") != NULL);
+        CHECK(strstr(b, "\"uv_span_v\": 3.000,\n") != NULL);
+        CHECK(strstr(b, "\"uv_span_u_max\": 8.000,\n") != NULL);
+        CHECK(strstr(b, "\"uv_span_draws\": 10\n}\n") != NULL);
+        free(b);
+    }
+    nv2a_tex_mag_set_on(0);
+}
+
 static void test_mag(void)
 {
-    static uint32_t slots[NV2A_TEX_MAG_DRAWS * NV2A_TEX_MAG_STAGES];
+    static uint32_t slots[NV2A_TEX_MAG_DRAWS * NV2A_TEX_MAG_SLOTS];
     static struct nv2a_tex_mag_draw draws[NV2A_TEX_MAG_DRAWS];
     const uint64_t HA = 0xA1A1ull, HB = 0xB2B2ull, HC = 0xC3C3ull;
     uint64_t hash[4] = { HA, HB, 0, HC }, n_draws = 0;
@@ -967,6 +1066,44 @@ static void test_p8(void)
     remove("tex_dump_p8.pack");
 }
 
+#ifndef _WIN32
+/* The exit lines with the trace on and no dump, from a child that exits:
+ * a span-only slot prints its spans and no magnification of 0, and is not
+ * counted as a texture. */
+static void test_mag_exit_lines(void)
+{
+    const char *name = "exit_lines.txt";
+    char path[640], *b;
+    long len;
+    pid_t pid;
+    int st = 0;
+    snprintf(path, sizeof path, "%s/%s", s_dir, name);
+    fflush(stderr);
+    pid = fork();
+    if (pid == 0) {
+        FILE *f = freopen(path, "w", stderr);
+        if (!f)
+            _exit(2);
+        nv2a_tex_dump_set_dir(NULL);
+        nv2a_tex_mag_set_on(1);
+        nv2a_tex_mag_note(0xE1E1ull, 2.0, 1);
+        nv2a_tex_span_note(0xE2E2ull, 4.0, 1.0);
+        exit(0);
+    }
+    CHECK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    b = slurp(name, &len);
+    CHECK(b != NULL);
+    if (b) {
+        CHECK(strstr(b, "mag 000000000000E1E1 mag_max=2.000") != NULL);
+        CHECK(strstr(b, "mag 000000000000E2E2 uv_span_u=4.000 uv_span_v=1.000 span_draws=1\n")
+              != NULL);
+        CHECK(strstr(b, "tex_mag: 1 textures, highest 2.000 (000000000000E1E1)") != NULL);
+        free(b);
+    }
+    remove(path);
+}
+#endif
+
 int main(void)
 {
     snprintf(s_dir, sizeof s_dir, "tex_dump_out_%d/a/b", (int)getpid());
@@ -977,12 +1114,14 @@ int main(void)
     test_volatile();
     test_rt_oversize();
     test_mag();
+    test_span();
     test_mag_triangle();
     test_facts();
     test_older_sidecar();
     test_p8();
 #ifndef _WIN32
     test_retry();   /* rename onto a directory fails the POSIX way */
+    test_mag_exit_lines();
 #endif
     nv2a_tex_dump_summary();
     test_cap();

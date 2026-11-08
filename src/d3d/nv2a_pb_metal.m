@@ -1808,7 +1808,7 @@ static void mag_draw(void)
     }
     id = nv2a_tex_mag_draw_id(s_mag[s_mag_cur].rec, &s_mag[s_mag_cur].n, hash, scale);
     [s_enc setFragmentBuffer:s_mag[s_mag_cur].buf
-                      offset:(NSUInteger)id * NV2A_TEX_MAG_STAGES * 4u
+                      offset:(NSUInteger)id * NV2A_TEX_MAG_SLOTS * 4u
                      atIndex:2];
 }
 
@@ -1818,6 +1818,7 @@ static void mag_pretransformed(const float *vf, unsigned nf4, const int *slot,
                                const uint32_t *idx, uint32_t nidx)
 {
     unsigned rs = nv2a_host_render_scale(), k, a;
+    struct nv2a_tex_span span;
     for (k = 0; k < NV2A_TEX_MAG_STAGES; k++) {
         const Stage *t = &s_stage[k];
         int norm = nv2a_tex_size_from_format(t->color), kp = -1, kt = -1;
@@ -1830,6 +1831,7 @@ static void mag_pretransformed(const float *vf, unsigned nf4, const int *slot,
         }
         if (kp < 0 || kt < 0)
             continue;
+        nv2a_tex_span_begin(&span);
         /* A few triangles of each: a 2D batch's pieces share their scale. */
         for (i = 0; s_stage_hash[k] && i + 3 <= nidx && i < 3u * 64u; i += 3) {
             float xy[3][2], uv[3][2];
@@ -1844,11 +1846,13 @@ static void mag_pretransformed(const float *vf, unsigned nf4, const int *slot,
                     uv[c][0] *= (float)t->width;
                     uv[c][1] *= (float)t->height;
                 }
+                nv2a_tex_span_take(&span, uv[c], t->width, t->height);
             }
             nv2a_tex_mag_note(s_stage_hash[k], nv2a_tex_mag_triangle((const float (*)[2])xy,
                                                                      (const float (*)[2])uv) * rs,
                               rs);
         }
+        nv2a_tex_span_end(&span, s_stage_hash[k]);
     }
 }
 

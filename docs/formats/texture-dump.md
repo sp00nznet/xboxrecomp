@@ -228,8 +228,24 @@ every summary:
 "mag_p90": 3.000,      what 9 draws in 10 stay at or under
 "mag_scale1_p90": 1.000, mag_p90 / render_scale, the figure a pack is built for
 "mag_draws": 3127,     readings folded in, one per draw and hash
-"render_scale": 3
+"render_scale": 3,
+"uv_span_u": 4.016,    repeats across one draw covered, what 9 draws in 10 stay at or under
+"uv_span_v": 2.000,    the same down
+"uv_span_u_max": 12.500, the most of any draw, across
+"uv_span_v_max": 3.000,  and down
+"uv_span_draws": 2980  span readings folded in
 ```
+
+The `uv_span_*` keys say whether a draw relies on the texture repeating, per
+axis, which the address mode cannot: WRAP is a game's default for most 3D
+surfaces, a UV-unwrapped prop's too. A span is how far the stage's normalised
+coordinate ran over one draw, in repeats of the texture, at the sampled quads
+(1/64 steps). A texture drawn once stays at or under 1 on both axes; a tile
+reads over 1 on the axes it repeats along, so a strip that wraps along u only
+reads over 1 in u and under it in v. Readings are binned by quarter octave
+(2^-6 to 2^12) like the magnification, for the p90. A hash with span readings
+and no magnification reading (a pre-transformed draw whose triangles have no
+area) has the span keys only, never a figure of 0.
 
 The maximum is one draw's word: a sliver, or a texture stretched over a seam,
 reads tens to millions of pixels per texel on a texture every other draw shows
@@ -240,9 +256,11 @@ when that quarter octave's readings agree (a 1:1 texture reads 1.000).
 
 Without it, each hash gets one line at exit:
 `[TEXDUMP] mag <hash> mag_max=... mag_scale1=... mag_scale1_p90=... draws=...
-render_scale=...`.
+render_scale=... uv_span_u=... uv_span_v=... span_draws=...`, the mag fields
+only with magnification readings and the span fields only with span readings.
 Each summary and exit print `[TEXDUMP] tex_mag: N textures, highest X (<hash>),
-K draws past the frame's slots; an upper bound: occluded fragments count`.
+K draws past the frame's slots; an upper bound: occluded fragments count`,
+N counting the hashes with magnification readings.
 
 Under the trace the combiner shader of a program batch takes one variant
 (`NV2ACombinerState.tex_mag`, in its cache key, so the stock text is untouched)
@@ -253,6 +271,22 @@ slot holds `(32 - lod) * 1024`, so `2^-lod` is the pixels per texel of what is
 bound; a source texel is `scale` texels of a pack entry, so the fold multiplies
 by the entry's scale. A pre-transformed batch takes no variant: its figure comes
 from up to 64 of its triangles on the CPU (`nv2a_tex_mag_triangle`).
+
+The same quads take the repeat span. After its 4 LOD slots, each draw has 4
+per stage (20 in all, `NV2A_TEX_MAG_SLOTS`): u's highest and lowest step, then
+v's. A step is `q = floor(t * 64) + 2^24` of the coordinate `t` the sampler
+wraps (`uv * tex_scale`, before the snap); the shader max's `q + 1` into the
+highest and `2^25 - q` into the lowest, so every slot is a max and a cleared
+one is no sample. The decode is `(q_hi - q_lo) / 64` with `q_hi` the stored
+`q + 1`. A coordinate past 2^18 repeats, or NaN, is not taken. Only true 2D
+stages take a span: cube, 3D, bump-env and dot-product stages read no
+coordinate the texture repeats along. A pre-transformed batch has its span
+from the same triangles' vertices: at most 64 of them, and not stepped to
+1/64.
+
+A span is a lower bound. Only one 2x2 quad per 8x8 tile is sampled, so a
+draw smaller than a tile may be missed, and up to about 7 pixels' worth of
+coordinate is lost at each edge of a draw.
 
 The sampled pixels are a whole quad, never one pixel of it: an LOD comes from
 the derivatives across its quad, and the compiler may move the LOD into the

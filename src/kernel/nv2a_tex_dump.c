@@ -244,12 +244,20 @@ static void summary(int exiting);
  * of a texture every other draw shows at a fraction of it. */
 #define MAG_BINS    112
 #define MAG_BIN_LO  (-8)
+/* The repeat span the same way, per axis: quarter octaves from 1/64 of a
+ * repeat (the shader's step; a draw that never moves reads 0, the first bin)
+ * up to 2^12 repeats. */
+#define SPAN_BINS   72
+#define SPAN_BIN_LO (-6)
 static int s_mag = -1;
 typedef struct {
-    uint64_t hash, draws;
+    uint64_t hash, draws, span_draws;
     double   mag_max;
     uint32_t bins[MAG_BINS];
     float    bin_max[MAG_BINS];
+    float    span_max[2];
+    uint32_t span_bins[2][SPAN_BINS];
+    float    span_bin_max[2][SPAN_BINS];
     unsigned render_scale;
     uint8_t  used, dirty;
 } MagSlot;
@@ -951,10 +959,15 @@ static MagSlot *mag_slot(uint64_t hash, int add)
     return &s_mag_tab[i];
 }
 
+static unsigned quarter_octave(double x, int lo, unsigned n)
+{
+    double b = floor((log2(x) - lo) * 4.0);
+    return !(b >= 0.0) ? 0u : b >= n ? n - 1u : (unsigned)b;
+}
+
 static unsigned mag_bin(double mag)
 {
-    double b = floor((log2(mag) - MAG_BIN_LO) * 4.0);
-    return b < 0.0 ? 0u : b >= MAG_BINS ? MAG_BINS - 1u : (unsigned)b;
+    return quarter_octave(mag, MAG_BIN_LO, MAG_BINS);
 }
 
 /* The figure a fraction q of the readings stay at or under: the largest
@@ -962,23 +975,33 @@ static unsigned mag_bin(double mag)
  * quantile, and exact when the readings of that quarter octave agree: a 1:1
  * texture reads 1, not the octave's edge, which would be one upscale step
  * more. */
-static double mag_quantile(const MagSlot *m, double q)
+static double bins_quantile(const uint32_t *bins, const float *bin_max, unsigned n, double q)
 {
     uint64_t total = 0, run = 0, want;
     unsigned b;
-    for (b = 0; b < MAG_BINS; b++)
-        total += m->bins[b];
+    for (b = 0; b < n; b++)
+        total += bins[b];
     if (!total)
         return 0.0;
     want = (uint64_t)ceil(q * (double)total);
     if (want < 1)
         want = 1;
-    for (b = 0; b < MAG_BINS - 1u; b++) {
-        run += m->bins[b];
+    for (b = 0; b < n - 1u; b++) {
+        run += bins[b];
         if (run >= want)
             break;
     }
-    return m->bin_max[b];
+    return bin_max[b];
+}
+
+static double mag_quantile(const MagSlot *m, double q)
+{
+    return bins_quantile(m->bins, m->bin_max, MAG_BINS, q);
+}
+
+static double span_quantile(const MagSlot *m, int axis, double q)
+{
+    return bins_quantile(m->span_bins[axis], m->span_bin_max[axis], SPAN_BINS, q);
 }
 
 /* Under the lock. */
@@ -997,6 +1020,72 @@ static void mag_add(uint64_t hash, double mag, unsigned render_scale)
     m->draws++;
     m->render_scale = render_scale;
     m->dirty = 1;
+}
+
+/* Under the lock. */
+static void span_add(uint64_t hash, double su, double sv)
+{
+    MagSlot *m = mag_slot(hash, 1);
+    const double s[2] = { su, sv };
+    int a;
+    if (!m)
+        return;
+    for (a = 0; a < 2; a++) {
+        unsigned b = quarter_octave(s[a], SPAN_BIN_LO, SPAN_BINS);
+        if ((float)s[a] > m->span_max[a])
+            m->span_max[a] = (float)s[a];
+        m->span_bins[a][b]++;
+        if ((float)s[a] > m->span_bin_max[a][b])
+            m->span_bin_max[a][b] = (float)s[a];
+    }
+    m->span_draws++;
+    m->dirty = 1;
+}
+
+void nv2a_tex_span_note(uint64_t hash, double span_u, double span_v)
+{
+    if (!hash || !(span_u >= 0.0) || !(span_v >= 0.0))
+        return;
+    lock();
+    span_add(hash, span_u, span_v);
+    unlock();
+}
+
+void nv2a_tex_span_begin(struct nv2a_tex_span *s)
+{
+    s->lo[0] = s->lo[1] = HUGE_VALF;
+    s->hi[0] = s->hi[1] = -HUGE_VALF;
+}
+
+void nv2a_tex_span_take(struct nv2a_tex_span *s, const float texel[2], unsigned w, unsigned h)
+{
+    int a;
+    if (!w || !h)
+        return;
+    for (a = 0; a < 2; a++) {
+        float t = texel[a] / (float)(a ? h : w);
+        /* As the shader's: a far or NaN coordinate is not taken. */
+        if (fabsf(t) < 262144.0f) {
+            s->lo[a] = t < s->lo[a] ? t : s->lo[a];
+            s->hi[a] = t > s->hi[a] ? t : s->hi[a];
+        }
+    }
+}
+
+void nv2a_tex_span_end(const struct nv2a_tex_span *s, uint64_t hash)
+{
+    if (s->hi[0] >= s->lo[0] && s->hi[1] >= s->lo[1])
+        nv2a_tex_span_note(hash, (double)s->hi[0] - s->lo[0], (double)s->hi[1] - s->lo[1]);
+}
+
+/* One axis of a stage's span slots (nv2a_tex_dump.h): -1 when the shader
+ * took no sample there or the pair cannot be one it wrote. */
+static double span_of(uint32_t hi, uint32_t lo)
+{
+    int64_t qhi = (int64_t)hi - 1, qlo = 2 * (int64_t)NV2A_TEX_SPAN_BIAS - (int64_t)lo;
+    if (!hi || !lo || hi > 2u * NV2A_TEX_SPAN_BIAS || lo > 2u * NV2A_TEX_SPAN_BIAS || qhi < qlo)
+        return -1.0;
+    return (double)(qhi - qlo) / NV2A_TEX_SPAN_ONE;
 }
 
 void nv2a_tex_mag_note(uint64_t hash, double mag, unsigned render_scale)
@@ -1030,12 +1119,22 @@ void nv2a_tex_mag_fold(const struct nv2a_tex_mag_draw *draws, unsigned n,
     lock();
     for (i = 0; i < n; i++)
         for (k = 0; k < NV2A_TEX_MAG_STAGES; k++) {
-            uint32_t v = slots[i * NV2A_TEX_MAG_STAGES + k];
+            const uint32_t *d = slots + (size_t)i * NV2A_TEX_MAG_SLOTS;
+            const uint32_t *sp = d + NV2A_TEX_MAG_STAGES + k * 4u;
+            uint32_t v = d[k];
             uint32_t scale = draws[i].scale[k] ? draws[i].scale[k] : 1u;
+            double su, sv;
+            if (!draws[i].hash[k])
+                continue;
             /* The shader's 2^-lod is host pixels per texel of what is bound;
              * a source texel is `scale` of an entry's. */
-            if (draws[i].hash[k] && v && v < 64u * 1024u)
+            if (v && v < 64u * 1024u)
                 mag_add(draws[i].hash[k], pow(2.0, v / 1024.0 - 32.0) * scale, render_scale);
+            /* Repeats are of the texture, whatever an entry's scale. */
+            su = span_of(sp[0], sp[1]);
+            sv = span_of(sp[2], sp[3]);
+            if (su >= 0.0 && sv >= 0.0)
+                span_add(draws[i].hash[k], su, sv);
         }
     unlock();
 }
@@ -1062,6 +1161,8 @@ int nv2a_tex_mag_get(uint64_t hash, double *mag_max, uint64_t *draws, unsigned *
     const MagSlot *m;
     lock();
     m = mag_slot(hash, 0);
+    if (m && !m->draws)
+        m = NULL;   /* a span reading alone */
     if (m) {
         if (mag_max)
             *mag_max = m->mag_max;
@@ -1074,6 +1175,27 @@ int nv2a_tex_mag_get(uint64_t hash, double *mag_max, uint64_t *draws, unsigned *
     return m != NULL;
 }
 
+int nv2a_tex_span_get(uint64_t hash, double max[2], double p90[2], uint64_t *draws)
+{
+    const MagSlot *m;
+    int a, ok;
+    lock();
+    m = mag_slot(hash, 0);
+    ok = m && m->span_draws;
+    if (ok) {
+        for (a = 0; a < 2; a++) {
+            if (max)
+                max[a] = m->span_max[a];
+            if (p90)
+                p90[a] = span_quantile(m, a, 0.9);
+        }
+        if (draws)
+            *draws = m->span_draws;
+    }
+    unlock();
+    return ok;
+}
+
 /* The fields after "texels": what is known of the hash so far. No `drawn_2d`
  * until a draw shows it, so a scene that only uploaded a texture has no say. */
 static void print_facts(FILE *f, uint64_t hash)
@@ -1084,7 +1206,9 @@ static void print_facts(FILE *f, uint64_t hash)
             h && h->rt ? "true" : "false");
     if (h && h->drawn != DRAWN_NONE)
         fprintf(f, ",\n  \"drawn_2d\": %s", h->drawn == DRAWN_2D ? "true" : "false");
-    if (m) {
+    /* A slot with span readings alone has no figure: 0 would read as never
+     * magnified. */
+    if (m && m->draws) {
         unsigned rs = m->render_scale ? m->render_scale : 1u;
         double p90 = mag_quantile(m, 0.9);
         fprintf(f,
@@ -1098,6 +1222,18 @@ static void print_facts(FILE *f, uint64_t hash)
                 m->mag_max, m->mag_max / rs, p90, p90 / rs,
                 (unsigned long long)m->draws, m->render_scale);
     }
+    /* Repeats of the texture per draw: over 1 on an axis is a draw that
+     * relies on that axis' wrap; a texture drawn once stays at or under it. */
+    if (m && m->span_draws)
+        fprintf(f,
+                ",\n"
+                "  \"uv_span_u\": %.3f,\n"
+                "  \"uv_span_v\": %.3f,\n"
+                "  \"uv_span_u_max\": %.3f,\n"
+                "  \"uv_span_v_max\": %.3f,\n"
+                "  \"uv_span_draws\": %llu",
+                span_quantile(m, 0, 0.9), span_quantile(m, 1, 0.9), m->span_max[0],
+                m->span_max[1], (unsigned long long)m->span_draws);
 }
 
 /* The facts into a hash's sidecar, in place of the last ones. A hash the dump
@@ -1166,27 +1302,39 @@ static void rewrite_sidecar(uint64_t hash)
 static void mag_summary(int exiting)
 {
     size_t i;
+    unsigned long long n = 0;
     const MagSlot *top = NULL;
     for (i = 0; i < s_mag_cap; i++) {
         MagSlot *m = &s_mag_tab[i];
         if (!m->used)
             continue;
-        if (!top || m->mag_max > top->mag_max)
-            top = m;
+        /* A slot with spans only (a draw whose magnification was not read)
+         * has no figure: it neither counts as a texture nor prints a 0. */
+        if (m->draws) {
+            n++;
+            if (!top || m->mag_max > top->mag_max)
+                top = m;
+        }
         if (s_on > 0 && m->dirty)
             rewrite_sidecar(m->hash);
         if (s_on <= 0 && exiting) {
             unsigned rs = m->render_scale ? m->render_scale : 1u;
-            fprintf(stderr, "[TEXDUMP] mag %016llX mag_max=%.3f mag_scale1=%.3f"
-                    " mag_scale1_p90=%.3f draws=%llu render_scale=%u\n",
-                    (unsigned long long)m->hash, m->mag_max, m->mag_max / rs,
-                    mag_quantile(m, 0.9) / rs, (unsigned long long)m->draws,
-                    m->render_scale);
+            fprintf(stderr, "[TEXDUMP] mag %016llX", (unsigned long long)m->hash);
+            if (m->draws)
+                fprintf(stderr, " mag_max=%.3f mag_scale1=%.3f mag_scale1_p90=%.3f draws=%llu"
+                        " render_scale=%u", m->mag_max, m->mag_max / rs,
+                        mag_quantile(m, 0.9) / rs, (unsigned long long)m->draws,
+                        m->render_scale);
+            if (m->span_draws)
+                fprintf(stderr, " uv_span_u=%.3f uv_span_v=%.3f span_draws=%llu",
+                        span_quantile(m, 0, 0.9), span_quantile(m, 1, 0.9),
+                        (unsigned long long)m->span_draws);
+            fputc('\n', stderr);
         }
     }
     fprintf(stderr, "[TEXDUMP] tex_mag: %llu textures, highest %.3f (%016llX), %llu draws past"
             " the frame's slots; an upper bound: occluded fragments count\n",
-            (unsigned long long)s_mag_n, top ? top->mag_max : 0.0,
+            n, top ? top->mag_max : 0.0,
             (unsigned long long)(top ? top->hash : 0u),
             (unsigned long long)__atomic_load_n(&s_mag_dropped, __ATOMIC_RELAXED));
 }

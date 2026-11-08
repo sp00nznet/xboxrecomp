@@ -178,6 +178,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     char src[32];
     int off = 0;
     int i, s, k;
+    unsigned spans = 0;   /* tex_mag: the stages whose repeat span is taken */
 
     /* ---- Textures ---- */
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
@@ -230,7 +231,21 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
              "    float m = 32.0 - lod;\n"
              "    uint v = 0u, was;\n"
              "    if (m > 0.0 && m < 64.0) v = uint(m * 1024.0);\n"
-             "    InterlockedMax(mag_buf[mag_draw * 4u + slot], v, was);\n"
+             "    InterlockedMax(mag_buf[mag_draw * 20u + slot], v, was);\n"
+             "}\n"
+             /* The repeat span (nv2a_tex_dump.h: NV2A_TEX_SPAN_ONE 64,
+              * NV2A_TEX_SPAN_BIAS 2^24, after the draw's 4 LOD slots):
+              * the lowest step as a max of 2 * BIAS - q, so every slot is a
+              * max and a cleared one is no sample. A far or NaN coordinate
+              * fails the test and is not taken. */
+             "void mag_span(uint stage, float2 t) {\n"
+             "    if (!(abs(t.x) < 262144.0 && abs(t.y) < 262144.0)) return;\n"
+             "    uint2 q = uint2(int2(floor(t * 64.0)) + 16777216);\n"
+             "    uint o = mag_draw * 20u + 4u + stage * 4u, was;\n"
+             "    InterlockedMax(mag_buf[o], q.x + 1u, was);\n"
+             "    InterlockedMax(mag_buf[o + 1u], 33554432u - q.x, was);\n"
+             "    InterlockedMax(mag_buf[o + 2u], q.y + 1u, was);\n"
+             "    InterlockedMax(mag_buf[o + 3u], 33554432u - q.y, was);\n"
              "}\n");
     if (state->rect_snap)
         EMIT("%s", D3D8_HLSL_SNAP_UV);
@@ -256,7 +271,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     for (k = 0; k < 16; k++)
         EMIT("    float4 x%d = 0;\n", k);
     if (state->tex_mag)
-        EMIT("    float mag_lod[4] = { 64.0, 64.0, 64.0, 64.0 };\n");
+        EMIT("    float mag_lod[4] = { 64.0, 64.0, 64.0, 64.0 };\n"
+             "    float2 mag_uv[4] = { (float2)0, (float2)0, (float2)0, (float2)0 };\n");
     if (state->fog_input)
         EMIT("    x3 = float4(fog_color.rgb, saturate(i.fog));\n");
     else
@@ -327,9 +343,14 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                 EMIT("        if (tex_mode[%d] == 1u && i.tc%d.w != 0.0 && i.tc%d.w != 1.0)"
                      " uv /= i.tc%d.w;\n", i, i, i, i);
             /* Before the snap, whose derivatives spike at its steps. */
-            if (state->tex_mag)
-                EMIT("        mag_lod[%d] = tex%d.CalculateLevelOfDetailUnclamped(samp%d,"
-                     " uv * tex_scale[%d].xy);\n", i, i, i, i);
+            if (state->tex_mag) {
+                /* The normalised coordinate the sampler wraps: a linear
+                 * texture's is in texels until tex_scale. */
+                EMIT("        mag_uv[%d] = uv * tex_scale[%d].xy;\n"
+                     "        mag_lod[%d] = tex%d.CalculateLevelOfDetailUnclamped(samp%d,"
+                     " mag_uv[%d]);\n", i, i, i, i, i, i);
+                spans |= 1u << i;
+            }
             if (state->rect_snap && state->snap_2d) {
                 /* A 2D-snapped stage (.z < 0) samples with the 1x
                  * gradients, so its mip level and min/mag choice are the
@@ -371,11 +392,15 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
      * others' stale lanes: zero gradients (LOD -32, no figure), or a figure
      * off by the render scale times the texture's width. The quad's four
      * pixels take the branch together, so their derivatives hold. */
-    if (state->tex_mag)
+    if (state->tex_mag) {
         EMIT("    if ((uint(i.pos.x) & 6u) == 0u && (uint(i.pos.y) & 6u) == 0u) {\n"
              "        mag_put(0u, mag_lod[0]); mag_put(1u, mag_lod[1]);\n"
-             "        mag_put(2u, mag_lod[2]); mag_put(3u, mag_lod[3]);\n"
-             "    }\n");
+             "        mag_put(2u, mag_lod[2]); mag_put(3u, mag_lod[3]);\n");
+        for (i = 0; i < NV2A_MAX_TEXTURES; i++)
+            if (spans & 1u << i)
+                EMIT("        mag_span(%du, mag_uv[%d]);\n", i, i);
+        EMIT("    }\n");
+    }
     EMIT("    x12.a = x8.a;\n");
 
     /* ---- General combiner stages ---- */

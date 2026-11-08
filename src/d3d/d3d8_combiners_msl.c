@@ -182,6 +182,7 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
     char src[32];
     int off = 0;
     int i, s, k;
+    unsigned spans = 0;   /* tex_mag: the stages whose repeat span is taken */
 
     EMIT("/* Auto-generated NV2A register combiners (MSL) */\n"
          "#include <metal_stdlib>\n"
@@ -213,6 +214,16 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
              "    uint v = 0u;\n"
              "    if (m > 0.0 && m < 64.0) v = uint(m * 1024.0);\n"
              "    atomic_fetch_max_explicit(mag + slot, v, memory_order_relaxed);\n"
+             "}\n"
+             /* As the HLSL's mag_span: the slots after the draw's 4. */
+             "static inline void mag_span(device atomic_uint *mag, uint stage, float2 t) {\n"
+             "    if (!(abs(t.x) < 262144.0 && abs(t.y) < 262144.0)) return;\n"
+             "    uint2 q = uint2(int2(floor(t * 64.0)) + 16777216);\n"
+             "    device atomic_uint *o = mag + 4u + stage * 4u;\n"
+             "    atomic_fetch_max_explicit(o, q.x + 1u, memory_order_relaxed);\n"
+             "    atomic_fetch_max_explicit(o + 1u, 33554432u - q.x, memory_order_relaxed);\n"
+             "    atomic_fetch_max_explicit(o + 2u, q.y + 1u, memory_order_relaxed);\n"
+             "    atomic_fetch_max_explicit(o + 3u, 33554432u - q.y, memory_order_relaxed);\n"
              "}\n");
     EMIT("fragment %s fs_main(VOut i [[stage_in]],\n"
          "                        constant PsConsts &pc [[buffer(0)]]",
@@ -241,7 +252,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
     for (k = 0; k < 16; k++)
         EMIT("    float4 x%d = float4(0.0);\n", k);
     if (state->tex_mag)
-        EMIT("    float mag_lod[4] = { 64.0, 64.0, 64.0, 64.0 };\n");
+        EMIT("    float mag_lod[4] = { 64.0, 64.0, 64.0, 64.0 };\n"
+             "    float2 mag_uv[4] = { float2(0.0), float2(0.0), float2(0.0), float2(0.0) };\n");
     if (state->fog_input)
         EMIT("    x3 = float4(pc.fog_color.rgb, saturate(i.fog));\n");
     else
@@ -307,9 +319,12 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                 EMIT("        if (pc.tex_mode[%d] == 1u && i.t%d.w != 0.0 && i.t%d.w != 1.0)"
                      " uv /= i.t%d.w;\n", i, i, i, i);
             /* As the HLSL: before the snap. */
-            if (state->tex_mag)
-                EMIT("        mag_lod[%d] = tex%d.calculate_unclamped_lod(samp%d,"
-                     " uv * pc.tex_scale[%d].xy);\n", i, i, i, i);
+            if (state->tex_mag) {
+                EMIT("        mag_uv[%d] = uv * pc.tex_scale[%d].xy;\n"
+                     "        mag_lod[%d] = tex%d.calculate_unclamped_lod(samp%d,"
+                     " mag_uv[%d]);\n", i, i, i, i, i, i);
+                spans |= 1u << i;
+            }
             if (state->rect_snap && state->snap_2d) {
                 /* As the HLSL: a .z < 0 stage samples with the 1x
                  * gradients. gradient2d takes no bias(), so the stage's
@@ -351,11 +366,15 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
     /* As the HLSL: before anything can discard, one 2x2 quad in each 8x8
      * tile, all four pixels together, so an LOD the compiler sinks into the
      * branch still has its quad's derivatives. */
-    if (state->tex_mag)
+    if (state->tex_mag) {
         EMIT("    if ((uint(i.pos.x) & 6u) == 0u && (uint(i.pos.y) & 6u) == 0u) {\n"
              "        mag_put(mag, 0u, mag_lod[0]); mag_put(mag, 1u, mag_lod[1]);\n"
-             "        mag_put(mag, 2u, mag_lod[2]); mag_put(mag, 3u, mag_lod[3]);\n"
-             "    }\n");
+             "        mag_put(mag, 2u, mag_lod[2]); mag_put(mag, 3u, mag_lod[3]);\n");
+        for (i = 0; i < NV2A_MAX_TEXTURES; i++)
+            if (spans & 1u << i)
+                EMIT("        mag_span(mag, %du, mag_uv[%d]);\n", i, i);
+        EMIT("    }\n");
+    }
     EMIT("    x12.a = x8.a;\n");
 
     /* ---- General combiner stages ---- */

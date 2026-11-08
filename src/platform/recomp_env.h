@@ -187,7 +187,7 @@ extern "C" {
     X(TEX_STATE,         TRACE, "tex_state",       "RECOMP_TEX_STATE",         "texture-state methods seen, in the report") \
     X(BUMP_TRACE,        TRACE, "bump",            NULL,                       "[BUMP] line per distinct BUMPENVMAP stage setup (stage, input, matrix as stored, scale, offset, formats), with the flip; GPU backends") \
     X(TEX_PACK_TRACE,    TRACE, "tex_pack",        NULL,                       "texture pack misses every 600 flips: hash, size, format, count, candidate") \
-    X(TEX_MAG_TRACE,     TRACE, "tex_mag",         NULL,                       "Metal and D3D11: host pixels per source texel of each texture hash, an upper bound (occluded fragments count), at exit and into the tex_dump sidecars") \
+    X(TEX_MAG_TRACE,     TRACE, "tex_mag",         NULL,                       "Metal and D3D11: host pixels per source texel of each texture hash, an upper bound (occluded fragments count), and the repeats each draw spans per axis, at exit and into the tex_dump sidecars") \
     X(CLIP_TRACE,        TRACE, "clip",            "RECOMP_CLIP_TRACE",        "near-plane clipping, per triangle") \
     X(ZPASS_TRACE,       TRACE, "zpass",           "RECOMP_ZPASS_TRACE",       "occlusion report writes") \
     X(PB_EXEC_VERBOSE,   TRACE, "pb_verbose",      "RECOMP_PB_EXEC_VERBOSE",   "executor bring-up detail") \

@@ -362,7 +362,11 @@ static int tex_mag_check(void)
     if ((n = d3d8_combiners_generate_msl(&st, text, (int)sizeof text)) <= 0)
         return 1;
     if (!strstr(text, "device atomic_uint *mag [[buffer(2)]]")
-            || !strstr(text, "mag_lod[0] = tex0.calculate_unclamped_lod(samp0, uv * pc.tex_scale[0].xy);")
+            || !strstr(text, "mag_uv[0] = uv * pc.tex_scale[0].xy;")
+            || !strstr(text, "mag_lod[0] = tex0.calculate_unclamped_lod(samp0, mag_uv[0]);")
+            || !strstr(text, "device atomic_uint *o = mag + 4u + stage * 4u;")
+            || !strstr(text, "atomic_fetch_max_explicit(o + 3u, 33554432u - q.y, memory_order_relaxed);")
+            || !strstr(text, "        mag_span(mag, 0u, mag_uv[0]);\n")
             || !strstr(text, "(uint(i.pos.x) & 6u) == 0u && (uint(i.pos.y) & 6u) == 0u")
             || !strstr(text, "mag_put(mag, 3u, mag_lod[3]);")
             || !strstr(text, "uint(m * 1024.0)")) {

@@ -16,7 +16,7 @@
  * and, rewritten at each summary, counts.json (uploads per hash) and
  * volatile.json (the addresses given up on, with their hashes). Under
  * RECOMP_TRACE=tex_mag (below, with or without the dump) the sidecars take
- * the magnification too.
+ * the magnification and the repeat span too.
  *
  * Not written, counted instead: a stage bound to a render target (it never
  * hashes; the backend calls nv2a_tex_dump_rt), an address whose texels
@@ -141,7 +141,19 @@ void nv2a_tex_dump_get_stats(struct nv2a_tex_dump_stats *out);
  * of a draw its scissor would not have let the sampler see. */
 #define NV2A_TEX_MAG_DRAWS  8192u   /* a frame's draws read; more share a slot, dropped */
 #define NV2A_TEX_MAG_STAGES 4u
-#define NV2A_TEX_MAG_BYTES  (NV2A_TEX_MAG_DRAWS * NV2A_TEX_MAG_STAGES * 4u)
+/* The repeat span: how far each 2D stage's normalised coordinate ran over a
+ * draw, per axis, in repeats of the texture. A tile is drawn over several; a
+ * texture drawn once (a UV-unwrapped prop, a sign) stays inside one, whatever
+ * its address mode says (WRAP is the game's default for every 3D surface).
+ * After a draw's NV2A_TEX_MAG_STAGES magnification slots, four per stage: u's
+ * highest and lowest, then v's. The shader takes floor(t * SPAN_ONE) + BIAS of
+ * the coordinate t, and max's q + 1 into the highest and 2 * BIAS - q into the
+ * lowest, so a cleared slot (0) reads as no sample and every slot is a max. */
+#define NV2A_TEX_SPAN_ONE   64u           /* steps per repeat */
+#define NV2A_TEX_SPAN_BIAS  (1u << 24)    /* |t| < 2^24 / SPAN_ONE, else not taken */
+#define NV2A_TEX_SPAN_SLOTS (NV2A_TEX_MAG_STAGES * 4u)
+#define NV2A_TEX_MAG_SLOTS  (NV2A_TEX_MAG_STAGES + NV2A_TEX_SPAN_SLOTS)   /* per draw */
+#define NV2A_TEX_MAG_BYTES  (NV2A_TEX_MAG_DRAWS * NV2A_TEX_MAG_SLOTS * 4u)
 
 /* What a draw id had bound: hash 0 is a stage without a cache entry (a render
  * target, black, no texture); scale is the entry's over the guest texture. */
@@ -158,7 +170,7 @@ int nv2a_tex_mag_on(void);
 unsigned nv2a_tex_mag_draw_id(struct nv2a_tex_mag_draw *draws, unsigned *n,
                               const uint64_t hash[NV2A_TEX_MAG_STAGES],
                               const uint32_t scale[NV2A_TEX_MAG_STAGES]);
-/* A frame's buffer: n records and their NV2A_TEX_MAG_STAGES slots each. */
+/* A frame's buffer: n records and their NV2A_TEX_MAG_SLOTS slots each. */
 void nv2a_tex_mag_fold(const struct nv2a_tex_mag_draw *draws, unsigned n,
                        const uint32_t *slots, unsigned render_scale);
 /* Pixels per texel of a triangle at xy (pixels) and uv (texels), the rule the
@@ -166,8 +178,24 @@ void nv2a_tex_mag_fold(const struct nv2a_tex_mag_draw *draws, unsigned n,
 double nv2a_tex_mag_triangle(const float xy[3][2], const float uv[3][2]);
 /* One reading for hash: `mag` host pixels per source texel. */
 void nv2a_tex_mag_note(uint64_t hash, double mag, unsigned render_scale);
+/* One draw's repeat span for hash: how far its normalised coordinate ran, in
+ * repeats, across (u) and down (v). A pre-transformed batch has it from its
+ * vertices. */
+void nv2a_tex_span_note(uint64_t hash, double span_u, double span_v);
+/* A pre-transformed draw's span from its vertices: begin, take each vertex's
+ * texel coordinate on a w x h texture, end notes it for hash (nothing when no
+ * vertex was taken on both axes). */
+struct nv2a_tex_span {
+    float lo[2], hi[2];
+};
+void nv2a_tex_span_begin(struct nv2a_tex_span *s);
+void nv2a_tex_span_take(struct nv2a_tex_span *s, const float texel[2], unsigned w, unsigned h);
+void nv2a_tex_span_end(const struct nv2a_tex_span *s, uint64_t hash);
 /* The table, for the tests: 0 when the hash has no reading. */
 int nv2a_tex_mag_get(uint64_t hash, double *mag_max, uint64_t *draws, unsigned *render_scale);
+/* The span's figures, for the tests: each axis' largest and 90th percentile
+ * (any may be NULL); 0 when the hash has no span reading. */
+int nv2a_tex_span_get(uint64_t hash, double max[2], double p90[2], uint64_t *draws);
 /* Tests: turn the trace on (the environment is then not read), table empty. */
 void nv2a_tex_mag_set_on(int on);
 

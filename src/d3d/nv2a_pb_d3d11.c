@@ -2320,9 +2320,11 @@ static void mag_pretransformed(const struct nv2a_pb_draw *d, const struct nv2a_p
 {
     unsigned rs = nv2a_host_render_scale();
     uint32_t k, i;
+    struct nv2a_tex_span span;
     for (k = 0; k < NV2A_TEX_MAG_STAGES; k++) {
         const Stage *t = &s_stage[k];
         int norm = nv2a_tex_size_from_format(t->color);
+        nv2a_tex_span_begin(&span);
         /* A few triangles of each: a 2D batch's pieces share their scale. */
         for (i = 0; s_mag_hash[k] && i + 3 <= nidx && i < 3u * 64u; i += 3) {
             float xy[3][2], uv[3][2], o[4];
@@ -2334,11 +2336,13 @@ static void mag_pretransformed(const struct nv2a_pb_draw *d, const struct nv2a_p
                 vtx_input(d, v, 9 + k, lo + idx[i + (uint32_t)c], o);
                 uv[c][0] = norm ? o[0] * (float)t->width : o[0];
                 uv[c][1] = norm ? o[1] * (float)t->height : o[1];
+                nv2a_tex_span_take(&span, uv[c], t->width, t->height);
             }
             nv2a_tex_mag_note(s_mag_hash[k], nv2a_tex_mag_triangle((const float (*)[2])xy,
                                                                    (const float (*)[2])uv) * rs,
                               rs);
         }
+        nv2a_tex_span_end(&span, s_mag_hash[k]);
     }
 }
 

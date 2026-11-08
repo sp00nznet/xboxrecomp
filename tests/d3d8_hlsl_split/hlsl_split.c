@@ -331,9 +331,15 @@ static int tex_mag_check(void)
         return 1;
     if (!strstr(text, "RWBuffer<uint> mag_buf : register(u7);")
             || !strstr(text, "cbuffer TexMag : register(b3) { uint mag_draw; };")
-            || !strstr(text, "mag_lod[0] = tex0.CalculateLevelOfDetailUnclamped(samp0, uv * tex_scale[0].xy);")
+            || !strstr(text, "mag_uv[0] = uv * tex_scale[0].xy;")
+            || !strstr(text, "mag_lod[0] = tex0.CalculateLevelOfDetailUnclamped(samp0, mag_uv[0]);")
             || !strstr(text, "(uint(i.pos.x) & 6u) == 0u && (uint(i.pos.y) & 6u) == 0u")
-            || !strstr(text, "InterlockedMax(mag_buf[mag_draw * 4u + slot], v, was);")) {
+            || !strstr(text, "InterlockedMax(mag_buf[mag_draw * 20u + slot], v, was);")
+            /* the repeat span: NV2A_TEX_MAG_SLOTS, _SPAN_ONE and _SPAN_BIAS */
+            || !strstr(text, "uint o = mag_draw * 20u + 4u + stage * 4u, was;")
+            || !strstr(text, "uint2 q = uint2(int2(floor(t * 64.0)) + 16777216);")
+            || !strstr(text, "InterlockedMax(mag_buf[o + 1u], 33554432u - q.x, was);")
+            || !strstr(text, "        mag_span(0u, mag_uv[0]);\n")) {
         printf("FAIL: the tex_mag variant's text\n");
         bad = 1;
     }
