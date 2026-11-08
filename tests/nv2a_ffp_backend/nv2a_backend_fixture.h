@@ -37,10 +37,10 @@ typedef void (*Nv2aBackendFixtureObserver)(
 
 typedef struct Nv2aBackendFixture {
     Nv2aBackend backend;
-    unsigned draws;
-    unsigned clears;
-    unsigned syncs;
-    unsigned flips;
+    int draws;
+    int clears;
+    int syncs;
+    int flips;
     Nv2aSurface surf;
     Nv2aRenderState rs;
     uint32_t count;
