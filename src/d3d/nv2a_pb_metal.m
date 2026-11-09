@@ -1244,6 +1244,8 @@ typedef struct {
     /* What the sampler follows (nv2a_stage_lod): the entry's scale over the
      * guest texture, and its chain. 1 and the guest's levels for guest texels. */
     uint32_t       pack_scale, pack_levels;
+    /* The entry is marked XRTP_FLAG_MIP_BLEND (nv2a_stage_lod's blend). */
+    int            pack_blend;
     /* The pack entry it holds is marked XRTP_FLAG_DETILE_HEX: kept whatever
      * textures.detile says, so the menu's toggle needs no re-upload. */
     int            pack_detile;
@@ -1463,9 +1465,9 @@ static id<MTLTexture> tex_make_cube(uint32_t size, uint32_t levels, const uint32
  * the pack only ever adds detail, never a black texture. */
 static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube);
 /* What the last tex_upload left (TexEntry.pack_scale, .pack_levels,
- * .pack_detile). */
+ * .pack_blend, .pack_detile). */
 static uint32_t s_up_scale, s_up_levels;
-static int      s_up_detile;
+static int      s_up_blend, s_up_detile;
 
 static id<MTLTexture> tex_upload(const Stage *t, uint64_t hash, int cube)
 {
@@ -1507,6 +1509,7 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
 
     s_up_scale = 1;
     s_up_levels = t->levels;
+    s_up_blend = 0;
     s_up_detile = 0;
     if (cube) {
         /* No pack entry is a cube map: the six faces go up from the guest.
@@ -1539,6 +1542,7 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
         if (tex) {
             s_up_scale = nv2a_stage_pack_scale(t->width, pe->width);
             s_up_levels = pe->levels;
+            s_up_blend = (pe->flags & XRTP_FLAG_MIP_BLEND) != 0;
             s_up_detile = (pe->flags & XRTP_FLAG_DETILE_HEX) != 0;
             nv2a_tex_pack_release(pe);
         } else if (src && (pe->flags & XRTP_FLAG_RECOLOUR)) {
@@ -1680,6 +1684,7 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
                 e->pack_gen = pg;
                 e->pack_scale = s_up_scale;
                 e->pack_levels = s_up_levels;
+                e->pack_blend = s_up_blend;
                 e->pack_detile = s_up_detile;
                 [e->tex release];
                 e->tex = nt;
@@ -1709,6 +1714,7 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
         e->pack_gen = nv2a_tex_pack_gen();
         e->pack_scale = s_up_scale;
         e->pack_levels = s_up_levels;
+        e->pack_blend = s_up_blend;
         e->pack_detile = s_up_detile;
         e->tex = nt;
         e->live = 1;
@@ -1763,9 +1769,9 @@ static int border_colour(uint32_t argb)
 /* What each stage's bind took from its cache entry, by value. The
  * NV2A_TEX_CACHE_MIN floor keeps a draw's binds from evicting each other's
  * entries, so the copy is only a safety net against a later change to
- * that. The sampler's scale and chain, and the texel hash (0: no cache
- * entry). */
-static uint32_t s_stage_pack[4][2];
+ * that. The sampler's scale, chain and blend mark, and the texel hash
+ * (0: no cache entry). */
+static uint32_t s_stage_pack[4][3];
 static uint64_t s_stage_hash[4];
 /* The bound entry is marked detile (TexEntry.pack_detile); 0 for anything
  * else. */
@@ -1776,6 +1782,7 @@ static void stage_from_cache(int k)
     if (s_tex_last) {
         s_stage_pack[k][0] = s_tex_last->pack_scale;
         s_stage_pack[k][1] = s_tex_last->pack_levels;
+        s_stage_pack[k][2] = (uint32_t)s_tex_last->pack_blend;
         s_stage_hash[k] = s_tex_last->hash;
         s_stage_detile[k] = s_tex_last->pack_detile;
     }
@@ -1912,11 +1919,21 @@ static void mag_flip(void)
 static struct { uint64_t key; id<MTLSamplerState> s; } s_smp[SMP_MAX];
 static int s_smp_n;
 
-/* scale, entry_levels: the bound cache entry's (TexEntry.pack_scale,
- * .pack_levels), 1 and 1 for a render target or a black or magenta one: a
- * pack entry moves the clamps (nv2a_stage_lod). */
+/* The blend_bias of nv2a_stage_lod, read once. */
+static float blend_bias(void)
+{
+    static float b = 1e9f;
+    if (b > 1e8f)
+        b = nv2a_stage_blend_bias(recomp_env(RENV_PACK_MIP_BIAS));
+    return b;
+}
+
+/* scale, entry_levels, blend: the bound cache entry's (TexEntry.pack_scale,
+ * .pack_levels, .pack_blend), 1, 1 and 0 for a render target or a black or
+ * magenta one: a pack entry moves the clamps (nv2a_stage_lod). The LOD bias
+ * is the shader's (MsPsConsts.tex_bias, stage_bias). */
 static id<MTLSamplerState> sampler(const Stage *t, int bump_source, uint32_t scale,
-                                   uint32_t entry_levels)
+                                   uint32_t entry_levels, int blend)
 {
     static int point = -1;
     MTLSamplerDescriptor *sd;
@@ -1935,7 +1952,8 @@ static id<MTLSamplerState> sampler(const Stage *t, int bump_source, uint32_t sca
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
     guest_mip = t->levels > 1 ? filter_mip(t->filter) : 0;
-    lod = nv2a_stage_lod(guest_mip, t->lod_min, t->lod_max, scale, entry_levels);
+    lod = nv2a_stage_lod(guest_mip, t->lod_min, t->lod_max, scale, entry_levels, blend,
+                         blend_bias());
     mip = lod.mip;
     /* render.aniso, on the D3D11 sampler's rule (nv2a_stage_aniso) and key
      * bit: a bump source in one draw and plain in the next gets its own. */
@@ -3265,6 +3283,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 RenderTarget *src;
                 stex[k] = s_black;
                 s_stage_pack[k][0] = s_stage_pack[k][1] = 1;
+                s_stage_pack[k][2] = 0;
                 s_stage_hash[k] = 0;
                 s_stage_detile[k] = 0;
                 if (!t->mode || t->mode == 4)
@@ -3502,6 +3521,13 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             [s_enc setVertexBytes:&vc length:sizeof vc atIndex:1];
             s_vc1.ok = 0;              /* buffer 1 is vc now, not c[] */
         }
+        /* The D3D11 sampler's MipLODBias for a blended pack chain under a
+         * guest of one level (nv2a_stage_lod), known once the stages are
+         * bound; such a stage's guest bias was 0 above. */
+        for (k = 0; k < 4; k++)
+            if (s_stage_pack[k][2] && !(s_stage[k].levels > 1 && filter_mip(s_stage[k].filter)))
+                mpc.tex_bias[k] = nv2a_stage_lod(0, 0, 0, s_stage_pack[k][0],
+                                                 s_stage_pack[k][1], 1, blend_bias()).bias;
         [s_enc setFragmentBytes:&mpc length:sizeof mpc atIndex:0];
         if (s_fs_w) {
             struct nv2a_wdepth_consts wc;
@@ -3517,7 +3543,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         for (k = 0; k < 4; k++) {
             [s_enc setFragmentTexture:stex[k] atIndex:k];
             [s_enc setFragmentSamplerState:sampler(&s_stage[k], bump_src >> k & 1,
-                                                   s_stage_pack[k][0], s_stage_pack[k][1])
+                                                   s_stage_pack[k][0], s_stage_pack[k][1],
+                                                   (int)s_stage_pack[k][2])
                                      atIndex:k];
         }
         /* A read of this batch's inputs only: the dump must not move a frame. */

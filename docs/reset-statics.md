@@ -1427,6 +1427,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_tex_pack.c | - | s_kind_count | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_bc3_count | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_recolour_count | file_static | keep | - | texture pack keyed by content hash |
+| src/kernel/nv2a_tex_pack.c | - | s_blend_count | file_static | keep | - | texture pack keyed by content hash |
 | src/kernel/nv2a_tex_pack.c | - | s_recolour_buf | file_static | keep | - | recolour output, rewritten at each upload from the bound palette |
 | src/kernel/nv2a_tex_pack.c | - | s_recolour_cap | file_static | keep | - | recolour output, rewritten at each upload from the bound palette |
 | src/kernel/nv2a_tex_pack.c | - | s_path | file_static | keep | - | texture pack keyed by content hash |
@@ -1783,6 +1784,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_smp_n | file_static | keep | - | sampler cache fill count |
 | src/d3d/nv2a_pb_d3d11.c | - | s_smp_last | file_static | keep | - | per-stage index into kept sampler cache, key-checked |
 | src/d3d/nv2a_pb_d3d11.c | sampler | point | local_static | keep | - | cached env read |
+| src/d3d/nv2a_pb_d3d11.c | sampler | blend_bias | local_static | keep | - | cached env read |
 | src/d3d/nv2a_pb_d3d11.c | sampler | fallback | local_static | keep | - | host fallback sampler object |
 | src/d3d/nv2a_pb_d3d11.c | sampler | next | local_static | keep | - | round-robin eviction index |
 | src/d3d/nv2a_pb_d3d11.c | - | s_rc | file_static | keep | - | combiner PS keyed by combiner-state content |
@@ -2091,6 +2093,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_smp | file_static | keep | - | sampler states keyed by sampler state |
 | src/d3d/nv2a_pb_metal.m | - | s_smp_n | file_static | keep | - | sampler cache fill count |
 | src/d3d/nv2a_pb_metal.m | sampler | point | local_static | keep | - | cached env read |
+| src/d3d/nv2a_pb_metal.m | blend_bias | b | local_static | keep | - | cached env read |
 | src/d3d/nv2a_pb_metal.m | sampler | next | local_static | keep | - | round-robin eviction index |
 | src/d3d/nv2a_pb_metal.m | - | s_compile_errors | file_static | keep | - | stats counter |
 | src/d3d/nv2a_pb_metal.m | - | s_vs_compiled | file_static | keep | - | stats counter |
@@ -2195,6 +2198,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_fs_hex | file_static | keep | - | textures.detile, the batch's hex stages, set again on each draw |
 | src/d3d/nv2a_pb_metal.m | - | s_up_scale | file_static | keep | - | the upload just made, read back by its caller |
 | src/d3d/nv2a_pb_metal.m | - | s_up_detile | file_static | keep | - | the upload just made, read back by its caller |
+| src/d3d/nv2a_pb_metal.m | - | s_up_blend | file_static | keep | - | the upload just made, read back by its caller |
 | src/d3d/nv2a_pb_metal.m | - | s_up_levels | file_static | keep | - | the upload just made, read back by its caller |
 | src/d3d/nv2a_pb_metal.m | - | s_tex_last | file_static | keep | - | the entry tex_bind just bound, set again on each bind |
 | src/d3d/nv2a_pb_metal.m | - | s_stage_pack | file_static | keep | - | the entry each stage just bound, set again on each draw |

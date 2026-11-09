@@ -18,6 +18,7 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../d3d/d3d8_swizzle.h"
@@ -131,23 +132,37 @@ static inline int nv2a_tex_filter_mip(uint32_t f)
  *   - a guest that does not mip, under an entry with a chain, gets the
  *     nearest level over [0, log2(scale)]: without it the entry aliases
  *     worse than stock, and past it the far end is what the guest showed;
+ *   - the same under an entry marked XRTP_FLAG_MIP_BLEND (`blend`, a chain
+ *     the pack built for minified 2D art and fonts) blends the two levels
+ *     around the LOD, moved by `blend_bias` (nv2a_stage_blend_bias). The
+ *     nearest level switches a 4x font drawn at 0.81 from level 0 at RS3
+ *     (LOD 0.72, rounded up to the softer 2x level) to level 1 at RS2,
+ *     where a 2x level minified 1.23 times doubles its stems; a blend
+ *     pulled half a level towards the sharper one tracked a box-filtered
+ *     reference best on the font and HUD art at RS1 to RS3;
  * mip is what the sampler filters with (nv2a_tex_filter_mip's values), key
  * its bits above the stock key's: 0 for stock, so stock states stay what
  * they were. The key carries the integer scale, which quantises the shift
  * (a 3x chain's levels fall between the guest's: log2 3). Float clamps, on
- * both APIs. */
+ * both APIs. bias is the LOD bias the stage samples with when the guest's
+ * own has no say (no guest chain): 0 but for a blend. */
 struct nv2a_stage_lod {
     int      mip;
     float    min, max;
+    float    bias;
     uint64_t key;
 };
 #define NV2A_STAGE_LOD_SCALE_BIT  44   /* 4 bits */
 #define NV2A_STAGE_LOD_FORCED_BIT 48
+#define NV2A_STAGE_LOD_BLEND_BIT  49
 #define NV2A_STAGE_LOD_SCALE_MAX  15u
+/* The default blend_bias: half a level towards level 0. */
+#define NV2A_STAGE_BLEND_BIAS    (-0.5f)
 
 static inline struct nv2a_stage_lod nv2a_stage_lod(int guest_mip, uint32_t lod_min,
                                                    uint32_t lod_max, uint32_t scale,
-                                                   uint32_t entry_levels)
+                                                   uint32_t entry_levels, int blend,
+                                                   float blend_bias)
 {
     struct nv2a_stage_lod l;
     float shift = scale > 1u ? (float)log2((double)scale) : 0.0f;
@@ -155,6 +170,7 @@ static inline struct nv2a_stage_lod nv2a_stage_lod(int guest_mip, uint32_t lod_m
     l.mip = guest_mip;
     l.min = guest_mip ? (float)lod_min : 0.0f;
     l.max = guest_mip ? (float)lod_max : 0.0f;
+    l.bias = 0.0f;
     l.key = 0;
     if (scale <= 1u)
         return l;
@@ -167,8 +183,25 @@ static inline struct nv2a_stage_lod nv2a_stage_lod(int guest_mip, uint32_t lod_m
         l.mip = 1;
         l.max = shift;
         l.key |= (uint64_t)1 << NV2A_STAGE_LOD_FORCED_BIT;
+        if (blend) {
+            /* The bias is one value per process: the bit alone keys it. */
+            l.mip = 2;
+            l.bias = blend_bias;
+            l.key |= (uint64_t)1 << NV2A_STAGE_LOD_BLEND_BIT;
+        }
     }
     return l;
+}
+
+/* blend_bias for nv2a_stage_lod from RECOMP_DEBUG=pack_mip_bias=x (`v`,
+ * already read; NULL when unset): within [-2, 2], else the default. */
+static inline float nv2a_stage_blend_bias(const char *v)
+{
+    char *end;
+    double b = v ? strtod(v, &end) : 0.0;
+    if (!v || end == v || !(b >= -2.0 && b <= 2.0))
+        return NV2A_STAGE_BLEND_BIAS;
+    return (float)b;
 }
 
 /* An entry's scale over the guest texture: its width over the guest's when

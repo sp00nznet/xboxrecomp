@@ -28,7 +28,7 @@
  *             and v2 still read
  *   v4        bit 6 (XRTP_FLAG_DETILE_HEX) read and counted on a world
  *             entry, refused on any other kind; v3 still reads; bit 7
- *             refused, alone or with bit 6, and version 6
+ *             refused, alone or with bit 6, and version 7
  *   v5        bit 7 (XRTP_FLAG_RECOLOUR) read and counted; find never takes
  *             a recolour entry and find_recolour only one, each under the
  *             switches and the aspect rule; the recolour test vector of
@@ -37,6 +37,8 @@
  *             with bit 6 on a world entry it loads and keeps both; the
  *             two-lane blend equals (c0 * (255 - w) + c1 * w + 127) / 255
  *             for every c0, c1, w on every channel
+ *   v6        bit 8 (XRTP_FLAG_MIP_BLEND) read, kept on the entry and
+ *             counted, cleared by unload; refused under v5; v5 still reads
  *   volatile  a plane taking more than BURST new palettes within WINDOW
  *             flips is volatile (find_recolour NULL, the generation bumped,
  *             a known palette refused too, the miss tagged), and recolours
@@ -655,8 +657,8 @@ static void test_v4(void)
     wr32(buf + 4, 4);
     refuse("v4_recolour.pack", buf, n, "unknown flags");
     n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_DETILE_HEX, 8, 4);
-    wr32(buf + 4, 6);
-    refuse("v6.pack", buf, n, "version");
+    wr32(buf + 4, 7);
+    refuse("v7.pack", buf, n, "version");
 }
 
 /* texture-pack.md's vector: bytes i0, i1, w, 0 under FF000000, FFFFFFFF,
@@ -749,6 +751,34 @@ static void test_v5(void)
     write_file("v4_under_v5.pack", buf, n);
     CHECK(nv2a_tex_pack_load("v4_under_v5.pack", err, sizeof err) == 1
           && nv2a_tex_pack_recolour_count() == 0, "v4 under v5: '%s'", err);
+    nv2a_tex_pack_unload();
+}
+
+static void test_v6(void)
+{
+    uint8_t buf[512];
+    char err[256];
+    struct nv2a_tex_pack_entry *e;
+    size_t n;
+
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_BC1 | XRTP_FLAG_MIP_BLEND, 8, 4);
+    wr32(buf + 4, 6);
+    write_file("v6_blend.pack", buf, n);
+    CHECK(nv2a_tex_pack_load("v6_blend.pack", err, sizeof err) == 1
+          && nv2a_tex_pack_blend_count() == 1, "v6 blend: '%s'", err);
+    e = nv2a_tex_pack_find(HASH_C, 4, 2);
+    CHECK(e && (e->flags & XRTP_FLAG_MIP_BLEND) && e->bc == XRTP_BC_1, "v6 blend entry");
+    nv2a_tex_pack_unload();
+    CHECK(nv2a_tex_pack_blend_count() == 0, "blend count after unload");
+
+    /* A v5 reader knows no bit 8: an older pack carrying it is corrupt. */
+    wr32(buf + 4, 5);
+    refuse("v5_blend.pack", buf, n, "unknown flags");
+    n = build_v3(buf, XRTP_KIND_WORLD | XRTP_FLAG_BC1, 8, 4);
+    wr32(buf + 4, 5);
+    write_file("v5_under_v6.pack", buf, n);
+    CHECK(nv2a_tex_pack_load("v5_under_v6.pack", err, sizeof err) == 1
+          && nv2a_tex_pack_blend_count() == 0, "v5 under v6: '%s'", err);
     nv2a_tex_pack_unload();
 }
 
@@ -1212,6 +1242,7 @@ int main(void)
     test_v3();
     test_v4();
     test_v5();
+    test_v6();
     test_blend_exhaustive();
     test_volatile();
     test_volatile_cycles();

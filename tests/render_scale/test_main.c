@@ -173,18 +173,18 @@ static int test_stage_lod(void)
     struct nv2a_stage_lod l;
 
     /* Stock: what the backends' clamps always were, and no key bits. */
-    l = nv2a_stage_lod(0, 3, 9, 1, 1);
+    l = nv2a_stage_lod(0, 3, 9, 1, 1, 0, 0.0f);
     CHECK(l.mip == 0 && l.min == 0.0f && l.max == 0.0f && l.key == 0);
-    l = nv2a_stage_lod(2, 1, 5, 1, 6);
+    l = nv2a_stage_lod(2, 1, 5, 1, 6, 0, 0.0f);
     CHECK(l.mip == 2 && l.min == 1.0f && l.max == 5.0f && l.key == 0);
-    l = nv2a_stage_lod(1, 0, 5, 0, 6);
+    l = nv2a_stage_lod(1, 0, 5, 0, 6, 0, 0.0f);
     CHECK(l.mip == 1 && l.min == 0.0f && l.max == 5.0f && l.key == 0);
 
     /* A guest chain: max follows the shift; min moves only when the guest
      * set one, or level 0, the new detail, could never be reached. */
     for (k = 0; k < 4; k++)
         for (gmin = 0; gmin < 2; gmin++) {
-            l = nv2a_stage_lod(2, gmin, 5, scales[k], 6);
+            l = nv2a_stage_lod(2, gmin, 5, scales[k], 6, 0, 0.0f);
             CHECK(l.mip == 2);
             CHECK(feq(l.max, 5.0f + shifts[k]));
             CHECK(feq(l.min, gmin ? 1.0f + shifts[k] : 0.0f));
@@ -197,16 +197,48 @@ static int test_stage_lod(void)
     /* A guest of one level under a chain: the nearest level, over the
      * levels above the guest's own. */
     for (k = 1; k < 4; k++) {
-        l = nv2a_stage_lod(0, 0, 0, scales[k], 4);
+        l = nv2a_stage_lod(0, 0, 0, scales[k], 4, 0, 0.0f);
         CHECK(l.mip == 1 && l.min == 0.0f && feq(l.max, shifts[k]));
         CHECK(l.key >> NV2A_STAGE_LOD_FORCED_BIT & 1u);
     }
     /* A one-level entry has nothing to follow: no mip filter of its own. */
-    l = nv2a_stage_lod(0, 0, 0, 2, 1);
+    l = nv2a_stage_lod(0, 0, 0, 2, 1, 0, 0.0f);
     CHECK(l.mip == 0 && l.min == 0.0f && l.max == 0.0f);
 
+    /* A chain marked blend (XRTP_FLAG_MIP_BLEND) under a guest of one
+     * level: two levels blended over the same range, with the bias, and a
+     * sampler of its own. */
+    for (k = 1; k < 4; k++) {
+        l = nv2a_stage_lod(0, 0, 0, scales[k], 3, 1, -0.5f);
+        CHECK(l.mip == 2 && l.min == 0.0f && feq(l.max, shifts[k]) && l.bias == -0.5f);
+        CHECK(l.key >> NV2A_STAGE_LOD_FORCED_BIT & 1u);
+        CHECK(l.key >> NV2A_STAGE_LOD_BLEND_BIT & 1u);
+        CHECK(l.key != nv2a_stage_lod(0, 0, 0, scales[k], 3, 0, -0.5f).key);
+        CHECK(nv2a_stage_lod(0, 0, 0, scales[k], 3, 0, -0.5f).bias == 0.0f);
+    }
+    /* The mark changes nothing where the guest mips, on a one-level entry,
+     * or on stock: the guest's own filter and bias rule there. */
+    l = nv2a_stage_lod(2, 0, 5, 4, 6, 1, -0.5f);
+    CHECK(l.mip == 2 && feq(l.max, 7.0f) && l.bias == 0.0f
+          && !(l.key >> NV2A_STAGE_LOD_BLEND_BIT & 1u));
+    l = nv2a_stage_lod(1, 0, 5, 4, 6, 1, -0.5f);
+    CHECK(l.mip == 1 && l.bias == 0.0f);
+    l = nv2a_stage_lod(0, 0, 0, 4, 1, 1, -0.5f);
+    CHECK(l.mip == 0 && l.bias == 0.0f && !(l.key >> NV2A_STAGE_LOD_BLEND_BIT & 1u));
+    l = nv2a_stage_lod(0, 0, 0, 1, 1, 1, -0.5f);
+    CHECK(l.mip == 0 && l.bias == 0.0f && l.key == 0);
+
+    /* RECOMP_DEBUG=pack_mip_bias: a number within [-2, 2], else the
+     * default. */
+    CHECK(nv2a_stage_blend_bias(NULL) == NV2A_STAGE_BLEND_BIAS);
+    CHECK(nv2a_stage_blend_bias("-0.25") == -0.25f);
+    CHECK(nv2a_stage_blend_bias("0") == 0.0f);
+    CHECK(nv2a_stage_blend_bias("abc") == NV2A_STAGE_BLEND_BIAS);
+    CHECK(nv2a_stage_blend_bias("3") == NV2A_STAGE_BLEND_BIAS);
+    CHECK(nv2a_stage_blend_bias("nan") == NV2A_STAGE_BLEND_BIAS);
+
     /* Two scales never share a sampler. */
-    CHECK(nv2a_stage_lod(1, 0, 5, 2, 6).key != nv2a_stage_lod(1, 0, 5, 3, 6).key);
+    CHECK(nv2a_stage_lod(1, 0, 5, 2, 6, 0, 0.0f).key != nv2a_stage_lod(1, 0, 5, 3, 6, 0, 0.0f).key);
 
     CHECK(nv2a_stage_pack_scale(64, 64) == 1 && nv2a_stage_pack_scale(64, 128) == 2
           && nv2a_stage_pack_scale(64, 192) == 3 && nv2a_stage_pack_scale(64, 256) == 4);

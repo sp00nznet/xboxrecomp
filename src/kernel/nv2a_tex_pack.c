@@ -65,6 +65,7 @@ static struct nv2a_tex_pack_entry *s_entries;
 static unsigned  s_count, s_scale, s_text_scale, s_version;
 static unsigned  s_kind_count[XRTP_KIND_COUNT], s_bc1_count, s_bc3_count, s_detile_count;
 static unsigned  s_recolour_count;
+static unsigned  s_blend_count;
 /* nv2a_tex_pack_recolour's output, grown to the largest entry recoloured,
  * freed past NV2A_TEX_PACK_RECOLOUR_KEEP at release; in s_resident. */
 static uint32_t *s_recolour_buf;
@@ -226,6 +227,7 @@ void nv2a_tex_pack_unload(void)
     s_bc1_count = 0;
     s_detile_count = 0;
     s_recolour_count = 0;
+    s_blend_count = 0;
     free(s_recolour_buf);
     s_recolour_buf = NULL;
     s_recolour_cap = 0;
@@ -249,7 +251,8 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
     long long size;
     uint64_t index_off;
     uint32_t count, version, scale, text_scale = 0, known = 0, kinds_read = 0;
-    unsigned i, kinds[XRTP_KIND_COUNT] = {0}, bc1 = 0, bc3 = 0, detile = 0, recolour = 0;
+    unsigned i, kinds[XRTP_KIND_COUNT] = {0}, bc1 = 0, bc3 = 0, detile = 0, recolour = 0,
+             blend = 0;
     struct nv2a_tex_pack_entry *entries = NULL;
     const char *why = NULL;
 
@@ -298,6 +301,9 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
         kinds_read = 4u;
     } else if (version == 5u) {
         known = XRTP_FLAGS_KNOWN_V5;
+        kinds_read = 4u;
+    } else if (version == 6u) {
+        known = XRTP_FLAGS_KNOWN_V6;
         kinds_read = 4u;
     }
     if (version < 1u || version > NV2A_TEX_PACK_VERSION)
@@ -387,6 +393,7 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
             bc3 += e->bc == XRTP_BC_3 ? 1u : 0u;
             detile += (e->flags & XRTP_FLAG_DETILE_HEX) ? 1u : 0u;
             recolour += (e->flags & XRTP_FLAG_RECOLOUR) ? 1u : 0u;
+            blend += (e->flags & XRTP_FLAG_MIP_BLEND) ? 1u : 0u;
         }
     }
     free(index);
@@ -413,6 +420,7 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
     s_bc3_count = bc3;
     s_detile_count = detile;
     s_recolour_count = recolour;
+    s_blend_count = blend;
     bump_gen();
     return (int)count;
 }
@@ -460,6 +468,11 @@ unsigned nv2a_tex_pack_detile_count(void)
 unsigned nv2a_tex_pack_recolour_count(void)
 {
     return s_recolour_count;
+}
+
+unsigned nv2a_tex_pack_blend_count(void)
+{
+    return s_blend_count;
 }
 
 uint64_t nv2a_tex_pack_hits(void)

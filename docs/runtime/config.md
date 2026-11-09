@@ -884,6 +884,9 @@ declares `OriginalSize` in its uniform block) is not a read.
   ([texture-dump.md](../formats/texture-dump.md)).
 - **`RECOMP_DEBUG=tex_pack_keep`.** Keeps a pack entry's payload in RAM after
   its GPU upload, under the 512 MB budget, instead of freeing it, for A/B.
+- **`RECOMP_DEBUG=pack_mip_bias=x`.** The LOD bias, -2 to 2, of a pack entry
+  marked `XRTP_FLAG_MIP_BLEND` under a guest texture of one level (default
+  -0.5), for A/B ([texture-pack.md](../formats/texture-pack.md)).
 - **Texture dump: `RECOMP_DEBUG=tex_dump=<dir>`.** Not a config key: a
   debug entry, off by default. The Metal and D3D11 backends write every
   texture they upload into `<dir>` once per texel hash, the hash a pack

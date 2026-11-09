@@ -56,7 +56,7 @@ extern "C" {
 #endif
 
 #define NV2A_TEX_PACK_MAGIC   "XRTP"
-#define NV2A_TEX_PACK_VERSION 5u   /* the newest read; 1 to 4 are read too */
+#define NV2A_TEX_PACK_VERSION 6u   /* the newest read; 1 to 5 are read too */
 #define NV2A_TEX_PACK_HDR     32u
 #define NV2A_TEX_PACK_ENTRY   32u
 #define NV2A_TEX_PACK_MAX_DIM 16384u   /* D3D11 and Metal texture limit */
@@ -104,6 +104,12 @@ extern "C" {
  * 16-23 w, 24-31 zero. Never with a block format. */
 #define XRTP_FLAG_RECOLOUR 0x80u
 #define XRTP_FLAGS_KNOWN_V5 (XRTP_FLAGS_KNOWN_V4 | XRTP_FLAG_RECOLOUR)
+/* v6: the entry's chain is for a guest of one level drawn minified (2D art,
+ * a font atlas): a sampler that forces the chain on such a guest blends two
+ * levels, with nv2a_stage_blend_bias, instead of taking the nearest one
+ * (nv2a_stage_lod). Meaningless on an entry of one level. */
+#define XRTP_FLAG_MIP_BLEND 0x100u
+#define XRTP_FLAGS_KNOWN_V6 (XRTP_FLAGS_KNOWN_V5 | XRTP_FLAG_MIP_BLEND)
 
 /* nv2a_tex_pack_entry.bc: the payload's block format. */
 #define XRTP_BC_NONE 0
@@ -152,6 +158,8 @@ unsigned nv2a_tex_pack_detile_count(void);
 /* Entries marked XRTP_FLAG_RECOLOUR: 0, and no upload computes a plane
  * hash or looks one up. */
 unsigned nv2a_tex_pack_recolour_count(void);
+/* Entries marked XRTP_FLAG_MIP_BLEND, for the log line. */
+unsigned nv2a_tex_pack_blend_count(void);
 /* The scale the TEXT entries were built at: the u32 at header +24 from v2
  * on (0 in the file means the header scale). Informational, like the scale. */
 unsigned nv2a_tex_pack_text_scale(void);

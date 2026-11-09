@@ -1802,6 +1802,8 @@ typedef struct {
     /* What the sampler follows (nv2a_stage_lod): the entry's scale over the
      * guest texture, and its chain. 1 and tex_levels for guest texels. */
     uint32_t pack_scale, pack_levels;
+    /* The entry is marked XRTP_FLAG_MIP_BLEND (nv2a_stage_lod's blend). */
+    int pack_blend;
     /* The pack entry it holds is marked XRTP_FLAG_DETILE_HEX: kept whatever
      * textures.detile says, so the menu's toggle needs no re-upload. */
     int      pack_detile;
@@ -2051,6 +2053,7 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
             }
         e->pack_scale = 1;
         e->pack_levels = levels;
+        e->pack_blend = 0;
         e->pack_detile = 0;
         s_tex_uploads++;
         nv2a_stats_add(NV2A_STAT_TEX_UPLOADS, 1);
@@ -2110,6 +2113,7 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
     /* src is the guest's when the entry was refused above. */
     e->pack_scale = src != s_texels ? nv2a_stage_pack_scale(t->width, width) : 1u;
     e->pack_levels = levels;
+    e->pack_blend = pe && src != s_texels && (pe->flags & XRTP_FLAG_MIP_BLEND);
     e->pack_detile = pe && src != s_texels && (pe->flags & XRTP_FLAG_DETILE_HEX);
     if (pe && src != s_texels)
         nv2a_tex_pack_release(pe);
@@ -2472,6 +2476,7 @@ static void mag_flip(void)
 static ID3D11SamplerState *sampler(const Stage *t, int bump_source, const TexEntry *e)
 {
     static int point = -1;
+    static float blend_bias = 1e9f;
     static ID3D11SamplerState *fallback;
     D3D11_SAMPLER_DESC sd;
     uint32_t u = t->addr_u & 0xF, v = t->addr_v & 0xF;
@@ -2484,11 +2489,13 @@ static ID3D11SamplerState *sampler(const Stage *t, int bump_source, const TexEnt
 
     if (point < 0)
         point = recomp_env(RENV_D3D11_POINT) != NULL;
+    if (blend_bias > 1e8f)
+        blend_bias = nv2a_stage_blend_bias(recomp_env(RENV_PACK_MIP_BIAS));
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
     guest_mip = t->levels > 1 ? filter_mip(t->filter) : 0;
     lod = nv2a_stage_lod(guest_mip, t->lod_min, t->lod_max, e ? e->pack_scale : 1u,
-                         e ? e->pack_levels : 1u);
+                         e ? e->pack_levels : 1u, e && e->pack_blend, blend_bias);
     mip = lod.mip;
     /* render.aniso: anisotropic filtering on the world's surfaces, seen at
      * an angle (nv2a_stage_aniso has the rule). In the key, so a stage that
@@ -2522,7 +2529,7 @@ static ID3D11SamplerState *sampler(const Stage *t, int bump_source, const TexEnt
     sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     nv2a_argb_to_float4(border, sd.BorderColor);
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    sd.MipLODBias = guest_mip ? lod_bias(t->filter) : 0.0f;
+    sd.MipLODBias = guest_mip ? lod_bias(t->filter) : lod.bias;
     if (sd.MipLODBias > 15.99f) sd.MipLODBias = 15.99f;
     if (sd.MipLODBias < -16.0f) sd.MipLODBias = -16.0f;
     sd.MinLOD = lod.min;

@@ -267,6 +267,9 @@ static void load_tex_pack(const struct nv2a_host_opts *o)
     if (n >= 0 && nv2a_tex_pack_recolour_count())
         fprintf(stderr, LOGP "textures.pack: %u recolour entries (P8 planes, any palette)\n",
                 nv2a_tex_pack_recolour_count());
+    if (n >= 0 && nv2a_tex_pack_blend_count())
+        fprintf(stderr, LOGP "textures.pack: %u entries blend their mips when drawn minified\n",
+                nv2a_tex_pack_blend_count());
 }
 
 static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };

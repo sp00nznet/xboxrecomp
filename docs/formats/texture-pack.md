@@ -52,24 +52,25 @@ empty input to `0x40500CA3D9E617F3`; 64 zero bytes to `0x69597731194007AB`.
 All fields little-endian. Version 2 adds entry kinds, BC3 payloads and a
 text scale. Version 3 adds kind 3 (world), BC1 payloads and the `classes`
 word. Version 4 adds the `XRTP_FLAG_DETILE_HEX` mark on world entries
-(`textures.detile`). Version 5 adds `XRTP_FLAG_RECOLOUR` entries. The reader
-takes all five, each by its own rules. A writer uses v5 only for a pack that
-holds a recolour entry, so every other pack stays readable by older
-runtimes.
+(`textures.detile`). Version 5 adds `XRTP_FLAG_RECOLOUR` entries. Version 6
+adds the `XRTP_FLAG_MIP_BLEND` mark. The reader takes all six, each by its
+own rules. A writer uses v5 only for a pack that holds a recolour entry, and
+v6 only for one that holds a mip blend mark, so every other pack stays
+readable by older runtimes.
 
 ```
 offset  size  field
 0       4     magic "XRTP"
-4       4     version, 1 to 5
+4       4     version, 1 to 6
 8       4     count
 12      4     scale: the factor the art entries were made at (informational;
               logged as "scale N")
 16      8     index offset (>= 32)
 24      8     v1: reserved, 0 (a reader refuses any other value)
-24      4     v2 to v5: text scale, the factor the TEXT entries were made at
+24      4     v2 to v6: text scale, the factor the TEXT entries were made at
               (informational; 0 means the header scale)
 28      4     v2: reserved, 0
-28      4     v3 to v5: classes, a bit per kind present (1 << kind); informational,
+28      4     v3 to v6: classes, a bit per kind present (1 << kind); informational,
               the reader does not check it
 
 index: count entries of 32 bytes, sorted by hash, strictly increasing
@@ -78,7 +79,7 @@ index: count entries of 32 bytes, sorted by hash, strictly increasing
 8       4     width  (1..16384)
 12      4     height (1..16384)
 16      4     levels (1 .. 1 + floor(log2(max(w, h))))
-20      4     flags: v1 0; v2 to v5 below (a reader refuses any other value)
+20      4     flags: v1 0; v2 to v6 below (a reader refuses any other value)
 24      8     payload offset (>= 32)
 
 payload: per entry, every level, level 0 first, each further level
@@ -98,17 +99,18 @@ Entry flags:
 
 | Bits | Name | Meaning |
 |---|---|---|
-| 0-1 | kind | `0` art (HUD pieces and other images), `1` font (the atlas the glyphs are drawn from), `2` text (an image of pre-rendered text); `3` world (textures of the 3D scene), v3 to v5 |
+| 0-1 | kind | `0` art (HUD pieces and other images), `1` font (the atlas the glyphs are drawn from), `2` text (an image of pre-rendered text); `3` world (textures of the 3D scene), v3 to v6 |
 | 4 | `XRTP_FLAG_BC3` | the payload is BC3 blocks |
-| 5 | `XRTP_FLAG_BC1` | the payload is BC1 blocks, v3 to v5; never with bit 4 |
-| 6 | `XRTP_FLAG_DETILE_HEX` | v4 and v5, world entries only (a reader refuses it on another kind): with `textures.detile` on, the entry samples hex-tiled (`src/d3d/nv2a_hex_tile.h`). The payload is unchanged; a writer marks only organic tiles, never bricks or planks. Only a stage that wraps on both axes samples hex-tiled (`nv2a_hex_wrap_ok`); clamp, mirror and border keep the stock read. If the hex shader does not compile, the draw keeps the stock shader |
-| 7 | `XRTP_FLAG_RECOLOUR` | v5: a P8 index plane's entry (see Recolour entries); never with bit 4 or 5 (a reader refuses the file) |
+| 5 | `XRTP_FLAG_BC1` | the payload is BC1 blocks, v3 to v6; never with bit 4 |
+| 6 | `XRTP_FLAG_DETILE_HEX` | v4 to v6, world entries only (a reader refuses it on another kind): with `textures.detile` on, the entry samples hex-tiled (`src/d3d/nv2a_hex_tile.h`). The payload is unchanged; a writer marks only organic tiles, never bricks or planks. Only a stage that wraps on both axes samples hex-tiled (`nv2a_hex_wrap_ok`); clamp, mirror and border keep the stock read. If the hex shader does not compile, the draw keeps the stock shader |
+| 7 | `XRTP_FLAG_RECOLOUR` | v5 and v6: a P8 index plane's entry (see Recolour entries); never with bit 4 or 5 (a reader refuses the file) |
+| 8 | `XRTP_FLAG_MIP_BLEND` | v6: under a guest texture of one level, sample the entry's chain linearly between levels with a LOD bias, instead of the nearest level (see below). The payload is unchanged; any kind |
 
 Each version refuses what it does not define (a v2 file with kind 3 or bit 5,
 any file with another bit), so a later meaning is never misread by this
 reader. A runtime from before v4 refuses a v4 pack whole (bit 6 is a flag it
 does not know), so a toolkit that reads v4 must ship before, or with, the
-tool that writes it; the same holds for v5 and bit 7. The kind is the unit a player turns off (`textures.font`,
+tool that writes it; the same holds for v5 and bit 7, and v6 and bit 8. The kind is the unit a player turns off (`textures.font`,
 `textures.text`, `textures.world`, [config.md](../runtime/config.md)): a
 turned-off entry is not found, and the guest texture goes up as without a
 pack. The header scale describes the art; each entry carries its own size,
@@ -162,6 +164,19 @@ entry's width over the guest's, when that is an exact multiple of at most 15
   samples `[0, shift]` with the nearest level. Without it the entry aliases
   worse than stock, and past `shift` the far end is what the guest showed;
 - an entry with one level has nothing to choose from: `[0, 0]`, as before.
+
+An entry marked `XRTP_FLAG_MIP_BLEND` (v6) changes only the second case: the
+range stays `[0, shift]`, but the stage blends the two nearest levels and
+biases the LOD by -0.5 (`NV2A_STAGE_BLEND_BIAS`; `RECOMP_DEBUG=pack_mip_bias=x`
+sets it, -2 to 2, for A/B). Text, the font and HUD art are drawn minified at
+fractional ratios (BLiNX 2's font at about 0.81 of its 4x entry at render
+scale 2, HUD art at 0.5): the nearest level then snaps to a level up to twice
+too coarse or too fine, and a blend half a level sharp follows the ratio. The
+CLI marks the chains it builds down to the guest size (`mips = "guest"`),
+whose levels are the entry at 1/2^k of its scale, so each level's texel edges
+still fall on the guest's. A guest texture that mips, and an entry of one
+level, sample as without the mark. D3D11 sets the bias in the sampler
+(`MipLODBias`); Metal has none and adds it in the shader (`tex_bias`).
 
 A linear texture (texel coordinates) would be sampled at guest texel positions
 and should not be put in a pack.
