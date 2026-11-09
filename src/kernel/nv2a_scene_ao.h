@@ -159,13 +159,13 @@ struct nv2a_ao_trig {
     int         retried, gave_up;
     /* This frame's events for the ao_frames trace (nv2a_ao_frame_str):
      * why each fired (NV2A_AO_WHY_*), the candidate's depth-writing draws
-     * by then, the ordinal the first pass ran at (0: none) and a bit per
-     * event that ran a pass. */
+     * by then, the ordinal the first pass ran at (0: none), a bit per
+     * event that ran a pass and one per flat top-up (shown "+", not "*"). */
     uint8_t     ev_why[NV2A_AO_EVENTS];
     uint16_t    ev_zd[NV2A_AO_EVENTS];
     const void *ev_rt[NV2A_AO_EVENTS];
     unsigned    fired_at;
-    uint16_t    ev_fired;
+    uint16_t    ev_fired, ev_flat;
     uint8_t     hist[NV2A_AO_HIST];  /* ring of event counts, newest at nhist - 1 */
     unsigned    nhist;
     unsigned    memo;             /* want as frame_end set it (the flip moves want) */
@@ -200,6 +200,13 @@ struct nv2a_ao_trig {
     uint32_t    shape_clock;
     unsigned    floor;
     uint64_t    snaps;
+    /* Flat draws (nv2a_ao_flat_draw) on the occluded target since its last
+     * pass this frame (flat), and whether the window the current top-up
+     * closes had any (top_flat): that top-up keeps the ratio everywhere,
+     * so the HUD, 2D and full-screen layers drawn in it are not occluded.
+     * flat_topups: such top-ups, for the trace. */
+    int         flat, top_flat;
+    uint64_t    flat_topups;
 };
 
 void nv2a_ao_reset(struct nv2a_ao_trig *t);
@@ -216,6 +223,20 @@ void nv2a_ao_forget(struct nv2a_ao_trig *t, const void *rt);
  * occlusion of its last pass to tell what changed). */
 const void *nv2a_ao_draw(struct nv2a_ao_trig *t, const void *rt, uint32_t w, uint32_t h,
                          int has_depth, int zwrite, int samples_cand);
+
+/* A draw that writes colour, after nv2a_ao_draw and the pass it may have
+ * run: rt and whether it is flat (nv2a_ao_flat_draw). */
+void nv2a_ao_drew(struct nv2a_ao_trig *t, const void *rt, int flat);
+
+/* Whether a colour draw is one a top-up must not take as covering the
+ * pixels with fresh content (the full map, nv2a_ao_top_full): its depth
+ * test is off or ALWAYS (the HUD, text, 2D, a full-screen glow or fog
+ * quad: on top of the scene, not in it), or it modulates what is there
+ * (sfactor DST_COLOR or dfactor SRC_COLOR: a lightmap or detail pass over
+ * a base the last pass already occluded). Depth func and blend
+ * factors are the guest's GL codes. */
+int nv2a_ao_flat_draw(int ztest, uint32_t zfunc, int blend, uint32_t sfactor,
+                      uint32_t dfactor);
 
 /* The backend did not run the pass nv2a_ao_draw or nv2a_ao_flip just
  * returned (no readable depth of the target's size, a top-up whose record
@@ -270,7 +291,8 @@ void nv2a_ao_frame_str(const struct nv2a_ao_trig *t, char *buf, size_t cap,
  * the C one. p0 = (a, b, wmode, zmax); p1 = (radius in host pixels,
  * 1 / wref, fade_lo, fade_hi); p2 = (host w, host h, tan x, tan y) of the
  * assumed 60 degree vertical field; p3 = (strength, bias, view, mode):
- * mode 0 a first pass, 1 a top-up, 2 a fallback. */
+ * mode 0 a first pass, 1 a top-up, 2 a fallback, 3 a top-up whose window
+ * held a flat draw (t->top_flat: the ratio only, no colour compare). */
 struct nv2a_ao_consts {
     float p0[4];
     float p1[4];
@@ -285,11 +307,26 @@ void nv2a_ao_consts_fill(const struct nv2a_ao_trig *t, const struct nv2a_ao_cfg 
 
 /* One pixel of ao_comp_fs after its filter (nv2a_scene_ao_shaders.h; the
  * shaders do the same, this is for the tests): filt is this pass's
- * occlusion, d the pixel's depth now, top a top-up outside ao_view, and
- * (prev_t, prev_d) the pixel's record from the frame's last pass. Returns
- * the factor the colour is multiplied by and sets *t to the new record's
- * total, the occlusion the pixel now carries. */
-float nv2a_ao_comp_px(float filt, float d, int top, float prev_t, float prev_d, float *t);
+ * occlusion, d the pixel's depth now, top a top-up outside ao_view (2: a
+ * flat one, t->top_flat, which ignores change and keeps the ratio), and
+ * (prev_t, prev_d) the pixel's record from the frame's last pass; change
+ * is how far its colour moved since that pass left it (the largest
+ * channel's, 0..1). Returns the factor the colour is multiplied by and
+ * sets *t to the new record's total, the occlusion the pixel now carries. */
+float nv2a_ao_comp_px(float filt, float d, int top, float prev_t, float prev_d, float change,
+                      float *t);
+
+/* How much of a top-up's full occlusion a pixel with unchanged depth takes
+ * (ao_comp_fs; the shaders do the same, this is for the tests), against
+ * the ratio new / old: 0 up to NV2A_AO_TOP_LO (the colour the last pass
+ * left, at most a rounding step or a faint glow off), 1 from
+ * NV2A_AO_TOP_HI (a draw without depth writes since, the BLiNX 2 Stage 1
+ * pool's water), linear between. A single pass after that draw
+ * occludes it in full, so a top-up after it must too, or the frames whose
+ * pass fell before the water show it brighter than those after. */
+#define NV2A_AO_TOP_LO 0.02f
+#define NV2A_AO_TOP_HI 0.06f
+float nv2a_ao_top_full(float change);
 
 /* ao_comp_fs's fallback mask in C (the shaders do the same, this is for
  * the tests): how much of the occlusion a fallback pass applies to a pixel

@@ -1041,25 +1041,25 @@ static void test_comp(void)
      * cannot brighten, so the pixel keeps 0.5, and the next top-up (0.6)
      * divides by the 0.5 applied, not by the 0.8 wanted (that left it at
      * 0.5 * 0.6 / 0.8, darker with each top-up). */
-    c = nv2a_ao_comp_px(0.5f, 0.3f, 0, 1.0f, 0.0f, &t);
-    a = nv2a_ao_comp_px(0.8f, 0.3f, 1, t, 0.3f, &t);
+    c = nv2a_ao_comp_px(0.5f, 0.3f, 0, 1.0f, 0.0f, 0.0f, &t);
+    a = nv2a_ao_comp_px(0.8f, 0.3f, 1, t, 0.3f, 0.0f, &t);
     c *= a;
     check(a == 1.0f && t == 0.5f, "comp: a lighter top-up leaves the pixel as it was");
-    c *= nv2a_ao_comp_px(0.6f, 0.3f, 1, t, 0.3f, &t);
+    c *= nv2a_ao_comp_px(0.6f, 0.3f, 1, t, 0.3f, 0.0f, &t);
     check(fabsf(c - 0.5f) < 1e-6f && t == 0.5f, "comp: and the next one divides by what was applied");
-    c *= nv2a_ao_comp_px(0.2f, 0.3f, 1, t, 0.3f, &t);
+    c *= nv2a_ao_comp_px(0.2f, 0.3f, 1, t, 0.3f, 0.0f, &t);
     check(fabsf(c - 0.2f) < 1e-6f && t == 0.2f, "comp: a darker one brings the pixel to it");
-    a = nv2a_ao_comp_px(0.4f, 0.3f, 1, 0.0f, 0.3f, &t);
+    a = nv2a_ao_comp_px(0.4f, 0.3f, 1, 0.0f, 0.3f, 0.0f, &t);
     check(a == 1.0f && t == 0.0f, "comp: a pixel at no light divides by nothing");
-    a = nv2a_ao_comp_px(0.4f, 0.25f, 1, 0.5f, 0.3f, &t);
+    a = nv2a_ao_comp_px(0.4f, 0.25f, 1, 0.5f, 0.3f, 0.0f, &t);
     check(a == 0.4f && t == 0.4f, "comp: new depth (drawn again) takes the map in full");
-    a = nv2a_ao_comp_px(0.4f, 0.3f, 0, 0.5f, 0.3f, &t);
+    a = nv2a_ao_comp_px(0.4f, 0.3f, 0, 0.5f, 0.3f, 0.0f, &t);
     check(a == 0.4f && t == 0.4f, "comp: a first pass takes the map in full");
     /* Random chains: some passes over new depth (the colour drawn again,
      * so it starts over at 1), the others over the same. */
     for (i = 0; i < 2000; i++) {
         float d = 0.5f;
-        c = nv2a_ao_comp_px(0.3f + 0.7f * (float)(i % 97) / 96.0f, d, 0, 1.0f, 0.0f, &t);
+        c = nv2a_ao_comp_px(0.3f + 0.7f * (float)(i % 97) / 96.0f, d, 0, 1.0f, 0.0f, 0.0f, &t);
         for (k = 0; k < 6; k++) {
             float pd = d, f;
             seed = seed * 1103515245u + 12345u;
@@ -1068,11 +1068,90 @@ static void test_comp(void)
                 d = pd - 0.01f;
                 c = 1.0f;
             }
-            c *= nv2a_ao_comp_px(f, d, 1, t, pd, &t);
+            c *= nv2a_ao_comp_px(f, d, 1, t, pd, 0.0f, &t);
         }
         bad += fabsf(c - t) > 1e-5f;
     }
     check(bad == 0, "comp: the colour carries the record's total through top-ups");
+}
+
+/* The BLiNX 2 Stage 1 pool: water drawn without depth writes
+ * over the pool floor, near the corner wall's crease (occlusion 0.6). The
+ * memo's ordinal lands before the water on some frames and after it on
+ * others while the camera pans. One pass after the water occludes it; a
+ * pass before it then a top-up must too, or the water's edge flickers. */
+static void test_comp_translucent(void)
+{
+    const float occ = 0.6f, floor_c = 0.30f, water = 0.70f, alpha = 0.8f, d = 0.42f;
+    float t, t0, a, after, before, ratio, moved;
+    /* Pass after the water: the blended colour, occluded once. */
+    a = nv2a_ao_comp_px(occ, d, 0, 1.0f, 0.0f, 0.0f, &t);
+    after = (alpha * water + (1.0f - alpha) * floor_c) * a;
+    /* Pass before: the floor occluded, the water blended over it (depth
+     * kept), then a top-up at the same occlusion. */
+    a = nv2a_ao_comp_px(occ, d, 0, 1.0f, 0.0f, 0.0f, &t);
+    before = alpha * water + (1.0f - alpha) * floor_c * a;
+    moved = fabsf(before - floor_c * a);
+    t0 = t;                     /* the first pass's record, which both top-ups read */
+    ratio = before * nv2a_ao_comp_px(occ, d, 1, t0, d, 0.0f, &t);
+    before *= nv2a_ao_comp_px(occ, d, 1, t0, d, moved, &t);
+    check(fabsf(ratio - after) > 0.15f,
+          "comp: (the ratio left the water unoccluded, 0.15 off a single pass)");
+    /* What is left is the floor seen through the water, occluded twice:
+     * (1 - alpha) floor occ (1 - occ), 0.0144 here (the mask's known cost,
+     * nv2a_scene_ao_shaders.h). */
+    check(fabsf((after - before) - (1.0f - alpha) * floor_c * occ * (1.0f - occ)) < 1e-4f
+              && t == occ,
+          "comp: a top-up over translucent content occludes it as a single pass would");
+    /* What decides it, nv2a_ao_top_full: 0 up to LO, 1 from HI. */
+    check(nv2a_ao_top_full(0.0f) == 0.0f && nv2a_ao_top_full(NV2A_AO_TOP_LO) == 0.0f,
+          "top-up mask: an unchanged pixel keeps the ratio");
+    check(fabsf(nv2a_ao_top_full(0.04f) - 0.5f) < 1e-4f, "top-up mask: half way at 0.04");
+    check(nv2a_ao_top_full(NV2A_AO_TOP_HI) == 1.0f && nv2a_ao_top_full(1.0f) == 1.0f,
+          "top-up mask: a covered pixel takes the full map");
+    /* Covered content starts over at this pass's map (the old total was
+     * the floor's), and a new depth is the same whatever the colour. */
+    a = nv2a_ao_comp_px(0.9f, d, 1, 0.5f, d, 1.0f, &t);
+    check(a == 0.9f && t == 0.9f, "comp: covered content gets this pass's map, not the old one");
+    a = nv2a_ao_comp_px(0.4f, 0.25f, 1, 0.5f, 0.3f, 0.0f, &t);
+    check(a == 0.4f && t == 0.4f, "comp: new depth still takes the map in full, colour or not");
+}
+
+/* A HUD-like pixel in a top-up's window (the water fix's review): a large move at
+ * the depth under it. The colour mask alone would take it for fresh
+ * content and occlude it with the scene's crease; the window held a flat
+ * draw (depth test off), so the top-up keeps the ratio there, and the HUD
+ * stays as drawn. */
+static void test_comp_hud_in_topup(void)
+{
+    const float occ = 0.6f, d = 0.42f;
+    float t, t0, a;
+    nv2a_ao_comp_px(occ, d, 0, 1.0f, 0.0f, 0.0f, &t);
+    t0 = t;
+    a = nv2a_ao_comp_px(occ, d, 1, t0, d, 0.9f, &t);
+    check(a == occ, "comp: (without the gate the HUD pixel takes the crease)");
+    a = nv2a_ao_comp_px(occ, d, 2, t0, d, 0.9f, &t);
+    check(a == 1.0f && t == t0, "comp: a flat top-up leaves a HUD pixel over a crease alone");
+    a = nv2a_ao_comp_px(0.4f, d, 2, t0, d, 0.9f, &t);
+    check(fabsf(a - 0.4f / 0.6f) < 1e-6f && t == 0.4f,
+          "comp: a flat top-up still corrects by the ratio");
+    a = nv2a_ao_comp_px(0.4f, 0.3f, 2, t0, d, 0.0f, &t);
+    check(a == 0.4f && t == 0.4f, "comp: a flat top-up occludes new depth in full");
+}
+
+/* Which draws make a window flat: the guest's GL codes. */
+static void test_flat_draw(void)
+{
+    check(nv2a_ao_flat_draw(0, 0x0203u, 1, 0x0302u, 0x0303u), "flat: depth test off (HUD, 2D)");
+    check(nv2a_ao_flat_draw(1, 0x0207u, 0, 0, 0), "flat: depth func ALWAYS");
+    check(!nv2a_ao_flat_draw(1, 0x0203u, 1, 0x0302u, 0x0303u),
+          "flat: not a depth-tested over blend (the pool's water)");
+    check(!nv2a_ao_flat_draw(1, 0x0203u, 0, 0x0306u, 0x0300u),
+          "flat: not an opaque draw, whatever its idle blend factors");
+    check(nv2a_ao_flat_draw(1, 0x0202u, 1, 0x0306u, 0x0000u), "flat: DST_COLOR x ZERO (lightmap)");
+    check(nv2a_ao_flat_draw(1, 0x0202u, 1, 0x0000u, 0x0300u), "flat: ZERO x SRC_COLOR (modulate)");
+    check(!nv2a_ao_flat_draw(1, 0x0203u, 1, 0x0302u, 0x0001u),
+          "flat: not a depth-tested additive (a sparkle: local)");
 }
 
 /* A HUD in the middle of the frame, then the 3D again on some frames: the
@@ -1102,6 +1181,64 @@ static void test_hud_then_3d(void)
     }
     check(bad == 0, "HUD then 3D: the HUD fires, the flip tops up the 3D after it");
     check(extra == 12, "HUD then 3D: a top-up only on the frames with 3D after the HUD");
+}
+
+/* The same shape, with the colour draws reported (nv2a_ao_drew, as the
+ * backends do): the HUD drawn in the top-up's window makes it flat, so the
+ * 3D portrait's top-up keeps the ratio on the HUD. A window of
+ * depth-tested draws only (the pool's water) is not flat; a dropped top-up
+ * hands its window on, and the next frame starts clear. */
+static void test_flat_window(void)
+{
+    struct nv2a_ao_trig t;
+    struct nv2a_ao_cfg c;
+    struct nv2a_ao_consts k;
+    unsigned f, i, bad = 0, flat = 0, tops = 0, marks = 0;
+    char line[400];
+    nv2a_ao_cfg_default(&c);
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 40; f++) {
+        int more = f % 3 == 1, hud = f % 2 == 0;
+        for (i = 0; i < 70 + (more ? 20u : 0u); i++) {
+            int zw = i < 60 || i >= 70;
+            nv2a_ao_draw(&t, RT_3D, 640, 480, 1, zw, 0);
+            /* Draws 60-69: the HUD (no depth test) or, on odd frames, a
+             * depth-tested translucent layer without depth writes. */
+            nv2a_ao_drew(&t, RT_3D, !zw && hud);
+            if (zw) put_proj(&t, 2.0f + (float)(i * 53 % 900), 0.5f, 2000.0f, 0);
+        }
+        if (nv2a_ao_flip(&t, RT_3D) && t.fired > 1) {
+            nv2a_ao_consts_fill(&t, &c, 640, 480, 480, 1, &k);
+            if (f >= 4) {
+                tops++;
+                flat += t.top_flat;
+                bad += t.top_flat != hud || k.p3[3] != (hud ? 3.0f : 1.0f);
+                /* The ao_frames trace marks the flat top-up "+". */
+                nv2a_ao_frame_str(&t, line, sizeof line, NULL);
+                marks += (strchr(line, '+') != NULL) == hud;
+            }
+        }
+        frame_done(&t);
+        bad += t.flat || t.top_flat;
+    }
+    check(tops == 12 && bad == 0, "flat window: a HUD in the window makes its top-up flat");
+    check(flat == 6 && t.flat_topups >= 6, "flat window: a depth-tested layer does not");
+    check(marks == 12, "flat window: the trace marks flat top-ups");
+
+    /* A flat top-up the backend drops: its window runs on to the next. */
+    nv2a_ao_reset(&t);
+    t.fired = 2;
+    t.fired_rt = RT_3D;
+    t.top_flat = 1;
+    t.flat_topups = 1;
+    t.topups = 1;
+    nv2a_ao_dropped(&t);
+    check(t.fired == 1 && t.flat && !t.top_flat && t.flat_topups == 0,
+          "flat window: a dropped top-up hands its flat draws on");
+    nv2a_ao_drew(&t, RT_SHADOW, 1);
+    t.flat = 0;
+    nv2a_ao_drew(&t, RT_SHADOW, 1);
+    check(!t.flat, "flat window: another target's draws do not count");
 }
 
 static void test_dump_parse(void)
@@ -1872,7 +2009,11 @@ int main(void)
     test_wmode();
     test_consts();
     test_comp();
+    test_comp_translucent();
+    test_comp_hud_in_topup();
+    test_flat_draw();
     test_hud_then_3d();
+    test_flat_window();
     test_dump_parse();
     test_forget();
     test_late();

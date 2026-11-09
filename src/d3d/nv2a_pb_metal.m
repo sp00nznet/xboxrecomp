@@ -2602,6 +2602,9 @@ static const void *s_ao_rec_rt;
  * target's at the flip. A fallback occludes where the two are close (nv2a_ao_fb_keep). */
 static id<MTLTexture> s_ao_snap[2];
 static const void *s_ao_snap_rt;
+/* The colour the last pass on s_ao_rec_rt left: a top-up gives the full
+ * map, not the ratio, where the colour moved since. */
+static id<MTLTexture> s_ao_left;
 static id<MTLCommandBuffer> s_ao_cmd;   /* ao trace: the last passes' own buffer */
 static uint64_t s_ao_runs, s_ao_skips, s_ao_gpu_ns, s_ao_gpu_n;
 static int s_ao_trace = -1;
@@ -2763,32 +2766,39 @@ static void ao_gpu_collect(void)
     }
 }
 
-/* Copy rt's colour into s_ao_snap[i] (the open pass ends; the next draw
- * loads it again). 0 when no texture of its size could be made. */
-static int ao_copy(RenderTarget *rt, int i)
+/* Copy rt's colour into *tex, made or remade at rt's size (the open pass
+ * ends; the next draw loads it again). 0 when no texture of its size could
+ * be made. */
+static int ao_copy_to(RenderTarget *rt, id<MTLTexture> *tex)
 {
     id<MTLBlitCommandEncoder> bl;
     if (!rt || !rt->tex)
         return 0;
-    if (!s_ao_snap[i] || [s_ao_snap[i] width] != rt->hw || [s_ao_snap[i] height] != rt->hh) {
+    if (!*tex || [*tex width] != rt->hw || [*tex height] != rt->hh) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:[rt->tex pixelFormat] width:rt->hw height:rt->hh
                                      mipmapped:NO];
         td.usage = MTLTextureUsageShaderRead;
         td.storageMode = MTLStorageModePrivate;
-        [s_ao_snap[i] release];
-        s_ao_snap[i] = [s_dev newTextureWithDescriptor:td];
-        if (!s_ao_snap[i])
+        [*tex release];
+        *tex = [s_dev newTextureWithDescriptor:td];
+        if (!*tex)
             return 0;
     }
     end_encoder();
     ensure_cmd();
     bl = [s_cmd blitCommandEncoder];
     [bl copyFromTexture:rt->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-             sourceSize:MTLSizeMake(rt->hw, rt->hh, 1) toTexture:s_ao_snap[i]
+             sourceSize:MTLSizeMake(rt->hw, rt->hh, 1) toTexture:*tex
        destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
     [bl endEncoding];
     return 1;
+}
+
+/* Copy rt's colour into s_ao_snap[i]. */
+static int ao_copy(RenderTarget *rt, int i)
+{
+    return ao_copy_to(rt, &s_ao_snap[i]);
 }
 
 /* Occlude rt's colour now, from its depth buffer. Between passes: the open
@@ -2801,7 +2811,7 @@ static void ao_apply(RenderTarget *rt)
     MTLRenderPassDescriptor *rp;
     id<MTLRenderCommandEncoder> e;
     id<MTLBuffer> pre = nil, post = nil, snap = nil;
-    int dump, timed = ao_trace(), top = s_ao.fired > 1, fb = s_ao.fallback, i;
+    int dump, timed = ao_trace(), top = s_ao.fired > 1, fb = s_ao.fallback, i, flat;
     unsigned cur;
 
     if (!dt || !dt->readable || dt->hw != rt->hw || dt->hh != rt->hh || !ao_build())
@@ -2817,7 +2827,12 @@ static void ao_apply(RenderTarget *rt)
      * a full pass would occlude them twice. */
     if (top && s_ao_rec_rt != rt)
         top = 0;
-    if (top && ([s_ao_rec[0] width] != rt->hw || [s_ao_rec[0] height] != rt->hh)) {
+    /* A window that held a flat draw (the HUD, a glow: nv2a_ao_flat_draw)
+     * keeps the ratio and compares no colour. */
+    flat = top && s_ao.top_flat;
+    if (top && ([s_ao_rec[0] width] != rt->hw || [s_ao_rec[0] height] != rt->hh
+                || (!c->view && !flat && (!s_ao_left || [s_ao_left width] != rt->hw
+                                          || [s_ao_left height] != rt->hh)))) {
         s_ao_skips++;
         return;
     }
@@ -2839,8 +2854,11 @@ static void ao_apply(RenderTarget *rt)
     /* The first pass writes record 0; each top-up the other one. */
     cur = top ? s_ao_i ^ 1u : 0u;
     nv2a_ao_consts_fill(&s_ao, c, rt->hw, rt->hh, rt->h, rt->n, &k);
-    k.p3[3] = fb ? 2.0f : (float)top;
-    if (fb && !ao_copy(rt, 1))
+    k.p3[3] = fb ? 2.0f : flat ? 3.0f : (float)top;
+    /* A fallback's colour now; a top-up's too, against the colour the
+     * last pass left (outside ao_view and a flat window, which read
+     * neither). */
+    if ((fb || (top && !flat && !c->view)) && !ao_copy(rt, 1))
         return;
     dump = ao_dump_due();
     end_encoder();
@@ -2879,14 +2897,24 @@ static void ao_apply(RenderTarget *rt)
     /* The previous record; the first pass reads none, so any texture but
      * the attachment it writes stands in. */
     [e setFragmentTexture:top ? s_ao_rec[s_ao_i] : s_ao_tex atIndex:2];
-    /* The fallback's two colours; other passes read neither. */
-    [e setFragmentTexture:fb ? s_ao_snap[0] : s_ao_tex atIndex:3];
-    [e setFragmentTexture:fb ? s_ao_snap[1] : s_ao_tex atIndex:4];
+    /* The fallback's two colours, or a top-up's; a first pass reads
+     * neither. */
+    [e setFragmentTexture:fb ? s_ao_snap[0] : top && !flat && !c->view ? s_ao_left : s_ao_tex
+                  atIndex:3];
+    [e setFragmentTexture:fb || (top && !flat && !c->view) ? s_ao_snap[1] : s_ao_tex atIndex:4];
     [e setFragmentBytes:&k length:sizeof k atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
     s_ao_i = cur;
     s_ao_rec_rt = rt;
+    /* What this pass left, for the next top-up's compare (one without it
+     * is skipped above, as one whose record no longer fits). */
+    if (!fb && !c->view) {
+        ao_copy_to(rt, &s_ao_left);
+    } else if (c->view) {
+        [s_ao_left release];    /* stale once ao_view goes off: the next copy remakes it */
+        s_ao_left = nil;
+    }
     rt->dirty = 1;
     s_ao_runs++;
     if (dump)
@@ -2929,7 +2957,7 @@ static void ao_run(const void *fire)
 }
 
 /* Before a draw on rt: the trigger's step, and the passes if it fires. */
-static void ao_on_draw(RenderTarget *rt, int has_depth, int zwrite)
+static void ao_on_draw(RenderTarget *rt, int has_depth, int zwrite, int colour, int flat)
 {
     const RenderTarget *cand = (const RenderTarget *)s_ao.cand;
     int smp = 0;
@@ -2943,6 +2971,8 @@ static void ao_on_draw(RenderTarget *rt, int has_depth, int zwrite)
     fire = nv2a_ao_draw(&s_ao, rt, rt->w, rt->h, has_depth, zwrite, smp);
     if (fire)
         ao_run(fire);
+    if (colour)
+        nv2a_ao_drew(&s_ao, rt, flat);
     /* An event the frame may end at below the memo (one short of it, or a
      * count the shape window saw): the colour now, for the flip's
      * fallback if the frame ends here. */
@@ -3018,7 +3048,7 @@ static void ao_flip(RenderTarget *shown)
             ao_gpu_collect();
             fprintf(stderr, LOGP "ao: flip %llu: %llu frames, %llu occluded, %llu missed,"
                     " %llu refused fits; fit a=%.6f b=%.6g conf=%.2f wmode=%d wref=%.4g;"
-                    " %llu passes (%llu top-ups, %llu dropped, %llu of them top-ups that"
+                    " %llu passes (%llu top-ups, %llu flat, %llu dropped, %llu of them top-ups that"
                     " no longer fit), GPU %.3f ms each;"
                     " %llu late frames (%llu draws), %llu fallbacks, %llu fired early,"
                     " %llu colour copies asked\n",
@@ -3027,6 +3057,7 @@ static void ao_flip(RenderTarget *shown)
                     (unsigned long long)s_ao.missed, (unsigned long long)s_ao.no_fit,
                     s_ao.fit.a, s_ao.fit.b, s_ao.fit.conf, s_ao.fit.wmode, s_ao.fit.wref,
                     (unsigned long long)s_ao_runs, (unsigned long long)s_ao.topups,
+                    (unsigned long long)s_ao.flat_topups,
                     (unsigned long long)s_ao.drop_total, (unsigned long long)s_ao_skips,
                     s_ao_gpu_n ? (double)s_ao_gpu_ns / (double)s_ao_gpu_n / 1e6 : 0.0,
                     (unsigned long long)s_ao.late_frames, (unsigned long long)s_ao.late_draws,
@@ -3128,7 +3159,11 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
          * trigger on either backend. */
         if (s_ao_on && (g->color_keep != 0xFFFFFFFFu || (v->depth_enable && v->depth_mask)
                         || use_s))
-            ao_on_draw(rt, rt->dt != NULL || use_z, v->depth_enable && v->depth_mask);
+            ao_on_draw(rt, rt->dt != NULL || use_z, v->depth_enable && v->depth_mask,
+                       g->color_keep != 0xFFFFFFFFu,
+                       nv2a_ao_flat_draw(v->depth_enable, v->depth_func,
+                                         (int)g->blend_enable, g->blend_sfactor,
+                                         g->blend_dfactor));
         bump_src = nv2a_bump_sources(s_stage, v->rc_set && (v->rc_ctl & 0xFF),
                                      v->other_stage_input);
         {

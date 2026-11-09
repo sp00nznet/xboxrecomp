@@ -294,6 +294,7 @@ static const void *event(struct nv2a_ao_trig *t, int why)
             t->fired = 1;
             t->fired_at = t->ord;
             t->fired_rt = t->cand;
+            t->flat = 0;
         } else if (t->ord < t->want && t->cand && copy_here(t)) {
             /* If the frame ends here, its HUD is next and no event follows
              * it, so the flip's fallback needs the colour as of now
@@ -310,6 +311,11 @@ static const void *event(struct nv2a_ao_trig *t, int why)
         fire = t->cand;
         t->fired++;
         t->topups++;
+        t->top_flat = t->flat;
+        t->flat = 0;
+        t->flat_topups += t->top_flat ? 1u : 0u;
+        if (t->top_flat && t->ord <= NV2A_AO_EVENTS)
+            t->ev_flat |= (uint16_t)(1u << (t->ord - 1u));
     }
     if (fire)
         t->late = 0;
@@ -328,11 +334,17 @@ void nv2a_ao_dropped(struct nv2a_ao_trig *t)
         t->fallback = 0;
         t->fallbacks--;
     }
-    if (t->ord && t->ord <= NV2A_AO_EVENTS)
+    if (t->ord && t->ord <= NV2A_AO_EVENTS) {
         t->ev_fired &= (uint16_t)~(1u << (t->ord - 1u));
+        t->ev_flat &= (uint16_t)~(1u << (t->ord - 1u));
+    }
     if (t->fired > 1) {
         t->fired--;
         t->topups--;
+        /* The window runs on to the next pass, with what it held. */
+        t->flat_topups -= t->top_flat ? 1u : 0u;
+        t->flat |= t->top_flat;
+        t->top_flat = 0;
         return;
     }
     if (t->early_now) {
@@ -421,6 +433,21 @@ const void *nv2a_ao_draw(struct nv2a_ao_trig *t, const void *rt, uint32_t w, uin
     if (!t->armed && t->since >= (t->since == t->zdraws ? c->arm_draws : c->rearm_draws))
         t->armed = 1;
     return fire;
+}
+
+void nv2a_ao_drew(struct nv2a_ao_trig *t, const void *rt, int flat)
+{
+    if (flat && t->fired && rt == t->fired_rt)
+        t->flat = 1;
+}
+
+int nv2a_ao_flat_draw(int ztest, uint32_t zfunc, int blend, uint32_t sfactor,
+                      uint32_t dfactor)
+{
+    /* GL_ALWAYS; GL_SRC_COLOR, GL_DST_COLOR. */
+    if (!ztest || zfunc == 0x0207u)
+        return 1;
+    return blend && (sfactor == 0x0306u || dfactor == 0x0300u);
 }
 
 int nv2a_ao_sample_slot(struct nv2a_ao_trig *t, int wmode)
@@ -582,7 +609,10 @@ void nv2a_ao_frame_end(struct nv2a_ao_trig *t, uint32_t shown_w, uint32_t shown_
     t->snap_req = 0;
     t->fallback = 0;
     t->early_now = 0;
+    t->flat = 0;
+    t->top_flat = 0;
     t->ev_fired = 0;
+    t->ev_flat = 0;
     t->cand = NULL;
     t->zdraws = 0;
     t->since = 0;
@@ -613,7 +643,8 @@ void nv2a_ao_frame_str(const struct nv2a_ao_trig *t, char *buf, size_t cap,
         uint32_t rid = id ? id(t->ev_rt[i]) : (uint32_t)((uintptr_t)t->ev_rt[i] & 0xFFFFFu);
         o += (size_t)snprintf(buf + o, cap - o, "%s%c%u@%x%s", i ? "," : "",
                               why[t->ev_why[i] < sizeof why - 1 ? t->ev_why[i] : 0],
-                              (unsigned)t->ev_zd[i], rid, (t->ev_fired >> i) & 1u ? "*" : "");
+                              (unsigned)t->ev_zd[i], rid,
+                              (t->ev_flat >> i) & 1u ? "+" : (t->ev_fired >> i) & 1u ? "*" : "");
     }
     if (o >= cap)
         buf[cap - 1] = 0;
@@ -644,21 +675,35 @@ void nv2a_ao_consts_fill(const struct nv2a_ao_trig *t, const struct nv2a_ao_cfg 
     o->p3[1] = 0.1f; /* angle bias: flat ground shades itself without it */
     o->p3[2] = (float)c->view;
     /* A fallback (nv2a_ao_flip), a top-up (nv2a_ao_draw) or a first pass. */
-    o->p3[3] = t->fallback ? 2.0f : t->fired > 1 ? 1.0f : 0.0f;
+    o->p3[3] = t->fallback ? 2.0f : t->fired > 1 ? (t->top_flat ? 3.0f : 1.0f) : 0.0f;
 }
 
-float nv2a_ao_comp_px(float filt, float d, int top, float prev_t, float prev_d, float *t)
+float nv2a_ao_comp_px(float filt, float d, int top, float prev_t, float prev_d, float change,
+                      float *t)
 {
     float a = filt;
     *t = filt;
     /* Unchanged depth: the pixel has prev_t already. The total only falls
      * (a multiply cannot brighten), and the record is what was applied,
-     * so the next top-up divides by the truth. */
+     * so the next top-up divides by the truth. Unless a draw without depth
+     * writes covered it since (its colour moved): that content has had no
+     * occlusion, and gets the full map as a single pass after it would.
+     * Not in a flat window: there the move may be the HUD over the scene,
+     * a glow or a lightmap pass, which a second occlusion would darken. */
     if (top && d == prev_d) {
-        *t = filt < prev_t ? filt : prev_t;
-        a = filt < prev_t ? filt / prev_t : 1.0f;
+        float k = top == 2 ? 0.0f : nv2a_ao_top_full(change);
+        float tr = filt < prev_t ? filt : prev_t;
+        float ar = filt < prev_t ? filt / prev_t : 1.0f;
+        *t = tr + (filt - tr) * k;
+        a = ar + (filt - ar) * k;
     }
     return a;
+}
+
+float nv2a_ao_top_full(float change)
+{
+    float k = (change - NV2A_AO_TOP_LO) / (NV2A_AO_TOP_HI - NV2A_AO_TOP_LO);
+    return k < 0.0f ? 0.0f : k > 1.0f ? 1.0f : k;
 }
 
 float nv2a_ao_fb_keep(float change)

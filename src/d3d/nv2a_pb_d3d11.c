@@ -4143,6 +4143,11 @@ static ID3D11Texture2D *s_ao_snap[2];
 static ID3D11ShaderResourceView *s_ao_snap_srv[2];
 static UINT s_ao_snap_w[2], s_ao_snap_h[2];
 static const void *s_ao_snap_rt;
+/* The colour the last pass on s_ao_rec_rt left: a top-up gives the full
+ * map, not the ratio, where the colour moved since. */
+static ID3D11Texture2D *s_ao_left;
+static ID3D11ShaderResourceView *s_ao_left_srv;
+static UINT s_ao_left_w, s_ao_left_h;
 /* ao trace: one pair of timestamps in flight, read without waiting. */
 static ID3D11Query *s_ao_q[3];
 static int s_ao_q_busy;
@@ -4347,38 +4352,44 @@ static void ao_gpu_collect(void)
     }
 }
 
-/* Copy rt's colour into s_ao_snap[i]. 0 when no texture of its size
- * could be made. */
-static int ao_copy(RenderTarget *rt, int i)
+/* Copy rt's colour into *tex (made or remade at rt's size, with its view
+ * *srv). 0 when no texture of its size could be made. */
+static int ao_copy_to(RenderTarget *rt, ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv,
+                      UINT *w, UINT *h)
 {
     if (!rt || !rt->tex)
         return 0;
-    if (!s_ao_snap[i] || s_ao_snap_w[i] != rt->hw || s_ao_snap_h[i] != rt->hh) {
+    if (!*tex || *w != rt->hw || *h != rt->hh) {
         D3D11_TEXTURE2D_DESC td;
-        if (s_ao_snap_srv[i]) ID3D11ShaderResourceView_Release(s_ao_snap_srv[i]);
-        if (s_ao_snap[i]) ID3D11Texture2D_Release(s_ao_snap[i]);
-        s_ao_snap_srv[i] = NULL;
-        s_ao_snap[i] = NULL;
-        s_ao_snap_w[i] = s_ao_snap_h[i] = 0;
+        if (*srv) ID3D11ShaderResourceView_Release(*srv);
+        if (*tex) ID3D11Texture2D_Release(*tex);
+        *srv = NULL;
+        *tex = NULL;
+        *w = *h = 0;
         ID3D11Texture2D_GetDesc(rt->tex, &td);
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         td.CPUAccessFlags = 0;
         td.MiscFlags = 0;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ao_snap[i])))
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, tex)))
             return 0;
-        if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_ao_snap[i],
-                                                         NULL, &s_ao_snap_srv[i]))) {
-            ID3D11Texture2D_Release(s_ao_snap[i]);
-            s_ao_snap[i] = NULL;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)*tex, NULL,
+                                                         srv))) {
+            ID3D11Texture2D_Release(*tex);
+            *tex = NULL;
             return 0;
         }
-        s_ao_snap_w[i] = rt->hw;
-        s_ao_snap_h[i] = rt->hh;
+        *w = rt->hw;
+        *h = rt->hh;
     }
-    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_ao_snap[i],
-                                     (ID3D11Resource *)rt->tex);
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)*tex, (ID3D11Resource *)rt->tex);
     return 1;
+}
+
+/* Copy rt's colour into s_ao_snap[i]. */
+static int ao_copy(RenderTarget *rt, int i)
+{
+    return ao_copy_to(rt, &s_ao_snap[i], &s_ao_snap_srv[i], &s_ao_snap_w[i], &s_ao_snap_h[i]);
 }
 
 /* Occlude rt's colour now, from its depth buffer. The draw that follows
@@ -4393,6 +4404,7 @@ static void ao_apply(RenderTarget *rt)
     ID3D11ShaderResourceView *srv[5], *none[5] = {NULL, NULL, NULL, NULL, NULL};
     ID3D11RenderTargetView *rtv[2];
     int dump, timed = ao_trace() && !s_ao_q_busy, top = s_ao.fired > 1, fb = s_ao.fallback;
+    int flat;
     unsigned cur;
     char tag[16];
 
@@ -4409,7 +4421,12 @@ static void ao_apply(RenderTarget *rt)
      * a full pass would occlude them twice. */
     if (top && s_ao_rec_rt != rt)
         top = 0;
-    if (top && (s_ao_w != rt->hw || s_ao_h != rt->hh)) {
+    /* A window that held a flat draw (the HUD, a glow: nv2a_ao_flat_draw)
+     * keeps the ratio and compares no colour. */
+    flat = top && s_ao.top_flat;
+    if (top && (s_ao_w != rt->hw || s_ao_h != rt->hh
+                || (!c->view && !flat && (!s_ao_left || s_ao_left_w != rt->hw
+                                          || s_ao_left_h != rt->hh)))) {
         s_ao_skips++;
         return;
     }
@@ -4449,8 +4466,11 @@ static void ao_apply(RenderTarget *rt)
     /* The first pass writes record 0; each top-up the other one. */
     cur = top ? s_ao_i ^ 1u : 0u;
     nv2a_ao_consts_fill(&s_ao, c, rt->hw, rt->hh, rt->h, rt->n, &k);
-    k.p3[3] = fb ? 2.0f : (float)top;
-    if (fb && !ao_copy(rt, 1))
+    k.p3[3] = fb ? 2.0f : flat ? 3.0f : (float)top;
+    /* A fallback's colour now; a top-up's too, against the colour the
+     * last pass left (outside ao_view and a flat window, which read
+     * neither). */
+    if ((fb || (top && !flat && !c->view)) && !ao_copy(rt, 1))
         return;
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ao_cb, 0,
                                        D3D11_MAP_WRITE_DISCARD, 0, &m)))
@@ -4513,9 +4533,10 @@ static void ao_apply(RenderTarget *rt)
     /* The previous record; the first pass reads none (the one it writes
      * cannot also be bound for reading). */
     srv[2] = top ? s_ao_srv[1 + s_ao_i] : NULL;
-    /* The fallback's two colours; other passes read neither. */
-    srv[3] = fb ? s_ao_snap_srv[0] : NULL;
-    srv[4] = fb ? s_ao_snap_srv[1] : NULL;
+    /* The fallback's two colours, or a top-up's; a first pass reads
+     * neither. */
+    srv[3] = fb ? s_ao_snap_srv[0] : top && !flat && !c->view ? s_ao_left_srv : NULL;
+    srv[4] = fb || (top && !flat && !c->view) ? s_ao_snap_srv[1] : NULL;
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 5, srv);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 5, none);
@@ -4523,6 +4544,12 @@ static void ao_apply(RenderTarget *rt)
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 2, rtv, NULL);
     s_ao_i = cur;
     s_ao_rec_rt = rt;
+    /* What this pass left, for the next top-up's compare (one without it
+     * is skipped above, as one whose record no longer fits). */
+    if (!fb && !c->view)
+        ao_copy_to(rt, &s_ao_left, &s_ao_left_srv, &s_ao_left_w, &s_ao_left_h);
+    else if (c->view)
+        s_ao_left_w = 0;        /* stale once ao_view goes off: the next copy remakes it */
     if (timed) {
         ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_ao_q[2]);
         ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_ao_q[0]);
@@ -4548,7 +4575,7 @@ static void ao_run(const void *fire)
 }
 
 /* Before a draw on rt: the trigger's step, and the passes if it fires. */
-static void ao_on_draw(RenderTarget *rt, int has_depth, int zwrite)
+static void ao_on_draw(RenderTarget *rt, int has_depth, int zwrite, int colour, int flat)
 {
     const RenderTarget *cand = (const RenderTarget *)s_ao.cand;
     int smp = 0;
@@ -4564,6 +4591,8 @@ static void ao_on_draw(RenderTarget *rt, int has_depth, int zwrite)
     fire = nv2a_ao_draw(&s_ao, rt, rt->w, rt->h, has_depth, zwrite, smp);
     if (fire)
         ao_run(fire);
+    if (colour)
+        nv2a_ao_drew(&s_ao, rt, flat);
     /* An event the frame may end at below the memo (one short of it, or a
      * count the shape window saw): the colour now, for the flip's
      * fallback if the frame ends here. */
@@ -4641,7 +4670,7 @@ static void ao_flip(RenderTarget *shown)
             if (s_presents % 300 == 0) {
                 fprintf(stderr, LOGP "ao: flip %llu: %llu frames, %llu occluded, %llu missed,"
                         " %llu refused fits; fit a=%.6f b=%.6g conf=%.2f wmode=%d wref=%.4g;"
-                        " %llu passes (%llu top-ups, %llu dropped, %llu of them top-ups that"
+                        " %llu passes (%llu top-ups, %llu flat, %llu dropped, %llu of them top-ups that"
                         " no longer fit), GPU %.3f ms each;"
                         " %llu late frames (%llu draws), %llu fallbacks, %llu fired early,"
                         " %llu colour copies asked\n",
@@ -4650,6 +4679,7 @@ static void ao_flip(RenderTarget *shown)
                         (unsigned long long)s_ao.missed, (unsigned long long)s_ao.no_fit,
                         s_ao.fit.a, s_ao.fit.b, s_ao.fit.conf, s_ao.fit.wmode, s_ao.fit.wref,
                         (unsigned long long)s_ao_runs, (unsigned long long)s_ao.topups,
+                        (unsigned long long)s_ao.flat_topups,
                         (unsigned long long)s_ao.drop_total, (unsigned long long)s_ao_skips,
                         s_ao_gpu_n ? (double)s_ao_gpu_ns / (double)s_ao_gpu_n / 1e6 : 0.0,
                         (unsigned long long)s_ao.late_frames, (unsigned long long)s_ao.late_draws,
@@ -4710,7 +4740,10 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
      * events for one frame. */
     if (s_ao_on && (g->color_keep != 0xFFFFFFFFu || (v->depth_enable && v->depth_mask)
                     || (v->stencil_enable && ((g->format >> 4) & 0xF) == 2)))
-        ao_on_draw(rt, rt->has_zeta || v->depth_enable, v->depth_enable && v->depth_mask);
+        ao_on_draw(rt, rt->has_zeta || v->depth_enable, v->depth_enable && v->depth_mask,
+                   g->color_keep != 0xFFFFFFFFu,
+                   nv2a_ao_flat_draw(v->depth_enable, v->depth_func, (int)g->blend_enable,
+                                     g->blend_sfactor, g->blend_dfactor));
     for (i = 0; i < d->idx_count; i++) {
         if (d->idx[i] < lo) lo = d->idx[i];
         if (d->idx[i] > hi) hi = d->idx[i];

@@ -24,16 +24,48 @@
  *     where the depth is unchanged the pixel already carries that total,
  *     so it is multiplied by new / old only (never above 1: a multiply
  *     cannot brighten, and the record keeps what was applied, so a chain
- *     of top-ups stays exact). Draws without depth writes since (a
- *     translucent chunk, particles, glows) so get no second occlusion. A
- *     pixel whose depth changed was drawn again and gets the new map in
- *     full. The costs, all of them keyed on depth alone:
- *     - a decal drawn since at the same depth keeps the ratio's light
- *       touch, not its own full occlusion; so does an opaque draw with
- *       depth writes off;
- *     - a draw without depth writes over a pixel whose filtered occlusion
- *       deepened since (new geometry nearby) still gets the ratio
- *       (new / old < 1), which is the occlusion it was owed;
+ *     of top-ups stays exact), unless its colour moved since that pass
+ *     left it: texture 3 is a copy of the colour then, texture 4 of the
+ *     colour now. A draw without depth writes covered it (a translucent
+ *     chunk: the BLiNX 2 Stage 1 pool's water), whose content
+ *     has had no occlusion, so it takes the new map in full, as a single
+ *     pass after that draw would give it. With the ratio there, the frames
+ *     whose pass fell before the water showed the water unoccluded and
+ *     those after it occluded, and the pool's edge flickered as the event
+ *     count moved by one while the camera panned. A move of up to 0.02 a
+ *     channel keeps the ratio, from 0.06 the full map, a ramp between
+ *     (nv2a_ao_top_full; the literals here are NV2A_AO_TOP_LO and
+ *     TOP_HI - TOP_LO, keep them in step). LO is a rounding step on 8-bit
+ *     channels only: on a 16-bit target (R5G6B5) one red or blue step is
+ *     about 0.032, so a dither or one-step change lands mid-ramp there. A
+ *     top-up whose window held a flat draw (p3.w 3, nv2a_ao_flat_draw:
+ *     depth test off or ALWAYS, or a modulating blend) keeps the ratio
+ *     everywhere and reads no colour: the move there may be the HUD, text
+ *     or 2D over the scene, a full-screen glow or fog quad, or a lightmap
+ *     pass over an occluded base, and the full map would occlude those a
+ *     second time. A pixel whose depth changed was drawn again and gets
+ *     the new map in full.
+ *     Why this colour mask and not a delta (C filt + L (r - filt) with a
+ *     replace blend, L the colour the last pass left, r the ratio): write
+ *     what was drawn since as C = (1 - b) L + X. The truth is
+ *     (1 - b) L r + X filt. The mask assumes b = 1 (exact for an opaque
+ *     or near-opaque layer), the delta b = 0 (exact for an additive one),
+ *     the ratio a modulating one. On the pool's water (alpha 0.8 over a
+ *     floor at occlusion 0.6) the mask is 0.014 off, the delta 0.058, the
+ *     old ratio 0.224; the delta also mixes a HUD with the scene under it,
+ *     so it needs the flat gate as much, and the layers it gets right
+ *     (glows, fog) are mostly drawn without a depth test, which the gate
+ *     already hands to the ratio. The costs:
+ *     - a translucent draw over a creased floor already occluded takes the
+ *       full map over both, so the floor seen through it is occluded
+ *       twice, by its uncovered share (1 - alpha); a faint glow (under
+ *       0.02) is spared that;
+ *     - an additive draw that tests depth (a sparkle, a 3D light shaft)
+ *       does not make its window flat, so the pixels it covers are
+ *       occluded twice where it moved them 0.02 or more: local, against a
+ *       whole window back on the ratio for every particle;
+ *     - an opaque draw with depth writes off, or an opaque replace pass at
+ *       the same depth, takes the full map: what a single pass gives it;
  *     - a blended draw that writes depth, or a polygon-offset decal, moves
  *       the depth and takes the full occlusion, so the background seen
  *       through it is occluded twice;
@@ -47,7 +79,8 @@
  *     full-screen glow, fog: up to 0.06 a channel) takes the occlusion in
  *     full, one that moved a lot (the HUD, text, a reflection drawn over
  *     the floor: 0.20 or more) none, with a ramp between
- *     (nv2a_ao_fb_keep). An exact compare kept nothing in the story hub,
+ *     (nv2a_ao_fb_keep; the literals are NV2A_AO_FB_LO and
+ *     FB_HI - FB_LO). An exact compare kept nothing in the story hub,
  *     where the glow drawn after the last 3D chunk changes nearly every
  *     pixel by a few levels.
  *
@@ -141,14 +174,19 @@
 "        a = ws > 0.0 ? sum / ws : 1.0;\n" \
 "    }\n" \
 "    float t = a;\n" \
-"    if (c.p3.w > 0.5 && c.p3.w < 1.5 && c.p3.z < 0.5) {\n" \
+"    if (((c.p3.w > 0.5 && c.p3.w < 1.5) || c.p3.w > 2.5) && c.p3.z < 0.5) {\n" \
 "        float2 pv = st.read(uint2(p)).rg;\n" \
 "        if (pv.y == d) {\n" \
-"            t = min(a, pv.x);\n" \
-"            a = a < pv.x ? a / pv.x : 1.0;\n" \
+"            float k = 0.0;\n" \
+"            if (c.p3.w < 1.5) {\n" \
+"                float3 dc = abs(sn.read(uint2(p)).rgb - cu.read(uint2(p)).rgb);\n" \
+"                k = saturate((max(dc.r, max(dc.g, dc.b)) - 0.02) / 0.04);\n" \
+"            }\n" \
+"            t = mix(min(a, pv.x), a, k);\n" \
+"            a = mix(a < pv.x ? a / pv.x : 1.0, a, k);\n" \
 "        }\n" \
 "    }\n" \
-"    if (c.p3.w > 1.5) {\n" \
+"    if (c.p3.w > 1.5 && c.p3.w < 2.5) {\n" \
 "        float3 dc = abs(sn.read(uint2(p)).rgb - cu.read(uint2(p)).rgb);\n" \
 "        float k = saturate(1.0 - (max(dc.r, max(dc.g, dc.b)) - 0.06) / 0.14);\n" \
 "        a = mix(1.0, a, k);\n" \
@@ -239,14 +277,19 @@
 "        a = ws > 0.0 ? sum / ws : 1.0;\n" \
 "    }\n" \
 "    float t = a;\n" \
-"    if (p3.w > 0.5 && p3.w < 1.5 && p3.z < 0.5) {\n" \
+"    if (((p3.w > 0.5 && p3.w < 1.5) || p3.w > 2.5) && p3.z < 0.5) {\n" \
 "        float2 pv = st.Load(int3(p, 0));\n" \
 "        if (pv.y == d) {\n" \
-"            t = min(a, pv.x);\n" \
-"            a = a < pv.x ? a / pv.x : 1.0;\n" \
+"            float k = 0.0;\n" \
+"            if (p3.w < 1.5) {\n" \
+"                float3 dc = abs(sn.Load(int3(p, 0)).rgb - cu.Load(int3(p, 0)).rgb);\n" \
+"                k = saturate((max(dc.r, max(dc.g, dc.b)) - 0.02) / 0.04);\n" \
+"            }\n" \
+"            t = lerp(min(a, pv.x), a, k);\n" \
+"            a = lerp(a < pv.x ? a / pv.x : 1.0, a, k);\n" \
 "        }\n" \
 "    }\n" \
-"    if (p3.w > 1.5) {\n" \
+"    if (p3.w > 1.5 && p3.w < 2.5) {\n" \
 "        float3 dc = abs(sn.Load(int3(p, 0)).rgb - cu.Load(int3(p, 0)).rgb);\n" \
 "        float k = saturate(1.0 - (max(dc.r, max(dc.g, dc.b)) - 0.06) / 0.14);\n" \
 "        a = lerp(1.0, a, k);\n" \

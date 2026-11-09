@@ -1983,6 +1983,10 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_snap_w | file_static | keep | - | render.ao fallback: size of s_ao_snap |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_snap_h | file_static | keep | - | render.ao fallback: size of s_ao_snap |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_snap_rt | file_static | keep | - | render.ao fallback: target of the before copy, cleared at each flip |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_left | file_static | keep | - | render.ao top-up: colour the last pass left, host, remade on size change |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_left_srv | file_static | keep | - | render.ao top-up: view of s_ao_left |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_left_w | file_static | keep | - | render.ao top-up: size of s_ao_left |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ao_left_h | file_static | keep | - | render.ao top-up: size of s_ao_left |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_mul_bs | file_static | keep | - | render.ao blend state |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_rep_bs | file_static | keep | - | render.ao blend state |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_cb | file_static | keep | - | render.ao constant buffer |
@@ -2214,6 +2218,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_ao_rec_rt | file_static | keep | - | render.ao top-up: target of the last pass and its record, cleared at each flip |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_snap | file_static | keep | - | render.ao fallback: colour copies before and after the frame's last event, host, remade on size change |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_snap_rt | file_static | keep | - | render.ao fallback: target of the before copy, cleared at each flip |
+| src/d3d/nv2a_pb_metal.m | - | s_ao_left | file_static | keep | - | render.ao top-up: colour the last pass left, host, remade on size change |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_runs | file_static | keep | - | ao trace totals |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_skips | file_static | keep | - | ao trace totals: top-ups skipped (record no longer fits) |
 | src/d3d/nv2a_pb_metal.m | - | s_ao_gpu_ns | file_static | keep | - | ao trace totals |
