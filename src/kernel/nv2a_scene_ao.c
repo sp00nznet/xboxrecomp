@@ -166,7 +166,7 @@ static unsigned memo_back(const struct nv2a_ao_trig *t)
  * composited scene) may hold more depth draws than the shown one and
  * would take every first pass, leaving the scene with none. A frame that
  * goes on after all is topped up by its later events, a pass more. */
-static int looks_last(const struct nv2a_ao_trig *t)
+static int ends_like_prev(const struct nv2a_ao_trig *t)
 {
     unsigned n, i, k, m = t->prev_n, o = t->ord;
     if (!m || !o || o > NV2A_AO_EVENTS)
@@ -195,6 +195,83 @@ static int looks_last(const struct nv2a_ao_trig *t)
            && (t->cand == t->prev_rt[0] || t->cand == t->prev_rt[1]);
 }
 
+/* The newest frame of ord events, if one lies in the shape window. */
+static const struct nv2a_ao_shape *shape_of(const struct nv2a_ao_trig *t, unsigned ord)
+{
+    const struct nv2a_ao_shape *s;
+    if (!ord || ord > NV2A_AO_EVENTS)
+        return NULL;
+    s = &t->shape[ord - 1u];
+    return s->seen && t->shape_clock - s->seen < NV2A_AO_SHAPE_WIN ? s : NULL;
+}
+
+/* Two chunks of depth draws of about the same size: within a factor of two,
+ * with rearm_draws of slack for short ones. */
+static int chunk_like(unsigned a, unsigned b)
+{
+    return a <= 2u * b + s_cfg.rearm_draws && b <= 2u * a + s_cfg.rearm_draws;
+}
+
+/* The frame's first o events have the kinds of s's and a last chunk of
+ * about its size. */
+static int prefix_like(const struct nv2a_ao_trig *t, const struct nv2a_ao_shape *s, unsigned o)
+{
+    unsigned cur, ref;
+    if (memcmp(s->why, t->ev_why, o) || t->ev_zd[o - 1] < t->ev_zd[o - 2]
+        || s->zd[o - 1] < s->zd[o - 2])
+        return 0;
+    cur = (unsigned)t->ev_zd[o - 1] - t->ev_zd[o - 2];
+    ref = (unsigned)s->zd[o - 1] - s->zd[o - 2];
+    return chunk_like(cur, ref);
+}
+
+/* Below the memo, does the frame so far look like the last frame of this
+ * many events, however long ago? The Deck's Stage 1 fly-over
+ * and the cave by the pool cycle with a period of 12: eight frames of 8
+ * events, then 6, 4, 4, 6. The 4 lies 10 or 11 frames back, past the memo,
+ * so want is 6 and the 4-event frame, all 'z', has neither the last
+ * frame's tail ('r' then 'z') nor a pass. A frame of the remembered count
+ * has the same kinds and a last chunk of about the same size: the 4-event
+ * frame's last one was 15 depth draws, where the longer frames are 200
+ * deep in a chunk by then. And no longer frame of the window looks the
+ * same that far: where the short frame is the long one's start (the Mac
+ * hub's runs of 4 and 3 equal chunks), nothing tells them apart, and an
+ * early pass on every long frame costs a top-up each; those keep the
+ * flip's fallback. From the second event: a first chunk says nothing of
+ * the frame's length. */
+static int ends_like_shape(const struct nv2a_ao_trig *t)
+{
+    unsigned o = t->ord, c;
+    const struct nv2a_ao_shape *s = shape_of(t, o);
+    if (!s || o < 2 || !prefix_like(t, s, o))
+        return 0;
+    if (t->cand != t->prev_rt[0] && t->cand != t->prev_rt[1])
+        return 0;
+    for (c = o + 1u; c <= NV2A_AO_EVENTS; c++)
+        if ((s = shape_of(t, c)) && prefix_like(t, s, o))
+            return 0;
+    return 1;
+}
+
+static int looks_last(const struct nv2a_ao_trig *t)
+{
+    return ends_like_prev(t) || ends_like_shape(t);
+}
+
+/* Below the memo, the events a frame may end at: one short of it, and
+ * now any count the shape window saw and the one under its
+ * fewest. Two short, a frame got neither a pass nor the fallback; the
+ * Deck's cave went 10, 8, 6 and then a first 5. Only seen counts: after
+ * 50 frames of 9 with 3s and 4s in the window, copying at every event
+ * from 2 to 8 would cost seven copies a frame for nothing. */
+static int copy_here(const struct nv2a_ao_trig *t)
+{
+    unsigned o = t->ord;
+    if (o + 1u == t->want)
+        return 1;
+    return t->floor && (o + 1u == t->floor || (o >= t->floor && shape_of(t, o)));
+}
+
 static const void *event(struct nv2a_ao_trig *t, int why)
 {
     const void *fire = NULL;
@@ -217,12 +294,13 @@ static const void *event(struct nv2a_ao_trig *t, int why)
             t->fired = 1;
             t->fired_at = t->ord;
             t->fired_rt = t->cand;
-        } else if (t->ord + 1u == t->want && t->cand) {
-            /* One short of the memo: if the frame ends here, its HUD is
-             * next and no event follows it, so the flip's fallback needs
-             * the colour as of now (nv2a_ao_snap). */
+        } else if (t->ord < t->want && t->cand && copy_here(t)) {
+            /* If the frame ends here, its HUD is next and no event follows
+             * it, so the flip's fallback needs the colour as of now
+             * (nv2a_ao_snap). A later copy replaces this one. */
             t->snap_rt = t->cand;
             t->snap_req = 1;
+            t->snaps++;
         }
     } else if (t->cand && t->cand == t->fired_rt) {
         /* A top-up: the occluded target took a chunk more after its pass
@@ -260,13 +338,15 @@ void nv2a_ao_dropped(struct nv2a_ao_trig *t)
     if (t->early_now) {
         t->early_now = 0;
         t->earlies--;
-        /* Fired at the event one short of the memo, so no colour copy was
-         * asked for: ask now (the backend copies after the pass), or a
-         * frame that ends here would get neither its pass nor the flip's
-         * fallback. */
-        if (t->ord + 1u == t->want && t->fired_rt) {
+        /* Fired early below the memo (one short of it, or now
+         * at a count the shape window saw), so no colour copy was asked
+         * for at this event: ask now (the backend copies after the pass),
+         * or a frame that ends here would get neither its pass nor the
+         * flip's fallback. */
+        if (t->ord < t->want && t->fired_rt) {
             t->snap_rt = t->fired_rt;
             t->snap_req = 1;
+            t->snaps++;
         }
     }
     /* The first pass: the next event on a candidate takes its place, as
@@ -380,10 +460,10 @@ const void *nv2a_ao_flip(struct nv2a_ao_trig *t, const void *shown)
      * first), and one that fired tops up the chunk drawn since, since
      * nothing after the flip can be HUD. */
     if (!t->armed) {
-        /* A frame one event short of the memo: its last 3D chunk ended
+        /* A frame that ended below the memo: its last 3D chunk ended
          * before the HUD, so a full pass now would occlude the HUD. The
-         * fallback occludes what changed little since the copy (the event
-         * one short of the memo): the 3D under a glow, not the HUD drawn
+         * fallback occludes what changed little since the newest copy (at
+         * an event copy_here picked): the 3D under a glow, not the HUD drawn
          * over it (nv2a_ao_fb_keep). Only on the shown target: one drawn
          * offscreen and composited (Burnout 3) was consumed already, and
          * a later read of it would see the occlusion. */
@@ -465,6 +545,16 @@ void nv2a_ao_frame_end(struct nv2a_ao_trig *t, uint32_t shown_w, uint32_t shown_
         t->prev_zd = t->prev_n ? t->ev_zd[o - 1] : 0;
         t->prev_rt[1] = t->prev_rt[0];
         t->prev_rt[0] = t->prev_n ? t->ev_rt[o - 1] : NULL;
+        t->shape_clock++;
+        if (t->prev_n) {
+            struct nv2a_ao_shape *s = &t->shape[o - 1u];
+            memcpy(s->why, t->ev_why, o);
+            memcpy(s->zd, t->ev_zd, o * sizeof s->zd[0]);
+            s->seen = t->shape_clock;
+        }
+        t->floor = 0;
+        for (i = 1; i <= NV2A_AO_EVENTS && !t->floor; i++)
+            t->floor = shape_of(t, i) ? i : 0;
     } else {
         t->want = 0;
         /* No events and no 3D at all (a loading screen): what follows is
@@ -474,6 +564,8 @@ void nv2a_ao_frame_end(struct nv2a_ao_trig *t, uint32_t shown_w, uint32_t shown_
             t->prev_n = 0;
             t->prev_zd = 0;
             t->prev_rt[0] = t->prev_rt[1] = NULL;
+            memset(t->shape, 0, sizeof t->shape);
+            t->floor = 0;
         }
     }
     t->memo = t->want;

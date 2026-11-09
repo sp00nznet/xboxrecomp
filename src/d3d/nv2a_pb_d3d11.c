@@ -4136,9 +4136,9 @@ static ID3D11ShaderResourceView *s_ao_srv[3];
 static UINT s_ao_w, s_ao_h;
 static unsigned s_ao_i;
 static const void *s_ao_rec_rt;
-/* The fallback's colours: 0 copied at the event one short of
- * the memo (nv2a_ao_snap), of s_ao_snap_rt; 1 the same target's at the
- * flip. A fallback occludes where the two are close (nv2a_ao_fb_keep). */
+/* The fallback's colours: 0 copied at the newest event
+ * nv2a_ao_snap picked below the memo, of s_ao_snap_rt; 1 the same
+ * target's at the flip. A fallback occludes where the two are close (nv2a_ao_fb_keep). */
 static ID3D11Texture2D *s_ao_snap[2];
 static ID3D11ShaderResourceView *s_ao_snap_srv[2];
 static UINT s_ao_snap_w[2], s_ao_snap_h[2];
@@ -4564,7 +4564,8 @@ static void ao_on_draw(RenderTarget *rt, int has_depth, int zwrite)
     fire = nv2a_ao_draw(&s_ao, rt, rt->w, rt->h, has_depth, zwrite, smp);
     if (fire)
         ao_run(fire);
-    /* The event one short of the memo: the colour now, for the flip's
+    /* An event the frame may end at below the memo (one short of it, or a
+     * count the shape window saw): the colour now, for the flip's
      * fallback if the frame ends here. */
     fire = nv2a_ao_snap(&s_ao);
     if (fire)
@@ -4642,7 +4643,8 @@ static void ao_flip(RenderTarget *shown)
                         " %llu refused fits; fit a=%.6f b=%.6g conf=%.2f wmode=%d wref=%.4g;"
                         " %llu passes (%llu top-ups, %llu dropped, %llu of them top-ups that"
                         " no longer fit), GPU %.3f ms each;"
-                        " %llu late frames (%llu draws), %llu fallbacks, %llu fired early\n",
+                        " %llu late frames (%llu draws), %llu fallbacks, %llu fired early,"
+                        " %llu colour copies asked\n",
                         (unsigned long long)s_presents,
                         (unsigned long long)s_ao.frames, (unsigned long long)s_ao.fired_frames,
                         (unsigned long long)s_ao.missed, (unsigned long long)s_ao.no_fit,
@@ -4651,7 +4653,8 @@ static void ao_flip(RenderTarget *shown)
                         (unsigned long long)s_ao.drop_total, (unsigned long long)s_ao_skips,
                         s_ao_gpu_n ? (double)s_ao_gpu_ns / (double)s_ao_gpu_n / 1e6 : 0.0,
                         (unsigned long long)s_ao.late_frames, (unsigned long long)s_ao.late_draws,
-                        (unsigned long long)s_ao.fallbacks, (unsigned long long)s_ao.earlies);
+                        (unsigned long long)s_ao.fallbacks, (unsigned long long)s_ao.earlies,
+                        (unsigned long long)s_ao.snaps);
                 s_ao_gpu_ns = s_ao_gpu_n = 0;
             }
         }

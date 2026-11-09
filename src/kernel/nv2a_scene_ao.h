@@ -32,7 +32,11 @@
  *    known short at the flip, after its HUD: the backend copies the
  *    candidate's colour at the event one short of the memo, and the flip
  *    occludes the pixels that changed little since (nv2a_ao_snap,
- *    nv2a_ao_fb_keep), if that target is the one shown. "The first 2D
+ *    nv2a_ao_fb_keep), if that target is the one shown. A count further
+ *    below (the Deck's Stage 1 cycle of 8, 6, 4, 4, 6) fires
+ *    early when the frame so far matches the last frame of that count in
+ *    a longer window (NV2A_AO_SHAPE_WIN), and the copies also come at
+ *    the counts that window saw, so the fallback still has one. "The first 2D
  *    draw after 3D" does not work: Burnout 3 draws its 3D offscreen and
  *    its HUD is not classified as 2D.
  *  - The depth fit: the buffer stores z / zmax (oPos.z after the XDK
@@ -107,6 +111,16 @@ enum { NV2A_AO_WHY_RT = 1, NV2A_AO_WHY_NOZ, NV2A_AO_WHY_NODEPTH, NV2A_AO_WHY_SAM
 /* Event counts of the last frames that had any, for the memo
  * (nv2a_ao_frame_end). */
 #define NV2A_AO_HIST 16
+/* Frames a shape is remembered for. */
+#define NV2A_AO_SHAPE_WIN 256u
+
+/* The newest frame of one event count (nv2a_ao_trig.shape): its event
+ * kinds, the depth draws by each event, and shape_clock as of it (0: none). */
+struct nv2a_ao_shape {
+    uint8_t  why[NV2A_AO_EVENTS];
+    uint16_t zd[NV2A_AO_EVENTS];
+    uint32_t seen;
+};
 
 /* The trigger and the frame's samples. Opaque target pointers: the
  * backend's own render targets. */
@@ -155,10 +169,11 @@ struct nv2a_ao_trig {
     uint8_t     hist[NV2A_AO_HIST];  /* ring of event counts, newest at nhist - 1 */
     unsigned    nhist;
     unsigned    memo;             /* want as frame_end set it (the flip moves want) */
-    /* The fallback: at the event one short of the memo the
-     * backend copies the candidate's colour (nv2a_ao_snap); a frame that
-     * then ends with no pass gets one at the flip that occludes the
-     * pixels that changed little since that copy (fallback 1), so the
+    /* The fallback: at the event one short of the memo, and
+     * now at the counts copy_here adds, the backend copies the
+     * candidate's colour (nv2a_ao_snap); a frame that then ends with no
+     * pass gets one at the flip that occludes the pixels that changed
+     * little since the newest copy (fallback 1), so the
      * HUD and any 2D drawn since are left alone (nv2a_ao_fb_keep).
      * snap_req: a copy is due now. */
     const void *snap_rt;
@@ -175,6 +190,16 @@ struct nv2a_ao_trig {
     const void *prev_rt[2];
     uint64_t    earlies;
     int         early_now;
+    /* The newest frame of each event count (shape[c - 1]: c events) in the
+     * last NV2A_AO_SHAPE_WIN frames that had any, for a short frame whose
+     * last one lies past the memo's window; shape_clock counts
+     * those frames. floor: the fewest events among them, the colour copies
+     * start one under it (copy_here); snaps: copies asked for in all (a
+     * backend may decline one: no texture of the target's size). */
+    struct nv2a_ao_shape shape[NV2A_AO_EVENTS];
+    uint32_t    shape_clock;
+    unsigned    floor;
+    uint64_t    snaps;
 };
 
 void nv2a_ao_reset(struct nv2a_ao_trig *t);
@@ -224,7 +249,7 @@ const void *nv2a_ao_flip(struct nv2a_ao_trig *t, const void *shown);
 void nv2a_ao_frame_end(struct nv2a_ao_trig *t, uint32_t shown_w, uint32_t shown_h);
 
 /* After nv2a_ao_draw: the target whose colour the backend copies now,
- * before this draw (the event one short of the memo), or NULL. The flip
+ * before this draw (an event copy_here picks below the memo), or NULL. The flip
  * may hand it back as a fallback pass (t->fallback): occlude the pixels
  * whose colour changed little since that copy (nv2a_ao_fb_keep). A
  * backend that cannot copy declines that pass (nv2a_ao_dropped). */

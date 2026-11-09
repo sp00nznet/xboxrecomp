@@ -29,6 +29,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static int failures;
 
@@ -1283,6 +1284,557 @@ static void test_dropped_persistent(void)
     check(!t.retried && !t.gave_up, "persistent drop: frame_end clears the retry");
 }
 
+/* Deck flips 1560-1780 (a Deck trace) */
+static const char *const deck_intro[] = {
+    "z548 z739 r1085 z1098",
+    "z554 z756 r1102 z1115",
+    "z554 z762 r1108 z1121",
+    "z568 z778 r1132 z1145",
+    "z568 z780 r1134 z1147",
+    "z568 z780 r1134 z1147",
+    "z605 z842 r1196 z1209",
+    "z610 z841 z1193 z1208",
+    "z610 z862 z1214 z1431 z1479 z1494",
+    "z617 z879 z1231 z1448 z1495 z1510",
+    "z617 z879 z1231 z1448 z1489 z1706 r1748 z1761",
+    "z617 z879 z1231 z1448 z1488 z1705 r1747 z1760",
+    "z617 z883 z1235 z1452 z1492 z1709 r1751 z1764",
+    "z617 z892 z1244 z1461 z1501 z1718 r1760 z1773",
+    "z618 z893 z1245 z1462 z1502 z1719 r1761 z1774",
+    "z618 z894 z1246 z1463 z1503 z1720 r1762 z1775",
+    "z637 z914 z1266 z1483 z1523 z1740 r1782 z1795",
+    "z637 z921 z1273 z1490 r1532 z1545",
+    "z637 z942 z1294 z1309", /* missed */
+    "z637 z952 z1304 z1319",
+    "z652 z971 z1323 z1540 z1580 z1595",
+    "z652 z980 z1332 z1549 z1589 z1806 r1848 z1861",
+    "z660 z1004 z1356 z1573 z1613 z1830 r1872 z1885",
+    "z674 z1032 z1384 z1601 z1641 z1858 r1900 z1913",
+    "z680 z1045 z1397 z1614 z1654 z1871 r1913 z1926",
+    "z681 z1073 z1425 z1642 z1682 z1899 r1941 z1954",
+    "z692 z1134 z1486 z1703 z1743 z1960 r2002 z2015",
+    "z701 z1149 z1501 z1718 z1758 z1975 r2017 z2030",
+    "z701 z1149 z1501 z1718 z1758 z1975 r2017 z2030",
+    "z709 z1157 z1509 z1726 r1768 z1781",
+    "z709 z1159 z1511 z1526", /* missed */
+    "z716 z1171 z1523 z1538",
+    "z716 z1173 z1525 z1742 z1782 z1797",
+    "z716 z1175 z1519 z1736 z1776 z1993 r2035 z2048",
+    "z716 z1177 z1521 z1738 z1778 z1995 r2037 z2050",
+    "z716 z1195 z1539 z1756 z1796 z2013 r2055 z2068",
+    "z720 z1199 z1543 z1760 z1800 z2017 r2059 z2072",
+    "z758 z1241 z1585 z1802 z1842 z2059 r2101 z2114",
+    "z758 z1241 z1585 z1802 z1842 z2059 r2101 z2114",
+    "z762 z1272 z1616 z1833 z1873 z2090 r2132 z2145",
+    "z766 z1281 z1625 z1842 z1882 z2099 r2141 z2154",
+    "z777 z1317 z1661 z1878 r1920 z1933",
+    "z782 z1323 z1667 z1682", /* missed */
+    "z787 z1345 z1689 z1704",
+    "z791 z1343 z1687 z1904 z1944 z1959",
+    "z794 z1360 z1704 z1921 z1961 z2178 r2220 z2233",
+    "z794 z1370 z1714 z1931 z1971 z2188 r2230 z2243",
+    "z794 z1368 z1712 z1929 z1969 z2186 r2228 z2241",
+    "z794 z1379 z1723 z1940 z1980 z2197 r2239 z2252",
+    "z795 z1379 z1723 z1940 z1980 z2197 r2239 z2252",
+    "z795 z1391 z1735 z1952 z1992 z2209 r2251 z2264",
+    "z795 z1391 z1735 z1952 z1992 z2209 r2251 z2264",
+    "z809 z1403 z1747 z1964 z2004 z2221 r2263 z2276",
+    "z811 z1397 z1741 z1958 r2000 z2013",
+    "z814 z1403 z1747 z1762", /* missed */
+    "z814 z1411 z1755 z1770",
+    "z815 z1412 z1756 z1973 z2013 z2028",
+    "z814 z1418 z1762 z1979 z2019 z2236 r2278 z2291",
+    "z814 z1435 z1779 z1996 z2036 z2253 r2295 z2308",
+    "z814 z1453 z1797 z2014 z2054 z2271 r2313 z2326",
+    "z815 z1456 z1800 z2017 z2057 z2274 r2316 z2329",
+    "z815 z1431 z1775 z1992 z2032 z2249 r2291 z2304",
+    "z815 z1416 z1760 z1977 z2017 z2234 r2276 z2289",
+    "z815 z1548 z1892 z2109 z2149 z2366 r2408 z2421",
+    "z815 z1548 z1611 z1955 z2172 z2212 z2429 r2471 z2484",
+    "z815 z1562 z1625 z1969 z2186 r2228 z2241",
+    "z827 z1574 z1637 z1981 z1996", /* missed */
+    "z827 z1564 z1627 z1971 z1986",
+    "z839 z1595 z1732 z2076 z2293 r2335 z2348",
+    "z839 z1568 z1741 z2085 z2302 r2344 z2357",
+    "z839 z1547 z1760 z2104 z2321 r2363 z2376",
+    "z842 z1554 z1767 z2111 z2328 r2370 z2383",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2125", /* missed */
+    "z841 z1553 z1766 z2110 z2125",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2110 z2327 r2369 z2382",
+    "z841 z1553 z1766 z2118 z2133", /* missed */
+    "z841 z1553 z1766 z2118 z2133",
+    "z841 z1553 z1766 z2118 z2335 r2377 z2390",
+    "z841 z1553 z1766 z2118 z2335 r2377 z2390",
+    "z841 z1553 z1766 z2118 z2335 r2377 z2390",
+    "z841 z1553 z1766 z2118 z2335 r2377 z2390",
+    "z841 z1553 z1766 z2118 z2335 r2377 z2390",
+    "z841 z1553 z1766 z2118 z2335 r2377 z2390",
+    "z841 z1553 z1766 z2118 z2335 r2377 z2390",
+    "z841 z1553 z1766 z2118 z2335 r2377 z2390",
+    "z841 z1553 z1766 z2118 z2335 r2377 z2390",
+    "z841 z1553 z1766 z2118 z2133", /* missed */
+    "z841 z1553 z1766 z2118 z2133",
+    "z841 z1553 z1766 z2118 z2335 r2377 z2390",
+    "z752 z1229 z1581 z1798 z1838 z2055 r2097 z2110",
+    "z752 z1229 z1581 z1798 r1840 z1853",
+    "z752 z1229 z1581 z1596",
+    "z752 z1229 z1581 z1596",
+    "z752 z1229 z1581 z1798 z1838 z1853",
+    "z752 z1229 z1581 z1798 z1838 z2055 r2097 z2110",
+    "z752 z1229 z1581 z1798 z1838 z2055 r2097 z2110",
+    "z752 z1229 z1581 z1798 z1838 z2055 r2097 z2110",
+    "z752 z1229 z1581 z1798 z1838 z2055 r2097 z2110",
+    "z752 z1227 z1579 z1796 z1836 z2053 r2095 z2108",
+    "z752 z1227 z1579 z1796 z1836 z2053 r2095 z2108",
+    "z752 z1227 z1579 z1796 z1836 z2053 r2095 z2108",
+    "z753 z1228 z1580 z1797 z1837 z2054 r2096 z2109",
+    "z752 z1227 z1579 z1796 r1838 z1851",
+    "z752 z1227 z1579 z1594", /* missed */
+    "z752 z1227 z1580 z1595",
+    "z752 z1229 z1573 z1790 z1830 z1845",
+    "z752 z1229 z1573 z1790 z1830 z2047 r2089 z2102",
+    "z752 z1229 z1573 z1790 z1830 z2047 r2089 z2102",
+    "z752 z1229 z1573 z1790 z1830 z2047 r2089 z2102",
+    "z752 z1229 z1573 z1790 z1830 z2047 r2089 z2102",
+    "z752 z1229 z1573 z1790 z1830 z2047 r2089 z2102",
+    "z752 z1231 z1575 z1792 z1832 z2049 r2091 z2104",
+    "z752 z1231 z1575 z1792 z1832 z2049 r2091 z2104",
+    "z752 z1231 z1575 z1792 z1832 z2049 r2091 z2104",
+    "z752 z1231 z1575 z1792 r1834 z1847",
+    "z752 z1231 z1575 z1590", /* missed */
+    "z752 z1231 z1575 z1590",
+    "z752 z1231 z1575 z1792 z1832 z1847",
+    "z752 z1231 z1575 z1792 z1832 z2049 r2091 z2104",
+    "z752 z1231 z1575 z1792 z1832 z2049 r2091 z2104",
+    "z752 z1231 z1575 z1792 z1832 z2049 r2091 z2104",
+    "z752 z1231 z1575 z1792 z1832 z2049 r2091 z2104",
+    "z752 z1231 z1575 z1792 z1832 z2049 r2091 z2104",
+    "z752 z1231 z1575 z1792 z1832 z2049 r2091 z2104",
+    "z752 z1231 z1575 z1792 z1832 z2049 r2091 z2104",
+    "z752 z1231 z1575 z1792 z1832 z2049 r2091 z2104",
+    "z736 z1215 z1559 z1776 r1818 z1831",
+    "z738 z1193 z1537 z1552", /* missed */
+    "z774 z1218 z1562 z1577",
+    "z707 z1053 z1397 z1614 z1654 z1669",
+    "z689 z1014 z1358 z1575 z1615 z1630",
+    "z640 z963 z1307 z1524 z1564 z1781 r1823 z1836",
+    "z612 z958 z1302 z1519 z1559 z1776 r1818 z1829",
+    "z604 z921 z1265 z1482 z1522 z1739 r1781 z1792",
+    "z605 z870 z1214 z1431 z1471 z1688 r1730 z1741",
+    "z590 z837 z1181 z1398 z1438 z1655 r1697 z1708",
+    "z590 z807 z1152 z1369 z1409 z1626 r1668 z1679",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 r1381 z1392",
+    "z561 z778 z1122 z1135", /* missed */
+    "z561 z778 z1122 z1135",
+    "z561 z778 z1122 z1339 z1379 z1392",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 r1381 z1392",
+    "z561 z778 z1122 z1135", /* missed */
+    "z561 z778 z1122 z1135",
+    "z561 z778 z1122 z1339 z1379 z1392",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 r1381 z1392",
+    "z561 z778 z1122 z1135", /* missed */
+    "z561 z778 z1122 z1135",
+    "z561 z778 z1122 z1339 z1379 z1392",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 r1381 z1392",
+    "z561 z778 z1122 z1135", /* missed */
+    "z561 z778 z1122 z1135",
+    "z561 z778 z1122 z1339 z1379 z1392",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 z1379 z1596 r1638 z1649",
+    "z561 z778 z1122 z1339 r1381 z1392",
+    "z561 z778 z1122 z1135", /* missed */
+    "z561 z778 z1122 z1135",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+};
+/* Deck flips 1780-1870 (a Deck trace) */
+static const char *const deck_long9[] = {
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z580",
+    "z226 z565 z582",
+    "z226 z565 z582",
+    "z226 z565 z583",
+    "z226 z565 z583",
+    "z226 z565 z583",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z585",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z584",
+    "z226 z565 z583",
+    "z226 z565 z583",
+    "z226 z565 z583",
+    "z564 z928 z1149 z1189 z1406 r1448 z1461",
+    "z564 z928 z1150 z1369 z1590 z1630 z1847 r1889 z1902",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z564 z928 z1141 z1360 z1581 z1621 z1838 r1880 z1893",
+    "z561 z778 z1015 z1252 z1469 z1509 z1726 r1768 z1779",
+    "z561 z778 z1130 z1143", /* missed */
+    "z554 z756 z1108 z1121",
+    "z534 z734 z1086 z1303 z1343 z1356",
+    "z534 z714 z1066 z1283 z1323 z1540 r1582 z1593",
+    "z490 z653 z1005 z1222 z1262 z1479 r1521 z1532",
+    "z482 z633 z985 z1202 z1242 z1459 r1501 z1512",
+    "z466 z608 z960 z1177 z1217 z1434 r1476 z1487",
+    "z460 z593 z945 z1162 z1202 z1419 r1461 z1472",
+    "z459 z586 z938 z1155 z1195 z1412 r1454 z1465",
+    "z430 z526 z1095 z1352 r1394 z1405",
+    "z373 z480 r834 z844",
+    "z359 z444 r798 z808",
+    "z332 z380 r734 z744",
+    "z329 z369 r723 z731",
+    "z326 z354 r708 z716",
+    "z294 z320 r674 z682",
+    "z285 z311 r665 z673",
+};
+/* Deck flips 2380-2460 (a Deck trace) */
+static const char *const deck_cave[] = {
+    "z648 z909 z1028 z1147 z1526 z1743 r1785 z1794",
+    "z626 z889 z1008 z1127 z1506 z1517", /* missed */
+    "z626 z886 z1005 z1124 z1503 z1515",
+    "z626 z886 z1005 z1124 z1503 z1720 z1760 z1772",
+    "z632 z905 z1024 z1143 z1522 z1739 z1779 z1996 r2038 z2049",
+    "z644 z917 z1036 z1155 z1534 z1751 z1791 z2008 r2050 z2061",
+    "z644 z901 z1020 z1139 z1518 z1735 z1775 z1992 r2034 z2045",
+    "z647 z896 z1015 z1134 z1513 z1730 z1770 z1987 r2029 z2040",
+    "z649 z901 z1020 z1139 z1518 z1735 z1775 z1992 r2034 z2045",
+    "z641 z891 z1010 z1129 z1508 z1725 z1765 z1982 r2024 z2035",
+    "z655 z907 z1026 z1145 z1524 z1741 z1781 z1998 r2040 z2051",
+    "z648 z898 z1017 z1136 z1515 z1732 z1772 z1989 r2031 z2042",
+    "z648 z898 z1017 z1136 z1515 z1732 r1774 z1785",
+    "z648 z898 z1017 z1136 z1515 z1528", /* missed */
+    "z654 z904 z1023 z1142 z1521 z1534",
+    "z654 z899 z1018 z1137 z1516 z1733 z1773 z1786",
+    "z648 z893 z1012 z1131 z1511 z1728 z1768 z1985 r2027 z2038",
+    "z634 z879 z998 z1117 z1496 z1713 z1753 z1970 r2012 z2023",
+    "z634 z877 z996 z1115 z1494 z1711 z1751 z1968 r2010 z2021",
+    "z634 z880 z999 z1118 z1497 z1714 z1754 z1971 r2013 z2024",
+    "z634 z878 z997 z1116 z1495 z1712 z1752 z1969 r2011 z2022",
+    "z634 z875 z994 z1113 z1492 z1709 z1749 z1966 r2008 z2019",
+    "z634 z867 z986 z1105 z1484 z1701 z1741 z1958 r2000 z2011",
+    "z631 z861 z980 z1099 z1478 z1695 z1735 z1952 r1994 z2005",
+    "z634 z850 z969 z1088 z1467 z1684 r1726 z1737",
+    "z636 z852 z971 z1090 z1469 z1482", /* missed */
+    "z633 z841 z960 z1079 z1458 z1471",
+    "z633 z839 z958 z1077 z1456 z1673 z1713 z1726",
+    "z671 z877 z996 z1115 z1494 z1711 z1751 z1968 r2010 z2021",
+    "z671 z866 z985 z1104 z1483 z1700 z1740 z1957 r1999 z2010",
+    "z672 z861 z980 z1099 z1478 z1695 z1735 z1952 r1994 z2005",
+    "z671 z855 z974 z1093 z1472 z1689 z1729 z1946 r1988 z1999",
+    "z671 z855 z974 z1093 z1472 z1689 z1729 z1946 r1988 z1999",
+    "z633 z817 z936 z1055 z1434 z1651 z1691 z1908 r1950 z1961",
+    "z633 z817 z936 z1055 z1426 z1643 z1683 z1900 r1942 z1953",
+    "z633 z817 z936 z1055 z1426 z1643 z1683 z1900 r1942 z1953",
+    "z633 z819 z938 z1057 z1428 z1645 r1687 z1698",
+    "z627 z818 z937 z1056 z1427 z1440", /* missed */
+    "z593 z784 z903 z1022 z1393 z1406",
+    "z575 z767 z886 z1005 z1376 z1593 z1633 z1646",
+    "z575 z765 z884 z1003 z1382 z1599 z1639 z1856 r1898 z1909",
+    "z571 z765 z884 z1003 z1382 z1599 z1639 z1856 r1898 z1909",
+    "z567 z761 z880 z999 z1378 z1595 z1635 z1852 r1894 z1905",
+    "z567 z781 z900 z1019 z1398 z1615 z1655 z1872 r1914 z1925",
+    "z538 z749 z868 z987 z1366 z1583 z1623 z1840 r1882 z1893",
+    "z538 z749 z868 z987 z1366 z1583 z1623 z1840 r1882 z1893",
+    "z538 z749 z868 z987 z1366 z1583 z1623 z1840 r1882 z1893",
+    "z538 z749 z868 z987 z1366 z1583 z1623 z1840 r1882 z1893",
+    "z522 z733 z852 z971 z1350 z1567 r1609 z1620",
+    "z522 z733 z852 z971 z1350 z1363", /* missed */
+    "z522 z733 z852 z971 z1350 z1363",
+    "z522 z730 z849 z968 z1347 z1564 z1604 z1617",
+    "z504 z700 z819 z938 z1317 z1534 z1574 z1791 r1833 z1844",
+    "z504 z680 z799 z918 z1297 z1514 z1554 z1771 r1813 z1824",
+    "z504 z680 z799 z918 z1297 z1514 z1554 z1771 r1813 z1824",
+    "z504 z680 z799 z918 z1297 z1514 z1554 z1771 r1813 z1824",
+    "z504 z680 z799 z918 z1297 z1514 z1554 z1771 r1813 z1824",
+    "z504 z680 z799 z1178 z1395 z1435 z1652 r1694 z1705",
+    "z504 z680 z799 z1178 z1395 r1437 z1448",
+    "z504 z677 z796 z1175 z1188", /* missed */
+    "z504 z677 z796 z1175 z1188",
+    "z504 z677 z796 z1175 z1392 z1432 z1445",
+    "z498 z656 z775 z1154 z1371 z1411 z1628 r1670 z1681",
+    "z512 z666 z785 z1164 z1381 z1421 z1638 r1680 z1691",
+    "z515 z669 z788 z1167 z1384 z1424 z1641 r1683 z1694",
+    "z508 z664 z783 z1162 z1379 z1419 z1636 r1678 z1689",
+    "z489 z651 z770 z1149 z1366 z1406 z1623 r1665 z1676",
+    "z519 z697 z816 z1195 z1412 z1452 z1669 r1711 z1722",
+    "z521 z698 z817 z1196 z1413 z1453 z1670 r1712 z1723",
+    "z538 z717 z836 z1215 z1432 z1472 z1689 r1731 z1742",
+    "z536 z717 z836 z1207 z1424 r1466 z1477",
+    "z521 z709 z828 z1199 z1212", /* missed */
+    "z521 z709 z828 z1199 z1212",
+    "z521 z711 z830 z1201 z1418 z1458 z1471",
+    "z521 z711 z830 z1201 z1418 z1458 z1675 r1717 z1728",
+    "z521 z709 z828 z1199 z1416 z1456 z1673 r1715 z1726",
+    "z521 z709 z828 z1199 z1416 z1456 z1673 r1715 z1726",
+    "z521 z709 z828 z1199 z1416 z1456 z1673 r1715 z1726",
+    "z521 z709 z828 z1199 z1416 z1456 z1673 r1715 z1726",
+    "z521 z709 z828 z1199 z1416 z1456 z1673 r1715 z1726",
+    "z521 z709 z828 z1199 z1416 z1456 z1673 r1715 z1726",
+};
+
+/* The Deck's Stage 1 trace (RECOMP_TRACE=ao,ao_frames), replayed event for event. Each string
+ * is one frame's events as the trace logs them: kind ('z' a draw with no
+ * depth write, 'r' a draw on another target) and the frame's draw index it
+ * came at. The scene's count cycles over 12 frames: 8 events (zzzzzzrz)
+ * for 8 frames, then 6 (zzzzrz), 4 (zzzz), 4, 6. The 4 is 10 frames back
+ * when it comes, past the memo's 8, and two short of a memo of 6; its kinds
+ * have no 'r', so the last frame's tail ('rz') does not match it and the
+ * depth-draw test is not asked. 68 of the trace's 74 missed frames are this
+ * one. deck_long9: 9 events for 50 frames, then 4 (flip 1854). s_rp_snaps
+ * and s_rp_early: the colour copies and early first passes of the last
+ * replay, past its warm-up. */
+static unsigned s_rp_snaps, s_rp_early;
+
+/* One frame of a replay up to its flip (the caller runs frame_end): the
+ * depth-writing draws up to each event's index, then the event, then five
+ * draws of HUD. */
+static void rp_frame(struct nv2a_ao_trig *t, const void *shown, const char *p)
+{
+    unsigned i = 0;
+    while (*p) {
+        char k = *p++;
+        unsigned at = (unsigned)strtoul(p, (char **)&p, 10);
+        while (*p == ' ') p++;
+        for (; i < at; i++) {
+            nv2a_ao_draw(t, shown, 640, 480, 1, 1, 0);
+            nv2a_ao_snap(t);
+            put_proj(t, 3.0f + (float)(i * 71 % 700), 0.5f, 2000.0f, 0);
+        }
+        if (k == 'r')
+            nv2a_ao_draw(t, RT_SHADOW, 512, 512, 1, 1, 0);
+        else
+            nv2a_ao_draw(t, shown, 640, 480, 1, 0, 0);
+        nv2a_ao_snap(t);
+        i++;
+    }
+    for (unsigned j = 0; j < 5; j++)
+        nv2a_ao_draw(t, shown, 640, 480, 1, 0, 0);
+    nv2a_ao_flip(t, shown);
+}
+
+static void replay(const char *const *seq, unsigned n, unsigned *missed, unsigned *fb,
+                   unsigned *passes)
+{
+    struct nv2a_ao_trig t;
+    static int b[2];
+    unsigned f;
+    nv2a_ao_reset(&t);
+    *missed = *fb = *passes = 0;
+    s_rp_snaps = s_rp_early = 0;
+    for (f = 0; f < n; f++) {
+        uint64_t m0 = t.missed, s0 = t.snaps, e0 = t.earlies;
+        rp_frame(&t, &b[f & 1], seq[f]);
+        /* Test-only switch to print the replay frame by frame; no
+         * recomp_env row, as nothing in the runtime reads it. */
+        if (getenv("AO_REPLAY_TRACE"))
+            printf("      f%u ord=%u want=%u at=%u fired=%u fb=%d ok=%d %s\n", f, t.ord, t.memo,
+                   t.fired_at, t.fired, t.fallback, t.fit.ok, seq[f]);
+        if (f >= 8) {
+            *fb += (unsigned)t.fallback;
+            *passes += t.fired;
+        }
+        nv2a_ao_frame_end(&t, 640, 480);
+        if (f >= 8) {
+            *missed += (unsigned)(t.missed - m0);
+            s_rp_snaps += (unsigned)(t.snaps - s0);
+            s_rp_early += (unsigned)(t.earlies - e0);
+        }
+    }
+}
+
+/* A shape is remembered for NV2A_AO_SHAPE_WIN frames with events, then
+ * forgotten: the floor rises back to the count the scene draws now. */
+static void test_shape_expires(void)
+{
+    struct nv2a_ao_trig t;
+    static int b[2];
+    unsigned f;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 10; f++) {
+        rp_frame(&t, &b[f & 1], f == 5 ? "z30 z60 z90 z120" : "z30 z60 z90 z120 z150 z180");
+        nv2a_ao_frame_end(&t, 640, 480);
+    }
+    check(t.floor == 4, "shape window: the one frame of 4 events sets the floor");
+    for (; f < 5 + NV2A_AO_SHAPE_WIN; f++) {
+        rp_frame(&t, &b[f & 1], "z30 z60 z90 z120 z150 z180");
+        nv2a_ao_frame_end(&t, 640, 480);
+    }
+    check(t.floor == 4, "shape window: still remembered one frame short of the window");
+    rp_frame(&t, &b[f & 1], "z30 z60 z90 z120 z150 z180");
+    nv2a_ao_frame_end(&t, 640, 480);
+    check(t.floor == 6, "shape window: forgotten after NV2A_AO_SHAPE_WIN frames");
+}
+
+/* A loading screen (no events, no samples) clears the shapes with the
+ * history: the next scene's short frames are not matched to the old one's. */
+static void test_loading_clears_shapes(void)
+{
+    struct nv2a_ao_trig t;
+    static int b[2];
+    unsigned f, i, any = 0;
+    nv2a_ao_reset(&t);
+    for (f = 0; f < 12; f++) {
+        rp_frame(&t, &b[f & 1], f % 4 == 3 ? "z30 z60 z90" : "z30 z60 z90 z120 z150");
+        nv2a_ao_frame_end(&t, 640, 480);
+    }
+    check(t.floor == 3, "loading: the scene's shapes are remembered");
+    nv2a_ao_flip(&t, &b[0]);
+    nv2a_ao_frame_end(&t, 640, 480);
+    for (i = 0; i < NV2A_AO_EVENTS; i++)
+        any |= t.shape[i].seen;
+    check(!any && t.floor == 0 && t.nhist == 0, "loading: a frame with no events nor 3D clears the shapes");
+}
+
+/* One replay and its bounds, past the warm-up: no frame missed, and the
+ * cost the fix may add capped (the fix's review). max_passes: the
+ * passes before the fix (3afdaf07) plus 5%; at most 2.5 colour copies a
+ * frame (2.33 to 2.37 when written, from 1 to 2 before) and max_fb
+ * fallbacks. */
+static void replay_bounded(const char *name, const char *const *seq, unsigned n,
+                           unsigned max_passes, unsigned max_fb, const char *what)
+{
+    unsigned m, fb, p, k = n - 8;
+    char msg[160];
+    replay(seq, n, &m, &fb, &p);
+    printf("    %s: %u frames, %u missed, %u fallbacks, %u passes, %u copies, %u early\n", name,
+           k, m, fb, p, s_rp_snaps, s_rp_early);
+    check(m == 0, what);
+    snprintf(msg, sizeof msg, "%s: at most %u passes", name, max_passes);
+    check(p <= max_passes, msg);
+    snprintf(msg, sizeof msg, "%s: at most 2.5 colour copies a frame", name);
+    check(2u * s_rp_snaps <= 5u * k, msg);
+    snprintf(msg, sizeof msg, "%s: at most %u fallbacks", name, max_fb);
+    check(fb <= max_fb, msg);
+}
+
+static void test_deck_stage1_cycle(void)
+{
+#define N(a) (unsigned)(sizeof a / sizeof a[0])
+    /* passes before the fix: 669, 265, 159 */
+    replay_bounded("intro", deck_intro, N(deck_intro), 702, 2,
+                   "Deck Stage 1 fly-over (12-frame cycle): no frame missed");
+    replay_bounded("cave", deck_cave, N(deck_cave), 278, 1,
+                   "Deck Stage 1 cave (10, 8, 6 events): no frame missed");
+    replay_bounded("long9", deck_long9, N(deck_long9), 167, 2,
+                   "Deck Stage 1, 4 events after 50 frames of 9: not missed");
+#undef N
+}
+
 int main(void)
 {
     struct nv2a_ao_cfg c;
@@ -1308,6 +1860,9 @@ int main(void)
     test_short_order_kind();
     test_short_offscreen();
     test_short_early_dropped();
+    test_deck_stage1_cycle();
+    test_shape_expires();
+    test_loading_clears_shapes();
     test_fallback_edges();
     test_fallback_mask();
     test_jittered_chunks();
