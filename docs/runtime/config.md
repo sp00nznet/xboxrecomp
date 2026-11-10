@@ -172,6 +172,10 @@ the stock settings, `present.pacing = "spin"` included.
 | `render.scale` | int | internal resolution factor: 1, 2, 3, ... | `1` | `RECOMP_RENDER_SCALE` |
 | `render.aniso` | int | anisotropic filtering on mipmapped textures: `0` (off), `2`..`16` | `0` | `RECOMP_RENDER_ANISO` |
 | `render.snap_2d` | bool | above `render.scale` 1, 2D batches sample their textures on the guest grid, as at 1x (no seams between tiles, blockier 2D art); textures a texture pack replaced at a whole multiple of their width, 2x to 15x, are left as with it off | `false` | `RECOMP_RENDER_SNAP_2D` |
+| `render.ao` | bool | ambient occlusion on the 3D scene before the HUD, from the depth buffer, on Metal and D3D11 (the CPU rasteriser ignores it); off is stock, and the backends then make no pass and no samplable depth buffer. Also on the menu's Render page | `false` | `RECOMP_RENDER_AO` |
+| `render.ao_strength` | number | with `render.ao`: how dark full occlusion gets, `0.0` to `2.0`; out of range is clamped with a line. Live from the menu | `1.5` | `RECOMP_RENDER_AO_STRENGTH` |
+| `render.ao_radius` | number | with `render.ao`: the occlusion's reach in 480-line guest pixels (times `render.scale` on the host), `2` to `32`; out of range is clamped with a line. Live from the menu | `20` | `RECOMP_RENDER_AO_RADIUS` |
+| `render.ao_suited` | bool | a game's `config.default.toml` sets `false` where AO does not suit the art (cel-shaded): the menu says so and recommends off; the option still works | `true` | `RECOMP_RENDER_AO_SUITED` |
 | `display.aspect` | string | `"W:H"`: `"4:3"` (stock) or a wider ratio such as `"16:9"`, `"16:10"`, `"21:9"`: Hor+ on Metal and D3D11 ([Hor+](#hor-widescreen-displayaspect)); the CPU rasteriser ignores it with a log line | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
 | `display.movie` | string | `"black"`, `"fit"`, `"fill"`: with a wide aspect, a full-screen movie or still is pillarboxed, stretched to the width, or scaled to cover it (top and bottom cropped) | `"black"` | `RECOMP_DISPLAY_MOVIE` |
 | `display.overscan` | int | guest pixels cropped from each left and right edge at present, top and bottom in proportion: `0` (stock) to `64` ([Overscan](#display-overscan-displayoverscan)); ignored with a wide `display.aspect` and by the CPU rasteriser, each with a log line | `0` | `RECOMP_DISPLAY_OVERSCAN` |
@@ -1588,7 +1592,7 @@ points, its live class; the footer names the selected row's:
 
 | Class | Takes effect | Items |
 |---|---|---|
-| live | at the next flip | `render.aniso`, `render.snap_2d`, `textures.detile`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `overlay.stats`, `overlay.ui_scale`, `overlay.ui_fit`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
+| live | at the next flip | `render.aniso`, `render.snap_2d`, `render.ao`, `render.ao_strength`, `render.ao_radius`, `textures.detile`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `overlay.stats`, `overlay.ui_scale`, `overlay.ui_fit`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
 | at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.art`, `textures.font`, `textures.text`, `textures.world` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
