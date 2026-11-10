@@ -43,6 +43,7 @@
 #define OPEN_TRUNC(p) _open(p, _O_WRONLY | _O_CREAT | _O_TRUNC, 0644)
 #else
 #include <pthread.h>
+#include <time.h>
 #include <unistd.h>
 #define MKDIR(p) mkdir(p, 0755)
 #define DUP dup
@@ -2422,22 +2423,36 @@ static void *rec_poll_thread(void *u)
     return NULL;
 }
 
-/* No torn read: both axes come from one record. */
+static double rec_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* No torn read: both axes come from one record. Under load the poller
+ * can start after a fixed count of reads is done, which left reads at 0,
+ * so the loop runs until enough reads saw a record, with a deadline. */
 static void test_record_torn(void)
 {
     pthread_t t;
     struct xbox_ctl_value v;
     int torn = 0, reads = 0;
+    double deadline;
 
     start_with(NULL, &k_fake, k_recs);
     s_rec->input_capture(1);
     __atomic_store_n(&s_rec_stop, 0, __ATOMIC_RELEASE);
     pthread_create(&t, NULL, rec_poll_thread, NULL);
-    for (int i = 0; i < 200000; i++)
+    deadline = rec_now() + 20.0;
+    for (long i = 0; i < 200000 || reads < 100000; i++) {
         if (rec_value(3, &v)) {
             reads++;
             torn += v.raw[0] != v.raw[1];
         }
+        if ((i & 4095) == 0 && rec_now() > deadline)
+            break;
+    }
     __atomic_store_n(&s_rec_stop, 1, __ATOMIC_RELEASE);
     pthread_join(t, NULL);
     CHECK(reads > 0 && torn == 0);
