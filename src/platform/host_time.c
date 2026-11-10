@@ -139,6 +139,70 @@ int xbox_HostUnderWine(void)
 #endif
 }
 
+#ifdef _WIN32
+static INIT_ONCE s_res_once = INIT_ONCE_STATIC_INIT;
+static int s_res_ok;   /* InitOnce orders the write before every read */
+
+static BOOL CALLBACK res_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    /* winmm is loaded at run time, as the kernel's timer thread did before
+     * this was moved here: the recomp_env library carries no link
+     * dependency to the platform layer's users (the tests link it alone). */
+    typedef unsigned (WINAPI *tbp_fn)(unsigned);
+    HMODULE winmm = LoadLibraryA("winmm.dll");
+    tbp_fn tbp = winmm ? (tbp_fn)(void *)GetProcAddress(winmm,
+                                                       "timeBeginPeriod")
+                       : NULL;
+
+    (void)once; (void)param; (void)ctx;
+    /* Held until the process exits; Windows drops it then. 0 is
+     * TIMERR_NOERROR. */
+    if (tbp && tbp(1) == 0)
+        s_res_ok = 1;
+
+    /* Windows 11 may ignore that request while the window is occluded,
+     * minimised or otherwise not visible, which would put the waits back on
+     * the 15.6 ms tick whenever the game loses focus. Opting out of that
+     * throttling makes the system keep honouring the request. Looked up at
+     * run time: Windows 7 has no SetProcessInformation, Windows 8 and 8.1
+     * lack the ProcessPowerThrottling class, Windows 10 (1709 on) has it but
+     * rejects the IGNORE_TIMER_RESOLUTION bit, and Wine may refuse it too.
+     * All of those keep the timeBeginPeriod request, so a failure is
+     * ignored. */
+    {
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+        typedef struct {
+            ULONG Version, ControlMask, StateMask;
+        } power_throttling_state;
+        typedef BOOL (WINAPI *spi_fn)(HANDLE, int, LPVOID, DWORD);
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        spi_fn spi = k32 ? (spi_fn)(void *)GetProcAddress(k32,
+                                                         "SetProcessInformation")
+                         : NULL;
+        power_throttling_state st;
+        st.Version = 1;               /* PROCESS_POWER_THROTTLING_CURRENT_VERSION */
+        st.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        st.StateMask = 0;
+        if (spi)
+            spi(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &st,
+                sizeof st);
+    }
+    return TRUE;
+}
+#endif
+
+int xbox_HostTimerResolutionInit(void)
+{
+#ifdef _WIN32
+    InitOnceExecuteOnce(&s_res_once, res_init, NULL, NULL);
+    return s_res_ok;
+#else
+    return 1;
+#endif
+}
+
 /* The mode the naps take: AUTO until set or first used. Resolving AUTO twice
  * at once is harmless (both threads resolve it the same way), but the word
  * is read and written atomically so it is not a data race. */

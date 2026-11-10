@@ -2685,6 +2685,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/platform/host_time.c | - | s_timer_wake_lock | file_static | keep | - | host timer state |
 | src/platform/host_time.c | - | s_timer_wake_cv | file_static | keep | - | host timer state |
 | src/platform/host_time.c | - | s_timer_wake_pending | file_static | keep | - | host timer state |
+| src/platform/host_time.c | - | s_res_once | once | keep | - | no rerun: the 1 ms timer period stays for the process |
+| src/platform/host_time.c | - | s_res_ok | file_static | keep | - | host timer state |
 
 ### src/platform/mem_stats.c
 

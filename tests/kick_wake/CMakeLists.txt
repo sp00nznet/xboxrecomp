@@ -14,7 +14,8 @@ add_executable(kick_wake_test test_main.c
     ../../src/kernel/nv2a_kick_wake.c ../../src/platform/host_time.c)
 target_include_directories(kick_wake_test PRIVATE ../../src ../../src/kernel ../../src/platform)
 if(WIN32)
-    # timeBeginPeriod(1) in host_time.c, as the runtime's timer thread sets it.
+    # timeBeginPeriod(1), as xbox_kernel_init sets it in the runtime
+    # (xbox_HostTimerResolutionInit).
     target_link_libraries(kick_wake_test PRIVATE winmm)
 else()
     find_package(Threads REQUIRED)

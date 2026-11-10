@@ -7,7 +7,8 @@ set(CMAKE_C_STANDARD 11)
 add_executable(host_nap_test test_main.c ../../src/platform/host_time.c)
 target_include_directories(host_nap_test PRIVATE ../../src/platform)
 if(WIN32)
-    # timeBeginPeriod(1), as the runtime's timer thread sets it.
+    # timeBeginPeriod(1), as xbox_kernel_init sets it in the runtime
+    # (xbox_HostTimerResolutionInit).
     target_link_libraries(host_nap_test PRIVATE winmm)
 else()
     # pthread_once and the condvar clock are in libpthread before glibc 2.34.

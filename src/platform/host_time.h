@@ -77,6 +77,21 @@ void xbox_HostWakerWake(XboxHostWaker *w);
  * native Windows host and on POSIX. Looked up once. */
 int xbox_HostUnderWine(void);
 
+/* Ask for a 1 ms timer period for the rest of the process, and keep it while
+ * the window is hidden. Every timed wait on native Windows (Sleep,
+ * SleepConditionVariableCS, a WaitFor* timeout) ends on the system clock
+ * interrupt, and since Windows 10 2004 the period is per process: one that
+ * never asks waits in 15.6 ms steps whatever other programs ask for. The
+ * APU frame thread's pacing wait (one 5.3 ms EP period, 6 ms in whole ms)
+ * then lasts 15.6 ms, three periods play for each one rendered, and the
+ * XAudio2 queue at the 512 x 4 default runs dry. It applies to every thread
+ * from its next wait. xbox_kernel_init makes the first call, whatever the
+ * vblank mode; further calls do nothing. Returns 1 when the period was
+ * granted (always on POSIX, where nothing is asked: waits are honoured),
+ * 0 when timeBeginPeriod failed or is missing. Wine honours the requested
+ * time either way. */
+int xbox_HostTimerResolutionInit(void);
+
 typedef enum {
     XBOX_NAP_AUTO,      /* the rule at xbox_HostNapNs, resolved once */
     XBOX_NAP_TIMER,     /* the thread's high-resolution waitable timer

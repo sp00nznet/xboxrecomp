@@ -3567,8 +3567,9 @@ static void kernel_vblank_arm(int raised)
  * and acked by the nv2a-ack thread's passes. RECOMP_VBLANK=paced, or the
  * one-CPU gate on top of any RECOMP_VBLANK, selects the 60 Hz schedule
  * below instead: the absolute schedule on the performance counter, the
- * vblank-ack thread, PCRTC_INTR_EN_0 and PMC_INTR_EN_0 honoured, and
- * timeBeginPeriod(1) on Windows. The gate needs it (its DPCs come late,
+ * vblank-ack thread, and PCRTC_INTR_EN_0 and PMC_INTR_EN_0 honoured (the
+ * 1 ms timer period both modes run on is xbox_kernel_init's, through
+ * xbox_HostTimerResolutionInit). The gate needs it (its DPCs come late,
  * and the tick's acks were lost behind them), and so does the flip hold
  * (RECOMP_FLIP_PACING), which holds flips to this count and would pace at
  * the tick's 50 Hz; a title that sets none of them gets the tick as
@@ -4619,46 +4620,13 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         }
     }
 
-#ifdef _WIN32
-    /* Sleep(1) is 15.6 ms on native Windows without this, which would make
-     * the vblank_clock=ms schedule run at 32 Hz; the nanosecond loop sleeps
-     * on a high-resolution waitable timer, and also wants it for the
-     * fallback. Wine needs nothing. */
-    {
-        typedef unsigned (WINAPI *tbp_fn)(unsigned);
-        HMODULE winmm = LoadLibraryA("winmm.dll");
-        tbp_fn tbp = winmm ? (tbp_fn)(void *)GetProcAddress(winmm,
-                                                           "timeBeginPeriod")
-                           : NULL;
-        if (tbp)
-            tbp(1);
-    }
-    /* Windows 11 may ignore that request while the window is occluded,
-     * minimised or otherwise not visible, which would put Sleep(1) and the
-     * ms vblank schedule back on the 15.6 ms tick whenever the game loses
-     * focus. Opting out of that throttling makes the system keep honouring
-     * the request. Windows 10 and Wine refuse or lack the class: ignored. */
-    {
-#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
-#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
-#endif
-        typedef struct {
-            ULONG Version, ControlMask, StateMask;
-        } power_throttling_state;
-        typedef BOOL (WINAPI *spi_fn)(HANDLE, int, LPVOID, DWORD);
-        HMODULE k32 = GetModuleHandleA("kernel32.dll");
-        spi_fn spi = k32 ? (spi_fn)(void *)GetProcAddress(k32,
-                                                         "SetProcessInformation")
-                         : NULL;
-        power_throttling_state st;
-        st.Version = 1;               /* PROCESS_POWER_THROTTLING_CURRENT_VERSION */
-        st.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
-        st.StateMask = 0;
-        if (spi)
-            spi(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &st,
-                sizeof st);
-    }
-#endif
+    /* Sleep(1) is 15.6 ms on native Windows without a 1 ms timer period,
+     * which would make the vblank_clock=ms schedule run at 32 Hz; the
+     * nanosecond loop sleeps on a high-resolution waitable timer, and also
+     * wants it for the fallback. xbox_kernel_init has asked for it already,
+     * for every vblank mode; this repeats the ask (a no-op) so the schedule
+     * never depends on the order of the two. */
+    xbox_HostTimerResolutionInit();
 
     if (kernel_vblank_clock_ms())
         kernel_timer_loop_ms();

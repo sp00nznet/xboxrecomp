@@ -20,6 +20,7 @@
 #include "kernel.h"
 #include "recomp_env.h"
 #include "xbox_memory_layout.h"
+#include "platform/host_time.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -398,6 +399,15 @@ void xbox_kernel_init(void)
     ULONG unresolved = 0;
     uint32_t thunk_base = 0;
     uint32_t thunk_count = 0;
+    int timer_period_ok;
+
+    /* Before the title runs, for every vblank mode: on native Windows each
+     * timed wait (the APU frame thread's pacing, the trapped front end's
+     * 1 ms wait, the kernel timer's tick) is otherwise 15.6 ms long, and the
+     * XAudio2 queue runs dry. Only the paced schedule asked for it before,
+     * so a title on the plain tick or none crackled. The period is per
+     * process: threads already running get it from their next wait. */
+    timer_period_ok = xbox_HostTimerResolutionInit();
 
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);
@@ -416,6 +426,9 @@ void xbox_kernel_init(void)
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
         "=== Xbox Kernel Replacement Layer initializing ===");
+    if (!timer_period_ok)
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,
+            "timeBeginPeriod(1) refused: timed waits end on the 15.6 ms tick");
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
         "Kernel version: %u.%u.%u.%u (emulated)",
         xbox_KrnlVersion.Major, xbox_KrnlVersion.Minor,

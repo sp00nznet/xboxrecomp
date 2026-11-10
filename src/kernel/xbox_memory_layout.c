@@ -2659,8 +2659,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * held a whole core (99% in top on both). A 1 ms tick bounds how
          * long a guest poller waits for an ack. On macOS it also doubled the
          * executor's flip rate (20 -> 41 per s, RECOMP_PB_EXEC=1), with the
-         * thread at ~14%. A native Windows host needs timeBeginPeriod(1)
-         * for this, as the kernel timer's Sleep(10) already does. */
+         * thread at ~14%. A native Windows host needs the 1 ms timer
+         * period for this, which xbox_kernel_init asks for
+         * (xbox_HostTimerResolutionInit). */
         if (det) {
             xbox_GuestDetDeviceDone(XBOX_DET_DEV_NV2A, det_worked);
             continue;

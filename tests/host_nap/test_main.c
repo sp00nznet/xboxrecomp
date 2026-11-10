@@ -11,7 +11,8 @@
  * POSIX's delay (none below the 50 us asked, since no wait returns early),
  * and a nap of 0. The timer, the native Windows delay and the hybrid's cold nap are
  * printed for the record. Under _WIN32 the process asks for
- * timeBeginPeriod(1) first, as the runtime's timer thread does.
+ * timeBeginPeriod(1) first, as xbox_kernel_init does in the runtime
+ * (xbox_HostTimerResolutionInit).
  */
 #include "host_time.h"
 
