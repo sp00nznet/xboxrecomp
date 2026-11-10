@@ -86,6 +86,8 @@
 #include "nv2a_pb_state.h"
 #include "nv2a_2d.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_bind_shadow.h"
+#include "nv2a_pb_cost.h"
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
 #include "nv2a_tex_dump.h"
@@ -340,6 +342,11 @@ static uint64_t s_enc_serial;
  * s_vc1.gen while ok. */
 static struct { uint64_t enc; uint32_t gen; int ok; } s_vc1;
 static uint64_t s_c_uploads;   /* c[] writes to buffer 1; "consts" in the flip trace */
+/* What the encoder s_bind.enc holds at vertex buffer 0 and fragment
+ * textures and samplers 0-3, as the draw path last set them
+ * (nv2a_bind_shadow.h). The command buffer retains what the encoder was
+ * given, so no compared pointer is freed and reused while it lives. */
+static struct nv2a_bind_shadow s_bind;
 
 static void end_encoder(void)
 {
@@ -3111,6 +3118,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
     id<MTLTexture> stex[4];
+    uint64_t ct = nv2a_pb_cost_start();   /* RECOMP_TRACE=pb_cost, as d3d11_on_draw */
 
     if (!init())
         return;
@@ -3218,6 +3226,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             s_draws_culled++;
             return;
         }
+        nv2a_pb_cost_mark(&ct, NV2A_COST_SETUP);
 
         /* Rings first: an overflow flushes, which ends the open pass. */
         vbytes = (NSUInteger)count * nf4 * 16u;
@@ -3251,9 +3260,11 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             }
         }
         memcpy(ip, idx, (size_t)nidx * 4u);
+        nv2a_pb_cost_mark(&ct, NV2A_COST_STREAMS);
         if (s_ao_on && d->program && v->depth_enable && v->depth_mask)
             ao_sample(v, g->format, vf, nf4, slot, count,
                       nv2a_w_depth_on(v, 1, v->rc_set && (v->rc_ctl & 0xFF)));
+        nv2a_pb_cost_mark(&ct, NV2A_COST_AO);
 
         /* Hor+: which batches are 2D, and their x range (nv2a_aspect_place
          * decides from it). A pass-through batch is 2D, its positions in
@@ -3302,6 +3313,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         if (have_x)
             full_w = nv2a_aspect_full(lo_x, hi_x, tris ? (const float (*)[2])hxy : NULL,
                                       tris ? idx : NULL, nidx / 3u, rt->w, rt->h, &wide);
+        nv2a_pb_cost_mark(&ct, NV2A_COST_ASPECT);
 
         /* Depth: the zeta surface's buffer, attached to this target's
          * passes from now on (a new pass if the open one lacks it). */
@@ -3359,6 +3371,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             if (textured)
                 s_draws_tex++;
         }
+        nv2a_pb_cost_mark(&ct, NV2A_COST_PX_STAGES);
         /* Hor+: a perspective screen quad over padded targets is a
          * full-width pass too (nv2a_aspect_screen_quad) and marks the third
          * it lies in as holding a bar; one drawn without depth in such a
@@ -3471,6 +3484,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 s_fs_w = fw;
             }
         }
+        nv2a_pb_cost_mark(&ct, NV2A_COST_PX_ASPECT);
         nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
         nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
         nv2a_vp_tie_fill(&vc, rt->hw, rt->hh);
@@ -3539,7 +3553,13 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                                       g->blend_dfactor, g->blend_color, bf, &(int){0});
             [s_enc setBlendColorRed:bf[0] green:bf[1] blue:bf[2] alpha:bf[3]];
         }
-        [s_enc setVertexBuffer:s_vb offset:vb_off atIndex:0];
+        nv2a_bind_shadow_begin(&s_bind, s_enc_serial, memo_on());
+        /* The ring stays bound; only where this batch starts moves. */
+        if (nv2a_bind_shadow_set(&s_bind.vb, s_vb))
+            [s_enc setVertexBuffer:s_vb offset:vb_off atIndex:0];
+        else
+            [s_enc setVertexBufferOffset:vb_off atIndex:0];
+        nv2a_pb_cost_mark(&ct, NV2A_COST_BIND);
         if (d->program) {
             /* c[192] is 3 KB: under setVertexBytes' 4 KB. An encoder keeps
              * its bindings from draw to draw, so while it is the same
@@ -3559,6 +3579,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             [s_enc setVertexBytes:&vc length:sizeof vc atIndex:1];
             s_vc1.ok = 0;              /* buffer 1 is vc now, not c[] */
         }
+        nv2a_pb_cost_mark(&ct, NV2A_COST_CONSTS);
         /* The D3D11 sampler's MipLODBias for a blended pack chain under a
          * guest of one level (nv2a_stage_lod), known once the stages are
          * bound; such a stage's guest bias was 0 above. */
@@ -3579,12 +3600,15 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             [s_enc setFragmentBytes:hf length:sizeof hf atIndex:3];
         }
         for (k = 0; k < 4; k++) {
-            [s_enc setFragmentTexture:stex[k] atIndex:k];
-            [s_enc setFragmentSamplerState:sampler(&s_stage[k], bump_src >> k & 1,
-                                                   s_stage_pack[k][0], s_stage_pack[k][1],
-                                                   (int)s_stage_pack[k][2])
-                                     atIndex:k];
+            id<MTLSamplerState> smp = sampler(&s_stage[k], bump_src >> k & 1,
+                                              s_stage_pack[k][0], s_stage_pack[k][1],
+                                              (int)s_stage_pack[k][2]);
+            if (nv2a_bind_shadow_set(&s_bind.tex[k], stex[k]))
+                [s_enc setFragmentTexture:stex[k] atIndex:k];
+            if (nv2a_bind_shadow_set(&s_bind.smp[k], smp))
+                [s_enc setFragmentSamplerState:smp atIndex:k];
         }
+        nv2a_pb_cost_mark(&ct, NV2A_COST_PX_BIND);
         /* A read of this batch's inputs only: the dump must not move a frame. */
         if (nv2a_tex_dump_on()) {
             int dump_2d = !d->program;
@@ -3598,8 +3622,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             mag_draw();
         else if (nv2a_tex_mag_on() && !d->program && topo == NV2A_TOPO_TRIANGLES)
             mag_pretransformed(vf, nf4, slot, idx, nidx);
+        nv2a_pb_cost_mark(&ct, NV2A_COST_PLACE);
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
+        nv2a_pb_cost_mark(&ct, NV2A_COST_DRAW);
         s_draws += d->batches;
     }
 }
@@ -4669,6 +4695,8 @@ static void dbg_present(RenderTarget *rt)
         [s_enc setCullMode:MTLCullModeNone];
         [s_enc setVertexBuffer:s_dbg_vb offset:0 atIndex:0];
         [s_enc setVertexBytes:&xs length:sizeof xs atIndex:1];
+        nv2a_bind_shadow_drop(&s_bind);    /* buffer 0 is no longer the ring */
+        s_vc1.ok = 0;                      /* buffer 1 is xs now, not c[] */
     }
     for (s = 0; s < NV2A_DBG_SEGS; s++) {
         int xray = s == NV2A_DBG_TRI_XRAY || s == NV2A_DBG_LINE_XRAY;

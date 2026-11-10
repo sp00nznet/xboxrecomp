@@ -9,6 +9,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 uint32_t nv2a_tex_extent(uint32_t fmt, uint32_t w, uint32_t h,
                          uint32_t pitch, uint32_t levels)
@@ -57,7 +58,18 @@ uint64_t nv2a_tex_hash(const uint8_t *p, uint32_t n, uint64_t h)
     return (l[0] ^ (l[1] << 1) ^ (l[2] << 2) ^ (l[3] << 3)) * 0x100000001B3ull;
 }
 
-static _Atomic uint64_t s_rt_hashes;
+static _Atomic uint64_t s_rt_hashes, s_rt_hash_bytes, s_rt_hash_ns;
+/* Set by nv2a_pb_cost_init with RECOMP_TRACE=pb_cost. A flag here rather
+ * than nv2a_pb_cost_on: the tests that link this file alone have no
+ * nv2a_pb_cost.c. Off, a hash reads no clock; only the count (tests) moves. */
+int nv2a_rt_own_cost_on;
+
+static uint64_t rt_own_now_ns(void)
+{
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 static uint64_t rt_own_hash(const uint8_t *mem, uint32_t addr, uint32_t pitch, uint32_t h)
 {
@@ -66,11 +78,17 @@ static uint64_t rt_own_hash(const uint8_t *mem, uint32_t addr, uint32_t pitch, u
     uint64_t top = addr >= NV2A_RT_CONTIG_BASE
                        ? (uint64_t)NV2A_RT_CONTIG_BASE + NV2A_RT_CONTIG_SIZE
                  : addr < NV2A_RT_WINDOW ? NV2A_RT_WINDOW : 0x100000000ull;
-    uint64_t n = (uint64_t)pitch * h;
+    uint64_t n = (uint64_t)pitch * h, t0, r;
     if (n > top - addr)
         n = top - addr;
     atomic_fetch_add_explicit(&s_rt_hashes, 1, memory_order_relaxed);
-    return nv2a_tex_hash(mem + addr, (uint32_t)n, NV2A_TEX_HASH_SEED);
+    if (!nv2a_rt_own_cost_on)
+        return nv2a_tex_hash(mem + addr, (uint32_t)n, NV2A_TEX_HASH_SEED);
+    t0 = rt_own_now_ns();
+    r = nv2a_tex_hash(mem + addr, (uint32_t)n, NV2A_TEX_HASH_SEED);
+    atomic_fetch_add_explicit(&s_rt_hash_bytes, n, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_rt_hash_ns, rt_own_now_ns() - t0, memory_order_relaxed);
+    return r;
 }
 
 void nv2a_rt_own_reset(struct nv2a_rt_own *o, const uint8_t *mem, uint32_t addr,
@@ -95,6 +113,16 @@ int nv2a_rt_own_stale(struct nv2a_rt_own *o, const uint8_t *mem, uint32_t addr,
 uint64_t nv2a_rt_own_hashes(void)
 {
     return atomic_load_explicit(&s_rt_hashes, memory_order_relaxed);
+}
+
+uint64_t nv2a_rt_own_hash_bytes(void)
+{
+    return atomic_load_explicit(&s_rt_hash_bytes, memory_order_relaxed);
+}
+
+uint64_t nv2a_rt_own_hash_ns(void)
+{
+    return atomic_load_explicit(&s_rt_hash_ns, memory_order_relaxed);
 }
 
 size_t nv2a_tex_texels(uint32_t w, uint32_t h, uint32_t levels)

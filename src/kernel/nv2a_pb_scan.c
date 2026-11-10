@@ -40,6 +40,7 @@
 
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "nv2a_pb_state.h"
+#include "nv2a_pb_cost.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -324,8 +325,11 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         return;
     if (s_exec_enabled) {
         extern void nv2a_pb_exec_walk_begin(void);
+        uint64_t t;
         nv2a_pb_perf_scan_begin();
+        t = nv2a_pb_cost_start();
         nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
+        nv2a_pb_cost_add(t, NV2A_COST_D_WALK);
     }
     /* Test hook: RECOMP_PB_INJECT_STOP=N stops every Nth walk at its first
      * word, so the recovery from a stop can be seen without a real desync.
@@ -358,8 +362,14 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
              * costs ~1 ms of a 10k-batch frame, so it runs only then. */
             if (s_scan_enabled)
                 note(s_subch, s_method);
-            if (s_exec_enabled)
+            if (s_exec_enabled) {
+                uint64_t t = nv2a_pb_cost_start();
                 nv2a_pb_exec_method(s_subch, s_method, w);
+                if (t) {
+                    nv2a_pb_cost_add(t, NV2A_COST_D_EXEC);
+                    nv2a_pb_cost_method(s_subch, s_method, t);
+                }
+            }
             if (!s_noninc)
                 s_method += 4;
             s_left--;
@@ -393,8 +403,10 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
              * has drawn nothing for GET or an ack to stand for. */
             if (s_checkpoint && s_exec_enabled > 0 && !in_call
                 && words - ckpt_words >= NV2A_PB_CHECKPOINT_WORDS) {
+                uint64_t t = nv2a_pb_cost_start();
                 ckpt_words = words;
                 s_checkpoint(at);
+                nv2a_pb_cost_add(t, NV2A_COST_D_CKPT);
             }
             s_left   = (w >> 18) & 0x7FFu;
             s_subch  = (w >> 13) & 7u;
@@ -411,7 +423,9 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
      * semaphore: the title may read them once either happens. */
     if (s_exec_enabled) {
         extern void nv2a_pb_exec_walk_end(void);
+        uint64_t t = nv2a_pb_cost_start();
         nv2a_pb_exec_walk_end();
+        nv2a_pb_cost_add(t, NV2A_COST_D_WALK);
     }
     if (why) {
         static unsigned said;

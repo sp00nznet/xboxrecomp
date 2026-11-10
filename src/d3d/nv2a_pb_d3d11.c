@@ -50,6 +50,7 @@
 #include "nv2a_pb_state.h"
 #include "nv2a_2d.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_pb_cost.h"
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
 #include "nv2a_tex_dump.h"
@@ -148,7 +149,9 @@ static int memo_on(void)
 /* The pipeline state last bound, so a batch binding the same again skips
  * the call. Only state this file alone sets and nothing unbinds behind it;
  * SRVs (which the runtime nulls on a render-target hazard) and the vertex
- * and index buffers (new offsets every batch) are always set. Releasing a
+ * buffers (new offsets every batch) are always set. The index ring is bound
+ * once at offset 0 and each draw starts at its indices (s_ib_first), so its
+ * bind is one more shadowed state. Releasing a
  * shader or input layout bumps s_state_gen, since a new object can come
  * back at a released one's address. The output merger's targets need no
  * such bump: the context holds a reference to the views it has bound, so a
@@ -174,6 +177,7 @@ static struct {
     ID3D11DepthStencilView   *dsv;
     ID3D11DepthStencilState  *dss;
     UINT                      sref;     /* the stencil reference with dss */
+    ID3D11Buffer             *ib;       /* s_ib at offset 0, or unknown */
 } s_sc;
 static int s_sc_init;
 
@@ -192,6 +196,7 @@ static ID3D11Buffer           *s_vb;            /* ring of float4 streams */
 static UINT                    s_vb_size, s_vb_pos;
 static ID3D11Buffer           *s_ib;
 static UINT                    s_ib_size, s_ib_pos;
+static UINT                    s_ib_first;      /* this batch's first index */
 /* Rasteriser states: [cull][front CCW], cull 0 none, 1 back, 2 front.
  * s_rs_sc are the same with the scissor on: every draw's, whose scissor is
  * the surface clip (nv2a_draw_box). */
@@ -3053,7 +3058,7 @@ static int st_w_on(int w, const struct nv2a_pb_draw *d)
 }
 
 static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a_pb_draw *d,
-                                      int w)
+                                      int w, uint64_t *ct)
 {
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     ID3D11ShaderResourceView *srv[4];
@@ -3207,6 +3212,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         memcpy(lm.srv, srv, sizeof srv);
         memcpy(lm.src, s_stage_src, sizeof lm.src);
     }
+    nv2a_pb_cost_mark(ct, NV2A_COST_PX_STAGES);
     hp->place = NV2A_PLACE_CENTRE;
     hp->post_tex = 0;
     if (s_cur && s_cur->pad) {
@@ -3277,6 +3283,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         pc.tex_scale[n][0] *= sc;
         pc.tex_scale[n][3] = off;
     }
+    nv2a_pb_cost_mark(ct, NV2A_COST_PX_ASPECT);
     if (memo_on() && s_cb_ps_ok && !memcmp(&s_cb_ps_shadow, &pc, sizeof pc)) {
         /* the buffer already holds these bytes */
     } else if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_ps, 0,
@@ -3297,6 +3304,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
     }
     if (textured)
         s_draws_tex++;
+    nv2a_pb_cost_mark(ct, NV2A_COST_PX_BIND);
 
     if (v->rc_set && (v->rc_ctl & 0xFF)) {
         NV2ACombinerState st;
@@ -3517,7 +3525,7 @@ static int trace_stream_out(VsEntry *vs, D3D11_PRIMITIVE_TOPOLOGY topo,
     ID3D11DeviceContext_SOSetTargets(s_ctx, 1, &buf, &zero);
     ID3D11DeviceContext_GSSetShader(s_ctx, gs, NULL, 0);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
-    ID3D11DeviceContext_DrawIndexed(s_ctx, 3, 0, 0);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, 3, s_ib_first, 0);
     ID3D11DeviceContext_SOSetTargets(s_ctx, 1, &none, &zero);
     ID3D11DeviceContext_GSSetShader(s_ctx, NULL, NULL, 0);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, topo);
@@ -3895,7 +3903,7 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
         ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dsv ? dss_le : s_ds_off, 0);
         ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFF);
         ID3D11DeviceContext_PSSetShader(s_ctx, px_shader(pass), NULL, 0);
-        ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+        ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, s_ib_first, 0);
         for (n = 0; n < s_px_n; n++) {
             D3D11_BOX b;
             if (s_px_x[n] < 0 || s_px_y[n] < 0
@@ -4720,6 +4728,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     uint8_t fmts[16];
     uint32_t lo = 0xFFFF, hi = 0, count, nidx, i, k;
     void *p;
+    uint64_t ct = nv2a_pb_cost_start();   /* RECOMP_TRACE=pb_cost */
 
     if (!init())
         return;
@@ -4772,12 +4781,14 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         s_draws_culled++;
         return;
     }
+    nv2a_pb_cost_mark(&ct, NV2A_COST_SETUP);
 
     /* render.ao's depth samples (the trigger stepped above). */
     if (s_ao_on) {
         if (d->program && v->depth_enable && v->depth_mask)
             ao_sample(d, v, vs->inputs, lo, count, g->format, w_on);
     }
+    nv2a_pb_cost_mark(&ct, NV2A_COST_AO);
 
     /* Streams: each one the shader reads. One in a format the input
      * assembler reads natively is copied as it is: vertices lo..hi of its
@@ -4876,6 +4887,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         vbs[i] = s_vb;
     }
     vb_end();
+    nv2a_pb_cost_mark(&ct, NV2A_COST_STREAMS);
     p = ring_map(s_ib, s_ib_size, &s_ib_pos, nidx * 4u, 4);
     if (!p) {
         s_draws_skipped++;
@@ -4883,6 +4895,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     }
     memcpy(p, idx, nidx * 4u);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ib, 0);
+    nv2a_pb_cost_mark(&ct, NV2A_COST_IB);
 
     /* Hor+: which batches are 2D, and their x range (nv2a_aspect_place
      * decides from it), as metal_on_draw does. A pass-through batch is 2D,
@@ -4966,6 +4979,8 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         hp.nidx = nidx;
     }
 
+    nv2a_pb_cost_mark(&ct, NV2A_COST_ASPECT);
+
     /* Constants: the program's c[192] at b1. The pixels->NDC mapping at b2
      * waits for the placement (setup_pixel, below). */
     {
@@ -4994,6 +5009,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             consts_gen = gen;
         }
     }
+    nv2a_pb_cost_mark(&ct, NV2A_COST_CONSTS);
 
     {
         D3D11_VIEWPORT vp;
@@ -5065,8 +5081,14 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             }
             ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, NV2A_VS_MAX_INPUTS,
                                                    vbs, strides, offs);
-            ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT,
-                                                 s_ib_pos - nidx * 4u);
+            /* ring_map keeps the indices 4-aligned, so they start at a
+             * whole index: one bind serves every batch until something
+             * else binds an index buffer (and resets s_sc_init). */
+            s_ib_first = (s_ib_pos - nidx * 4u) / 4u;
+            if (!sc || s_sc.ib != s_ib) {
+                ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT, 0);
+                s_sc.ib = s_ib;
+            }
             if (!sc || s_sc.topo != topo) {
                 ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, topo);
                 s_sc.topo = topo;
@@ -5081,13 +5103,15 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             }
         }
         s_cur = rt;
+        nv2a_pb_cost_mark(&ct, NV2A_COST_BIND);
         {
             static int skip_post = -1;
             ID3D11PixelShader *ps;
             if (skip_post < 0)
                 skip_post = recomp_env(RENV_D3D11_DEBUG_PS_SKIP_POST) != NULL;
             s_dbg_post = skip_post && !v->depth_enable && d->idx_count <= 8;
-            ps = setup_pixel(&hp, d, w_on);
+            ps = setup_pixel(&hp, d, w_on, &ct);
+            nv2a_pb_cost_mark(&ct, NV2A_COST_PX_SHADER);
             /* setup_pixel may have compiled (and evicted) a shader */
             if (!sc_on() || s_sc.ps != ps) {
                 ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
@@ -5099,6 +5123,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 s_sc.rs = rs;
             }
         }
+        nv2a_pb_cost_mark(&ct, NV2A_COST_PIXEL);
         if (hp.place != NV2A_PLACE_CENTRE)
             s_draws_stretch++;
         if (hp.two_d && !have_x) {
@@ -5154,16 +5179,18 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             mag_draw();
         else if (nv2a_tex_mag_on() && topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
             mag_pretransformed(d, v, lo, idx, nidx);
+        nv2a_pb_cost_mark(&ct, NV2A_COST_PLACE);
         if (px_on()) {
             uint32_t before[4];
             int n;
             for (n = 0; n < s_px_n; n++)
                 before[n] = read_pixel(rt, s_px_x[n], s_px_y[n]);
-            ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+            ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, s_ib_first, 0);
             px_probe(d, vs, rt, fmts, strides, offs, topo, nidx, dsv, before);
         } else {
-            ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+            ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, s_ib_first, 0);
         }
+        nv2a_pb_cost_mark(&ct, NV2A_COST_DRAW);
     }
     rt->last_draw = ++s_seq;
     s_cur = NULL;

@@ -179,6 +179,13 @@ static inline void write_out(float (*o)[4], float c[NV2A_VSH_CONSTANTS][4],
     }
 }
 
+/* Counted only with RECOMP_TRACE=pb_cost (nv2a_pb_cost_init sets the
+ * flag; the tests that link this file alone have no nv2a_pb_cost.c). The
+ * walker thread is the only writer and the flip line the only reader. */
+int nv2a_vsh_count_on;
+uint32_t nv2a_vsh_run_count;
+uint64_t nv2a_vsh_step_count;
+
 void nv2a_vsh_run(const uint32_t prog[NV2A_VSH_SLOTS][4], uint32_t start,
                   float c[NV2A_VSH_CONSTANTS][4], int const_write,
                   const float v[NV2A_VSH_INPUTS][4], Nv2aVshOut *out)
@@ -238,6 +245,10 @@ void nv2a_vsh_run(const uint32_t prog[NV2A_VSH_SLOTS][4], uint32_t start,
     }
     memcpy(out->o, o, sizeof out->o);
     out->steps = steps;
+    if (nv2a_vsh_count_on) {
+        nv2a_vsh_run_count++;
+        nv2a_vsh_step_count += (uint64_t)steps;
+    }
 }
 
 /* ---- disassembly ------------------------------------------------------ */

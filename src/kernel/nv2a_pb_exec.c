@@ -49,6 +49,7 @@
 #include "nv2a_pb_state.h"
 #include "nv2a_2d.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_pb_cost.h"
 #include "nv2a_opts_at.h"
 #include "nv2a_tex_pack.h"
 #include "nv2a_zbuf_cache.h"
@@ -6214,8 +6215,11 @@ static void reports_settle(void)
 {
     if (s_report_owed) {
         s_report_owed = 0;
-        if (s_backend->on_poll)
+        if (s_backend->on_poll) {
+            uint64_t t = nv2a_pb_cost_start();
             s_backend->on_poll();
+            nv2a_pb_cost_add(t, NV2A_COST_D_POLL);
+        }
     }
 }
 
@@ -6246,6 +6250,7 @@ static void get_report(uint32_t param)
     static uint32_t fixed = 0x10000;
     uint32_t va, value, phys;
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    int took = 0;
 
     if (fixed_set < 0) {
         const char *e = recomp_env(RENV_ZPASS_FIXED);
@@ -6264,7 +6269,12 @@ static void get_report(uint32_t param)
         note_unhandled(NV097_GET_REPORT, param);
         return;
     }
-    if (!fixed_set && s_backend->on_report && s_backend->on_report(va)) {
+    if (!fixed_set && s_backend->on_report) {
+        uint64_t t = nv2a_pb_cost_start();
+        took = s_backend->on_report(va);
+        nv2a_pb_cost_add(t, NV2A_COST_D_REPORT);
+    }
+    if (took) {
         s_reports++;                       /* the backend completes it */
         s_report_owed = 1;
         return;
@@ -6623,9 +6633,11 @@ static void draw_primitive(void)
 {
     float v[4];
     uint32_t i;
+    uint64_t cost_t;
 
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
+    cost_t = nv2a_pb_cost_start();
     /* Every count here is per guest batch: a merged chain (merge_flush)
      * counts as the s_draw_batches it stands for, drawn or skipped. */
     s_gpu.draws += s_draw_batches;
@@ -6675,6 +6687,7 @@ static void draw_primitive(void)
         d.inline_bytes = s_gpu.inline_count * 4;
         d.program      = vsh_batch_active();
         d.batches      = s_draw_batches;
+        nv2a_pb_cost_mark(&cost_t, NV2A_COST_PRE);
         if (cpu_px_on()) {
             uint32_t before[4] = {0};
             float zb[4] = {0};
@@ -7205,9 +7218,11 @@ static void twod_blit(void)
                     b.src_offset, b.in_x, b.in_y, b.src_pitch, b.dst_offset, b.out_x,
                     b.out_y, b.dst_pitch, s_gpu.flips);
     }
-    if (s_backend->on_blit)
+    if (s_backend->on_blit) {
+        uint64_t t = nv2a_pb_cost_start();
         s_backend->on_blit(&b);
-    else
+        nv2a_pb_cost_add(t, NV2A_COST_D_BLIT);
+    } else
         nv2a_pb_blit_guest(&b);
 }
 
@@ -7259,6 +7274,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * and for the immediate-mode snapshot alike. */
         for (a = 0; a < NV_VERTEX_ATTRS; a++)
             s_vsh.inl[a][3] = 1.0f;
+        nv2a_pb_cost_init();
 #ifdef _WIN32
         {   /* RECOMP_PB_BACKEND=d3d11: src/d3d/nv2a_pb_d3d11.c */
             extern void nv2a_pb_d3d11_register_from_env(void);
@@ -7463,10 +7479,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_CLEAR_SURFACE:
         if (param & 0xF0)
             present_note(1);
-        if (s_backend->on_zclear)
-            s_backend->on_zclear(param);
-        if (s_backend->on_clear)
-            s_backend->on_clear(param);
+        {
+            uint64_t t = nv2a_pb_cost_start();
+            if (s_backend->on_zclear)
+                s_backend->on_zclear(param);
+            if (s_backend->on_clear)
+                s_backend->on_clear(param);
+            nv2a_pb_cost_add(t, NV2A_COST_D_CLEAR);
+        }
         break;
 
     case NV097_SET_BEGIN_END:
@@ -7625,7 +7645,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_sema_last_va = va;
         s_sema_last_value = param;
         fence_shift_learn(fence_paired, param);
-        xbox_SpinWake();   /* a fence wait may be sleeping on this word */
+        {
+            uint64_t t = nv2a_pb_cost_start();
+            xbox_SpinWake();   /* a fence wait may be sleeping on this word */
+            nv2a_pb_cost_add(t, NV2A_COST_D_WAKE);
+        }
         if (s_sema_releases++ == 0 || recomp_env(RENV_PB_SEMA_TRACE)) {
             static unsigned shown;
             if (shown++ < 16) {
@@ -7679,6 +7703,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * the backend's present: a vsynced present can hold this thread for
          * a host frame, and that time counts against the hold. */
         uint64_t stall_ns = flip_now_ns();
+        uint64_t cost_t = nv2a_pb_cost_start();
         int clock_ok;
         uint32_t stall_vbl;
         (void)flip_clock(stall_ns, &clock_ok);
@@ -7728,6 +7753,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                         nv2a_host_opts()->overscan, why,
                         cpu ? "it presents the whole frame" : "it presents nothing");
         }
+        nv2a_pb_cost_mark(&cost_t, NV2A_COST_F_HEAD);
         if (s_backend->on_flip) {
             uint64_t t0 = rt_now();
             if (s_present.offset)
@@ -7738,6 +7764,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                    s_gpu.pitch);
             s_perf.flip += rt_now() - t0;   /* Present, for the [PB-PERF] line */
         }
+        nv2a_pb_cost_mark(&cost_t, NV2A_COST_F_PRESENT);
         /* The menu's copy of the pack's miss ring, taken here on the
          * walker thread that writes the ring (one load while nothing reads
          * it), then the host actions' tick (enhancements layer, when
@@ -7746,6 +7773,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         nv2a_tex_pack_snapshot();
         nv2a_tex_pack_flip();
         nv2a_flip_hook_run();
+        nv2a_pb_cost_mark(&cost_t, NV2A_COST_F_HOOKS);
         /* The window title's FPS and draws: one call per flip, with the
          * draws of the frame just finished. */
         {
@@ -7756,6 +7784,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             nv2a_stats_flip(s_gpu.draws - last_draws, rt_now());
             last_draws = s_gpu.draws;
         }
+        nv2a_pb_cost_mark(&cost_t, NV2A_COST_F_STATS);
         dump_at_flip(s_gpu.flips);
         cap_at_flip(s_gpu.flips);
         /* RECOMP_FB_DUMP_FLIPS=<n>: with RECOMP_FB_DUMP, the finished frame
@@ -7779,6 +7808,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             if (every > 0 && s_gpu.flips % (uint32_t)every == 0)
                 prev_tris = drew;
         }
+        nv2a_pb_cost_mark(&cost_t, NV2A_COST_F_DUMPS);
         /* RECOMP_FLIP_LOG=1: every flip, with the batches drawn since the last. */
         {
             static int on = -1;
@@ -7840,12 +7870,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                             s_perf.flip / 1e6, kicks, kwait / 1e6,
                             stops - prev_stops, s_perf.draws);
                     prev_stops = stops;
+                    /* RECOMP_TRACE=pb_cost: the draw share by stage */
+                    nv2a_pb_cost_flip(s_gpu.flips, s_perf.batches, s_perf.draws);
                     s_perf.scan = s_perf.draw = s_perf.flip = 0;
                     s_perf.methods = s_perf.batches = s_perf.draws = 0;
                     s_perf.scan_t0 = s_perf.flip_t0 = now;
                 }
             }
         }
+        nv2a_pb_cost_mark(&cost_t, NV2A_COST_F_LOG);
         /* The first few always, so a log says whether flips happen at all
          * and which surface each one put on screen; more with VERBOSE. */
         {
@@ -7870,6 +7903,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FlipHoldStall(&s_flip_hold, stall_vbl, stall_ns,
                                clock_ok && !nv2a_pb_scan_in_call());
         }
+        nv2a_pb_cost_mark(&cost_t, NV2A_COST_F_TAIL);
         return;
     }
 

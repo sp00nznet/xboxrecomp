@@ -58,6 +58,14 @@ void nv2a_vsh_run(const uint32_t prog[NV2A_VSH_SLOTS][4], uint32_t start,
                   float c[NV2A_VSH_CONSTANTS][4], int const_write,
                   const float v[NV2A_VSH_INPUTS][4], Nv2aVshOut *out);
 
+/* Every run and instruction since start, for the [PB-COST] line: the CPU
+ * interpreter on the draw path (hor+, snap_2d, render.ao) is a per-batch
+ * cost. Plain counters, kept only while nv2a_vsh_count_on (set by
+ * nv2a_pb_cost_init); a run off the walker's thread may be missed. */
+extern int nv2a_vsh_count_on;
+extern uint32_t nv2a_vsh_run_count;
+extern uint64_t nv2a_vsh_step_count;
+
 /* One instruction as text, for traces and tests. Returns `buf`. */
 char *nv2a_vsh_disasm(const uint32_t insn[4], char *buf, int size);
 

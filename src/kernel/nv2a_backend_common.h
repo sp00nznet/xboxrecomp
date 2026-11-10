@@ -369,6 +369,11 @@ int nv2a_rt_own_stale(struct nv2a_rt_own *o, const uint8_t *mem, uint32_t addr,
 
 /* Hashes taken so far by the two above (tests and the profile). */
 uint64_t nv2a_rt_own_hashes(void);
+/* The bytes those hashes read and the time they took (RECOMP_TRACE=pb_cost). */
+uint64_t nv2a_rt_own_hash_bytes(void);
+uint64_t nv2a_rt_own_hash_ns(void);
+/* Nonzero while those two are kept (nv2a_pb_cost_init sets it). */
+extern int nv2a_rt_own_cost_on;
 
 /* Whether [a, a + an) and [b, b + bn) share a byte, through the low 27 bits
  * (the backends' rule for "the same memory through either window"). */

@@ -965,6 +965,9 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | file | scope | name | kind | class | hook | why |
 |---|---|---|---|---|---|---|
 | src/kernel/nv2a_backend_common.c | - | s_rt_hashes | file_static | keep | - | render-target hash counter stat |
+| src/kernel/nv2a_backend_common.c | - | s_rt_hash_bytes | file_static | keep | - | render-target hash bytes stat |
+| src/kernel/nv2a_backend_common.c | - | s_rt_hash_ns | file_static | keep | - | render-target hash time stat |
+| src/kernel/nv2a_backend_common.c | - | nv2a_rt_own_cost_on | global | keep | - | cached RECOMP_TRACE=pb_cost read (nv2a_pb_cost_init) |
 | src/kernel/nv2a_backend_common.c | - | s_host_opts | file_static | keep | - | enhance options and pending menu requests, host settings |
 | src/kernel/nv2a_backend_common.c | - | s_req_opts | file_static | keep | - | enhance options and pending menu requests, host settings |
 | src/kernel/nv2a_backend_common.c | - | s_req_mask | file_static | keep | - | enhance options and pending menu requests, host settings |
@@ -1061,6 +1064,17 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_overlay_ui.c | - | s_probe | file_static | keep | - | UI scale and display probe, host |
 | src/kernel/nv2a_overlay_ui.c | - | s_probed | file_static | keep | - | UI scale and display probe, host |
 | src/kernel/nv2a_overlay_ui.c | - | s_comp | file_static | keep | - | UI scale and display probe, host |
+
+### src/kernel/nv2a_pb_cost.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/kernel/nv2a_pb_cost.c | - | nv2a_pb_cost_on | global | keep | - | cached RECOMP_TRACE=pb_cost read |
+| src/kernel/nv2a_pb_cost.c | - | nv2a_pb_cost_ticks | global | keep | - | profiler totals, cleared each flip |
+| src/kernel/nv2a_pb_cost.c | - | s_cost_last | file_static | keep | - | profiler clock and counter baseline |
+| src/kernel/nv2a_pb_cost.c | - | s_m_ticks | file_static | keep | - | per-method profiler totals, cleared each table |
+| src/kernel/nv2a_pb_cost.c | - | s_m_calls | file_static | keep | - | per-method call counts, cleared each table |
+| src/kernel/nv2a_pb_cost.c | - | s_m_flips | file_static | keep | - | flips since the last method table |
 
 ### src/kernel/nv2a_pb_exec.c
 
@@ -1463,6 +1477,14 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_tex_pack.c | - | s_rc_why | file_static | keep | - | last recolour lookup, for the miss tag |
 | src/kernel/nv2a_tex_pack.c | - | s_rc_kind | file_static | keep | - | last recolour lookup, for the miss tag |
 
+### src/kernel/nv2a_vsh_cpu.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/kernel/nv2a_vsh_cpu.c | - | nv2a_vsh_count_on | global | keep | - | cached RECOMP_TRACE=pb_cost read (nv2a_pb_cost_init) |
+| src/kernel/nv2a_vsh_cpu.c | - | nv2a_vsh_run_count | global | keep | - | profiler totals, read as deltas |
+| src/kernel/nv2a_vsh_cpu.c | - | nv2a_vsh_step_count | global | keep | - | profiler totals, read as deltas |
+
 ### src/nv2a/nv2a_core.c
 
 | file | scope | name | kind | class | hook | why |
@@ -1681,6 +1703,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_state_gen | file_static | keep | - | monotonic bound-state generation; bump, never zero |
 | src/d3d/nv2a_pb_d3d11.c | - | s_sc | file_static | reset | renderer.d3d11 | bound-state filter; may name released RT views |
 | src/d3d/nv2a_pb_d3d11.c | - | s_sc_init | once | reset | renderer.d3d11 | rerun: clear s_sc after caches drop and ClearState |
+| src/d3d/nv2a_pb_d3d11.c | - | s_ib_first | file_static | keep | - | first index of the batch in the ring; set before each draw |
 | src/d3d/nv2a_pb_d3d11.c | - | s_vb | file_static | keep | - | host vertex ring buffer object |
 | src/d3d/nv2a_pb_d3d11.c | - | s_vb_size | file_static | keep | - | vertex ring size |
 | src/d3d/nv2a_pb_d3d11.c | - | s_vb_pos | file_static | keep | - | vertex ring position, host transient |
@@ -2074,6 +2097,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_enc_serial | file_static | keep | - | monotonic encoder serial; never zero |
 | src/d3d/nv2a_pb_metal.m | - | s_vc1 | file_static | reset | renderer.metal | c[] gen memo on encoder; pgraph gen rewinds |
 | src/d3d/nv2a_pb_metal.m | - | s_c_uploads | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_metal.m | - | s_bind | file_static | keep | - | encoder binding shadow; keyed on monotonic s_enc_serial |
 | src/d3d/nv2a_pb_metal.m | init | tried | local_static | keep | - | device init ran once; device kept |
 | src/d3d/nv2a_pb_metal.m | alias_check_on | on | local_static | keep | - | cached env read |
 | src/d3d/nv2a_pb_metal.m | rt_drop_if_stale | said | local_static | keep | - | log-once guard |
