@@ -6726,6 +6726,133 @@ static void gpu_mem_note(void)
     mem_stats_gpu_note("d3d11", loc.CurrentUsage, nl.CurrentUsage);
 }
 
+/* RECOMP_TRACE=d3d11_prof: the GPU side of a frame, which the CPU sampler
+ * cannot see. A timestamp pair brackets everything submitted from one
+ * Present to the next; its result is read a few flips later without a
+ * flush, so the run's pacing is untouched. The span runs from the frame's
+ * first command reaching the GPU to its last finishing: with the GPU idle
+ * between submissions (a CPU-bound frame) it reads high, so a GPU-bound
+ * frame shows a span near the flip interval AND a busy GPU (the Deck's
+ * gpu_busy_percent). Present's own call time is the CPU's wait on the
+ * swap chain (vsync, frame latency). Not metal_prof's gpu figure, which
+ * sums each command buffer's GPU start-to-end and so leaves the gaps out:
+ * the two backends' gpu ms are not comparable. */
+#define D11P_RING 8
+static int s_d11p = -1;   /* 0 off, 1 summary every 300 flips, 2 also per flip */
+static struct {
+    ID3D11Query *dj, *t0, *t1;
+    uint64_t flip;
+    double present_ms;
+    int busy;
+} s_d11p_q[D11P_RING];
+static int s_d11p_open = -1;  /* the slot bracketing the frame being built */
+static unsigned s_d11p_next;
+static struct {
+    uint64_t n, ngpu, lost, disjoint;
+    double gpu, gpu_max, pres, pres_max;
+} s_d11p_acc;
+
+static int d11p_on(void)
+{
+    if (s_d11p < 0) {
+        const char *v = recomp_env(RENV_D3D11_PROF);
+        s_d11p = !recomp_env_on(RENV_D3D11_PROF) ? 0 : !strcmp(v, "all") ? 2 : 1;
+    }
+    return s_d11p;
+}
+
+static void d11p_collect(void)
+{
+    /* Oldest slot first, so the per-flip lines come out in flip order. */
+    for (unsigned j = 0; j < D11P_RING; j++) {
+        unsigned i = (s_d11p_next + j) % D11P_RING;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+        UINT64 t0, t1;
+        if (!s_d11p_q[i].busy)
+            continue;
+        if (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)s_d11p_q[i].dj, &dj,
+                                        sizeof dj, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK
+                || ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)s_d11p_q[i].t0,
+                                               &t0, sizeof t0,
+                                               D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK
+                || ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)s_d11p_q[i].t1,
+                                               &t1, sizeof t1,
+                                               D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            continue;
+        s_d11p_q[i].busy = 0;
+        if (dj.Disjoint || !dj.Frequency || t1 < t0) {
+            s_d11p_acc.disjoint++;
+            continue;
+        }
+        {
+            double ms = (double)(t1 - t0) * 1e3 / (double)dj.Frequency;
+            s_d11p_acc.ngpu++;
+            s_d11p_acc.gpu += ms;
+            if (ms > s_d11p_acc.gpu_max)
+                s_d11p_acc.gpu_max = ms;
+            if (s_d11p == 2)
+                fprintf(stderr, "[D3D11-PROF] flip %llu gpu %.3f ms present %.3f ms\n",
+                        (unsigned long long)s_d11p_q[i].flip, ms, s_d11p_q[i].present_ms);
+        }
+    }
+}
+
+/* Before Present: close the open frame's bracket. */
+static void d11p_end(void)
+{
+    if (s_d11p_open < 0)
+        return;
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_d11p_q[s_d11p_open].t1);
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_d11p_q[s_d11p_open].dj);
+    s_d11p_q[s_d11p_open].flip = s_presents;
+    s_d11p_q[s_d11p_open].busy = 1;
+}
+
+/* After Present: account the call, read finished brackets, open the next. */
+static void d11p_after_present(double present_ms)
+{
+    int k;
+    if (s_d11p_open >= 0)
+        s_d11p_q[s_d11p_open].present_ms = present_ms;
+    s_d11p_acc.n++;
+    s_d11p_acc.pres += present_ms;
+    if (present_ms > s_d11p_acc.pres_max)
+        s_d11p_acc.pres_max = present_ms;
+    d11p_collect();
+    k = (int)(s_d11p_next++ % D11P_RING);
+    if (!s_d11p_q[k].dj) {
+        D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+        ID3D11Device_CreateQuery(s_dev, &qd, &s_d11p_q[k].dj);
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        ID3D11Device_CreateQuery(s_dev, &qd, &s_d11p_q[k].t0);
+        ID3D11Device_CreateQuery(s_dev, &qd, &s_d11p_q[k].t1);
+    }
+    if (!s_d11p_q[k].dj || !s_d11p_q[k].t0 || !s_d11p_q[k].t1) {
+        s_d11p_open = -1;
+        return;
+    }
+    /* Never read back in D11P_RING flips: the GPU is that far behind, or
+     * the result was lost; the slot is reused and the frame not counted. */
+    if (s_d11p_q[k].busy) {
+        s_d11p_q[k].busy = 0;
+        s_d11p_acc.lost++;
+    }
+    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)s_d11p_q[k].dj);
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_d11p_q[k].t0);
+    s_d11p_open = k;
+    if (s_d11p_acc.n == 300) {
+        double g = s_d11p_acc.ngpu ? s_d11p_acc.gpu / (double)s_d11p_acc.ngpu : 0.0;
+        fprintf(stderr, LOGP "prof %llu flips: gpu %.3f ms/flip (max %.3f, %llu read,"
+                " %llu disjoint, %llu lost); present call %.3f ms/flip (max %.3f)\n",
+                (unsigned long long)s_presents, g, s_d11p_acc.gpu_max,
+                (unsigned long long)s_d11p_acc.ngpu,
+                (unsigned long long)s_d11p_acc.disjoint,
+                (unsigned long long)s_d11p_acc.lost,
+                s_d11p_acc.pres / (double)s_d11p_acc.n, s_d11p_acc.pres_max);
+        memset(&s_d11p_acc, 0, sizeof s_d11p_acc);
+    }
+}
+
 static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
 {
     HRESULT hr;
@@ -6868,7 +6995,15 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     ovl_present();
     nv2a_stats_add(NV2A_STAT_PRESENTS, 1);
 #endif
-    hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
+    if (d11p_on()) {
+        double t0;
+        d11p_end();
+        t0 = sh_now_ms();
+        hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
+        d11p_after_present(sh_now_ms() - t0);
+    } else {
+        hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
+    }
     if (FAILED(hr) && s_presents < 4)
         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);
     /* FLIP_DISCARD unbinds the back buffer; the next frame rebinds its own

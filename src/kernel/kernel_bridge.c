@@ -563,6 +563,39 @@ static void thread_set_os_name(const char *name)
 #endif
 }
 
+/* RECOMP_DEBUG=host_cpus=<hex mask>: the whole process on those logical
+ * CPUs, so a run on a big PC has the core count of a smaller target (the
+ * Steam Deck: 4 cores, 8 threads, 0xFF where Windows numbers SMT siblings
+ * side by side). SetProcessAffinityMask re-masks every thread the process
+ * already has and the ones it starts later; it runs at process-main, before
+ * any guest pin, so RECOMP_GUEST_CPUS then picks within it. Windows only: elsewhere the
+ * host's own tools (taskset) do this from outside. */
+static void host_cpus_from_env(void)
+{
+    const char *v = recomp_env(RENV_HOST_CPUS);
+    if (!v || !*v)
+        return;
+#ifdef _WIN32
+    {
+        unsigned long long m = strtoull(v, NULL, 16);
+        DWORD_PTR proc = 0, sys = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
+        if (!m)
+            fprintf(stderr, "  [KERNEL] host_cpus=%s: an empty mask; unchanged\n", v);
+        else if ((m & sys) == m
+                && SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)m))
+            fprintf(stderr, "  [KERNEL] host_cpus: process on cpu mask %#llx"
+                            " (system %#llx)\n", m, (unsigned long long)sys);
+        else
+            fprintf(stderr, "  [KERNEL] host_cpus=%s: not a subset of the system's"
+                            " cpus (%#llx); unchanged\n", v, (unsigned long long)sys);
+    }
+#else
+    fprintf(stderr, "  [KERNEL] host_cpus=%s: Windows only; use taskset on this host\n", v);
+#endif
+    fflush(stderr);
+}
+
 void xbox_log_thread_role(const char *role, uint32_t routine)
 {
     static DWORD main_tid;   /* the thread that logged process-main */
@@ -575,6 +608,7 @@ void xbox_log_thread_role(const char *role, uint32_t routine)
         snprintf(os, sizeof os, "%.15s", role);
     if (!strcmp(role, "process-main")) {
         main_tid = GetCurrentThreadId();
+        host_cpus_from_env();
         /* RECOMP_TRACE=prof: the earliest point every host passes once. */
         host_prof_start_from_env();
         /* The [MEM] exit line, from here so a bench's SIGINT finds it. */

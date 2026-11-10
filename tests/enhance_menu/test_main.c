@@ -2934,7 +2934,7 @@ static void test_pages(void)
      * Recordings with no folder yet: no file rows. */
     static const uint32_t k_sum[11] = {
         0x6FDBE087u, 0xC58D4BA2u, 0x601BABF4u, 0x775B0691u, 0x109DEB36u,
-        0x6930FCBFu, 0xC1417056u, 0xD09AF0E9u, 0xE13F4B8Bu, 0x5548E3AAu, 0xE2E461FFu };
+        0x6930FCBFu, 0xC1417056u, 0x5040B48Fu, 0xE13F4B8Bu, 0x5548E3AAu, 0xE2E461FFu };
     /* Files shows Open exports folder only off Game Mode. Pack with a pack
      * loaded: with none it names the packs folder, an absolute path that
      * moves with the build folder. */

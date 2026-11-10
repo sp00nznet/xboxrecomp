@@ -41,6 +41,7 @@ One per stage, in the order you run them.
 - [Xbox Kernel Replacement](technical/kernel-replacement.md) — Mapping Xbox kernel ordinals to Win32, and the gotchas
 - [Mods: reference](runtime/mods.md) — The mod API's contract, its calls, and how a mod reaches the game
 - [Write a mod](runtime/mod-howto.md) — A minimal mod with settings, controls, a status panel and a hook; the code is `templates/mod/`
+- [Profiling a frame](runtime/profiling.md) — Splitting a slow scene into game code, toolkit, renderer and GPU time, on the PC and the Deck
 
 ### Graphics
 

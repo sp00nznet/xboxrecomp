@@ -1996,6 +1996,11 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_h | file_static | keep | - | size of s_ao_tex |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_q | file_static | keep | - | ao trace timestamp queries, host |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ao_q_busy | file_static | keep | - | ao trace query in flight, host |
+| src/d3d/nv2a_pb_d3d11.c | - | s_d11p | file_static | keep | - | d3d11_prof mode from env, host |
+| src/d3d/nv2a_pb_d3d11.c | - | s_d11p_q | file_static | keep | - | d3d11_prof timestamp query ring, host |
+| src/d3d/nv2a_pb_d3d11.c | - | s_d11p_open | file_static | keep | - | d3d11_prof slot bracketing the frame being built, host |
+| src/d3d/nv2a_pb_d3d11.c | - | s_d11p_next | file_static | keep | - | d3d11_prof next ring slot, host |
+| src/d3d/nv2a_pb_d3d11.c | - | s_d11p_acc | file_static | keep | - | d3d11_prof run totals, host |
 
 ### src/d3d/nv2a_pb_metal.m
 

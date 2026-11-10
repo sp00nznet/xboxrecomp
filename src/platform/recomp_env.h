@@ -180,6 +180,7 @@ extern "C" {
     X(AO_FB_FORCE,       DEBUG, "ao_fb_force",     NULL,                       "=1: render.ao's memo one event high on every frame, so each frame at the low count ends one short and takes the flip's fallback pass (the early fire below the memo off); a repro for the fallback's look") \
     X(AO_DUMP,           DEBUG, "ao_dump",         NULL,                       "=DIR[:FROM[:N]]: render.ao writes the 3D target before and after occlusion as DIR/ao-<flip>-{pre,post}.ppm (a fallback: prefb, postfb and snapfb, the copy at the event before) and the trigger state as DIR/ao-frames.txt, N frames (default 300) from flip FROM; heavy") \
     X(METAL_PROF,        TRACE, "metal_prof",      NULL,                       "Metal flip cost every 300 flips: GPU wait, readbacks, write-back, slot blit, hand-off, GPU time") \
+    X(D3D11_PROF,        TRACE, "d3d11_prof",      NULL,                       "D3D11 GPU time per flip from timestamp queries (read back a few flips late) and the Present call's time; a summary every 300 flips, =all also a [D3D11-PROF] line per flip") \
     X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip; each new pitch-alias pair once") \
     X(METAL_SHADERS,     TRACE, "metal_shaders",   NULL,                       "Metal shader and pipeline builds: each MSL library and pipeline state with its ms, and a [metal] build line for every flip that built one or uploaded textures for 5 ms or more") \
     X(VSH_TRACE,         TRACE, "vsh",             "RECOMP_VSH_TRACE",         "vertex programs and their batches") \
@@ -255,6 +256,7 @@ extern "C" {
     X(FAST_KICK,         DEBUG, "fast_kick",       "RECOMP_FAST_KICK",         "=0: ack loop ticks at Sleep(1)") \
     X(KICK_EVENT,        DEBUG, "kick_event",      NULL,                       "=1: the ack loop sleeps until the guest pokes it instead of polling the KickOff every ~50 us (default off)") \
     X(RUN_AHEAD,         DEBUG, "run_ahead",       NULL,                       "=N: the walker publishes GET as it walks and acks the KickOff flush with up to N segments (1 for any other value but 0) submitted past its walk; D3D's notify NOPs raise the PGRAPH interrupt (default off; docs/env.md)") \
+    X(HOST_CPUS,         DEBUG, "host_cpus",       NULL,                       "=mask (hex): the whole process on these logical CPUs from start (Windows; a Deck-shaped PC run: 0xFF = 4 cores, 8 threads); default every CPU") \
     X(KICK_NAP,          DEBUG, "kick_nap",        NULL,                       "=hybrid|timer|delay|spin: how the ack loop naps between its ~50 us polls (docs/env.md)") \
     X(FORCE_RETURN,      DEBUG, "force_return",    "RECOMP_FORCE_RETURN",      "honour forced returns in the build") \
     X(TRAP_NULL,         DEBUG, "trap_null",       "RECOMP_TRAP_NULL",         "guest page zero faults") \
