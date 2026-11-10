@@ -3,7 +3,10 @@ project(kernel_file_relative_test C)
 # Cross-platform: xbox_NtCreateFile and friends called directly, so it covers
 # the Win32 backend on Windows/Proton and the POSIX one elsewhere.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(kernel_file_relative_test test_main.c)
 target_include_directories(kernel_file_relative_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_file_relative_test PRIVATE xboxrecomp)

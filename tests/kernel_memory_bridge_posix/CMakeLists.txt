@@ -4,11 +4,16 @@ project(kernel_memory_bridge_posix_test C)
 # a real mapped guest window (xbox_MemoryLayoutInit on the synthetic XBE), so
 # the contiguous window at 0x80000000 exists. POSIX-only because it points the
 # save directory at a temporary one through XDG_DATA_HOME.
+include(${CMAKE_CURRENT_LIST_DIR}/../xr_test.cmake)
 if(WIN32)
-    message(FATAL_ERROR "This regression covers the POSIX host")
+    xr_test_refuse("This regression covers the POSIX host")
+    return()
 endif()
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(kernel_memory_bridge_posix_test test_main.c)
 target_include_directories(kernel_memory_bridge_posix_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_memory_bridge_posix_test PRIVATE xboxrecomp)

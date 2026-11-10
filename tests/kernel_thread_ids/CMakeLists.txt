@@ -3,7 +3,10 @@ project(kernel_thread_ids_test C)
 # Cross-platform, like tests/memory_regressions: the bridge's thread creation
 # and the TIB are the same code on both hosts.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(kernel_thread_ids_test test_main.c)
 target_include_directories(kernel_thread_ids_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_thread_ids_test PRIVATE xboxrecomp)

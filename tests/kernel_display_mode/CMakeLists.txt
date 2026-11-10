@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_display_mode_test C)
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(kernel_display_mode_test test_main.c)
 target_include_directories(kernel_display_mode_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_display_mode_test PRIVATE xboxrecomp)

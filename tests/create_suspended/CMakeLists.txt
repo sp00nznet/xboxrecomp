@@ -5,7 +5,10 @@ project(create_suspended_test C)
 # thread waits at its start gate until NtResumeThread on its handle, with the
 # guest lock off and on.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(create_suspended_test test_main.c)
 target_include_directories(create_suspended_test PRIVATE ../../src/kernel ../../src)
 target_link_libraries(create_suspended_test PRIVATE xboxrecomp)

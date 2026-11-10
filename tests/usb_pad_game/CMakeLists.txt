@@ -6,7 +6,10 @@ project(usb_pad_game_test C)
 # the same states. No guest memory and no USB transfer: the functions are
 # called directly, so this runs on every host.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 
 add_executable(usb_pad_game_test test_main.c)
 target_include_directories(usb_pad_game_test PRIVATE

@@ -7,13 +7,18 @@ project(mmio_direct_test C)
 # direct path is covered by the Proton bench runs (fails=0) until this
 # harness is ported.
 string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" mmio_cpu)
+include(${CMAKE_CURRENT_LIST_DIR}/../xr_test.cmake)
 if(WIN32 OR NOT (mmio_cpu MATCHES "^(arm64|aarch64)$"
                  OR (CMAKE_SYSTEM_NAME STREQUAL "Linux"
                      AND mmio_cpu MATCHES "^(x86_64|amd64)$")))
-    message(FATAL_ERROR "This regression runs on arm64 POSIX and x86-64 Linux hosts")
+    xr_test_refuse("This regression runs on arm64 POSIX and x86-64 Linux hosts")
+    return()
 endif()
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(mmio_direct_test test_main.c)
 target_include_directories(mmio_direct_test PRIVATE
     ../../src ../../src/kernel ../../src/apu ../../src/nv2a ../../src/platform)

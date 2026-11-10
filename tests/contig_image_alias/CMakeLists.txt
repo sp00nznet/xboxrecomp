@@ -3,7 +3,10 @@ project(contig_image_alias_test C)
 # No contiguous block shares a physical number with a named image page.
 # Cross-platform: the arena and the resolvers are the same code on both hosts.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(contig_image_alias_test test_main.c)
 target_include_directories(contig_image_alias_test PRIVATE ../../src ../../src/apu ../../src/kernel)
 target_link_libraries(contig_image_alias_test PRIVATE xboxrecomp)

@@ -3,12 +3,17 @@ project(ac97_reset_posix_test C)
 # The AC'97 bus-master write trap behind a real POSIX fault: a PROT_READ
 # page, a SIGBUS/SIGSEGV handler and the host's decoder (A64, or x86-64 on
 # Linux). Elsewhere the trap is never armed and the test exits 77 (skipped).
+include(${CMAKE_CURRENT_LIST_DIR}/../xr_test.cmake)
 if(WIN32)
-    message(FATAL_ERROR "This regression covers the POSIX trap path")
+    xr_test_refuse("This regression covers the POSIX trap path")
+    return()
 endif()
 set(CMAKE_C_STANDARD 11)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 
 # The guest window needs an XBE header to map; the synthetic one is enough.
 set(TEST_XBE ${CMAKE_CURRENT_BINARY_DIR}/test.xbe)

@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(apu_mixdown_test C)
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(apu_mixdown_test test_main.c)
 target_include_directories(apu_mixdown_test PRIVATE ../../src ../../src/apu)
 # The whole runtime: the APU delivers its interrupt and resolves physical

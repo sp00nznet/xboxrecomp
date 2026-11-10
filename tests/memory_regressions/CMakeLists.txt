@@ -3,7 +3,10 @@ project(memory_regressions_test C)
 # Cross-platform, like tests/kernel_bridge: the heap and the memory bridge are
 # the same code on both hosts.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(memory_regressions_test test_main.c)
 target_include_directories(memory_regressions_test PRIVATE ../../src/kernel)
 target_link_libraries(memory_regressions_test PRIVATE xboxrecomp)

@@ -6,7 +6,10 @@ project(kernel_bridge_test C)
 # region -- real on Windows, shimmed elsewhere -- which is exactly why it is
 # worth running in both places.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(kernel_bridge_test test_main.c)
 target_include_directories(kernel_bridge_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_bridge_test PRIVATE xboxrecomp)

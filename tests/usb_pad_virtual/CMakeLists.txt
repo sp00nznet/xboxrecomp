@@ -7,7 +7,10 @@ project(usb_pad_virtual_test C)
 # (usb_gamepad_game_press) with the clock stepped by hand, so no guest memory
 # and no USB transfer: this runs on every host.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 
 add_executable(usb_pad_virtual_test test_main.c)
 target_include_directories(usb_pad_virtual_test PRIVATE

@@ -4,7 +4,10 @@ project(apu_phys_test C)
 # contiguous window give the same physical number to two different pages.
 # Cross-platform: the resolver and the heap are the same code on both hosts.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(apu_phys_test test_main.c)
 target_include_directories(apu_phys_test PRIVATE ../../src ../../src/apu ../../src/kernel)
 target_link_libraries(apu_phys_test PRIVATE xboxrecomp)

@@ -4,7 +4,10 @@ project(kernel_summary_report_test C)
 # (as tests/kernel_bridge does), so the exit hooks are the Win32 ones under
 # Proton and the POSIX ones elsewhere.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(kernel_summary_report_test test_main.c)
 target_include_directories(kernel_summary_report_test PRIVATE ../../src/kernel)
 target_link_libraries(kernel_summary_report_test PRIVATE xboxrecomp)

@@ -3,7 +3,10 @@ project(apu_voice_mask_test C)
 # A front-end method from the title's thread and the frame thread's voice
 # processing change bits of the same voice word without losing either write.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(apu_voice_mask_test test_main.c)
 target_include_directories(apu_voice_mask_test PRIVATE ../../src ../../src/apu ../../src/nv2a)
 # test_main.c defines every xa2_* function, so no host audio device is opened.

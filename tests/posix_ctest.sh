@@ -3,11 +3,17 @@
 #
 #   tests/posix_ctest.sh [BUILD_DIR]      (default: build/posix-ctest)
 #
-# Two kinds of test dir live under tests/:
+# Three kinds of test dir live under tests/:
 #   - standalone projects (they call project()): configured and built one by
 #     one. A harness that cannot run here refuses at configure time with
 #     message(FATAL_ERROR) in its own CMakeLists.txt and is reported as n/a;
 #     any other configure error (a missing package, say) is a FAIL;
+#   - standalone projects that link the whole runtime and add it under
+#     if(NOT TARGET xboxrecomp): built together by tests/CMakeLists.txt over
+#     one build of the runtime (BUILD_DIR/_shared), not one runtime each,
+#     which made a tree about 5 GB. Their refusals go through xr_test_refuse
+#     (tests/xr_test.cmake) and are read from _shared/refused.txt; a compile
+#     error in one of them fails that dir, one in the runtime fails them all;
 #   - in-tree dirs (no project(), pulled in by the runtime's own CMakeLists
 #     with add_subdirectory): run from one build of the toolkit root, n/a when
 #     this host's build does not add them. Run on their own they fail with
@@ -49,6 +55,9 @@ mkdir -p "$XDG_DATA_HOME"
 is_project() {
     grep -qiE '^[[:space:]]*project[[:space:]]*\(' "$1/CMakeLists.txt"
 }
+is_shared() {
+    grep -q '^if(NOT TARGET xboxrecomp)' "$1/CMakeLists.txt"
+}
 
 # Build phase, in parallel: prints "n/a"/"FAIL" lines, or "ok <name> <dir>"
 # for a dir whose tests should run. build_one NAME [SRC_DIR [CMAKE_ARGS...]]
@@ -70,10 +79,12 @@ build_one() {
             >"$log" 2>&1; then
         # n/a only when the one error is the harness's own refusal: an error
         # from a find module or the runtime's CMake is a broken host.
+        # The refusal is the harness's own message(FATAL_ERROR) or its
+        # xr_test_refuse (tests/xr_test.cmake), which reports from there.
         if [ "$(grep -c '^CMake Error' "$log")" = 1 ] &&
-            grep -qE '^CMake Error at CMakeLists.txt:[0-9]+ \(message\):' "$log"; then
-            echo "n/a   $t: $(sed -n '/^CMake Error at CMakeLists.txt:[0-9]* (message):/,/^$/p' "$log" |
-                sed '1d;/^$/d;s/^ *//' | tr '\n' ' ' | sed 's/ $//')"
+            grep -qE '^CMake Error at (CMakeLists.txt|[^ ]*/tests/xr_test.cmake):[0-9]+ \(message\):' "$log"; then
+            echo "n/a   $t: $(sed -nE '/^CMake Error at (CMakeLists.txt|[^ ]*\/tests\/xr_test.cmake):[0-9]+ \(message\):/,/^$/p' "$log" |
+                sed '1d;/^Call Stack/,$d;/^$/d;s/^ *//' | tr '\n' ' ' | sed 's/ $//')"
         else
             echo "FAIL  $t: configure, see $log"
         fi
@@ -89,11 +100,50 @@ export -f build_one is_project
 export here B
 export gen_str="${gen[*]-}"
 
+# The runtime-linking projects, in one build (tests/CMakeLists.txt). Same
+# lines as build_one: "ok <name> <dir>", n/a or FAIL, one per dir.
+build_shared() {
+    local S=$B/_shared t failed keep=(-k) tab=$'\t'
+    [ ${#gen[@]} -gt 0 ] && keep=(-k 0)
+    if ! cmake -S "$here" -B "$S" ${gen[@]+"${gen[@]}"} -DCMAKE_BUILD_TYPE=Release \
+            "-DXR_TEST_SHARED_DIRS=$(echo $shared | tr ' ' ';')" \
+            "-DXBOXRECOMP_DSP56300_CACHE=$B/_deps/dsp56300" \
+            "-DXBOXRECOMP_LIBRASHADER_CACHE=$B/_deps/librashader" \
+            >"$B/_shared.cfg.log" 2>&1; then
+        for t in $shared; do echo "FAIL  $t: shared configure, see $B/_shared.cfg.log"; done
+        return
+    fi
+    if cmake --build "$S" -- "${keep[@]}" >"$B/_shared.build.log" 2>&1; then
+        failed=
+    else
+        # Ninja names each failed output by its path: the first component is
+        # the test's dir, or runtime. Without ninja, or with a runtime error,
+        # every dir fails.
+        failed=$(sed -n 's/^FAILED: \(\[code=[0-9]*\] \)\{0,1\}\([^/ ]*\)\/.*/\2/p' \
+            "$B/_shared.build.log" | sort -u)
+        [ -z "$failed" ] && failed=runtime
+        echo "$failed" | grep -qvxF "$(echo $shared | tr ' ' '\n')" && failed=$shared
+    fi
+    for t in $shared; do
+        if grep -q "^$t$tab" "$S/refused.txt"; then
+            echo "n/a   $t: $(grep "^$t$tab" "$S/refused.txt" | cut -f2-)"
+        elif echo "$failed" | tr ' ' '\n' | grep -qxF "$t"; then
+            echo "FAIL  $t: build, see $B/_shared.build.log"
+        else
+            echo "ok $t $S/$t"
+        fi
+    done
+}
+
 built=$B/built.txt
 : >"$built"
 [ -f "$here/apu_dsp_link/CMakeLists.txt" ] && build_one apu_dsp_link >>"$built"
+shared=$(for d in "$here"/*/; do
+    [ -f "$d/CMakeLists.txt" ] && is_project "$d" && is_shared "$d" && basename "$d"
+done)
+[ -n "$shared" ] && build_shared >>"$built"
 for d in "$here"/*/; do
-    [ -f "$d/CMakeLists.txt" ] && is_project "$d" && basename "$d"
+    [ -f "$d/CMakeLists.txt" ] && is_project "$d" && ! is_shared "$d" && basename "$d"
 done | grep -vxE 'apu_dsp_emu|apu_dsp_link' |
     xargs -P "${JOBS:-6}" -I{} bash -c 'build_one "$@"' _ {} >>"$built"
 [ -f "$here/apu_dsp_emu/CMakeLists.txt" ] && build_one apu_dsp_emu >>"$built"

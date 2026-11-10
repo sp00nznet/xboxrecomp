@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(apu_irq_test C)
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(apu_irq_test test_main.c)
 target_include_directories(apu_irq_test PRIVATE ../../src ../../src/apu ../../src/nv2a)
 # The whole runtime, as apu_mixdown: the APU delivers its interrupt through

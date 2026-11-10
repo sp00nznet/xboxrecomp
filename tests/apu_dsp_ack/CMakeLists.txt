@@ -4,7 +4,10 @@ project(apu_dsp_ack_test C)
 # GPRST keeps the GP in reset. No title tested writes GPRST, so this is the
 # only place the gate runs.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(apu_dsp_ack_test test_main.c)
 target_include_directories(apu_dsp_ack_test PRIVATE ../../src ../../src/apu)
 target_link_libraries(apu_dsp_ack_test PRIVATE xboxrecomp)

@@ -16,6 +16,11 @@ project(pad_session_test C)
 set(CMAKE_C_STANDARD 11)
 option(PAD_SESSION_TSAN "Build with ThreadSanitizer" OFF)
 if(PAD_SESSION_TSAN)
+    # The shared build (tests/CMakeLists.txt) has added the runtime already,
+    # uninstrumented: TSan over half the program reports false races.
+    if(XR_TEST_SHARED_RUNTIME)
+        message(FATAL_ERROR "PAD_SESSION_TSAN needs its own runtime build: configure tests/pad_session on its own")
+    endif()
     # A compiler that cannot link TSan reports n/a instead of failing.
     include(CheckCSourceCompiles)
     set(CMAKE_REQUIRED_FLAGS -fsanitize=thread)
@@ -29,7 +34,10 @@ if(PAD_SESSION_TSAN)
     add_compile_options(-fsanitize=thread -g -O1)
     add_link_options(-fsanitize=thread)
 endif()
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 find_package(Threads REQUIRED)
 
 add_executable(pad_session_test test_main.c)

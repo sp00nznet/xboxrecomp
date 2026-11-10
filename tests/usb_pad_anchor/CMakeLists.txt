@@ -6,7 +6,10 @@ project(usb_pad_anchor_test C)
 # called directly, so this runs on every host. Its own binary, since the
 # runtime reads RECOMP_DEBUG once per process.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 
 find_package(Threads REQUIRED)
 enable_testing()

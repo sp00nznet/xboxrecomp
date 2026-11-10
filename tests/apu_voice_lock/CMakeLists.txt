@@ -5,7 +5,10 @@ project(apu_voice_lock_test C)
 # on a locked voice; the mix holds a frame while a queued voice is locked,
 # up to its bound.
 set(CMAKE_C_STANDARD 11)
-add_subdirectory(../.. runtime)
+# Under tests/CMakeLists.txt the whole suite shares one runtime build.
+if(NOT TARGET xboxrecomp)
+    add_subdirectory(../.. runtime)
+endif()
 add_executable(apu_voice_lock_test test_main.c)
 target_include_directories(apu_voice_lock_test PRIVATE ../../src ../../src/apu ../../src/nv2a)
 # test_main.c defines every xa2_* function, so no host audio device is opened.
