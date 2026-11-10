@@ -56,3 +56,71 @@ build(off -DXBOXRECOMP_ENHANCE=OFF -DCALL_GAME=ON)
 expect(off game 0)
 build(off-umbrella -DXBOXRECOMP_ENHANCE=OFF -DUMBRELLA=ON)
 expect(off-umbrella game 0)
+
+# Restaging: the presets were staged only when the executable
+# relinked, so an edited shader or notice shipped stale until a code change.
+# The toolkit is copied so its presets can be edited; the build after an
+# edit must restage that file without a link, and a build with no edit must
+# rewrite nothing.
+function(rebuild name what)
+    execute_process(COMMAND ${CMAKE_COMMAND} --build "${WORK}/${name}"
+                    RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+    if(rc)
+        message(FATAL_ERROR "${name}: ${what}: build failed:\n${out}")
+    endif()
+    if(out MATCHES "Linking")
+        message(FATAL_ERROR "${name}: ${what}: relinked:\n${out}")
+    endif()
+endfunction()
+
+set(tk "${WORK}/restage-toolkit")
+file(REMOVE_RECURSE "${tk}")
+file(MAKE_DIRECTORY "${tk}/assets")
+file(COPY "${TOOLKIT}/cmake" DESTINATION "${tk}")
+file(COPY "${TOOLKIT}/assets/shaders" DESTINATION "${tk}/assets")
+set(TOOLKIT "${tk}")
+build(restage -DXBOXRECOMP_ENHANCE=ON)
+expect(restage game 1)
+set(staged "${WORK}/restage/game/shaders")
+set(lottes "${staged}/crt/shaders/crt-lottes.slang")
+set(png "${staged}/anti-aliasing/shaders/smaa/SearchTex.png")
+file(TIMESTAMP "${staged}/README.md" before "%s")
+file(TIMESTAMP "${png}" png_before "%s")
+
+# Timestamps have a resolution of one second here.
+execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 1.1)
+file(APPEND "${tk}/assets/shaders/crt/shaders/crt-lottes.slang" "// edited\n")
+rebuild(restage "after an edit")
+file(READ "${lottes}" text)
+if(NOT text MATCHES "// edited\n$")
+    message(FATAL_ERROR "restage: the edited preset was not restaged (${lottes})")
+endif()
+file(TIMESTAMP "${staged}/README.md" after "%s")
+file(TIMESTAMP "${png}" png_after "%s")
+if(NOT before STREQUAL after OR NOT png_before STREQUAL png_after)
+    message(FATAL_ERROR "restage: an unchanged staged file was rewritten")
+endif()
+
+# A preset added since configure, and a staged file someone deleted.
+file(WRITE "${tk}/assets/shaders/added.slangp" "shaders = 0\n")
+file(REMOVE "${staged}/README.md")
+rebuild(restage "after an add and a delete")
+foreach(f added.slangp README.md)
+    if(NOT EXISTS "${staged}/${f}")
+        message(FATAL_ERROR "restage: ${f} was not staged")
+    endif()
+endforeach()
+
+# A linked directory is staged as its files, as copy_directory did; a link
+# taken as one entry made the copy fail on a directory (POSIX only).
+if(NOT WIN32)
+    set(linked "${WORK}/restage-linked")
+    file(REMOVE_RECURSE "${linked}")
+    file(WRITE "${linked}/linked.slangp" "shaders = 0\n")
+    file(CREATE_LINK "${linked}" "${tk}/assets/shaders/linked" SYMBOLIC)
+    rebuild(restage "with a linked directory")
+    if(NOT EXISTS "${staged}/linked/linked.slangp"
+       OR IS_SYMLINK "${staged}/linked")
+        message(FATAL_ERROR "restage: the linked directory was not staged as files")
+    endif()
+endif()

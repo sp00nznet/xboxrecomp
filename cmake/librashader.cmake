@@ -225,13 +225,20 @@ endfunction()
 # POST_BUILD: add_custom_command(TARGET) is refused for a target of another
 # directory (CMP0040), and this runs in the top-level one while Burnout 3's
 # executable lives in src/game. $<TARGET_FILE_DIR> adds no dependency back on
-# the executable (CMP0112), and copy_directory makes the directory, so this
-# can run before the link. Being a dependency it also runs for a build of
-# just the executable, and puts back a shaders/ someone deleted.
+# the executable (CMP0112), and the copies make the directory, so this can
+# run before the link. Being a dependency it also runs for a build of just
+# the executable, and puts back a shaders/ someone deleted.
+#
+# The target runs at every build rather than off a stamp: a stamp cannot sit
+# beside the executable (OUTPUT refuses $<TARGET_FILE_DIR>), and one in the
+# build tree would miss a staged file someone deleted or edited. Every copy
+# compares content instead, so an edited preset or notice is restaged with no
+# relink and an unchanged one is not rewritten.
 function(_xboxrecomp_present_shaders_stage target)
     get_filename_component(root "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/.." ABSOLUTE)
     set(dir "$<TARGET_FILE_DIR:${target}>")
-    set(copies COMMAND ${CMAKE_COMMAND} -E copy_directory "${root}/assets/shaders" "${dir}/shaders")
+    set(copies COMMAND ${CMAKE_COMMAND} -DSRC=${root}/assets/shaders
+            -DDST=${dir}/shaders -P "${root}/cmake/present_shaders_copy.cmake")
     if(XBOXRECOMP_LIBRASHADER)
         _xboxrecomp_librashader_fetch(lib notices)
         if(lib)
