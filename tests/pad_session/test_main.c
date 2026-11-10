@@ -10,6 +10,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 /* Supplied by recompiled game code in a real build; nothing here calls one. */
 typedef void (*recomp_func_t)(void);
@@ -21,6 +28,8 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define BOOT_PATH "pad_session_boot.pad"
 #define OTHER_PATH "pad_session_other.pad"
 #define MOVED_PATH "pad_session_moved.pad"
+#define SIG_PATH "pad_session_signal.pad"
+#define SIG_SETUP_PATH "pad_session_signal_setup.pad"
 #define REC_AT 1000u
 #define PLAY_AT 5000u
 #define A_POLLS 5u      /* A held from the record's first poll */
@@ -334,6 +343,125 @@ static int poll_fb(uint32_t poll, int *b)
     return r[4];
 }
 
+#ifndef _WIN32
+/* Ctrl+C with a record not yet started: the handler drops its empty file,
+ * and closes it first, as Windows will not delete an open file (the empty
+ * .pad stayed there). Each case runs in a child, before anything installs
+ * the handler, so a handler of ours sits behind record_signal and sees
+ * what it left. The child's exit status is a mask of SIG_* failures. */
+enum {
+    SIG_OPEN = 1,      /* the record's descriptor is still open */
+    SIG_THERE = 2,     /* its file is still there */
+    SIG_RAN = 4,       /* it started after the signal */
+    SIG_DIED = 8,      /* the child did not outlive the signal */
+    SIG_SETUP = 16,    /* the setup never started */
+    SIG_START = 32,    /* the record or chain did not start */
+};
+static int s_sig_fd = -1, s_sig_seen;
+
+static void sig_note(void)
+{
+    if (!(fcntl(s_sig_fd, F_GETFD) == -1 && errno == EBADF))
+        s_sig_seen |= SIG_OPEN;
+    if (access(SIG_PATH, F_OK) == 0)
+        s_sig_seen |= SIG_THERE;
+}
+
+static void sig_exit(int sig)
+{
+    (void)sig;
+    sig_note();
+    _exit(s_sig_seen);
+}
+
+/* Returns, as SIGINT inherited ignored does: the process goes on. */
+static void sig_return(int sig)
+{
+    (void)sig;
+    sig_note();
+}
+
+/* The lowest free descriptor, which the record's fopen takes next. */
+static int next_fd(void)
+{
+    int fd = open("/dev/null", O_RDONLY);
+    if (fd >= 0)
+        close(fd);
+    return fd;
+}
+
+static void sig_child_armed(void)
+{
+    char why[160];
+    s_sig_fd = next_fd();
+    signal(SIGTERM, sig_exit);
+    if (padrec_record_start(SIG_PATH, NULL, PADREC_ARMED, why, sizeof why) != 0
+        || fcntl(s_sig_fd, F_GETFD) == -1)
+        _exit(SIG_START);
+    raise(SIGTERM);
+    _exit(SIG_DIED);
+}
+
+/* Play setup, then record: at the signal the record waits behind the
+ * setup. The process outlives the signal and the setup ends after it: the
+ * record must not start on the file the handler closed. */
+static void sig_child_queued(void)
+{
+    PadrecSeg seg;
+    char why[160];
+    uint32_t p;
+    put(SIG_SETUP_PATH, SESSION_HDR "g0:A:2\ng10:@end\n");
+    memset(&seg, 0, sizeof seg);
+    seg.path = SIG_SETUP_PATH;
+    s_sig_fd = next_fd();
+    signal(SIGTERM, sig_return);
+    if (padrec_play_chain(&seg, 1, 0, SIG_PATH, NULL, why, sizeof why) != 0
+        || fcntl(s_sig_fd, F_GETFD) == -1)
+        _exit(SIG_START);
+    for (p = 9000; p < 9003; p++)
+        poll0(p, 0, 0);
+    if (state() != PADREC_PLAY)
+        _exit(SIG_SETUP);
+    raise(SIGTERM);
+    for (; p < 9040; p++)
+        poll0(p, 0, 0);
+    if (state() == PADREC_REC)
+        s_sig_seen |= SIG_RAN;
+    _exit(s_sig_seen);
+}
+
+static void sig_case(const char *what, void (*child)(void))
+{
+    static const char *const names[] = { "descriptor still open", "file still there",
+                                         "record started after it", "no exit from the handler",
+                                         "setup never started", "did not start" };
+    int status = -1, code, i;
+    pid_t pid;
+    remove(SIG_PATH);
+    fflush(stdout);
+    pid = fork();
+    if (pid == 0)
+        child();
+    check(pid > 0 && waitpid(pid, &status, 0) == pid, "the child ran");
+    code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    check(code == 0, what);
+    if (code < 0)
+        printf("    child killed by signal %d\n", WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    for (i = 0; code > 0 && i < 6; i++)
+        if (code & (1 << i))
+            printf("    %s\n", names[i]);
+    remove(SIG_PATH);
+    remove(SIG_SETUP_PATH);
+}
+
+static void test_signal(void)
+{
+    printf("a record not yet started at SIGTERM\n");
+    sig_case("an ARMED record: closed, then removed", sig_child_armed);
+    sig_case("one behind a setup: closed, removed, never started", sig_child_queued);
+}
+#endif
+
 static void test_chain(void)
 {
     const char *two[2] = { SEG1_PATH, SEG2_PATH };
@@ -517,6 +645,9 @@ static void test_actions(void)
 int main(void)
 {
     recomp_env_init();
+#ifndef _WIN32
+    test_signal();
+#endif
     test_clock_pick();
     test_record();
     test_play();

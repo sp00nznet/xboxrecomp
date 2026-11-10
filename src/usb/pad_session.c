@@ -21,10 +21,12 @@
 #include <io.h>
 #define ps_write _write
 #define ps_lseek _lseek
+#define ps_close _close
 #else
 #include <unistd.h>
 #define ps_write write
 #define ps_lseek lseek
+#define ps_close close
 #endif
 
 /* ---- the pad lock -------------------------------------------------------- */
@@ -456,6 +458,25 @@ static ps_sig_fn s_old_int = SIG_DFL, s_old_term = SIG_DFL;
 static int s_sig_installed;
 static PadrecClocks s_sig_clock;   /* the last poll's, for the end's count */
 
+/* An armed record's empty file, from the signal handler. Closed first:
+ * Windows refuses to delete a file still open without FILE_SHARE_DELETE,
+ * which left the empty .pad behind. close(2) on the descriptor, as fclose
+ * is not async-signal-safe. The FILE and its session leak: the caller has
+ * unlinked the session from every list, so nothing reaches either again,
+ * even when the process outlives the signal (SIGINT inherited ignored). */
+static void sig_drop_file(PadSession *p)
+{
+    FILE *f = __atomic_exchange_n(&p->f, NULL, __ATOMIC_ACQ_REL);
+
+    if (f)
+        (void)ps_close(fileno(f));
+#ifdef _WIN32
+    utf8_remove(p->path);
+#else
+    unlink(p->path);
+#endif
+}
+
 static void record_signal(int sig)
 {
     ps_sig_fn old = sig == SIGINT ? s_old_int : s_old_term;
@@ -467,23 +488,18 @@ static void record_signal(int sig)
     /* An armed record that never started holds no steps: its empty file
      * would be listed, then refused. Leaked, not freed: no free() here. */
     for (; p; p = p->next)
-        if (p->kind == KIND_REC && p->path) {
-#ifdef _WIN32
-            utf8_remove(p->path);
-#else
-            unlink(p->path);
-#endif
-        }
-    /* "Play setup, then record": the record waits behind the setup. */
+        if (p->kind == KIND_REC && p->path)
+            sig_drop_file(p);
+    /* "Play setup, then record": the record waits behind the setup.
+     * Detached, as the pad thread takes it (padrec_sync): left linked, the
+     * setup's end would start it on a closed file, and padrec_exit or a
+     * stop on the pad thread would drop it a second time. On Windows this
+     * handler runs on a thread of its own, so the race is real. */
     p = __atomic_load_n(&s_active, __ATOMIC_ACQUIRE);
-    for (p = p ? p->next : NULL; p; p = p->next)
-        if (p->kind == KIND_REC && p->path) {
-#ifdef _WIN32
-            utf8_remove(p->path);
-#else
-            unlink(p->path);
-#endif
-        }
+    p = p ? __atomic_exchange_n(&p->next, NULL, __ATOMIC_ACQ_REL) : NULL;
+    for (; p; p = p->next)
+        if (p->kind == KIND_REC && p->path)
+            sig_drop_file(p);
     if (f) {
         char lines[512], end[32], len[LEN_WIDTH];
         uint32_t rel = rel_now(s, &s_sig_clock);
@@ -590,9 +606,14 @@ static void end_active(int state, const PadrecClocks *c)
 static void record_begin(PadSession *s, const PadrecClocks *c)
 {
     const char *why, *pick = padrec_clock_pick(c->game_tap, c->flip, &why);
-    char *buf = malloc(64 * 1024), open[PAD_ANCHOR_TEXT];
+    char *buf, open[PAD_ANCHOR_TEXT];
     int i, n;
 
+    /* Its file taken by a signal: nothing to write to, and no end to
+     * write, as record_end and padrec_feed skip a NULL file. */
+    if (!s->f)
+        return;
+    buf = malloc(64 * 1024);
     s->clock = !strcmp(pick, "poll") ? 2 : 1;
     fprintf(stderr, "[PADREC] record %s: clock %s (%s)\n", s->name, pick, why);
     fflush(stderr);
@@ -950,12 +971,16 @@ void padrec_set_action_hook(int (*fire)(const char *name, char *why, size_t n))
  * replaced before the menu closed). */
 static void pending_drop(PadSession *s)
 {
-    for (PadSession *p = s; p; p = p->next)
-        if (p->kind == KIND_REC && p->f && p->path) {
-            fclose(p->f);
-            p->f = NULL;
-            utf8_remove(p->path);
+    for (PadSession *p = s; p; p = p->next) {
+        /* Taken once: record_signal may take it on another thread. */
+        FILE *f = p->kind == KIND_REC ? __atomic_exchange_n(&p->f, NULL, __ATOMIC_ACQ_REL)
+                                      : NULL;
+        if (f) {
+            fclose(f);
+            if (p->path)
+                utf8_remove(p->path);
         }
+    }
     session_free(s);
 }
 

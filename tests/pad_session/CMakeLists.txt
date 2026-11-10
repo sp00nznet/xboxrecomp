@@ -6,8 +6,9 @@ project(pad_session_test C)
 # report and padrec_feed after. A record started at poll 1000 writes g0; its
 # playback started at poll 5000 presses there; a stop writes one @end; a
 # session is swapped in at the next poll, not before; Play again waits,
-# ARMED, for the release; an ARMED record cancelled leaves no file; a file
-# with no header is refused; an env key wins; the clock pick.
+# ARMED, for the release; an ARMED record cancelled, quit or stopped by
+# SIGTERM leaves no file; a file with no header is refused; an env key
+# wins; the clock pick.
 # padrec_stub.c beside this is the menu side's fake for the enhancement
 # layer's tests, which build without a pad.
 # test_threads: the pad, game and menu threads at once, and the record cap.

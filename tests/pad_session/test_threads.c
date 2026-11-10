@@ -186,9 +186,15 @@ static void test_threads(void)
     {
         FILE *f = fopen(LOG_PATH, "rb");
         char line[600];
-        while (f && fgets(line, sizeof line, f))
+        /* Lines that are not the session's go back to stderr: a
+         * ThreadSanitizer report lands here too, and fails the test
+         * (exit 66) with its text deleted below. */
+        while (f && fgets(line, sizeof line, f)) {
             if (strstr(line, "flip 42949"))
                 wrapped = 1;
+            if (strncmp(line, "[PADREC]", 8) != 0)
+                fputs(line, stderr);
+        }
         if (f)
             fclose(f);
         remove(LOG_PATH);
