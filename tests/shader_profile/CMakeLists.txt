@@ -22,6 +22,7 @@ add_executable(shader_profile_test
     ${XR_SRC}/enhance/enhance_cfg.c
     ${XR_SRC}/kernel/nv2a_present_chain.c
     ${XR_SRC}/platform/recomp_env.c
+    ${XR_SRC}/platform/recomp_fatal.c
     ${XR_SRC}/platform/recomp_exe_dir.c)
 target_include_directories(shader_profile_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/platform
     ${XR_SRC}/kernel ${XR_SRC} ${XR_SRC}/../third_party/librashader)

@@ -45,6 +45,7 @@ add_executable(mod_guest_call_test
     ${XR_SRC}/kernel/nv2a_backend_common.c
     ${XR_SRC}/kernel/nv2a_tex_pack.c
     ${XR_SRC}/platform/recomp_env.c
+    ${XR_SRC}/platform/recomp_fatal.c
     ${XR_SRC}/platform/recomp_exe_dir.c
     ${XR_SRC}/platform/recomp_exit_hook.c)
 target_include_directories(mod_guest_call_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/usb ${XR_SRC}/platform

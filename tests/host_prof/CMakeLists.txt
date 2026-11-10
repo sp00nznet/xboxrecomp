@@ -8,7 +8,7 @@ if(NOT WIN32 AND NOT APPLE)
 endif()
 set(CMAKE_C_STANDARD 11)
 set(P ../../src/platform)
-set(PROF_SRC ${P}/host_prof.c ${P}/recomp_env.c ${P}/recomp_exe_dir.c
+set(PROF_SRC ${P}/host_prof.c ${P}/recomp_env.c ${P}/recomp_fatal.c ${P}/recomp_exe_dir.c
     ${P}/recomp_exit_hook.c ${P}/host_time.c)
 enable_testing()
 # host_prof_test samples a spinner; host_prof_delay_test dumps during the

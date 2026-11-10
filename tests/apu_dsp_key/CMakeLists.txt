@@ -14,7 +14,8 @@ set(XR_SRC ${CMAKE_CURRENT_LIST_DIR}/../../src)
 enable_testing()
 # test_main.c includes recomp_env.c itself, for its held notes.
 foreach(variant nodsp dsp device game_stub)
-    add_executable(apu_dsp_key_${variant} test_main.c)
+    add_executable(apu_dsp_key_${variant} test_main.c
+        ${XR_SRC}/platform/recomp_fatal.c)
     target_include_directories(apu_dsp_key_${variant} PRIVATE ${XR_SRC}/platform)
     if(NOT MSVC)
         target_compile_options(apu_dsp_key_${variant} PRIVATE -Wall -Wextra)

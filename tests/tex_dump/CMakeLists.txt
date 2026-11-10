@@ -16,6 +16,7 @@ add_executable(tex_dump_test test_main.c
     ${XR_SRC}/kernel/nv2a_backend_common.c
     ${XR_SRC}/kernel/nv2a_tex_pack.c
     ${XR_SRC}/platform/recomp_env.c
+    ${XR_SRC}/platform/recomp_fatal.c
     ${XR_SRC}/platform/recomp_exit_hook.c)
 target_include_directories(tex_dump_test PRIVATE ${XR_SRC}/kernel ${XR_SRC}/d3d
     ${XR_SRC}/platform ${XR_SRC})

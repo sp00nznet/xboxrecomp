@@ -22,7 +22,8 @@ add_executable(apu_sdl_quit_test
     test_main.c
     ${XR_SRC}/apu/apu_sdl.c
     ${XR_SRC}/apu/apu_vclock.c
-    ${XR_SRC}/platform/recomp_env.c)
+    ${XR_SRC}/platform/recomp_env.c
+    ${XR_SRC}/platform/recomp_fatal.c)
 target_include_directories(apu_sdl_quit_test PRIVATE ${XR_SRC}/apu ${XR_SRC}/video
     ${XR_SRC}/platform ${XR_SRC})
 target_compile_options(apu_sdl_quit_test PRIVATE -Wall -Wextra)

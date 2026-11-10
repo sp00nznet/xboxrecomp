@@ -10,7 +10,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 set(XR_SRC ${CMAKE_CURRENT_LIST_DIR}/../../src)
 # test_main.c includes recomp_env.c itself, for its static tables.
-add_executable(recomp_env_list_test test_main.c)
+add_executable(recomp_env_list_test test_main.c
+    ${XR_SRC}/platform/recomp_fatal.c)
 target_include_directories(recomp_env_list_test PRIVATE ${XR_SRC}/platform)
 if(NOT MSVC)
     target_compile_options(recomp_env_list_test PRIVATE -Wall -Wextra)

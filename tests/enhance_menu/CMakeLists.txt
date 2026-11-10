@@ -97,6 +97,7 @@ add_executable(enhance_menu_test
     ${XR_SRC}/kernel/nv2a_overlay_ref.c
     ${XR_SRC}/kernel/nv2a_stats.c
     ${XR_SRC}/platform/recomp_env.c
+    ${XR_SRC}/platform/recomp_fatal.c
     ${XR_SRC}/platform/recomp_exe_dir.c
     ${XR_SRC}/platform/recomp_exit_hook.c
     ${_vendored} "${_fonts_c}")

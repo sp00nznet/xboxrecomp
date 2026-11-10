@@ -35,6 +35,7 @@ add_executable(enhance_text_test test_main.c
     ${XR_SRC}/input/input_names.c
     ${XR_SRC}/input/pad_map.c
     ${XR_SRC}/platform/recomp_env.c
+    ${XR_SRC}/platform/recomp_fatal.c
     ${XR_SRC}/platform/recomp_exe_dir.c
     ${XR_SRC}/kernel/nv2a_overlay.c
     ${XR_SRC}/kernel/nv2a_overlay_ui.c

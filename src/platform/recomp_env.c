@@ -2,6 +2,7 @@
  * recomp_env.c - read the environment once; see recomp_env.h.
  */
 #include "recomp_env.h"
+#include "recomp_fatal.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -399,6 +400,9 @@ void recomp_env_init(void)
     if (recomp_env_ready_)
         return;
     if (cas(&s_state, 0, 1) == 0) {
+        /* First, before any thread: every game calls this at the top of
+         * main, so the [FATAL] reporters cover all of the run. */
+        recomp_fatal_install();
         load();
         atexit(recomp_env_flush_notes);
         cas(&s_state, 1, 2);              /* full barrier: values first */

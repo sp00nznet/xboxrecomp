@@ -2731,6 +2731,14 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/platform/recomp_exit_hook.c | - | s_more | file_static | keep | - | host exit hooks |
 | src/platform/recomp_exit_hook.c | - | s_quit | file_static | keep | - | host exit hooks |
 
+### src/platform/recomp_fatal.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/platform/recomp_fatal.c | - | s_reported | file_static | keep | - | crash handler: one report per process |
+| src/platform/recomp_fatal.c | - | s_installed | once | keep | - | no rerun: host crash handlers stay installed |
+| src/platform/recomp_fatal.c | - | s_prev_filter | file_static | keep | - | crash handler: the filter chained to |
+
 ### src/platform/win32_compat.c
 
 | file | scope | name | kind | class | hook | why |

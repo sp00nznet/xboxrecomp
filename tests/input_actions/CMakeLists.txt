@@ -58,6 +58,7 @@ add_executable(input_actions_test
     ${XR_SRC}/kernel/nv2a_backend_common.c
     ${XR_SRC}/kernel/nv2a_tex_pack.c
     ${XR_SRC}/platform/recomp_env.c
+    ${XR_SRC}/platform/recomp_fatal.c
     ${XR_SRC}/platform/recomp_exe_dir.c
     ${XR_SRC}/platform/recomp_exit_hook.c)
 target_include_directories(input_actions_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/usb ${XR_SRC}/platform

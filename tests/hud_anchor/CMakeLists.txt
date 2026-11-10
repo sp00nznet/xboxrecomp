@@ -23,7 +23,8 @@ add_executable(hud_anchor_test
     ${XR_SRC}/kernel/nv2a_tex_pack.c
     ${XR_SRC}/kernel/nv2a_aspect.c
     ${XR_SRC}/kernel/nv2a_vsh_cpu.c
-    ${XR_SRC}/platform/recomp_env.c)
+    ${XR_SRC}/platform/recomp_env.c
+    ${XR_SRC}/platform/recomp_fatal.c)
 target_include_directories(hud_anchor_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/platform
     ${XR_SRC}/input ${XR_SRC}/kernel ${XR_SRC}/d3d ${XR_SRC})
 target_compile_definitions(hud_anchor_test PRIVATE RECOMP_ENV_HAVE_ENHANCE_KEYS)

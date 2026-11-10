@@ -25,9 +25,10 @@ get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOL
 # of the runtime's libraries, so the host clock (host_time.h) and the window
 # exit hook (recomp_exit_hook.h) ride with it, and the in-process sampler
 # (host_prof.h, RECOMP_TRACE=prof) that uses both, and the [MEM] exit line
-# (mem_stats.h), which the GPU backends feed.
+# (mem_stats.h), which the GPU backends feed, and the [FATAL] line for the
+# deaths the games' crash handlers miss (recomp_fatal.h).
 add_library(recomp_env STATIC recomp_env.c recomp_exe_dir.c recomp_exit_hook.c host_time.c
-    host_prof.c mem_stats.c)
+    host_prof.c mem_stats.c recomp_fatal.c)
 target_include_directories(recomp_env PUBLIC
     ${XBOXRECOMP_SRC_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
