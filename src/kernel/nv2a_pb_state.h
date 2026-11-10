@@ -307,7 +307,7 @@ uint32_t nv2a_pb_flips(void);
 /* RECOMP_FB_DUMP_AT: whether `flip` is listed. The executor dumps listed
  * flips for the CPU path and backends that write back; a backend that
  * presents from its own surfaces (D3D11) asks this at each present and dumps
- * the frame itself, as <prefix>flip_NNNNN.bmp. */
+ * the frame itself, as <prefix>flip_NNNNN.png. */
 int nv2a_pb_dump_at_listed(uint32_t flip);
 
 /* One batch, at SET_BEGIN_END(0).

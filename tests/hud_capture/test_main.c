@@ -437,8 +437,8 @@ static void test_run(void)
     set_aspect(4, 3);
     s_nhooks = 0;
     remove(DIR "/capture.jsonl");
-    remove(DIR "/frame_00002.bmp");
-    remove(DIR "/frame_00003.bmp");
+    remove(DIR "/frame_00002.png");
+    remove(DIR "/frame_00003.png");
     write_file(TABLE, k_table);
     recomp_env_set(RENV_HUD_CAPTURE, DIR "/");
     recomp_env_set(RENV_HUD_CAPTURE_AT, "2:2");
@@ -508,7 +508,7 @@ static void test_run(void)
     /* The walker presents flip 1 and takes frame 2's request. */
     slot = nv2a_cap_take(1, path, sizeof path);
     CHECK(slot >= 0);
-    CHECK(strstr(path, DIR "/frame_00002.bmp") != NULL);
+    CHECK(strstr(path, DIR "/frame_00002.png") != NULL);
     if (slot >= 0) {
         write_file(path, "BM");
         nv2a_cap_done(slot, 1);
@@ -553,7 +553,7 @@ static void test_run(void)
                  "\"canvas\":{\"w\":640,\"h\":480,\"origin\":\"top-left\",\"y\":\"down\","
                  "\"view\":[0,0,640,480],\"target\":[640,480],\"pad\":0}")
           != NULL);
-    CHECK(strstr(line_at(out, 2), "\"bmp\":\"frame_00002.bmp\"}") != NULL);
+    CHECK(strstr(line_at(out, 2), "\"bmp\":\"frame_00002.png\"}") != NULL);
     CHECK(strstr(line_at(out, 3), "\"level\":1,\"frame\":3,") != NULL);
     CHECK(strstr(line_at(out, 3),
                  "\"site\":\"0x00002060\",\"element\":\"gauge\",\"group\":null,\"n\":4,"

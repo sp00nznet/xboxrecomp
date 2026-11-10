@@ -544,25 +544,28 @@ static void test_shutdown_once(void)
     CHECK(s_once_frames == 1 && s_once_asks == 1 && s_drawn == 1);
 }
 
-/* ---- 7. the exit hook table: eight, and a full one says so ----------- */
+/* ---- 7. the exit hook table: sixteen, and a full one says so -------- */
 
 static int s_hooks_run;
 #define HOOK(n) static void hook##n(const char *w) { (void)w; s_hooks_run++; }
 HOOK(0) HOOK(1) HOOK(2) HOOK(3) HOOK(4) HOOK(5) HOOK(6) HOOK(7)
+HOOK(8) HOOK(9) HOOK(10) HOOK(11) HOOK(12) HOOK(13) HOOK(14) HOOK(15)
 
 static void test_exit_hooks(void)
 {
     static const recomp_exit_hook_fn hooks[] = { hook0, hook1, hook2, hook3,
-                                                 hook4, hook5, hook6, hook7 };
+                                                 hook4, hook5, hook6, hook7,
+                                                 hook8, hook9, hook10, hook11,
+                                                 hook12, hook13, hook14, hook15 };
     int i, added = 0;
 
     /* mod.c's hook is in already (test_table ran a mod). */
-    for (i = 0; i < 8; i++)
+    for (i = 0; i < 16; i++)
         added += recomp_exit_hook_add(hooks[i]);
-    CHECK(added == 7);
+    CHECK(added == 15);
     CHECK(recomp_exit_hook_add(hook0) == 1);    /* twice keeps one */
     recomp_exit_hook_run("test");
-    CHECK(s_hooks_run == 7);
+    CHECK(s_hooks_run == 15);
 }
 
 /* ---- 8. a mod off by mods.<name> takes its keys' warnings with it ---- */

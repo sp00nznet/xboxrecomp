@@ -22,10 +22,11 @@
  * Enabled with RECOMP_PB_EXEC. RECOMP_RASTER_TEST draws one known triangle
  * after every clear, which separates "the pixel path is broken" from "the title
  * has not given us any vertices". RECOMP_DEBUG=fb_dump=<prefix> writes the surface to
- * <prefix>NNN.bmp, so the result can be looked at without a display.
+ * <prefix>NNN.png (img_dump.h), so the result can be looked at without a display.
  */
 #include <math.h>
 #include "recomp_env.h"
+#include "img_dump.h"
 #include "recomp_exit_hook.h"
 #include <stdio.h>
 #include <stdint.h>
@@ -944,51 +945,38 @@ static uint32_t surface_bpp(void)
 }
 
 
-/* Write w x h pixels of a surface at host address `base` as a 24-bit BMP.
+/* Write w x h pixels of a surface at host address `base` as a debug image
+ * (img_dump.h: PNG, or the 24-bit BMP of old with dump_format=bmp).
  * `swz` is a swizzled target's log2 width/height pair (0 for a pitch one). */
-static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
-                        uint32_t w, uint32_t h, uint32_t bpp, uint32_t swz)
+static int write_dump_at(const char *path, const uint8_t *base, uint32_t pitch,
+                         uint32_t w, uint32_t h, uint32_t bpp, uint32_t swz)
 {
-    uint32_t row_bytes = w * 3, pad = (4 - (row_bytes & 3)) & 3, y, x;
-    uint32_t filesz = 54 + (row_bytes + pad) * h, mx = 0, my = 0;
-    uint8_t hdr[54];
-    FILE *f = fopen(path, "wb");
+    uint32_t y, x, mx = 0, my = 0;
+    uint8_t *px, *d;
+    int ok;
 
-    if (!f)
+    if (!w || !h || (bpp != 2 && bpp != 4) || !(px = (uint8_t *)malloc((size_t)w * h * 3)))
         return 0;
     if (swz)
         xbox_swizzle_masks(1u << (swz & 0xFF), 1u << (swz >> 8), &mx, &my);
-    memset(hdr, 0, sizeof hdr);
-    hdr[0] = 'B'; hdr[1] = 'M';
-    memcpy(hdr + 2, &filesz, 4);
-    hdr[10] = 54; hdr[14] = 40;
-    memcpy(hdr + 18, &w, 4);
-    memcpy(hdr + 22, &h, 4);
-    hdr[26] = 1; hdr[28] = 24;
-    fwrite(hdr, 1, sizeof hdr, f);
-    for (y = h; y-- > 0; ) {
-        for (x = 0; x < w; x++) {
-            uint8_t bgr[3];
+    for (y = 0, d = px; y < h; y++) {
+        for (x = 0; x < w; x++, d += 3) {
             size_t i = swz ? (size_t)(swizzle_deposit(x, mx) | swizzle_deposit(y, my))
                            : (size_t)y * (pitch / bpp) + x;
             if (bpp == 4) {
                 uint32_t v = ((const uint32_t *)base)[i];
-                bgr[0] = (uint8_t)v; bgr[1] = (uint8_t)(v >> 8); bgr[2] = (uint8_t)(v >> 16);
+                d[0] = (uint8_t)v; d[1] = (uint8_t)(v >> 8); d[2] = (uint8_t)(v >> 16);
             } else {
                 uint16_t v = ((const uint16_t *)base)[i];
-                bgr[0] = (uint8_t)(( v        & 0x1F) << 3);
-                bgr[1] = (uint8_t)(((v >>  5) & 0x3F) << 2);
-                bgr[2] = (uint8_t)(((v >> 11) & 0x1F) << 3);
+                d[0] = (uint8_t)(( v        & 0x1F) << 3);
+                d[1] = (uint8_t)(((v >>  5) & 0x3F) << 2);
+                d[2] = (uint8_t)(((v >> 11) & 0x1F) << 3);
             }
-            fwrite(bgr, 1, 3, f);
-        }
-        if (pad) {
-            static const uint8_t zero[3] = {0, 0, 0};
-            fwrite(zero, 1, pad, f);
         }
     }
-    fclose(f);
-    return 1;
+    ok = img_dump_write(path, px, (size_t)w * 3, w, h, 3, 0);
+    free(px);
+    return ok;
 }
 
 /* ── Present surface ─────────────────────────────────────────────────────
@@ -1544,9 +1532,9 @@ static void present_pick(void)
 }
 
 /* RECOMP_FB_DUMP at a flip: the surface that flip presents, at its own size
- * and pitch, as <prefix>NNN.bmp in the same sequence as dump_surface_bmp. */
+ * and pitch, as <prefix>NNN.png in the same sequence as dump_surface_bmp. */
 static int s_bmp_seq;
-static int write_present_bmp(const char *path)
+static int write_present_dump(const char *path)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = s_present.w ? s_present.pitch / s_present.w : 0;
@@ -1558,7 +1546,7 @@ static int write_present_bmp(const char *path)
     be = nv2a_pb_get_backend();
     if (be->sync_guest)
         be->sync_guest(s_present.offset, s_present.pitch, s_present.w, s_present.h);
-    return write_bmp_at(path, mem + dma_resolve(s_present.offset), s_present.pitch,
+    return write_dump_at(path, mem + dma_resolve(s_present.offset), s_present.pitch,
                         s_present.w, s_present.h, bpp, 0);
 }
 
@@ -1571,14 +1559,14 @@ static void dump_present_bmp(void)
     /* Check the format before taking a number, so the numbering has no gaps. */
     if (!prefix || !s_present.offset || (bpp != 2 && bpp != 4))
         return;
-    snprintf(path, sizeof path, "%s%03d.bmp", prefix, s_bmp_seq++);
-    if (write_present_bmp(path) && s_bmp_seq == 1)
+    snprintf(path, sizeof path, "%s%03d%s", prefix, s_bmp_seq++, img_dump_ext());
+    if (write_present_dump(path) && s_bmp_seq == 1)
         fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X)\n",
                 path, s_present.w, s_present.h, s_present.offset);
 }
 
 /* RECOMP_FB_DUMP_AT=<flips>: the frame each listed flip presents, as
- * <prefix>flip_NNNNN.bmp named by the flip number (the number
+ * <prefix>flip_NNNNN.png named by the flip number (the number
  * RECOMP_FLIP_LOG prints), whatever else dumps in between. <flips> is a comma
  * list of numbers and ranges (a-b), up to DUMP_AT_MAX items; the rest are
  * counted and reported, not dumped. Flip N is the frame
@@ -1669,8 +1657,8 @@ static void fb_prog_write_ring(const char *prefix)
 
     for (i = 0; prefix && i < s_fbp.ring.count; i++) {
         const struct nv2a_fb_frame *f = nv2a_fb_ring_get(&s_fbp.ring, i);
-        snprintf(path, sizeof path, "%sflip_%05u.bmp", prefix, f->flip);
-        if (!write_bmp_at(path, f->px, f->pitch, f->w, f->h, f->bpp, 0))
+        snprintf(path, sizeof path, "%sflip_%05u%s", prefix, f->flip, img_dump_ext());
+        if (!write_dump_at(path, f->px, f->pitch, f->w, f->h, f->bpp, 0))
             fprintf(stderr, "  [GPU] flip %u: fb_dump_prog dump failed\n", f->flip);
     }
     nv2a_fb_ring_free(&s_fbp.ring);
@@ -1719,8 +1707,8 @@ static void dump_at_flip(uint32_t flip)
     }
     if (!here || !prefix || !nv2a_pb_dump_at_listed(flip))
         return;
-    snprintf(path, sizeof path, "%sflip_%05u.bmp", prefix, flip);
-    if (!write_present_bmp(path))
+    snprintf(path, sizeof path, "%sflip_%05u%s", prefix, flip, img_dump_ext());
+    if (!write_present_dump(path))
         fprintf(stderr, "  [GPU] flip %u: fb_dump_at dump failed\n", flip);
 }
 
@@ -1738,7 +1726,7 @@ static void cap_at_flip(uint32_t flip)
         int slot;
         if ((be == nv2a_pb_cpu_backend() || be->writes_back)
             && (slot = nv2a_cap_take(flip, path, sizeof path)) >= 0)
-            nv2a_cap_done(slot, write_present_bmp(path));
+            nv2a_cap_done(slot, write_present_dump(path));
     }
     nv2a_cap_note_flip(flip);
 #else
@@ -1746,82 +1734,34 @@ static void cap_at_flip(uint32_t flip)
 #endif
 }
 
-/* Write the current surface out as a 24-bit BMP.
+/* Write the current surface out as a debug image (write_dump_at).
  *
  * A framebuffer window needs someone watching it. A file does not, which makes
  * this the only way to check what a title actually rendered on a machine you
  * are not sitting at -- and the only way to put a picture in a bug report.
- *
- * ponytail: bottom-up 24bpp BMP, no palette, no compression. That is the one
- * format every viewer reads and it is 30 lines; PNG would need a dependency.
  */
 static void dump_surface_bmp(void)
 {
     const char *prefix = recomp_env(RENV_FB_DUMP);
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = surface_bpp();
+    uint32_t bpp = surface_bpp(), off;
     char path[512];
-    uint32_t w = s_gpu.clip_w, h = s_gpu.clip_h, y, x;
-    uint32_t row_bytes, pad, filesz;
-    uint8_t hdr[54];
-    FILE *f;
+    uint32_t w = s_gpu.clip_w, h = s_gpu.clip_h;
 
     if (!prefix || !w || !h || (bpp != 2 && bpp != 4) || !s_gpu.color_offset)
         return;
+    off = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
     {
         const struct nv2a_pb_backend *be = nv2a_pb_get_backend();
         if (be->sync_guest)
-            be->sync_guest(s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset,
-                           s_gpu.pitch, s_gpu.clip_x + w, s_gpu.clip_y + h);
+            be->sync_guest(off, s_gpu.pitch, s_gpu.clip_x + w, s_gpu.clip_y + h);
     }
 
-    row_bytes = w * 3;
-    pad = (4 - (row_bytes & 3)) & 3;
-    filesz = 54 + (row_bytes + pad) * h;
-
-    snprintf(path, sizeof path, "%s%03d.bmp", prefix, s_bmp_seq++);
-    f = fopen(path, "wb");
-    if (!f)
+    snprintf(path, sizeof path, "%s%03d%s", prefix, s_bmp_seq++, img_dump_ext());
+    if (!write_dump_at(path, mem + dma_resolve(off) + (size_t)s_gpu.clip_y * s_gpu.pitch
+                                 + (size_t)s_gpu.clip_x * bpp,
+                       s_gpu.pitch, w, h, bpp, 0))
         return;
-
-    memset(hdr, 0, sizeof hdr);
-    hdr[0] = 'B'; hdr[1] = 'M';
-    memcpy(hdr + 2, &filesz, 4);
-    hdr[10] = 54;
-    hdr[14] = 40;
-    memcpy(hdr + 18, &w, 4);
-    memcpy(hdr + 22, &h, 4);
-    hdr[26] = 1;
-    hdr[28] = 24;
-    fwrite(hdr, 1, sizeof hdr, f);
-
-    /* BMP rows run bottom-up. */
-    for (y = h; y-- > 0; ) {
-        const uint8_t *row = mem + dma_resolve(s_gpu.drawn_offset
-                                                ? s_gpu.drawn_offset
-                                                : s_gpu.color_offset)
-                           + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
-        for (x = 0; x < w; x++) {
-            uint8_t bgr[3];
-            if (bpp == 4) {
-                uint32_t v = ((const uint32_t *)row)[s_gpu.clip_x + x];
-                bgr[0] = (uint8_t)(v);
-                bgr[1] = (uint8_t)(v >> 8);
-                bgr[2] = (uint8_t)(v >> 16);
-            } else {
-                uint16_t v = ((const uint16_t *)row)[s_gpu.clip_x + x];
-                bgr[0] = (uint8_t)(( v        & 0x1F) << 3);
-                bgr[1] = (uint8_t)(((v >>  5) & 0x3F) << 2);
-                bgr[2] = (uint8_t)(((v >> 11) & 0x1F) << 3);
-            }
-            fwrite(bgr, 1, 3, f);
-        }
-        if (pad) {
-            static const uint8_t zero[3] = {0, 0, 0};
-            fwrite(zero, 1, pad, f);
-        }
-    }
-    fclose(f);
     if (s_bmp_seq == 1)
         fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
                 path, w, h, s_gpu.color_offset, bpp);
@@ -2203,7 +2143,7 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
     return sample_tex(&s_gpu.tex, u, v, argb);
 }
 
-/* Write a bound texture out as a BMP, through the sampler rather than around it.
+/* Write a bound texture out as an image (img_dump.h), through the sampler rather than around it.
  *
  * "Which texture is this" is not answerable from an address and a format, and
  * it is the question behind most of the ones that matter -- is that a font
@@ -2220,50 +2160,30 @@ static void dump_texture_bmp(uint32_t seq)
 {
     const char *prefix = recomp_env(RENV_TEX_DUMP);
     uint32_t w = s_gpu.tex.width, h = s_gpu.tex.height, x, y;
-    uint32_t row_bytes, pad, filesz;
-    uint8_t hdr[54];
     char path[512];
-    FILE *f;
+    uint8_t *px, *d;
+    int ok;
 
-    if (!prefix || !w || !h || w > 4096 || h > 4096)
+    if (!prefix || !w || !h || w > 4096 || h > 4096 || !(px = (uint8_t *)malloc((size_t)w * h * 3)))
         return;
-    row_bytes = w * 3;
-    pad = (4 - (row_bytes & 3)) & 3;
-    filesz = 54 + (row_bytes + pad) * h;
-
-    snprintf(path, sizeof path, "%s%02u_%08X_fmt%02X.bmp",
-             prefix, seq, s_gpu.tex.offset, s_gpu.tex.color);
-    f = fopen(path, "wb");
-    if (!f)
-        return;
-    memset(hdr, 0, sizeof hdr);
-    hdr[0] = 'B'; hdr[1] = 'M';
-    memcpy(hdr + 2, &filesz, 4);
-    hdr[10] = 54; hdr[14] = 40;
-    memcpy(hdr + 18, &w, 4);
-    memcpy(hdr + 22, &h, 4);
-    hdr[26] = 1; hdr[28] = 24;
-    fwrite(hdr, 1, sizeof hdr, f);
-
-    for (y = 0; y < h; y++) {
-        for (x = 0; x < w; x++) {
+    for (y = 0, d = px; y < h; y++) {
+        for (x = 0; x < w; x++, d += 3) {
             uint32_t argb = 0, a;
-            uint8_t px[3];
-            if (!sample_texture(x, h - 1 - y, &argb))
+            if (!sample_texture(x, y, &argb))
                 argb = 0;
             a = (argb >> 24) & 0xFFu;
             /* over mid-grey, so an alpha-only page is visible either way */
-            px[0] = (uint8_t)(((argb & 0xFFu) * a + 128u * (255u - a)) / 255u);
-            px[1] = (uint8_t)((((argb >> 8) & 0xFFu) * a + 128u * (255u - a)) / 255u);
-            px[2] = (uint8_t)((((argb >> 16) & 0xFFu) * a + 128u * (255u - a)) / 255u);
-            fwrite(px, 1, 3, f);
-        }
-        if (pad) {
-            static const uint8_t zero[3] = {0, 0, 0};
-            fwrite(zero, 1, pad, f);
+            d[0] = (uint8_t)(((argb & 0xFFu) * a + 128u * (255u - a)) / 255u);
+            d[1] = (uint8_t)((((argb >> 8) & 0xFFu) * a + 128u * (255u - a)) / 255u);
+            d[2] = (uint8_t)((((argb >> 16) & 0xFFu) * a + 128u * (255u - a)) / 255u);
         }
     }
-    fclose(f);
+    snprintf(path, sizeof path, "%s%02u_%08X_fmt%02X%s",
+             prefix, seq, s_gpu.tex.offset, s_gpu.tex.color, img_dump_ext());
+    ok = img_dump_write(path, px, (size_t)w * 3, w, h, 3, 0);
+    free(px);
+    if (!ok)
+        return;
     fprintf(stderr, "  [TEXDUMP] %s (%ux%u fmt 0x%02X)\n",
             path, w, h, s_gpu.tex.color);
     fflush(stderr);
@@ -5956,32 +5876,8 @@ static void raster_batch(void);
 
 static void ab_write_bmp(const char *path, const uint8_t *surf, uint32_t bpp)
 {
-    uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h, x, y;
-    uint32_t row = w * 3, pad = (4 - (row & 3)) & 3, fsz = 54 + (row + pad) * h;
-    uint8_t hdr[54] = {0}, px[3], z[3] = {0};
-    FILE *f = fopen(path, "wb");
-    if (!f)
-        return;
-    hdr[0] = 'B'; hdr[1] = 'M'; memcpy(hdr + 2, &fsz, 4); hdr[10] = 54;
-    hdr[14] = 40; memcpy(hdr + 18, &w, 4); memcpy(hdr + 22, &h, 4);
-    hdr[26] = 1; hdr[28] = 24;
-    fwrite(hdr, 1, 54, f);
-    for (y = h; y-- > 0; ) {
-        const uint8_t *r = surf + (size_t)y * s_gpu.pitch;
-        for (x = 0; x < w; x++) {
-            if (bpp == 4) {
-                px[0] = r[x*4]; px[1] = r[x*4+1]; px[2] = r[x*4+2];
-            } else {
-                uint16_t t = ((const uint16_t *)r)[x];
-                px[0] = (uint8_t)((t & 0x1F) << 3);
-                px[1] = (uint8_t)(((t >> 5) & 0x3F) << 2);
-                px[2] = (uint8_t)((t >> 11) << 3);
-            }
-            fwrite(px, 1, 3, f);
-        }
-        fwrite(z, 1, pad, f);
-    }
-    fclose(f);
+    write_dump_at(path, surf, s_gpu.pitch, s_gpu.clip_x + s_gpu.clip_w,
+                  s_gpu.clip_y + s_gpu.clip_h, bpp, 0);
 }
 
 static void raster_batch_ab(void)
@@ -6029,7 +5925,7 @@ static void raster_batch_ab(void)
     s_vsh_ab_batches++;
     if (diff) {
         /* RECOMP_PB_VSH_AB_DUMP=<prefix>: both versions of the first
-         * differing batch per texture, as <prefix>NNN_old/new.bmp. */
+         * differing batch per texture, as <prefix>NNN_old/new.png. */
         const char *pre = recomp_env(RENV_PB_VSH_AB_DUMP);
         static uint32_t seen[16];
         static int nseen;
@@ -6042,11 +5938,11 @@ static void raster_batch_ab(void)
             char path[512];
             if (!have && nseen < 16)
                 seen[nseen++] = s_gpu.tex.offset;
-            snprintf(path, sizeof path, "%s%03llu_old.bmp", pre,
-                     (unsigned long long)s_vsh_ab_batches);
+            snprintf(path, sizeof path, "%s%03llu_old%s", pre,
+                     (unsigned long long)s_vsh_ab_batches, img_dump_ext());
             ab_write_bmp(path, old, bpp);
-            snprintf(path, sizeof path, "%s%03llu_new.bmp", pre,
-                     (unsigned long long)s_vsh_ab_batches);
+            snprintf(path, sizeof path, "%s%03llu_new%s", pre,
+                     (unsigned long long)s_vsh_ab_batches, img_dump_ext());
             ab_write_bmp(path, s_surface, bpp);
         }
         s_vsh_ab_diff_batches++;
@@ -6539,7 +6435,8 @@ static int fb_prog_count(const char *key, const char *e, uint32_t *out)
     return 0;
 }
 
-/* Each dumped flip is a full BMP (about 1.2 MB at 640x480): a typo such as
+/* Each dumped flip is a full frame (about 1.2 MB at 640x480 as BMP, and a
+ * PNG can be most of that on a noisy frame): a typo such as
  * fb_dump_prog_after=60000 would otherwise write tens of GB. */
 #define FB_PROG_AFTER_MAX 240
 
@@ -7326,11 +7223,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "[ENHANCE] textures.pack ignored: the CPU rasteriser"
                     " samples guest memory\n");
         /* The texture dump hooks the GPU backends' uploads; the CPU path
-         * keeps its first-use BMPs under the same entry instead. */
+         * keeps its first-use images under the same entry instead. */
         if (recomp_env(RENV_TEX_DUMP)
                 && (s_backend == &s_cpu_backend || s_backend == &s_null_backend))
             fprintf(stderr, "[TEXDUMP] the CPU rasteriser does not write the texture"
-                    " dump (<hash>.xtd); tex_dump is its BMP file prefix here\n");
+                    " dump (<hash>.xtd); tex_dump is its image file prefix here\n");
     }
     s_perf.methods++;
     /* One flip's method stream, to see what a heavy flip spends its batches

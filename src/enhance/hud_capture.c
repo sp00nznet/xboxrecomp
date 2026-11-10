@@ -7,7 +7,7 @@
  * sealed into the frame just ended, and the oldest frames whose pictures
  * are settled (taken, failed, or passed) are written out in order: their
  * sprite lines, then the frame line. So the file never names a frame
- * before that frame's lines and BMP are complete.
+ * before that frame's lines and picture are complete.
  */
 #include "hud_capture.h"
 
@@ -26,6 +26,7 @@
 
 #include "nv2a_backend_common.h"
 #include "recomp_env.h"
+#include "img_dump.h"
 
 #define LOGP "[hud.capture] "
 
@@ -520,7 +521,9 @@ static void frame_line(const struct pend *p, int bmp_ok)
         put(&l, "null");
     }
     if (bmp_ok)
-        put(&l, ",\"bmp\":\"frame_%05u.bmp\"}", (unsigned)p->frame);
+        /* The key stays "bmp" for the readers; its file is PNG unless
+         * dump_format=bmp (img_dump.h). */
+        put(&l, ",\"bmp\":\"frame_%05u%s\"}", (unsigned)p->frame, img_dump_ext());
     else
         put(&l, ",\"bmp\":null}");
     if (s_out && l.k < sizeof l.b)
@@ -609,7 +612,7 @@ static int frame_begin(uint32_t f)
     }
     p->flip = nv2a_cap_flips() + 1u;
     p->has_flip = 1;
-    snprintf(path, sizeof path, "%s/frame_%05u.bmp", s_dir, (unsigned)f);
+    snprintf(path, sizeof path, "%s/frame_%05u%s", s_dir, (unsigned)f, img_dump_ext());
     p->slot = nv2a_cap_post(p->flip, path);
     p->posted = s_tick;
     if (p->slot < 0)

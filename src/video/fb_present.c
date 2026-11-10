@@ -24,6 +24,7 @@
  */
 #include <stdint.h>
 #include "recomp_env.h"
+#include "img_dump.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -305,6 +306,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (!recomp_env_on(RENV_CLOSE_KEEPS_RUNNING)) {
             fprintf(stderr, "  [FBWIN] window closed: exiting\n");
             recomp_exit_hook_run("window");
+            img_dump_flush(5000);   /* the queued PNGs, hook slot or not */
             fflush(stdout);
             fflush(stderr);
             TerminateProcess(GetCurrentProcess(), 0);
@@ -397,45 +399,21 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
     }
 }
 
-/* Write what the window is currently showing to a 24-bit BMP.
+/* Write what the window is currently showing to an image (img_dump.h: the
+ * format follows the path's extension; the fb_dump prefix used as is has
+ * none, so a 24-bit BMP).
  *
  * A black window is ambiguous: it means either that the read path is wrong or
  * that the title really did render black. Dumping the same converted pixels
  * the window draws settles which, and does it without a screenshot. */
 int xbox_FramebufferDumpBmp(const char *path)
 {
-    FILE *f;
-    uint32_t row = ((s_fb_width * 3u) + 3u) & ~3u;
-    uint32_t img = row * s_fb_height, total = 54u + img, y, x;
-    uint8_t hdr[54], *line;
-
     if (!s_rgb || !s_fb_va)
         return -1;
-    f = fopen(path, "wb");
-    if (!f)
+    /* s_rgb is 0x00RRGGBB a pixel: the bytes B, G, R, X, top-down. */
+    if (!img_dump_write(path, (const uint8_t *)s_rgb, (size_t)s_fb_width * 4u, s_fb_width,
+                        s_fb_height, 4, 0))
         return -1;
-    memset(hdr, 0, sizeof(hdr));
-    hdr[0] = 'B'; hdr[1] = 'M';
-    memcpy(hdr + 2, &total, 4);
-    hdr[10] = 54; hdr[14] = 40;
-    memcpy(hdr + 18, &s_fb_width, 4);
-    memcpy(hdr + 22, &s_fb_height, 4);
-    hdr[26] = 1; hdr[28] = 24;
-    memcpy(hdr + 34, &img, 4);
-    fwrite(hdr, 1, sizeof(hdr), f);
-
-    line = (uint8_t *)calloc(1, row);
-    for (y = 0; y < s_fb_height; y++) {
-        const uint32_t *src = s_rgb + (size_t)(s_fb_height - 1 - y) * s_fb_width;
-        for (x = 0; x < s_fb_width; x++) {
-            line[x * 3 + 0] = (uint8_t)(src[x] & 0xFF);
-            line[x * 3 + 1] = (uint8_t)((src[x] >> 8) & 0xFF);
-            line[x * 3 + 2] = (uint8_t)((src[x] >> 16) & 0xFF);
-        }
-        fwrite(line, 1, row, f);
-    }
-    free(line);
-    fclose(f);
     fprintf(stderr, "  [FBWIN] wrote %s (%ux%u from 0x%08X)\n",
             path, s_fb_width, s_fb_height, s_fb_va);
     return 0;

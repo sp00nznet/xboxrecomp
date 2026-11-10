@@ -1,4 +1,8 @@
-stb_truetype.h v1.26, unmodified
+stb_truetype.h v1.26, stb_image_write.h v1.16, stb_image.h v2.30, all unmodified
 https://github.com/nothings/stb
 commit 003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5
 sha256 ecd30b05e0dd4fea3a13c26810dd9e1992dc379049482c393d5a19e6b5090aab  stb_truetype.h
+sha256 cbd5f0ad7a9cf4468affb36354a1d2338034f2c12473cf1a8e32053cb6914a05  stb_image_write.h
+sha256 594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3  stb_image.h
+stb_image.h is read only by tests/img_dump (an independent PNG decoder for
+the dump writer's round trip); the runtime does not build it.

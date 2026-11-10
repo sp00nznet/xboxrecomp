@@ -2688,6 +2688,26 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/platform/host_time.c | - | s_res_once | once | keep | - | no rerun: the 1 ms timer period stays for the process |
 | src/platform/host_time.c | - | s_res_ok | file_static | keep | - | host timer state |
 
+### src/platform/img_dump.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/platform/img_dump.c | - | s_used | file_static | keep | - | the debug dump budget, one per process (a reset does not refill it) |
+| src/platform/img_dump.c | - | s_refused_said | file_static | keep | - | the debug dump budget, one per process (a reset does not refill it) |
+| src/platform/img_dump.c | - | s_cap | file_static | keep | - | the debug dump budget, one per process (a reset does not refill it) |
+| src/platform/img_dump.c | - | s_head | file_static | keep | - | the PNG writer threads and their queue, one per process (what is queued still gets written) |
+| src/platform/img_dump.c | - | s_tail | file_static | keep | - | the PNG writer threads and their queue, one per process (what is queued still gets written) |
+| src/platform/img_dump.c | - | s_queued | file_static | keep | - | the PNG writer threads and their queue, one per process (what is queued still gets written) |
+| src/platform/img_dump.c | - | s_pending | file_static | keep | - | the PNG writer threads and their queue, one per process (what is queued still gets written) |
+| src/platform/img_dump.c | - | s_started | file_static | keep | - | the PNG writer threads and their queue, one per process (what is queued still gets written) |
+| src/platform/img_dump.c | - | s_writers | file_static | keep | - | the PNG writer threads and their queue, one per process (what is queued still gets written) |
+| src/platform/img_dump.c | - | s_exits_taken | file_static | keep | - | the drains registered at the process's exits, once per process |
+| src/platform/img_dump.c | - | s_lock | file_static | keep | - | the PNG writer threads and their queue, one per process (what is queued still gets written) |
+| src/platform/img_dump.c | - | s_work | file_static | keep | - | the PNG writer threads and their queue, one per process (what is queued still gets written) |
+| src/platform/img_dump.c | - | s_room | file_static | keep | - | the PNG writer threads and their queue, one per process (what is queued still gets written) |
+| src/platform/img_dump.c | - | s_old_int | file_static | keep | - | the handlers the drain chains to, saved once per process |
+| src/platform/img_dump.c | - | s_old_term | file_static | keep | - | the handlers the drain chains to, saved once per process |
+
 ### src/platform/mem_stats.c
 
 | file | scope | name | kind | class | hook | why |

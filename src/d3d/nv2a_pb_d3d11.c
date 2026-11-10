@@ -31,6 +31,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include "recomp_env.h"
+#include "img_dump.h"
 #include "recomp_exit_hook.h"
 #include "mem_stats.h"
 #include <d3d11.h>
@@ -376,6 +377,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
          * ExitProcess skips atexit, where the missing-file summary prints. */
         xbox_InputMouseWin32Release(h);   /* no pump follows to drop the clip */
         recomp_exit_hook_run("window");
+        /* The queued PNGs too, even if the hook table had no slot for the
+         * writer's drain: this is how a bench's RECOMP_WINDOW_QUIT_AFTER
+         * ends, seconds after the last dump. */
+        img_dump_flush(5000);
         ExitProcess(0);
     }
     if (m == WM_SIZE && w != SIZE_MINIMIZED && LOWORD(l) && HIWORD(l)) {
@@ -5201,52 +5206,32 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
 
 /* ---- flip ------------------------------------------------------------------ */
 
-/* RECOMP_D3D11_DUMP=<prefix>: every 60th presented frame as <prefix>NNNN.bmp,
+/* RECOMP_D3D11_DUMP=<prefix>: every 60th presented frame as <prefix>NNNN.png,
  * read back from the swap chain's buffer. Proof of what reached the screen.
  * The prefix is prepended to the file name as is; one ending in / or \ is a
- * directory, and the files in it are named frame_NNNN.bmp. The flips listed
- * in RECOMP_FB_DUMP_AT are written too, as <prefix>flip_NNNNN.bmp named by
+ * directory, and the files in it are named frame_NNNN.png (.bmp with
+ * dump_format=bmp, img_dump.h). The flips listed
+ * in RECOMP_FB_DUMP_AT are written too, as <prefix>flip_NNNNN.png named by
  * present number (= flip number), so a golden run can pick its frames by an
  * event's flip rather than every 60th present. */
-/* w x h 32-bit pixels (B8G8R8A8, `pitch` bytes a row) as a top-down BMP,
- * with the dump's one line either way. */
+/* w x h 32-bit pixels (B8G8R8A8, `pitch` bytes a row) as a debug image
+ * (img_dump.h; the alpha kept, as the 32-bit BMP of old kept it), with the
+ * dump's one line either way. */
 static int write_bmp32(const char *path, const uint8_t *px, size_t pitch, UINT w, UINT h)
 {
-    BITMAPFILEHEADER fh;
-    BITMAPINFOHEADER ih;
-    FILE *f = fopen(path, "wb");
-    UINT y;
-    int ok = 1;
+    int ok = img_dump_write(path, px, pitch, w, h, 4, IMG_DUMP_ALPHA);
 
-    if (!f) {
-        fprintf(stderr, LOGP "dump %s: cannot open it\n", path);
-        return 0;
-    }
-    memset(&fh, 0, sizeof fh);
-    memset(&ih, 0, sizeof ih);
-    fh.bfType = 0x4D42;
-    fh.bfOffBits = sizeof fh + sizeof ih;
-    fh.bfSize = fh.bfOffBits + w * h * 4;
-    ih.biSize = sizeof ih;
-    ih.biWidth = (LONG)w;
-    ih.biHeight = -(LONG)h;
-    ih.biPlanes = 1;
-    ih.biBitCount = 32;
-    if (fwrite(&fh, sizeof fh, 1, f) != 1 || fwrite(&ih, sizeof ih, 1, f) != 1)
-        ok = 0;
-    for (y = 0; ok && y < h; y++)
-        if (fwrite(px + (size_t)y * pitch, (size_t)w * 4, 1, f) != 1)
-            ok = 0;
-    if (fclose(f))
-        ok = 0;
+    /* A PNG is still being deflated here; its bytes are reserved, so the
+     * file lands (img_dump.h). */
     if (ok)
-        fprintf(stderr, LOGP "dumped %s\n", path);
+        fprintf(stderr, LOGP "dumped %s%s\n", path,
+                strstr(path, ".png") ? " (queued)" : "");
     else
-        fprintf(stderr, LOGP "dump %s: write failed\n", path);
+        fprintf(stderr, LOGP "dump %s: not written (an error or the dump budget)\n", path);
     return ok;
 }
 
-/* The frame of this flip as a BMP: the back buffer after the direct copy
+/* The frame of this flip as an image: the back buffer after the direct copy
  * (the stock path, as always), or the present RT itself when the flip went
  * through the scaling blit, so a window size or a filter never reaches the
  * dump (under render.scale the RT is host-sized: dumps are hw x hh). */
@@ -5285,7 +5270,7 @@ static UINT s_shown_w, s_shown_h;   /* the last flip's present extent */
 /* The HUD capture's picture (nv2a_backend_common.h): rt's frame, cw x ch
  * guest pixels (its present extent, the hor+ pads left out), at guest size.
  * Under render.scale each n x n block of host pixels is averaged, as
- * Metal's write-back does, so the BMP is the guest surface that Metal and
+ * Metal's write-back does, so the image is the guest surface that Metal and
  * the CPU path write from guest memory and a guest-pixel bbox lands on the
  * same pixels on every backend. A grown target or a crop never changes its
  * size. The take maps a staging copy here, synchronously. */
@@ -5392,18 +5377,19 @@ static void dump_frame(void)
     n = strlen(prefix);
     dir = n && (prefix[n - 1] == '/' || prefix[n - 1] == '\\');
     if ((s_presents % 60) == 1) {
-        snprintf(path, sizeof path, "%s%s%04u.bmp", prefix, dir ? "frame_" : "",
-                 (unsigned)(s_presents / 60));
+        snprintf(path, sizeof path, "%s%s%04u%s", prefix, dir ? "frame_" : "",
+                 (unsigned)(s_presents / 60), img_dump_ext());
         dump_back_buffer(path);
     }
     if (nv2a_pb_dump_at_listed((uint32_t)s_presents)) {
-        snprintf(path, sizeof path, "%sflip_%05u.bmp", prefix,
-                 (unsigned)s_presents);
+        snprintf(path, sizeof path, "%sflip_%05u%s", prefix,
+                 (unsigned)s_presents, img_dump_ext());
         dump_back_buffer(path);
 #ifdef XBOXRECOMP_ENHANCE
         /* What present.shader put on screen, the overlay not yet drawn. */
         if (s_chained) {
-            snprintf(path, sizeof path, "%spresent_%05u.bmp", prefix, (unsigned)s_presents);
+            snprintf(path, sizeof path, "%spresent_%05u%s", prefix, (unsigned)s_presents,
+                     img_dump_ext());
             dump_texture(s_back, path);
         }
 #endif
@@ -6956,7 +6942,7 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
         }
         if (s_chained) {
             /* d3d11_dump keeps reading the frame (the goldens'); the back
-             * buffer goes to present_NNNNN.bmp beside it. */
+             * buffer goes to present_NNNNN.png beside it. */
             s_dump_rt = 1;
         } else
 #endif

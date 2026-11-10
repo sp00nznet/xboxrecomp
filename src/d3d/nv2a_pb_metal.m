@@ -69,6 +69,7 @@
 #include <math.h>
 #include <stddef.h>
 #include "recomp_env.h"
+#include "img_dump.h"
 #include "mem_stats.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -4517,7 +4518,7 @@ static void prof_flip_end(uint64_t t_flip0)
 }
 
 /* RECOMP_DEBUG=metal_host_dump=<prefix>: the frame as drawn, host size,
- * every fb_dump_flips flip (20), <prefix>host_NNNNN.bmp by present count. A
+ * every fb_dump_flips flip (20), <prefix>host_NNNNN.png by present count. A
  * guest-size dump (fb_dump) shows only the centre of a padded target. */
 static int host_dump_due(void)
 {
@@ -4537,34 +4538,13 @@ static void host_dump(RenderTarget *rt, uint32_t hcw, uint32_t hch)
 {
     const uint8_t *px = host_readback(rt);
     char path[1024];
-    uint8_t hdr[54];
-    uint32_t row = hcw * 3u, padb = (4u - (row & 3u)) & 3u, size, y, x;
-    FILE *f;
 
     if (!px || !hcw || !hch)
         return;
-    snprintf(path, sizeof path, "%shost_%05llu.bmp", recomp_env(RENV_METAL_HOST_DUMP),
-             (unsigned long long)(s_presents + 1));
-    f = fopen(path, "wb");
-    if (!f)
-        return;
-    size = 54u + (row + padb) * hch;
-    memset(hdr, 0, sizeof hdr);
-    hdr[0] = 'B'; hdr[1] = 'M';
-    memcpy(hdr + 2, &size, 4);
-    hdr[10] = 54; hdr[14] = 40;
-    memcpy(hdr + 18, &hcw, 4);
-    memcpy(hdr + 22, &hch, 4);
-    hdr[26] = 1; hdr[28] = 24;
-    fwrite(hdr, 1, sizeof hdr, f);
-    for (y = hch; y-- > 0; ) {
-        const uint8_t *s = px + (size_t)y * rt->hw * 4u;
-        for (x = 0; x < hcw; x++)
-            fwrite(s + (size_t)x * 4u, 1, 3, f);
-        if (padb)
-            fwrite(hdr + 1, 1, padb, f);   /* zero bytes of the header */
-    }
-    fclose(f);
+    snprintf(path, sizeof path, "%shost_%05llu%s", recomp_env(RENV_METAL_HOST_DUMP),
+             (unsigned long long)(s_presents + 1), img_dump_ext());
+    /* BGRA rows rt->hw wide; the alpha is dropped, as the 24-bit BMP did. */
+    img_dump_write(path, px, (size_t)rt->hw * 4u, hcw, hch, 4, 0);
 }
 
 #ifdef XBOXRECOMP_ENHANCE

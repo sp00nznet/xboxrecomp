@@ -31,6 +31,7 @@
 #pragma comment(lib, "ole32.lib")
 
 #include "video_player.h"
+#include "img_dump.h"
 #include "d3d/d3d8_xbox.h"
 #include "d3d/d3d8_internal.h"
 
@@ -620,7 +621,7 @@ void video_close(void)
     g_vp.height = 0;
 }
 
-/* Write the frame currently decoded to a 24-bit BMP.
+/* Write the frame currently decoded to an image (img_dump.h).
  *
  * The point is evidence rather than debugging: "the video played" is otherwise
  * only a log line, and a log line cannot distinguish a decoded frame that got
@@ -629,41 +630,13 @@ void video_close(void)
  * decoded pixels reached the renderer. */
 int video_dump_frame_bmp(const char *path)
 {
-    FILE *f;
-    uint32_t w = g_vp.width, h = g_vp.height, y, x;
-    uint32_t row = ((w * 3u) + 3u) & ~3u;
-    uint32_t img = row * h, total = 54u + img;
-    uint8_t hdr[54];
-    uint8_t *line;
+    uint32_t w = g_vp.width, h = g_vp.height;
 
     if (!g_vp.has_frame || !g_vp.frame_buf || !w || !h)
         return -1;
-    f = fopen(path, "wb");
-    if (!f) return -1;
-
-    memset(hdr, 0, sizeof(hdr));
-    hdr[0] = 'B'; hdr[1] = 'M';
-    memcpy(hdr + 2, &total, 4);
-    hdr[10] = 54;
-    hdr[14] = 40;
-    memcpy(hdr + 18, &w, 4);
-    memcpy(hdr + 22, &h, 4);
-    hdr[26] = 1; hdr[28] = 24;
-    memcpy(hdr + 34, &img, 4);
-    fwrite(hdr, 1, sizeof(hdr), f);
-
-    line = (uint8_t *)calloc(1, row);
-    for (y = 0; y < h; y++) {
-        const uint8_t *src = g_vp.frame_buf + (size_t)(h - 1 - y) * g_vp.stride;
-        for (x = 0; x < w; x++) {          /* BGRA -> BGR */
-            line[x * 3 + 0] = src[x * 4 + 0];
-            line[x * 3 + 1] = src[x * 4 + 1];
-            line[x * 3 + 2] = src[x * 4 + 2];
-        }
-        fwrite(line, 1, row, f);
-    }
-    free(line);
-    fclose(f);
+    /* BGRA rows, the alpha dropped. */
+    if (!img_dump_write(path, g_vp.frame_buf, g_vp.stride, w, h, 4, 0))
+        return -1;
     fprintf(stderr, "  [VIDEO] wrote %s (%ux%u)\n", path, w, h);
     return 0;
 }

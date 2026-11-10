@@ -27,12 +27,16 @@ get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOL
 # (host_prof.h, RECOMP_TRACE=prof) that uses both, and the [MEM] exit line
 # (mem_stats.h), which the GPU backends feed, and the [FATAL] line for the
 # deaths the games' crash handlers miss (recomp_fatal.h).
+# The debug image writer (img_dump.h) rides with it too: every dumper in the
+# runtime names and writes its PNGs or BMPs through it, under one budget.
 add_library(recomp_env STATIC recomp_env.c recomp_exe_dir.c recomp_exit_hook.c host_time.c
-    host_prof.c mem_stats.c recomp_fatal.c)
+    host_prof.c mem_stats.c recomp_fatal.c img_dump.c)
 target_include_directories(recomp_env PUBLIC
     ${XBOXRECOMP_SRC_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+# stb_image_write, vendored unmodified (third_party/stb/VERSION).
+target_include_directories(recomp_env PRIVATE ${XBOXRECOMP_SRC_DIR}/../third_party/stb)
 
 if(WIN32)
     add_library(platform INTERFACE)

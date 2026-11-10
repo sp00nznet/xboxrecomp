@@ -5,7 +5,8 @@
  *
  * RECOMP_DEBUG keys:
  *   hud_capture=<dir>          on; writes <dir>/capture.jsonl and one
- *                              <dir>/frame_NNNNN.bmp per captured frame
+ *                              <dir>/frame_NNNNN.png per captured frame
+ *                              (.bmp with dump_format=bmp)
  *   hud_capture_at=<from>:<count>  the guest frames (default 1:1)
  *   hud_capture_table=<path>   a HUD table the capture loads and hooks
  *                              itself, so a capture needs no mod
@@ -16,7 +17,7 @@
  * finds their callers by a scan of the stack. Both go into a buffer on the
  * guest's thread, written to capture.jsonl at xbox_mod_frame; a frame's
  * lines are written once its picture is (or cannot be) taken, so a reader
- * that sees frame F's record has F's sprites and its BMP. The format is in
+ * that sees frame F's record has F's sprites and its picture. The format is in
  * docs/runtime/config.md ("HUD table (v5)", the capture).
  *
  * A guest frame is the span between two xbox_mod_frame calls: frame F runs

@@ -290,7 +290,7 @@ extern "C" {
     X(METAL_POINT,       DEBUG, "metal_point",     "RECOMP_METAL_POINT",       "Metal point sampling") \
     X(METAL_NO_RTT,      DEBUG, "metal_no_rtt",    "RECOMP_METAL_NO_RTT",      "Metal decodes render targets from memory (implies metal_writeback=always)") \
     X(METAL_PRESENT,     DEBUG, "metal_present",   NULL,                       "=layer|readback: Metal window present, CAMetalLayer from GPU slots (default) or the old texture readback") \
-    X(METAL_HOST_DUMP,   DEBUG, "metal_host_dump", NULL,                       "=prefix: Metal host-size frame dumps (render.scale, display.aspect) as <prefix>host_NNNNN.bmp, every fb_dump_flips flip") \
+    X(METAL_HOST_DUMP,   DEBUG, "metal_host_dump", NULL,                       "=prefix: Metal host-size frame dumps (render.scale, display.aspect) as <prefix>host_NNNNN.png, every fb_dump_flips flip") \
     X(METAL_WRITEBACK,   DEBUG, "metal_writeback", NULL,                       "=lazy|always: Metal writes guest memory when a dump reads it (default) or at every flip") \
     X(METAL_FB_GUARD,    DEBUG, "metal_fb_guard",  NULL,                       "trap title reads of the last Metal present surface; a read switches to metal_writeback=always") \
     X(METAL_OCC,         DEBUG, "metal_occ",       "RECOMP_METAL_OCC",         "=sync|fixed: Metal occlusion mode") \
@@ -307,12 +307,14 @@ extern "C" {
     X(USB_NDP,           DEBUG, "usb_ndp",         "RECOMP_USB_NDP",           "=n: root-hub ports, 1..4") \
     X(PAD_PRESS,         DEBUG, "pad_press",       "RECOMP_PAD_PRESS",         "=mask: pulse these buttons (USB pad)") \
     X(FB_DUMP,           DEBUG, "fb_dump",         "RECOMP_FB_DUMP",           "=prefix: frame dumps (CPU/Metal, window)") \
+    X(DUMP_FORMAT,       DEBUG, "dump_format",     NULL,                       "=png|bmp: the format of every debug image dump (fb_dump, d3d11_dump, metal_host_dump, hud_capture, window shots, A/B and CPU texture images); png (the default) is lossless and a quarter of a BMP or less, bmp the old files (src/platform/img_dump.h)") \
+    X(DUMP_BUDGET_MB,    DEBUG, "dump_budget_mb",  NULL,                       "=MiB: the most bytes of image and texture dumps one run writes, then one [DUMP] line and no further dumps (default 2048 on macOS, else none; 0 none)") \
     X(FB_DUMP_AT,        DEBUG, "fb_dump_at",      "RECOMP_FB_DUMP_AT",        "=flips: fb_dump at these flips (up to 256 ranges)") \
     X(FB_DUMP_FLIPS,     DEBUG, "fb_dump_flips",   "RECOMP_FB_DUMP_FLIPS",     "=n: fb_dump every nth flip") \
     X(FB_DUMP_PROG,      DEBUG, "fb_dump_prog",    NULL,                       "=hash[,hash]: fb_dump the flips around the first draw of these vertex programs (hex, up to 16)") \
     X(FB_DUMP_PROG_BEFORE, DEBUG, "fb_dump_prog_before", NULL,                 "=n: fb_dump_prog flips kept before the trigger, 0..240 (default 30; CPU/Metal)") \
     X(FB_DUMP_PROG_AFTER, DEBUG, "fb_dump_prog_after", NULL,                   "=n: fb_dump_prog flips dumped from the trigger on, capped at 240 (default 60)") \
-    X(HUD_CAPTURE,       DEBUG, "hud_capture",     NULL,                       "=dir: the HUD mapping capture (hud_capture.h): capture.jsonl and one BMP per captured guest frame; records and changes nothing") \
+    X(HUD_CAPTURE,       DEBUG, "hud_capture",     NULL,                       "=dir: the HUD mapping capture (hud_capture.h): capture.jsonl and one picture per captured guest frame; records and changes nothing") \
     X(HUD_CAPTURE_AT,    DEBUG, "hud_capture_at",  NULL,                       "=from:count: hud_capture's guest frames (default 1:1, count up to 10000)") \
     X(HUD_CAPTURE_TABLE, DEBUG, "hud_capture_table", NULL,                     "=path: a HUD table (TOML) hud_capture loads and hooks itself, so a capture needs no mod; a table a mod registered wins") \
     X(FB_WINDOW_DUMP_EVERY, DEBUG, "fb_window_dump_every", "RECOMP_FB_WINDOW_DUMP_EVERY", "=n: window dump period") \
@@ -321,7 +323,7 @@ extern "C" {
     X(RESET_PROBE,       DEBUG, "reset_probe",     NULL,                       "=flips (N, A-B or A-B/S, comma-separated): the stop probe (game-reset phase 0): at each flip, how long every guest thread takes to reach a point where a reset could stop it, one [RESET-PROBE] line per thread and a summary; nothing is stopped") \
     X(OPTS_AT,           DEBUG, "opts_at",         NULL,                       "=flip:key=value,...: live option requests at those flips, as the in-game menu makes them (scale, filter, fullscreen, aniso, movie, overscan, snap_2d, pacing)") \
     X(MOD_SET_AT,        DEBUG, "mod_set_at",      NULL,                       "=frame:key=value,...: mod settings changed live from the flip tick once the guest reaches that xbox_mod_frame count, as the Mods page does (needs the menu armed)") \
-    X(TEX_DUMP,          DEBUG, "tex_dump",        "RECOMP_TEX_DUMP",          "=dir: Metal and D3D11 write each uploaded texture once per texel hash as <hash>.xtd and <hash>.json, the hash a texture pack matches (docs/formats/texture-dump.md); the CPU rasteriser writes first-use BMPs with it as a file prefix instead") \
+    X(TEX_DUMP,          DEBUG, "tex_dump",        "RECOMP_TEX_DUMP",          "=dir: Metal and D3D11 write each uploaded texture once per texel hash as <hash>.xtd and <hash>.json, the hash a texture pack matches (docs/formats/texture-dump.md); the CPU rasteriser writes first-use images with it as a file prefix instead") \
     X(TEX_PACK_KEEP,     DEBUG, "tex_pack_keep",   NULL,                       "keep a pack entry's payload in RAM after its GPU upload, under the resident budget, for A/B") \
     X(TEX_DUMP_EVERY,    DEBUG, "tex_dump_every",  "RECOMP_TEX_DUMP_EVERY",    "=n: tex_dump every nth bind too") \
     X(VSH_DUMP,          DEBUG, "vsh_dump",        "RECOMP_VSH_DUMP",          "=prefix: vertex programs, raw, once each (every backend)") \

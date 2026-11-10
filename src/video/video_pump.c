@@ -13,6 +13,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include "recomp_env.h"
+#include "img_dump.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -143,8 +144,8 @@ static DWORD WINAPI vp_thread(LPVOID unused)
          * rather than one still held for the duration. */
         if ((frames == 60 || frames == 80) && recomp_env(RENV_FMV_DUMP)) {
             char out[MAX_PATH];
-            _snprintf_s(out, sizeof(out), _TRUNCATE, "%s.%u.bmp",
-                        recomp_env(RENV_FMV_DUMP), frames);
+            _snprintf_s(out, sizeof(out), _TRUNCATE, "%s.%u%s",
+                        recomp_env(RENV_FMV_DUMP), frames, img_dump_ext());
             video_dump_frame_bmp(out);
         }
 

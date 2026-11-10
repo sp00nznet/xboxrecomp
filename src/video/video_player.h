@@ -53,7 +53,7 @@ void video_close(void);
 int  xbox_VideoPlayFile(const char *host_path);
 int  xbox_VideoIsPlaying(void);
 
-/* Write the current decoded frame to a 24-bit BMP -- evidence that real
+/* Write the current decoded frame to an image (img_dump.h) -- evidence that real
  * pixels reached the renderer, which a log line cannot give. */
 int  video_dump_frame_bmp(const char *path);
 

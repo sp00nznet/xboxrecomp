@@ -16,11 +16,12 @@ void recomp_exit_hook_set(recomp_exit_hook_fn fn)
     s_hook = fn;
 }
 
-/* The kernel's summary, the present trace, the mouse's clip, the mods and
- * the [MEM] exit line take one each; 8 leaves room. A full table says so
- * on stderr: the hook left out is often the mouse's, added last, whose
- * clip then outlives a Wine exit. */
-#define MORE 8
+/* The kernel's summary, the present trace, the mouse's clip, the mods,
+ * the [MEM] exit line, the profiler, the pad recorder and session, the
+ * texture dump and the image writer's drain take one each: ten, most added
+ * lazily, so the last ones in were the first left out of the eight there
+ * were. 16 leaves room. A full table says so on stderr. */
+#define MORE 16
 static recomp_exit_hook_fn s_more[MORE];
 
 int recomp_exit_hook_add(recomp_exit_hook_fn fn)

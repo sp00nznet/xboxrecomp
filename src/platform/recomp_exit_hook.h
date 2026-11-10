@@ -20,7 +20,7 @@ typedef void (*recomp_exit_hook_fn)(const char *why);
 void recomp_exit_hook_set(recomp_exit_hook_fn fn);
 
 /* More hooks that run after it, for state outside the process that the OS
- * may not undo on a Wine exit (the mouse's cursor clip). Up to eight; adding
+ * may not undo on a Wine exit (the mouse's cursor clip). Up to sixteen; adding
  * one twice keeps one. Returns 0 when the table is full. Any thread. */
 int recomp_exit_hook_add(recomp_exit_hook_fn fn);
 

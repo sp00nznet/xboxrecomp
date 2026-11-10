@@ -42,7 +42,7 @@
  * the frame of that walker flip count (the number RECOMP_FB_DUMP_FLIPS and
  * RECOMP_FLIP_LOG print), at the window's pixel size, with
  * SDL_RenderReadPixels (the layer: a blit of the drawable), into
- * <prefix>win_flip<NNNNN>.bmp. <prefix> is RECOMP_WINDOW_SHOT_PREFIX, else
+ * <prefix>win_flip<NNNNN>.png (img_dump.h). <prefix> is RECOMP_WINDOW_SHOT_PREFIX, else
  * RECOMP_FB_DUMP, else "window_". A flip the window dropped is shot at the
  * next frame it shows, under that frame's own flip number. Only the
  * process's own pixels are read.
@@ -69,6 +69,7 @@
 
 #include <SDL3/SDL.h>
 #include "recomp_env.h"
+#include "img_dump.h"
 #include "recomp_exit_hook.h"
 #include "platform/sdl_env.h"
 #include <pthread.h>
@@ -509,15 +510,15 @@ static void shot_path(char *path, size_t n, uint32_t flip)
         prefix = recomp_env(RENV_FB_DUMP);
     if (!prefix)
         prefix = "window_";
-    snprintf(path, n, "%swin_flip%05u.bmp", prefix, flip);
+    snprintf(path, n, "%swin_flip%05u%s", prefix, flip, img_dump_ext());
 }
 
 /* Between RenderTexture and RenderPresent: the back buffer is what is shown.
  * The read is of the whole window, letterbox bars included: logical
  * presentation is set aside for it (SDL3 reads only the logical viewport
  * otherwise) and restored, which leaves the drawn pixels as they are.
- * The read comes back 32-bit, which SDL_SaveBMP writes with a V5 header;
- * BGR24 keeps the 24-bit file the layer's shots and the SDL2 build write. */
+ * The read comes back 32-bit; BGR24 is the bytes B, G, R that img_dump
+ * takes, as the layer's shots do. */
 static void shot_save(SDL_Renderer *ren, uint32_t flip)
 {
     SDL_Surface *read, *surf = NULL;
@@ -536,12 +537,13 @@ static void shot_save(SDL_Renderer *ren, uint32_t flip)
         SDL_DestroySurface(read);
     }
     shot_path(path, sizeof path, flip);
-    if (surf && SDL_SaveBMP(surf, path))
+    if (surf && img_dump_write(path, (const uint8_t *)surf->pixels, (size_t)surf->pitch,
+                               (uint32_t)surf->w, (uint32_t)surf->h, 3, 0))
         fprintf(stderr, "[PRESENT] window shot: %s (%dx%d, flip %u)\n",
                 path, surf->w, surf->h, flip);
     else
         fprintf(stderr, "[PRESENT] window shot at flip %u failed: %s\n",
-                flip, SDL_GetError());
+                flip, surf ? "not written (an error or the dump budget)" : SDL_GetError());
     SDL_DestroySurface(surf);
 }
 

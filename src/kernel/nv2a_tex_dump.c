@@ -5,6 +5,7 @@
 #include "nv2a_backend_common.h"
 #include "nv2a_tex_pack.h"   /* NV2A_TEX_PACK_MAX_DIM */
 #include "recomp_env.h"
+#include "img_dump.h"
 #include "recomp_exit_hook.h"
 
 #include <errno.h>
@@ -818,13 +819,21 @@ static void dump_upload(const struct nv2a_stage *t, uint64_t hash, const uint32_
                      (unsigned long long)(s_max_bytes >> 20));
             stop_locked(why);
             s_st.stopped++;
+        } else if (!img_dump_budget_take(bytes)) {
+            /* The run's budget for every dump (img_dump.h), which on the
+             * Mac is smaller than this dump's own cap. */
+            stop_locked("the run's dump budget (dump_budget_mb) is spent");
+            s_st.stopped++;
         } else if (!write_xtd(t, hash, levels, n)) {
+            /* Nothing stays on disk: the bytes go back to the budget. */
+            img_dump_budget_refund(bytes);
             h->tries++;
             s_st.errors++;
         } else if (!write_json(t, hash, 1, p8)) {
             /* An .xtd without its sidecar is not a dump entry; the next
              * upload of the hash writes both again. */
             remove_file(hash, "xtd");
+            img_dump_budget_refund(bytes);
             h->tries++;
             s_st.errors++;
         } else {

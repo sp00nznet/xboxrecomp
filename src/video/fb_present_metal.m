@@ -65,6 +65,7 @@
 #include "librashader.h"
 #endif
 #include "fb_present_metal.h"
+#include "img_dump.h"
 #include "metal_compile.h"
 
 #if __has_feature(objc_arc)
@@ -411,27 +412,11 @@ int fbm_upload(int k, const uint8_t *src, uint32_t w, uint32_t h, uint32_t pitch
 static void save_shot(id<MTLBuffer> buf, uint32_t w, uint32_t h, const char *path,
                       uint32_t flip)
 {
-    SDL_Surface *surf = SDL_CreateSurface((int)w, (int)h, SDL_PIXELFORMAT_BGR24);
-    const uint8_t *px = (const uint8_t *)[buf contents];
-    uint32_t x, y;
-
-    if (!surf)
-        return;
-    for (y = 0; y < h; y++) {
-        uint8_t *o = (uint8_t *)surf->pixels + (size_t)y * surf->pitch;
-        const uint8_t *in = px + (size_t)y * w * 4;
-        for (x = 0; x < w; x++) {
-            /* BGRA in the drawable; BGR24 is the bytes B, G, R. */
-            o[x * 3 + 0] = in[x * 4 + 0];
-            o[x * 3 + 1] = in[x * 4 + 1];
-            o[x * 3 + 2] = in[x * 4 + 2];
-        }
-    }
-    if (SDL_SaveBMP(surf, path))
+    /* BGRA in the drawable, w a row; the alpha dropped (img_dump.h). */
+    if (img_dump_write(path, (const uint8_t *)[buf contents], (size_t)w * 4u, w, h, 4, 0))
         fprintf(stderr, "[PRESENT] window shot: %s (%ux%u, flip %u)\n", path, w, h, flip);
     else
-        fprintf(stderr, "[PRESENT] window shot at flip %u failed: %s\n", flip, SDL_GetError());
-    SDL_DestroySurface(surf);
+        fprintf(stderr, "[PRESENT] window shot at flip %u failed\n", flip);
 }
 
 /* Slot k (fw x fh, drawn at render scale n with hor+ pad pad) into the
