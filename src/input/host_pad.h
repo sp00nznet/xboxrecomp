@@ -32,8 +32,8 @@ extern "C" {
 #define XBOX_HOST_TOUCHPAD  0x40u
 #define XBOX_HOST_EXTRA_MASK 0x7Fu
 
-/* A read the backend could not make now (its lock was busy): the caller
- * keeps what it had. */
+/* A read the backend could not make now (its lock was busy, or input is
+ * not up yet): the caller keeps what it had. */
 #define XBOX_INPUT_BUSY 170u        /* ERROR_BUSY */
 
 /* struct xbox_host_pad has `raw`; a title's glue fills it under this. */
@@ -89,7 +89,8 @@ void xbox_InputHostRaw(DWORD slot, InputRaw *raw);
 
 /* Read slot's host pad off the poll thread (the flip tick): the raw pad, the
  * guest map of it and extra. ERROR_SUCCESS, ERROR_DEVICE_NOT_CONNECTED (host zeroed), or
- * XBOX_INPUT_BUSY (host untouched). Publishes the extra bits, and clears
+ * XBOX_INPUT_BUSY (host untouched; also before the title's first poll brings
+ * input up). Publishes the extra bits, and clears
  * them when no pad is open, so a modifier held as the pad went away does
  * not stay held. */
 DWORD xbox_input_backend_read_host(DWORD slot, struct xbox_host_pad *host);

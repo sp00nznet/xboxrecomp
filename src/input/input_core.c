@@ -300,8 +300,12 @@ DWORD xbox_input_backend_read_host(DWORD slot, struct xbox_host_pad *host)
         return ERROR_DEVICE_NOT_CONNECTED;
     memset(&raw, 0, sizeof raw);
     /* Before the title's first poll the backend is not up, and bringing it
-     * up is the poll thread's job (the SDL boot wait). */
-    if (__atomic_load_n(&g_inited, __ATOMIC_ACQUIRE) && g_be->read_raw)
+     * up is the poll thread's job (the SDL boot wait). Busy, not "no pad":
+     * nothing is known of the pad yet, and a pad held through the start
+     * read as let go would fire a binding on the first poll. */
+    if (!__atomic_load_n(&g_inited, __ATOMIC_ACQUIRE))
+        return XBOX_INPUT_BUSY;
+    if (g_be->read_raw)
         rc = g_be->read_raw(slot, &raw);
     if (rc == XBOX_INPUT_BUSY)
         return rc;

@@ -222,6 +222,7 @@ struct port_state {
     uint64_t last_poll;
     int polled;
     int slot;               /* the backend slot behind the port, -1 unknown */
+    int known;              /* held is a reading: a poll's, or a tick's that got an answer */
 };
 
 static struct table *s_table;           /* under s_step_lock */
@@ -733,11 +734,17 @@ int enhance_action_fire_by_pad(const char *name, char *why, size_t n)
  * bindings fires: the first finds what would fire, the second fires the
  * longest of them. A binding inside a longer one (guide inside guide+a)
  * waits for its release, and a longer one firing first takes the press
- * from it. */
-static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64_t now)
+ * from it.
+ *
+ * pad 0: nothing is known of the pad yet (the tick's first read was busy, or
+ * input is not up), so only the keys step; the pad's bindings keep their
+ * state, held_over included, as a release read off no pad would wrongly end
+ * it and fire a binding held through its build. */
+static void step(struct table *t, unsigned port, uint32_t held, int tick, int pad,
+                 uint64_t now)
 {
     struct port_state *ps = &s_port[port];
-    uint32_t fresh = held & ~ps->held;
+    uint32_t fresh;
     int quiet = __atomic_load_n(&s_quiet, __ATOMIC_ACQUIRE), wants = 0;
 
     /* Port 0's step after a capture is still quiet: the menu reads its
@@ -751,6 +758,9 @@ static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64
                                     __ATOMIC_ACQUIRE);
     else if (quiet == 2)
         quiet = 0;
+    if (!pad)
+        held = ps->held;
+    fresh = held & ~ps->held;
     ps->held = held;
     ps->consumed &= held;
     for (int i = 0; i < 32; i++)
@@ -765,7 +775,7 @@ static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64
         b->want = 0;
         if (b->kind == B_OFF || b->dormant || (b->kind == B_KEY ? port != 0 : b->port != port))
             continue;
-        if (tick && b->kind == B_CHORD && b->guest)
+        if ((tick && b->kind == B_CHORD && b->guest) || (!pad && b->kind != B_KEY))
             continue;
         switch (b->kind) {
         case B_KEY:
@@ -815,7 +825,7 @@ static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64
     /* A longer binding held whole takes the press from those inside it,
      * whether or not it fires: let go before its hold, it fires nothing,
      * and neither does the shorter one (one press, one action). */
-    for (int i = 0; i < t->n; i++) {
+    for (int i = 0; pad && i < t->n; i++) {
         const struct binding *c = &t->b[i];
         if (!c->active || c->kind == B_KEY || c->kind == B_OFF || c->port != port)
             continue;
@@ -843,7 +853,8 @@ static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64
     }
     for (int i = 0; i < t->n; i++) {
         struct binding *b = &t->b[i];
-        if (b->kind == B_OFF || b->dormant || (b->kind == B_KEY ? port != 0 : b->port != port))
+        if (b->kind == B_OFF || b->dormant || (b->kind == B_KEY ? port != 0 : b->port != port)
+            || (!pad && b->kind != B_KEY))
             continue;
         /* A shorter binding is a tap: it never reads as down. */
         if (b->active && b->fired && !b->held_over && !b->shadowed)
@@ -915,8 +926,9 @@ void enhance_actions_filter(unsigned port, const struct xbox_host_pad *host,
     s_port[port].polled = 1;
     /* -1 too: a port whose pad went away has no slot for the tick to read. */
     s_port[port].slot = host ? host->slot : -1;
+    s_port[port].known = 1;
     held = host_bits(host);
-    step(s_table, port, held, 0, now);
+    step(s_table, port, held, 0, 1, now);
     mask = guest_mask(s_table, port, now);
     spin_unlock(&s_step_lock);
     if (st)
@@ -1012,6 +1024,7 @@ void enhance_actions_tick(void)
     for (unsigned port = 0; t && port < PORTS; port++) {
         struct port_state *ps = &s_port[port];
         uint32_t held = ps->held;
+        int pad = 1;
 
         /* A poll during the read has stepped the port with a newer state:
          * stepping it again with ours would refire a press or start a hold
@@ -1030,8 +1043,12 @@ void enhance_actions_tick(void)
                 held = got[port];
             else if (rc[port] != XBOX_INPUT_BUSY)
                 held = 0;   /* no pad: a modifier held as it went away is let go */
+            else
+                pad = ps->known;    /* busy: keep what the port had, if anything */
+            if (pad)
+                ps->known = 1;
         }
-        step(t, port, held, 1, now);
+        step(t, port, held, 1, pad, now);
         if (port == 0)
             held0 = held;
     }

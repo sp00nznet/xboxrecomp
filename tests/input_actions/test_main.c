@@ -1128,6 +1128,76 @@ static void test_tick_race(void)
     CHECK(enhance_action_down(enhance_action_find("menu.open")) == 0);
 }
 
+/* A tick before the title's first poll: input is not up, so the tick's read
+ * says nothing about the pad, and a binding built while its input is held
+ * stays spent until a release. Read as "no pad", it let paddle1 go, and the
+ * first poll pressed it anew: the menu opened on a pad held through the
+ * start (test_live_rebuild's flake, where the flip thread won the race to
+ * the poll thread's first poll under load). A first read that comes back
+ * busy knows no more. */
+static void test_tick_before_poll(void)
+{
+    const char *cfg = ARMED "[input.actions]\nmenu.open = [\"paddle1\"]\n";
+    int id, reads;
+
+    start_with(cfg, &k_fake, NULL);
+    id = enhance_action_find("menu.open");
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    reads = f_reads;
+    nv2a_flip_hook_run();
+    CHECK(f_reads == reads);            /* not up: the backend is not read */
+    advance(16);
+    poll0();
+    CHECK(menu_fires() == 0);
+    CHECK(!enhance_action_down(id));
+    advance(16);
+    nv2a_flip_hook_run();
+    poll0();
+    CHECK(menu_fires() == 0);
+    /* Let go and pressed: it fires. */
+    hold_extra(XBOX_HOST_PADDLE1, 0);
+    advance(16);
+    poll0();
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    advance(16);
+    poll0();
+    CHECK(menu_fires() == 1);
+    CHECK(enhance_action_down(id));
+    pad_clear();
+    advance(16);
+    poll0();
+
+    /* Up, never polled, and the first read is busy. */
+    start_with(cfg, &k_fake, NULL);
+    xbox_InputInit();
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    f_busy = 1;
+    nv2a_flip_hook_run();
+    f_busy = 0;
+    advance(16);
+    nv2a_flip_hook_run();
+    CHECK(menu_fires() == 0);
+    CHECK(!enhance_action_down(id));
+    /* A read made, a later busy one keeps it: still spent. */
+    advance(16);
+    f_busy = 1;
+    nv2a_flip_hook_run();
+    f_busy = 0;
+    advance(16);
+    nv2a_flip_hook_run();
+    CHECK(menu_fires() == 0);
+    hold_extra(XBOX_HOST_PADDLE1, 0);
+    advance(16);
+    nv2a_flip_hook_run();
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    advance(16);
+    nv2a_flip_hook_run();
+    CHECK(menu_fires() == 1);
+    pad_clear();
+    advance(16);
+    nv2a_flip_hook_run();
+}
+
 /* ---- 11. the mod API: a v1 mod, a v2 mod, a failed init ----------------- */
 
 static int s_v1_frames;
@@ -2574,6 +2644,7 @@ int main(void)
     test_stats_toggle();
     test_tick();
     test_tick_race();
+    test_tick_before_poll();
     test_mod_api();
     test_seam();
     test_host_space();

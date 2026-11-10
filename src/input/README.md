@@ -204,7 +204,9 @@ second loop past the guest map, `MISC1`, the four paddles and the touchpad
 it Guide reads 0). `xbox_InputHostExtra(slot)` answers what the last read
 of a slot saw. `xbox_input_backend_read_host(slot, &host)` reads a slot
 off the poll thread (the flip tick below) and clears the bits when no pad
-is open, so a Guide held as the pad went away does not stay held. Under
+is open, so a Guide held as the pad went away does not stay held. Before
+the title's first poll brings input up it answers busy, not "no pad", so a
+binding held through the start is not read as let go and pressed anew. Under
 Steam Input, and on some hosts by default, the system keeps Guide; the
 per-host table is in `docs/runtime/config.md` ("Host actions").
 
