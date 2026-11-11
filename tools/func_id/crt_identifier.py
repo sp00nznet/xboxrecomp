@@ -73,6 +73,9 @@ def identify_crt_functions(xbe_data, functions, verbose=False):
                     # New match is better, remove old one
                     del results[prev_addr]
 
+                if func_addr in results:
+                    del matched_names[results[func_addr]["name"]]
+
                 results[func_addr] = {
                     "name": sig_name,
                     "confidence": config.CONFIDENCE_CRT_SIGNATURE,
