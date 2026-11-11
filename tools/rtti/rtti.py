@@ -41,7 +41,8 @@ from tools.abi_analysis.xbe_min import XbeFile
 TD_NAME = re.compile(rb"\.\?A[VU][A-Za-z0-9_@?$]{2,250}@@\x00")
 
 # Sections whose contents are executable, so a vtable slot pointing into one is
-# plausibly a method. XDK library code lives in its own named sections.
+# plausibly a method: any section flagged executable, plus the XDK library
+# sections by name for images that leave the flag off.
 CODE_SECTIONS = (".text", "D3D", "D3DX", "XGRPH", "DSOUND", "XPP", "XONLINE",
                  "XNET", "WMVDEC", "XACTENG")
 # Sections that can hold vtables and RTTI records.
@@ -65,19 +66,23 @@ class Image:
     def __init__(self, path):
         xbe = XbeFile(path)
         self.d = xbe.data
-        self.secs = [(s.virtual_address, s.raw_address, s.raw_size, s.name)
-                     for s in xbe.sections]
-        self.code = [(v, v + rs) for v, _, rs, n in self.secs
-                     if n in CODE_SECTIONS]
+        self.secs, self.code = [], []
+        for section in xbe.sections:
+            # A header can claim more raw bytes than the file holds.
+            size = min(section.raw_size, max(0, len(self.d) - section.raw_address))
+            va = section.virtual_address
+            self.secs.append((va, section.raw_address, size, section.name))
+            if section.flags & 0x4 or section.name in CODE_SECTIONS:
+                self.code.append((va, va + size))
 
-    def raw(self, va):
+    def raw(self, va, size=1):
         for v, r, rs, _ in self.secs:
-            if v <= va < v + rs:
+            if size > 0 and v <= va and va + size <= v + rs:
                 return r + (va - v)
         return None
 
     def u32(self, va):
-        r = self.raw(va)
+        r = self.raw(va, 4)
         return struct.unpack_from("<I", self.d, r)[0] if r is not None else None
 
     def is_code(self, va):
