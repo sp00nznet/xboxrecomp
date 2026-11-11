@@ -3,9 +3,7 @@ Formulaic stub function classifier.
 
 Identifies mechanically-generated stub functions:
 - SSE float chains: sequences of movss/addss/subss/mulss/divss ending in ret
-- These form the game's data-driven parameter initialization system:
-  thousands of tiny functions that copy/compute float values between
-  .rdata constants and .data globals.
+- Results are structural pattern candidates, not proof of application purpose.
 
 General pattern: F3 0F XX 05 [addr] repeated N times, ending with C3 (ret).
 Each SSE instruction is 8 bytes (prefix F3 0F + opcode + ModR/M 05 + 4-byte addr).
@@ -51,8 +49,8 @@ def classify_stubs(xbe_data, functions, verbose=False):
         func_addr = int(func["start"], 16)
         func_size = func.get("size", 0)
 
-        # Only check functions up to ~120 bytes (longest observed chains)
-        if func_size < 9 or func_size > 120:
+        # At least two eight-byte operations followed by RET.
+        if func_size < 17:
             continue
 
         file_offset = config.va_to_file_offset(func_addr)
