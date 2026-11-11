@@ -1,6 +1,7 @@
 /*
  * The NV2A's notify interrupt for D3D's software methods, and the walker's
- * bounded run-ahead that needs it (RECOMP_DEBUG=run_ahead, default off).
+ * bounded run-ahead that needs it (RECOMP_DEBUG=run_ahead, on by default
+ * at depth 64; see nv2a_run_ahead_depth).
  *
  * On the console a NO_OPERATION with a non-zero parameter is trapped by
  * PGRAPH: it latches the method and parameter in TRAPPED_ADDR and
@@ -48,6 +49,8 @@
 #define NV2A_GR_NOTIFY_H
 
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define NV2A_GR_PMC_INTR_0          0x000100u
 #define NV2A_GR_PMC_INTR_EN_0       0x000140u
@@ -272,6 +275,36 @@ static inline int nv2a_run_ahead_may_ack(int kick_set, int flip_held,
                                          uint32_t depth)
 {
     return kick_set && !flip_held && acks_this_walk < depth;
+}
+
+/* The depth when nothing sets one: deep enough that D3D's own bounds
+ * (MakeSpace on GET, BlockOnTime on the fence and its notify) hold the
+ * title, as on the console, where the flush is acked at once. BLiNX 1's
+ * stage 1-3 on the Deck: 26-28 fps at the old one-segment lockstep, 29-30
+ * at depth 1, 30.0 at 64. */
+#define NV2A_RUN_AHEAD_DEFAULT_DEPTH 64u
+#define NV2A_RUN_AHEAD_MAX_DEPTH     1024u
+
+/* The run-ahead depth for RECOMP_DEBUG=run_ahead's value (NULL when
+ * neither it nor a game default is set), 0 for off.
+ *   - unset or empty: NV2A_RUN_AHEAD_DEFAULT_DEPTH, except in the
+ *     deterministic mode, whose walker passes are granted by the guest ring
+ *     and whose runs were recorded with the lockstep: off there unless asked;
+ *   - "0" or "off": off (a game that breaks under it says
+ *     D(RUN_AHEAD, "0") in RECOMP_ENV_GAME_DEFAULTS);
+ *   - N > 1: N, at most NV2A_RUN_AHEAD_MAX_DEPTH; any other value 1. */
+static inline uint32_t nv2a_run_ahead_depth(const char *e, int deterministic)
+{
+    unsigned long n;
+
+    if (!e || !*e)
+        return deterministic ? 0u : NV2A_RUN_AHEAD_DEFAULT_DEPTH;
+    if (!strcmp(e, "0") || !strcmp(e, "off"))
+        return 0u;
+    n = strtoul(e, NULL, 10);
+    if (n <= 1)
+        return 1u;
+    return n > NV2A_RUN_AHEAD_MAX_DEPTH ? NV2A_RUN_AHEAD_MAX_DEPTH : (uint32_t)n;
 }
 
 #endif /* NV2A_GR_NOTIFY_H */

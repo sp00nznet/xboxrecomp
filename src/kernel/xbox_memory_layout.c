@@ -1930,8 +1930,9 @@ static void kick_cleared(uint64_t now)
 }
 
 /*
- * RECOMP_DEBUG=run_ahead: the walker no longer holds the title to the
- * segment it is executing.
+ * RECOMP_DEBUG=run_ahead (on, depth 64, unless =0, a game default of 0
+ * or the deterministic mode): the walker no longer holds the
+ * title to the segment it is executing.
  *
  * The flush ack above is what serialises the frame: the title waits at each
  * KickOff until the walker has finished the segment before it, so a frame
@@ -1945,7 +1946,7 @@ static void kick_cleared(uint64_t now)
  *     method header) GET says how far it has got, so the title's ring and
  *     fence waits see the walk's progress rather than its end;
  *   - at the same checkpoint the flush is acked when the title is waiting
- *     to submit another segment and fewer than N (run_ahead=N, default 1)
+ *     to submit another segment and fewer than N (run_ahead=N, default 64)
  *     are already submitted past this walk (nv2a_run_ahead_may_ack), so the
  *     title fills them while the walker draws this one, and never past a
  *     held flip;
@@ -1956,6 +1957,11 @@ static void kick_cleared(uint64_t now)
  *     GR_NOTIFY_STALL_NS; one that finds another still pending is queued
  *     behind it, and the ack thread watches a pending one to its end.
  * Off, nothing here runs and the walk acks only when caught up.
+ *
+ * The lockstep was the default before run-ahead. In BLiNX 1's stage 1-3 on
+ * the Deck it cost the title 24 ms of every 36-38 ms frame in the KickOff
+ * spin while the walker sat idle 6-8 ms of it; at depth 64 the spin is
+ * 3 ms and the stage holds 30 fps on the walker alone.
  */
 static int g_run_ahead;                       /* RECOMP_DEBUG=run_ahead */
 static uint32_t g_gr_notify_mask = NV2A_GR_NOTIFY_DEFAULT_MASK;
@@ -2196,16 +2202,21 @@ int xbox_Nv2aGrNotify(uint32_t subch, uint32_t param)
 static void run_ahead_init(void)
 {
     const char *e = recomp_env(RENV_RUN_AHEAD);
+    uint32_t depth;
 
-    /* =N: up to N segments past the walk; any other value but 0 (=1,
-     * =on) one. */
-    g_run_ahead = e && *e && strcmp(e, "0") != 0;
-    if (!g_run_ahead)
+    /* On by default, off in the deterministic mode unless asked;
+     * =0 off, =N up to N segments past the walk (nv2a_run_ahead_depth). The
+     * deterministic key, not xbox_GuestDetOn: the mode is decided at the
+     * first guest join, after this. */
+    depth = nv2a_run_ahead_depth(e, recomp_env_on(RENV_DETERMINISTIC));
+    g_run_ahead = depth != 0;
+    if (!g_run_ahead) {
+        if (e && *e)
+            fprintf(stderr, "  [NV2A] run ahead: off (run_ahead=%s, RECOMP_DEBUG or the game default);"
+                    " the walk acks the KickOff flush only when caught up\n", e);
         return;
-    {
-        unsigned long n = strtoul(e, NULL, 10);
-        g_run_ahead_depth = n > 1 ? (n > 1024 ? 1024u : (uint32_t)n) : 1u;
     }
+    g_run_ahead_depth = depth;
     {
         extern void nv2a_pb_scan_set_checkpoint(void (*fn)(uint32_t));
         nv2a_pb_scan_set_checkpoint(run_ahead_checkpoint);

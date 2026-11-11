@@ -342,6 +342,22 @@ int main(void)
     check(!nv2a_run_ahead_may_ack(1, 1, 0, 64), "no ack while a flip is held");
     check(!nv2a_run_ahead_may_ack(0, 0, 0, 64), "no ack without a kick");
 
+    /* The depth from RECOMP_DEBUG=run_ahead (on by default). */
+    check(nv2a_run_ahead_depth(NULL, 0) == NV2A_RUN_AHEAD_DEFAULT_DEPTH
+              && nv2a_run_ahead_depth("", 0) == NV2A_RUN_AHEAD_DEFAULT_DEPTH,
+          "unset: on at the default depth");
+    check(nv2a_run_ahead_depth(NULL, 1) == 0,
+          "unset in the deterministic mode: off");
+    check(nv2a_run_ahead_depth("64", 1) == 64,
+          "asked for in the deterministic mode: on");
+    check(nv2a_run_ahead_depth("0", 0) == 0 && nv2a_run_ahead_depth("off", 0) == 0,
+          "=0 and =off (a game default of 0): off");
+    check(nv2a_run_ahead_depth("1", 0) == 1 && nv2a_run_ahead_depth("on", 0) == 1,
+          "=1 and a value that is not a number: depth 1");
+    check(nv2a_run_ahead_depth("8", 0) == 8
+              && nv2a_run_ahead_depth("99999", 0) == NV2A_RUN_AHEAD_MAX_DEPTH,
+          "=N: N, capped");
+
     free(regs);
     printf("%s\n", failures ? "FAILED" : "all passed");
     return failures != 0;

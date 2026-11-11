@@ -59,6 +59,10 @@ extern "C" {
 /* PAD_CLOCK and PAD_QUIT: a game that gives them defaults tests
  * this first, since its public pin may predate them. */
 #define RECOMP_ENV_HAVE_PAD_CLOCK_ROW 1
+/* RUN_AHEAD is on at 64 when unset (it was opt-in). A game
+ * that runs better in the old lockstep gives D(RUN_AHEAD, "0") under this
+ * test, since its public pin may predate the row. */
+#define RECOMP_ENV_HAVE_RUN_AHEAD_DEFAULT 1
 
 #ifdef RECOMP_ENV_HAVE_GAME_KEYS
 #include "recomp_env_game.h"
@@ -257,7 +261,7 @@ extern "C" {
     X(PB_MERGE,          DEBUG, "pb_merge",        NULL,                       "=0: draw every guest batch on its own, no merging of back-to-back triangle batches on a GPU backend") \
     X(FAST_KICK,         DEBUG, "fast_kick",       "RECOMP_FAST_KICK",         "=0: ack loop ticks at Sleep(1)") \
     X(KICK_EVENT,        DEBUG, "kick_event",      NULL,                       "=1: the ack loop sleeps until the guest pokes it instead of polling the KickOff every ~50 us (default off)") \
-    X(RUN_AHEAD,         DEBUG, "run_ahead",       NULL,                       "=N: the walker publishes GET as it walks and acks the KickOff flush with up to N segments (1 for any other value but 0) submitted past its walk; D3D's notify NOPs raise the PGRAPH interrupt (default off; docs/env.md)") \
+    X(RUN_AHEAD,         DEBUG, "run_ahead",       NULL,                       "=N (1-1024): the walker publishes GET as it walks and acks the KickOff flush with up to N segments submitted past its walk; D3D's notify NOPs raise the PGRAPH interrupt. Unset: on at 64, off in the deterministic mode. =0 or =off (or a game default of 0): the old lockstep. A bare run_ahead, =on or any other non-number is depth 1, not 64 (docs/env.md)") \
     X(HOST_CPUS,         DEBUG, "host_cpus",       NULL,                       "=mask (hex): the whole process on these logical CPUs from start (Windows; a Deck-shaped PC run: 0xFF = 4 cores, 8 threads); default every CPU") \
     X(KICK_NAP,          DEBUG, "kick_nap",        NULL,                       "=hybrid|timer|delay|spin: how the ack loop naps between its ~50 us polls (docs/env.md)") \
     X(FORCE_RETURN,      DEBUG, "force_return",    "RECOMP_FORCE_RETURN",      "honour forced returns in the build") \
