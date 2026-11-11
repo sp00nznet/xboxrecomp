@@ -3628,6 +3628,14 @@ static int watch_arm(uint32_t va)
 #endif
 }
 
+int xbox_PeekRead32(uint32_t va, uint32_t *out)
+{
+    if (!peek_readable(va))
+        return 0;
+    *out = *(const volatile uint32_t *)((const uint8_t *)g_memory_offset + va);
+    return 1;
+}
+
 /* Print the RECOMP_PEEK globals. Shared, because the two moments worth
  * sampling are a hang and an early exit, and only the first had it: a title
  * whose main() returns during init never reaches the watchdog, so the one

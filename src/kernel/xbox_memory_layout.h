@@ -345,6 +345,9 @@ void xbox_WatchdogStart(void);
 /* Print the globals named by RECOMP_PEEK, tagged with `label`. No-op when
  * RECOMP_PEEK is unset. Called at a hang and at an early exit. */
 void xbox_PeekSample(const char *label);
+/* The guest dword at va into *out, if va is in a mapped window (RAM, the
+ * contiguous and tiled views, NV2A, MCPX, flash): 1, else 0. */
+int xbox_PeekRead32(uint32_t va, uint32_t *out);
 void xbox_WatchInit(void);
 
 /* ================================================================

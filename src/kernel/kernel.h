@@ -542,6 +542,21 @@ void xbox_kernel_bridge_init(void);
  * exit paths and the watchdog's hang report print it. */
 void xbox_kernel_summary_report(const char *why);
 
+/* RECOMP_TRACE=suspend[=va] (kernel_suspend_trace.c): the thread suspend and
+ * resume bridges note each call (kind 0 suspend, 1 resume; target is the
+ * guest's handle or thread object), and a host thread prints a [SUSPEND]
+ * line once a second, with the guest dword at va. Off, Note returns on one
+ * cached word. Format writes one line and starts the next second's ranges;
+ * Start (from the bridge init) starts the reporter once. */
+int      xbox_SuspendTraceOn(void);
+uint32_t xbox_SuspendTraceVa(void);
+void     xbox_SuspendTraceNote(int kind, uint32_t target, NTSTATUS status,
+                               uint32_t prev);
+/* A full line: 64 targets at about 150 characters each. */
+#define XBOX_SUSPEND_TRACE_LINE 10240
+size_t   xbox_SuspendTraceFormat(char *buf, size_t n, uint32_t t_s);
+void     xbox_SuspendTraceStart(void);
+
 /**
  * Per-title kernel ordinal remap.
  *

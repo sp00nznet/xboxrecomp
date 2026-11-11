@@ -588,6 +588,17 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/kernel_sync.c | - | g_timer_cs | file_static | keep | - | host lock for the timer queue |
 | src/kernel/kernel_sync.c | - | g_timer_cs_init | once | keep | - | no rerun: host lock init only |
 
+### src/kernel/kernel_suspend_trace.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/kernel/kernel_suspend_trace.c | - | s_on | file_static | keep | - | suspend-trace diagnostic, process-wide |
+| src/kernel/kernel_suspend_trace.c | - | s_va | file_static | keep | - | suspend-trace diagnostic, process-wide |
+| src/kernel/kernel_suspend_trace.c | - | s_slot | file_static | keep | - | suspend-trace diagnostic, process-wide |
+| src/kernel/kernel_suspend_trace.c | - | s_slot_full | file_static | keep | - | suspend-trace diagnostic, process-wide |
+| src/kernel/kernel_suspend_trace.c | - | s_t0 | file_static | keep | - | suspend-trace diagnostic, process-wide |
+| src/kernel/kernel_suspend_trace.c | - | s_started | once | keep | - | suspend-trace diagnostic, process-wide |
+
 ### src/kernel/kernel_thread.c
 
 | file | scope | name | kind | class | hook | why |

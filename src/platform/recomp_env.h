@@ -205,6 +205,7 @@ extern "C" {
     X(HEAP_TRACE,        TRACE, "heap",            "RECOMP_HEAP_TRACE",        "=va: heap blocks covering that address") \
     X(FILE_TRACE,        TRACE, "file",            NULL,                       "[READ]/[WRITE] records per NtReadFile/NtWriteFile call: caller, buffer, offset, length, status and the first bytes") \
     X(KERNEL_SUMMARY,    TRACE, "kernel_summary",  NULL,                       "the 2 s [KERNEL] summary block: cumulative calls, the ordinal the tick landed on, esp, the six most-called ordinals") \
+    X(SUSPEND_TRACE,     TRACE, "suspend",         NULL,                       "[=va]: [SUSPEND] line once a second: per target thread, the NtSuspendThread/NtResumeThread (and Ke forms) calls that second and in all, the previous suspend counts they returned, and with va the guest dword there, now and at each target's last call") \
     X(KERNEL_LOG_BUDGET, TRACE, "kernel_budget",   "RECOMP_KERNEL_LOG_BUDGET", "=n: kernel log lines per call site (200)") \
     X(TRACE_BUDGET,      TRACE, "call_budget",     "RECOMP_TRACE_BUDGET",      "=n: call-trace line budget (400000)") \
     X(TRACE_ARGS,        TRACE, "call_args",       "RECOMP_TRACE_ARGS",        "=n: call trace prints n stack args") \

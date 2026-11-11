@@ -6594,6 +6594,26 @@ static void bridge_sched_resume_unknown(uint32_t arg, int self)
             " object or handle: the host resumes it (first only)\n", arg);
 }
 
+/* RECOMP_TRACE=suspend (kernel_suspend_trace.c): the host path's previous
+ * count, which the call writes to the guest only when it asked for it.
+ * Read through a local only with the trace on, so stock passes the guest's
+ * pointer as before. */
+static NTSTATUS bridge_host_suspend(int kind, uint32_t arg, uint32_t count_va)
+{
+    HANDLE h = bridge_resolve_handle(arg);
+    PULONG out = count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL;
+    ULONG prev = 0;
+    NTSTATUS st;
+
+    if (!xbox_SuspendTraceOn())
+        return kind ? xbox_NtResumeThread(h, out) : xbox_NtSuspendThread(h, out);
+    st = kind ? xbox_NtResumeThread(h, &prev) : xbox_NtSuspendThread(h, &prev);
+    if (st == STATUS_SUCCESS && out)
+        *out = prev;
+    xbox_SuspendTraceNote(kind, arg, st, prev);
+    return st;
+}
+
 static void bridge_NtSuspendThread(void)
 {
     uint32_t count_va = STACK_ARG(1);
@@ -6605,18 +6625,26 @@ static void bridge_NtSuspendThread(void)
             || thobj_gate_count(thobj_target(STACK_ARG(0)), 1, &prev)) {
         if (count_va)
             BRIDGE_MEM32(count_va) = prev;
+        xbox_SuspendTraceNote(0, STACK_ARG(0), STATUS_SUCCESS, prev);
         g_eax = 0;
         return;
     }
-    if (bridge_sched_self_suspend(self, &prev)) {
-        if (count_va)
-            BRIDGE_MEM32(count_va) = prev;
-        g_eax = 0;
+    if (self) {
+        /* Noted before the park, since a self-suspend returns only once
+         * resumed; a running thread's previous count is 0. */
+        xbox_SuspendTraceNote(0, 0xFFFFFFFEu, STATUS_SUCCESS, 0);
+        if (!bridge_sched_self_suspend(self, &prev))
+            g_eax = (uint32_t)xbox_NtSuspendThread(
+                bridge_resolve_handle(STACK_ARG(0)),
+                count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+        else {
+            if (count_va)
+                BRIDGE_MEM32(count_va) = prev;
+            g_eax = 0;
+        }
         return;
     }
-    g_eax = (uint32_t)xbox_NtSuspendThread(
-        bridge_resolve_handle(STACK_ARG(0)),
-        count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+    g_eax = (uint32_t)bridge_host_suspend(0, STACK_ARG(0), count_va);
 }
 
 /* ── NtResumeThread (ordinal 224, 2 args) */
@@ -6630,14 +6658,13 @@ static void bridge_NtResumeThread(void)
             || thobj_gate_count(thobj_target(STACK_ARG(0)), -1, &prev)) {
         if (STACK_ARG(1))
             BRIDGE_MEM32(STACK_ARG(1)) = prev;
+        xbox_SuspendTraceNote(1, STACK_ARG(0), STATUS_SUCCESS, prev);
         g_eax = 0;
         return;
     }
     if (!obj)
         bridge_sched_resume_unknown(STACK_ARG(0), self);
-    g_eax = (uint32_t)xbox_NtResumeThread(
-        bridge_resolve_handle(STACK_ARG(0)),
-        (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
+    g_eax = (uint32_t)bridge_host_suspend(1, STACK_ARG(0), STACK_ARG(1));
 }
 
 /* ── ObfDereferenceObject (ordinal 250, fastcall: object in ecx)
@@ -9512,6 +9539,7 @@ static void bridge_KeResumeThread(void)
 
     if ((obj && xbox_GuestSchedSuspend(obj, -1, &prev))
             || thobj_gate_count(thobj_target(STACK_ARG(0)), -1, &prev)) {
+        xbox_SuspendTraceNote(1, STACK_ARG(0), STATUS_SUCCESS, prev);
         g_eax = prev;
         return;
     }
@@ -9525,6 +9553,10 @@ static void bridge_KeResumeThread(void)
         g_eax = (uint32_t)ResumeThread(hThread);
     else
         g_eax = 0;
+    if (hThread)
+        xbox_SuspendTraceNote(1, STACK_ARG(0),
+                              g_eax == 0xFFFFFFFFu ? STATUS_UNSUCCESSFUL
+                                                   : STATUS_SUCCESS, g_eax);
 }
 
 /* --- KeSuspendThread (ordinal 152, 1 arg = 4 bytes) --- */
@@ -9537,9 +9569,12 @@ static void bridge_KeSuspendThread(void)
 
     if ((obj && xbox_GuestSchedSuspend(obj, 1, &prev))
             || thobj_gate_count(thobj_target(STACK_ARG(0)), 1, &prev)) {
+        xbox_SuspendTraceNote(0, STACK_ARG(0), STATUS_SUCCESS, prev);
         g_eax = prev;
         return;
     }
+    if (self)
+        xbox_SuspendTraceNote(0, 0xFFFFFFFEu, STATUS_SUCCESS, 0);
     if (bridge_sched_self_suspend(self, &prev)) {
         g_eax = prev;
         return;
@@ -9552,6 +9587,10 @@ static void bridge_KeSuspendThread(void)
         g_eax = (uint32_t)SuspendThread(hThread);
     else
         g_eax = 0;
+    if (hThread && !self)
+        xbox_SuspendTraceNote(0, STACK_ARG(0),
+                              g_eax == 0xFFFFFFFFu ? STATUS_UNSUCCESSFUL
+                                                   : STATUS_SUCCESS, g_eax);
 }
 
 /* --- KeAlertResumeThread (ordinal 92, 1 arg = 4 bytes) --- */
@@ -12161,6 +12200,7 @@ void xbox_kernel_bridge_init(void)
      * other thread. */
     xbox_DpcMarkGuestThread();
     guest_cpu_join();
+    xbox_SuspendTraceStart();
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
             g_thunk_table_count, g_thunk_table_base);
 
