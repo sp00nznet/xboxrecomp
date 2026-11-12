@@ -22,7 +22,7 @@ One per stage, in the order you run them.
 - [Step 3: Function Identification](pipeline/03-function-id.md)
 - [Step 4: x86 to C Lifting](pipeline/04-lifting.md) — including jump tables the pattern match misses, and privileged registers
 - [Step 5: Building the Runtime](pipeline/05-runtime.md) — manual overrides (replace, don't wrap), and `RECOMP_ABI_CHECK` wiring
-- [Step 6: Iterative Debugging](pipeline/06-debugging.md) — including the ABI checker's standing reports, and guest registers in cdb
+- [Step 6: Iterative Debugging](pipeline/06-debugging.md) — including the ABI checker's standing reports, guest registers in cdb, and the store trace (who wrote an address)
 
 ## Technical Deep Dives
 

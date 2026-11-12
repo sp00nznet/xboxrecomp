@@ -216,6 +216,9 @@ extern "C" {
     X(TRACE_ARGS,        TRACE, "call_args",       "RECOMP_TRACE_ARGS",        "=n: call trace prints n stack args") \
     X(TRACE_DEREF,       TRACE, "call_deref",      "RECOMP_TRACE_DEREF",       "call trace follows pointer args") \
     X(TRACE_PROFILE,     TRACE, "call_profile",    "RECOMP_TRACE_PROFILE",     "call profile; =n report interval") \
+    X(STORE_TRACE,       TRACE, "stores",          NULL,                       "=LO+LEN|LO-HI,...: guest stores into those ranges, in code lifted with --trace-stores (unset: the lift's defaults; 0: off); rows to stores_out") \
+    X(STORE_TRACE_OUT,   TRACE, "stores_out",      NULL,                       "=path: the store-trace file (store_trace.bin); read it with python -m tools.recomp.store_trace") \
+    X(STORE_TRACE_MAX,   TRACE, "stores_max",      NULL,                       "=n: store-trace rows before it stops (4194304, 128 MB; 0: no limit)") \
     X(IRQL_TRACE,        TRACE, "irql",            "RECOMP_IRQL_TRACE",        "first IRQL transitions") \
     X(APU_TRACE,         TRACE, "apu",             "RECOMP_APU_TRACE",         "APU register and frame trace; [APU-IRQ] line every 5 s") \
     X(AUDIO_HOST,        TRACE, "audio_host",      NULL,                       "host audio playback vs wall clock; [AUDIO-HOST] starve lines (on with apu)") \

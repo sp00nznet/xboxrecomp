@@ -504,6 +504,9 @@ class FunctionTranslator:
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
         self.trace_functions = set(trace_functions or ())
+        # --trace-stores: None (off), or the gen-time default ranges string.
+        self.trace_stores = None
+        self.trace_stores_functions = None
         self.force_returns = dict(force_returns or {})
         self.disasm = Disassembler()
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
@@ -2804,6 +2807,19 @@ class FunctionTranslator:
         # kept coming up. The lifter emits the matching exit trace at each ret.
         self.lifter.trace_exit_name = name if start in self.trace_functions else None
 
+        # --trace-stores: the store-side twin of the entry trace. Who wrote
+        # this address is the question a per-frame state map needs, and a
+        # watchpoint cannot answer it on a host with 16 KB pages. The hooks
+        # are inert until RECOMP_TRACE=stores=... names a range at run time
+        # (or the lift's default ranges do).
+        self.lifter.trace_stores = bool(
+            self.trace_stores is not None
+            and (self.trace_stores_functions is None
+                 or start in self.trace_stores_functions))
+        if self.lifter.trace_stores:
+            lines.append("    uint32_t _st_a = 0, _st_n = 0;"
+                         " (void)_st_a; (void)_st_n;")
+
         # --force-return: hand this function's callers a constant.
         #
         # Bring-up keeps arriving at the same shape. A title waits on a
@@ -3252,6 +3268,7 @@ class BatchTranslator:
     """Translates multiple functions and writes C source files."""
 
     entry_stubs = False     # --entry-stubs; see translate_batch_split
+    trace_stores = None     # --trace-stores ranges; see _write_store_trace_header
 
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
@@ -3259,11 +3276,14 @@ class BatchTranslator:
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
                  icall_sites_json_path=None, spin_waits=None,
-                 back_edge_yield=False, entry_stubs=False):
+                 back_edge_yield=False, entry_stubs=False,
+                 trace_stores=None, trace_stores_functions=None):
         """spin_waits: a spin_waits.SpinWaitConfig (--spin-waits), or None.
         back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
         (--back-edge-yield; off by default). entry_stubs: an unresolved
-        target inside a function enters a copy of it (--entry-stubs)."""
+        target inside a function enters a copy of it (--entry-stubs).
+        trace_stores: the default ranges of --trace-stores ("" for none), or
+        None when off; trace_stores_functions limits it to those starts."""
         self.xbe_path = xbe_path
         self.back_edge_yield = back_edge_yield
         # Starts of the seeds a run saw (--seeds, `"observed": true`): the
@@ -3333,6 +3353,13 @@ class BatchTranslator:
             from .spin_waits import SpinWaitReport
             self.translator.spin_waits = SpinWaitReport(spin_waits)
         self.translator.back_edge_yield = self.back_edge_yield
+        self.trace_stores = trace_stores
+        self.translator.trace_stores = trace_stores
+        # None means every function. An empty list stays empty (nothing
+        # instrumented) rather than silently widening to the whole binary.
+        self.translator.trace_stores_functions = (
+            set(trace_stores_functions)
+            if trace_stores_functions is not None else None)
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         for explicit_helper in (seh_prolog, seh_epilog):
@@ -3414,6 +3441,25 @@ class BatchTranslator:
             return None
         return self.translator.translate_function(addr, func_info)
 
+    def _write_store_trace_header(self, output_dir):
+        """gen/recomp_store_trace.h under --trace-stores: the template with
+        the lift's default ranges in front. Without the option a copy left by
+        an instrumented lift is removed, so the stock gen/ is exactly what it
+        was before the option existed."""
+        dst = os.path.join(output_dir, "recomp_store_trace.h")
+        if self.trace_stores is None:
+            if os.path.exists(dst):
+                os.remove(dst)
+            return
+        src = os.path.join(os.path.dirname(__file__), "..", "..",
+                           "templates", "runtime", "recomp_store_trace.h")
+        with open(src, "r", encoding="utf-8") as f:
+            body = f.read()
+        ranges = self.trace_stores.replace("\\", "").replace('"', "")
+        write_if_changed(dst, (
+            "/* Written by tools.recomp --trace-stores; the default ranges. */\n"
+            f'#define RECOMP_STORE_TRACE_DEFAULTS "{ranges}"\n' + body))
+
     def translate_batch(self, func_list, output_file=None, max_funcs=None,
                         verbose=False):
         """
@@ -3452,6 +3498,8 @@ class BatchTranslator:
         c_chunks.append("")
         c_chunks.append('#define RECOMP_GENERATED_CODE')
         c_chunks.append('#include "recomp_types.h"')
+        if self.trace_stores is not None:
+            c_chunks.append('#include "recomp_store_trace.h"')
         c_chunks.append('#include <math.h>')
         c_chunks.append("")
         c_chunks.append("/* Forward declarations */")
@@ -3489,6 +3537,10 @@ class BatchTranslator:
         # Write output
         if output_file is None:
             output_file = os.path.join(self.output_dir, "recompiled.c")
+        # The header sits beside the C it serves. Written on and removed off,
+        # so a stock lift over an instrumented gen/ leaves no marker behind.
+        self._write_store_trace_header(
+            os.path.dirname(os.path.abspath(output_file)))
 
         output_text = "\n".join(c_chunks)
         with open(output_file, "w", encoding="utf-8") as f:
@@ -3644,6 +3696,8 @@ class BatchTranslator:
             '#include "recomp_types.h"',
             "",
         ]
+        if self.trace_stores is not None:
+            header_lines[-1:-1] = ['#include "recomp_store_trace.h"']
         for addr, name, _ in translations:
             decl = self._make_declaration(addr, name)
             header_lines.append(f"{decl};")
@@ -3714,6 +3768,8 @@ class BatchTranslator:
             print(f"  WARNING: could not write recomp_types.h ({e}); copy "
                   f"it from templates/runtime/ by hand or the build will "
                   f"not find it", file=sys.stderr)
+
+        self._write_store_trace_header(output_dir)
 
         # Split translations into chunks and write .c files
         generated_files = [header_path]

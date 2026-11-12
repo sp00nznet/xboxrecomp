@@ -251,6 +251,72 @@ fprintf(stderr, "DIAG: state=%d rwWorld=%08X carObj=%08X heapCursor=%08X\n",
 );
 ```
 
+## Store Trace: Who Wrote This Address
+
+A state trace shows that a global changed; the store trace shows which
+instruction changed it, every frame. It is a debug lift, never a shipping
+one:
+
+```sh
+python -m tools.recomp ... --trace-stores 0x00100000+16 \
+    [--trace-stores-functions funcs.json]
+RECOMP_TRACE=stores=0x00100000+16,stores_out=trace.bin,stores_max=2000000 ./game
+python -m tools.recomp.store_trace trace.bin --addr 0x00100000+16
+```
+
+`--trace-stores` brackets every guest store that can leave the stack with a
+range check, and writes `gen/recomp_store_trace.h` beside the C (a stock
+lift removes it again). `RECOMP_TRACE=stores=LO+LEN,LO-HI,...` (up to 32
+ranges) overrides the lift's default ranges at run time; `stores=0` turns it
+off. Each hit is a 32-byte row: guest va, address, size, value, function,
+flip, thread. `stores_max=N` stops the trace after N rows (default
+4194304, 128 MB; 0 means no limit). Each thread's rows go to its own 256 KB ring; a full ring,
+every 60 flips and every way the process ends write them out: exit,
+`ExitProcess`, a closed window, SIGINT and SIGTERM, the watchdog, and a
+crash that a reporter sees. A string store (`rep stos`, `rep movs`) is one
+row per traced range it overlaps, clipped to that range; inside a range of
+64 KB or more the clipped part is cut into rows of 0xFFFF bytes, so the
+16-bit size never saturates.
+
+How much a bad ending loses:
+
+- **Crashes.** The toolkit's reporter (Windows exceptions, abort, SIGILL,
+  SIGFPE, SIGTRAP) and the watchdog run the last-words hooks
+  (`recomp_fatal_on_death`). On POSIX a game installs its own SIGSEGV and
+  SIGBUS handler, so that handler must call `recomp_fatal_run_on_death()`
+  after its report, or a segfault loses the rows logged since the last
+  write. BLiNX 2 (`cat`) and BLiNX 1 (`blinx`) do; in a stock build no hook
+  is registered and the call does nothing.
+- **Hard kills.** SIGKILL and `taskkill /F` run no code: the rows since the
+  last write are lost.
+- **A stop signal on a busy thread.** The 60-flip flush blocks SIGINT and
+  SIGTERM while it holds the trace's lock, so a stop never lands under it.
+  A stop that lands on a thread in the middle of an append still costs that
+  thread's ring (the handler cannot take a lock its own thread holds, and
+  gives the ring up after 500 ms); the other rings are written.
+- **A suspended thread (Windows).** `SuspendThread` can stop a guest thread
+  in the middle of an append, with its ring locked. The 60-flip flush waits
+  50 ms for a ring, then leaves it for the next interval, so it never hangs;
+  that ring's rows come later (or at the end) instead.
+
+A traced Windows run has not been benched yet; run one before relying on
+the first Windows trace.
+
+What it does not see:
+
+- **Stack stores.** An esp-based store or a push is never traced, so
+  `mov [esp+8], eax` into a struct on the stack is invisible while the same
+  store through `lea eax, [esp+8]; mov [eax], ...` is logged.
+- **Writers outside gen.** Manual code (`recomp_manual.c`), mods, kernel
+  HLE (`NtReadFile`, `memcpy` thunks) and device DMA write guest memory
+  without a hook. A value that changes with no row came from one of these.
+- **Implicit operands.** `maskmovq` and `maskmovdqu` write `[edi]` without
+  naming it.
+
+And one store it logs that changes nothing: a failed `cmpxchg` or
+`cmpxchg8b` logs the unchanged value, as the hardware's locked write-back
+does. A port compared row for row against gen must log it the same way.
+
 ## .rdata Corruption
 
 ### The Problem

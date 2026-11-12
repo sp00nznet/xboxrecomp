@@ -322,6 +322,23 @@ def main():
                         help="JSON list of addresses to emit an entry trace "
                              "for (RECOMP_TRACE_ENTER). For bring-up: shows "
                              "which call in an init chain is not returning")
+    parser.add_argument("--trace-stores", metavar="RANGES", nargs="?",
+                        const="", default=None,
+                        help="Bracket every guest store that can leave the "
+                             "stack with a range check that logs a hit "
+                             "(templates/runtime/recomp_store_trace.h): guest "
+                             "va, address, size, value and function. RANGES "
+                             "(LO+LEN or LO-HI, comma-separated) is the "
+                             "default; RECOMP_TRACE=stores=... overrides it at "
+                             "run time. Debug only: off, the output is "
+                             "unchanged. Blind spots: esp-relative stores "
+                             "and pushes, writes by manual code, mods, "
+                             "kernel HLE and DMA. A failed cmpxchg logs "
+                             "the unchanged value, as the locked write-back "
+                             "does")
+    parser.add_argument("--trace-stores-functions", metavar="FILE",
+                        help="JSON list of function addresses: --trace-stores "
+                             "instruments only these")
     parser.add_argument("--force-return", metavar="ADDR=VALUE",
                         action="append", default=[],
                         help="Make a function hand its callers a constant "
@@ -373,6 +390,17 @@ def main():
                              "gen/recomp_names.h)")
 
     args = parser.parse_args()
+
+    trace_stores_functions = None
+    if args.trace_stores_functions:
+        if args.trace_stores is None:
+            print("WARNING: --trace-stores-functions does nothing without "
+                  "--trace-stores", file=sys.stderr)
+        trace_stores_functions = _load_addrs(args.trace_stores_functions)
+        if not trace_stores_functions and args.trace_stores is not None:
+            print(f"WARNING: {args.trace_stores_functions} lists no "
+                  "function: --trace-stores instruments nothing",
+                  file=sys.stderr)
 
     spin_waits = None
     if args.spin_waits:
@@ -458,6 +486,8 @@ def main():
         spin_waits=spin_waits,
         back_edge_yield=args.back_edge_yield,
         entry_stubs=args.entry_stubs,
+        trace_stores=args.trace_stores,
+        trace_stores_functions=trace_stores_functions,
     )
     translator.observed_seeds = _load_observed_seeds(args.seeds)
 

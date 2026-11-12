@@ -110,6 +110,34 @@ const char *recomp_fatal_signal_name(int sig)
     }
 }
 
+#define ON_DEATH 4
+static recomp_fatal_fn s_on_death[ON_DEATH];
+static volatile int s_died;
+
+int recomp_fatal_on_death(recomp_fatal_fn fn)
+{
+    for (int i = 0; i < ON_DEATH; i++) {
+        recomp_fatal_fn cur = NULL;
+        if (__atomic_compare_exchange_n(&s_on_death[i], &cur, fn, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
+            || cur == fn)
+            return 1;
+    }
+    return 0;
+}
+
+/* Once per process: a second death while these run goes straight on. */
+void recomp_fatal_run_on_death(void)
+{
+    if (__atomic_exchange_n(&s_died, 1, __ATOMIC_SEQ_CST))
+        return;
+    for (int i = 0; i < ON_DEATH; i++) {
+        recomp_fatal_fn fn = __atomic_load_n(&s_on_death[i], __ATOMIC_ACQUIRE);
+        if (fn != NULL)
+            fn();
+    }
+}
+
 /* One report per process: a second death while the first is written (or a
  * second thread dying) goes straight to the default end. */
 static volatile int s_reported;
@@ -201,6 +229,7 @@ static LONG WINAPI fatal_filter(PEXCEPTION_POINTERS ep)
                         ep && ep->ExceptionRecord
                             ? ep->ExceptionRecord->ExceptionAddress : NULL);
     win_write(line);
+    recomp_fatal_run_on_death();
     return verdict;
 }
 
@@ -215,6 +244,7 @@ static void fatal_abort(int sig)
         return;
     recomp_fatal_format(line, sizeof line, "SIGABRT", "abort()", NULL);
     win_write(line);
+    recomp_fatal_run_on_death();
 }
 
 void recomp_fatal_install(void)
@@ -298,6 +328,7 @@ static void fatal_signal(int sig, siginfo_t *si, void *ucv)
                 off += (size_t)w;
             }
         }
+        recomp_fatal_run_on_death();
     }
     /* End as the process would have: the default action, by the same
      * signal, so the exit status and any core dump are unchanged. The signal

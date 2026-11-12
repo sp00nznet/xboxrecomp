@@ -29,6 +29,7 @@
 #include "guest_vmem.h"
 #include "xbe_sections.h"
 #include "platform/host_time.h"
+#include "platform/recomp_fatal.h"   /* the watchdog runs the last words */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3791,6 +3792,8 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                     (unsigned)hi, (unsigned)lo);
         fflush(stderr);
     }
+    /* And the debug writers' last words (the store trace's rings). */
+    recomp_fatal_run_on_death();
     _exit(3);
     return 0;
 }

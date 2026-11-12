@@ -665,6 +665,28 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/recomp_hook.c | - | s_chains | file_static | keep | - | mod hook chains published at init; code VAs fixed |
 | src/kernel/recomp_hook.c | - | s_published | file_static | keep | - | mod hook chains published at init; code VAs fixed |
 
+### src/kernel/recomp_store_trace.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/kernel/recomp_store_trace.c | - | g_store_trace_state | global | keep | - | debug store trace: ranges, rings and file run on across a reset |
+| src/kernel/recomp_store_trace.c | - | g_store_trace_nranges | global | keep | - | debug store trace: ranges, rings and file run on across a reset |
+| src/kernel/recomp_store_trace.c | - | g_store_trace_lo | global | keep | - | debug store trace: ranges, rings and file run on across a reset |
+| src/kernel/recomp_store_trace.c | - | g_store_trace_hi | global | keep | - | debug store trace: ranges, rings and file run on across a reset |
+| src/kernel/recomp_store_trace.c | - | t_ring | tls | keep | - | debug store trace: ranges, rings and file run on across a reset |
+| src/kernel/recomp_store_trace.c | - | s_rings | file_static | keep | - | debug store trace: ranges, rings and file run on across a reset |
+| src/kernel/recomp_store_trace.c | - | s_fd | file_static | keep | - | debug store trace: ranges, rings and file run on across a reset |
+| src/kernel/recomp_store_trace.c | - | s_last_flush_frame | file_static | keep | - | debug store trace: ranges, rings and file run on across a reset |
+| src/kernel/recomp_store_trace.c | - | s_frames | file_static | keep | - | test seam: the frame clock the trace reads |
+| src/kernel/recomp_store_trace.c | - | s_old_int | file_static | keep | - | host signal handler chained to at exit |
+| src/kernel/recomp_store_trace.c | - | s_old_term | file_static | keep | - | host signal handler chained to at exit |
+| src/kernel/recomp_store_trace.c | recomp_store_trace_init | exits_taken | local_static | keep | - | no rerun: exit, signal and death hooks stay registered |
+| src/kernel/recomp_store_trace.c | - | s_seq | file_static | keep | - | debug store trace: ranges, rings and file run on across a reset |
+| src/kernel/recomp_store_trace.c | - | s_rows | file_static | keep | - | debug store trace: ranges, rings and file run on across a reset |
+| src/kernel/recomp_store_trace.c | - | s_max_rows | file_static | keep | - | debug store trace: ranges, rings and file run on across a reset |
+| src/kernel/recomp_store_trace.c | - | s_threads | file_static | keep | - | debug store trace: ranges, rings and file run on across a reset |
+| src/kernel/recomp_store_trace.c | - | s_lock | file_static | keep | - | host lock, never held at a stop point |
+
 ### src/kernel/recomp_trace.c
 
 | file | scope | name | kind | class | hook | why |
@@ -2812,6 +2834,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/platform/recomp_fatal.c | - | s_reported | file_static | keep | - | crash handler: one report per process |
 | src/platform/recomp_fatal.c | - | s_installed | once | keep | - | no rerun: host crash handlers stay installed |
 | src/platform/recomp_fatal.c | - | s_prev_filter | file_static | keep | - | crash handler: the filter chained to |
+| src/platform/recomp_fatal.c | - | s_on_death | file_static | keep | - | crash handler: last-words callbacks |
+| src/platform/recomp_fatal.c | - | s_died | file_static | keep | - | crash handler: last words run once per process |
 
 ### src/platform/win32_compat.c
 

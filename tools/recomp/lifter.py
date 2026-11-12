@@ -18,7 +18,7 @@ import os
 import re
 import struct
 
-from .disasm import Instruction, Operand, LOOP_JUMPS
+from .disasm import Instruction, Operand, LOOP_JUMPS, COND_JUMPS
 from .config import is_code_address, is_data_address, va_to_file_offset
 
 # Function export names of the Windows libraries the host exe links
@@ -1461,6 +1461,7 @@ class Lifter:
         self.publishes_ebp = False  # Set per-function: has a real frame
         self.trace_exit_name = None  # Set per-function when traced
         self.force_return_value = None   # Set per-function by --force-return
+        self.trace_stores = False  # Set per-function by --trace-stores
         # Every direct call target we emit a name for, as {addr: name}. The
         # batch translator diffs this against the functions it actually defined
         # so it can stub out the remainder (see translate_batch_split).
@@ -4220,6 +4221,82 @@ def publish_flags(state, note="flags for pushfd"):
             + " | ".join(bits) + f"; /* {note} */"]
 
 
+# --trace-stores: which operand of an instruction is a guest store.
+#
+# Most writers name their destination first, so the rule is "a memory first
+# operand", less the instructions whose first operand is only read. x87 is the
+# other way round -- `fld dword [eax]` loads through its first operand -- so
+# it is an allow-list of the stores instead.
+_STORE_X87 = frozenset({
+    "fst", "fstp", "fist", "fistp", "fisttp", "fbstp",
+    "fnstsw", "fstsw", "fnstcw", "fstcw", "fnstenv", "fstenv",
+    "fnsave", "fsave", "fxsave",
+})
+_STORE_READ_ONLY = frozenset({
+    "cmp", "test", "bt", "push", "call", "jmp", "ljmp", "lcall", "lea",
+    "nop", "ldmxcsr",
+    "mul", "div", "idiv", "cmpsb", "cmpsw", "cmpsd", "clflush", "invlpg",
+    "bound", "verr", "verw", "lgdt", "lidt", "lldt", "ltr", "lmsw",
+    "prefetchnta", "prefetcht0", "prefetcht1", "prefetcht2", "prefetchw",
+})
+# Stores whose width the operand does not carry.
+_STORE_SIZE = {"fnstenv": 28, "fstenv": 28, "fnsave": 108, "fsave": 108,
+               "fxsave": 512, "cmpxchg8b": 8}
+_REP_STORE = {"stosb": 1, "stosw": 2, "stosd": 4,
+              "movsb": 1, "movsw": 2, "movsd": 4}
+
+
+def _store_operand(insn):
+    """The memory operand insn writes, or None. Stack slots (esp-based) and
+    the TIB (fs) are never the state a store trace is after, so they are
+    left out rather than paying a range check on every push and SEH frame.
+    maskmovq and maskmovdqu are missed too: they write an implicit [edi]
+    and name only registers. A failed cmpxchg still counts as a store, of
+    the unchanged value, as the hardware's locked write-back is."""
+    m = insn.mnemonic
+    ops = insn.operands or []
+    if m.startswith("lock "):
+        m = m[5:]
+    if m in ("xchg", "xadd", "cmpxchg"):
+        cand = next((o for o in ops if o.type == "mem"), None)
+    elif m.startswith("f"):
+        cand = ops[0] if m in _STORE_X87 and ops else None
+    elif (m in _STORE_READ_ONLY or m in COND_JUMPS or m in LOOP_JUMPS
+          or (m == "imul" and len(ops) == 1)):
+        cand = None
+    else:
+        cand = ops[0] if ops else None
+    if cand is None or cand.type != "mem":
+        return None
+    if cand.mem_base in ("esp", "sp") or getattr(cand, "mem_seg", None) == "fs":
+        return None
+    return cand
+
+
+def _trace_store(lifter, insn, results):
+    """results with the store-trace hooks around them: the address is taken
+    before the instruction (its registers may be what it writes), the row
+    after it, so the logged value is what the store left in memory."""
+    m = insn.mnemonic
+    func = lifter.func_start
+    if m.startswith("rep") and " " in m and not _has_xmm_operand(insn.operands):
+        size = _REP_STORE.get(m.split()[-1])
+        if size is None:
+            return results
+        # rep stos/movs is a range: DF=1 walks it down from edi.
+        pre = (f"_st_n = ecx * {size}u; "
+               f"_st_a = g_df ? edi + {size}u - _st_n : edi;")
+        post = f"RECOMP_STORE_N(0x{insn.address:08X}u, 0x{func:08X}u);"
+        return [pre] + list(results) + [post]
+    op = _store_operand(insn)
+    if op is None:
+        return results
+    size = _STORE_SIZE.get(m.replace("lock ", ""), op.mem_size or 4)
+    pre = f"_st_a = (uint32_t)({_fmt_mem(op)});"
+    post = (f"RECOMP_STORE(0x{insn.address:08X}u, 0x{func:08X}u, {size}u);")
+    return [pre] + list(results) + [post]
+
+
 def lift_basic_block(lifter, bb, flag_state=None):
     """
     Lift a basic block to C statements.
@@ -4371,10 +4448,12 @@ def lift_basic_block(lifter, bb, flag_state=None):
             cond = _make_setcc_value(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
             if cond:
-                stmts.append(
-                    _fmt_operand_write(curr.operands[0],
-                                       f"({cond}) ? 1 : 0")
-                    + f" /* {curr.mnemonic} */")
+                setcc = [_fmt_operand_write(curr.operands[0],
+                                            f"({cond}) ? 1 : 0")
+                         + f" /* {curr.mnemonic} */"]
+                if lifter.trace_stores:
+                    setcc = _trace_store(lifter, curr, setcc)
+                stmts.extend(setcc)
                 i += 1
                 continue
 
@@ -4439,6 +4518,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 if zf:
                     stmts.append(f"_flags = ({zf[0]}) ? 1 : 0;"
                                  " /* ZF in: a zero count keeps it */")
+        if lifter.trace_stores:
+            results = _trace_store(lifter, curr, results)
         stmts.extend(results)
 
         # Track flag-setting instructions

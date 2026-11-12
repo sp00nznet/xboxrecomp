@@ -52,6 +52,16 @@ const char *recomp_fatal_signal_name(int sig);
 size_t recomp_fatal_format(char *buf, size_t n, const char *what,
                            const char *detail, const void *pc);
 
+/* Last words: up to four functions run once when a reported death ends the
+ * process (after the [FATAL] line), and from paths that end it without a
+ * signal (the kernel watchdog's _exit). They run inside a signal handler or
+ * on a thread whose stack may have overflowed, so they must be best effort:
+ * no malloc, no stdio, locks only tried with a bound. Adding one twice keeps
+ * one; 0 when the table is full. Any thread. */
+typedef void (*recomp_fatal_fn)(void);
+int recomp_fatal_on_death(recomp_fatal_fn fn);
+void recomp_fatal_run_on_death(void);
+
 #ifdef __cplusplus
 }
 #endif

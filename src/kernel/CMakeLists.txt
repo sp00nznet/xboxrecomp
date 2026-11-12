@@ -38,6 +38,7 @@ set(KERNEL_SOURCES
     guest_vmem.c
     icall_feedback.c
     recomp_trace.c
+    recomp_store_trace.c
     recomp_hook.c
     recomp_hook_run.c
     recomp_guest_call.c
@@ -144,6 +145,10 @@ target_include_directories(xbox_kernel PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${XBOXRECOMP_SRC_DIR}
 )
+# The store trace's runtime includes the header the lifter puts in gen/, so
+# the two cannot drift; only that file sees templates/runtime.
+set_source_files_properties(recomp_store_trace.c PROPERTIES
+    INCLUDE_DIRECTORIES "${XBOXRECOMP_SRC_DIR}/../templates/runtime;${XBOXRECOMP_SRC_DIR}/platform")
 
 if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
