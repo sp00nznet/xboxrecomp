@@ -32,7 +32,6 @@
 #include <windows.h>
 #include "recomp_env.h"
 #include "img_dump.h"
-#include "recomp_exit_hook.h"
 #include "mem_stats.h"
 #include <d3d11.h>
 #include <d3d11_1.h>   /* ID3D11DeviceContext1::ClearView, for a partial clear */
@@ -67,12 +66,10 @@
 #include "nv2a_scene_ao_shaders.h"
 #include "nv2a_hex_tile.h"   /* nv2a_hex_wrap_ok */
 #include "shader_cache.h"
+#include "d3d11_host.h"
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
-#include "video/video_player.h"   /* xbox_FramebufferWindowTitleText */
-#include "video/window_title.h"
 
 #define LOGP "[d3d11] "
-#define D3D11_WND_CLASS "RecompNv2aD3D11"   /* RegisterClassA, then CreateWindowW as L"" D3D11_WND_CLASS */
 
 /* RECOMP_TRACE=d3d11_calls: every context call this file makes, counted by
  * kind, for the [D3D11-CALLS] line per flip (flip_log). Under Proton each one
@@ -199,24 +196,12 @@ static uint32_t s_srv_gen;
 #undef ID3D11ShaderResourceView_Release
 #define ID3D11ShaderResourceView_Release(v) (s_srv_gen++, (v)->lpVtbl->Release(v))
 
-typedef HRESULT (WINAPI *compile_fn)(LPCVOID, SIZE_T, LPCSTR,
-                                     const D3D_SHADER_MACRO *, ID3DInclude *,
-                                     LPCSTR, LPCSTR, UINT, UINT,
-                                     ID3DBlob **, ID3DBlob **);
-typedef HRESULT (WINAPI *create_blob_fn)(SIZE_T, ID3DBlob **);
-
 /* kernel_path.c: <HDD root>/ShaderCache, which the dxbc cache sits under. */
 int xbox_path_shader_cache(char *out, size_t n);
 
 /* ---- device ------------------------------------------------------------ */
 
 static int                     s_failed;        /* init failed: draw nothing */
-static HWND                    s_hwnd;
-/* This window is not fb_present.c's, which keeps the title bar's name (and,
- * with RECOMP_TRACE=title, FPS and draws); ours comes from the same place.
- * One clock for the creation title and the per-flip refresh, so the window
- * opens with the game's name and the first flip has nothing to rewrite. */
-static struct xbox_title_clock s_title_clock;
 /* Present's sync interval. Stock D3D11 presents without waiting for the
  * display (0): the guest's vblank clock paces the frames. RECOMP_PRESENT_VSYNC
  * is the SDL window's knob (default on there); here only a value that turns
@@ -230,15 +215,12 @@ static ID3D11Texture2D        *s_back;
 static UINT                    s_back_w, s_back_h;
 /* The swap chain size init() created, before any WM_SIZE resize. */
 static UINT                    s_made_w, s_made_h;
-/* Present (E1, nv2a_host_opts): the client size WM_SIZE last reported (0 =
- * none since init); the back buffer's view, made for the scaling blit only;
- * whether the frame being dumped is the present RT rather than the back
- * buffer (the blit path: the dump stays the frame, not the window). */
-static volatile UINT           s_client_w, s_client_h;
+/* Present (E1, nv2a_host_opts): the back buffer's view, made for the
+ * scaling blit only; whether the frame being dumped is the present RT rather
+ * than the back buffer (the blit path: the dump stays the frame, not the
+ * window). The client size is the host's (d3d11_host_client_size). */
 static ID3D11RenderTargetView *s_back_rtv;
 static int                     s_dump_rt;
-static compile_fn              s_compile;
-static create_blob_fn          s_create_blob;  /* a cache hit's blob */
 
 /* The on-disk shader cache (shader_cache.h): D3DCompile under Proton is
  * Wine's, at tens of ms a shader, and a title's first 3D scene asks for a
@@ -455,158 +437,16 @@ static int        s_blend_n;
 
 /* ------------------------------------------------------------------------- */
 
-/* The port-0 keyboard and mouse (src/input/keyboard.c, mouse.c); declared
- * here rather than included so this file keeps no dependency on src/input's
- * headers. */
-extern void xbox_InputKeyEventWin32(int vk, unsigned long lparam, int down);
-extern void xbox_InputKeysClear(void);
-extern void xbox_InputMouseWin32Msg(void *hwnd, unsigned msg, uintptr_t w, intptr_t l);
-extern void xbox_InputMouseWin32Sync(void *hwnd);
-extern void xbox_InputMouseWin32Release(void *hwnd);
-extern int xbox_InputKeyboardOn(void);
-extern int xbox_InputTextWin32Char(void *hwnd, uintptr_t w, intptr_t l);
-extern void xbox_InputTextFocusLost(void);
-
-static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
-{
-    /* The mouse only observes (motion, buttons, focus, the capture), so
-     * every message goes on to the cases below. */
-    xbox_InputMouseWin32Msg(h, m, (uintptr_t)w, (intptr_t)l);
-
-    switch (m) {
-    /* Keys for the port-0 keyboard, as the GDI window (fb_present.c)
-     * records them. This window is the only one a D3D11 run has, so
-     * without these the keyboard is a port-0 pad that never presses
-     * anything. RECOMP_TRACE=key traces the edges in xbox_InputKeyEvent. */
-    case WM_KEYDOWN:
-    case WM_SYSKEYDOWN:
-        /* Auto-repeat (bit 30, the previous state) is not a new edge. */
-        if (!(l & (1L << 30)))
-            xbox_InputKeyEventWin32((int)w, (unsigned long)l, 1);
-        /* System keys still go to Windows, or Alt+F4 stops closing us. */
-        return m == WM_SYSKEYDOWN ? DefWindowProcA(h, m, w, l) : 0;
-    case WM_KEYUP:
-    case WM_SYSKEYUP:
-        xbox_InputKeyEventWin32((int)w, (unsigned long)l, 0);
-        return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
-    /* Typed text for a menu field (text_input.c), only while one has
-     * focus; otherwise WM_CHAR goes on to DefWindowProc. Same handling as
-     * the GDI window's (fb_present.c). */
-    case WM_CHAR:
-        if (xbox_InputTextWin32Char(h, (uintptr_t)w, (intptr_t)l))
-            return 0;
-        break;
-    /* Alt (the walk key) or F10 alone would put the window in menu mode,
-     * which takes the keyboard until the next key. There is no menu;
-     * Alt+F4 is SC_CLOSE and still reaches Windows. With the keyboard off
-     * the keys drive nothing, so Alt+Space keeps the system menu. */
-    case WM_SYSCOMMAND:
-        if ((w & 0xFFF0) == SC_KEYMENU && xbox_InputKeyboardOn())
-            return 0;
-        break;
-    /* Alt-tabbing away with a key held would leave it held for ever. */
-    case WM_KILLFOCUS:
-        xbox_InputKeysClear();
-        xbox_InputTextFocusLost();
-        return 0;
-    }
-    if (m == WM_CLOSE) {
-        /* Closing the window ends the run, like the CPU path's window.
-         * ExitProcess skips atexit, where the missing-file summary prints. */
-        xbox_InputMouseWin32Release(h);   /* no pump follows to drop the clip */
-        recomp_exit_hook_run("window");
-        /* The queued PNGs too, even if the hook table had no slot for the
-         * writer's drain: this is how a bench's RECOMP_WINDOW_QUIT_AFTER
-         * ends, seconds after the last dump. */
-        img_dump_flush(5000);
-        ExitProcess(0);
-    }
-    if (m == WM_SIZE && w != SIZE_MINIMIZED && LOWORD(l) && HIWORD(l)) {
-        /* Recorded only: the flip (this thread, which pumps the window)
-         * resizes the swap chain before its next present. */
-        s_client_w = LOWORD(l);
-        s_client_h = HIWORD(l);
-    }
-    return DefWindowProcA(h, m, w, l);
-}
-
-/* A quit asked for off this thread (RECOMP_DEBUG=pad_quit): closed as the
- * close button closes it, by WM_CLOSE on the thread that pumps the window. */
-static int post_close(const char *why)
-{
-    (void)why;
-    return PostMessageA(s_hwnd, WM_CLOSE, 0, 0) ? 1 : 0;
-}
-
-static void pump(void)
-{
-    /* RECOMP_WINDOW_QUIT_AFTER=<seconds>: close the window then, as the SDL
-     * window does, so a timed bench run leaves through WM_CLOSE (the exit
-     * hooks: profile and summaries) rather than a kill. Timed from the
-     * first pump, the window's first frame. */
-    static ULONGLONG quit_at;
-    static int quit_posted;
-    MSG msg;
-    if (!quit_at && recomp_env(RENV_WINDOW_QUIT_AFTER)) {
-        double s = atof(recomp_env(RENV_WINDOW_QUIT_AFTER));
-        quit_at = s > 0 ? GetTickCount64() + (ULONGLONG)(s * 1000.0) : (ULONGLONG)-1;
-    }
-    if (quit_at && quit_at != (ULONGLONG)-1 && !quit_posted && GetTickCount64() >= quit_at) {
-        quit_posted = 1;
-        PostMessageA(s_hwnd, WM_CLOSE, 0, 0);
-    }
-    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessageA(&msg);
-    }
-    xbox_InputMouseWin32Sync(s_hwnd);
-}
-
-static double sh_now_ms(void)
-{
-    static LARGE_INTEGER f;
-    LARGE_INTEGER c;
-    if (!f.QuadPart)
-        QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&c);
-    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
-}
-
-/* The DLL's VS_FIXEDFILEINFO file version, read from the loaded module's
- * own resource (no version.dll): a replacement that keeps the old file's
- * size and time still changes this. 0 when there is none. */
-static unsigned long long dll_file_version(HMODULE dll)
-{
-    HRSRC r = FindResourceW(dll, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16) /* RT_VERSION */);
-    const BYTE *b;
-    DWORD n, i;
-
-    if (!r || !(n = SizeofResource(dll, r)))
-        return 0;
-    b = (const BYTE *)LockResource(LoadResource(dll, r));
-    if (!b)
-        return 0;
-    /* The fixed block sits after a wide-string header; find its signature. */
-    for (i = 0; i + sizeof(VS_FIXEDFILEINFO) <= n; i += 4) {
-        const VS_FIXEDFILEINFO *v = (const VS_FIXEDFILEINFO *)(b + i);
-        if (v->dwSignature == 0xFEEF04BDu)
-            return (unsigned long long)v->dwFileVersionMS << 32 | v->dwFileVersionLS;
-    }
-    return 0;
-}
-
-/* Opens the cache, after D3DCompile is found. The key's compiler identity is
- * "<path>|<size>|<write time>|<file version>" of the d3dcompiler_47.dll in
- * use; when that cannot be asked the cache stays off, since a key without
- * the compiler could hand one compiler's output to another. */
-static void shader_cache_setup(HMODULE dll)
+/* Opens the cache, after the compiler is found. The key's compiler identity
+ * comes from the host (d3d11_host_compiler_id: on Windows the path, size,
+ * write time and file version of the d3dcompiler_47.dll in use); when that
+ * cannot be asked the cache stays off, since a key without the compiler
+ * could hand one compiler's output to another. */
+static void shader_cache_setup(void)
 {
     const char *e = recomp_env(RENV_DXBC_CACHE);
     shader_cache_env_kind kind = shader_cache_env(e);
-    char dir[1024], path[MAX_PATH * 3];
-    wchar_t wpath[MAX_PATH];
-    WIN32_FILE_ATTRIBUTE_DATA fa;
-    DWORD n;
+    char dir[1024];
 
     if (kind == SHADER_CACHE_ENV_OFF) {
         fprintf(stderr, LOGP "shader cache: off (RECOMP_DXBC_CACHE=%s)\n", e);
@@ -617,17 +457,10 @@ static void shader_cache_setup(HMODULE dll)
                 "absolute directory)\n", e);
         return;
     }
-    n = GetModuleFileNameW(dll, wpath, MAX_PATH);
-    if (!s_create_blob || !n || n >= MAX_PATH
-     || !GetFileAttributesExW(wpath, GetFileExInfoStandard, &fa)
-     || !WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, (int)sizeof path, NULL, NULL)) {
+    if (!d3d11_host_compiler_id(s_shc_compiler, sizeof s_shc_compiler)) {
         fprintf(stderr, LOGP "shader cache: off (no compiler identity)\n");
         return;
     }
-    snprintf(s_shc_compiler, sizeof s_shc_compiler, "%s|%08lx%08lx|%08lx%08lx|%016llx",
-             path, (unsigned long)fa.nFileSizeHigh, (unsigned long)fa.nFileSizeLow,
-             (unsigned long)fa.ftLastWriteTime.dwHighDateTime,
-             (unsigned long)fa.ftLastWriteTime.dwLowDateTime, dll_file_version(dll));
     if (kind == SHADER_CACHE_ENV_DIR) {
         snprintf(dir, sizeof dir, "%s", e);
     } else if (xbox_path_shader_cache(dir, sizeof dir - 8)) {
@@ -650,7 +483,7 @@ static int compile(const char *what, const char *src, const char *target,
 {
     ID3DBlob *err = NULL;
     shader_cache_key key;
-    double t0 = sh_now_ms();
+    double t0 = d3d11_host_now_ms();
     HRESULT hr;
 
     key.compiler = s_shc_compiler;
@@ -663,17 +496,17 @@ static int compile(const char *what, const char *src, const char *target,
     if (s_shc.dir[0]) {
         size_t n = 0;
         void *hit = shader_cache_load(&s_shc, &key, &n);
-        if (hit && SUCCEEDED(s_create_blob(n, code))) {
+        if (hit && d3d11_host_blob(n, code)) {
             memcpy(ID3D10Blob_GetBufferPointer(*code), hit, n);
             free(hit);
             s_sh_cached++;
-            s_sh_cached_ms += sh_now_ms() - t0;
+            s_sh_cached_ms += d3d11_host_now_ms() - t0;
             return 1;
         }
         free(hit);
     }
-    hr = s_compile(src, key.src_len, what, NULL, NULL, key.entry, target,
-                   key.flags1, key.flags2, code, &err);
+    hr = d3d11_host_compile(src, key.src_len, what, key.entry, target,
+                            key.flags1, key.flags2, code, &err);
     if (FAILED(hr)) {
         fprintf(stderr, LOGP "compile %s failed hr=0x%08lX\n%s\n", what,
                 (unsigned long)hr,
@@ -685,7 +518,7 @@ static int compile(const char *what, const char *src, const char *target,
     }
     if (err) ID3D10Blob_Release(err);
     s_sh_compiled++;
-    s_sh_compile_ms += sh_now_ms() - t0;
+    s_sh_compile_ms += d3d11_host_now_ms() - t0;
     if (s_shc.dir[0])
         shader_cache_store(&s_shc, &key, ID3D10Blob_GetBufferPointer(*code),
                            ID3D10Blob_GetBufferSize(*code));
@@ -720,12 +553,9 @@ static void internal_client(UINT fw, UINT fh, UINT *cw, UINT *ch);
 static int init(void)
 {
     static int tried;
-    HMODULE dll;
     DXGI_SWAP_CHAIN_DESC sd;
     D3D_FEATURE_LEVEL fl;
     HRESULT hr;
-    WNDCLASSA wc;
-    wchar_t title[192];
     /* display.aspect: a window of the padded frame's shape (854x480 at
      * 16:9), so the pads are on screen at 1:1. */
     RECT r = {0, 0, (LONG)nv2a_host_window_w(640, 480, 1), 480};
@@ -738,24 +568,10 @@ static int init(void)
     tried = 1;
     s_failed = 1;
 
-    dll = LoadLibraryA("d3dcompiler_47.dll");
-    if (dll)
-        s_compile = (compile_fn)(void (*)(void))GetProcAddress(dll, "D3DCompile");
-    if (!s_compile) {
-        fprintf(stderr, LOGP "no D3DCompile in d3dcompiler_47.dll\n");
+    if (!d3d11_host_compiler_load())
         return 0;
-    }
-    s_create_blob = (create_blob_fn)(void (*)(void))GetProcAddress(dll, "D3DCreateBlob");
-    shader_cache_setup(dll);
+    shader_cache_setup();
 
-    memset(&wc, 0, sizeof wc);
-    wc.lpfnWndProc = wnd_proc;
-    wc.hInstance = GetModuleHandleA(NULL);
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = D3D11_WND_CLASS;
-    RegisterClassA(&wc);
-    if (!xbox_FramebufferWindowTitleText(title, 192, &s_title_clock))
-        title[0] = 0;
     if (internal) {
         /* present.surface=internal: the swap chain is the frame, and a
          * scaling compositor (gamescope) fits the window to its output with
@@ -772,32 +588,18 @@ static int init(void)
     } else if (full) {
         /* present.fullscreen: borderless over the primary monitor (no HWND
          * yet to ask MonitorFromWindow), no exclusive mode. */
-        bw = (UINT)GetSystemMetrics(SM_CXSCREEN);
-        bh = (UINT)GetSystemMetrics(SM_CYSCREEN);
+        d3d11_host_screen_size(&bw, &bh);
         if (!bw || !bh) {
             bw = nv2a_host_window_w(640, 480, 1);
             bh = 480;
             full = 0;
         }
     }
-    if (full) {
-        s_hwnd = CreateWindowW(L"" D3D11_WND_CLASS, title,
-                               WS_POPUP | WS_VISIBLE, 0, 0,
-                               internal ? (int)r.right : (int)bw,
-                               internal ? (int)r.bottom : (int)bh,
-                               NULL, NULL, wc.hInstance, NULL);
-    } else {
-        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-        s_hwnd = CreateWindowW(L"" D3D11_WND_CLASS, title,
-                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                               CW_USEDEFAULT, CW_USEDEFAULT,
-                               r.right - r.left, r.bottom - r.top,
-                               NULL, NULL, wc.hInstance, NULL);
-    }
-    if (!s_hwnd) {
-        fprintf(stderr, LOGP "CreateWindow failed (%lu)\n", GetLastError());
+    /* Borderless at the frame's or the screen's size, or framed around a
+     * client area of r. */
+    if (!d3d11_host_window_open(full, full && !internal ? bw : (unsigned)r.right,
+                                full && !internal ? bh : (unsigned)r.bottom))
         return 0;
-    }
     s_sync_interval = recomp_env_on(RENV_PRESENT_VSYNC) ? 1 : 0;
     if (recomp_env(RENV_PRESENT_VSYNC))
         fprintf(stderr, LOGP "present vsync %s (RECOMP_PRESENT_VSYNC=%s)\n",
@@ -810,7 +612,7 @@ static int init(void)
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = 2;
-    sd.OutputWindow = s_hwnd;
+    sd.OutputWindow = (HWND)d3d11_host_window();
     sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
@@ -821,19 +623,7 @@ static int init(void)
                 (unsigned long)hr);
         return 0;
     }
-    /* DXGI's default window association takes Alt+Enter as a fullscreen
-     * toggle, and nothing here follows that switch. With the keyboard on,
-     * Alt is a key players hold in play (a walk key) and Enter is START,
-     * so a pause while walking would switch to exclusive fullscreen behind
-     * the presenter's back. Stock runs (keyboard off) keep DXGI's
-     * default. */
-    if (xbox_InputKeyboardOn()) {
-        IDXGIFactory *f = NULL;
-        if (SUCCEEDED(IDXGISwapChain_GetParent(s_swap, &IID_IDXGIFactory, (void **)&f)) && f) {
-            IDXGIFactory_MakeWindowAssociation(f, s_hwnd, DXGI_MWA_NO_ALT_ENTER);
-            IDXGIFactory_Release(f);
-        }
-    }
+    d3d11_host_swap_chain_made(s_swap);
     IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&s_back);
     if (FAILED(ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext1,
                                                   (void **)&s_ctx1)))
@@ -906,10 +696,8 @@ static int init(void)
 #ifdef XBOXRECOMP_ENHANCE
     nv2a_present_chain_host("D3D11");
 #endif
-    /* Only once the device is up: a failed init returns before any frame
-     * is pumped, and a poster left behind would take pad_quit's close for
-     * a window that never closes, and the quit would be lost. */
-    recomp_quit_set(post_close);
+    /* Only once the device is up (d3d11_host_ready: the quit poster). */
+    d3d11_host_ready();
     s_failed = 0;
     return 1;
 }
@@ -4349,7 +4137,7 @@ static int ao_dump_due(void)
     /* Made at the first due frame, whose draw-time pass writes first. */
     if (!s_ao_dump.made) {
         s_ao_dump.made = 1;
-        CreateDirectoryA(s_ao_dump.dir, NULL); /* an existing one is fine */
+        d3d11_host_mkdir(s_ao_dump.dir); /* an existing one is fine */
     }
     return 1;
 }
@@ -5787,11 +5575,12 @@ static void swap_resize(UINT cw, UINT ch)
     }
 }
 
-/* WM_SIZE recorded a client size the swap chain does not have: resize it. */
+/* The window's client size (WM_SIZE) is not the swap chain's: resize it. */
 static void present_resize(void)
 {
-    UINT cw = s_client_w, ch = s_client_h;
+    UINT cw, ch;
 
+    d3d11_host_client_size(&cw, &ch);
     /* present.surface=internal: the swap chain stays the frame's size; the
      * compositor scales it to whatever the window became. */
     if (nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL)
@@ -5812,7 +5601,8 @@ static void present_resize(void)
  * area; the overlay's view (ovl_present) maps the pointer through that. */
 static void internal_client(UINT fw, UINT fh, UINT *cw, UINT *ch)
 {
-    UINT sw = (UINT)GetSystemMetrics(SM_CXSCREEN), sh = (UINT)GetSystemMetrics(SM_CYSCREEN);
+    UINT sw, sh;
+    d3d11_host_screen_size(&sw, &sh);
     *cw = fw;
     *ch = fh;
     if (!sw || !sh || !fw || !fh || (fw <= sw && fh <= sh))
@@ -5834,24 +5624,14 @@ static void internal_client(UINT fw, UINT fh, UINT *cw, UINT *ch)
  * leaves both alone. */
 static void internal_resize(const RenderTarget *rt, UINT cw, UINT ch)
 {
-    RECT r;
+    UINT ww, wh;
 
     if (!s_back || (rt->hw == s_back_w && rt->hh == s_back_h))
         return;
     if (cw != rt->w || ch != rt->h || !rt->hw || !rt->hh)
         return;
-    {
-        UINT ww, wh;
-        internal_client(rt->hw, rt->hh, &ww, &wh);
-        r.left = 0;
-        r.top = 0;
-        r.right = (LONG)ww;
-        r.bottom = (LONG)wh;
-    }
-    if (!nv2a_host_opts()->fullscreen)
-        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    SetWindowPos(s_hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
-                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    internal_client(rt->hw, rt->hh, &ww, &wh);
+    d3d11_host_set_client_size(ww, wh, !nv2a_host_opts()->fullscreen);
     swap_resize(rt->hw, rt->hh);
     fprintf(stderr, LOGP "render scale change: back buffer %ux%u (surface internal)\n",
             s_back_w, s_back_h);
@@ -6122,46 +5902,31 @@ static int chain_surface(int on, int internal)
     static int s_popup;
     const struct nv2a_host_opts *eo = nv2a_host_opts();
     int over = recomp_env_on(RENV_HOST_GAMESCOPE) || eo->fullscreen;
-    UINT w = s_client_w, h = s_client_h;
+    UINT w, h;
 
+    d3d11_host_client_size(&w, &h);
     if (!on || !internal) {
-        if (s_popup && !eo->fullscreen) {
-            SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_OVERLAPPEDWINDOW | WS_VISIBLE));
-            SetWindowPos(s_hwnd, HWND_TOP, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-        }
+        if (s_popup && !eo->fullscreen)
+            d3d11_host_framed();
         s_popup = 0;
         return 0;
     }
     if (over) {
-        MONITORINFO mi;
-        RECT r;
-        mi.cbSize = sizeof mi;
-        if (GetMonitorInfoW(MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
-            r = mi.rcMonitor;
-        } else {
-            r.left = r.top = 0;
-            r.right = GetSystemMetrics(SM_CXSCREEN);
-            r.bottom = GetSystemMetrics(SM_CYSCREEN);
-        }
-        w = (UINT)(r.right - r.left);
-        h = (UINT)(r.bottom - r.top);
+        int x, y;
+        d3d11_host_monitor_rect(&x, &y, &w, &h);
         if (!s_popup && w && h) {
-            SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_POPUP | WS_VISIBLE));
-            SetWindowPos(s_hwnd, HWND_TOP, r.left, r.top, (int)w, (int)h,
-                         SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            d3d11_host_popup(x, y, w, h);
             s_popup = 1;
         }
     }
     if (w && h && (w != s_back_w || h != s_back_h)) {
-        RECT cr = {0, 0, 0, 0};
+        unsigned crw, crh;
         swap_resize(w, h);
         /* The client area beside it: a window the compositor sees at
          * another size than the swap chain is scaled by it. */
-        GetClientRect(s_hwnd, &cr);
+        d3d11_host_client_rect(&crw, &crh);
         fprintf(stderr, "[SHADER] present.shader: back buffer %ux%u (the output's size),"
-                " client %ldx%ld\n", s_back_w, s_back_h, (long)(cr.right - cr.left),
-                (long)(cr.bottom - cr.top));
+                " client %ldx%ld\n", s_back_w, s_back_h, (long)crw, (long)crh);
     }
     return 1;
 }
@@ -6418,7 +6183,7 @@ static int present_chain(RenderTarget *rt, int filter, int internal, int surface
     fo.version = LIBRASHADER_CURRENT_VERSION;
     fo.total_subframes = 1;
     fo.current_subframe = 1;
-    fo.frames_per_second = nv2a_present_chain_rate((uint64_t)(sh_now_ms() * 1e6));
+    fo.frames_per_second = nv2a_present_chain_rate((uint64_t)(d3d11_host_now_ms() * 1e6));
     e = s_lrs_ff(&s_lrs_chain, s_ctx, s_lrs_frames++, src, s_lrs_out_rtv, &lv, NULL, &fo);
     /* Every binding the chain made went behind the draw path's state shadow. */
     s_sc_init = 0;
@@ -6622,7 +6387,8 @@ static void ovl_present(void)
      * client pixels map through that stretch (Metal's fit is the same
      * call); the same sizes publish none. */
     {
-        UINT vw = s_client_w, vh = s_client_h;
+        UINT vw, vh;
+        d3d11_host_client_size(&vw, &vh);
         if (vw && vh && (vw != s_back_w || vh != s_back_h))
             nv2a_overlay_set_view(0, 0, (int)vw, (int)vh, (int)s_back_w, (int)s_back_h);
         else
@@ -6637,7 +6403,7 @@ static void ovl_present(void)
         else
             nv2a_overlay_set_compositor(0, 0);
     }
-    nv2a_overlay_poll(GetTickCount64());
+    nv2a_overlay_poll(d3d11_host_ticks_ms());
     if (!nv2a_overlay_visible() || !(n = nv2a_overlay_lists(ls)) || !ovl_init())
         return;
     if (!s_back_rtv && FAILED(ID3D11Device_CreateRenderTargetView(
@@ -7062,12 +6828,8 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
 
     if (!init())
         return;
-    pump();
-    {
-        wchar_t tb[192];
-        if (xbox_FramebufferWindowTitleText(tb, 192, &s_title_clock))
-            SetWindowTextW(s_hwnd, tb);
-    }
+    d3d11_host_pump();
+    d3d11_host_title();
     if (s_occ.ops)
         nv2a_occ_poll(&s_occ, 0);
     present_resize();
@@ -7201,9 +6963,9 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     if (d11p_on()) {
         double t0;
         d11p_end();
-        t0 = sh_now_ms();
+        t0 = d3d11_host_now_ms();
         hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
-        d11p_after_present(sh_now_ms() - t0);
+        d11p_after_present(d3d11_host_now_ms() - t0);
     } else {
         hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
     }
@@ -7299,26 +7061,15 @@ static void scale_drop(void)
             nv2a_host_render_scale());
 }
 
-/* present.fullscreen changed live: swap the window's style and size on this
- * thread, which owns the window. SetWindowPos sends WM_SIZE here at once,
- * so the next flip's present_resize gives the swap chain the new client
- * size before it presents; no other thread touches the window, so there is
- * no resize to race. Borderless over the window's monitor, as at start; the
- * windowed placement is the one left, or the starting size when the run
- * began fullscreen. Under present.surface=internal the client size stays the
- * frame's (the compositor scales it), only the border changes. */
+/* present.fullscreen changed live: the host swaps the window's style and
+ * size (d3d11_host_fullscreen). Under present.surface=internal the client
+ * size stays the frame's (the compositor scales it), only the border
+ * changes. */
 static void fullscreen_switch(int full)
 {
-    /* The placement, not GetWindowRect: a maximised window comes back
-     * maximised over its restored rectangle, and a minimised one's rect
-     * (off screen) is not where it goes back to. */
-    static WINDOWPLACEMENT s_windowed;
-    static int s_have_windowed;
-    RECT r;
+    UINT fw = 0, fh = 0;
     int internal = nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
 
-    if (!s_hwnd)
-        return;
 #ifdef XBOXRECOMP_ENHANCE
     /* With a chain the back buffer is the output's size (chain_surface),
      * not the frame's: the switch goes as under present.surface=window, or
@@ -7326,59 +7077,9 @@ static void fullscreen_switch(int full)
     if (s_lrs_chain)
         internal = 0;
 #endif
-    if (full) {
-        MONITORINFO mi;
-
-        s_windowed.length = sizeof s_windowed;
-        if (GetWindowPlacement(s_hwnd, &s_windowed)) {
-            s_have_windowed = 1;
-            if (s_windowed.showCmd == SW_SHOWMINIMIZED)
-                s_windowed.showCmd = (s_windowed.flags & WPF_RESTORETOMAXIMIZED)
-                                   ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
-        }
-        mi.cbSize = sizeof mi;
-        if (internal) {
-            UINT ww, wh;
-            internal_client(s_back_w, s_back_h, &ww, &wh);
-            r.left = r.top = 0;
-            r.right = (LONG)ww;
-            r.bottom = (LONG)wh;
-        } else if (GetMonitorInfoW(MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
-            r = mi.rcMonitor;
-        } else {
-            r.left = r.top = 0;
-            r.right = GetSystemMetrics(SM_CXSCREEN);
-            r.bottom = GetSystemMetrics(SM_CYSCREEN);
-        }
-        SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_POPUP | WS_VISIBLE));
-    } else {
-        if (internal || !s_have_windowed) {
-            UINT ww = nv2a_host_window_w(640, 480, 1), wh = 480;
-            if (internal)
-                internal_client(s_back_w, s_back_h, &ww, &wh);
-            r.left = r.top = 0;
-            r.right = (LONG)ww;
-            r.bottom = (LONG)wh;
-            AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-            OffsetRect(&r, 64 - r.left, 64 - r.top);
-        } else {
-            /* The style first, so the placement sizes a framed window. */
-            SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_OVERLAPPEDWINDOW | WS_VISIBLE));
-            SetWindowPlacement(s_hwnd, &s_windowed);
-            SetWindowPos(s_hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
-                         | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-            r = s_windowed.rcNormalPosition;
-            fprintf(stderr, LOGP "present.fullscreen=off (live): window %ldx%ld%s\n",
-                    (long)(r.right - r.left), (long)(r.bottom - r.top),
-                    s_windowed.showCmd == SW_SHOWMAXIMIZED ? ", maximised" : "");
-            return;
-        }
-        SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_OVERLAPPEDWINDOW | WS_VISIBLE));
-    }
-    SetWindowPos(s_hwnd, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top,
-                 SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-    fprintf(stderr, LOGP "present.fullscreen=%s (live): window %ldx%ld\n",
-            full ? "on" : "off", (long)(r.right - r.left), (long)(r.bottom - r.top));
+    if (internal)
+        internal_client(s_back_w, s_back_h, &fw, &fh);
+    d3d11_host_fullscreen(full, internal, fw, fh, nv2a_host_window_w(640, 480, 1), 480);
 }
 
 /* Live options (nv2a_host_opts_request) are applied after the present:
@@ -7450,13 +7151,8 @@ static int occ_mode(void)
 
 static uint64_t occ_now_us(void *ctx)
 {
-    static LARGE_INTEGER f;
-    LARGE_INTEGER c;
     (void)ctx;
-    if (!f.QuadPart)
-        QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&c);
-    return (uint64_t)(c.QuadPart * 1000000.0 / (double)f.QuadPart);
+    return d3d11_host_now_us();
 }
 
 static void *occ_get(void *ctx)

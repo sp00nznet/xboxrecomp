@@ -22,10 +22,11 @@ if(WIN32)
         d3d8_vsh_msl.c
         d3d8_combiners_msl.c
         nv2a_pb_d3d11.c
+        d3d11_host_win32.c
         shader_cache.c
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
-    # nv2a_pb_d3d11.c's window records keys in src/input's key table.
+    # d3d11_host_win32.c's window records keys in src/input's key table.
     target_link_libraries(xbox_d3d8 PUBLIC xbox_input)
     # nv2a_pb_d3d11.c: the pushbuffer executor's state (nv2a_pb_state.h) and
     # guest memory (xbox_memory_layout.h) live with the kernel.

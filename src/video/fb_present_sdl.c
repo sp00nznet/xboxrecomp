@@ -31,6 +31,12 @@
  * s_in_present handshake) and never through guest memory. Guest-bytes frames are uploaded into a slot. When the
  * layer cannot be set up, the window is re-created with the SDL renderer.
  *
+ * With the dxvk-native build (XBOXRECOMP_DXVK_NATIVE) and RECOMP_PB_BACKEND=
+ * d3d11 the window is lent to the D3D11 backend's swap chain instead
+ * (fb_present_swap.h, d3d11_host_sdl.c): a Vulkan window with no renderer,
+ * where the backend presents and draws the overlay on the ack thread, and
+ * this loop keeps the events, input, title and fullscreen.
+ *
  * RECOMP_HEADLESS=1 (or no display, or SDL video failing to start) skips all
  * of it: the guest runs on the main thread exactly as before.
  *
@@ -93,6 +99,7 @@
 #include "text_input_sdl.h"   /* src/input: typed text for the menu */
 #include "host_open_sdl.h"    /* src/input: the menu's Open exports folder */
 #include "present_sdl_quit.h"
+#include "fb_present_swap.h"
 #ifdef XBOXRECOMP_ENHANCE
 #include "kernel/nv2a_overlay.h"
 #include "kernel/nv2a_stats.h"
@@ -128,6 +135,14 @@ static volatile int    s_in_present;         /* ack thread inside Present */
  * SDL_Renderer, and a slot is a GPU texture in fb_present_metal.m (indexed by
  * slot number) rather than bytes. Set once before the guest starts. */
 static int             s_layer;
+/* Swap mode (dxvk-native): the window the D3D11 backend's swap chain
+ * presents to, or NULL. Set once before the guest starts. Its drawable and
+ * display in pixels, and a client size the backend asked for (0: none),
+ * cross threads as relaxed atomics, each packed w << 16 | h so the ack
+ * thread never reads a new width with an old height. */
+static SDL_Window     *s_swap_win;
+static uint32_t        s_swap_size, s_disp_size;
+static uint32_t        s_swap_req;
 
 /* Ack-thread side counters, read by the stats line. */
 static uint64_t s_flips, s_copy_ns;          /* relaxed atomics */
@@ -161,7 +176,7 @@ static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
  * readback for the window when not (headless). */
 int xbox_FramebufferWindowRunning(void)
 {
-    return __atomic_load_n(&s_running, __ATOMIC_SEQ_CST) != 0;
+    return !s_swap_win && __atomic_load_n(&s_running, __ATOMIC_SEQ_CST) != 0;
 }
 
 /* A GPU backend's frame, already in host memory (Metal: the presented
@@ -171,7 +186,7 @@ int xbox_FramebufferWindowRunning(void)
 void xbox_FramebufferWindowPresentPixels(const void *px, uint32_t w, uint32_t h,
                                          uint32_t pitch, uint32_t bpp)
 {
-    if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !px || !w || !h
+    if (s_swap_win || !__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !px || !w || !h
             || (bpp != 2 && bpp != 4) || pitch < w * bpp)
         return;
     __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
@@ -186,7 +201,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     /* Dekker-style handshake with the close path: each side stores its own
      * flag and then loads the other's, all seq_cst, so either the window sees
      * this present in flight or this present sees the window closing. */
-    if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !fb_va || !pitch)
+    if (s_swap_win || !__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !fb_va || !pitch)
         return;
     __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
     if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST)) {   /* closing */
@@ -287,6 +302,53 @@ static void present_pixels(const uint8_t *src, uint32_t w, uint32_t h,
         memcpy(s->px + (size_t)y * w * bpp, src + (size_t)y * pitch,
                (size_t)w * bpp);
     publish(w, h, bpp, t0);
+}
+
+/* ── Swap mode: the D3D11 backend's side (nv2a-ack thread) ─────────────── */
+
+/* Wakes the main loop, once per batch it has not looked at. */
+static void wake_loop(void)
+{
+    if (!__atomic_load_n(&s_running, __ATOMIC_ACQUIRE) || !s_frame_event)
+        return;
+    if (!__atomic_exchange_n(&s_wake_pending, 1, __ATOMIC_ACQ_REL)) {
+        SDL_Event ev;
+        memset(&ev, 0, sizeof ev);
+        ev.type = s_frame_event;
+        SDL_PushEvent(&ev);
+    }
+}
+
+void *xbox_FramebufferWindowSwap(void)
+{
+    return s_swap_win;
+}
+
+void xbox_FramebufferWindowSwapSize(unsigned *w, unsigned *h)
+{
+    uint32_t v = __atomic_load_n(&s_swap_size, __ATOMIC_RELAXED);
+    *w = v >> 16;
+    *h = v & 0xFFFF;
+}
+
+void xbox_FramebufferWindowSwapDisplay(unsigned *w, unsigned *h)
+{
+    uint32_t v = __atomic_load_n(&s_disp_size, __ATOMIC_RELAXED);
+    *w = v >> 16;
+    *h = v & 0xFFFF;
+}
+
+void xbox_FramebufferWindowSwapResize(unsigned w, unsigned h)
+{
+    if (!s_swap_win || !w || !h || w > 0xFFFF || h > 0xFFFF)
+        return;
+    __atomic_store_n(&s_swap_req, (uint32_t)(w << 16 | h), __ATOMIC_RELAXED);
+    wake_loop();
+}
+
+int xbox_FramebufferWindowSwapInternal(void)
+{
+    return nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
 }
 
 /* ── Layer mode: the Metal backend's side (nv2a-ack thread) ─────────────── */
@@ -558,14 +620,7 @@ static void shot_save(SDL_Renderer *ren, uint32_t flip)
 
 static void ovl_wake(void)
 {
-    if (!__atomic_load_n(&s_running, __ATOMIC_ACQUIRE) || !s_frame_event)
-        return;
-    if (!__atomic_exchange_n(&s_wake_pending, 1, __ATOMIC_ACQ_REL)) {
-        SDL_Event ev;
-        memset(&ev, 0, sizeof ev);
-        ev.type = s_frame_event;
-        SDL_PushEvent(&ev);
-    }
+    wake_loop();
 }
 
 /* Texture 0 is the atlas, 1.. the image slots; each re-made when its gen
@@ -791,6 +846,33 @@ static void mac_fullscreen_level(SDL_Window *win, int full, int spaces_off)
 }
 #endif
 
+/* Swap mode: the drawable's pixel size, for the backend's swap chain. */
+static void swap_size_note(SDL_Window *win)
+{
+    int w = 0, h = 0;
+    if (SDL_GetWindowSizeInPixels(win, &w, &h) && w > 0 && h > 0
+        && w <= 0xFFFF && h <= 0xFFFF)
+        __atomic_store_n(&s_swap_size, (uint32_t)w << 16 | (uint32_t)h, __ATOMIC_RELAXED);
+}
+
+/* Swap mode, once a loop turn: a client size the backend asked for
+ * (present.surface=internal), in pixels, made in SDL's points; a fullscreen
+ * window keeps the display's. Then the drawable as it is now. */
+static void swap_sync(SDL_Window *win)
+{
+    uint32_t req = __atomic_exchange_n(&s_swap_req, 0, __ATOMIC_RELAXED);
+    if (req && !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN)) {
+        float d = SDL_GetWindowPixelDensity(win);
+        if (d <= 0.0f)
+            d = 1.0f;
+        if (!SDL_SetWindowSize(win, (int)((float)(req >> 16) / d + 0.5f),
+                               (int)((float)(req & 0xFFFF) / d + 0.5f)))
+            fprintf(stderr, "[PRESENT] swap window resize to %ux%u failed (%s)\n",
+                    req >> 16, req & 0xFFFF, SDL_GetError());
+    }
+    swap_size_note(win);
+}
+
 /* SDL_PushEvent may be called from any thread. */
 static int post_quit(const char *why)
 {
@@ -874,6 +956,25 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                                | (eo->fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
         /* display.aspect: the padded frame's shape (854x480 at 16:9). */
         int win_w = (int)nv2a_host_window_w(640, 480, (unsigned)scale);
+#ifdef XBOXRECOMP_DXVK_NATIVE
+        /* The D3D11 backend over dxvk-native presents to the window itself
+         * (DXVK_WSI_DRIVER=SDL3 takes the SDL_Window * as the HWND): a
+         * Vulkan window, and no renderer to fight its swap chain for it. */
+        {
+            const char *b = recomp_env(RENV_PB_BACKEND);
+            if (b && !SDL_strcasecmp(b, "d3d11")) {
+                win = SDL_CreateWindow(window_name(), win_w, 480 * scale,
+                                       wflags | SDL_WINDOW_VULKAN);
+                if (win && eo->fullscreen)
+                    SDL_SetWindowFullscreenMode(win, NULL);
+                if (win)
+                    s_swap_win = win;
+                else
+                    fprintf(stderr, "[PRESENT] Vulkan window failed (%s);"
+                            " SDL renderer\n", SDL_GetError());
+            }
+        }
+#endif
 #if defined(__APPLE__)
         /* The Metal backend's frames stay on the GPU: a CAMetalLayer window
          * the backend blits into (fb_present_metal.m), unless
@@ -899,7 +1000,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             }
         }
 #endif
-        if (!s_layer) {
+        if (!s_layer && !s_swap_win) {
             win = SDL_CreateWindow(window_name(), win_w, 480 * scale, wflags);
             if (win && eo->fullscreen)
                 SDL_SetWindowFullscreenMode(win, NULL);
@@ -917,7 +1018,20 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             }
         }
     }
-    if (s_layer) {
+    if (s_swap_win) {
+        /* The display's size, for present.fullscreen's surface; the swap
+         * chain's vsync is the backend's (present.vsync). */
+        const SDL_DisplayMode *dm = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(win));
+        swap_size_note(win);
+        if (dm) {
+            float d = dm->pixel_density > 0.0f ? dm->pixel_density : 1.0f;
+            uint32_t dw = (uint32_t)((float)dm->w * d + 0.5f), dh = (uint32_t)((float)dm->h * d + 0.5f);
+            if (dw <= 0xFFFF && dh <= 0xFFFF)
+                __atomic_store_n(&s_disp_size, dw << 16 | dh, __ATOMIC_RELAXED);
+        }
+        fprintf(stderr, "[PRESENT] window up: Vulkan, lent to the D3D11 swap chain (%ux%u px);"
+                " guest runs on a pthread\n", s_swap_size >> 16, s_swap_size & 0xFFFF);
+    } else if (s_layer) {
         fprintf(stderr, "[PRESENT] window up: CAMetalLayer (zero-copy), vsync %s;"
                 " guest runs on a pthread\n", vsync ? "on" : "off");
     } else {
@@ -937,14 +1051,19 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     if (s_guest_done_event == 0) {
         fprintf(stderr, "[PRESENT] SDL_RegisterEvents failed; running headless\n");
         close_present(ren);
+        s_swap_win = NULL;   /* the backend's init must not adopt a dead window */
         SDL_DestroyWindow(win);
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
         return guest_main();
     }
     s_frame_event = s_guest_done_event + 1;
 #ifdef XBOXRECOMP_ENHANCE
-    nv2a_overlay_set_presenter(s_layer ? "Metal" : "SDL");
-    nv2a_overlay_set_wake(ovl_wake);
+    /* In swap mode the backend's present is the overlay's one reader and
+     * names itself (ovl_present); this loop only feeds it input. */
+    if (!s_swap_win) {
+        nv2a_overlay_set_presenter(s_layer ? "Metal" : "SDL");
+        nv2a_overlay_set_wake(ovl_wake);
+    }
     /* The video is up and the guest not started: the display probe that
      * waited for it runs now, and the atlas is baked for it. */
     nv2a_overlay_display_ready();
@@ -959,6 +1078,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         s_running = 0;
         xbox_InputSetMainPump(0);
         close_present(ren);
+        s_swap_win = NULL;   /* the backend's init must not adopt a dead window */
         SDL_DestroyWindow(win);
         return guest_main();
     }
@@ -1009,6 +1129,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* Pads come and go here, on the thread that pumps their events
          * (xinput_device.c says why it cannot be a poll thread). */
         xbox_InputSdlPadSync();
+        if (s_swap_win)
+            swap_sync(win);
         /* Live present options (nv2a_host_opts_request): the walker applies
          * them at a flip and bumps the gen; the window and its renderer are
          * this thread's, so the change is made here. A new frame wakes the
@@ -1094,7 +1216,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
 #ifdef XBOXRECOMP_ENHANCE
         /* Disarmed (every golden): one load. Armed, the poll composes the
          * strip and toasts when due; a move in what it draws redraws. */
-        if (nv2a_overlay_armed()) {
+        if (!s_swap_win && nv2a_overlay_armed()) {
             uint64_t e = nv2a_overlay_poll(now_ns(CLOCK_MONOTONIC) / 1000000ull);
             if (e != ovl_seen) {
                 ovl_seen = e;
@@ -1135,7 +1257,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             upload_ns += now_ns(CLOCK_MONOTONIC) - t0;
         }
 #endif
-        if (dirty && !s_layer) {
+        if (dirty && !s_layer && !s_swap_win) {
             dirty = 0;
             SDL_RenderClear(ren);
             if (tex && filter == NV2A_PRESENT_INTEGER) {
@@ -1239,7 +1361,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 " %llu presents (%.1f/s), %llu dropped, main thread %.1f%% of a"
                 " core, upload %.3f ms/frame, ack copy %.3f ms/flip\n",
                 quit ? "window closed" : "guest returned", dt,
-                s_layer ? "CAMetalLayer" : "SDL renderer",
+                s_swap_win ? "D3D11 swap chain" : s_layer ? "CAMetalLayer" : "SDL renderer",
                 (unsigned long long)fl, dt > 0 ? (double)fl / dt : 0.0,
                 (unsigned long long)presents, dt > 0 ? (double)presents / dt : 0.0,
                 (unsigned long long)dropped_base,
@@ -1259,6 +1381,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * stream and the game controllers are still in use on other threads.
      * Cmd-Q with sound on crashed in SDL_GetAudioStreamQueued when this was
      * SDL_Quit; the dummy driver's virtual clock never touches the stream. */
+    /* A lent window stays: the backend may be presenting to it on the ack
+     * thread, which nothing here can stop, until exit() ends the process
+     * (as the Win32 window's WM_CLOSE ends it with the window up). */
+    if (s_swap_win) {
+        if (quit)
+            exit(0);
+        return s_guest_rc;
+    }
     if (tex)
         SDL_DestroyTexture(tex);
     close_present(ren);

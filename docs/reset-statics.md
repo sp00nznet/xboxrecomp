@@ -1559,7 +1559,37 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 
 ## HLE D3D8, translators, shader cache, D3D11 and Metal backends
 
-538 rows.
+541 rows.
+
+### src/d3d/d3d11_hlsl_vkd3d.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/d3d/d3d11_hlsl_vkd3d.c | d3d11_hlsl_version | v | local_static | constant | - | vkd3d-shader version string from the loaded library |
+
+### src/d3d/d3d11_host_sdl.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/d3d/d3d11_host_sdl.c | - | s_hlsl | file_static | constant | - | HLSL compiler version, the shader cache key |
+
+### src/d3d/d3d11_host_win32.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/d3d/d3d11_host_win32.c | d3d11_host_now_ms | f | local_static | constant | - | QPC frequency |
+| src/d3d/d3d11_host_win32.c | d3d11_host_now_us | f | local_static | constant | - | QPC frequency |
+| src/d3d/d3d11_host_win32.c | - | s_dll | file_static | constant | - | d3dcompiler_47 module handle |
+| src/d3d/d3d11_host_win32.c | - | s_compile | file_static | constant | - | D3DCompile function pointer from loaded DLL |
+| src/d3d/d3d11_host_win32.c | - | s_create_blob | file_static | constant | - | D3DCreateBlob function pointer from loaded DLL |
+| src/d3d/d3d11_host_win32.c | - | s_hwnd | file_static | keep | - | host window handle |
+| src/d3d/d3d11_host_win32.c | - | s_title_clock | file_static | keep | - | window title refresh clock, host |
+| src/d3d/d3d11_host_win32.c | - | s_client_w | file_static | keep | - | window client size from WM_SIZE |
+| src/d3d/d3d11_host_win32.c | - | s_client_h | file_static | keep | - | window client size from WM_SIZE |
+| src/d3d/d3d11_host_win32.c | d3d11_host_pump | quit_at | local_static | keep | - | bench quit deadline from env, host |
+| src/d3d/d3d11_host_win32.c | d3d11_host_pump | quit_posted | local_static | keep | - | bench quit already posted |
+| src/d3d/d3d11_host_win32.c | d3d11_host_fullscreen | s_windowed | local_static | keep | - | saved windowed placement |
+| src/d3d/d3d11_host_win32.c | d3d11_host_fullscreen | s_have_windowed | local_static | keep | - | saved placement valid |
 
 ### src/d3d/d3d8_combiners.c
 
@@ -1687,8 +1717,6 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | file | scope | name | kind | class | hook | why |
 |---|---|---|---|---|---|---|
 | src/d3d/nv2a_pb_d3d11.c | - | s_failed | file_static | keep | - | device init failed flag, host |
-| src/d3d/nv2a_pb_d3d11.c | - | s_hwnd | file_static | keep | - | host window handle |
-| src/d3d/nv2a_pb_d3d11.c | - | s_title_clock | file_static | keep | - | window title refresh clock, host |
 | src/d3d/nv2a_pb_d3d11.c | - | s_sync_interval | file_static | keep | - | present vsync interval from env |
 | src/d3d/nv2a_pb_d3d11.c | - | s_dev | file_static | keep | - | D3D11 device |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ctx | file_static | keep | - | D3D11 immediate context |
@@ -1699,12 +1727,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_back_h | file_static | keep | - | back buffer height |
 | src/d3d/nv2a_pb_d3d11.c | - | s_made_w | file_static | keep | - | swap chain size at init |
 | src/d3d/nv2a_pb_d3d11.c | - | s_made_h | file_static | keep | - | swap chain size at init |
-| src/d3d/nv2a_pb_d3d11.c | - | s_client_w | file_static | keep | - | window client size from WM_SIZE |
-| src/d3d/nv2a_pb_d3d11.c | - | s_client_h | file_static | keep | - | window client size from WM_SIZE |
 | src/d3d/nv2a_pb_d3d11.c | - | s_back_rtv | file_static | keep | - | back buffer RTV for the scaling blit |
 | src/d3d/nv2a_pb_d3d11.c | - | s_dump_rt | file_static | keep | - | frame dump source choice, host option |
-| src/d3d/nv2a_pb_d3d11.c | - | s_compile | file_static | constant | - | D3DCompile function pointer from loaded DLL |
-| src/d3d/nv2a_pb_d3d11.c | - | s_create_blob | file_static | constant | - | D3DCreateBlob function pointer from loaded DLL |
 | src/d3d/nv2a_pb_d3d11.c | - | s_shc | file_static | keep | - | on-disk DXBC cache keyed by source and compiler |
 | src/d3d/nv2a_pb_d3d11.c | - | s_shc_compiler | file_static | constant | - | compiler identity string for cache keys |
 | src/d3d/nv2a_pb_d3d11.c | - | s_sh_compiled | file_static | keep | - | compile count stats |
@@ -1756,9 +1780,6 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_vs | file_static | keep | - | VS/layouts keyed by vertex program content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_blend | file_static | keep | - | blend states keyed by state words |
 | src/d3d/nv2a_pb_d3d11.c | - | s_blend_n | file_static | keep | - | blend cache fill count |
-| src/d3d/nv2a_pb_d3d11.c | pump | quit_at | local_static | keep | - | bench quit deadline from env, host |
-| src/d3d/nv2a_pb_d3d11.c | pump | quit_posted | local_static | keep | - | bench quit already posted |
-| src/d3d/nv2a_pb_d3d11.c | sh_now_ms | f | local_static | constant | - | QPC frequency |
 | src/d3d/nv2a_pb_d3d11.c | init | tried | local_static | keep | - | device init ran once; device kept |
 | src/d3d/nv2a_pb_d3d11.c | - | s_rt_gen | file_static | keep | - | monotonic RT-set gen; rt_release bumps it |
 | src/d3d/nv2a_pb_d3d11.c | - | s_stale_drops | file_static | keep | - | stats counter |
@@ -1981,13 +2002,10 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | gpu_mem_note | said | local_static | keep | - | log-once guard |
 | src/d3d/nv2a_pb_d3d11.c | d3d11_flip | said | local_static | keep | - | log-once guard |
 | src/d3d/nv2a_pb_d3d11.c | d3d11_flip | said_nb | local_static | keep | - | log-once guard |
-| src/d3d/nv2a_pb_d3d11.c | fullscreen_switch | s_windowed | local_static | keep | - | saved windowed placement |
-| src/d3d/nv2a_pb_d3d11.c | fullscreen_switch | s_have_windowed | local_static | keep | - | saved placement valid |
 | src/d3d/nv2a_pb_d3d11.c | - | s_occ_pool | file_static | keep | - | free host query objects |
 | src/d3d/nv2a_pb_d3d11.c | - | s_occ_pool_n | file_static | keep | - | free query count |
 | src/d3d/nv2a_pb_d3d11.c | - | s_occ_made | file_static | keep | - | queries made total |
 | src/d3d/nv2a_pb_d3d11.c | - | s_occ_mode | file_static | keep | - | cached RENV_D3D11_OCC read |
-| src/d3d/nv2a_pb_d3d11.c | occ_now_us | f | local_static | constant | - | QPC frequency |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_buf | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_read | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_cb | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
@@ -3037,6 +3055,10 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/video/fb_present_sdl.c | - | s_ovl_tex | file_static | keep | - | host present slots and window |
 | src/video/fb_present_sdl.c | - | s_ovl_tex_gen | file_static | keep | - | host present slots and window |
 | src/video/fb_present_sdl.c | - | s_ovl_conv | file_static | keep | - | host present slots and window |
+| src/video/fb_present_sdl.c | - | s_swap_win | file_static | keep | - | D3D11 swap window and its sizes (dxvk-native) |
+| src/video/fb_present_sdl.c | - | s_swap_size | file_static | keep | - | D3D11 swap window and its sizes (dxvk-native) |
+| src/video/fb_present_sdl.c | - | s_disp_size | file_static | keep | - | D3D11 swap window and its sizes (dxvk-native) |
+| src/video/fb_present_sdl.c | - | s_swap_req | file_static | keep | - | pending swap-window resize, host |
 
 ### src/video/gpu_present.c
 
