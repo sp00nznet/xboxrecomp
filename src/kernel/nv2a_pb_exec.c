@@ -6822,6 +6822,9 @@ static void draw_immediate(void)
  * strips back to back: 7.8k draws merged, and on the Deck each backend
  * draw is ~1.3 us of the walk. */
 static struct nv2a_merge s_mrg;
+/* The faces the chain draws with: its first batch's. A later batch whose
+ * faces cull the other winding joins wound the other way (merge_take). */
+static uint32_t s_mrg_cull, s_mrg_front;
 static int s_batch_pure;        /* the open batch has had only indices */
 static uint32_t s_mrg_save_n;
 /* merge_continues flushes before an open batch passes the batch cap, so
@@ -6836,14 +6839,21 @@ static uint16_t s_mrg_save[NV2A_MERGE_BATCH_MAX];
  * merged): under either only a batch the backend's merge_placed accepts
  * is held, the settled 3D world (nv2a_merge_placed). Hor+ used to stop
  * merging altogether. */
-static int merge_on(void)
+/* pb_merge: 0 off, 1 narrow (nothing but the next batch between), 2 wide
+ * (also merge_neutral's methods, the default). */
+static int merge_mode(void)
 {
     static int env = -1;
     if (env < 0) {
         const char *e = recomp_env(RENV_PB_MERGE);
-        env = !(e && !strcmp(e, "0"));
+        env = !e ? 2 : !strcmp(e, "0") ? 0 : !strcmp(e, "narrow") ? 1 : 2;
     }
-    if (!env || !s_backend->merge_draws || !s_backend->on_draw)
+    return env;
+}
+
+static int merge_on(void)
+{
+    if (!merge_mode() || !s_backend->merge_draws || !s_backend->on_draw)
         return 0;
     if (!nv2a_host_opts()->aspect_w && !nv2a_snap_2d_on(nv2a_host_render_scale()))
         return 1;
@@ -6855,7 +6865,7 @@ static int merge_on(void)
  * indices so far): that batch's indices are kept aside meanwhile. */
 static void merge_flush(void)
 {
-    uint32_t prim = s_gpu.prim, n = s_gpu.idx_count;
+    uint32_t prim = s_gpu.prim, n = s_gpu.idx_count, cull, front;
     int cut = s_idx_cut;
 
     if (!s_mrg.batches)
@@ -6865,6 +6875,10 @@ static void merge_flush(void)
         s_mrg_save_n = n;
     }
     s_idx_cut = 0;
+    cull = s_vsh.cull_face;
+    front = s_vsh.front_face;
+    s_vsh.cull_face = s_mrg_cull;
+    s_vsh.front_face = s_mrg_front;
     if (s_mrg.batches == 1) {
         s_gpu.prim = s_mrg.prim;
         memcpy(s_gpu.idx, s_mrg.raw, s_mrg.raw_n * sizeof *s_gpu.idx);
@@ -6882,6 +6896,8 @@ static void merge_flush(void)
         s_gpu.verts += s_mrg.verts - s_mrg.n;
     }
     s_mrg.batches = 0;
+    s_vsh.cull_face = cull;
+    s_vsh.front_face = front;
     s_gpu.prim = prim;
     s_gpu.idx_count = 0;
     if (prim && n) {
@@ -6913,26 +6929,143 @@ static int merge_samples_target(void)
     return 0;
 }
 
+/* Which winding a pair of faces culls: 1 for clockwise. The executor and
+ * both GPU backends use the faces for culling only (no front-facing shader
+ * input, two-sided lighting or per-face polygon mode), so two batches with
+ * the same parity draw alike under either's faces, and one with the other
+ * parity draws alike wound the other way. */
+static int merge_parity(uint32_t cull, uint32_t front)
+{
+    return (cull == 0x405) ^ (front == 0x900);
+}
+
+/* Start a chain with the open batch, under the faces set now. */
+static int merge_start(void)
+{
+    s_mrg_cull = s_vsh.cull_face;
+    s_mrg_front = s_vsh.front_face;
+    return nv2a_merge_add(&s_mrg, s_gpu.prim, s_gpu.idx, s_gpu.idx_count, 0);
+}
+
 /* At a batch's END: hold it (1) or leave it to be drawn now (0), drawing
  * any chain it cannot join first. */
 static int merge_take(void)
 {
+    int flip;
+
     if (!s_batch_pure || s_gpu.imm_count || s_gpu.inline_count || s_idx_cut
             || !nv2a_merge_joinable(s_gpu.prim, s_gpu.idx_count) || !merge_on()
             || merge_samples_target()) {
         merge_flush();
         return 0;
     }
-    if (nv2a_merge_add(&s_mrg, s_gpu.prim, s_gpu.idx, s_gpu.idx_count))
+    if (!s_mrg.batches)
+        return merge_start();
+    flip = merge_parity(s_vsh.cull_face, s_vsh.front_face)
+        != merge_parity(s_mrg_cull, s_mrg_front);
+    if (nv2a_merge_add(&s_mrg, s_gpu.prim, s_gpu.idx, s_gpu.idx_count, flip))
         return 1;
     merge_flush();
-    return nv2a_merge_add(&s_mrg, s_gpu.prim, s_gpu.idx, s_gpu.idx_count);
+    return merge_start();
+}
+
+/* A method between batches that may leave a held chain open (pb_merge not
+ * narrow): a cull or front face change between the two culling faces and
+ * the two windings, which merge_take absorbs by winding, or a store that
+ * leaves its state as it is, so the held batches draw the same at the flush.
+ * BLiNX 2 flips the cull face between its strips to suit each one's winding:
+ * in a stage1 flip 1.3k of 2.1k chains ended at that alone. Kept to these
+ * few: other methods act on an equal value too (constant and program loads
+ * move a pointer, semaphores and notifies signal, clears draw). */
+static int merge_neutral(uint32_t method, uint32_t param)
+{
+    uint32_t i;
+
+    if (merge_mode() < 2)
+        return 0;
+    switch (method) {
+    case NV097_SET_CULL_FACE_M:
+        return (param == 0x404 || param == 0x405)
+            && (s_vsh.cull_face == 0x404 || s_vsh.cull_face == 0x405);
+    case NV097_SET_FRONT_FACE_M:
+        return (param == 0x900 || param == 0x901)
+            && (s_vsh.front_face == 0x900 || s_vsh.front_face == 0x901);
+    case NV097_SET_CULL_FACE_ENABLE_M:
+        return (param != 0) == s_vsh.cull_enable;
+    default:
+        break;
+    }
+    if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET
+            && method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + NV_VERTEX_ATTRS * 4) {
+        i = (method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4;
+        return s_gpu.attr[i].offset == dma_resolve(param);
+    }
+    if (method >= NV097_SET_VERTEX_DATA_ARRAY_FORMAT
+            && method < NV097_SET_VERTEX_DATA_ARRAY_FORMAT + NV_VERTEX_ATTRS * 4) {
+        const VertexAttr *a = &s_gpu.attr[(method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4];
+        return a->type == (param & 0x0F) && a->size == ((param >> 4) & 0x0F)
+            && a->stride == ((param >> 8) & 0xFF);
+    }
+    return 0;
+}
+
+/* RECOMP_DEBUG=pb_merge_why: per flip, which methods ended held chains, the
+ * most frequent printed with the [PB-PERF] line as [PB-MERGE]. To see what
+ * keeps a title's batches apart without a method log. Index:
+ * the kelvin method / 4; the last slot for every other subchannel. */
+#define MERGE_WHY_SLOTS (0x2000u / 4u + 1u)
+static uint32_t *s_mwhy;
+
+static void merge_why_note(uint32_t subch, uint32_t method)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_PB_MERGE_WHY);
+        on = e && strcmp(e, "0") != 0;
+        if (on)
+            s_mwhy = calloc(MERGE_WHY_SLOTS, sizeof *s_mwhy);
+    }
+    if (s_mwhy)
+        s_mwhy[subch == 0 && method < 0x2000u ? method / 4u : MERGE_WHY_SLOTS - 1u]++;
+}
+
+static void merge_why_flip(uint32_t flip)
+{
+    uint32_t top[5] = {0}, cnt[5] = {0}, i, k, total = 0;
+    char line[160];
+    int at;
+
+    if (!s_mwhy)
+        return;
+    for (i = 0; i < MERGE_WHY_SLOTS; i++) {
+        uint32_t c = s_mwhy[i];
+        total += c;
+        for (k = 0; k < 5 && c <= cnt[k]; k++)
+            ;
+        if (k == 5)
+            continue;
+        memmove(&top[k + 1], &top[k], (4 - k) * sizeof *top);
+        memmove(&cnt[k + 1], &cnt[k], (4 - k) * sizeof *cnt);
+        top[k] = i;
+        cnt[k] = c;
+    }
+    at = snprintf(line, sizeof line, "[PB-MERGE] flip %u ends %u:", flip, total);
+    for (k = 0; k < 5 && cnt[k] && at > 0 && at < (int)sizeof line; k++) {
+        if (top[k] == MERGE_WHY_SLOTS - 1u)
+            at += snprintf(line + at, sizeof line - at, " subch:%u", cnt[k]);
+        else
+            at += snprintf(line + at, sizeof line - at, " %04X:%u", top[k] * 4u, cnt[k]);
+    }
+    fprintf(stderr, "%s\n", line);
+    memset(s_mwhy, 0, MERGE_WHY_SLOTS * sizeof *s_mwhy);
 }
 
 /* Whether a method keeps the held chain open: the next batch's BEGIN with
  * the chain's primitive, and inside it its indices and END. */
-static int merge_continues(uint32_t method, uint32_t param)
+static int merge_continues(uint32_t subch, uint32_t method, uint32_t param)
 {
+    if (subch != 0)
+        return 0;
     switch (method) {
     case NV097_SET_BEGIN_END:
         return param ? !s_gpu.prim && param == s_mrg.prim : s_gpu.prim && s_batch_pure;
@@ -6946,7 +7079,7 @@ static int merge_continues(uint32_t method, uint32_t param)
     case NV097_ARRAY_ELEMENT32:
         return s_gpu.prim && s_batch_pure && s_gpu.idx_count + 1u <= NV2A_MERGE_BATCH_MAX;
     default:
-        return 0;
+        return !s_gpu.prim && merge_neutral(method, param);
     }
 }
 
@@ -7249,8 +7382,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (s_gpu.prim && method != NV097_SET_BEGIN_END && method != NV097_DRAW_ARRAYS
             && method != NV097_ARRAY_ELEMENT16 && method != NV097_ARRAY_ELEMENT32)
         s_batch_pure = 0;
-    if (s_mrg.batches && !merge_continues(method, param))
+    if (s_mrg.batches && !merge_continues(subch, method, param)) {
+        merge_why_note(subch, method);
         merge_flush();
+    }
     fence_paired = s_fence_ref_next;
     s_fence_ref_next = 0;
     /* Bring-up: the first parameters each surface method carries. A wrong
@@ -7774,6 +7909,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     prev_stops = stops;
                     /* RECOMP_TRACE=pb_cost: the draw share by stage */
                     nv2a_pb_cost_flip(s_gpu.flips, s_perf.batches, s_perf.draws);
+                    merge_why_flip(s_gpu.flips);
                     s_perf.scan = s_perf.draw = s_perf.flip = 0;
                     s_perf.methods = s_perf.batches = s_perf.draws = 0;
                     s_perf.scan_t0 = s_perf.flip_t0 = now;
@@ -7907,8 +8043,10 @@ uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc,
     s_perf.methods += n;
     if (s_gpu.prim)
         s_batch_pure = 0;
-    if (s_mrg.batches)
+    if (s_mrg.batches) {
+        merge_why_note(subch, method);
         merge_flush();
+    }
     s_fence_ref_next = 0;
     if (!s_vsh.ff_ready) {
         nv2a_ff_init(&s_vsh.ff);

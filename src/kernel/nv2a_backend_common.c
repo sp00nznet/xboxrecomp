@@ -334,8 +334,13 @@ int nv2a_merge_joinable(uint32_t prim, uint32_t n)
         && n >= 3 && n <= NV2A_MERGE_BATCH_MAX;
 }
 
-/* Append batch v's triangles to out at *at, room permitting. */
-static int merge_put(uint16_t *out, uint32_t *at, uint32_t prim, const uint16_t *v, uint32_t n)
+/* Append batch v's triangles to out at *at, room permitting; with flip,
+ * each wound the other way by swapping its first two vertices. No backend
+ * does flat shading today, so which vertex leads does not matter; flat
+ * shading would need the provoking vertex (D3D8's is the first) kept here
+ * and in nv2a_prim_to_list's odd strip triangles, which swap the same way. */
+static int merge_put(uint16_t *out, uint32_t *at, uint32_t prim, const uint16_t *v, uint32_t n,
+                     int flip)
 {
     uint32_t tmp[NV2A_MERGE_BATCH_MAX * 3u], k, i;
     enum nv2a_topology topo;
@@ -345,11 +350,17 @@ static int merge_put(uint16_t *out, uint32_t *at, uint32_t prim, const uint16_t 
         return 0;
     for (i = 0; i < k; i++)
         out[*at + i] = (uint16_t)tmp[i];
+    if (flip)
+        for (i = 0; i + 2 < k; i += 3) {
+            out[*at + i] = (uint16_t)tmp[i + 1];
+            out[*at + i + 1] = (uint16_t)tmp[i];
+        }
     *at += k;
     return 1;
 }
 
-int nv2a_merge_add(struct nv2a_merge *m, uint32_t prim, const uint16_t *v, uint32_t n)
+int nv2a_merge_add(struct nv2a_merge *m, uint32_t prim, const uint16_t *v, uint32_t n,
+                   int flip)
 {
     uint16_t lo = v[0], hi = v[0];
     uint32_t i, at;
@@ -376,11 +387,11 @@ int nv2a_merge_add(struct nv2a_merge *m, uint32_t prim, const uint16_t *v, uint3
     if ((uint32_t)(hi - lo) >= NV2A_MERGE_SPAN_MAX)
         return 0;
     at = 0;
-    if (m->batches == 1 && !merge_put(m->list, &at, prim, m->raw, m->raw_n))
+    if (m->batches == 1 && !merge_put(m->list, &at, prim, m->raw, m->raw_n, 0))
         return 0;
     if (m->batches > 1)
         at = m->n;
-    if (!merge_put(m->list, &at, prim, v, n))
+    if (!merge_put(m->list, &at, prim, v, n, flip))
         return 0;
     m->n = at;
     m->batches++;

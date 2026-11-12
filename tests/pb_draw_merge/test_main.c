@@ -33,6 +33,23 @@
  *              batch from its own vertices) only what merge_placed takes
  *              is merged, as under Hor+; at scale 1, where the snap is
  *              off, batches merge as stock
+ *   faces      a cull face or front face change between batches (FRONT or
+ *              BACK, CW or CCW) keeps the chain: a batch that culls the
+ *              other winding joins wound the other way (first two vertices
+ *              of each triangle swapped), one that culls the same as is,
+ *              and the chain draws with its first batch's faces, the
+ *              stream's restored after; FRONT_AND_BACK, a face change
+ *              inside a batch and a cull enable change still end it.
+ * TRIANGLES, QUADS and FAN batches flip per
+ *              triangle too; a batch past the span after a face change
+ *              draws the chain under its faces and starts a new one under
+ *              the new faces; the walk's end and a transform constant run
+ *              draw a held flipped chain and restore the stream's faces
+ *   unchanged  a cull enable or vertex array offset / format write that
+ *              leaves the state as it is keeps the chain; one that changes
+ *              it ends the chain
+ *   narrow     with pb_merge=narrow (the second ctest, argument "narrow")
+ *              only batches with nothing between them merge
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -44,6 +61,8 @@
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 void nv2a_pb_exec_walk_end(void);
+uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc,
+                          const uint32_t *p, uint32_t n);
 
 /* The kernel library expects these from the title's generated code. */
 typedef void (*recomp_func_t)(void);
@@ -60,10 +79,17 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define TEX0_OFF    0x1B00u     /* SET_TEXTURE_OFFSET(0) */
 #define TEX0_CTL0   0x1B0Cu     /* SET_TEXTURE_CONTROL0(0), bit 30 enables */
 #define XFORM_MODE  0x1E94u     /* SET_TRANSFORM_EXECUTION_MODE, 2: PROGRAM */
+#define CULL_ENABLE 0x0308u
+#define CULL_FACE   0x039Cu     /* 0x404 FRONT, 0x405 BACK, 0x408 both */
+#define FRONT_FACE  0x03A0u     /* 0x900 CW, 0x901 CCW */
+#define VA_OFF0     0x1720u     /* SET_VERTEX_DATA_ARRAY_OFFSET(0) */
+#define VA_FMT0     0x1760u     /* SET_VERTEX_DATA_ARRAY_FORMAT(0) */
+#define XFORM_CONST 0x0B80u     /* SET_TRANSFORM_CONSTANT(0) */
 
 #define MAX_DRAWS 16
 static struct {
     uint32_t prim, n, batches;
+    uint32_t cull, front;       /* the faces the executor drew with */
     uint16_t idx[64];
 } s_draw[MAX_DRAWS];
 static int s_draws;
@@ -75,6 +101,8 @@ static void rec_on_draw(const struct nv2a_pb_draw *d)
         s_draw[s_draws].prim = d->prim;
         s_draw[s_draws].n = d->idx_count;
         s_draw[s_draws].batches = d->batches;
+        s_draw[s_draws].cull = nv2a_pb_vsh_state()->cull_face;
+        s_draw[s_draws].front = nv2a_pb_vsh_state()->front_face;
         memcpy(s_draw[s_draws].idx, d->idx,
                (d->idx_count < 64 ? d->idx_count : 64) * sizeof *d->idx);
     }
@@ -140,7 +168,225 @@ static void build_xbe(uint8_t *xbe, size_t n)
     v = 0x00010800u ^ 0x5B6D40B6u; memcpy(xbe + 0x158, &v, 4); /* empty thunks */
 }
 
-int main(void)
+/* The faces and unchanged-write cases. narrow: pb_merge=narrow,
+ * where each of them draws its batches apart. */
+static void faces(int narrow)
+{
+    /* Strips of 4, 3 and 4 from 0, 4 and 7 under BACK, FRONT, BACK: the
+     * middle one culls the other winding, so it joins as (5 4 6). */
+    static const uint16_t flipped[] = {0, 1, 2, 2, 1, 3, 5, 4, 6, 7, 8, 9, 9, 8, 10};
+    static const uint16_t chain[] = {0, 1, 2, 2, 1, 3, 4, 5, 6, 7, 8, 9, 9, 8, 10};
+    static const uint16_t strip4[] = {0, 1, 2, 3};
+    static const uint16_t pair[] = {0, 1, 2, 2, 1, 3, 4, 5, 6};
+    static const uint16_t pairflip[] = {0, 1, 2, 2, 1, 3, 5, 4, 6};
+    static const uint16_t tris_flip[] = {0, 1, 2, 3, 4, 5, 7, 6, 8};
+    static const uint16_t fan_flip[] = {0, 1, 2, 0, 2, 3, 5, 4, 6, 6, 4, 7};
+    static const uint16_t far_flip[] = {0x2000, 0x2001, 0x2002, 0x2004, 0x2003, 0x2005,
+                                        0x2004, 0x2005, 0x2006};
+    const char *tag = narrow ? "narrow: " : "";
+    char what[96];
+
+#define CHECK(text, ok) (snprintf(what, sizeof what, "%s%s", tag, (text)), check(what, (ok)))
+    M(CULL_ENABLE, 1);
+    M(FRONT_FACE, 0x901);
+    M(CULL_FACE, 0x405);
+    M(VA_OFF0, 0x1000);
+    M(VA_FMT0, 0x1002);
+    M(BLEND, 0);
+
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    M(CULL_ENABLE, 1);                      /* as BLiNX 2 sends it, unchanged */
+    M(CULL_FACE, 0x404);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    M(CULL_ENABLE, 1);
+    M(CULL_FACE, 0x405);
+    batch(NV_PRIM_TRIANGLE_STRIP, 7, 4);
+    M(CULL_FACE, 0x404);                    /* between batches: still held */
+    if (narrow) {
+        M(BLEND, 0);
+        CHECK("faces: every strip drawn on its own", s_draws == 3
+              && draw_is(0, NV_PRIM_TRIANGLE_STRIP, strip4, 4)
+              && s_draw[0].cull == 0x405 && s_draw[1].cull == 0x404);
+        M(CULL_FACE, 0x405);
+        s_draws = 0;
+        batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+        M(VA_OFF0, 0x1000);
+        batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+        M(BLEND, 0);
+        CHECK("unchanged: an unchanged write ends the chain", s_draws == 2);
+        return;
+    }
+    CHECK("faces: a cull face flip between strips keeps the chain held", s_draws == 0);
+    M(BLEND, 0);
+    CHECK("faces: one draw, the FRONT strip wound the other way",
+          s_draws == 1 && draw_is(0, NV_PRIM_TRIANGLES, flipped, 15)
+          && s_draw[0].batches == 3);
+    CHECK("faces: drawn with the first strip's faces",
+          s_draws == 1 && s_draw[0].cull == 0x405 && s_draw[0].front == 0x901);
+    CHECK("faces: the stream's cull face is back after the draw",
+          nv2a_pb_vsh_state()->cull_face == 0x404);
+
+    /* Front face CW with cull FRONT culls what CCW with BACK does: same
+     * parity, joined as is. CW with BACK culls the other: flipped. */
+    M(CULL_FACE, 0x405);
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    M(FRONT_FACE, 0x900);
+    M(CULL_FACE, 0x404);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    M(BLEND, 0);
+    CHECK("faces: CW+FRONT after CCW+BACK culls alike, joined as is",
+          s_draws == 1 && draw_is(0, NV_PRIM_TRIANGLES, pair, 9)
+          && s_draw[0].cull == 0x405 && s_draw[0].front == 0x901);
+    M(CULL_FACE, 0x405);
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    M(FRONT_FACE, 0x901);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    M(BLEND, 0);
+    CHECK("faces: a front face change alone flips the batch",
+          s_draws == 1 && draw_is(0, NV_PRIM_TRIANGLES, pairflip, 9)
+          && s_draw[0].front == 0x900 && nv2a_pb_vsh_state()->front_face == 0x901);
+
+    /* A one-batch chain is drawn as it came, with its own faces, even after
+     * a face change that kept it held. */
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    M(CULL_FACE, 0x404);
+    M(BLEND, 0);
+    CHECK("faces: a lone held strip draws as it came with its faces",
+          s_draws == 1 && draw_is(0, NV_PRIM_TRIANGLE_STRIP, strip4, 4)
+          && s_draw[0].cull == 0x405 && nv2a_pb_vsh_state()->cull_face == 0x404);
+    M(CULL_FACE, 0x405);
+
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    M(CULL_FACE, 0x408);
+    CHECK("faces: FRONT_AND_BACK ends the chain", s_draws == 1);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    M(CULL_FACE, 0x405);
+    batch(NV_PRIM_TRIANGLE_STRIP, 7, 4);
+    M(BLEND, 0);
+    CHECK("faces: and from FRONT_AND_BACK a face change ends it too",
+          s_draws == 3 && s_draw[1].cull == 0x408);
+
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    M(BEGIN_END, NV_PRIM_TRIANGLE_STRIP);
+    M(CULL_FACE, 0x404);                    /* inside the next batch */
+    CHECK("faces: a face change inside a batch ends the chain", s_draws == 1);
+    M(DRAW_ARRAYS, (2u << 24) | 4u);
+    M(BEGIN_END, 0);
+    CHECK("faces: and that batch draws on its own", s_draws == 2
+          && s_draw[1].prim == NV_PRIM_TRIANGLE_STRIP && s_draw[1].cull == 0x404);
+    M(CULL_FACE, 0x405);
+
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    M(CULL_ENABLE, 0);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    M(CULL_ENABLE, 1);
+    batch(NV_PRIM_TRIANGLE_STRIP, 7, 4);
+    M(BLEND, 0);
+    CHECK("faces: a cull enable change ends the chain", s_draws == 3);
+
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    M(VA_OFF0, 0x1000);
+    M(VA_FMT0, 0x1002);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    M(VA_OFF0, 0x1000);
+    batch(NV_PRIM_TRIANGLE_STRIP, 7, 4);
+    M(BLEND, 0);
+    CHECK("unchanged: unchanged array offset and format writes keep the chain",
+          s_draws == 1 && draw_is(0, NV_PRIM_TRIANGLES, chain, 15));
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    M(VA_OFF0, 0x2000);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    M(VA_FMT0, 0x1012);
+    batch(NV_PRIM_TRIANGLE_STRIP, 7, 4);
+    M(BLEND, 0);
+    CHECK("unchanged: a new offset or format ends the chain", s_draws == 3);
+
+    /* Lists, fans and quads flip per triangle too: (4 5 6) (4 6 7) of the
+     * second batch join as (5 4 6) (6 4 7), a TRIANGLES (6 7 8) as (7 6 8). */
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLES, 0, 6);
+    M(CULL_FACE, 0x404);
+    batch(NV_PRIM_TRIANGLES, 6, 3);
+    M(BLEND, 0);
+    CHECK("faces: a flipped TRIANGLES batch joins wound the other way",
+          s_draws == 1 && draw_is(0, NV_PRIM_TRIANGLES, tris_flip, 9)
+          && s_draw[0].cull == 0x405);
+    M(CULL_FACE, 0x405);
+    s_draws = 0;
+    batch(NV_PRIM_QUADS, 0, 4);
+    M(CULL_FACE, 0x404);
+    batch(NV_PRIM_QUADS, 4, 4);
+    M(BLEND, 0);
+    CHECK("faces: a flipped QUADS batch joins wound the other way",
+          s_draws == 1 && draw_is(0, NV_PRIM_TRIANGLES, fan_flip, 12)
+          && s_draw[0].batches == 2 && s_draw[0].cull == 0x405);
+    M(CULL_FACE, 0x405);
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_FAN, 0, 4);
+    M(CULL_FACE, 0x404);
+    batch(NV_PRIM_TRIANGLE_FAN, 4, 4);
+    M(BLEND, 0);
+    CHECK("faces: a flipped FAN batch joins wound the other way",
+          s_draws == 1 && draw_is(0, NV_PRIM_TRIANGLES, fan_flip, 12));
+    M(CULL_FACE, 0x405);
+
+    /* A batch past the span after a face change: the chain so far draws
+     * under its own faces, and a new one starts under the new faces, so a
+     * later BACK batch is the one that flips. */
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    M(CULL_FACE, 0x404);
+    batch(NV_PRIM_TRIANGLE_STRIP, 0x2000, 3);
+    CHECK("faces: past the span the held chain draws under its faces",
+          s_draws == 1 && draw_is(0, NV_PRIM_TRIANGLE_STRIP, strip4, 4)
+          && s_draw[0].cull == 0x405 && nv2a_pb_vsh_state()->cull_face == 0x404);
+    M(CULL_FACE, 0x405);
+    batch(NV_PRIM_TRIANGLE_STRIP, 0x2003, 4);
+    M(BLEND, 0);
+    CHECK("faces: and the new chain starts under the new faces",
+          s_draws == 2 && draw_is(1, NV_PRIM_TRIANGLES, far_flip, 9)
+          && s_draw[1].cull == 0x404 && nv2a_pb_vsh_state()->cull_face == 0x405);
+
+    /* The walk's end and a transform constant run draw a held flipped
+     * chain too, and give the stream its faces back. */
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    M(CULL_FACE, 0x404);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    nv2a_pb_exec_walk_end();
+    CHECK("faces: the walk's end draws the chain, faces restored",
+          s_draws == 1 && draw_is(0, NV_PRIM_TRIANGLES, pairflip, 9)
+          && s_draw[0].cull == 0x405 && nv2a_pb_vsh_state()->cull_face == 0x404);
+    M(CULL_FACE, 0x405);
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    M(CULL_FACE, 0x404);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    {
+        static const uint32_t konst[4];
+        nv2a_pb_exec_run(0, XFORM_CONST, 0, konst, 4);
+    }
+    CHECK("faces: a constant run draws the chain, faces restored",
+          s_draws == 1 && draw_is(0, NV_PRIM_TRIANGLES, pairflip, 9)
+          && s_draw[0].cull == 0x405 && nv2a_pb_vsh_state()->cull_face == 0x404);
+    M(CULL_FACE, 0x405);
+
+    M(VA_OFF0, 0);
+    M(VA_FMT0, 0);
+    M(CULL_ENABLE, 0);
+#undef CHECK
+}
+
+int main(int argc, char **argv)
 {
     static uint8_t xbe[0x1000];
     /* Strips of 4, 3 and 4 from 0, 4 and 7: (0 1 2) (2 1 3), (4 5 6),
@@ -161,6 +407,10 @@ int main(void)
     }
     nv2a_pb_set_backend(&s_rec);
     M(BLEND, 0);                            /* first method: the executor's setup */
+    if (argc > 1 && !strcmp(argv[1], "narrow")) {
+        faces(1);
+        goto done;
+    }
 
     draws0 = nv2a_pb_gpu_state()->draws;
     verts0 = nv2a_pb_gpu_state()->verts;
@@ -324,6 +574,14 @@ int main(void)
         struct nv2a_host_opts o = *nv2a_host_opts();
         o.aspect_w = 0;
         o.aspect_h = 0;
+        nv2a_host_opts_set(&o);
+    }
+    faces(0);
+
+    {
+        struct nv2a_host_opts o = *nv2a_host_opts();
+        o.aspect_w = 0;
+        o.aspect_h = 0;
         o.snap_2d = 1;
         o.render_scale = 1;
         nv2a_host_opts_set(&o);
@@ -380,6 +638,7 @@ int main(void)
               && !nv2a_merge_placed(1, 1, &gearly, 0) && !nv2a_merge_placed(1, 1, NULL, 0));
     }
 
+done:
     if (s_fail) {
         fprintf(stderr, "[pb_draw_merge] FAIL: %d check(s)\n", s_fail);
         return 1;

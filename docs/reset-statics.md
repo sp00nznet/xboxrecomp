@@ -1329,10 +1329,14 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_pb_exec.c | vsh_note_gpu | on | local_static | keep | - | cached env read |
 | src/kernel/nv2a_pb_exec.c | draw_primitive | shown | local_static | keep | - | log-once guard |
 | src/kernel/nv2a_pb_exec.c | - | s_mrg | file_static | reset | pgraph | draw merge carry-over across methods |
+| src/kernel/nv2a_pb_exec.c | - | s_mrg_cull | file_static | reset | pgraph | draw merge carry-over across methods |
+| src/kernel/nv2a_pb_exec.c | - | s_mrg_front | file_static | reset | pgraph | draw merge carry-over across methods |
 | src/kernel/nv2a_pb_exec.c | - | s_batch_pure | file_static | reset | pgraph | draw merge carry-over across methods |
 | src/kernel/nv2a_pb_exec.c | - | s_mrg_save_n | file_static | reset | pgraph | draw merge carry-over across methods |
 | src/kernel/nv2a_pb_exec.c | - | s_mrg_save | file_static | reset | pgraph | draw merge carry-over across methods |
-| src/kernel/nv2a_pb_exec.c | merge_on | env | local_static | keep | - | cached env read |
+| src/kernel/nv2a_pb_exec.c | merge_mode | env | local_static | keep | - | cached env read |
+| src/kernel/nv2a_pb_exec.c | - | s_mwhy | file_static | keep | - | pb_merge_why debug counters; zeroed each flip, continue across reset |
+| src/kernel/nv2a_pb_exec.c | merge_why_note | on | local_static | keep | - | cached env read |
 | src/kernel/nv2a_pb_exec.c | - | s_exec_inited | once | reset | pgraph | rerun: s_gpu min/max, s_vsh.inl w=1; split out backend registration |
 | src/kernel/nv2a_pb_exec.c | - | s_mlog_flip | file_static | keep | - | cached env read |
 | src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | verbose | local_static | keep | - | cached env read |

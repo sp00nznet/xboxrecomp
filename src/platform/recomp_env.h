@@ -262,7 +262,8 @@ extern "C" {
     X(PB_NULL_DRAW_US,   DEBUG, "null_draw_us",    "RECOMP_PB_NULL_DRAW_US",   "=us: null backend cost per draw") \
     X(PB_INJECT_STOP,    DEBUG, "pb_inject_stop",  "RECOMP_PB_INJECT_STOP",    "=n: stop every nth walk (test hook)") \
     X(PB_MLOG,           DEBUG, "pb_mlog",         NULL,                       "=flip: every method of that flip (subchannel, method, parameter) to stderr as [MLOG]") \
-    X(PB_MERGE,          DEBUG, "pb_merge",        NULL,                       "=0: draw every guest batch on its own, no merging of back-to-back triangle batches on a GPU backend") \
+    X(PB_MERGE,          DEBUG, "pb_merge",        NULL,                       "=0: draw every guest batch on its own, no merging of back-to-back triangle batches on a GPU backend; =narrow: merge only batches with nothing between them (no cull face changes or unchanged writes)") \
+    X(PB_MERGE_WHY,      DEBUG, "pb_merge_why",    NULL,                       "=1: per flip, the methods that ended held merge chains, the top five as [PB-MERGE] with the flip log's [PB-PERF] line") \
     X(FAST_KICK,         DEBUG, "fast_kick",       "RECOMP_FAST_KICK",         "=0: ack loop ticks at Sleep(1)") \
     X(KICK_EVENT,        DEBUG, "kick_event",      NULL,                       "=1: the ack loop sleeps until the guest pokes it instead of polling the KickOff every ~50 us (default off)") \
     X(RUN_AHEAD,         DEBUG, "run_ahead",       NULL,                       "=N (1-1024): the walker publishes GET as it walks and acks the KickOff flush with up to N segments submitted past its walk; D3D's notify NOPs raise the PGRAPH interrupt. Unset: on at 64, off in the deterministic mode. =0 or =off (or a game default of 0): the old lockstep. A bare run_ahead, =on or any other non-number is depth 1, not 64 (docs/env.md)") \

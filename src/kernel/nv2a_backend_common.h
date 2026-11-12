@@ -961,7 +961,8 @@ uint32_t nv2a_prim_to_list(uint32_t prim, const uint16_t *v, uint32_t n,
                            enum nv2a_topology *topo);
 
 /* Draw merging (nv2a_pb_exec.c): back-to-back batches of one triangle
- * primitive with no method between them are drawn as one triangle list.
+ * primitive with no method between them (or only a cull face change or a
+ * write that changes nothing, merge_neutral) are drawn as one triangle list.
  * Titles that draw every particle or sprite as its own 3- or 4-vertex
  * strip (BLiNX 1's snow: 18k batches a flip, most of them with nothing in
  * between) pay a backend draw call per strip otherwise. The list is
@@ -989,8 +990,11 @@ struct nv2a_merge {
 int nv2a_merge_joinable(uint32_t prim, uint32_t n);
 /* Add a joinable batch to m (batches 0 starts a chain). Returns 0, with m
  * unchanged, when it does not fit: another primitive, the list full or the
- * span too wide; the caller draws m and starts again. */
-int nv2a_merge_add(struct nv2a_merge *m, uint32_t prim, const uint16_t *v, uint32_t n);
+ * span too wide; the caller draws m and starts again. flip (not for the
+ * first batch) winds the batch's triangles the other way, for a batch whose
+ * cull faces cull the other winding from the chain's. */
+int nv2a_merge_add(struct nv2a_merge *m, uint32_t prim, const uint16_t *v, uint32_t n,
+                   int flip);
 
 /* FNV-1a over the vertex program's slots, from v->start through the slot
  * with the FINAL bit (or the end). *len, if given, gets the slot count. */
