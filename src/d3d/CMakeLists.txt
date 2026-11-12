@@ -84,6 +84,24 @@ else()
         add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_backend_smoke
                          ${CMAKE_CURRENT_BINARY_DIR}/nv2a_backend_smoke)
     endif()
+    if(XBOXRECOMP_DXVK_NATIVE)
+        # The D3D11 backend Windows builds, over dxvk-native's D3D11 and DXGI
+        # (cmake/dxvk_native.cmake) with the SDL presenter's window as its
+        # host and vkd3d-shader (cmake/vkd3d_shader.cmake) as its HLSL
+        # compiler.
+        target_sources(xbox_d3d8 PRIVATE
+            nv2a_pb_d3d11.c d3d11_host_sdl.c d3d11_hlsl_vkd3d.c)
+        target_include_directories(xbox_d3d8 PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
+        target_link_libraries(xbox_d3d8 PUBLIC dxvk::d3d11 dxvk::dxgi xbox_input)
+        xboxrecomp_vkd3d_shader(xbox_d3d8)
+        if(XBOXRECOMP_ENHANCE)
+            # librashader.h's types; its D3D11 runtime is Windows-only, so
+            # present.shader is stubbed out in this build.
+            target_include_directories(xbox_d3d8 PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/librashader)
+        endif()
+    endif()
 endif()
 
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

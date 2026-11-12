@@ -79,6 +79,17 @@ void d3d11_host_swap_chain_made(void *swap);
 void d3d11_host_ready(void);
 /* Once a flip: the window's events, input and the timed quit. */
 void d3d11_host_pump(void);
+/* Around the swap chain's Present. On Linux begin never returns once the
+ * presenter's window is closing (the thread parks, so exit() tears DXVK
+ * down with no call in flight; fb_present_swap.h) and end counts the
+ * present; on Windows both do nothing. */
+void d3d11_host_present_begin(void);
+void d3d11_host_present_end(void);
+/* Around every backend callback (nv2a_pb_d3d11.c's vtable): the same
+ * park as present_begin, so exit() never runs under an upload, draw, Map or
+ * occlusion settle either. Nests with present_begin/end; Windows: no-ops. */
+void d3d11_host_work_begin(void);
+void d3d11_host_work_end(void);
 /* Once a flip: the title bar, when its text is due a change. */
 void d3d11_host_title(void);
 /* The window's client size as last reported (0 x 0: none yet). */

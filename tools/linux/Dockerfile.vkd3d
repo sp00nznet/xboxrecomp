@@ -1,0 +1,41 @@
+# libvkd3d-shader, the dxvk-native build's HLSL compiler, built unmodified
+# from the pinned upstream source tarball (cmake/vkd3d_shader.cmake) in the
+# sniper SDK image, so it links against sniper's glibc like the game. The
+# release is the one GE-Proton's d3dcompiler_47 reports ("vkd3d-shader 2.1"),
+# so a native run and a Proton run compile the same DXBC (openspec
+# linux-native-vulkan 3.4). Only the shader library and its two public
+# headers are kept; libvkd3d and the tools are not built (the generated
+# headers the library needs first are BUILT_SOURCES, which a named target
+# does not make on its own). Its -flto=auto link loses make's jobserver
+# under -j ("write jobserver: Bad file descriptor"), so a failed parallel
+# link is redone serially, objects already built. --with-metal is
+# left at its default (test, so off here): --without-metal leaves automake's
+# OBJC conditional undefined in 2.1's configure.
+# Run only as `docker build --output` (tools/linux/vkd3d.sh), the tarball the
+# whole build context; no bind mounts.
+FROM registry.gitlab.steamos.cloud/steamrt/sniper/sdk@sha256:9ae8083ee9ae6298361a62f289e62f0a2b0779d23fc8c276304157f0c06010c5 AS build
+ARG VERSION
+ARG SHA256
+ARG JOBS=8
+COPY vkd3d-${VERSION}.tar.xz /src/
+WORKDIR /src
+RUN set -e; echo "${SHA256}  vkd3d-${VERSION}.tar.xz" | sha256sum -c - \
+ && tar -xJf vkd3d-${VERSION}.tar.xz && cd vkd3d-${VERSION} \
+ && { ./configure --prefix=/usr --libdir=/usr/lib --disable-doxygen-doc \
+        --without-ncurses --without-xcb --without-opengl \
+        CFLAGS="-O2 -g0" > /src/configure.log 2>&1 \
+        || { tail -40 /src/configure.log; exit 1; }; } \
+ && { make -j"$JOBS" include/private/spirv_grammar.h include/private/vkd3d_version.h \
+        libs/vkd3d-shader/hlsl.tab.h libs/vkd3d-shader/preproc.tab.h \
+        > /src/make.log 2>&1 \
+        && { make -j"$JOBS" libvkd3d-shader.la >> /src/make.log 2>&1 \
+             || make libvkd3d-shader.la >> /src/make.log 2>&1; } \
+        || { tail -40 /src/make.log; exit 1; }; } \
+ && mkdir -p /out/lib /out/include/vkd3d \
+ && cp -a .libs/libvkd3d-shader.so* /out/lib/ \
+ && cp include/vkd3d_shader.h include/vkd3d_types.h /out/include/vkd3d/ \
+ && cp COPYING /out/COPYING.vkd3d \
+ && printf 'vkd3d %s\nsha256 %s\n' "${VERSION}" "${SHA256}" > /out/SOURCE \
+ && cp /src/configure.log /src/make.log /out/
+FROM scratch
+COPY --from=build /out /

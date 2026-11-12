@@ -43,6 +43,12 @@ void *xbox_FramebufferWindowSwap(void) { return s_win; }
 void xbox_FramebufferWindowSwapSize(unsigned *w, unsigned *h) { *w = s_w; *h = s_h; }
 void xbox_FramebufferWindowSwapDisplay(unsigned *w, unsigned *h) { *w = s_dw; *h = s_dh; }
 int xbox_FramebufferWindowSwapInternal(void) { return s_internal; }
+static int s_pbegin, s_pend;
+void xbox_FramebufferWindowSwapPresentBegin(void) { s_pbegin++; }
+void xbox_FramebufferWindowSwapPresentEnd(void) { s_pend++; }
+static int s_wbegin, s_wend;
+void xbox_FramebufferWindowSwapWorkBegin(void) { s_wbegin++; }
+void xbox_FramebufferWindowSwapWorkEnd(void) { s_wend++; }
 void xbox_FramebufferWindowSwapResize(unsigned w, unsigned h)
 {
     s_req_w = w;
@@ -148,6 +154,14 @@ static void check_window(void)
     d3d11_host_framed();
     d3d11_host_fullscreen(1, 0, 640, 480, 1920, 1080);
     CHECK(s_reqs == 2, "a no-op asked for a resize");
+
+    /* The Present bracket is the presenter's close handshake. */
+    d3d11_host_present_begin();
+    d3d11_host_present_end();
+    CHECK(s_pbegin == 1 && s_pend == 1, "present bracket %d/%d", s_pbegin, s_pend);
+    d3d11_host_work_begin();
+    d3d11_host_work_end();
+    CHECK(s_wbegin == 1 && s_wend == 1, "work bracket %d/%d", s_wbegin, s_wend);
 }
 
 static void check_compiler(void)

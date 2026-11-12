@@ -29,8 +29,10 @@ get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOL
 # deaths the games' crash handlers miss (recomp_fatal.h).
 # The debug image writer (img_dump.h) rides with it too: every dumper in the
 # runtime names and writes its PNGs or BMPs through it, under one budget.
+# The executor backend's one selector (pb_backend.h) reads RECOMP_PB_BACKEND
+# here too, so the presenter, the executor and the menu agree on it.
 add_library(recomp_env STATIC recomp_env.c recomp_exe_dir.c recomp_exit_hook.c host_time.c
-    host_prof.c mem_stats.c recomp_fatal.c img_dump.c)
+    host_prof.c mem_stats.c recomp_fatal.c img_dump.c pb_backend.c)
 target_include_directories(recomp_env PUBLIC
     ${XBOXRECOMP_SRC_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}

@@ -325,6 +325,12 @@ void d3d11_host_swap_chain_made(void *swap)
     }
 }
 
+/* WM_CLOSE ends the process on this thread's own pump, between frames. */
+void d3d11_host_present_begin(void) {}
+void d3d11_host_present_end(void) {}
+void d3d11_host_work_begin(void) {}
+void d3d11_host_work_end(void) {}
+
 void d3d11_host_ready(void)
 {
     /* Only once the device is up: a failed init returns before any frame

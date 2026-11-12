@@ -102,6 +102,21 @@ if(XBOXRECOMP_APU_DSP)
     endif()
 endif()
 
+# Linux: the D3D11 backend over dxvk-native (openspec linux-native-vulkan,
+# phase 2). ON builds nv2a_pb_d3d11.c against DXVK's headers and libraries
+# (cmake/dxvk_native.cmake, pinned), d3d11_host_sdl.c as its host and
+# vkd3d-shader as its HLSL compiler, and makes d3d11 the default
+# RECOMP_PB_BACKEND. OFF (the default) leaves the Linux build as it was:
+# the CPU rasteriser and OpenGL.
+option(XBOXRECOMP_DXVK_NATIVE
+    "Linux: build the D3D11 backend over dxvk-native and vkd3d-shader" OFF)
+if(XBOXRECOMP_DXVK_NATIVE)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/dxvk_native.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/vkd3d_shader.cmake)
+    xboxrecomp_dxvk_native(XBOXRECOMP_DXVK_NATIVE_ROOT)
+    target_compile_definitions(recomp_env PUBLIC XBOXRECOMP_DXVK_NATIVE)
+endif()
+
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
 

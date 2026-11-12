@@ -247,6 +247,26 @@ void *d3d11_host_window(void)
 void d3d11_host_swap_chain_made(void *swap) { (void)swap; }
 void d3d11_host_ready(void) {}
 void d3d11_host_pump(void) {}
+
+void d3d11_host_present_begin(void)
+{
+    xbox_FramebufferWindowSwapPresentBegin();
+}
+
+void d3d11_host_present_end(void)
+{
+    xbox_FramebufferWindowSwapPresentEnd();
+}
+
+void d3d11_host_work_begin(void)
+{
+    xbox_FramebufferWindowSwapWorkBegin();
+}
+
+void d3d11_host_work_end(void)
+{
+    xbox_FramebufferWindowSwapWorkEnd();
+}
 void d3d11_host_title(void) {}
 
 void d3d11_host_client_size(unsigned *w, unsigned *h)

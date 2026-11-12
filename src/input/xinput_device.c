@@ -580,7 +580,9 @@ static int xbox_sdl_family_of(int type, uint16_t vid, uint16_t pid)
     case SDL_GAMEPAD_TYPE_GAMECUBE:
         return XBOX_PAD_FAMILY_GAMECUBE;
 #endif
-#if SDL_VERSION_ATLEAST(3, 4, 0)
+/* SDL_GAMEPAD_TYPE_STEAM is newer than 3.4.0: the Steam Runtime's 3.4.16
+ * stops at GAMECUBE, 3.4.18 has it. */
+#if SDL_VERSION_ATLEAST(3, 4, 18)
     case SDL_GAMEPAD_TYPE_STEAM:
         return XBOX_PAD_FAMILY_STEAM;
 #endif

@@ -69,6 +69,7 @@
 #include <math.h>
 #include <stddef.h>
 #include "recomp_env.h"
+#include "pb_backend.h"
 #include "img_dump.h"
 #include "mem_stats.h"
 #include <stdint.h>
@@ -5225,8 +5226,7 @@ const struct nv2a_pb_backend *nv2a_pb_metal_backend(void)
  * executor's first method, on the ack thread. */
 void nv2a_pb_metal_register_from_env(void)
 {
-    const char *b = recomp_env(RENV_PB_BACKEND);
-    if (b && !strcasecmp(b, "metal")) {
+    if (pb_backend_is("metal")) {
         const struct nv2a_pb_backend *mb = nv2a_pb_metal_backend();
         if (s_failed) {
             fprintf(stderr, LOGP "RECOMP_PB_BACKEND=metal: no device, staying on"

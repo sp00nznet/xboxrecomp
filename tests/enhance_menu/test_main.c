@@ -2931,10 +2931,13 @@ static void test_pages(void)
 {
     /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Saves,
      * Recordings, Files. Saves with no title yet: its rows hold no dates;
-     * Recordings with no folder yet: no file rows. */
+     * Recordings with no folder yet: no file rows. RECOMP_PB_BACKEND is
+     * unset, so the backend is this build's default, cpu (pb_backend.h):
+     * Render's AO rows say they do nothing, Pack says ignored, Debug names
+     * cpu. */
     static const uint32_t k_sum[11] = {
-        0x6FDBE087u, 0xC58D4BA2u, 0x601BABF4u, 0x775B0691u, 0x109DEB36u,
-        0x6930FCBFu, 0xC1417056u, 0x08369C2Du, 0xE13F4B8Bu, 0x5548E3AAu, 0xE2E461FFu };
+        0x3C4817E6u, 0xC58D4BA2u, 0x1B88F742u, 0x775B0691u, 0x109DEB36u,
+        0x6930FCBFu, 0xC1417056u, 0xF21EEDE1u, 0xE13F4B8Bu, 0x5548E3AAu, 0xE2E461FFu };
     /* Files shows Open exports folder only off Game Mode. Pack with a pack
      * loaded: with none it names the packs folder, an absolute path that
      * moves with the build folder. */

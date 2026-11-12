@@ -65,6 +65,7 @@
 #include "shader_profile_edit.h"
 #include "recomp_cfg.h"
 #include "recomp_env.h"
+#include "pb_backend.h"
 #include "recomp_exit_hook.h"
 #include "saves_store.h"
 #include "saves_zip.h"
@@ -429,14 +430,13 @@ static struct enhance_item s_ao[] = {
 static void ao_items(void)
 {
     int suited = enhance_cfg_bool("render.ao_suited", 1);
-    const char *b = recomp_env(RENV_PB_BACKEND);
     s_ao[0].note = suited ? NULL : "not for this art";
     s_ao[0].help = suited ? "Shades the creases and contacts of the 3D scene, under the HUD"
                           : "This game's flat-shaded art gains little from it; off is "
                             "recommended";
     /* The CPU renderer has no AO pass: the rows stay, so a config shared
      * with a GPU run keeps its values, but say they do nothing here. */
-    if (b && !strcmp(b, "cpu")) {
+    if (pb_backend_is("cpu")) {
         s_ao[0].note = "no effect on CPU";
         s_ao[0].help = "The CPU renderer does not draw it; Metal and Direct3D 11 do";
     }
@@ -1862,8 +1862,7 @@ static void miss_rows(int max)
 
 static const char *backend_name(void)
 {
-    const char *b = recomp_env(RENV_PB_BACKEND);
-    return b && *b ? b : "default";
+    return pb_backend();
 }
 
 static void rates(uint64_t now)
@@ -2760,7 +2759,7 @@ static void build_rows(void)
         int pi = slot_find("textures.pack");
         const char *cur = pi >= 0 ? s_slot[pi].cur : "none";
         char said[160];
-        if (!strcmp(backend_name(), "cpu"))
+        if (pb_backend_is("cpu"))
             info("CPU path", "pack ignored");
         slot_row("textures.pack");
         if (s_pack_more)

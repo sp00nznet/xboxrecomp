@@ -24,13 +24,16 @@
  * Everything runs on the NV2A ack thread: the device, the window and its
  * message pump are created and used there only.
  *
- * Off Windows this file compiles to nothing.
+ * Off Windows this file compiles only in the dxvk-native build
+ * (XBOXRECOMP_DXVK_NATIVE): dxvk-native's headers and libraries stand in
+ * for the Windows SDK's, d3d11_host_sdl.c for d3d11_host_win32.c.
  */
-#ifdef _WIN32
+#if defined(_WIN32) || defined(XBOXRECOMP_DXVK_NATIVE)
 
 #define COBJMACROS
 #include <windows.h>
 #include "recomp_env.h"
+#include "pb_backend.h"
 #include "img_dump.h"
 #include "mem_stats.h"
 #include <d3d11.h>
@@ -43,6 +46,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <strings.h>
+#define _stricmp strcasecmp   /* the CRT name, for the dxvk-native build */
+#endif
 
 #include "d3d8_vsh.h"
 #include "d3d8_combiners.h"
@@ -68,6 +75,30 @@
 #include "nv2a_hex_tile.h"   /* nv2a_hex_wrap_ok */
 #include "shader_cache.h"
 #include "d3d11_host.h"
+#ifdef XBOXRECOMP_DXVK_NATIVE
+/* dxvk-native's windows.h, included above, already gives the NT vocabulary
+ * xbox_memory_layout.h speaks (BOOL, DWORD), in its own Windows shapes:
+ * WCHAR is wchar_t and RECT a struct RECT. xbox_winnt.h's POSIX shapes
+ * (WCHAR uint16_t, the Xbox's) would redefine them, so this file opts out
+ * of them; it passes no WCHAR or RECT to the kernel. */
+#define XBOX_WINNT_HOST_TYPES
+#include <stddef.h>
+/* d3d11_host_sdl.c builds the shader blobs this file calls through
+ * ID3D10Blob_GetBufferPointer and friends without DXVK's headers (its own
+ * vtable of int32_t/uint32_t returns, in COM's order). A DXVK header that
+ * moved a method or widened HRESULT or ULONG would call the wrong slot or
+ * read a half-written return, silently; here it stops the build. */
+_Static_assert(sizeof(HRESULT) == 4 && sizeof(ULONG) == 4 && sizeof(SIZE_T) == sizeof(size_t),
+               "d3d11_host_sdl.c's blob returns int32_t, uint32_t and size_t");
+_Static_assert(offsetof(ID3D10Blob, lpVtbl) == 0, "blob: vtable pointer first");
+_Static_assert(offsetof(ID3D10BlobVtbl, QueryInterface) == 0 * sizeof(void *)
+               && offsetof(ID3D10BlobVtbl, AddRef) == 1 * sizeof(void *)
+               && offsetof(ID3D10BlobVtbl, Release) == 2 * sizeof(void *)
+               && offsetof(ID3D10BlobVtbl, GetBufferPointer) == 3 * sizeof(void *)
+               && offsetof(ID3D10BlobVtbl, GetBufferSize) == 4 * sizeof(void *)
+               && sizeof(ID3D10BlobVtbl) == 5 * sizeof(void *),
+               "blob: d3d11_host_sdl.c's blob_vtbl order");
+#endif
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
 
 #define LOGP "[d3d11] "
@@ -5750,6 +5781,7 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
  * holds more); for a CRT preset at render.scale > 1, the frame resolved to
  * the guest's lines (nv2a_present_chain_source). Built on this thread when
  * the request's generation moves; "none" never loads the library. */
+#ifdef _WIN32
 static libra_d3d11_filter_chain_t s_lrs_chain;
 static unsigned s_lrs_gen;
 static size_t s_lrs_frames;
@@ -6202,6 +6234,37 @@ static int present_chain(RenderTarget *rt, int filter, int internal, int surface
     s_ovl_place = r;
     return 1;
 }
+#else /* XBOXRECOMP_DXVK_NATIVE */
+/* librashader has no D3D11 runtime off Windows, so present.shader has no
+ * chain in the dxvk-native build: the frame is presented as with
+ * present.shader=none, said once. */
+static void *const s_lrs_chain = NULL;
+static int s_lrs_ov_said;
+
+static void lrs_free(void) {}
+
+static void *lrs_chain(void)
+{
+    static int said;
+    if (!said++)
+        fprintf(stderr, "[SHADER] present.shader: no D3D11 filter chain in this"
+                " build (librashader's D3D11 runtime is Windows-only); presenting"
+                " without it\n");
+    return NULL;
+}
+
+static int chain_surface(int on, int internal)
+{
+    (void)on; (void)internal;
+    return 0;
+}
+
+static int present_chain(RenderTarget *rt, int filter, int internal, int surface_internal)
+{
+    (void)rt; (void)filter; (void)internal; (void)surface_internal;
+    return 0;
+}
+#endif /* _WIN32 */
 #endif /* XBOXRECOMP_ENHANCE */
 
 #ifdef XBOXRECOMP_ENHANCE
@@ -6961,6 +7024,7 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     ovl_present();
     nv2a_stats_add(NV2A_STAT_PRESENTS, 1);
 #endif
+    d3d11_host_present_begin();
     if (d11p_on()) {
         double t0;
         d11p_end();
@@ -6970,6 +7034,7 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     } else {
         hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
     }
+    d3d11_host_present_end();
     if (FAILED(hr) && s_presents < 4)
         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);
     /* FLIP_DISCARD unbinds the back buffer; the next frame rebinds its own
@@ -7667,20 +7732,54 @@ static void d3d11_on_blit(const struct nv2a_pb_blit *b)
     }
 }
 
+/* Every entry the executor makes runs inside the host's work bracket: on
+ * Linux the presenter's close parks the ack thread at the next entry, so
+ * exit() never tears DXVK down under an upload, a draw, a Map or the
+ * occlusion settle on a long load frame. No-ops on
+ * Windows. */
+#define WORK_VOID(name, params, args)                                         \
+    static void name##_w params                                               \
+    {                                                                         \
+        d3d11_host_work_begin();                                              \
+        name args;                                                            \
+        d3d11_host_work_end();                                                \
+    }
+#define WORK_INT(name, params, args)                                          \
+    static int name##_w params                                                \
+    {                                                                         \
+        int r;                                                                \
+        d3d11_host_work_begin();                                              \
+        r = name args;                                                        \
+        d3d11_host_work_end();                                                \
+        return r;                                                             \
+    }
+WORK_VOID(d3d11_on_clear, (uint32_t param), (param))
+WORK_VOID(d3d11_on_zclear, (uint32_t param), (param))
+WORK_VOID(d3d11_on_draw, (const struct nv2a_pb_draw *d), (d))
+WORK_VOID(d3d11_on_flip, (uint32_t surface, uint32_t pitch), (surface, pitch))
+WORK_VOID(d3d11_on_zpass, (int enable), (enable))
+WORK_VOID(d3d11_on_zpass_clear, (void), ())
+WORK_INT(d3d11_on_report, (uint32_t va), (va))
+WORK_VOID(d3d11_on_poll, (void), ())
+WORK_INT(d3d11_merge_placed, (int program), (program))
+WORK_VOID(d3d11_on_blit, (const struct nv2a_pb_blit *b), (b))
+#undef WORK_VOID
+#undef WORK_INT
+
 static const struct nv2a_pb_backend s_d3d11_backend = {
-    d3d11_on_clear,
-    d3d11_on_zclear,
-    d3d11_on_draw,
-    d3d11_on_flip,
-    d3d11_on_zpass,
-    d3d11_on_zpass_clear,
-    d3d11_on_report,
-    d3d11_on_poll,
+    d3d11_on_clear_w,
+    d3d11_on_zclear_w,
+    d3d11_on_draw_w,
+    d3d11_on_flip_w,
+    d3d11_on_zpass_w,
+    d3d11_on_zpass_clear_w,
+    d3d11_on_report_w,
+    d3d11_on_poll_w,
     0,                  /* writes_back: presents and dumps from its swap chain */
     NULL,               /* sync_guest */
     1,                  /* merge_draws */
-    d3d11_merge_placed,
-    d3d11_on_blit,
+    d3d11_merge_placed_w,
+    d3d11_on_blit_w,
 };
 
 /* For tests/d3d11_backend_smoke: the size of the target at a colour offset
@@ -7800,11 +7899,12 @@ const struct nv2a_pb_backend *nv2a_pb_d3d11_backend(void)
  * executor's first method, on the ack thread. */
 void nv2a_pb_d3d11_register_from_env(void)
 {
-    const char *b = recomp_env(RENV_PB_BACKEND);
-    if (b && !_stricmp(b, "d3d11")) {
+    if (pb_backend_is("d3d11")) {
+        const char *b = recomp_env(RENV_PB_BACKEND);
         nv2a_pb_set_backend(&s_d3d11_backend);
-        fprintf(stderr, LOGP "RECOMP_PB_BACKEND=d3d11: executor draws through D3D11\n");
+        fprintf(stderr, LOGP "RECOMP_PB_BACKEND=d3d11%s: executor draws through D3D11\n",
+                (b && *b) ? "" : " (this build's default)");
     }
 }
 
-#endif /* _WIN32 */
+#endif /* _WIN32 || XBOXRECOMP_DXVK_NATIVE */

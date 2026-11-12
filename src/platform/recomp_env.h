@@ -129,7 +129,7 @@ extern "C" {
 #define RECOMP_ENV_KEYS(X) \
     /* ── config ─────────────────────────────────────────────────────── */ \
     X(PB_EXEC,           CONFIG, "RECOMP_PB_EXEC",           NULL, "pushbuffer executor (draws frames); default on, 0: off") \
-    X(PB_BACKEND,        CONFIG, "RECOMP_PB_BACKEND",        NULL, "executor backend: cpu (default), metal, d3d11, null") \
+    X(PB_BACKEND,        CONFIG, "RECOMP_PB_BACKEND",        NULL, "executor backend: cpu, metal, d3d11, null; default d3d11 in the dxvk-native Linux build, else cpu") \
     X(HEADLESS,          CONFIG, "RECOMP_HEADLESS",          NULL, "1: no window (SDL host); the template's Windows fatal-error dialog is skipped too") \
     X(WINDOW_SCALE,      CONFIG, "RECOMP_WINDOW_SCALE",      NULL, "window scale factor (SDL host and the Win32 framebuffer window, 1-8, default 2)") \
     X(FB_FULLSCREEN,     CONFIG, "RECOMP_FULLSCREEN",        NULL, "Win32 framebuffer window: 1 starts in borderless fullscreen (F11 / Alt+Enter toggle)") \

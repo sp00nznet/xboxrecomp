@@ -37,6 +37,18 @@ void xbox_FramebufferWindowSwapResize(unsigned w, unsigned h);
  * the backend sizes it; otherwise the window keeps the presenter's size
  * (present.window_scale), as the backend's own window does on Windows. */
 int xbox_FramebufferWindowSwapInternal(void);
+/* Bracket every backend call into DXVK on the ack thread (uploads, draws,
+ * Maps, the occlusion settle, the Present). Begin returns when the call may
+ * go ahead; once the window is closing it never returns: it parks the
+ * thread, so no DXVK call is in flight while exit() runs the libraries'
+ * teardown (the close waits for the park, or for a call in flight to end).
+ * Brackets nest; only the outermost one parks. */
+void xbox_FramebufferWindowSwapWorkBegin(void);
+void xbox_FramebufferWindowSwapWorkEnd(void);
+/* The work bracket around the Present; end also counts the present for the
+ * stats line and the title. */
+void xbox_FramebufferWindowSwapPresentBegin(void);
+void xbox_FramebufferWindowSwapPresentEnd(void);
 
 #ifdef __cplusplus
 }

@@ -12,7 +12,8 @@
  *      rt_offset), the W-buffer variant, and NPROG vertex programs and NCOMB
  *      combiner states from d3d8_hlsl_split's pseudo-random stream,
  *      through the emitters (d3d8_hlsl.h), each to DXBC ("DXBC" magic),
- *      except a vertex program whose text has -1.#INF (compile_text);
+ *      a vertex program whose text has fxc's -1.#INF included (the
+ *      compiler respells it; those are counted);
  *   4. with a directory (argv[1], or D3D11_HLSL_CACHE_DIR): every entry of a
  *      D3D11 shader cache (shader_cache.c's format), such as the one a
  *      Proton run writes, recompiled from its own key (source, target,
@@ -72,14 +73,11 @@ static int compile_one(const char *what, const char *src, size_t len,
 static void compile_text(const char *what, const char *src, const char *target)
 {
     /* The vertex emitter's LOG of 0 writes fxc's -1.#INF, which
-     * vkd3d-shader's HLSL parser rejects (a syntax error). None of the
-     * game's programs in a Proton cache has one, so the random programs
-     * that do are counted, not compiled; phase 2 of linux-native-vulkan
-     * owns the emitter fix (it changes the hashed text). */
-    if (strstr(src, "1.#INF")) {
+     * vkd3d-shader's parser rejects; d3d11_hlsl_compile respells it. None
+     * of the game's programs has one, so the random ones that do are the
+     * only check of that, and are counted to show they ran. */
+    if (strstr(src, "1.#INF"))
         s_inf++;
-        return;
-    }
     compile_one(what, src, strlen(src), "main", target, OPT_LEVEL3, 0, NULL, NULL);
 }
 
@@ -312,9 +310,13 @@ int main(int argc, char **argv)
 
     s_fail += check_api();
     check_emitters();
+    if (!s_inf) {
+        printf("FAIL: no emitted text has -1.#INF; the respelling went unchecked\n");
+        s_fail++;
+    }
     if (dir && *dir)
         check_cache(dir);
     printf("d3d11_hlsl_vkd3d: %d compiled, %d failed, %d emitted texts with "
-           "-1.#INF not compiled\n", s_ok, s_fail, s_inf);
+           "-1.#INF among them\n", s_ok, s_fail, s_inf);
     return s_fail ? 1 : 0;
 }

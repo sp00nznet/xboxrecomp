@@ -19,7 +19,10 @@
  *     wchar_t. Do not feed L"..." literals to WCHAR* APIs in ported code.
  */
 
-#ifndef XBOX_WINNT_H
+/* XBOX_WINNT_HOST_TYPES: the includer already has a Win32 SDK's own type
+ * vocabulary (dxvk-native's windows.h on Linux, whose WCHAR is wchar_t and
+ * RECT a struct RECT) and takes this header as empty rather than clash. */
+#if !defined(XBOX_WINNT_H) && !defined(XBOX_WINNT_HOST_TYPES)
 #define XBOX_WINNT_H
 
 /* Thread-local storage qualifier (portable).
@@ -311,4 +314,4 @@ typedef struct _SIZE  { LONG cx, cy; }                   SIZE,  *PSIZE,  *LPSIZE
 
 #endif /* _WIN32 */
 
-#endif /* XBOX_WINNT_H */
+#endif /* XBOX_WINNT_H, XBOX_WINNT_HOST_TYPES */

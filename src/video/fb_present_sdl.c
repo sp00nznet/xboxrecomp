@@ -75,6 +75,7 @@
 
 #include <SDL3/SDL.h>
 #include "recomp_env.h"
+#include "pb_backend.h"
 #include "img_dump.h"
 #include "recomp_exit_hook.h"
 #include "platform/sdl_env.h"
@@ -85,6 +86,7 @@
 #include <string.h>
 #include <time.h>
 #include <sched.h>
+#include <unistd.h>       /* pause: the parked ack thread */
 #include <sys/resource.h>
 
 #include "kernel/nv2a_pb_state.h"
@@ -143,6 +145,11 @@ static int             s_layer;
 static SDL_Window     *s_swap_win;
 static uint32_t        s_swap_size, s_disp_size;
 static uint32_t        s_swap_req;
+/* The close's handshake with the backend's Present (swap_close), seq_cst:
+ * closing is the main thread's, busy (inside Present) and parked the ack
+ * thread's. presents counts the backend's, relaxed. */
+static int             s_swap_closing, s_swap_busy, s_swap_parked;
+static uint64_t        s_swap_presents;
 
 /* Ack-thread side counters, read by the stats line. */
 static uint64_t s_flips, s_copy_ns;          /* relaxed atomics */
@@ -349,6 +356,79 @@ void xbox_FramebufferWindowSwapResize(unsigned w, unsigned h)
 int xbox_FramebufferWindowSwapInternal(void)
 {
     return nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
+}
+
+static void swap_park(void)
+{
+    __atomic_store_n(&s_swap_parked, 1, __ATOMIC_SEQ_CST);
+    for (;;)
+        pause();
+}
+
+/* The ack thread's depth in the bracket: the backend's callbacks nest the
+ * Present inside on_flip, and only the outermost begin parks or marks busy.
+ * Only the ack thread calls these. */
+static int s_swap_depth;
+
+void xbox_FramebufferWindowSwapWorkBegin(void)
+{
+    if (s_swap_depth++)
+        return;
+    /* Dekker-style, as xbox_FramebufferWindowPresent: either swap_close
+     * sees this call busy, or this one sees the close and parks. */
+    if (__atomic_load_n(&s_swap_closing, __ATOMIC_SEQ_CST))
+        swap_park();
+    __atomic_store_n(&s_swap_busy, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_swap_closing, __ATOMIC_SEQ_CST)) {
+        __atomic_store_n(&s_swap_busy, 0, __ATOMIC_SEQ_CST);
+        swap_park();
+    }
+}
+
+void xbox_FramebufferWindowSwapWorkEnd(void)
+{
+    if (--s_swap_depth)
+        return;
+    __atomic_store_n(&s_swap_busy, 0, __ATOMIC_SEQ_CST);
+}
+
+void xbox_FramebufferWindowSwapPresentBegin(void)
+{
+    xbox_FramebufferWindowSwapWorkBegin();
+}
+
+void xbox_FramebufferWindowSwapPresentEnd(void)
+{
+    xbox_FramebufferWindowSwapWorkEnd();
+    __atomic_add_fetch(&s_swap_presents, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&s_flips, 1, __ATOMIC_RELAXED);
+}
+
+/* Before exit() in swap mode: DXVK's static teardown under a call still
+ * running on the ack thread crashed or hung the close. The
+ * ack thread is the backend's only caller, and every backend callback (an
+ * upload, a draw, a Map, the occlusion settle, the Present) runs inside the
+ * work bracket, so once the close is flagged the thread either finishes the
+ * callback it is in or parks at the next one. A thread already parked, or
+ * outside a callback for 100 ms (a load, or the guest returned), is let be:
+ * it parks before it touches DXVK again. A callback that does not end in
+ * 2 s (a lost device) is not waited for. */
+static void swap_close(void)
+{
+    uint64_t t0 = now_ns(CLOCK_MONOTONIC), dt;
+    __atomic_store_n(&s_swap_closing, 1, __ATOMIC_SEQ_CST);
+    for (;;) {
+        if (__atomic_load_n(&s_swap_parked, __ATOMIC_SEQ_CST))
+            return;
+        dt = now_ns(CLOCK_MONOTONIC) - t0;
+        if (dt >= 2000000000ull)
+            break;
+        if (dt >= 100000000ull && !__atomic_load_n(&s_swap_busy, __ATOMIC_SEQ_CST))
+            return;
+        SDL_Delay(1);
+    }
+    fprintf(stderr, "[PRESENT] the D3D11 backend's call did not end in 2 s;"
+            " exiting under it\n");
 }
 
 /* ── Layer mode: the Metal backend's side (nv2a-ack thread) ─────────────── */
@@ -884,6 +964,20 @@ static int post_quit(const char *why)
     return SDL_PushEvent(&q) ? 1 : 0;
 }
 
+/* The guest without a window. A d3d11 run in the dxvk-native build has no
+ * window of its own to fall back on (the backend presents only to the one
+ * lent here), so it draws with the CPU rasteriser instead of staying black
+ * (pb_backend_demote, said once). */
+static int run_headless(int (*guest_main)(void), const char *why)
+{
+#ifdef XBOXRECOMP_DXVK_NATIVE
+    pb_backend_demote(why);
+#else
+    (void)why;
+#endif
+    return guest_main();
+}
+
 int xbox_HostWindowMain(int (*guest_main)(void))
 {
     SDL_Window *win;
@@ -925,7 +1019,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         nv2a_stats_use(NV2A_STATS_TITLE, 1);
 #endif
     if (recomp_env_on(RENV_HEADLESS))
-        return guest_main();
+        return run_headless(guest_main, "RECOMP_HEADLESS");
     shot_parse();
 
 #if defined(__APPLE__)
@@ -945,7 +1039,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "[PRESENT] SDL video unavailable (%s); running headless\n",
                 SDL_GetError());
-        return guest_main();
+        return run_headless(guest_main, "SDL video unavailable");
     }
     if (scale < 1 || scale > 8)
         scale = 2;
@@ -960,18 +1054,17 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* The D3D11 backend over dxvk-native presents to the window itself
          * (DXVK_WSI_DRIVER=SDL3 takes the SDL_Window * as the HWND): a
          * Vulkan window, and no renderer to fight its swap chain for it. */
-        {
-            const char *b = recomp_env(RENV_PB_BACKEND);
-            if (b && !SDL_strcasecmp(b, "d3d11")) {
-                win = SDL_CreateWindow(window_name(), win_w, 480 * scale,
-                                       wflags | SDL_WINDOW_VULKAN);
-                if (win && eo->fullscreen)
-                    SDL_SetWindowFullscreenMode(win, NULL);
-                if (win)
-                    s_swap_win = win;
-                else
-                    fprintf(stderr, "[PRESENT] Vulkan window failed (%s);"
-                            " SDL renderer\n", SDL_GetError());
+        if (pb_backend_is("d3d11")) {
+            win = SDL_CreateWindow(window_name(), win_w, 480 * scale,
+                                   wflags | SDL_WINDOW_VULKAN);
+            if (win && eo->fullscreen)
+                SDL_SetWindowFullscreenMode(win, NULL);
+            if (win) {
+                s_swap_win = win;
+            } else {
+                fprintf(stderr, "[PRESENT] Vulkan window failed (%s);"
+                        " SDL renderer\n", SDL_GetError());
+                pb_backend_demote("Vulkan window failed");
             }
         }
 #endif
@@ -979,9 +1072,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* The Metal backend's frames stay on the GPU: a CAMetalLayer window
          * the backend blits into (fb_present_metal.m), unless
          * metal_present=readback asks for the renderer and readback. */
-        const char *be = recomp_env(RENV_PB_BACKEND);
         const char *mp = recomp_env(RENV_METAL_PRESENT);
-        if (be && !strcasecmp(be, "metal") && !(mp && !strcasecmp(mp, "readback"))) {
+        if (pb_backend_is("metal") && !(mp && !strcasecmp(mp, "readback"))) {
             char why[256] = "";
             win = SDL_CreateWindow(window_name(), win_w, 480 * scale,
                                    wflags | SDL_WINDOW_METAL);
@@ -1014,7 +1106,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 if (win)
                     SDL_DestroyWindow(win);
                 SDL_QuitSubSystem(SDL_INIT_VIDEO);
-                return guest_main();
+                return run_headless(guest_main, "SDL window failed");
             }
         }
     }
@@ -1054,7 +1146,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         s_swap_win = NULL;   /* the backend's init must not adopt a dead window */
         SDL_DestroyWindow(win);
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
-        return guest_main();
+        return run_headless(guest_main, "SDL_RegisterEvents failed");
     }
     s_frame_event = s_guest_done_event + 1;
 #ifdef XBOXRECOMP_ENHANCE
@@ -1080,7 +1172,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         close_present(ren);
         s_swap_win = NULL;   /* the backend's init must not adopt a dead window */
         SDL_DestroyWindow(win);
-        return guest_main();
+        return run_headless(guest_main, "no guest thread");
     }
 
     t_start = t_stat = now_ns(CLOCK_MONOTONIC);
@@ -1334,9 +1426,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 uint64_t cpu = now_ns(CLOCK_THREAD_CPUTIME_ID);
                 double dt = (double)(t - t_stat) / 1e9;
                 uint64_t fl = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
-                fprintf(stderr, "[PRESENT] %.1f flips/s copied, %.1f presents/s,"
+                if (s_swap_win)
+                    presents = __atomic_load_n(&s_swap_presents, __ATOMIC_RELAXED);
+                /* In swap mode the backend presents its own frames; the
+                 * flips are its Presents, nothing is copied. */
+                fprintf(stderr, "[PRESENT] %.1f flips/s%s, %.1f presents/s,"
                         " main thread %.1f%% of a core, ack copy %.3f ms/flip\n",
-                        (double)(fl - flips_stat) / dt,
+                        (double)(fl - flips_stat) / dt, s_swap_win ? "" : " copied",
                         (double)(presents - pres_stat) / dt,
                         100.0 * (double)(cpu - cpu_stat) / (double)(t - t_stat),
                         fl ? (double)__atomic_load_n(&s_copy_ns, __ATOMIC_RELAXED) / (double)fl / 1e6 : 0.0);
@@ -1353,16 +1449,21 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     __atomic_store_n(&s_running, 0, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&s_in_present, __ATOMIC_SEQ_CST))
         sched_yield();
+    if (s_swap_win) {
+        swap_close();
+        presents = __atomic_load_n(&s_swap_presents, __ATOMIC_RELAXED);
+    }
     {
         uint64_t t = now_ns(CLOCK_MONOTONIC), cpu = now_ns(CLOCK_THREAD_CPUTIME_ID);
         double dt = (double)(t - t_start) / 1e9;
         uint64_t fl = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
-        fprintf(stderr, "[PRESENT] %s after %.1f s (%s): %llu flips copied (%.1f/s),"
+        fprintf(stderr, "[PRESENT] %s after %.1f s (%s): %llu flips%s (%.1f/s),"
                 " %llu presents (%.1f/s), %llu dropped, main thread %.1f%% of a"
                 " core, upload %.3f ms/frame, ack copy %.3f ms/flip\n",
                 quit ? "window closed" : "guest returned", dt,
                 s_swap_win ? "D3D11 swap chain" : s_layer ? "CAMetalLayer" : "SDL renderer",
-                (unsigned long long)fl, dt > 0 ? (double)fl / dt : 0.0,
+                (unsigned long long)fl, s_swap_win ? "" : " copied",
+                dt > 0 ? (double)fl / dt : 0.0,
                 (unsigned long long)presents, dt > 0 ? (double)presents / dt : 0.0,
                 (unsigned long long)dropped_base,
                 t > t_start ? 100.0 * (double)(cpu - cpu_start) / (double)(t - t_start) : 0.0,
@@ -1381,9 +1482,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * stream and the game controllers are still in use on other threads.
      * Cmd-Q with sound on crashed in SDL_GetAudioStreamQueued when this was
      * SDL_Quit; the dummy driver's virtual clock never touches the stream. */
-    /* A lent window stays: the backend may be presenting to it on the ack
-     * thread, which nothing here can stop, until exit() ends the process
-     * (as the Win32 window's WM_CLOSE ends it with the window up). */
+    /* A lent window stays up until exit() ends the process (as the Win32
+     * window's WM_CLOSE ends it with the window up); swap_close above has
+     * parked the backend, or found it idle, so exit() runs DXVK's teardown
+     * with no Present under it. */
     if (s_swap_win) {
         if (quit)
             exit(0);

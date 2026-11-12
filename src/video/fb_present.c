@@ -24,6 +24,7 @@
  */
 #include <stdint.h>
 #include "recomp_env.h"
+#include "pb_backend.h"
 #include "img_dump.h"
 
 #if defined(_WIN32)
@@ -666,7 +667,7 @@ void xbox_FramebufferWindowStart(void)
 
     if (!recomp_env(RENV_FB_WINDOW))
         return;
-    if (!fb_window_wanted(recomp_env(RENV_PB_BACKEND), 1)) {
+    if (!fb_window_wanted(pb_backend(), 1)) {
         static volatile LONG said;
         if (InterlockedExchange(&said, 1) == 0)
             fprintf(stderr, "  [FBWIN] RECOMP_FB_WINDOW ignored: the d3d11 "

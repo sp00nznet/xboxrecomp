@@ -1955,6 +1955,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_blit_failed | file_static | keep | - | present blit build failed flag |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ovl_place | file_static | keep | - | where this present placed the frame |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_chain | file_static | keep | - | librashader present chain |
+| src/d3d/nv2a_pb_d3d11.c | lrs_chain | said | local_static | keep | - | log-once guard (dxvk-native: no D3D11 filter chain) |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_gen | file_static | keep | - | present chain request generation applied |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_frames | file_static | keep | - | frames fed to the present chain |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_lines | file_static | keep | - | present chain preset lines per source line |
@@ -2773,6 +2774,12 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/platform/mem_stats.c | - | s_t0_ns | file_static | keep | - | memory stats |
 | src/platform/mem_stats.c | mem_stats_start_from_env | started | once | keep | - | no rerun: stats thread keeps running |
 
+### src/platform/pb_backend.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/platform/pb_backend.c | - | s_demoted | file_static | keep | - | the run's backend demoted to cpu (no window); a reset keeps the same window |
+
 ### src/platform/recomp_env.c
 
 | file | scope | name | kind | class | hook | why |
@@ -3069,6 +3076,11 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/video/fb_present_sdl.c | - | s_swap_size | file_static | keep | - | D3D11 swap window and its sizes (dxvk-native) |
 | src/video/fb_present_sdl.c | - | s_disp_size | file_static | keep | - | D3D11 swap window and its sizes (dxvk-native) |
 | src/video/fb_present_sdl.c | - | s_swap_req | file_static | keep | - | pending swap-window resize, host |
+| src/video/fb_present_sdl.c | - | s_swap_closing | file_static | keep | - | swap window closing, host (exit handshake) |
+| src/video/fb_present_sdl.c | - | s_swap_busy | file_static | keep | - | backend call in flight, host (exit handshake) |
+| src/video/fb_present_sdl.c | - | s_swap_depth | file_static | keep | - | ack thread's nesting in the work bracket, host (exit handshake) |
+| src/video/fb_present_sdl.c | - | s_swap_parked | file_static | keep | - | ack thread parked for exit, host |
+| src/video/fb_present_sdl.c | - | s_swap_presents | file_static | keep | - | backend presents counted for the stats line, host |
 
 ### src/video/gpu_present.c
 

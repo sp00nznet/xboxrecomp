@@ -26,6 +26,7 @@
  */
 #include <math.h>
 #include "recomp_env.h"
+#include "pb_backend.h"
 #include "img_dump.h"
 #include "recomp_exit_hook.h"
 #include <stdio.h>
@@ -7180,7 +7181,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         for (a = 0; a < NV_VERTEX_ATTRS; a++)
             s_vsh.inl[a][3] = 1.0f;
         nv2a_pb_cost_init();
-#ifdef _WIN32
+#if defined(_WIN32) || defined(XBOXRECOMP_DXVK_NATIVE)
         {   /* RECOMP_PB_BACKEND=d3d11: src/d3d/nv2a_pb_d3d11.c */
             extern void nv2a_pb_d3d11_register_from_env(void);
             nv2a_pb_d3d11_register_from_env();
@@ -7193,8 +7194,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
 #endif
         {
-            const char *b = recomp_env(RENV_PB_BACKEND);
-            if (b && !strcmp(b, "null")) {
+            if (pb_backend_is("null")) {
                 const char *us = recomp_env(RENV_PB_NULL_DRAW_US);
                 s_null_draw_us = us ? atoi(us) : 0;
                 if (s_null_draw_us > 0)
