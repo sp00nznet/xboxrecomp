@@ -1578,9 +1578,19 @@ void nv2a_report_set_pending(uint8_t *mem, uint32_t va);
  * a frame in all (NV2A_OCC_SETTLE_US; 0: no wait), so a host that keeps up
  * gives exact counts and one far behind pays at most that per frame. 8 ms,
  * as Metal's stage1 results often land 2-8 ms after the walk and D3D11's
- * within 2 ms; the wait ends when they do. The address's last count is what
- * a lagging GPU can give: at most one frame stale when the title reuses one
- * address a frame. A settled report keeps its queries on retired[]; when the
+ * within 2 ms; the wait ends when they do. The wait goes through the
+ * backend's wait op on the oldest pending report's last query, and polls
+ * once it returns: D3D11 reads a fence's value in a loop, Metal blocks on
+ * a command buffer's completed handler. It used to poll every pending
+ * query in a loop: on BLiNX 1's stage 1-3 at 2x on the Deck that was 65k
+ * flushing GetData calls a flip (20k at 1x), and 38% of the walker's
+ * samples on Metal. D3D11 does not block: a walker asleep in
+ * the wait made the rest of the frame ~9 ms slower on the Deck. The
+ * results, and so what the title reads, are the same;
+ * RECOMP_DEBUG=occ_settle_spin brings the loop back for an A/B, and a
+ * backend with no wait op polls. The address's last
+ * count is what a lagging GPU can give: at most one frame stale when the
+ * title reuses one address a frame. A settled report keeps its queries on retired[]; when the
  * late result comes in it updates the address's last count and amends the
  * report: the true count replaces the settled one, but only while the slot
  * still holds what the settle wrote (status 0, the same count) and no later
@@ -1626,6 +1636,12 @@ struct nv2a_occ_ops {
     int   (*result)(void *ctx, void *q, int flush, uint64_t *count);
     uint64_t (*now_us)(void *ctx);
     void *ctx;
+    /* Optional: wait until q's result is in or us passes, on what the GPU
+     * signals (a fence, a command buffer's completion), not by polling q.
+     * 1 when q's work is done on the GPU, 0 on a timeout, -1 when the
+     * backend cannot wait (no fence: the settle then polls, as with no wait
+     * at all, and does not count it as a wait). */
+    int   (*wait)(void *ctx, void *q, uint64_t us);
 };
 
 struct nv2a_occ_report {
@@ -1672,6 +1688,9 @@ struct nv2a_occ {
     uint64_t settled, stale, first, ret_drop, settle_wait_us, frame_wait_us;
     /* Settled reports a late result amended. */
     uint64_t amended, beside;
+    /* Settle waits through ops->wait, and the polls the settle made after
+     * its first (one a wake with the wait op, one a loop turn without). */
+    uint64_t waits, settle_polls;
     /* nv2a_occ_flip calls, and the age (GET_REPORT to the poll that found
      * it) of every result taken: <1, <2, <4, <8, <16, <33, <66, >=66 ms. */
     uint64_t flips, age[NV2A_OCC_AGES];
@@ -1682,6 +1701,8 @@ struct nv2a_occ {
      * settles of one frame wait up to settle_us in all for results (0: no
      * wait; NV2A_OCC_SETTLE_US from nv2a_occ_init). */
     uint64_t delay_us, settle_us;
+    /* RECOMP_DEBUG=occ_settle_spin: poll in a loop even with a wait op. */
+    int      spin;
     /* RECOMP_TRACE=zpass: print the first 64 settles and, in the summary,
      * the age histogram. */
     int      trace;
@@ -1711,6 +1732,7 @@ void nv2a_occ_set_scale(struct nv2a_occ *o, unsigned scale);
 void nv2a_occ_set_delay(struct nv2a_occ *o, uint64_t us);
 void nv2a_occ_set_settle(struct nv2a_occ *o, uint64_t us);
 void nv2a_occ_set_trace(struct nv2a_occ *o, int on);
+void nv2a_occ_set_spin(struct nv2a_occ *o, int on);
 /* The running totals under `tag` ("[D3D11]"), and with trace the age
  * histogram: what a run states of its GPU latency. */
 void nv2a_occ_summary(const struct nv2a_occ *o, const char *tag);

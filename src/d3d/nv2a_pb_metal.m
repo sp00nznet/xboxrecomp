@@ -397,10 +397,16 @@ static void flush(int wait)
         occ_after_wait();
 }
 
+/* s_cmd has the completed handler that wakes the occlusion settle's wait
+ * (occ_pass_begin adds it to a buffer that takes a visibility slot). */
+static int s_cmd_occ_wake;
+
 static void ensure_cmd(void)
 {
-    if (!s_cmd)
+    if (!s_cmd) {
         s_cmd = [[s_queue commandBuffer] retain];
+        s_cmd_occ_wake = 0;
+    }
 }
 
 /* Open a pass on rt: with `clear`, loadAction Clear to c; else Load. The
@@ -4119,8 +4125,8 @@ static void guard_flip(uint32_t addr, uint32_t len)
  * At the end of each walk, before a semaphore release that follows a
  * report (both on_poll) and at the flip after its wait, nv2a_occ_settle
  * waits for the results while the frame's RECOMP_DEBUG=occ_settle_us budget
- * lasts (8000 by default; a query still in the open s_cmd is committed by
- * occ_result's flush), then settles whatever is still pending with the
+ * lasts (8000 by default; asleep until a completed handler, occ_wait, which
+ * commits a query still in the open s_cmd), then settles whatever is still pending with the
  * report address's last count (visible the first time), so the title never
  * reads a test as incomplete (nv2a_backend_common.h). At stock
  * almost nothing is left to settle: the reports' command buffers were
@@ -4147,6 +4153,10 @@ static int               s_retire[VIS_SLOTS], s_nretire;
 static struct nv2a_occ   s_occ;
 static int               s_occ_mode = -1;  /* 0 defer, 1 sync, 2 fixed */
 static uint64_t          s_occ_ovf;
+/* The settle's wait (occ_wait) sleeps on this; a command buffer holding a
+ * visibility slot broadcasts it from its completed handler. */
+static pthread_mutex_t   s_occ_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t    s_occ_cv = PTHREAD_COND_INITIALIZER;
 
 static int occ_mode(void)
 {
@@ -4186,6 +4196,15 @@ static void occ_pass_begin(void)
     q->slot[q->n] = i;
     q->cmd[q->n] = [s_cmd retain];
     q->n++;
+    if (!s_cmd_occ_wake) {
+        [s_cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
+            (void)c;
+            pthread_mutex_lock(&s_occ_mu);
+            pthread_cond_broadcast(&s_occ_cv);
+            pthread_mutex_unlock(&s_occ_mu);
+        }];
+        s_cmd_occ_wake = 1;
+    }
     [s_enc setVisibilityResultMode:MTLVisibilityResultModeCounting offset:(NSUInteger)i * 8u];
     s_occ_slot = i;
 }
@@ -4291,8 +4310,45 @@ static int occ_result(void *ctx, void *qv, int flush_gpu, uint64_t *count)
     return 1;
 }
 
+static int occ_cmds_done(const OccQuery *q)
+{
+    int i;
+    for (i = 0; i < q->n; i++)
+        if (!cmd_done(q->cmd[i]))
+            return 0;
+    return 1;
+}
+
+/* The settle's wait for q (nv2a_occ_ops.wait): commit q's buffer if it is
+ * still open, then sleep until the completed handlers say its buffers are
+ * done. The old settle polled their status in a loop, 38% of the walker's
+ * samples on BLiNX 1's stage 1-3. No wake is lost: Metal sets a
+ * buffer's status before its completed handlers run, and the handler
+ * broadcasts under s_occ_mu, the lock this checks the status under. The
+ * 1 ms slices are defensive only, against a handler that never runs. */
+static int occ_wait(void *ctx, void *qv, uint64_t us)
+{
+    OccQuery *q = (OccQuery *)qv;
+    uint64_t end = occ_now_us(NULL) + us, now;
+    int i, done;
+    (void)ctx;
+    for (i = 0; i < q->n; i++)
+        if (q->cmd[i] == s_cmd) {
+            flush(0);
+            break;
+        }
+    pthread_mutex_lock(&s_occ_mu);
+    while (!(done = occ_cmds_done(q)) && (now = occ_now_us(NULL)) < end) {
+        uint64_t w = end - now < 1000 ? end - now : 1000;
+        struct timespec ts = { 0, (long)(w * 1000) };
+        pthread_cond_timedwait_relative_np(&s_occ_cv, &s_occ_mu, &ts);
+    }
+    pthread_mutex_unlock(&s_occ_mu);
+    return done;
+}
+
 static const struct nv2a_occ_ops s_occ_ops = {
-    occ_get, occ_put, occ_begin, occ_end, occ_result, occ_now_us, NULL
+    occ_get, occ_put, occ_begin, occ_end, occ_result, occ_now_us, NULL, occ_wait
 };
 
 static uint64_t occ_env_us(recomp_env_id id, uint64_t def)
@@ -4311,6 +4367,7 @@ static int occ_ready_on(void)
         nv2a_occ_set_settle(&s_occ, occ_env_us(RENV_OCC_SETTLE_US,
                                                NV2A_OCC_SETTLE_US));
         nv2a_occ_set_trace(&s_occ, recomp_env(RENV_ZPASS_TRACE) != NULL);
+        nv2a_occ_set_spin(&s_occ, recomp_env(RENV_OCC_SETTLE_SPIN) != NULL);
     }
     return 1;
 }

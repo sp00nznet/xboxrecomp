@@ -28,7 +28,7 @@ static uint64_t q_now(void *c) { (void)c; return 0; }
 
 static uint32_t occ_run(unsigned scale, uint64_t samples)
 {
-    static const struct nv2a_occ_ops ops = { q_get, q_put, q_begin, q_end, q_result, q_now, NULL };
+    static const struct nv2a_occ_ops ops = { q_get, q_put, q_begin, q_end, q_result, q_now, NULL, NULL };
     static struct nv2a_occ o;
     static uint32_t mem[64];
     nv2a_occ_init(&o, &ops, (uint8_t *)mem);
@@ -1492,7 +1492,7 @@ int main(void)
         CHECK(nv2a_host_render_scale() == 3);
         CHECK(nv2a_host_opts()->present_filter == NV2A_PRESENT_INTEGER && nv2a_host_opts()->fullscreen == 1);
         {
-            static const struct nv2a_occ_ops ops = { q_get, q_put, q_begin, q_end, q_result, q_now, NULL };
+            static const struct nv2a_occ_ops ops = { q_get, q_put, q_begin, q_end, q_result, q_now, NULL, NULL };
             struct nv2a_occ oc;
             static uint32_t mem[8];
             nv2a_occ_init(&oc, &ops, (uint8_t *)mem);

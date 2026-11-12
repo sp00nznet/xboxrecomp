@@ -648,6 +648,11 @@ void nv2a_occ_set_trace(struct nv2a_occ *o, int on)
     o->trace = on;
 }
 
+void nv2a_occ_set_spin(struct nv2a_occ *o, int on)
+{
+    o->spin = on;
+}
+
 uint32_t nv2a_occ_scale_count(uint64_t samples, unsigned scale)
 {
     if (scale > 1 && samples) {
@@ -861,10 +866,20 @@ void nv2a_occ_settle(struct nv2a_occ *o)
     /* One budget a frame, not a walk: a title testing a dozen times a frame
      * on a host far behind would otherwise wait a dozen times over. */
     if (o->npend && o->frame_wait_us < o->settle_us) {
-        uint64_t left = o->settle_us - o->frame_wait_us, w;
+        uint64_t left = o->settle_us - o->frame_wait_us, w, el;
         uint64_t t = o->ops->now_us(o->ops->ctx);
-        while (o->npend && o->ops->now_us(o->ops->ctx) - t < left)
+        while (o->npend && (el = o->ops->now_us(o->ops->ctx) - t) < left) {
+            /* Wait on the oldest report's last query: reports end in
+             * stream order, so when it is in the others mostly are too,
+             * and one poll after the wait takes them. Polling every query
+             * in the loop instead cost a flushing GetData each on D3D11. */
+            const struct nv2a_occ_report *p = &o->pend[0];
+            if (o->ops->wait && !o->spin && p->n && !p->overflow
+                    && o->ops->wait(o->ops->ctx, p->q[p->n - 1], left - el) >= 0)
+                o->waits++;
+            o->settle_polls++;
             nv2a_occ_poll(o, 1);
+        }
         w = o->ops->now_us(o->ops->ctx) - t;
         o->frame_wait_us += w;
         o->settle_wait_us += w;
@@ -938,7 +953,7 @@ void nv2a_occ_summary(const struct nv2a_occ *o, const char *tag)
             " settled %llu (stale %llu, beside %llu, first %llu),"
             " %llu amended,"
             " %llu retired dropped,"
-            " settle wait %llu us\n", tag,
+            " settle wait %llu us (%llu waits, %llu polls)\n", tag,
             (unsigned long long)o->reports,
             (unsigned long long)o->vis,
             (unsigned long long)o->late,
@@ -949,7 +964,9 @@ void nv2a_occ_summary(const struct nv2a_occ *o, const char *tag)
             (unsigned long long)o->first,
             (unsigned long long)o->amended,
             (unsigned long long)o->ret_drop,
-            (unsigned long long)o->settle_wait_us);
+            (unsigned long long)o->settle_wait_us,
+            (unsigned long long)o->waits,
+            (unsigned long long)o->settle_polls);
     if (o->trace)
         fprintf(stderr, "%s occ result age: <1ms %llu <2 %llu <4 %llu <8 %llu"
                 " <16 %llu <33 %llu <66 %llu >=66 %llu\n", tag,

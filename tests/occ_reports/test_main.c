@@ -76,7 +76,34 @@ static uint64_t q_now(void *c)
     return s_clock;
 }
 
-static const struct nv2a_occ_ops s_ops = { q_get, q_put, q_begin, q_end, q_result, q_now, NULL };
+/* The backend's blocking wait, as a fence or a completed handler would do
+ * it: the clock jumps to when q's result is in, or by the whole timeout.
+ * s_wait_can 0 is a backend that cannot wait (no fence): it returns -1 at
+ * once, the settle polls and counts no wait. */
+static unsigned s_waits;
+static int s_wait_can;
+
+static int q_wait(void *c, void *q, uint64_t us)
+{
+    const struct fq *f = (const struct fq *)q;
+    (void)c;
+    s_waits++;
+    if (!s_wait_can)
+        return -1;
+    if (s_clock >= f->ready_at)
+        return 1;
+    if (f->ready_at - s_clock <= us) {
+        s_clock = f->ready_at;
+        return 1;
+    }
+    s_clock += us;
+    return 0;
+}
+
+static const struct nv2a_occ_ops s_ops = { q_get, q_put, q_begin, q_end, q_result, q_now, NULL, NULL };
+static const struct nv2a_occ_ops s_ops_wait = {
+    q_get, q_put, q_begin, q_end, q_result, q_now, NULL, q_wait
+};
 static struct nv2a_occ s_o;
 
 static void fresh(void)
@@ -89,6 +116,8 @@ static void fresh(void)
     s_lat = 0;
     s_val = 0;
     s_gets = s_puts = s_bad = 0;
+    s_waits = 0;
+    s_wait_can = 1;
     nv2a_occ_init(&s_o, &s_ops, (uint8_t *)s_mem);
     nv2a_occ_set_scale(&s_o, 1);
     nv2a_occ_set_settle(&s_o, 0);       /* the fake clock stands still */
@@ -552,6 +581,96 @@ static int case_accounting(void)
     return 0;
 }
 
+/* The settle blocks on the backend's wait instead of polling in a
+ * loop, and the title reads the same. One script, the default budget, a
+ * clock that runs 10 us a poll: results in time (exact), one later than the
+ * budget (settled stale, then amended by its late result), one never in
+ * (first: visible, retired, dropped), and walk-end settles beside flips. */
+struct occ_run {
+    uint32_t mem[16];
+    uint64_t settled, stale, first, amended, vis, wait_us, polls, owaits;
+    unsigned waits;
+};
+
+static void wait_script(const struct nv2a_occ_ops *ops, int spin, int can,
+                        struct occ_run *r)
+{
+    int i;
+    fresh();
+    nv2a_occ_init(&s_o, ops, (uint8_t *)s_mem);
+    nv2a_occ_set_scale(&s_o, 1);
+    nv2a_occ_set_spin(&s_o, spin);
+    s_wait_can = can;
+    s_tick = 10;
+    vtest(A, 1000, 11);                 /* exact */
+    vtest(B, 3000, 22);                 /* exact, one poll after A's wake */
+    nv2a_occ_settle(&s_o);              /* a walk end */
+    nv2a_occ_flip(&s_o);
+    s_clock += 16600;
+    vtest(A, 20000, 33);                /* past the budget: stale 11 */
+    vtest(C, 500, 0);                   /* hidden, in time */
+    nv2a_occ_flip(&s_o);
+    s_clock += 16600;
+    vtest(D, 1000000000ull, 44);        /* never: first, visible */
+    nv2a_occ_flip(&s_o);
+    s_clock += 16600;                   /* A's 33 is in */
+    vtest(B, 100, 55);
+    nv2a_occ_settle(&s_o);              /* polls retired[]: the amend */
+    nv2a_occ_flip(&s_o);
+    for (i = 0; i < 4; i++) {
+        r->mem[i * 4 + 0] = count_at(A + (uint32_t)i * 0x100);
+        r->mem[i * 4 + 1] = status_at(A + (uint32_t)i * 0x100);
+        r->mem[i * 4 + 2] = s_mem[(A + (uint32_t)i * 0x100) / 4];
+        r->mem[i * 4 + 3] = s_mem[(A + (uint32_t)i * 0x100) / 4 + 1];
+    }
+    r->settled = s_o.settled;
+    r->stale = s_o.stale;
+    r->first = s_o.first;
+    r->amended = s_o.amended;
+    r->vis = s_o.vis;
+    r->wait_us = s_o.settle_wait_us;
+    r->polls = s_o.settle_polls;
+    r->waits = s_waits;
+    r->owaits = s_o.waits;
+}
+
+static int case_wait(void)
+{
+    struct occ_run spin, wait, none, cant;
+    wait_script(&s_ops_wait, 1, 1, &spin);  /* occ_settle_spin */
+    CHECK(drained());
+    wait_script(&s_ops_wait, 0, 1, &wait);
+    CHECK(drained());
+    wait_script(&s_ops, 0, 1, &none);       /* no wait op */
+    CHECK(drained());
+    wait_script(&s_ops_wait, 0, 0, &cant);  /* a wait op with no fence */
+    CHECK(drained());
+    /* What the title reads, and the settle's outcome, are the same. */
+    CHECK(!memcmp(spin.mem, wait.mem, sizeof spin.mem));
+    CHECK(!memcmp(spin.mem, none.mem, sizeof spin.mem));
+    CHECK(!memcmp(spin.mem, cant.mem, sizeof spin.mem));
+    CHECK(spin.mem[0] == 33 && spin.mem[1] == 0);           /* A amended */
+    CHECK(spin.mem[4] == 55 && spin.mem[8] == 0);           /* B, C exact */
+    CHECK(spin.mem[12] == NV2A_OCC_VISIBLE);                /* D first */
+    CHECK(wait.settled == spin.settled && wait.stale == spin.stale
+          && wait.first == spin.first && wait.amended == spin.amended
+          && wait.vis == spin.vis);
+    CHECK(spin.settled == 2 && spin.stale == 1 && spin.first == 1
+          && spin.amended == 1);
+    /* The spin polls every 10 us of the wait; the wait polls once a wake. */
+    CHECK(spin.waits == 0 && none.waits == 0);
+    CHECK(spin.polls > 500 && none.polls == spin.polls);
+    CHECK(wait.waits > 0 && wait.polls == wait.waits && wait.polls < 10);
+    CHECK(cant.polls == spin.polls);
+    /* The totals line counts only waits a backend made: one with no fence
+     * reads as the spin did. */
+    CHECK(wait.owaits == wait.waits && cant.waits > 0 && cant.owaits == 0);
+    /* The same budget is spent: the late frames wait it out either way. */
+    CHECK(wait.wait_us >= 2 * NV2A_OCC_SETTLE_US
+          && wait.wait_us <= spin.wait_us + 100);
+    return 0;
+}
+
 int main(void)
 {
     static const struct {
@@ -576,6 +695,7 @@ int main(void)
         { "a late result never replaces a newer count", case_order },
         { "scale change", case_scale },
         { "accounting", case_accounting },
+        { "the settle waits, not spins", case_wait },
     };
     unsigned i, fail = 0;
     for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {

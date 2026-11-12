@@ -33,6 +33,14 @@ uint64_t d3d11_host_now_us(void);
 /* A monotonic ms tick, the overlay's clock (nv2a_overlay_poll). */
 uint64_t d3d11_host_ticks_ms(void);
 
+/* ---- thread ----------------------------------------------------------- */
+
+/* Gives the rest of the time slice to another ready thread, if any. */
+void d3d11_host_yield(void);
+/* A spin-wait hint to the CPU (pause), for the occlusion settle's loop on
+ * the fence: it reads, never sleeps, so the core keeps its clock. */
+void d3d11_host_cpu_relax(void);
+
 /* ---- HLSL compiler ---------------------------------------------------- */
 
 /* ID3DBlob, the shape the backend keeps its bytecode in; the host's

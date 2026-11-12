@@ -2006,6 +2006,13 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_occ_pool_n | file_static | keep | - | free query count |
 | src/d3d/nv2a_pb_d3d11.c | - | s_occ_made | file_static | keep | - | queries made total |
 | src/d3d/nv2a_pb_d3d11.c | - | s_occ_mode | file_static | keep | - | cached RENV_D3D11_OCC read |
+| src/d3d/nv2a_pb_d3d11.c | - | s_occ_q | file_static | keep | - | host query objects and their end stamps; free ones sit in s_occ_pool |
+| src/d3d/nv2a_pb_d3d11.c | - | s_occ_fence | file_static | keep | - | settle fence (ID3D11Fence), device-owned |
+| src/d3d/nv2a_pb_d3d11.c | - | s_occ_ctx4 | file_static | keep | - | ID3D11DeviceContext4 for the settle fence |
+| src/d3d/nv2a_pb_d3d11.c | - | s_occ_fence_on | file_static | keep | - | fence probe done once per device |
+| src/d3d/nv2a_pb_d3d11.c | - | s_occ_fval | file_static | keep | - | last fence value signalled; must only grow |
+| src/d3d/nv2a_pb_d3d11.c | - | s_occ_ends | file_static | keep | - | query end stamp counter; must only grow (compared with s_occ_fends) |
+| src/d3d/nv2a_pb_d3d11.c | - | s_occ_fends | file_static | keep | - | last end stamp the fence covers; must only grow |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_buf | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_read | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_cb | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
@@ -2099,6 +2106,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_flushes | file_static | keep | - | stats counter |
 | src/d3d/nv2a_pb_metal.m | - | s_writebacks | file_static | keep | - | stats counter |
 | src/d3d/nv2a_pb_metal.m | - | s_cmd_errors | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_metal.m | - | s_cmd_occ_wake | file_static | keep | - | s_cmd has its settle wake handler; ensure_cmd clears it with each new s_cmd |
 | src/d3d/nv2a_pb_metal.m | - | s_draws_stretch | file_static | keep | - | stats counter |
 | src/d3d/nv2a_pb_metal.m | - | s_rt | file_static | reset | renderer.metal | render targets keyed by guest surface; drop without write-back |
 | src/d3d/nv2a_pb_metal.m | - | s_enc_rt | file_static | reset | renderer.metal | points into s_rt: encoder target |
@@ -2225,6 +2233,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_occ | file_static | reset | renderer.metal | pending occlusion reports at guest VAs |
 | src/d3d/nv2a_pb_metal.m | - | s_occ_mode | file_static | keep | - | cached RENV_METAL_OCC read |
 | src/d3d/nv2a_pb_metal.m | - | s_occ_ovf | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_metal.m | - | s_occ_mu | file_static | keep | - | host lock for the settle wake; never held at a stop point |
+| src/d3d/nv2a_pb_metal.m | - | s_occ_cv | file_static | keep | - | settle wake condvar, broadcast by completed handlers |
 | src/d3d/nv2a_pb_metal.m | - | s_report_commits | file_static | keep | - | stats counter |
 | src/d3d/nv2a_pb_metal.m | flip_log | on | local_static | keep | - | cached env read |
 | src/d3d/nv2a_pb_metal.m | flip_log | p_draws | local_static | keep | - | flip log previous totals |

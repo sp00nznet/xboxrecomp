@@ -35,6 +35,7 @@
 #include "mem_stats.h"
 #include <d3d11.h>
 #include <d3d11_1.h>   /* ID3D11DeviceContext1::ClearView, for a partial clear */
+#include <d3d11_4.h>   /* ID3D11Fence: the occlusion settle's wait */
 #include <dxgi.h>
 #include <dxgi1_4.h>  /* IDXGIAdapter3::QueryVideoMemoryInfo, the [MEM] line */
 #include <d3dcompiler.h>
@@ -7119,7 +7120,7 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
  * end of each walk, before a semaphore release that follows a report (both
  * on_poll) and at the flip after Present, nv2a_occ_settle waits for the
  * results while the frame's RECOMP_DEBUG=occ_settle_us budget lasts (8000
- * by default), then settles whatever is still pending with the report
+ * by default; read off an ID3D11Fence, occ_wait), then settles whatever is still pending with the report
  * address's last count (visible the first time), so the title never reads a
  * test as incomplete (nv2a_backend_common.h). occ_delay_us holds
  * every result back (a test hook for a slow GPU). RECOMP_D3D11_OCC=sync
@@ -7134,11 +7135,25 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
  * anything is polled: the old queries go back to the pool unread and nothing
  * is written for the old test, so its late completion cannot land over the
  * title's reset status or the new count. */
-/* Pending and retired reports, a query each at least, and the open ones. */
+/* Pending and retired reports, a query each at least, and the open ones.
+ * A query is handed out with the number of query ends before its own, so
+ * the settle's wait knows whether a fence signal covers it. */
 #define OCC_POOL    (NV2A_OCC_PENDING * 3 + NV2A_OCC_SEG)
-static ID3D11Query *s_occ_pool[OCC_POOL];
+typedef struct OccQ {
+    ID3D11Query *q;
+    uint64_t     end;            /* s_occ_ends at its End */
+} OccQ;
+static OccQ         s_occ_q[OCC_POOL];
+static OccQ        *s_occ_pool[OCC_POOL];
 static int          s_occ_pool_n, s_occ_made;
 static int          s_occ_mode = -1;         /* 0 defer, 1 sync, 2 fixed */
+/* The settle's wait (occ_wait): a fence signalled after the queries it
+ * waits on. -1: no ID3D11Fence (below D3D 11.4), the settle polls. */
+static ID3D11Fence          *s_occ_fence;
+static ID3D11DeviceContext4 *s_occ_ctx4;
+static int                   s_occ_fence_on;
+static UINT64                s_occ_fval;     /* last value signalled */
+static uint64_t              s_occ_ends, s_occ_fends;    /* ends; covered */
 
 static int occ_mode(void)
 {
@@ -7168,29 +7183,29 @@ static void *occ_get(void *ctx)
     qd.MiscFlags = 0;
     if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &q)))
         return NULL;
-    s_occ_made++;
-    return q;
+    s_occ_q[s_occ_made].q = q;
+    return &s_occ_q[s_occ_made++];
 }
 
+/* Every query handed out came from s_occ_q, so the pool never overflows. */
 static void occ_put(void *ctx, void *q)
 {
     (void)ctx;
-    if (q && s_occ_pool_n < OCC_POOL)
-        s_occ_pool[s_occ_pool_n++] = (ID3D11Query *)q;
-    else if (q)
-        ID3D11Query_Release((ID3D11Query *)q);
+    if (q)
+        s_occ_pool[s_occ_pool_n++] = (OccQ *)q;
 }
 
 static void occ_begin(void *ctx, void *q)
 {
     (void)ctx;
-    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)q);
+    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)((OccQ *)q)->q);
 }
 
 static void occ_end(void *ctx, void *q)
 {
     (void)ctx;
-    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)q);
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)((OccQ *)q)->q);
+    ((OccQ *)q)->end = ++s_occ_ends;
 }
 
 /* GetData without a flush polls; with one, it pushes the GPU along. */
@@ -7198,15 +7213,92 @@ static int occ_result(void *ctx, void *q, int flush, uint64_t *count)
 {
     UINT64 v = 0;
     (void)ctx;
-    if (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)q, &v, sizeof v,
+    if (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)((OccQ *)q)->q,
+                                    &v, sizeof v,
                                     flush ? 0 : D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
         return 0;
     *count = v;
     return 1;
 }
 
+/* Local copies: the mingw import libraries need not carry the 11.4 IIDs. */
+static const GUID s_iid_dev5 = { 0x8ffde202, 0xa0e7, 0x45df,
+                                 { 0x9e, 0x01, 0xe8, 0x37, 0x80, 0x1b, 0x5e, 0xa0 } };
+static const GUID s_iid_ctx4 = { 0x917600da, 0xf58c, 0x4c33,
+                                 { 0x98, 0xd8, 0x3e, 0x15, 0xb3, 0x90, 0xfa, 0x24 } };
+static const GUID s_iid_fence = { 0xaffde9d1, 0x1df7, 0x4bb7,
+                                  { 0x8a, 0x34, 0x0f, 0x46, 0x25, 0x1d, 0xab, 0x80 } };
+
+/* The fence and the 11.4 context, made on the first wait. */
+static int occ_fence_on(void)
+{
+    ID3D11Device5 *d5 = NULL;
+    if (s_occ_fence_on)
+        return s_occ_fence_on > 0;
+    s_occ_fence_on = -1;
+    if (FAILED(ID3D11Device_QueryInterface(s_dev, &s_iid_dev5, (void **)&d5)))
+        d5 = NULL;
+    /* Flags 0, not D3D11_FENCE_FLAG_NONE: the SDK's d3d11_3.h (10.0.16299)
+     * and mingw's both give NONE as 0x1, Microsoft's reference page as 0,
+     * and DXVK logs any flag but SHARED as unsupported. 0 is no option on
+     * every reading. */
+    if (d5 && SUCCEEDED(ID3D11Device5_CreateFence(d5, 0, (D3D11_FENCE_FLAG)0,
+                                                  &s_iid_fence, (void **)&s_occ_fence))) {
+        if (SUCCEEDED(ID3D11DeviceContext_QueryInterface(s_ctx, &s_iid_ctx4,
+                                                         (void **)&s_occ_ctx4)))
+            s_occ_fence_on = 1;
+        else {
+            ID3D11Fence_Release(s_occ_fence);
+            s_occ_fence = NULL;
+        }
+    }
+    if (d5)
+        ID3D11Device5_Release(d5);
+    fprintf(stderr, LOGP "occlusion settle: %s\n", s_occ_fence_on > 0
+            ? "reads an ID3D11Fence"
+            : "no ID3D11Fence (D3D 11.4), polls");
+    return s_occ_fence_on > 0;
+}
+
+/* The settle's wait for q (nv2a_occ_ops.wait). The fence is signalled only
+ * here, when the last signal came before q ended: one signal and flush a
+ * settle, as the polls' GetData flushes did. A query's result is in once
+ * the GPU has passed its End, so it is in at most when the fence's value
+ * is reached. The wait reads the fence's value in a loop, a cheap read,
+ * where the old settle called a flushing GetData on every pending query
+ * (65k calls a frame in BLiNX 1 at 2x on the Deck). It does not block on
+ * SetEventOnCompletion: on the Deck under Proton a blocked walker ran the
+ * rest of the frame about 9 ms slower (draws 14 -> 19 ms) in 5 runs of 6
+ * at 2x, below 30 fps, likely the CPU clocking down while it slept. */
+static int occ_wait(void *ctx, void *qv, uint64_t us)
+{
+    const OccQ *q = (const OccQ *)qv;
+    uint64_t t0;
+    (void)ctx;
+    if (!occ_fence_on())
+        return -1;
+    if (q->end > s_occ_fends) {
+        ID3D11DeviceContext4_Signal(s_occ_ctx4, s_occ_fence, ++s_occ_fval);
+        ID3D11DeviceContext_Flush(s_ctx);
+        s_occ_fends = s_occ_ends;
+    }
+    if (ID3D11Fence_GetCompletedValue(s_occ_fence) >= s_occ_fval) {
+        /* Passed, yet the poll before missed the result: the runtime
+         * (DXVK's query tracking) lags its fence by a little. */
+        d3d11_host_yield();
+        return 1;
+    }
+    t0 = occ_now_us(NULL);
+    while (ID3D11Fence_GetCompletedValue(s_occ_fence) < s_occ_fval) {
+        if (occ_now_us(NULL) - t0 >= us)
+            return 0;
+        d3d11_host_cpu_relax();
+    }
+    return 1;
+}
+
 static const struct nv2a_occ_ops s_occ_ops = {
-    occ_get, occ_put, occ_begin, occ_end, occ_result, occ_now_us, NULL
+    occ_get, occ_put, occ_begin, occ_end, occ_result, occ_now_us, NULL, occ_wait
 };
 
 static uint64_t occ_env_us(recomp_env_id id, uint64_t def)
@@ -7226,6 +7318,7 @@ static int occ_ready_on(void)
         nv2a_occ_set_settle(&s_occ, occ_env_us(RENV_OCC_SETTLE_US,
                                                NV2A_OCC_SETTLE_US));
         nv2a_occ_set_trace(&s_occ, recomp_env(RENV_ZPASS_TRACE) != NULL);
+        nv2a_occ_set_spin(&s_occ, recomp_env(RENV_OCC_SETTLE_SPIN) != NULL);
     }
     return 1;
 }

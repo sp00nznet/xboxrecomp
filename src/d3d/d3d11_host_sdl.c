@@ -21,6 +21,7 @@
 #ifndef _WIN32
 
 #include <errno.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,22 @@ uint64_t d3d11_host_now_us(void)
 uint64_t d3d11_host_ticks_ms(void)
 {
     return mono_ns() / 1000000u;
+}
+
+/* ---- thread ------------------------------------------------------------- */
+
+void d3d11_host_yield(void)
+{
+    sched_yield();
+}
+
+void d3d11_host_cpu_relax(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
 }
 
 /* ---- blobs -------------------------------------------------------------- */

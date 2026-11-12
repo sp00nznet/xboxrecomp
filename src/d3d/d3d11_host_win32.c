@@ -54,6 +54,18 @@ uint64_t d3d11_host_ticks_ms(void)
     return (uint64_t)GetTickCount64();
 }
 
+/* ---- thread ----------------------------------------------------------- */
+
+void d3d11_host_yield(void)
+{
+    SwitchToThread();
+}
+
+void d3d11_host_cpu_relax(void)
+{
+    YieldProcessor();
+}
+
 /* ---- HLSL compiler ---------------------------------------------------- */
 
 typedef HRESULT (WINAPI *compile_fn)(LPCVOID, SIZE_T, LPCSTR,
