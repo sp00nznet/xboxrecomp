@@ -4766,6 +4766,8 @@ static void ao_sample(const struct nv2a_pb_draw *d, const struct nv2a_pb_vsh *v,
 {
     float in[NV2A_VSH_INPUTS][4];
     Nv2aVshOut out;
+    const uint32_t (*prog)[4];
+    uint32_t start;
     unsigned i;
     int s = nv2a_ao_sample_slot(&s_ao, wmode);
     uint32_t j;
@@ -4776,7 +4778,10 @@ static void ao_sample(const struct nv2a_pb_draw *d, const struct nv2a_pb_vsh *v,
     for (i = 0; i < NV2A_VSH_INPUTS && i < NV2A_VS_MAX_INPUTS; i++)
         if (inputs & (1u << i))
             vtx_input(d, v, i, lo + j, in[i]);
-    nv2a_vsh_run((const uint32_t (*)[4])v->prog, v->start, (float (*)[4])(uintptr_t)v->c, 0,
+    /* oPos alone, so the program's oPos slice (nv2a_vsh_pos_prog). */
+    start = v->start;
+    prog = nv2a_vsh_pos_prog((const uint32_t (*)[4])v->prog, &start);
+    nv2a_vsh_run(prog, start, (float (*)[4])(uintptr_t)v->c, 0,
                  (const float (*)[4])in, &out);
     nv2a_ao_sample_put(&s_ao, s, out.ok ? out.o[NV2A_VSH_O_POS][2] : 0.0f,
                        out.ok ? out.o[NV2A_VSH_O_POS][3] : 0.0f, nv2a_zmax(fmt));

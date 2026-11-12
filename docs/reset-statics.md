@@ -1495,6 +1495,10 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_vsh_cpu.c | - | nv2a_vsh_count_on | global | keep | - | cached RECOMP_TRACE=pb_cost read (nv2a_pb_cost_init) |
 | src/kernel/nv2a_vsh_cpu.c | - | nv2a_vsh_run_count | global | keep | - | profiler totals, read as deltas |
 | src/kernel/nv2a_vsh_cpu.c | - | nv2a_vsh_step_count | global | keep | - | profiler totals, read as deltas |
+| src/kernel/nv2a_vsh_cpu.c | - | s_slices | file_static | keep | - | oPos slices keyed by the whole program words; a pure function of them |
+| src/kernel/nv2a_vsh_cpu.c | - | s_slice_next | file_static | keep | - | slice cache round-robin victim per set |
+| src/kernel/nv2a_vsh_cpu.c | - | nv2a_vsh_slice_hits | global | keep | - | profiler totals, read as deltas |
+| src/kernel/nv2a_vsh_cpu.c | - | nv2a_vsh_slice_misses | global | keep | - | profiler totals, read as deltas |
 
 ### src/nv2a/nv2a_core.c
 

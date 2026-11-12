@@ -58,6 +58,33 @@ void nv2a_vsh_run(const uint32_t prog[NV2A_VSH_SLOTS][4], uint32_t start,
                   float c[NV2A_VSH_CONSTANTS][4], int const_write,
                   const float v[NV2A_VSH_INPUTS][4], Nv2aVshOut *out);
 
+/* The instructions of the program in `prog` from slot `start` to its first
+ * FINAL that oPos depends on, in order, into `pos` (the FINAL one last, so
+ * the copy ends where the program does). nv2a_vsh_run on `pos` from slot 0
+ * leaves oPos and ok as the whole program would, bit for bit: an
+ * instruction is kept when it writes a component (of R0..R12, oPos being
+ * R12, or a0) that a kept one later reads before another write covers it,
+ * and every unit of a kept instruction runs as before. Only oPos is
+ * meaningful in its output, and only with const_write 0, as the 2D test
+ * runs it. Returns the slots kept, 0 for a program with no FINAL from
+ * start (its run never sets ok). */
+uint32_t nv2a_vsh_slice_pos(const uint32_t prog[NV2A_VSH_SLOTS][4], uint32_t start,
+                            uint32_t pos[NV2A_VSH_SLOTS][4]);
+
+/* nv2a_vsh_slice_pos, kept: the program to run from *start for oPos alone
+ * (the 2D test, render.ao's depth samples). Its slice, *start set to 0,
+ * or prog itself, *start kept, for a program with no FINAL. The slices are
+ * kept by the program's words from *start to FINAL, compared whole, so a
+ * program rewritten in place gets a new one. Walker thread only. Hits and
+ * misses count every lookup, for the [PB-COST] line; clear empties the
+ * cache (tests). The slice returned lives in the cache: it is valid only
+ * until the next nv2a_vsh_pos_prog call, which may evict it. The cache is
+ * 128 entries of two program copies, about 557 KB of BSS. */
+const uint32_t (*nv2a_vsh_pos_prog(const uint32_t prog[NV2A_VSH_SLOTS][4],
+                                   uint32_t *start))[4];
+extern uint64_t nv2a_vsh_slice_hits, nv2a_vsh_slice_misses;
+void nv2a_vsh_slice_clear(void);
+
 /* Every run and instruction since start, for the [PB-COST] line: the CPU
  * interpreter on the draw path (hor+, snap_2d, render.ao) is a per-batch
  * cost. Plain counters, kept only while nv2a_vsh_count_on (set by

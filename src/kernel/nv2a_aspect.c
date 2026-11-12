@@ -25,6 +25,8 @@ int nv2a_aspect_scan(struct nv2a_aspect_gate *gate,
     gate->n++;
     if (!check || !count)
         return 0;
+    /* Only oPos is read here: its slice gives it bit for bit. */
+    prog = nv2a_vsh_pos_prog(prog, &start);
     for (j = 0; j < count; j += step) {
         float x;
         memset(in, 0, sizeof in);
@@ -73,6 +75,7 @@ int nv2a_aspect_batch_2d(const uint32_t prog[][4], uint32_t start, float c[][4],
 
     if (!count)
         return -1;
+    prog = nv2a_vsh_pos_prog(prog, &start);
     for (j = 0; j < count; j += step) {
         const float *p = out.o[NV2A_VSH_O_POS];
         memset(in, 0, sizeof in);
@@ -108,6 +111,7 @@ int nv2a_aspect_screen_quad(const uint32_t prog[][4], uint32_t start, float c[][
 
     if (!count || count > NV2A_ASPECT_QUAD_MAX)
         return 0;
+    prog = nv2a_vsh_pos_prog(prog, &start);
     for (j = 0; j < count; j++) {
         const float *p;
         memset(in, 0, sizeof in);
@@ -239,6 +243,12 @@ int nv2a_aspect_flat(const uint32_t prog[][4], uint32_t start, float c[][4], con
     uint32_t step = nv2a_aspect_flat_step(count), j;
     unsigned k;
 
+    if (!count) {
+        if (w)
+            *w = 0.0f;
+        return 0;
+    }
+    prog = nv2a_vsh_pos_prog(prog, &start);
     for (j = 0; j < count; j += step) {
         float wj;
         memset(in, 0, sizeof in);

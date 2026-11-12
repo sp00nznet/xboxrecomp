@@ -251,6 +251,153 @@ void nv2a_vsh_run(const uint32_t prog[NV2A_VSH_SLOTS][4], uint32_t start,
     }
 }
 
+/* Components (bit 4*r + c, c 0 x .. 3 w) of R0..R12 that a xyzw mask
+ * covers in register r. */
+static inline uint64_t mask_bits(uint32_t r, uint32_t mask)
+{
+    uint64_t b = 0;
+    int c;
+    for (c = 0; c < 4; c++)
+        if (mask & (8u >> c))
+            b |= 1ull << (4u * r + (uint32_t)c);
+    return b;
+}
+
+uint32_t nv2a_vsh_slice_pos(const uint32_t prog[NV2A_VSH_SLOTS][4], uint32_t start,
+                            uint32_t pos[NV2A_VSH_SLOTS][4])
+{
+    /* Backward liveness by component: bit 4*r + c for component c of R0..R12
+     * (R12 is oPos), bit 52 for a0. An instruction is kept when it writes a
+     * live component; its writes then kill what they cover, and the
+     * components its sources' swizzles select become live. The writes are
+     * run_mac's and run_ilu's: MOV..SGE and every ILU op write, under their
+     * masks; MAC_ARL writes a0; a MAC op past SGE writes nothing. */
+    const uint64_t LIVE_A0 = 1ull << 52;
+    uint8_t keep[NV2A_VSH_SLOTS];
+    uint64_t live = mask_bits(12, 0xf);
+    uint32_t end, pc, n = 0;
+    int i, k;
+
+    for (end = start; end < NV2A_VSH_SLOTS && !NV2A_VSH_FINAL(prog[end]); end++)
+        ;
+    if (end >= NV2A_VSH_SLOTS)
+        return 0;
+    for (pc = end + 1; pc-- > start;) {
+        const uint32_t *w = prog[pc];
+        uint32_t mac = NV2A_VSH_MAC(w), ilu = NV2A_VSH_ILU(w);
+        int mac_wr = mac >= MAC_MOV && mac <= MAC_SGE, ilu_wr = ilu != ILU_NOP;
+        uint64_t def = 0;
+
+        if (mac == MAC_ARL)
+            def |= LIVE_A0;
+        if (mac_wr && NV2A_VSH_OUT_R(w) <= 12)
+            def |= mask_bits(NV2A_VSH_OUT_R(w), NV2A_VSH_MAC_MASK(w));
+        if (ilu_wr) {
+            uint32_t r = mac != MAC_NOP ? 1 : NV2A_VSH_OUT_R(w);
+            if (r <= 12)
+                def |= mask_bits(r, NV2A_VSH_ILU_MASK(w));
+        }
+        if (NV2A_VSH_ORB(w) && NV2A_VSH_O_ADDR(w) == 0
+            && (NV2A_VSH_O_MUX(w) == 0 ? mac_wr : ilu_wr))
+            def |= mask_bits(12, NV2A_VSH_O_MASK(w));
+        /* The FINAL instruction ends the copy too, needed or not; when it
+         * is not needed (an oD1 write), what it reads does not matter. */
+        keep[pc] = (def & live) != 0;
+        live &= ~def;
+        if (!keep[pc]) {
+            keep[pc] = pc == end;
+            continue;
+        }
+        for (i = 0; i < 3; i++) {
+            struct nv2a_vsh_src src;
+            nv2a_vsh_src_decode(w, i, &src);
+            if (src.mux == NV2A_VSH_MUX_R && src.reg <= 12) {
+                for (k = 0; k < 4; k++)
+                    live |= 1ull << (4u * src.reg + NV2A_VSH_SWZ(src.swz, k));
+            } else if (src.mux == NV2A_VSH_MUX_C && NV2A_VSH_A0X(w)) {
+                live |= LIVE_A0;
+            }
+        }
+    }
+    for (pc = start; pc <= end; pc++)
+        if (keep[pc])
+            memcpy(pos[n++], prog[pc], 16);
+    return n;
+}
+
+/* The slices, kept by the program's words from start to FINAL, compared
+ * whole: the backends' 32-bit program hash is no identity. Set-associative,
+ * since BLiNX 1 runs two big programs in turn that a direct-mapped table of
+ * 64 kept evicting each other. Walker-thread state, like the counters: the
+ * 2D test and render.ao's depth samples run in the backends' on_draw. */
+#define SLICE_SETS 32
+#define SLICE_WAYS 4
+
+struct slice_entry {
+    uint32_t len;           /* program slots start..FINAL; 0: empty */
+    uint32_t words[NV2A_VSH_SLOTS][4];
+    uint32_t pos[NV2A_VSH_SLOTS][4];
+};
+
+static struct slice_entry s_slices[SLICE_SETS][SLICE_WAYS];
+static uint8_t s_slice_next[SLICE_SETS];
+uint64_t nv2a_vsh_slice_hits, nv2a_vsh_slice_misses;
+
+const uint32_t (*nv2a_vsh_pos_prog(const uint32_t prog[NV2A_VSH_SLOTS][4],
+                                   uint32_t *start))[4]
+{
+    struct slice_entry *e, *set;
+    uint32_t end, len, h = 2166136261u, i, j, si;
+
+    for (end = *start; end < NV2A_VSH_SLOTS && !NV2A_VSH_FINAL(prog[end]); end++)
+        ;
+    if (end >= NV2A_VSH_SLOTS)
+        return prog;
+    len = end + 1 - *start;
+    /* The set from the length and four slots: the first two, the middle
+     * and the last. The memcmp below is what makes a hit exact, and
+     * hashing every word cost about what the slice saves. XDK programs
+     * share their first two slots (the dp4 oPos prologue) and their last
+     * (the epilogue), so without the middle one, lighting or skinning
+     * variants of one length would all share a set of 4 and thrash. */
+    h = (h ^ len) * 16777619u;
+    for (j = 0; j < 4; j++) {
+        h = (h ^ prog[*start][j]) * 16777619u;
+        h = (h ^ prog[*start + len / 2][j]) * 16777619u;
+        h = (h ^ prog[end][j]) * 16777619u;
+    }
+    if (len > 2)
+        for (j = 0; j < 4; j++)
+            h = (h ^ prog[*start + 1][j]) * 16777619u;
+    si = (h ^ h >> 16) % SLICE_SETS;
+    set = s_slices[si];
+    for (i = 0; i < SLICE_WAYS; i++)
+        if (set[i].len == len && !memcmp(set[i].words, prog[*start], (size_t)len * 16u)) {
+            nv2a_vsh_slice_hits++;
+            *start = 0;
+            return (const uint32_t (*)[4])set[i].pos;
+        }
+    nv2a_vsh_slice_misses++;
+    e = &set[s_slice_next[si]];
+    s_slice_next[si] = (uint8_t)((s_slice_next[si] + 1u) % SLICE_WAYS);
+    if (!nv2a_vsh_slice_pos(prog, *start, e->pos)) {
+        e->len = 0;
+        return prog;
+    }
+    memcpy(e->words, prog[*start], (size_t)len * 16u);
+    e->len = len;
+    *start = 0;
+    return (const uint32_t (*)[4])e->pos;
+}
+
+void nv2a_vsh_slice_clear(void)
+{
+    unsigned i, j;
+    for (i = 0; i < SLICE_SETS; i++)
+        for (j = 0; j < SLICE_WAYS; j++)
+            s_slices[i][j].len = 0;
+}
+
 /* ---- disassembly ------------------------------------------------------ */
 
 static const char *const MAC_NAMES[16] = {

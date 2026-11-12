@@ -153,6 +153,94 @@ int main(void)
     CHECK_F("oT0.x", o.o[NV2A_VSH_O_T0][0], 0.125f);
     CHECK_F("oT0.y", o.o[NV2A_VSH_O_T0][1], 0.875f);
 
+    /* The oPos slice (nv2a_vsh_slice_pos, nv2a_vsh_pos_prog): the oD0 and
+     * oT0 moves go, the transform and the epilogue stay, and oPos comes out
+     * bit for bit. The cache hands the same slice back for the same words,
+     * a new one when a word changes, live or dead, and holds no result, so
+     * new constants reach oPos at once. */
+    {
+        static uint32_t sl[NV2A_VSH_SLOTS][4];
+        const uint32_t (*p1)[4], (*p2)[4];
+        uint32_t st, n_sl = nv2a_vsh_slice_pos((const uint32_t (*)[4])prog, 0, sl);
+        uint64_t hits, misses;
+        Nv2aVshOut so;
+
+        if (n_sl != 6) { printf("FAIL: slice kept %u, want 6\n", n_sl); failures++; }
+        nv2a_vsh_run((const uint32_t (*)[4])sl, 0, cst, 0, (const float (*)[4])in, &so);
+        if (!so.ok || memcmp(so.o[NV2A_VSH_O_POS], o.o[NV2A_VSH_O_POS], 16)) {
+            printf("FAIL: slice oPos differs\n"); failures++;
+        }
+        nv2a_vsh_slice_clear();
+        hits = nv2a_vsh_slice_hits;
+        misses = nv2a_vsh_slice_misses;
+        st = 0;
+        p1 = nv2a_vsh_pos_prog((const uint32_t (*)[4])prog, &st);
+        if (st != 0 || p1 == (const uint32_t (*)[4])prog || memcmp(p1, sl, (size_t)n_sl * 16u)) {
+            printf("FAIL: pos_prog is not the slice\n"); failures++;
+        }
+        st = 0;
+        p2 = nv2a_vsh_pos_prog((const uint32_t (*)[4])prog, &st);
+        if (p2 != p1 || nv2a_vsh_slice_hits != hits + 1 || nv2a_vsh_slice_misses != misses + 1) {
+            printf("FAIL: pos_prog did not hit\n"); failures++;
+        }
+        /* new constants, same slice: the run sees them */
+        cst[96][0] = 4;
+        nv2a_vsh_run((const uint32_t (*)[4])prog, 0, cst, 0, (const float (*)[4])in, &o);
+        st = 0;
+        p2 = nv2a_vsh_pos_prog((const uint32_t (*)[4])prog, &st);
+        nv2a_vsh_run(p2, st, cst, 0, (const float (*)[4])in, &so);
+        if (memcmp(so.o[NV2A_VSH_O_POS], o.o[NV2A_VSH_O_POS], 16)) {
+            printf("FAIL: slice missed new constants\n"); failures++;
+        }
+        CHECK_F("oPos.x c96=4", so.o[NV2A_VSH_O_POS][0], 4.0f / 4 * 320 + 320);
+        cst[96][0] = 2;
+        /* a dead word changes (oD0 from v4): a miss, the same answer */
+        misses = nv2a_vsh_slice_misses;
+        put(prog[4], 1, 9, 4, 4);
+        st = 0;
+        p2 = nv2a_vsh_pos_prog((const uint32_t (*)[4])prog, &st);
+        if (nv2a_vsh_slice_misses != misses + 1) {
+            printf("FAIL: dead word change kept the slice\n"); failures++;
+        }
+        put(prog[4], 1, 9, 4, 3);
+        /* a live word changes (the x row from c[100]): a miss, the new answer */
+        misses = nv2a_vsh_slice_misses;
+        put(prog[0], 1, 13, 8, 100);
+        cst[100][0] = 1;
+        nv2a_vsh_run((const uint32_t (*)[4])prog, 0, cst, 0, (const float (*)[4])in, &o);
+        st = 0;
+        p2 = nv2a_vsh_pos_prog((const uint32_t (*)[4])prog, &st);
+        nv2a_vsh_run(p2, st, cst, 0, (const float (*)[4])in, &so);
+        if (nv2a_vsh_slice_misses != misses + 1
+            || memcmp(so.o[NV2A_VSH_O_POS], o.o[NV2A_VSH_O_POS], 16)) {
+            printf("FAIL: live word change\n"); failures++;
+        }
+        CHECK_F("oPos.x c100", so.o[NV2A_VSH_O_POS][0], 1.0f / 4 * 320 + 320);
+        put(prog[0], 1, 13, 8, 96);
+        cst[100][0] = 0;
+        /* the same words from another start slot: the same slice */
+        {
+            static uint32_t moved[NV2A_VSH_SLOTS][4];
+            memcpy(moved[3], prog[0], (size_t)n * 16u);
+            st = 3;
+            p2 = nv2a_vsh_pos_prog((const uint32_t (*)[4])moved, &st);
+            nv2a_vsh_run(p2, st, cst, 0, (const float (*)[4])in, &so);
+            nv2a_vsh_run((const uint32_t (*)[4])prog, 0, cst, 0, (const float (*)[4])in, &o);
+            if (st != 0 || memcmp(so.o[NV2A_VSH_O_POS], o.o[NV2A_VSH_O_POS], 16)) {
+                printf("FAIL: moved program\n"); failures++;
+            }
+        }
+        /* no FINAL: the program itself, start kept */
+        {
+            static uint32_t nofinal[NV2A_VSH_SLOTS][4];
+            st = 2;
+            if (nv2a_vsh_pos_prog((const uint32_t (*)[4])nofinal, &st)
+                    != (const uint32_t (*)[4])nofinal || st != 2) {
+                printf("FAIL: no-FINAL program sliced\n"); failures++;
+            }
+        }
+    }
+
     /* ARL + relative constant read, negate and swizzle. */
     memset(prog, 0, sizeof prog);
     n = 0;
@@ -173,6 +261,19 @@ int main(void)
     CHECK_F("rel x", o.o[NV2A_VSH_O_T0 + 1][0], -4);
     CHECK_F("rel y", o.o[NV2A_VSH_O_T0 + 1][1], -3);
     CHECK_F("rel w", o.o[NV2A_VSH_O_T0 + 1][3], -1);
+    /* No oPos write: the slice is the FINAL instruction alone (the arl
+     * goes), and oPos stays (0, 0, 0, 1) either way. */
+    {
+        static uint32_t sl[NV2A_VSH_SLOTS][4];
+        Nv2aVshOut so;
+        uint32_t n_sl = nv2a_vsh_slice_pos((const uint32_t (*)[4])prog, 0, sl);
+        nv2a_vsh_run((const uint32_t (*)[4])sl, 0, cst, 0, (const float (*)[4])in, &so);
+        if (n_sl != 1 || memcmp(sl[0], prog[1], 16) || !so.ok
+            || memcmp(so.o[NV2A_VSH_O_POS], o.o[NV2A_VSH_O_POS], 16)) {
+            printf("FAIL: slice of a program without oPos (%u kept)\n", n_sl);
+            failures++;
+        }
+    }
 
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("nv2a_vsh: all passed\n");

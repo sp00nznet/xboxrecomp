@@ -85,7 +85,7 @@ static void cost_method_table(uint32_t flip, double ns_per_tick)
 static struct {
     uint64_t tick, ns;
     uint32_t vsh_runs;
-    uint64_t vsh_steps, rt_hashes, rt_bytes, rt_ns;
+    uint64_t vsh_steps, rt_hashes, rt_bytes, rt_ns, slice_hits, slice_misses;
 } s_cost_last;
 
 void nv2a_pb_cost_init(void)
@@ -126,12 +126,15 @@ void nv2a_pb_cost_flip(uint32_t flip, uint32_t batches, uint32_t draws)
     }
     if (n > 0 && (size_t)n < sizeof line)
         snprintf(line + n, sizeof line - (size_t)n,
-                 " sum %.3f ms vsh %u steps %llu rt_hash %llu kb %llu us %llu",
+                 " sum %.3f ms vsh %u steps %llu rt_hash %llu kb %llu us %llu"
+                 " slice_hit %llu slice_miss %llu",
                  (double)sum * ns_per_tick / 1e6, nv2a_vsh_run_count - s_cost_last.vsh_runs,
                  (unsigned long long)(nv2a_vsh_step_count - s_cost_last.vsh_steps),
                  (unsigned long long)(nv2a_rt_own_hashes() - s_cost_last.rt_hashes),
                  (unsigned long long)((nv2a_rt_own_hash_bytes() - s_cost_last.rt_bytes) >> 10),
-                 (unsigned long long)((nv2a_rt_own_hash_ns() - s_cost_last.rt_ns) / 1000u));
+                 (unsigned long long)((nv2a_rt_own_hash_ns() - s_cost_last.rt_ns) / 1000u),
+                 (unsigned long long)(nv2a_vsh_slice_hits - s_cost_last.slice_hits),
+                 (unsigned long long)(nv2a_vsh_slice_misses - s_cost_last.slice_misses));
     fprintf(stderr, "%s\n", line);
     cost_method_table(flip, ns_per_tick);
     memset(nv2a_pb_cost_ticks, 0, sizeof nv2a_pb_cost_ticks);
@@ -142,4 +145,6 @@ void nv2a_pb_cost_flip(uint32_t flip, uint32_t batches, uint32_t draws)
     s_cost_last.rt_hashes = nv2a_rt_own_hashes();
     s_cost_last.rt_bytes = nv2a_rt_own_hash_bytes();
     s_cost_last.rt_ns = nv2a_rt_own_hash_ns();
+    s_cost_last.slice_hits = nv2a_vsh_slice_hits;
+    s_cost_last.slice_misses = nv2a_vsh_slice_misses;
 }
