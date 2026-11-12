@@ -105,6 +105,10 @@ if(NOT WIN32)
     # upload skip trusts.
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_vsh_cgen
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_vsh_cgen)
+    # And the transform program and constant uploads the walk executes as
+    # one run: the same state as word by word.
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_xf_run
+                     ${CMAKE_CURRENT_BINARY_DIR}/pb_xf_run)
     # And the semaphore release's context DMA base (RAMHT/PRAMIN lookup).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_semaphore
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_semaphore)

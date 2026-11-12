@@ -2800,18 +2800,9 @@ static int vsh_method(uint32_t method, uint32_t param)
         nv2a_ff_init(&s_vsh.ff);
         s_vsh.ff_ready = 1;
     }
-    if (nv2a_ff_method(&s_vsh.ff, method, param))
-        return 1;
-    switch (method) {
-    case 0x03B8: s_vsh.spec_enable = param != 0; return 1;  /* SET_SPECULAR_ENABLE */
-    case 0x0294: s_vsh.light_ctl = param; return 1;         /* SET_LIGHT_CONTROL */
-    case 0x029C: s_vsh.fog_mode = param; return 1;          /* SET_FOG_MODE */
-    case 0x02A0: s_vsh.fog_gen = param; return 1;           /* SET_FOG_GEN_MODE */
-    case 0x09C0: case 0x09C4: case 0x09C8:          /* SET_FOG_PARAMS */
-        s_vsh.fog_param[(method - 0x09C0) / 4] = u2f(param); return 1;
-    case 0x17F8: s_vsh.clip_plane_mode = param; return 1; /* SET_SHADER_CLIP_PLANE_MODE */
-    default: break;
-    }
+    /* The program and constant uploads first: most of a frame's methods
+     * (nv2a_pb_exec_run takes the longer runs), and no fixed-function
+     * register shares their window. */
     if (method >= NV097_SET_TRANSFORM_PROGRAM_M
             && method < NV097_SET_TRANSFORM_PROGRAM_M + 0x80) {
         uint32_t comp = ((method - NV097_SET_TRANSFORM_PROGRAM_M) / 4) & 3;
@@ -2833,6 +2824,18 @@ static int vsh_method(uint32_t method, uint32_t param)
             s_vsh.cload++;
         s_vsh.const_dwords++;
         return 1;
+    }
+    if (nv2a_ff_method(&s_vsh.ff, method, param))
+        return 1;
+    switch (method) {
+    case 0x03B8: s_vsh.spec_enable = param != 0; return 1;  /* SET_SPECULAR_ENABLE */
+    case 0x0294: s_vsh.light_ctl = param; return 1;         /* SET_LIGHT_CONTROL */
+    case 0x029C: s_vsh.fog_mode = param; return 1;          /* SET_FOG_MODE */
+    case 0x02A0: s_vsh.fog_gen = param; return 1;           /* SET_FOG_GEN_MODE */
+    case 0x09C0: case 0x09C4: case 0x09C8:          /* SET_FOG_PARAMS */
+        s_vsh.fog_param[(method - 0x09C0) / 4] = u2f(param); return 1;
+    case 0x17F8: s_vsh.clip_plane_mode = param; return 1; /* SET_SHADER_CLIP_PLANE_MODE */
+    default: break;
     }
     /* The viewport, matrix, plane and eye methods are not separate registers:
      * they write the transform context, which is the same memory as the
@@ -7157,13 +7160,18 @@ static int twod_method(uint32_t subch, uint32_t method, uint32_t param)
     return 1;
 }
 
+/* Set by nv2a_pb_exec_method's first call; nv2a_pb_exec_run leaves a run
+ * to it until then, so the one-time setup stays in one place. */
+static int s_exec_inited;
+/* RECOMP_DEBUG=pb_mlog=<flip>: -2 until read, -1 when off. */
+static long s_mlog_flip = -2;
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
-    static int inited;
     int fence_paired;
-    if (!inited) {
+    if (!s_exec_inited) {
         int a;
-        inited = 1;
+        s_exec_inited = 1;
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
         /* An attribute no SET_VERTEX_DATA* ever wrote reads (0, 0, 0, 1),
@@ -7232,15 +7240,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     s_perf.methods++;
     /* One flip's method stream, to see what a heavy flip spends its batches
      * on (which state changes sit between draws, how big each draw is). */
-    {
-        static long mlog_flip = -2;
-        if (mlog_flip == -2) {
-            const char *e = recomp_env(RENV_PB_MLOG);
-            mlog_flip = e ? strtol(e, NULL, 0) : -1;
-        }
-        if (mlog_flip >= 0 && s_gpu.flips == (uint32_t)mlog_flip)
-            fprintf(stderr, "[MLOG] %u %04X %08X\n", subch, method, param);
+    if (s_mlog_flip == -2) {
+        const char *e = recomp_env(RENV_PB_MLOG);
+        s_mlog_flip = e ? strtol(e, NULL, 0) : -1;
     }
+    if (s_mlog_flip >= 0 && s_gpu.flips == (uint32_t)s_mlog_flip)
+        fprintf(stderr, "[MLOG] %u %04X %08X\n", subch, method, param);
     if (s_gpu.prim && method != NV097_SET_BEGIN_END && method != NV097_DRAW_ARRAYS
             && method != NV097_ARRAY_ELEMENT16 && method != NV097_ARRAY_ELEMENT32)
         s_batch_pure = 0;
@@ -7865,6 +7870,88 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         break;
     }
+}
+
+/* A run of parameters to one method header, executed in one call: what
+ * nv2a_pb_exec_method does for each of them, word by word, with its
+ * per-method prologue done once. Taken only for the transform program and
+ * constant uploads (SET_TRANSFORM_PROGRAM / _CONSTANT, 0x0B00-0x0BFF),
+ * which a title re-sends around nearly every draw: about 70% of a heavy
+ * BLiNX 1 frame's ~290k methods, each of which walked the prologue, the
+ * fixed-function ranges and vsh_method's range chain to store one dword.
+ * Returns how many of the n words it executed (stopping where an
+ * incrementing run leaves its window), or 0 to leave the run to
+ * nv2a_pb_exec_method: any other method or subchannel, before the first
+ * call, and while RECOMP_DEBUG=pb_mlog logs the flip method by method. */
+uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc,
+                          const uint32_t *p, uint32_t n)
+{
+    uint32_t i, comp, end;
+
+    if (!s_exec_inited || subch != 0 || n < 2
+            || method < NV097_SET_TRANSFORM_PROGRAM_M
+            || method >= NV097_SET_TRANSFORM_CONSTANT_M + 0x80
+            || s_mlog_flip == -2
+            || (s_mlog_flip >= 0 && s_gpu.flips == (uint32_t)s_mlog_flip))
+        return 0;
+    end = method < NV097_SET_TRANSFORM_CONSTANT_M
+        ? NV097_SET_TRANSFORM_PROGRAM_M + 0x80 : NV097_SET_TRANSFORM_CONSTANT_M + 0x80;
+    if (!noninc && n > (end - method) / 4)
+        n = (end - method) / 4;
+
+    /* nv2a_pb_exec_method's prologue for these methods: they are no draw
+     * method and never continue a merge chain, and the vertical blank's
+     * fence pairing ends at any method. Once is enough: merge_flush leaves
+     * no batch held and keeps s_gpu.prim, so the words after the first
+     * find nothing more to do. */
+    s_perf.methods += n;
+    if (s_gpu.prim)
+        s_batch_pure = 0;
+    if (s_mrg.batches)
+        merge_flush();
+    s_fence_ref_next = 0;
+    if (!s_vsh.ff_ready) {
+        nv2a_ff_init(&s_vsh.ff);
+        s_vsh.ff_ready = 1;
+    }
+
+    comp = (method / 4) & 3;
+    if (method < NV097_SET_TRANSFORM_CONSTANT_M) {
+        for (i = 0; i < n; i++) {
+            if (s_vsh.load < NV2A_VSH_SLOTS)
+                s_vsh.prog[s_vsh.load][comp] = p[i];
+            if (comp == 3)
+                s_vsh.load++;
+            if (!noninc)
+                comp = (comp + 1) & 3;
+        }
+        s_vsh.prog_dwords += n;
+    } else {
+        for (i = 0; i < n; i++) {
+            if (s_vsh.cload < NV2A_VSH_CONSTANTS) {
+                s_vsh.c[s_vsh.cload][comp] = u2f(p[i]);
+                s_vsh_cgen++;
+            }
+            if (comp == 3)
+                s_vsh.cload++;
+            if (!noninc)
+                comp = (comp + 1) & 3;
+        }
+        s_vsh.const_dwords += n;
+    }
+    return n;
+}
+
+/* The prologue state nv2a_pb_exec_run has to leave as the word-by-word path
+ * does: methods counted, the open batch's purity, the fence pairing and the
+ * held merge chain. For tests (pb_xf_run). */
+void nv2a_pb_exec_prologue_state(uint32_t *methods, int *batch_pure,
+                                 int *fence_ref_next, uint32_t *held)
+{
+    *methods = s_perf.methods;
+    *batch_pure = s_batch_pure;
+    *fence_ref_next = s_fence_ref_next;
+    *held = s_mrg.batches;
 }
 
 /* Find where the title actually wrote its quad.

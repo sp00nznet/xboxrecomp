@@ -63,6 +63,8 @@ uint32_t nv2a_pb_scan_stops(void) { return s_tot_stops; }
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc,
+                                 const uint32_t *params, uint32_t n);
 extern void nv2a_pb_exec_report(void);
 extern uint32_t nv2a_pb_exec_semaphore_last_value(void);
 extern uint32_t nv2a_pb_exec_semaphore_releases(void);
@@ -362,6 +364,40 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
              * costs ~1 ms of a 10k-batch frame, so it runs only then. */
             if (s_scan_enabled)
                 note(s_subch, s_method);
+            /* The rest of the header's words in one call where the
+             * executor can take them as a run (nv2a_pb_exec_run), bounded
+             * as the word-by-word walk would stop: at PUT when it lies
+             * ahead, at the window's end and at the word limit. Not for a
+             * survey, which counts every word. Only Kelvin's transform
+             * program and constant windows (0x0B00-0x0BFF) run, so the
+             * inline arrays and vertex data skip the call per word. */
+            else if (s_exec_enabled && s_left > 1 && s_subch == 0
+                     && s_method >= 0x0B00 && s_method < 0x0C00) {
+                uint32_t n = s_left, room, done;
+                uint64_t t;
+                if (end_va > at && n > (end_va - at) / 4)
+                    n = (end_va - at) / 4;
+                room = (XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - at) / 4;
+                if (n > room)
+                    n = room;
+                if (n > 0x100000u - words + 1u)
+                    n = 0x100000u - words + 1u;
+                t = nv2a_pb_cost_start();
+                done = nv2a_pb_exec_run(s_subch, s_method, s_noninc,
+                                        (const uint32_t *)(mem + at), n);
+                if (done) {
+                    if (t) {
+                        nv2a_pb_cost_add(t, NV2A_COST_D_EXEC);
+                        nv2a_pb_cost_method(s_subch, s_method, t);
+                    }
+                    va = at + 4 * done;
+                    words += done - 1;
+                    if (!s_noninc)
+                        s_method += 4 * done;
+                    s_left -= done;
+                    continue;
+                }
+            }
             if (s_exec_enabled) {
                 uint64_t t = nv2a_pb_cost_start();
                 nv2a_pb_exec_method(s_subch, s_method, w);

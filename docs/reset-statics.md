@@ -1311,8 +1311,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_pb_exec.c | - | s_mrg_save_n | file_static | reset | pgraph | draw merge carry-over across methods |
 | src/kernel/nv2a_pb_exec.c | - | s_mrg_save | file_static | reset | pgraph | draw merge carry-over across methods |
 | src/kernel/nv2a_pb_exec.c | merge_on | env | local_static | keep | - | cached env read |
-| src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | inited | once | reset | pgraph | rerun: s_gpu min/max, s_vsh.inl w=1; split out backend registration |
-| src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | mlog_flip | local_static | keep | - | cached env read |
+| src/kernel/nv2a_pb_exec.c | - | s_exec_inited | once | reset | pgraph | rerun: s_gpu min/max, s_vsh.inl w=1; split out backend registration |
+| src/kernel/nv2a_pb_exec.c | - | s_mlog_flip | file_static | keep | - | cached env read |
 | src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | verbose | local_static | keep | - | cached env read |
 | src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | shown | local_static | keep | - | log-once guard |
 | src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | from | local_static | keep | - | cached env read |
@@ -3589,7 +3589,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 - src/kernel/nv2a_backend_common.c: nv2a_cap_reset() NULLs s_cap_k, which is set once at init (xbox_memory_layout.c); the reset must keep it. The batch_filter_ask memo is keyed by (prog_dwords, start), not content, and is a local static: expose a clear.
 - src/kernel/nv2a_dbg_draw.c: the flip thread reads the lists; hide them (nv2a_dbg_hide), never reset the triple-buffer indices.
 - src/kernel/nv2a_pb_scan.c: only the walker carry-over (s_left, s_subch, s_method, s_noninc, s_in_call) resets; survey and stats stay.
-- src/kernel/nv2a_pb_exec.c: the `inited` one-shot mixes guest defaults (s_gpu min/max, s_vsh.inl w=1) with backend registration; split it and rerun only the defaults. s_flip_hold reset must keep `.edge`, because the cached `mode` never re-arms it.
+- src/kernel/nv2a_pb_exec.c: the `s_exec_inited` one-shot mixes guest defaults (s_gpu min/max, s_vsh.inl w=1) with backend registration; split it and rerun only the defaults. s_flip_hold reset must keep `.edge`, because the cached `mode` never re-arms it.
 - src/kernel/nv2a_pb_exec.c: s_gpu mixes registers with counters (flips, draws); zeroing them wraps the delta locals (pacing prev, last_draws, FLIP_LOG prevs). Bump s_tex_gen, s_vsh_cgen and s_scanout_gen, never zero them; s_ff_serial must not reset. s_tc and s_surf_wr_seq reset together.
 - src/nv2a/*: nv2a_hook_init is called only from the README, so this library looks unused by our games; classes given for completeness.
 - Overlay, present chain, stats, tex_dump and tex_pack are host-only (UI, content-keyed caches, debug catalogs); all keep.
