@@ -186,6 +186,7 @@ extern "C" {
     X(METAL_PROF,        TRACE, "metal_prof",      NULL,                       "Metal flip cost every 300 flips: GPU wait, readbacks, write-back, slot blit, hand-off, GPU time") \
     X(PB_COST,           TRACE, "pb_cost",         NULL,                       "[PB-COST] line per flip: the walker's on_draw time by stage (setup, streams, aspect, pixel, draw...) in ms, with the CPU vertex-program runs; cycle-counter marks") \
     X(D3D11_PROF,        TRACE, "d3d11_prof",      NULL,                       "D3D11 GPU time per flip from timestamp queries (read back a few flips late) and the Present call's time; a summary every 300 flips, =all also a [D3D11-PROF] line per flip") \
+    X(D3D11_CALLS,       TRACE, "d3d11_calls",     NULL,                       "[D3D11-CALLS] line per flip: the D3D11 context calls by kind (maps by buffer, binds, draws)") \
     X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip; each new pitch-alias pair once") \
     X(METAL_SHADERS,     TRACE, "metal_shaders",   NULL,                       "Metal shader and pipeline builds: each MSL library and pipeline state with its ms, and a [metal] build line for every flip that built one or uploaded textures for 5 ms or more") \
     X(VSH_TRACE,         TRACE, "vsh",             "RECOMP_VSH_TRACE",         "vertex programs and their batches") \

@@ -1712,6 +1712,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_cb_ps | file_static | keep | - | host PS constant buffer object |
 | src/d3d/nv2a_pb_d3d11.c | - | s_memo | file_static | keep | - | cached RENV_D3D11_MEMO read |
 | src/d3d/nv2a_pb_d3d11.c | - | s_state_gen | file_static | keep | - | monotonic bound-state generation; bump, never zero |
+| src/d3d/nv2a_pb_d3d11.c | - | s_srv_gen | file_static | keep | - | monotonic SRV-slot generation for s_sc.srv; bump, never zero |
+| src/d3d/nv2a_pb_d3d11.c | - | s_cc | file_static | keep | - | d3d11_calls trace counters, host diagnostics |
 | src/d3d/nv2a_pb_d3d11.c | - | s_sc | file_static | reset | renderer.d3d11 | bound-state filter; may name released RT views |
 | src/d3d/nv2a_pb_d3d11.c | - | s_sc_init | once | reset | renderer.d3d11 | rerun: clear s_sc after caches drop and ClearState |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ib_first | file_static | keep | - | first index of the batch in the ring; set before each draw |
@@ -1894,6 +1896,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | dump_frame | warned | local_static | keep | - | warn-once guard |
 | src/d3d/nv2a_pb_d3d11.c | - | s_occ | file_static | reset | renderer.d3d11 | pending occlusion reports at guest VAs; return queries |
 | src/d3d/nv2a_pb_d3d11.c | flip_log | on | local_static | keep | - | cached env read |
+| src/d3d/nv2a_pb_d3d11.c | flip_log | cc_on | local_static | keep | - | cached env read |
+| src/d3d/nv2a_pb_d3d11.c | flip_log | p_cc | local_static | keep | - | d3d11_calls previous totals |
 | src/d3d/nv2a_pb_d3d11.c | flip_log | p_draws | local_static | keep | - | flip log previous totals |
 | src/d3d/nv2a_pb_d3d11.c | flip_log | p_prog | local_static | keep | - | flip log previous totals |
 | src/d3d/nv2a_pb_d3d11.c | flip_log | p_tex | local_static | keep | - | flip log previous totals |

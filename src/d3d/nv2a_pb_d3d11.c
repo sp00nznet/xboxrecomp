@@ -74,6 +74,131 @@
 #define LOGP "[d3d11] "
 #define D3D11_WND_CLASS "RecompNv2aD3D11"   /* RegisterClassA, then CreateWindowW as L"" D3D11_WND_CLASS */
 
+/* RECOMP_TRACE=d3d11_calls: every context call this file makes, counted by
+ * kind, for the [D3D11-CALLS] line per flip (flip_log). Under Proton each one
+ * is a trip through Wine into DXVK, paid ~6k times a frame in a busy scene,
+ * so the count per draw is the number to cut. The wrappers
+ * below replace COBJMACROS' own; the count is one add, so it always runs
+ * and only the printing waits on the trace. */
+enum {
+    CC_MAP_VB, CC_MAP_IB, CC_MAP_CB_CONSTS, CC_MAP_CB_VP, CC_MAP_CB_PS, CC_MAP_OTHER,
+    CC_UNMAP, CC_UPDATE_SUB,
+    CC_IA_VB, CC_IA_IB, CC_IA_IL, CC_IA_TOPO,
+    CC_VS_SHADER, CC_PS_SHADER, CC_VS_CB, CC_PS_CB, CC_PS_SRV, CC_PS_SMP,
+    CC_OM_RT, CC_OM_BS, CC_OM_DSS, CC_RS_STATE, CC_RS_VP, CC_RS_SR,
+    CC_DRAW, CC_DRAW_IDX, CC_COPY, CC_CLEAR, CC_Q_BEGIN, CC_Q_END, CC_Q_GET, CC_OTHER,
+    CC_N
+};
+static const char *const s_cc_name[CC_N] = {
+    "map_vb", "map_ib", "map_c", "map_vp", "map_ps", "map_other",
+    "unmap", "update",
+    "ia_vb", "ia_ib", "ia_il", "ia_topo",
+    "vs", "ps", "vs_cb", "ps_cb", "ps_srv", "ps_smp",
+    "om_rt", "om_bs", "om_dss", "rs", "rs_vp", "rs_sr",
+    "draw", "draw_idx", "copy", "clear", "q_begin", "q_end", "q_get", "other",
+};
+static uint64_t s_cc[CC_N];
+static void cc_map(const void *res);   /* which buffer: after their statics */
+#define CC_CALL(k, call) (s_cc[k]++, (call))
+/* Bumped by every call that can change or null what the pixel stage's SRV
+ * slots hold: an SRV bind from anywhere in this file, an output bind (the
+ * runtime nulls an SRV whose resource becomes a target), and an SRV release
+ * (a view nulled at its bind is not held by the context, so its address can
+ * come back as a new view). setup_pixel skips its bind while this and its
+ * four views are unchanged (s_sc.srv). */
+static uint32_t s_srv_gen;
+#define SRV_CALL(k, call) (s_srv_gen++, CC_CALL(k, call))
+#undef ID3D11DeviceContext_Map
+#define ID3D11DeviceContext_Map(t, r, ...) (cc_map(r), (t)->lpVtbl->Map(t, r, __VA_ARGS__))
+#undef ID3D11DeviceContext_Unmap
+#define ID3D11DeviceContext_Unmap(t, ...) CC_CALL(CC_UNMAP, (t)->lpVtbl->Unmap(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_UpdateSubresource
+#define ID3D11DeviceContext_UpdateSubresource(t, ...) \
+    CC_CALL(CC_UPDATE_SUB, (t)->lpVtbl->UpdateSubresource(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_IASetVertexBuffers
+#define ID3D11DeviceContext_IASetVertexBuffers(t, ...) \
+    CC_CALL(CC_IA_VB, (t)->lpVtbl->IASetVertexBuffers(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_IASetIndexBuffer
+#define ID3D11DeviceContext_IASetIndexBuffer(t, ...) \
+    CC_CALL(CC_IA_IB, (t)->lpVtbl->IASetIndexBuffer(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_IASetInputLayout
+#define ID3D11DeviceContext_IASetInputLayout(t, ...) \
+    CC_CALL(CC_IA_IL, (t)->lpVtbl->IASetInputLayout(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_IASetPrimitiveTopology
+#define ID3D11DeviceContext_IASetPrimitiveTopology(t, ...) \
+    CC_CALL(CC_IA_TOPO, (t)->lpVtbl->IASetPrimitiveTopology(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_VSSetShader
+#define ID3D11DeviceContext_VSSetShader(t, ...) \
+    CC_CALL(CC_VS_SHADER, (t)->lpVtbl->VSSetShader(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_PSSetShader
+#define ID3D11DeviceContext_PSSetShader(t, ...) \
+    CC_CALL(CC_PS_SHADER, (t)->lpVtbl->PSSetShader(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_VSSetConstantBuffers
+#define ID3D11DeviceContext_VSSetConstantBuffers(t, ...) \
+    CC_CALL(CC_VS_CB, (t)->lpVtbl->VSSetConstantBuffers(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_PSSetConstantBuffers
+#define ID3D11DeviceContext_PSSetConstantBuffers(t, ...) \
+    CC_CALL(CC_PS_CB, (t)->lpVtbl->PSSetConstantBuffers(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_PSSetShaderResources
+#define ID3D11DeviceContext_PSSetShaderResources(t, ...) \
+    SRV_CALL(CC_PS_SRV, (t)->lpVtbl->PSSetShaderResources(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_PSSetSamplers
+#define ID3D11DeviceContext_PSSetSamplers(t, ...) \
+    CC_CALL(CC_PS_SMP, (t)->lpVtbl->PSSetSamplers(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_OMSetRenderTargets
+#define ID3D11DeviceContext_OMSetRenderTargets(t, ...) \
+    SRV_CALL(CC_OM_RT, (t)->lpVtbl->OMSetRenderTargets(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_OMSetBlendState
+#define ID3D11DeviceContext_OMSetBlendState(t, ...) \
+    CC_CALL(CC_OM_BS, (t)->lpVtbl->OMSetBlendState(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_OMSetDepthStencilState
+#define ID3D11DeviceContext_OMSetDepthStencilState(t, ...) \
+    CC_CALL(CC_OM_DSS, (t)->lpVtbl->OMSetDepthStencilState(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_RSSetState
+#define ID3D11DeviceContext_RSSetState(t, ...) \
+    CC_CALL(CC_RS_STATE, (t)->lpVtbl->RSSetState(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_RSSetViewports
+#define ID3D11DeviceContext_RSSetViewports(t, ...) \
+    CC_CALL(CC_RS_VP, (t)->lpVtbl->RSSetViewports(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_RSSetScissorRects
+#define ID3D11DeviceContext_RSSetScissorRects(t, ...) \
+    CC_CALL(CC_RS_SR, (t)->lpVtbl->RSSetScissorRects(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_Draw
+#define ID3D11DeviceContext_Draw(t, ...) CC_CALL(CC_DRAW, (t)->lpVtbl->Draw(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_DrawIndexed
+#define ID3D11DeviceContext_DrawIndexed(t, ...) \
+    CC_CALL(CC_DRAW_IDX, (t)->lpVtbl->DrawIndexed(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_CopyResource
+#define ID3D11DeviceContext_CopyResource(t, ...) \
+    CC_CALL(CC_COPY, (t)->lpVtbl->CopyResource(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_CopySubresourceRegion
+#define ID3D11DeviceContext_CopySubresourceRegion(t, ...) \
+    CC_CALL(CC_COPY, (t)->lpVtbl->CopySubresourceRegion(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_ClearRenderTargetView
+#define ID3D11DeviceContext_ClearRenderTargetView(t, ...) \
+    CC_CALL(CC_CLEAR, (t)->lpVtbl->ClearRenderTargetView(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_ClearDepthStencilView
+#define ID3D11DeviceContext_ClearDepthStencilView(t, ...) \
+    CC_CALL(CC_CLEAR, (t)->lpVtbl->ClearDepthStencilView(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_Begin
+#define ID3D11DeviceContext_Begin(t, ...) CC_CALL(CC_Q_BEGIN, (t)->lpVtbl->Begin(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_End
+#define ID3D11DeviceContext_End(t, ...) CC_CALL(CC_Q_END, (t)->lpVtbl->End(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_GetData
+#define ID3D11DeviceContext_GetData(t, ...) \
+    CC_CALL(CC_Q_GET, (t)->lpVtbl->GetData(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_GSSetShader
+#define ID3D11DeviceContext_GSSetShader(t, ...) \
+    CC_CALL(CC_OTHER, (t)->lpVtbl->GSSetShader(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_SOSetTargets
+#define ID3D11DeviceContext_SOSetTargets(t, ...) \
+    SRV_CALL(CC_OTHER, (t)->lpVtbl->SOSetTargets(t, __VA_ARGS__))
+#undef ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews
+#define ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(t, ...) \
+    SRV_CALL(CC_OM_RT, (t)->lpVtbl->OMSetRenderTargetsAndUnorderedAccessViews(t, __VA_ARGS__))
+#undef ID3D11ShaderResourceView_Release
+#define ID3D11ShaderResourceView_Release(v) (s_srv_gen++, (v)->lpVtbl->Release(v))
+
 typedef HRESULT (WINAPI *compile_fn)(LPCVOID, SIZE_T, LPCSTR,
                                      const D3D_SHADER_MACRO *, ID3DInclude *,
                                      LPCSTR, LPCSTR, UINT, UINT,
@@ -149,10 +274,12 @@ static int memo_on(void)
 
 /* The pipeline state last bound, so a batch binding the same again skips
  * the call. Only state this file alone sets and nothing unbinds behind it;
- * SRVs (which the runtime nulls on a render-target hazard) and the vertex
- * buffers (new offsets every batch) are always set. The index ring is bound
- * once at offset 0 and each draw starts at its indices (s_ib_first), so its
- * bind is one more shadowed state. Releasing a
+ * the vertex buffers (new offsets every batch) are always set. The pixel
+ * stage's SRVs are shadowed apart (srv, srv_gen), under the s_srv_gen rules
+ * by SRV_CALL, since the runtime nulls them on a render-target hazard. The
+ * index buffer is s_vb (indices in the batch's mapping) or s_ib (the
+ * fallback ring), bound at offset 0 with each draw starting at its indices
+ * (s_ib_first), so it is shadowed by buffer (ib). Releasing a
  * shader or input layout bumps s_state_gen, since a new object can come
  * back at a released one's address. The output merger's targets need no
  * such bump: the context holds a reference to the views it has bound, so a
@@ -178,7 +305,9 @@ static struct {
     ID3D11DepthStencilView   *dsv;
     ID3D11DepthStencilState  *dss;
     UINT                      sref;     /* the stencil reference with dss */
-    ID3D11Buffer             *ib;       /* s_ib at offset 0, or unknown */
+    ID3D11Buffer             *ib;       /* bound at offset 0, or unknown */
+    ID3D11ShaderResourceView *srv[4];   /* setup_pixel's, valid at srv_gen */
+    uint32_t                  srv_gen;
 } s_sc;
 static int s_sc_init;
 
@@ -198,6 +327,15 @@ static UINT                    s_vb_size, s_vb_pos;
 static ID3D11Buffer           *s_ib;
 static UINT                    s_ib_size, s_ib_pos;
 static UINT                    s_ib_first;      /* this batch's first index */
+
+static void cc_map(const void *res)
+{
+    s_cc[res == (const void *)s_vb ? CC_MAP_VB
+         : res == (const void *)s_ib ? CC_MAP_IB
+         : res == (const void *)s_cb_consts ? CC_MAP_CB_CONSTS
+         : res == (const void *)s_cb_vp ? CC_MAP_CB_VP
+         : res == (const void *)s_cb_ps ? CC_MAP_CB_PS : CC_MAP_OTHER]++;
+}
 /* Rasteriser states: [cull][front CCW], cull 0 none, 1 back, 2 front.
  * s_rs_sc are the same with the scissor on: every draw's, whose scissor is
  * the surface clip (nv2a_draw_box). */
@@ -707,7 +845,9 @@ static int init(void)
     s_cb_vp     = make_buffer(80, D3D11_BIND_CONSTANT_BUFFER);
     s_cb_ps     = make_buffer(sizeof(PsConsts), D3D11_BIND_CONSTANT_BUFFER);
     s_vb_size   = 8u << 20;
-    s_vb        = make_buffer(s_vb_size, D3D11_BIND_VERTEX_BUFFER);
+    /* Also an index buffer: a batch's indices go in its one mapping of the
+     * ring after its streams (d3d11_on_draw), one Map and Unmap fewer. */
+    s_vb        = make_buffer(s_vb_size, D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER);
     s_ib_size   = NV_MAX_INDICES * 3u * 4u;  /* any accepted batch fits */
     s_ib        = make_buffer(s_ib_size, D3D11_BIND_INDEX_BUFFER);
     if (!s_cb_consts || !s_cb_vp || !s_cb_ps || !s_vb || !s_ib) {
@@ -3298,7 +3438,12 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         s_cb_ps_shadow = pc;
         s_cb_ps_ok = 1;
     }
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+    /* 84% of BLiNX 1's batches bind the views the last one did. */
+    if (!sc_on() || s_sc.srv_gen != s_srv_gen || memcmp(s_sc.srv, srv, sizeof s_sc.srv)) {
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+        memcpy(s_sc.srv, srv, sizeof s_sc.srv);
+        s_sc.srv_gen = s_srv_gen;
+    }
     if (!sc_on() || memcmp(s_sc.smp, smp, sizeof smp)) {
         ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
         memcpy(s_sc.smp, smp, sizeof smp);
@@ -4729,9 +4874,11 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     RenderTarget *rt;
     VsEntry *vs;
     ID3D11RasterizerState *rs;
+    ID3D11Buffer *ib;
     int cull_all, w_on;
     uint8_t fmts[16];
     uint32_t lo = 0xFFFF, hi = 0, count, nidx, i, k;
+    UINT at_ib;
     void *p;
     uint64_t ct = nv2a_pb_cost_start();   /* RECOMP_TRACE=pb_cost */
 
@@ -4815,6 +4962,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             bound += (a->size && a->stride)
                    ? (uint64_t)count * (a->stride > 16 ? a->stride : 16) + 48 : 32;
         }
+        bound += (uint64_t)nidx * 4u + 16u;   /* and the indices */
         vb_begin(bound <= 0xFFFFFFFFu ? (UINT)bound : 0);
     }
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
@@ -4891,15 +5039,30 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         vb_written();
         vbs[i] = s_vb;
     }
-    vb_end();
-    nv2a_pb_cost_mark(&ct, NV2A_COST_STREAMS);
-    p = ring_map(s_ib, s_ib_size, &s_ib_pos, nidx * 4u, 4);
-    if (!p) {
-        s_draws_skipped++;
-        return;
+    /* The indices: in the batch's mapping of s_vb when it has one (vb_alloc
+     * keeps them 16-aligned, so they start at a whole index), else in their
+     * own ring. */
+    if (s_vbm_base && (p = vb_alloc(nidx * 4u, &at_ib)) != NULL) {
+        memcpy(p, idx, nidx * 4u);
+        ib = s_vb;
+        s_ib_first = at_ib / 4u;
+        vb_end();
+        nv2a_pb_cost_mark(&ct, NV2A_COST_STREAMS);
+    } else {
+        vb_end();
+        nv2a_pb_cost_mark(&ct, NV2A_COST_STREAMS);
+        p = ring_map(s_ib, s_ib_size, &s_ib_pos, nidx * 4u, 4);
+        if (!p) {
+            s_draws_skipped++;
+            return;
+        }
+        memcpy(p, idx, nidx * 4u);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ib, 0);
+        ib = s_ib;
+        /* ring_map keeps the indices 4-aligned, so they start at a whole
+         * index. */
+        s_ib_first = (s_ib_pos - nidx * 4u) / 4u;
     }
-    memcpy(p, idx, nidx * 4u);
-    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ib, 0);
     nv2a_pb_cost_mark(&ct, NV2A_COST_IB);
 
     /* Hor+: which batches are 2D, and their x range (nv2a_aspect_place
@@ -5086,13 +5249,12 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             }
             ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, NV2A_VS_MAX_INPUTS,
                                                    vbs, strides, offs);
-            /* ring_map keeps the indices 4-aligned, so they start at a
-             * whole index: one bind serves every batch until something
+            /* Bound at offset 0, each draw starting at its first index: one
+             * bind serves every batch until the other ring's turn or something
              * else binds an index buffer (and resets s_sc_init). */
-            s_ib_first = (s_ib_pos - nidx * 4u) / 4u;
-            if (!sc || s_sc.ib != s_ib) {
-                ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT, 0);
-                s_sc.ib = s_ib;
+            if (!sc || s_sc.ib != ib) {
+                ID3D11DeviceContext_IASetIndexBuffer(s_ctx, ib, DXGI_FORMAT_R32_UINT, 0);
+                s_sc.ib = ib;
             }
             if (!sc || s_sc.topo != topo) {
                 ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, topo);
@@ -5454,6 +5616,29 @@ static void flip_log(uint32_t surface_offset)
      * exit to print them at, so the last of these is the run's. */
     if ((on || zt) && s_occ.reports && s_presents % 300 == 0)
         nv2a_occ_summary(&s_occ, "[D3D11]");
+    {
+        static int cc_on = -1;
+        static uint64_t p_cc[CC_N];
+        if (cc_on < 0)
+            cc_on = recomp_env(RENV_D3D11_CALLS) != NULL;
+        if (cc_on) {
+            char line[1024];
+            uint64_t sum = 0;
+            int n = snprintf(line, sizeof line, "[D3D11-CALLS] flip %llu",
+                             (unsigned long long)s_presents);
+            for (int k = 0; k < CC_N; k++) {
+                uint64_t c = s_cc[k] - p_cc[k];
+                sum += c;
+                if (c && n > 0 && (size_t)n < sizeof line)
+                    n += snprintf(line + n, sizeof line - (size_t)n, " %s %llu", s_cc_name[k],
+                                  (unsigned long long)c);
+            }
+            if (n > 0 && (size_t)n < sizeof line)
+                snprintf(line + n, sizeof line - (size_t)n, " sum %llu", (unsigned long long)sum);
+            fprintf(stderr, "%s\n", line);
+            memcpy(p_cc, s_cc, sizeof p_cc);
+        }
+    }
     if (!on)
         return;
     fprintf(stderr, "[D3D11] flip %llu batches %llu prog %llu tex %llu rtt %llu (self %llu)"
