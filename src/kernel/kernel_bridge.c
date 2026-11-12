@@ -1285,7 +1285,11 @@ static void bridge_NtAllocateVirtualMemory(void)
      * two. This clamp is enough for a title that reserves generously and
      * commits little, and it fails loudly and later rather than silently and
      * at startup if one does not. */
-    uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    /* A kernel-chosen address is 64 KB-aligned, as on the console. Unreal
+     * Engine 2's FMallocXbox indexes its pools by address bits 16-23; a pool
+     * on a 4 KB boundary straddles two slots and frees hit the wrong pool. */
+    uint32_t va_align = base_hint ? 4096u : 0x10000u;
+    uint32_t xbox_va = xbox_HeapAlloc(size, va_align);
     if (!xbox_va && (alloc_type & 0x2000) && !(alloc_type & 0x1000)) {
         /* A pure reservation too big for the heap. Take it from the mapped
          * space above RAM, where it costs no heap and the pages are distinct.
@@ -1298,7 +1302,7 @@ static void bridge_NtAllocateVirtualMemory(void)
          * live heap. Granting the full range is both more honest and less
          * damaging. Returns 0 unless the title asked for a mapping larger than
          * RAM, so nothing changes for titles that did not. */
-        xbox_va = xbox_ReserveAlloc(size, 4096);
+        xbox_va = xbox_ReserveAlloc(size, va_align);
         if (xbox_va) {
             fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: reserve of %u"
                             " granted at 0x%08X above RAM\n", size, xbox_va);
@@ -1309,7 +1313,7 @@ static void bridge_NtAllocateVirtualMemory(void)
         uint32_t want = size;
         while (want > 0x10000 && !xbox_va) {
             want /= 2;
-            xbox_va = xbox_HeapAlloc(want, 4096);
+            xbox_va = xbox_HeapAlloc(want, va_align);
         }
         if (xbox_va) {
             fprintf(stderr, "  [KERNEL] NtAllocateVirtualMemory: reserve of %u "
