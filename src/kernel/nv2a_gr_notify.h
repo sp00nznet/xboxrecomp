@@ -277,6 +277,25 @@ static inline int nv2a_run_ahead_may_ack(int kick_set, int flip_held,
     return kick_set && !flip_held && acks_this_walk < depth;
 }
 
+/* Whether occ_ckpt_defer or occ_sema_defer is on, from its RECOMP_DEBUG
+ * value e (NULL when unset). On by default since the per-game A/B:
+ * settle fell 3-7x at the same flips/s in BLiNX 1
+ * and 2 with their goldens passing, and Burnout 3 kept its flips/s with no
+ * stale reads; titles that ask for no visibility reports owe none, and the
+ * keys never act there. Unset in the deterministic mode it is off, as
+ * run_ahead is: a defer depends on whether the host GPU has finished a
+ * query yet, which is wall-clock time, so the order of report and
+ * semaphore writes would vary run to run. An empty value (`key=`) counts
+ * as unset, as it does for run_ahead. A value starting with '0', or "off"
+ * (run_ahead's word), turns it off; any other is on, deterministic or
+ * not. */
+static inline int nv2a_occ_defer_on(const char *e, int deterministic)
+{
+    if (!e || !*e)
+        return !deterministic;
+    return *e != '0' && strcmp(e, "off") != 0;
+}
+
 /* The run-ahead checkpoint's defer rule (RECOMP_DEBUG=occ_ckpt_defer),
  * in two steps so the backend is asked only when it can matter.
  *

@@ -516,7 +516,8 @@ uint32_t nv2a_pb_exec_semaphore_written_value(void) { return s_sema_written_valu
 static int sema_defer_on(void)
 {
     if (s_sema_defer < 0)
-        s_sema_defer = recomp_env_on(RENV_OCC_SEMA_DEFER);
+        s_sema_defer = nv2a_occ_defer_on(recomp_env(RENV_OCC_SEMA_DEFER),
+                                         recomp_env_on(RENV_DETERMINISTIC));
     return s_sema_defer;
 }
 
@@ -6211,7 +6212,8 @@ int nv2a_pb_exec_checkpoint_try(int notify_due)
     static int defer = -1;
 
     if (defer < 0)
-        defer = recomp_env_on(RENV_OCC_CKPT_DEFER);
+        defer = nv2a_occ_defer_on(recomp_env(RENV_OCC_CKPT_DEFER),
+                                  recomp_env_on(RENV_DETERMINISTIC));
     merge_flush();
     if (nv2a_ckpt_defer_asks(defer, s_report_owed, notify_due)
         && s_backend->on_report_pending) {

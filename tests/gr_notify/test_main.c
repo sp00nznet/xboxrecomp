@@ -434,6 +434,18 @@ int main(void)
               && nv2a_run_ahead_depth("99999", 0) == NV2A_RUN_AHEAD_MAX_DEPTH,
           "=N: N, capped");
 
+    /* occ_ckpt_defer / occ_sema_defer (on by default). */
+    check(nv2a_occ_defer_on(NULL, 0) && nv2a_occ_defer_on("", 0),
+          "occ defer unset, or empty (key=): on");
+    check(!nv2a_occ_defer_on(NULL, 1) && !nv2a_occ_defer_on("", 1),
+          "occ defer unset in the deterministic mode: off");
+    check(!nv2a_occ_defer_on("0", 0) && !nv2a_occ_defer_on("0", 1),
+          "occ defer =0 (the opt-out, or a game default): off");
+    check(!nv2a_occ_defer_on("off", 0) && !nv2a_occ_defer_on("off", 1),
+          "occ defer =off (run_ahead's word): off");
+    check(nv2a_occ_defer_on("1", 0) && nv2a_occ_defer_on("1", 1),
+          "occ defer asked for: on, deterministic or not");
+
     free(regs);
     printf("%s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
