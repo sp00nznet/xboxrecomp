@@ -1140,6 +1140,10 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_pb_exec.c | - | s_sema_releases | file_static | reset | pgraph | semaphore release state, guest addresses |
 | src/kernel/nv2a_pb_exec.c | - | s_sema_last_va | file_static | reset | pgraph | semaphore release state, guest addresses |
 | src/kernel/nv2a_pb_exec.c | - | s_sema_last_value | file_static | reset | pgraph | semaphore release state, guest addresses |
+| src/kernel/nv2a_pb_exec.c | - | s_sema_q | file_static | reset | pgraph | semaphore releases queued behind a pending report |
+| src/kernel/nv2a_pb_exec.c | - | s_sema_written_value | file_static | reset | pgraph | last released value in memory |
+| src/kernel/nv2a_pb_exec.c | - | s_sema_deferred | file_static | reset | pgraph | queued releases since the last flip line |
+| src/kernel/nv2a_pb_exec.c | - | s_sema_defer | file_static | keep | - | cached env override |
 | src/kernel/nv2a_pb_exec.c | - | s_zpass_count | file_static | reset | pgraph | zpass report state of guest |
 | src/kernel/nv2a_pb_exec.c | - | s_zpass_enable | file_static | reset | pgraph | zpass report state of guest |
 | src/kernel/nv2a_pb_exec.c | - | t_cnt | file_static | keep | - | thread-local raster counters |

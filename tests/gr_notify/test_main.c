@@ -373,6 +373,51 @@ int main(void)
     check(nv2a_ckpt_held_get(0x1800, 0x7000, 0x3000) == 0,
           "a stale latch from the last walk: GET does not go back");
 
+    /* The semaphore release's defer rule: args enabled, owed,
+     * pending, queued. */
+    check(!nv2a_sema_defer_asks(0, 1) && !nv2a_sema_defers(0, 1, 3, 0),
+          "sema defer off: the release settles and writes");
+    check(!nv2a_sema_defer_asks(1, 0) && !nv2a_sema_defers(1, 0, 3, 0),
+          "sema: nothing owed, no backend ask, written at once");
+    check(nv2a_sema_defer_asks(1, 1) && nv2a_sema_defers(1, 1, 1, 0),
+          "sema: a report still on the GPU, the write queues");
+    check(nv2a_sema_defer_asks(1, 1) && !nv2a_sema_defers(1, 1, 0, 3),
+          "sema: every owed report landed, settle (drains the queue) then write");
+    check(nv2a_sema_defers(1, 1, 2, NV2A_SEMA_QUEUE_MAX - 1)
+              && !nv2a_sema_defers(1, 1, 2, NV2A_SEMA_QUEUE_MAX),
+          "sema: a full queue settles everything");
+    {
+        static uint8_t mem[64];
+        struct nv2a_sema_queue q;
+        uint32_t w, i;
+        int pushed = 1;
+
+        memset(&q, 0, sizeof q);
+        memset(mem, 0, sizeof mem);
+        check(nv2a_sema_queue_push(&q, 0x10, 0x11)
+                  && nv2a_sema_queue_push(&q, 0x20, 0x21)
+                  && nv2a_sema_queue_push(&q, 0x10, 0x13),
+              "sema queue: three releases queue");
+        memcpy(&w, mem + 0x10, 4);
+        check(w == 0 && q.n == 3, "sema queue: nothing reaches memory before the drain");
+        check(nv2a_sema_queue_drain(&q, mem) == 3 && q.n == 0,
+              "sema queue: the drain writes all three and empties");
+        memcpy(&w, mem + 0x10, 4);
+        check(w == 0x13, "sema queue: a word released twice ends at the later value");
+        memcpy(&w, mem + 0x20, 4);
+        check(w == 0x21, "sema queue: the other word is written");
+        check(nv2a_sema_queue_drain(&q, mem) == 0, "sema queue: an empty drain writes nothing");
+        for (i = 0; i < NV2A_SEMA_QUEUE_MAX; i++)
+            pushed &= nv2a_sema_queue_push(&q, 0x30, 2 * i + 1);
+        check(pushed && !nv2a_sema_queue_push(&q, 0x30, 0x99)
+                  && q.n == NV2A_SEMA_QUEUE_MAX,
+              "sema queue: bounded at NV2A_SEMA_QUEUE_MAX");
+        nv2a_sema_queue_drain(&q, mem);
+        memcpy(&w, mem + 0x30, 4);
+        check(w == 2 * (NV2A_SEMA_QUEUE_MAX - 1) + 1,
+              "sema queue: a full drain ends at the last release");
+    }
+
     /* The depth from RECOMP_DEBUG=run_ahead (on by default). */
     check(nv2a_run_ahead_depth(NULL, 0) == NV2A_RUN_AHEAD_DEFAULT_DEPTH
               && nv2a_run_ahead_depth("", 0) == NV2A_RUN_AHEAD_DEFAULT_DEPTH,

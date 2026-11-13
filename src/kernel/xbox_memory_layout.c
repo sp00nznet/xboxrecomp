@@ -1401,7 +1401,7 @@ static int s_pb_exec = 0;
 extern uint32_t nv2a_pb_exec_semaphore_releases(void);
 extern uint32_t nv2a_pb_scan_catchups(void);
 extern uint32_t nv2a_pb_exec_semaphore_last_va(void);
-extern uint32_t nv2a_pb_exec_semaphore_last_value(void);
+extern uint32_t nv2a_pb_exec_semaphore_written_value(void);
 
 /* Mirror "submitted" into "completed" -- now only the fallback.
  *
@@ -1554,7 +1554,9 @@ static int fence_completed(uint32_t *out)
                             " 0x400B10 follows the executor's semaphore releases\n");
             fflush(stderr);
         }
-        *out = nv2a_pb_exec_semaphore_last_value();
+        /* What is in memory: a release occ_sema_defer still queues has not
+         * completed, so the register must not say it has. */
+        *out = nv2a_pb_exec_semaphore_written_value();
         return 1;
     }
     return 0;
@@ -2173,6 +2175,7 @@ int xbox_Nv2aGrNotify(uint32_t subch, uint32_t param)
 {
     extern void xbox_Nv2aGrRequest(void);
     extern void nv2a_pb_exec_checkpoint(void);
+    extern void nv2a_pb_exec_sema_settle(void);
     uint64_t t0;
     int r;
 
@@ -2180,6 +2183,9 @@ int xbox_Nv2aGrNotify(uint32_t subch, uint32_t param)
         || !nv2a_gr_notify_wanted(param, g_gr_notify_mask))
         return 0;
     t0 = nv2a_pb_now_ns();
+    /* Releases queued behind a report (occ_sema_defer) reach memory before
+     * the walk waits on the title's handler below. */
+    nv2a_pb_exec_sema_settle();
     /* One trap at a time, as on the console: PFIFO stops at the first. A
      * walk that gave up on the last one waits for it here first, and past
      * that queues this one behind it: each far-path BlockOnTime waits on

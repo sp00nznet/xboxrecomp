@@ -315,6 +315,69 @@ static inline uint32_t nv2a_ckpt_held_get(uint32_t owed, uint32_t va,
     return owed;
 }
 
+/* The semaphore release's defer (RECOMP_DEBUG=occ_sema_defer).
+ *
+ * A BACK_END_WRITE_SEMAPHORE_RELEASE orders after the visibility reports
+ * before it: on the console the GPU writes the word only once the earlier
+ * query has completed. The executor kept that order by settling the
+ * reports at the release, which waits out the GPU's latency mid-walk (most
+ * of the D3D11 settle once occ_ckpt_defer moved the checkpoints' share
+ * here). With the key on, a release that finds an owed report still on the
+ * GPU keeps the order the console's way instead: its write and the wake
+ * wait in a queue, and the next settle (a checkpoint, the notify raise, the
+ * walk end, or a release that finds nothing pending) writes the reports,
+ * then the queued words in release order, then wakes the fence waiters.
+ * The walk end settles, so nothing waits past the walk that released it.
+ *
+ * Asked only when the key is on and a report is owed; it defers only when
+ * one is still pending and the queue has room. A full queue settles
+ * everything, as the release did before. */
+#define NV2A_SEMA_QUEUE_MAX 16u
+
+struct nv2a_sema_queue {
+    uint32_t va[NV2A_SEMA_QUEUE_MAX];
+    uint32_t value[NV2A_SEMA_QUEUE_MAX];
+    uint32_t n;
+};
+
+static inline int nv2a_sema_defer_asks(int enabled, int report_owed)
+{
+    return enabled && report_owed;
+}
+
+static inline int nv2a_sema_defers(int enabled, int report_owed, int pending,
+                                   uint32_t queued)
+{
+    return nv2a_sema_defer_asks(enabled, report_owed) && pending > 0
+        && queued < NV2A_SEMA_QUEUE_MAX;
+}
+
+/* Queue a release: 0 (nothing queued) when full. */
+static inline int nv2a_sema_queue_push(struct nv2a_sema_queue *q, uint32_t va,
+                                       uint32_t value)
+{
+    if (q->n >= NV2A_SEMA_QUEUE_MAX)
+        return 0;
+    q->va[q->n] = va;
+    q->value[q->n] = value;
+    q->n++;
+    return 1;
+}
+
+/* Write the queued words into guest memory (mem + va) in release order, so
+ * a word released twice ends at its later value; empties the queue and
+ * returns how many it wrote. */
+static inline uint32_t nv2a_sema_queue_drain(struct nv2a_sema_queue *q,
+                                             uint8_t *mem)
+{
+    uint32_t i, n = q->n;
+
+    for (i = 0; i < n; i++)
+        *(volatile uint32_t *)(mem + q->va[i]) = q->value[i];
+    q->n = 0;
+    return n;
+}
+
 /* The depth when nothing sets one: deep enough that D3D's own bounds
  * (MakeSpace on GET, BlockOnTime on the fence and its notify) hold the
  * title, as on the console, where the flush is acked at once. BLiNX 1's

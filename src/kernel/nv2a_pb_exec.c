@@ -457,6 +457,15 @@ void nv2a_pb_exec_idx_stats(uint32_t *max, uint32_t *overflowed, uint32_t *over_
 
 static uint32_t s_sema_releases;
 static uint32_t s_sema_last_va, s_sema_last_value;
+/* RECOMP_DEBUG=occ_sema_defer: releases whose write waits for
+ * an owed report (nv2a_sema_defers), the value that last reached memory,
+ * and the releases queued since the last [PB-PERF] line. s_sema_last_* stay
+ * the release's own, at once: the fence shift, the stop's salvage and the
+ * mirror's target check read the stream, not memory. */
+static struct nv2a_sema_queue s_sema_q;
+static uint32_t s_sema_written_value;
+static uint32_t s_sema_deferred;
+static int s_sema_defer = -1;
 
 /* Visibility tests: D3DDevice_BeginVisibilityTest / EndVisibilityTest, which
  * are NV2A pixel-count reports. Begin sends CLEAR_REPORT_VALUE and
@@ -499,6 +508,16 @@ static uint32_t s_reports, s_reports_zero;
 uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_sema_releases; }
 uint32_t nv2a_pb_exec_semaphore_last_va(void) { return s_sema_last_va; }
 uint32_t nv2a_pb_exec_semaphore_last_value(void) { return s_sema_last_value; }
+/* The last released value that is in memory: s_sema_last_value but for
+ * the releases occ_sema_defer still holds. */
+uint32_t nv2a_pb_exec_semaphore_written_value(void) { return s_sema_written_value; }
+
+static int sema_defer_on(void)
+{
+    if (s_sema_defer < 0)
+        s_sema_defer = recomp_env_on(RENV_OCC_SEMA_DEFER);
+    return s_sema_defer;
+}
 
 /* Where the fence sits in PGRAPH 0x400B10, learned from the pushbuffer.
  *
@@ -6128,6 +6147,38 @@ static void reports_settle(void)
             s_perf.settle += (nv2a_occ_wait_us - w) * 1000u;
         }
     }
+    /* The releases that waited on those reports (occ_sema_defer), now
+     * that the reports are in memory, then the waiters' wake. */
+    if (s_sema_q.n) {
+        uint64_t t;
+        s_sema_written_value = s_sema_q.value[s_sema_q.n - 1];
+        nv2a_sema_queue_drain(&s_sema_q, (uint8_t *)xbox_GetMemoryOffset());
+        t = nv2a_pb_cost_start();
+        xbox_SpinWake();
+        nv2a_pb_cost_add(t, NV2A_COST_D_WAKE);
+    }
+}
+
+/* At a semaphore release under occ_sema_defer: 1 when its write waits in
+ * s_sema_q for the reports before it (nv2a_sema_defers), 0 when the
+ * release settles and writes now. The ask is the checkpoint's: a poll
+ * without a wait. */
+static int sema_release_defers(uint32_t va, uint32_t value)
+{
+    uint64_t t;
+    int pend;
+
+    if (!nv2a_sema_defer_asks(sema_defer_on(), s_report_owed)
+        || !s_backend->on_report_pending || s_sema_q.n >= NV2A_SEMA_QUEUE_MAX)
+        return 0;
+    t = nv2a_pb_cost_start();
+    pend = s_backend->on_report_pending();
+    nv2a_pb_cost_add(t, NV2A_COST_D_POLL);
+    if (!nv2a_sema_defers(1, s_report_owed, pend, s_sema_q.n))
+        return 0;
+    nv2a_sema_queue_push(&s_sema_q, va, value);
+    s_sema_deferred++;
+    return 1;
 }
 
 /* nv2a_pb_scan, at the end of each walk, before GET is stored. */
@@ -6171,6 +6222,16 @@ int nv2a_pb_exec_checkpoint_try(int notify_due)
     }
     reports_settle();
     return 1;
+}
+
+/* Releases occ_sema_defer still queues, settled with their reports; a
+ * no-op with the queue empty (always, with the key off). The notify path
+ * calls it before it waits on the title's handler, which must not find a
+ * fence the walk has passed unwritten. */
+void nv2a_pb_exec_sema_settle(void)
+{
+    if (s_sema_q.n)
+        reports_settle();
 }
 
 /* The walk's place before its oldest owed report; 0 when none is owed. */
@@ -7702,6 +7763,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * same resolution. The first release is logged. */
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         uint32_t va, phys;
+        int queued;
 
         if (!s_gpu.sema_offset_set) {
             /* No offset yet: nowhere honest to write. */
@@ -7720,12 +7782,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                         va, s_gpu.sema_offset);
             return;
         }
-        reports_settle();  /* the release orders after the reports */
-        *(volatile uint32_t *)(mem + va) = param;
+        /* The release orders after the reports: settled now, or queued
+         * behind the ones still on the GPU (occ_sema_defer). */
+        queued = sema_release_defers(va, param);
+        if (!queued) {
+            reports_settle();
+            *(volatile uint32_t *)(mem + va) = param;
+            s_sema_written_value = param;
+        }
         s_sema_last_va = va;
         s_sema_last_value = param;
         fence_shift_learn(fence_paired, param);
-        {
+        if (!queued) {
             uint64_t t = nv2a_pb_cost_start();
             xbox_SpinWake();   /* a fence wait may be sleeping on this word */
             nv2a_pb_cost_add(t, NV2A_COST_D_WAKE);
@@ -7953,6 +8021,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                             s_perf.methods, s_perf.batches,
                             s_perf.flip / 1e6, kicks, kwait / 1e6,
                             stops - prev_stops, s_perf.draws, s_perf.settle / 1e6);
+                    /* occ_sema_defer: the releases queued since the last line, on
+                     * a line of its own so [PB-PERF] keeps its fields. */
+                    if (sema_defer_on())
+                        fprintf(stderr, "[PB-SEMA] flip %u deferred %u\n",
+                                s_gpu.flips, s_sema_deferred);
+                    s_sema_deferred = 0;
                     prev_stops = stops;
                     /* RECOMP_TRACE=pb_cost: the draw share by stage */
                     nv2a_pb_cost_flip(s_gpu.flips, s_perf.batches, s_perf.draws,
