@@ -98,8 +98,20 @@ typedef enum {
                          * (POSIX: nanosleep) */
     XBOX_NAP_DELAY,     /* NtDelayExecution (POSIX: nanosleep) */
     XBOX_NAP_SPIN,      /* busy-wait on the clock with a pause instruction */
-    XBOX_NAP_HYBRID     /* SPIN for a hot nap, TIMER for a cold one */
+    XBOX_NAP_HYBRID,    /* SPIN for a hot nap, TIMER for a cold one */
+    XBOX_NAP_YIELD,     /* give the core away (SwitchToThread, sched_yield)
+                         * until the deadline: runnable throughout */
+    XBOX_NAP_SPINDELAY  /* SPIN for a hot nap, DELAY for a cold one
+                         * (native Windows: TIMER, as HYBRID) */
 } XboxNapMode;
+
+#define XBOX_NAP_SPINDELAY_DEFAULT_US 500u
+
+/* A `kick_nap` value (docs/env.md): hybrid, timer, delay, spin, yield or
+ * spindelay[:US], US 1-1000000. 1 with *mode set; 0 when unknown (or NULL);
+ * -1 for spindelay with a bad US, *mode set. *spin_us is spindelay's spin,
+ * XBOX_NAP_SPINDELAY_DEFAULT_US unless US was given and valid. */
+int xbox_HostNapModeParse(const char *s, XboxNapMode *mode, unsigned *spin_us);
 
 /* Set once before the napping threads start (an A/B switch). */
 void xbox_HostNapModeSet(XboxNapMode mode);
@@ -127,9 +139,23 @@ int xbox_HostNapHasTimer(void);
  * NtDelayExecution. POSIX nanosleep is honoured (~80 us). AUTO is HYBRID on
  * native Windows and DELAY under Wine and on POSIX.
  *
+ * YIELD and SPINDELAY are opt-in A/B arms for the clock a sleeping thread
+ * gets: a frequency governor that sees the walker asleep for
+ * most of a frame (schedutil on SteamOS and Bazzite) clocks its core down,
+ * and the walk that follows runs at the floor. YIELD keeps the thread
+ * runnable without holding the core from other threads; SPINDELAY spins
+ * only while the caller says it is hot and sleeps beyond, as DELAY (native
+ * Windows: TIMER, as HYBRID's cold nap).
+ *
  * 0 returns at once. The caller re-reads its clock, as with
  * xbox_HostSleepNs. */
 void xbox_HostNapNs(uint64_t ns, int hot);
+
+/* A nap that never spins or yields, whatever the mode: the mode's cold nap,
+ * or for SPIN and YIELD the host default's. For a poller whose latency does
+ * not matter (the flip log's kick observer), so an A/B arm's spin costs only
+ * the thread it is meant for. */
+void xbox_HostNapColdNs(uint64_t ns);
 
 #ifdef __cplusplus
 }

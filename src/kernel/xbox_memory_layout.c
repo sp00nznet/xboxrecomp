@@ -1823,6 +1823,15 @@ uint64_t nv2a_pb_now_ns(void);
 
 #define KICK_NAP_SPIN_BUDGET_NS 2000000ull
 
+/* RECOMP_DEBUG=kick_nap=spindelay[:US]: the naps spin for US
+ * (default 500) after the walker's last work -- a walk, or a kick it acked
+ * -- and sleep beyond. A flip hold is not work, so a held wait sleeps. 0
+ * when the mode is not on. */
+static uint64_t g_kick_spin_ns;
+/* The tick walked a new segment: the ack loop's next pass dates its last
+ * work from there. Ack thread only. */
+static int g_kick_walked;
+
 /* The event wait (nv2a_kick_wake.h). After an ack the guest stores PUT a
  * few instructions on, or after its wake from a sleeping spin (tens of us
  * under Wine): the watch spins this long for it before the walker sleeps. */
@@ -2305,8 +2314,11 @@ static DWORD WINAPI nv2a_kick_thread(LPVOID param)
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
             last_kick = now;
         }
-        /* Fine-grained while the title is kicking, 1 ms when it is not. */
-        kick_nap_us(now - last_kick < 200000000ull ? 50 : 1000, 0);
+        /* Fine-grained while the title is kicking, 1 ms when it is not.
+         * Never a spin: this observer runs for the flip log only, and an A/B
+         * nap mode is meant for the walker. */
+        xbox_HostNapColdNs((now - last_kick < 200000000ull ? 50u : 1000u)
+                           * 1000ull);
     }
     return 0;
 }
@@ -2341,20 +2353,24 @@ static void kick_nap_init(void)
     const char *e = recomp_env(RENV_FAST_KICK);
     const char *n = recomp_env(RENV_KICK_NAP);
     XboxNapMode asked = XBOX_NAP_AUTO;
+    unsigned spin_us;
+    int ok;
     char nap[160];
 
     g_kick_fast = !(e && *e == '0');
-    if (n && !strcmp(n, "hybrid"))
-        asked = XBOX_NAP_HYBRID;
-    else if (n && !strcmp(n, "timer"))
-        asked = XBOX_NAP_TIMER;
-    else if (n && !strcmp(n, "delay"))
-        asked = XBOX_NAP_DELAY;
-    else if (n && !strcmp(n, "spin"))
-        asked = XBOX_NAP_SPIN;
-    else if (n && *n)
-        fprintf(stderr, "  NV2A KickOff flush: kick_nap=%s unknown"
-                " (hybrid | timer | delay | spin); the host default\n", n);
+    ok = xbox_HostNapModeParse(n, &asked, &spin_us);
+    if (ok < 0)
+        fprintf(stderr, "  NV2A KickOff flush: kick_nap=%s: the spin is"
+                " 1-1000000 us; using %u us\n", n, spin_us);
+    else if (!ok) {
+        asked = XBOX_NAP_AUTO;
+        if (n && *n)
+            fprintf(stderr, "  NV2A KickOff flush: kick_nap=%s unknown"
+                    " (hybrid | timer | delay | spin | yield | spindelay[:US]);"
+                    " the host default\n", n);
+    }
+    if (asked == XBOX_NAP_SPINDELAY)
+        g_kick_spin_ns = (uint64_t)spin_us * 1000u;
     xbox_HostNapModeSet(asked);
 
     if (xbox_HostNapMode() == XBOX_NAP_HYBRID) {
@@ -2372,9 +2388,19 @@ static void kick_nap_init(void)
     } else {
         unsigned p50 = kick_nap_p50_us(0);
         const char *name;
+        char sd[64];
         switch (xbox_HostNapMode()) {
         case XBOX_NAP_SPIN:
             name = "spin";
+            break;
+        case XBOX_NAP_YIELD:
+            name = "yield";
+            break;
+        case XBOX_NAP_SPINDELAY:
+            /* p50 below is the cold nap, the delay. */
+            snprintf(sd, sizeof sd, "spindelay (spin %u us after work, then"
+                     " delay)", (unsigned)(g_kick_spin_ns / 1000u));
+            name = sd;
             break;
 #ifdef _WIN32
         case XBOX_NAP_TIMER:
@@ -2555,8 +2581,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             if (!flip_held
                     && (put != g_scanned_put
                         || (!det && (now_ms - last_put_ms) > 2000))) {
-                if (put != g_scanned_put)
+                if (put != g_scanned_put) {
                     det_worked = 1;
+                    g_kick_walked = 1;
+                }
                 /* Survey the segment the title just submitted, once. */
                 {
                     extern void nv2a_pb_scan(uint32_t, uint32_t);
@@ -2725,8 +2753,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * rest of the tick keeps its ~1 ms rate or slower. Idle for 200 ms,
          * it is a plain Sleep(1) again. */
         {
-            static uint64_t last_active;
+            static uint64_t last_active, last_work;
             uint64_t t0 = nv2a_pb_now_ns(), now = t0;
+            if (g_kick_walked) {        /* the tick just walked */
+                last_work = t0;
+                g_kick_walked = 0;
+            }
             volatile uint32_t *kr =
                 (volatile uint32_t *)((char *)regs + NV2A_KICK_REG);
             for (;;) {
@@ -2757,6 +2789,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     *kr &= ~NV2A_KICK_BIT;
                     kick_cleared(now);
                     last_active = now;
+                    last_work = now;
                     acked = 1;
                 }
                 if (now - t0 >= 1000000ull)
@@ -2800,7 +2833,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     Sleep(1);
                     break;
                 }
-                kick_nap_us(50, now - last_active < KICK_NAP_SPIN_BUDGET_NS);
+                kick_nap_us(50, g_kick_spin_ns
+                                ? now - last_work < g_kick_spin_ns
+                                : now - last_active < KICK_NAP_SPIN_BUDGET_NS);
                 now = nv2a_pb_now_ns();
             }
         }

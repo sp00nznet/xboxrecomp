@@ -13,6 +13,7 @@
 #include "host_time.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -26,6 +27,7 @@
 #else
 #include <time.h>
 #include <pthread.h>
+#include <sched.h>
 #ifdef __APPLE__
 #include <stdio.h>
 #include <mach/mach.h>
@@ -243,6 +245,36 @@ XboxNapMode xbox_HostNapMode(void)
     return m;
 }
 
+int xbox_HostNapModeParse(const char *s, XboxNapMode *mode, unsigned *spin_us)
+{
+    static const struct { const char *name; XboxNapMode mode; } names[] = {
+        { "hybrid", XBOX_NAP_HYBRID }, { "timer", XBOX_NAP_TIMER },
+        { "delay", XBOX_NAP_DELAY },   { "spin", XBOX_NAP_SPIN },
+        { "yield", XBOX_NAP_YIELD },
+    };
+    size_t i;
+
+    *spin_us = XBOX_NAP_SPINDELAY_DEFAULT_US;
+    if (!s)
+        return 0;
+    for (i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (!strcmp(s, names[i].name)) {
+            *mode = names[i].mode;
+            return 1;
+        }
+    if (strncmp(s, "spindelay", 9) || (s[9] && s[9] != ':'))
+        return 0;
+    *mode = XBOX_NAP_SPINDELAY;
+    if (s[9] == ':') {
+        char *end;
+        unsigned long us = strtoul(s + 10, &end, 10);
+        if (end == s + 10 || *end || us == 0 || us > 1000000ul)
+            return -1;
+        *spin_us = (unsigned)us;
+    }
+    return 1;
+}
+
 int xbox_HostNapHasTimer(void)
 {
     return !NAP_LOAD(s_nap_no_timer);
@@ -259,6 +291,34 @@ static void cpu_relax(void)
 #endif
 }
 
+/* The sleeping form a cold nap takes in mode `m`: HYBRID's timer;
+ * SPINDELAY's delay, or on native Windows the timer as HYBRID takes it
+ * (NtDelayExecution there is a 1 ms tick); TIMER and DELAY themselves. SPIN
+ * and YIELD have none, so the host default's applies. */
+static XboxNapMode nap_cold_form(XboxNapMode m)
+{
+    if (m == XBOX_NAP_SPIN || m == XBOX_NAP_YIELD)
+        m = nap_auto();
+    if (m == XBOX_NAP_HYBRID)
+        return XBOX_NAP_TIMER;
+    if (m == XBOX_NAP_SPINDELAY) {
+#ifdef _WIN32
+        return xbox_HostUnderWine() ? XBOX_NAP_DELAY : XBOX_NAP_TIMER;
+#else
+        return XBOX_NAP_DELAY;
+#endif
+    }
+    return m;
+}
+
+static void nap_sleep(XboxNapMode m, uint64_t ns);
+
+void xbox_HostNapColdNs(uint64_t ns)
+{
+    if (ns)
+        nap_sleep(nap_cold_form(xbox_HostNapMode()), ns);
+}
+
 void xbox_HostNapNs(uint64_t ns, int hot)
 {
     XboxNapMode m;
@@ -266,8 +326,21 @@ void xbox_HostNapNs(uint64_t ns, int hot)
     if (!ns)
         return;
     m = xbox_HostNapMode();
-    if (m == XBOX_NAP_HYBRID)
-        m = hot ? XBOX_NAP_SPIN : XBOX_NAP_TIMER;
+    if (m == XBOX_NAP_HYBRID || m == XBOX_NAP_SPINDELAY)
+        m = hot ? XBOX_NAP_SPIN : nap_cold_form(m);
+    if (m == XBOX_NAP_YIELD) {
+        /* Under Wine SwitchToThread is NtYieldExecution, a sched_yield:
+         * no wineserver call, and it returns at once on an idle core. */
+        uint64_t end = xbox_HostNowNs() + ns;
+        while (xbox_HostNowNs() < end) {
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
+        }
+        return;
+    }
     if (m == XBOX_NAP_SPIN) {
         /* Bounded by the clock, never by a count. */
         uint64_t end = xbox_HostNowNs() + ns;
@@ -275,6 +348,12 @@ void xbox_HostNapNs(uint64_t ns, int hot)
             cpu_relax();
         return;
     }
+    nap_sleep(m, ns);
+}
+
+/* TIMER or DELAY: the thread gives its core away until the deadline. */
+static void nap_sleep(XboxNapMode m, uint64_t ns)
+{
 #ifdef _WIN32
     if (m == XBOX_NAP_TIMER && !NAP_LOAD(s_nap_no_timer)) {
         if (timer_wait(ns))

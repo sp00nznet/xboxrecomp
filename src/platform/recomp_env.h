@@ -272,7 +272,7 @@ extern "C" {
     X(KICK_EVENT,        DEBUG, "kick_event",      NULL,                       "=1: the ack loop sleeps until the guest pokes it instead of polling the KickOff every ~50 us (default off)") \
     X(RUN_AHEAD,         DEBUG, "run_ahead",       NULL,                       "=N (1-1024): the walker publishes GET as it walks and acks the KickOff flush with up to N segments submitted past its walk; D3D's notify NOPs raise the PGRAPH interrupt. Unset: on at 64, off in the deterministic mode. =0 or =off (or a game default of 0): the old lockstep. A bare run_ahead, =on or any other non-number is depth 1, not 64 (docs/env.md)") \
     X(HOST_CPUS,         DEBUG, "host_cpus",       NULL,                       "=mask (hex): the whole process on these logical CPUs from start (Windows; a Deck-shaped PC run: 0xFF = 4 cores, 8 threads); default every CPU") \
-    X(KICK_NAP,          DEBUG, "kick_nap",        NULL,                       "=hybrid|timer|delay|spin: how the ack loop naps between its ~50 us polls (docs/env.md)") \
+    X(KICK_NAP,          DEBUG, "kick_nap",        NULL,                       "=hybrid|timer|delay|spin|yield|spindelay[:US]: how the ack loop naps between its ~50 us polls (docs/env.md)") \
     X(FORCE_RETURN,      DEBUG, "force_return",    "RECOMP_FORCE_RETURN",      "honour forced returns in the build") \
     X(TRAP_NULL,         DEBUG, "trap_null",       "RECOMP_TRAP_NULL",         "guest page zero faults") \
     X(DSP_ACK,           DEBUG, "dsp_ack",         "RECOMP_DSP_ACK",           "=va,...: zero these words (no APU)") \

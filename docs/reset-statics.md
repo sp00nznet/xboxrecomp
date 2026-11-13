@@ -783,6 +783,8 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/xbox_memory_layout.c | - | g_scanned_put | file_static | reset | pgraph | DMA_PUT the walker executed to; guest pushbuffer restarts |
 | src/kernel/xbox_memory_layout.c | - | g_kick_wait_ns | file_static | keep | - | kick statistics |
 | src/kernel/xbox_memory_layout.c | - | g_kick_event | file_static | keep | - | kick and run-ahead config from env |
+| src/kernel/xbox_memory_layout.c | - | g_kick_spin_ns | file_static | keep | - | kick and run-ahead config from env |
+| src/kernel/xbox_memory_layout.c | - | g_kick_walked | file_static | keep | - | ack thread report and idle timing |
 | src/kernel/xbox_memory_layout.c | - | g_kick_wake | file_static | keep | - | nv2a-kick thread handle and wake object; thread keeps running |
 | src/kernel/xbox_memory_layout.c | xbox_Nv2aKickReport | last_cpu | local_static | keep | - | kick report statistics |
 | src/kernel/xbox_memory_layout.c | - | g_run_ahead | file_static | keep | - | kick and run-ahead config from env |
@@ -800,6 +802,7 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/xbox_memory_layout.c | nv2a_ack_thread | report_ms | local_static | keep | - | ack thread report and idle timing |
 | src/kernel/xbox_memory_layout.c | nv2a_ack_thread | last_start | local_static | keep | - | ack thread report and idle timing |
 | src/kernel/xbox_memory_layout.c | nv2a_ack_thread | last_active | local_static | keep | - | ack thread report and idle timing |
+| src/kernel/xbox_memory_layout.c | nv2a_ack_thread | last_work | local_static | keep | - | ack thread report and idle timing |
 | src/kernel/xbox_memory_layout.c | - | g_kernel_memory | file_static | keep | - | host mapping of the guest window; cleared in place, never unmapped |
 | src/kernel/xbox_memory_layout.c | - | g_xbox_mem_offset | global | keep | - | host mapping of the guest window; cleared in place, never unmapped |
 | src/kernel/xbox_memory_layout.c | - | g_xbox_image_lo | global | keep | - | XBE image and region geometry; same image reloads |
