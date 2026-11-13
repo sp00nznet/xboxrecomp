@@ -977,6 +977,11 @@ static void clear_surface(uint32_t param)
                 p[x] = v;
         }
     }
+    /* A colour clear makes this the drawn surface: a frame that only clears
+     * and CPU-blits (a Bink video) otherwise flips a stale buffer. Swizzled
+     * targets are textures and stay out. */
+    if (!s_swz_on)
+        note_drawn();
     s_gpu.clears++;
     /* Progress markers, interleaved with everything else in the log. The
      * summary says drawing stopped; only a marker next to the surrounding
