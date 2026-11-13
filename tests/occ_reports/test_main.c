@@ -494,8 +494,9 @@ static int case_bound(void)
  * settles take what is in; the flip starts a new one. */
 static int case_budget(void)
 {
-    uint64_t w;
+    uint64_t w, all;
     fresh();
+    all = nv2a_occ_wait_us;
     s_tick = 10;
     nv2a_occ_set_settle(&s_o, 2000);
     vtest(A, 3000, 1);
@@ -513,6 +514,9 @@ static int case_budget(void)
     nv2a_occ_settle(&s_o);
     CHECK(count_at(C) == 3 && s_o.settled == 2);
     CHECK(s_o.settle_wait_us > w && s_o.settle_wait_us < w + 1100);
+    /* The walker's [PB-PERF] settle reads the shared total: it moves by
+     * exactly what this tracker waited. */
+    CHECK(nv2a_occ_wait_us - all == s_o.settle_wait_us);
     CHECK(drained());
     return 0;
 }

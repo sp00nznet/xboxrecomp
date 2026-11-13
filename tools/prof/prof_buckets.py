@@ -94,8 +94,10 @@ DRIVER_THREAD_RE = re.compile(r"^(dxvk-|nv(?!2a)|amd|vkd3d|wine_vk)", re.IGNOREC
 PACING_RE = re.compile(r"^\[PACING\] flip (\d+) t_us (\d+)")
 PBPERF_RE = re.compile(
     r"^\[PB-PERF\] flip (\d+) wall ([\d.]+) ms walk ([\d.]+) ms \(draw ([\d.]+), "
-    r"decode ([\d.]+)\) methods (\d+) batches (\d+) present ([\d.]+) kicks (\d+) "
+    r"decode ([-\d.]+)\) methods (\d+) batches (\d+) present ([\d.]+) kicks (\d+) "
     r"kickwait ([\d.]+)"
+    # settle is the line's last field; older logs have none.
+    r"(?:.* settle ([\d.]+))?"
 )
 D11P_RE = re.compile(r"^\[D3D11-PROF\] flip (\d+) gpu ([\d.]+) ms present ([\d.]+) ms")
 
@@ -316,7 +318,7 @@ def log_summaries(log_text, last=None):
     for line in log_text.splitlines():
         m = PBPERF_RE.match(line)
         if m:
-            pb.append([float(x) for x in m.groups()])
+            pb.append([float(x or 0) for x in m.groups()])
             continue
         m = D11P_RE.match(line)
         if m:
@@ -335,6 +337,7 @@ def log_summaries(log_text, last=None):
             "present",
             "kicks",
             "kickwait",
+            "settle",
         )
         out["pb_perf"] = {
             c: round(statistics.median(r[i + 1] for r in pb), 3)
@@ -449,7 +452,7 @@ def report(res, logsum):
         w("")
         w(
             "[PB-PERF] medians over %d flips: wall %s ms, walk %s (draw %s, decode %s),"
-            " present %s, kickwait %s, batches %s"
+            " present %s, settle %s, kickwait %s, batches %s"
             % (
                 p["flips"],
                 p["wall"],
@@ -457,6 +460,7 @@ def report(res, logsum):
                 p["draw"],
                 p["decode"],
                 p["present"],
+                p["settle"],
                 p["kickwait"],
                 p["batches"],
             )

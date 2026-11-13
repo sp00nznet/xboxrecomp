@@ -1731,6 +1731,12 @@ struct nv2a_occ {
     unsigned trace_n;
 };
 
+/* Microseconds every tracker has waited in its settles (settle_wait_us, all
+ * of them), for the [PB-PERF] line: the walker reads it either side of the
+ * settles it asks for and reports the difference as settle, not decode.
+ * Ack thread only, as the settles. */
+extern uint64_t nv2a_occ_wait_us;
+
 void nv2a_occ_init(struct nv2a_occ *o, const struct nv2a_occ_ops *ops,
                    uint8_t *mem);
 void nv2a_occ_zpass(struct nv2a_occ *o, int enable);

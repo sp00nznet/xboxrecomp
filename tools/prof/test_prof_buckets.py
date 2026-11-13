@@ -91,12 +91,23 @@ def test_log_parsing():
             " methods 100 batches 9000 present 1.00 kicks 3 kickwait 0.50"
             " stops 0 draws 9000",
             "[D3D11-PROF] flip 5 gpu 4.000 ms present 2.000 ms",
+            "[PB-PERF] flip 6 wall 33.30 ms walk 20.00 ms (draw 12.00, decode 4.00)"
+            " methods 100 batches 9000 present 1.00 kicks 3 kickwait 0.50"
+            " stops 0 draws 9000 settle 4.00",
+            # decode is a difference of two clocks and can read below 0.
+            "[PB-PERF] flip 7 wall 33.30 ms walk 20.00 ms (draw 12.00, decode -0.02)"
+            " methods 100 batches 9000 present 1.00 kicks 3 kickwait 0.50"
+            " stops 0 draws 9000 settle 7.02",
         ]
     )
     fps, n = flips_per_s(log, 5.0)
     assert abs(fps - 30.0) < 0.1 and n == 151
     s = log_summaries(log)
     assert s["pb_perf"]["walk"] == 20.0 and s["pb_perf"]["batches"] == 9000
+    # A line before settle reads 0 for it, and a negative decode
+    # is kept: medians of the three.
+    assert s["pb_perf"]["flips"] == 3
+    assert s["pb_perf"]["settle"] == 4.0 and s["pb_perf"]["decode"] == 4.0
     assert s["gpu"]["gpu_ms_p50"] == 4.0
 
 

@@ -3481,9 +3481,11 @@ static struct {
  * nv2a_pb_scan (the walk, decode and every backend hook it calls) and, inside
  * that, in the backend's on_draw, per flip. nv2a_pb_scan.c brackets each scan
  * with nv2a_pb_perf_scan_begin/end; the line is printed and reset at the flip,
- * which arrives inside a scan, so the open scan is counted up to that point. */
+ * which arrives inside a scan, so the open scan is counted up to that point.
+ * settle is the occlusion settle's wait in the walk (reports_settle, off
+ * nv2a_occ_wait_us), kept out of decode, which it made look slower. */
 static struct {
-    uint64_t scan, draw, flip, scan_t0, flip_t0;
+    uint64_t scan, draw, flip, settle, scan_t0, flip_t0;
     uint32_t methods, batches;
     uint32_t draws;     /* backend draws: batches less those merged (nv2a_merge) */
 } s_perf;
@@ -6116,9 +6118,10 @@ static void reports_settle(void)
     if (s_report_owed) {
         s_report_owed = 0;
         if (s_backend->on_poll) {
-            uint64_t t = nv2a_pb_cost_start();
+            uint64_t t = nv2a_pb_cost_start(), w = nv2a_occ_wait_us;
             s_backend->on_poll();
             nv2a_pb_cost_add(t, NV2A_COST_D_POLL);
+            s_perf.settle += (nv2a_occ_wait_us - w) * 1000u;
         }
     }
 }
@@ -7889,7 +7892,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     extern uint32_t nv2a_pb_scan_stops(void);
                     static uint32_t prev_stops;
                     uint32_t stops = nv2a_pb_scan_stops();
-                    /* decode is walk minus draw minus present; kicks are the
+                    /* decode is walk minus draw, present and settle (the
+                     * occlusion settle's wait in the walk, printed last so
+                     * the fields before keep their places); kicks are the
                      * title's KickOff flushes acknowledged since the last
                      * flip, kickwait how long it spun on them in all (on
                      * native Windows it under-reads by up to 0.5 ms a kick:
@@ -7898,19 +7903,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      * (the lifetime total is in the [PB] report). */
                     fprintf(stderr, "[PB-PERF] flip %u wall %.2f ms walk %.2f ms"
                             " (draw %.2f, decode %.2f) methods %u batches %u"
-                            " present %.2f kicks %u kickwait %.2f stops %u draws %u\n",
+                            " present %.2f kicks %u kickwait %.2f stops %u draws %u"
+                            " settle %.2f\n",
                             s_gpu.flips,
                             s_perf.flip_t0 ? (now - s_perf.flip_t0) / 1e6 : 0.0,
                             scan / 1e6, s_perf.draw / 1e6,
-                            (double)(int64_t)(scan - s_perf.draw - s_perf.flip) / 1e6,
+                            (double)(int64_t)(scan - s_perf.draw - s_perf.flip
+                                              - s_perf.settle) / 1e6,
                             s_perf.methods, s_perf.batches,
                             s_perf.flip / 1e6, kicks, kwait / 1e6,
-                            stops - prev_stops, s_perf.draws);
+                            stops - prev_stops, s_perf.draws, s_perf.settle / 1e6);
                     prev_stops = stops;
                     /* RECOMP_TRACE=pb_cost: the draw share by stage */
-                    nv2a_pb_cost_flip(s_gpu.flips, s_perf.batches, s_perf.draws);
+                    nv2a_pb_cost_flip(s_gpu.flips, s_perf.batches, s_perf.draws,
+                                      s_perf.settle);
                     merge_why_flip(s_gpu.flips);
-                    s_perf.scan = s_perf.draw = s_perf.flip = 0;
+                    s_perf.scan = s_perf.draw = s_perf.flip = s_perf.settle = 0;
                     s_perf.methods = s_perf.batches = s_perf.draws = 0;
                     s_perf.scan_t0 = s_perf.flip_t0 = now;
                 }

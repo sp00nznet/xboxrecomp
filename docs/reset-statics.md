@@ -1001,6 +1001,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_backend_common.c | - | s_rt_hash_bytes | file_static | keep | - | render-target hash bytes stat |
 | src/kernel/nv2a_backend_common.c | - | s_rt_hash_ns | file_static | keep | - | render-target hash time stat |
 | src/kernel/nv2a_backend_common.c | - | nv2a_rt_own_cost_on | global | keep | - | cached RECOMP_TRACE=pb_cost read (nv2a_pb_cost_init) |
+| src/kernel/nv2a_backend_common.c | - | nv2a_occ_wait_us | global | keep | - | settle wait total stat; the walker reads differences |
 | src/kernel/nv2a_backend_common.c | - | s_host_opts | file_static | keep | - | enhance options and pending menu requests, host settings |
 | src/kernel/nv2a_backend_common.c | - | s_req_opts | file_static | keep | - | enhance options and pending menu requests, host settings |
 | src/kernel/nv2a_backend_common.c | - | s_req_mask | file_static | keep | - | enhance options and pending menu requests, host settings |

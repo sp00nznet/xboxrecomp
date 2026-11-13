@@ -864,6 +864,8 @@ static int occ_crowded(const struct nv2a_occ *o, int i)
     return 0;
 }
 
+uint64_t nv2a_occ_wait_us;
+
 void nv2a_occ_settle(struct nv2a_occ *o)
 {
     uint64_t now;
@@ -894,6 +896,7 @@ void nv2a_occ_settle(struct nv2a_occ *o)
         w = o->ops->now_us(o->ops->ctx) - t;
         o->frame_wait_us += w;
         o->settle_wait_us += w;
+        nv2a_occ_wait_us += w;
     }
     if (!o->npend)
         return;

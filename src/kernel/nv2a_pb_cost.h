@@ -109,7 +109,10 @@ void nv2a_pb_cost_method(uint32_t subch, uint32_t method, uint64_t t);
 /* Reads the switch once; the walker calls it at its first method. */
 void nv2a_pb_cost_init(void);
 /* The [PB-COST] line for one flip, `batches` and `draws` as [PB-PERF] counts
- * them, then the stages are cleared. */
-void nv2a_pb_cost_flip(uint32_t flip, uint32_t batches, uint32_t draws);
+ * them, then the stages are cleared. settle_ns is [PB-PERF]'s settle, the
+ * occlusion settle's wait in the walk: printed last as d_settle, the part of
+ * d_poll (and so of d_walk, d_ckpt or d_exec) spent waiting on the GPU. */
+void nv2a_pb_cost_flip(uint32_t flip, uint32_t batches, uint32_t draws,
+                       uint64_t settle_ns);
 
 #endif
