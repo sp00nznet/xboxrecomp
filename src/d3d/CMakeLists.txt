@@ -120,6 +120,9 @@ if(NOT WIN32)
     # And draw merging: back-to-back strips reach a GPU backend as one list.
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_draw_merge
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_draw_merge)
+    # And DRAW_ARRAYS runs expanded into indices up to the batch's cap.
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_draw_arrays
+                     ${CMAKE_CURRENT_BINARY_DIR}/pb_draw_arrays)
     # And the vertex-constant write generation the D3D11 backend's c[]
     # upload skip trusts.
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_vsh_cgen

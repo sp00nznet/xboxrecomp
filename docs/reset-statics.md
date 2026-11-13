@@ -1349,10 +1349,12 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_pb_exec.c | merge_why_note | on | local_static | keep | - | cached env read |
 | src/kernel/nv2a_pb_exec.c | - | s_exec_inited | once | reset | pgraph | rerun: s_gpu min/max, s_vsh.inl w=1; split out backend registration |
 | src/kernel/nv2a_pb_exec.c | - | s_mlog_flip | file_static | keep | - | cached env read |
-| src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | verbose | local_static | keep | - | cached env read |
+| src/kernel/nv2a_pb_exec.c | - | s_diag_prologue | file_static | keep | - | cached env read |
+| src/kernel/nv2a_pb_exec.c | exec_diag_prologue | verbose | local_static | keep | - | cached env read |
+| src/kernel/nv2a_pb_exec.c | exec_diag_prologue | shown | local_static | keep | - | log-once guard |
+| src/kernel/nv2a_pb_exec.c | exec_diag_prologue | from | local_static | keep | - | cached env read |
+| src/kernel/nv2a_pb_exec.c | exec_diag_prologue | lines | local_static | keep | - | log line counter |
 | src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | shown | local_static | keep | - | log-once guard |
-| src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | from | local_static | keep | - | cached env read |
-| src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | lines | local_static | keep | - | log line counter |
 | src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | said | local_static | keep | - | log-once guard |
 | src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | prev | local_static | reset | pgraph | delta bases of s_gpu counters; wrap if s_gpu zeroed |
 | src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_method | last_draws | local_static | reset | pgraph | delta bases of s_gpu counters; wrap if s_gpu zeroed |
@@ -3772,8 +3774,8 @@ What `reset_statics.py` does not list, by design:
   macro at `src/nv2a/qemu_shim.h:281`. The scanner skips preprocessor
   lines. Each expansion is a log guard, class keep.
 - Two statics with the same name in one function share one row, since the
-  key has no line number. In `nv2a_pb_exec_method` this covers two `shown`
-  and two `prev_tris`; in `nv2a_pb_exec_report`, several `done`; in
+  key has no line number. In `nv2a_pb_exec_method` this covers two
+  `prev_tris`; in `nv2a_pb_exec_report`, several `done`; in
   `mcpx_apu_dsp_ack_poll` (`src/apu/apu_dsp.c`), the scalar and array
   `shown`. All are log guards or trace state, so the one class fits each.
 - Fields inside a static table, such as `struct hud_group.ref` and

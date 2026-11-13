@@ -7407,6 +7407,59 @@ static int s_exec_inited;
 /* RECOMP_DEBUG=pb_mlog=<flip>: -2 until read, -1 when off. */
 static long s_mlog_flip = -2;
 
+/* RECOMP_PB_MLOG, RECOMP_PB_EXEC_VERBOSE and RECOMP_SURF_TRACE: the
+ * per-method bring-up traces, off the hot path (s_diag_prologue). */
+static int s_diag_prologue;
+
+static void exec_diag_prologue(uint32_t subch, uint32_t method, uint32_t param)
+{
+    /* Bring-up: the first parameters each surface method carries. A wrong
+     * pitch or clip is indistinguishable from a method never arriving unless
+     * the values are visible. Read once: this runs for every method. */
+    static int verbose = -1;
+    if (verbose < 0)
+        verbose = recomp_env(RENV_PB_EXEC_VERBOSE) != NULL;
+    if (verbose) {
+        static int shown[8];
+        int slot = -1;
+        switch (method) {
+        case NV097_SET_SURFACE_CLIP_HORIZONTAL: slot = 0; break;
+        case NV097_SET_SURFACE_CLIP_VERTICAL:   slot = 1; break;
+        case NV097_SET_SURFACE_FORMAT:          slot = 2; break;
+        case NV097_SET_SURFACE_PITCH:           slot = 3; break;
+        case NV097_SET_SURFACE_COLOR_OFFSET:    slot = 4; break;
+        case NV097_SET_COLOR_CLEAR_VALUE:       slot = 5; break;
+        case NV097_CLEAR_SURFACE:               slot = 6; break;
+        default: break;
+        }
+        if (slot >= 0 && shown[slot]++ < 4)
+            fprintf(stderr, "  [GPU] subch %u method 0x%04X param 0x%08X\n",
+                    subch, method, param);
+    }
+
+    /* RECOMP_SURF_TRACE=<flip>, or =0x<colour offset> to start when that
+     * surface is first selected: from then on, the surface and clear
+     * methods as they arrive (up to 600), to see which clip, pitch and clear
+     * rect go with which render target. */
+    if (subch == 0 && ((method >= 0x0200 && method <= 0x0214)
+                       || (method >= 0x1D94 && method <= 0x1D9C))) {
+        static long from = -2;
+        static int lines;
+        if (from == -2) {
+            const char *e = recomp_env(RENV_SURF_TRACE);
+            from = e ? strtol(e, NULL, 0) : -1;
+        }
+        if (from >= 0 && method == 0x0210 && param == (uint32_t)from)
+            from = 0;                    /* =0x...: from that colour offset on */
+        if (from >= 0 && from < 0x10000 && s_gpu.flips >= (uint32_t)from
+                && lines < 600) {
+            lines++;
+            fprintf(stderr, "  [SURFTRACE] flip %u method 0x%04X param 0x%08X\n",
+                    s_gpu.flips, method, param);
+        }
+    }
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     int fence_paired;
@@ -7476,15 +7529,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 && (s_backend == &s_cpu_backend || s_backend == &s_null_backend))
             fprintf(stderr, "[TEXDUMP] the CPU rasteriser does not write the texture"
                     " dump (<hash>.xtd); tex_dump is its image file prefix here\n");
+        /* The three bring-up traces below, read here once: when none is
+         * set, one branch skips them all on every method. */
+        {
+            const char *e = recomp_env(RENV_PB_MLOG);
+            s_mlog_flip = e ? strtol(e, NULL, 0) : -1;
+        }
+        s_diag_prologue = s_mlog_flip >= 0
+                       || recomp_env(RENV_PB_EXEC_VERBOSE) != NULL
+                       || recomp_env(RENV_SURF_TRACE) != NULL;
     }
     s_perf.methods++;
     /* One flip's method stream, to see what a heavy flip spends its batches
-     * on (which state changes sit between draws, how big each draw is). */
-    if (s_mlog_flip == -2) {
-        const char *e = recomp_env(RENV_PB_MLOG);
-        s_mlog_flip = e ? strtol(e, NULL, 0) : -1;
-    }
-    if (s_mlog_flip >= 0 && s_gpu.flips == (uint32_t)s_mlog_flip)
+     * on (which state changes sit between draws, how big each draw is).
+     * s_diag_prologue first: it is the one branch the fast path takes. */
+    if (s_diag_prologue && s_mlog_flip >= 0 && s_gpu.flips == (uint32_t)s_mlog_flip)
         fprintf(stderr, "[MLOG] %u %04X %08X\n", subch, method, param);
     if (s_gpu.prim && method != NV097_SET_BEGIN_END && method != NV097_DRAW_ARRAYS
             && method != NV097_ARRAY_ELEMENT16 && method != NV097_ARRAY_ELEMENT32)
@@ -7495,51 +7554,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     fence_paired = s_fence_ref_next;
     s_fence_ref_next = 0;
-    /* Bring-up: the first parameters each surface method carries. A wrong
-     * pitch or clip is indistinguishable from a method never arriving unless
-     * the values are visible. Read once: this runs for every method. */
-    static int verbose = -1;
-    if (verbose < 0)
-        verbose = recomp_env(RENV_PB_EXEC_VERBOSE) != NULL;
-    if (verbose) {
-        static int shown[8];
-        int slot = -1;
-        switch (method) {
-        case NV097_SET_SURFACE_CLIP_HORIZONTAL: slot = 0; break;
-        case NV097_SET_SURFACE_CLIP_VERTICAL:   slot = 1; break;
-        case NV097_SET_SURFACE_FORMAT:          slot = 2; break;
-        case NV097_SET_SURFACE_PITCH:           slot = 3; break;
-        case NV097_SET_SURFACE_COLOR_OFFSET:    slot = 4; break;
-        case NV097_SET_COLOR_CLEAR_VALUE:       slot = 5; break;
-        case NV097_CLEAR_SURFACE:               slot = 6; break;
-        default: break;
-        }
-        if (slot >= 0 && shown[slot]++ < 4)
-            fprintf(stderr, "  [GPU] subch %u method 0x%04X param 0x%08X\n",
-                    subch, method, param);
-    }
-
-    /* RECOMP_SURF_TRACE=<flip>, or =0x<colour offset> to start when that
-     * surface is first selected: from then on, the surface and clear
-     * methods as they arrive (up to 600), to see which clip, pitch and clear
-     * rect go with which render target. */
-    if (subch == 0 && ((method >= 0x0200 && method <= 0x0214)
-                       || (method >= 0x1D94 && method <= 0x1D9C))) {
-        static long from = -2;
-        static int lines;
-        if (from == -2) {
-            const char *e = recomp_env(RENV_SURF_TRACE);
-            from = e ? strtol(e, NULL, 0) : -1;
-        }
-        if (from >= 0 && method == 0x0210 && param == (uint32_t)from)
-            from = 0;                    /* =0x...: from that colour offset on */
-        if (from >= 0 && from < 0x10000 && s_gpu.flips >= (uint32_t)from
-                && lines < 600) {
-            lines++;
-            fprintf(stderr, "  [SURFTRACE] flip %u method 0x%04X param 0x%08X\n",
-                    s_gpu.flips, method, param);
-        }
-    }
+    if (s_diag_prologue)
+        exec_diag_prologue(subch, method, param);
     if (subch != 0) {          /* Kelvin is on 0; the 2D objects elsewhere */
         if (method == NV_FENCE_REF_METHOD) {
             s_fence_ref = param;
@@ -7681,7 +7697,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * and an implicit run is just the indices start..start+count-1. */
         uint32_t start = param & 0x00FFFFFFu;
         uint32_t count = ((param >> 24) & 0xFFu) + 1u;
-        uint32_t i;
+        uint32_t i, n;
+        uint16_t *dst;
 
         if (!s_gpu.prim)
             break;
@@ -7689,9 +7706,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * a count here is a decode bug, not a title to support. */
         if (start + count - 1u > 0xFFFFu)
             s_idx_over_ffff++;
-        for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
-        if (i < count)
+        /* Filled with the count held in a local: index by index through
+         * s_gpu.idx_count, the store and the bound check repeat per index,
+         * the walk's busiest line under Wine. */
+        n = count;
+        if (n > NV_MAX_INDICES - s_gpu.idx_count)
+            n = NV_MAX_INDICES - s_gpu.idx_count;
+        dst = &s_gpu.idx[s_gpu.idx_count];
+        for (i = 0; i < n; i++)
+            dst[i] = (uint16_t)(start + i);
+        s_gpu.idx_count += n;
+        if (n < count)
             note_idx_overflow();
         break;
     }

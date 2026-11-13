@@ -353,6 +353,12 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (inject > 0 && s_tot_segments && s_tot_segments % (uint32_t)inject == 0)
         why = "injected (RECOMP_DEBUG=pb_inject_stop)";
 
+    /* The header in progress and the two switches in locals for the walk:
+     * as statics, every word reloads them after the executor's call, which
+     * the compiler must assume can change them. The header
+     * carries over to the next walk through the statics. */
+    uint32_t left = s_left, subch = s_subch, method = s_method;
+    int noninc = s_noninc, exec_on = s_exec_enabled, scan_on = s_scan_enabled;
     /* Bounded at 4 MB of words, a sane single-frame amount: GET that never
      * reaches PUT is a stream this walk is out of step with. */
     while (!why && va != end_va) {
@@ -366,14 +372,14 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         va += 4;
         words++;
 
-        if (s_left) {                         /* a parameter */
+        if (left) {                           /* a parameter */
             /* Same walk, two consumers: the survey counts, the executor
              * acts. Keeping them on one decode means they can never
              * disagree about what the stream said. Only the survey reads
              * the counts (nv2a_pb_scan_report), and under Wine the count
              * costs ~1 ms of a 10k-batch frame, so it runs only then. */
-            if (s_scan_enabled)
-                note(s_subch, s_method);
+            if (scan_on)
+                note(subch, method);
             /* The rest of the header's words in one call where the
              * executor can take them as a run (nv2a_pb_exec_run), bounded
              * as the word-by-word walk would stop: at PUT when it lies
@@ -381,9 +387,9 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
              * survey, which counts every word. Only Kelvin's transform
              * program and constant windows (0x0B00-0x0BFF) run, so the
              * inline arrays and vertex data skip the call per word. */
-            else if (s_exec_enabled && s_left > 1 && s_subch == 0
-                     && s_method >= 0x0B00 && s_method < 0x0C00) {
-                uint32_t n = s_left, room, done;
+            else if (exec_on && left > 1 && subch == 0
+                     && method >= 0x0B00 && method < 0x0C00) {
+                uint32_t n = left, room, done;
                 uint64_t t;
                 if (end_va > at && n > (end_va - at) / 4)
                     n = (end_va - at) / 4;
@@ -393,32 +399,32 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
                 if (n > 0x100000u - words + 1u)
                     n = 0x100000u - words + 1u;
                 t = nv2a_pb_cost_start();
-                done = nv2a_pb_exec_run(s_subch, s_method, s_noninc,
+                done = nv2a_pb_exec_run(subch, method, noninc,
                                         (const uint32_t *)(mem + at), n);
                 if (done) {
                     if (t) {
                         nv2a_pb_cost_add(t, NV2A_COST_D_EXEC);
-                        nv2a_pb_cost_method(s_subch, s_method, t);
+                        nv2a_pb_cost_method(subch, method, t);
                     }
                     va = at + 4 * done;
                     words += done - 1;
-                    if (!s_noninc)
-                        s_method += 4 * done;
-                    s_left -= done;
+                    if (!noninc)
+                        method += 4 * done;
+                    left -= done;
                     continue;
                 }
             }
-            if (s_exec_enabled) {
+            if (exec_on) {
                 uint64_t t = nv2a_pb_cost_start();
-                nv2a_pb_exec_method(s_subch, s_method, w);
+                nv2a_pb_exec_method(subch, method, w);
                 if (t) {
                     nv2a_pb_cost_add(t, NV2A_COST_D_EXEC);
-                    nv2a_pb_cost_method(s_subch, s_method, t);
+                    nv2a_pb_cost_method(subch, method, t);
                 }
             }
-            if (!s_noninc)
-                s_method += 4;
-            s_left--;
+            if (!noninc)
+                method += 4;
+            left--;
             continue;
         }
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
@@ -448,7 +454,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         if ((w & 0xE0030003u) == 0u || (w & 0xE0030003u) == 0x40000000u) {
             /* Only when the walk executes: a survey (RECOMP_PB_SCAN alone)
              * has drawn nothing for GET or an ack to stand for. */
-            if (s_checkpoint && s_exec_enabled > 0 && !in_call
+            if (s_checkpoint && exec_on > 0 && !in_call
                 && words - ckpt_words >= NV2A_PB_CHECKPOINT_WORDS) {
                 uint64_t t = nv2a_pb_cost_start();
                 ckpt_words = words;
@@ -457,16 +463,20 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             }
             if (!in_call)
                 s_top_va = at;
-            s_left   = (w >> 18) & 0x7FFu;
-            s_subch  = (w >> 13) & 7u;
-            s_method =  w & 0x1FFCu;
-            s_noninc = (w & 0xE0000000u) == 0x40000000u;
+            left   = (w >> 18) & 0x7FFu;
+            subch  = (w >> 13) & 7u;
+            method =  w & 0x1FFCu;
+            noninc = (w & 0xE0000000u) == 0x40000000u;
             continue;
         }
         unknown++;
         why = "unknown word";
         break;
     }
+    s_left = left;
+    s_subch = subch;
+    s_method = method;
+    s_noninc = noninc;
     s_in_call = 0;
     /* The walk's reports, before GET moves or a stop's salvage releases a
      * semaphore: the title may read them once either happens. */
