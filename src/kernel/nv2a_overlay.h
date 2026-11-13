@@ -171,6 +171,23 @@ const char *nv2a_overlay_game(void);
 
 /* Bit (1 << layer) per visible layer. One relaxed load. */
 uint32_t nv2a_overlay_visible(void);
+/* Whether the visible layers (a nv2a_overlay_visible() mask) want the
+ * output's own pixels: under present.surface=internal the presenter then
+ * draws at the output size instead of the frame's, so they are not
+ * resampled by the compositor. Only the menu does: it is open a
+ * short while and read closely. The stats strip, the pad-recording strip,
+ * toasts and status panels show in play, and holding the output for them
+ * would turn Steam's scaling and FSR off for as long as they are up. */
+int nv2a_overlay_wants_output(uint32_t visible);
+/* How long the output stays held after the menu closes. Closing the menu
+ * often shows a toast at once ("Saved") or reopens it; each switch of the
+ * surface costs a D3D11 swap chain resize, so a short tail keeps one hold
+ * across them. */
+#define NV2A_OVL_HOLD_MS 1500.0
+/* nv2a_overlay_wants_output with that tail: 1 while the menu is visible
+ * and for NV2A_OVL_HOLD_MS after it was last seen. *until is the caller's
+ * state (0 at start), now_ms any monotonic clock in ms. */
+int nv2a_overlay_hold_output(uint32_t visible, double now_ms, double *until);
 
 /* Composes STATS and TOAST when due, from the last placement. Returns a
  * value that moves whenever what the overlay would draw moves (a publish

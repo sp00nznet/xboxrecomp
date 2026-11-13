@@ -106,6 +106,14 @@ void d3d11_host_set_client_size(unsigned w, unsigned h, int framed);
 void d3d11_host_popup(int x, int y, unsigned w, unsigned h);
 /* Back to a framed window at its size and place (the popup's undo). */
 void d3d11_host_framed(void);
+/* The window as it is (style, placement, client size), kept for
+ * d3d11_host_hold_restore: the output surface's hold puts back
+ * exactly what it found, not a size worked out again from the frame. */
+void d3d11_host_hold_save(void);
+/* Back to what d3d11_host_hold_save kept. restyle 0 (gamescope, which
+ * shows only the client area): the style stays as it is, only the client
+ * size comes back, so no frame change is made. */
+void d3d11_host_hold_restore(int restyle);
 /* present.fullscreen switched live: borderless over the monitor (internal:
  * at fw x fh), or framed back where it was (internal, or never framed: a
  * client area of fw x fh or dw x dh). */

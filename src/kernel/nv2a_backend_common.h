@@ -2461,6 +2461,17 @@ int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t d
 int nv2a_present_chain_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
                             int filter, int surface_internal, struct nv2a_rect *r);
 
+/* present.surface=internal while the menu holds the output-sized surface
+ * (nv2a_overlay_wants_output): the filter the frame is drawn
+ * with so it stays where the compositor showed it a present earlier, an
+ * aspect fit, never INTEGER (a 640x480 frame on 800 lines would sit at 1x
+ * in the middle). Under a compositor (gamescope) LINEAR, its own scaler's
+ * look; else the Metal layer's rule: NEAREST stays nearest, the rest are
+ * LINEAR. down: the frame is larger than the output (render.scale 3 on a
+ * 1280x800 screen), where NEAREST would drop whole host rows and columns:
+ * LINEAR too. */
+int nv2a_present_held_filter(int filter, int compositor, int down);
+
 /* present.shader: the chain's input for a frame of host size hw x hh at
  * render scale n. A preset that draws one scanline per source line (lines:
  * a CRT) gets the guest's line count, hh / n rows of the whole host width,

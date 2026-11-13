@@ -384,20 +384,71 @@ void d3d11_host_monitor_rect(int *x, int *y, unsigned *w, unsigned *h)
     *h = (unsigned)(r.bottom - r.top);
 }
 
+/* The frame comes from the window's own style: under gamescope the window
+ * stays WS_POPUP after the menu's first hold, and an overlapped frame added
+ * to a popup made a 1067x800 client a 1083x839 window, past the Deck's 800
+ * lines (the off-screen bottom). */
 void d3d11_host_set_client_size(unsigned w, unsigned h, int framed)
 {
     RECT r = {0, 0, (LONG)w, (LONG)h};
-    if (framed)
-        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    LONG_PTR st = GetWindowLongPtrW(s_hwnd, GWL_STYLE);
+    if (framed && !(st & WS_POPUP))
+        AdjustWindowRect(&r, (DWORD)st & ~(DWORD)WS_VISIBLE, FALSE);
     SetWindowPos(s_hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+/* A window already borderless (a gamescope run after the first hold,
+ * present.fullscreen) is only moved and sized: a style change and
+ * SWP_FRAMECHANGED make Wine rebuild the X window's frame, the bulk of the
+ * switch's cost under Proton. */
 void d3d11_host_popup(int x, int y, unsigned w, unsigned h)
 {
-    SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_POPUP | WS_VISIBLE));
-    SetWindowPos(s_hwnd, HWND_TOP, x, y, (int)w, (int)h,
-                 SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    UINT fl = SWP_SHOWWINDOW;
+    if (!(GetWindowLongPtrW(s_hwnd, GWL_STYLE) & WS_POPUP)) {
+        SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_POPUP | WS_VISIBLE));
+        fl |= SWP_FRAMECHANGED;
+    }
+    SetWindowPos(s_hwnd, HWND_TOP, x, y, (int)w, (int)h, fl);
+}
+
+static LONG_PTR s_hold_style;
+static WINDOWPLACEMENT s_hold_place;
+static RECT s_hold_rect;
+static int s_hold_saved;
+
+void d3d11_host_hold_save(void)
+{
+    s_hold_style = GetWindowLongPtrW(s_hwnd, GWL_STYLE);
+    s_hold_place.length = sizeof s_hold_place;
+    s_hold_saved = GetWindowPlacement(s_hwnd, &s_hold_place)
+                && GetClientRect(s_hwnd, &s_hold_rect);
+}
+
+void d3d11_host_hold_restore(int restyle)
+{
+    if (!s_hold_saved)
+        return;
+    s_hold_saved = 0;
+    if (!restyle) {
+        /* The client area back to its size: under a borderless style the
+         * window is the client area. */
+        RECT r = s_hold_rect;
+        if (!(GetWindowLongPtrW(s_hwnd, GWL_STYLE) & WS_POPUP))
+            AdjustWindowRect(&r, (DWORD)GetWindowLongPtrW(s_hwnd, GWL_STYLE), FALSE);
+        SetWindowPos(s_hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return;
+    }
+    /* The style first, so the placement sizes the window it had. */
+    if (GetWindowLongPtrW(s_hwnd, GWL_STYLE) != s_hold_style) {
+        SetWindowLongPtrW(s_hwnd, GWL_STYLE, s_hold_style);
+        SetWindowPlacement(s_hwnd, &s_hold_place);
+        SetWindowPos(s_hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                     | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    } else {
+        SetWindowPlacement(s_hwnd, &s_hold_place);
+    }
 }
 
 void d3d11_host_framed(void)

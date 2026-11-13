@@ -496,10 +496,12 @@ static struct ovl_set *ovl_set(const struct nv2a_ovl_list *l, id<MTLCommandBuffe
     return o;
 }
 
-/* The lists over the frame at r, in a drawable of dw x dh. */
+/* The lists over the frame at r, in a drawable of dw x dh. edge: the
+ * present starts or ends the menu's hold (or holds), so the drawable may
+ * have changed shape since the lists were laid out. */
 static void ovl_draw(id<MTLRenderCommandEncoder> enc, id<MTLCommandBuffer> cb,
                      const struct nv2a_ovl_list *const *ls, int nls, struct nv2a_rect r,
-                     int dw, int dh)
+                     int dw, int dh, int edge)
 {
     int i;
     uint32_t c;
@@ -513,7 +515,15 @@ static void ovl_draw(id<MTLRenderCommandEncoder> enc, id<MTLCommandBuffer> cb,
         float sy = l->out_h ? (float)r.h / (float)l->out_h : 1.0f;
         float xf[4] = { sx * 2.0f / dw, -sy * 2.0f / dh,
                         r.x * 2.0f / dw - 1.0f, 1.0f - r.y * 2.0f / dh };
-        struct ovl_set *o = ovl_set(l, cb);
+        struct ovl_set *o;
+        /* A list composed for the other drawable (4:3 frame against the
+         * 16:10 window) would be stretched for this one present; its
+         * writer lays it out again for the new placement by the next
+         * (D3D11's ovl_present does the same). */
+        if (edge && l->out_w && l->out_h
+            && (sx > sy ? sx - sy > 0.01f * sx : sy - sx > 0.01f * sy))
+            continue;
+        o = ovl_set(l, cb);
         if (o) {
             [enc setVertexBuffer:o->vb offset:0 atIndex:0];
             [enc setVertexBuffer:o->ib offset:0 atIndex:1];
@@ -557,6 +567,8 @@ static PFN_libra_mtl_filter_chain_frame s_chain_ff;   /* with the chain */
 static PFN_libra_mtl_filter_chain_set_param s_chain_sp;
 static unsigned s_chain_pgen;       /* the parameter generation applied */
 static int s_chain_ov_said;
+static double s_menu_until;         /* the menu's hold of the window's pixels */
+static int s_menu_held;             /* the last present was held by the menu */
 static int s_chain_lines;           /* the preset draws per source line */
 static int s_chain_said;            /* the chain's first frame said how it was fed */
 /* The chain's input resolved to the guest's lines (nv2a_present_chain_source),
@@ -701,6 +713,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
 #ifdef XBOXRECOMP_ENHANCE
         libra_mtl_filter_chain_t chain = NULL;
         int chained = 0;
+        int held = 0, edge;
 
         if (nv2a_present_chain_wanted() || s_chain)
             chain = chain_get();
@@ -720,6 +733,25 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
             s_chain_ov_said = 1;
             ov = 0;
         }
+        /* The open menu draws at the window's pixels too: drawn into the
+         * frame-sized drawable it is resampled by the layer's fit, soft at
+         * render.scale 1 and different at every scale. The frame
+         * stays where the layer showed it (nv2a_present_held_filter; no
+         * compositor on the Mac). After the close and its tail
+         * (nv2a_overlay_hold_output, as D3D11) the drawable is the frame
+         * again. */
+        if (internal && nv2a_overlay_hold_output(nv2a_overlay_visible(),
+                                                 (double)SDL_GetTicksNS() / 1e6,
+                                                 &s_menu_until)) {
+            int pw = 0, ph = 0;
+            SDL_GetWindowSizeInPixels(win, &pw, &ph);
+            filter = nv2a_present_held_filter(filter, 0,
+                                              (int64_t)fw > pw || (int64_t)fh > ph);
+            internal = 0;
+            held = 1;
+        }
+        edge = held || s_menu_held;
+        s_menu_held = held;
 #endif
 
         /* Checked every present, not only on resize events: a move between
@@ -889,7 +921,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
             nv2a_overlay_set_view(0, 0, 0, 0, 0, 0);
         }
         if (nlayers && s_pso_ovl)
-            ovl_draw(enc, cb, layers, nlayers, r, dw, dh);
+            ovl_draw(enc, cb, layers, nlayers, r, dw, dh, edge);
 #else
         (void)layers;
         (void)nlayers;

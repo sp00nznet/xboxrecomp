@@ -482,6 +482,29 @@ same requests at given flips, to check a switch without the menu.
   `nearest` and linear otherwise; the macOS launcher sets no hint, so
   `auto` gives `window` there unless `RECOMP_HOST_GAMESCOPE` is set by hand. The
   SDL renderer window (the CPU backend) ignores the key with one line.
+
+  While the in-game menu is open, `internal` draws at the output size as
+  `window` does, so the menu is rasterised at the display's own pixels at
+  every `render.scale` instead of being resampled with the frame by the
+  compositor. D3D11 makes the same switch as for a shader
+  (below): a borderless window over the monitor under gamescope or
+  fullscreen, else a swap chain at the client area's size. Metal's
+  drawable follows the window. The frame is drawn where the compositor
+  showed it a moment earlier: the aspect fit, centred, never `integer`;
+  linear under gamescope or when the frame is larger than the output,
+  otherwise `nearest` stays nearest and the rest are linear. While the
+  menu is open Steam's *Scaling filter* and FSR do not apply to the frame
+  (the surface is already the output's size), and the switch at open and
+  close can cost a frame on D3D11 (a swap chain resize; the window is
+  restyled only the first time under gamescope). The hold lasts 1.5 s
+  past the close, so a quick reopen or the toast the close shows costs no
+  second switch. Then the window and the swap chain go back to exactly
+  what they were when the menu opened; a `render.scale` change made in
+  the menu resizes them at the next present. The stats strip, toasts, the pad-recording strip and mods'
+  status panels on their own keep the frame-sized surface, so FSR stays on
+  in play; they keep their size but are drawn at the frame's pixels. The
+  dxvk-native D3D11 build (Linux native) has no borderless switch yet and
+  keeps the menu at the frame's pixels.
 - **`present.shader`.** <a id="presentshader"></a>A RetroArch slang
   preset, run by [librashader](https://github.com/SnowflakePowered/librashader)
   0.12, replaces the draw that puts the frame on the screen. Its input is
@@ -1453,8 +1476,10 @@ whole back buffer or drawable (never the frame's rectangle in it), and its
 height is taken through the window's stretch (`present.surface =
 internal`) and, under gamescope, through the compositor's fit of the
 window to the screen. So `render.scale`, `present.filter` and
-`present.shader` change neither the overlay's size nor its hit areas.
-Under `present.surface = internal` on Windows the window is
+`present.shader` change neither the overlay's size nor its hit areas
+. While the menu is open under `present.surface = internal` the
+surface is the output's (see `present.surface`), so the menu is also
+drawn at the display's pixels. Under `present.surface = internal` on Windows the window is
 held to the screen (aspect kept) and the larger back buffer is stretched
 into it, so a pointer or touch reaches every part of the menu. Under `overlay.ui_fit = "display"`
 the floor is the primary display's, probed once:

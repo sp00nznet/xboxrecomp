@@ -1620,6 +1620,10 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/d3d11_host_win32.c | - | s_title_clock | file_static | keep | - | window title refresh clock, host |
 | src/d3d/d3d11_host_win32.c | - | s_client_w | file_static | keep | - | window client size from WM_SIZE |
 | src/d3d/d3d11_host_win32.c | - | s_client_h | file_static | keep | - | window client size from WM_SIZE |
+| src/d3d/d3d11_host_win32.c | - | s_hold_style | file_static | keep | - | window style at the output hold's start |
+| src/d3d/d3d11_host_win32.c | - | s_hold_place | file_static | keep | - | window placement at the output hold's start |
+| src/d3d/d3d11_host_win32.c | - | s_hold_rect | file_static | keep | - | client rect at the output hold's start |
+| src/d3d/d3d11_host_win32.c | - | s_hold_saved | file_static | keep | - | the hold's window state is saved |
 | src/d3d/d3d11_host_win32.c | d3d11_host_pump | quit_at | local_static | keep | - | bench quit deadline from env, host |
 | src/d3d/d3d11_host_win32.c | d3d11_host_pump | quit_posted | local_static | keep | - | bench quit already posted |
 | src/d3d/d3d11_host_win32.c | d3d11_host_fullscreen | s_windowed | local_static | keep | - | saved windowed placement |
@@ -1988,6 +1992,16 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_blit_cb | file_static | keep | - | present blit constant buffer |
 | src/d3d/nv2a_pb_d3d11.c | - | s_blit_failed | file_static | keep | - | present blit build failed flag |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ovl_place | file_static | keep | - | where this present placed the frame |
+| src/d3d/nv2a_pb_d3d11.c | - | s_held | file_static | keep | - | the last present held the output-sized surface |
+| src/d3d/nv2a_pb_d3d11.c | - | s_held_end | file_static | keep | - | this present ended the output hold |
+| src/d3d/nv2a_pb_d3d11.c | - | s_resize_fail_w | file_static | keep | - | width ResizeBuffers last refused, logged once |
+| src/d3d/nv2a_pb_d3d11.c | - | s_resize_fail_h | file_static | keep | - | height ResizeBuffers last refused, logged once |
+| src/d3d/nv2a_pb_d3d11.c | - | s_hold_win | file_static | keep | - | the window at the hold's start is kept (cleared by a fullscreen switch) |
+| src/d3d/nv2a_pb_d3d11.c | - | s_popup | file_static | keep | - | output_surface made the window a popup |
+| src/d3d/nv2a_pb_d3d11.c | - | s_hold_on | file_static | keep | - | output_surface holds the output-sized surface |
+| src/d3d/nv2a_pb_d3d11.c | - | s_hold_bw | file_static | keep | - | swap chain width at the hold's start |
+| src/d3d/nv2a_pb_d3d11.c | - | s_hold_bh | file_static | keep | - | swap chain height at the hold's start |
+| src/d3d/nv2a_pb_d3d11.c | d3d11_flip | s_menu_until | local_static | keep | - | end of the menu's output hold tail, host clock |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_chain | file_static | keep | - | librashader present chain |
 | src/d3d/nv2a_pb_d3d11.c | lrs_chain | said | local_static | keep | - | log-once guard (dxvk-native: no D3D11 filter chain) |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_gen | file_static | keep | - | present chain request generation applied |
@@ -2006,7 +2020,6 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_sp | file_static | constant | - | librashader set_param function pointer |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_pgen | file_static | keep | - | present chain parameter generation applied |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_ov_said | file_static | keep | - | log-once guard |
-| src/d3d/nv2a_pb_d3d11.c | chain_surface | s_popup | local_static | keep | - | window popup style state |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ovl_vs | file_static | keep | - | overlay VS |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ovl_ps | file_static | keep | - | overlay PS |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ovl_il | file_static | keep | - | overlay input layout |
@@ -3072,6 +3085,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/video/fb_present_metal.m | - | s_chain_sp | file_static | keep | - | Metal present chain and overlay |
 | src/video/fb_present_metal.m | - | s_chain_pgen | file_static | keep | - | Metal present chain and overlay |
 | src/video/fb_present_metal.m | - | s_chain_ov_said | file_static | keep | - | Metal present chain and overlay |
+| src/video/fb_present_metal.m | - | s_menu_until | file_static | keep | - | end of the menu's output hold tail, host clock |
+| src/video/fb_present_metal.m | - | s_menu_held | file_static | keep | - | the last present was held by the menu |
 | src/video/fb_present_metal.m | - | s_chain_lines | file_static | keep | - | Metal present chain and overlay |
 | src/video/fb_present_metal.m | - | s_chain_said | file_static | keep | - | Metal present chain and overlay |
 | src/video/fb_present_metal.m | - | s_chain_src | file_static | keep | - | Metal present chain and overlay |

@@ -306,6 +306,8 @@ void d3d11_host_popup(int x, int y, unsigned w, unsigned h)
 }
 
 void d3d11_host_framed(void) {}
+void d3d11_host_hold_save(void) {}
+void d3d11_host_hold_restore(int restyle) { (void)restyle; }
 
 void d3d11_host_fullscreen(int full, int internal, unsigned fw, unsigned fh,
                            unsigned dw, unsigned dh)

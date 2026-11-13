@@ -1167,7 +1167,7 @@ static void test_display_ready(void)
 static void test_shown_size(void)
 {
     struct nv2a_ovl_display deck = { 1280, 800, 1.0f, 0, 0 };
-    float a, b, c;
+    float a, b, c, d;
     int x, y;
     nv2a_overlay_reset_for_test();
     nv2a_overlay_display_mark_deck(&deck, "1");
@@ -1186,12 +1186,15 @@ static void test_shown_size(void)
         nv2a_overlay_set_view(0, 0, 1067, 800, 1920, 1440);
         nv2a_overlay_set_compositor(1067, 800);
         b = nv2a_ovl_ui_scale(1440) * 800.0f / 1440.0f;
+        nv2a_overlay_set_view(0, 0, 1067, 800, 1280, 960);
+        nv2a_overlay_set_compositor(1067, 800);
+        d = nv2a_ovl_ui_scale(960) * 800.0f / 960.0f;
         nv2a_overlay_set_view(0, 0, 0, 0, 0, 0);
         nv2a_overlay_set_compositor(1280, 800);
         c = nv2a_ovl_ui_scale(800);
-        CHECK(fabsf(a - c) < 0.01f * c && fabsf(b - c) < 0.01f * c,
-              "ui %.2f shown at rs1 %.3f, rs3 %.3f, shader %.3f", (double)mul[q], (double)a,
-              (double)b, (double)c);
+        CHECK(fabsf(a - c) < 0.01f * c && fabsf(b - c) < 0.01f * c && fabsf(d - c) < 0.01f * c,
+              "ui %.2f shown at rs1 %.3f, rs2 %.3f, rs3 %.3f, shader %.3f", (double)mul[q],
+              (double)a, (double)d, (double)b, (double)c);
     }
     nv2a_overlay_set_ui_scale(1.0f);
     c = nv2a_ovl_ui_scale(800);
@@ -1256,6 +1259,42 @@ static void test_rebake(void)
     nv2a_overlay_reset_for_test();
 }
 
+/* present.surface=internal draws at the output while the menu is open:
+ * the menu's bit alone decides, with or without the pointer
+ * and the play layers; the play layers alone never switch the surface. */
+static void test_wants_output(void)
+{
+    uint32_t menu = 1u << NV2A_OVL_MENU;
+    int l;
+
+    CHECK(!nv2a_overlay_wants_output(0), "nothing visible");
+    for (l = 0; l < NV2A_OVL_COUNT; l++) {
+        uint32_t b = 1u << l;
+        CHECK(nv2a_overlay_wants_output(b) == (l == NV2A_OVL_MENU),
+              "layer %d alone", l);
+        CHECK(nv2a_overlay_wants_output(b | menu), "layer %d with the menu", l);
+    }
+    CHECK(!nv2a_overlay_wants_output(((1u << NV2A_OVL_COUNT) - 1) & ~menu),
+          "every play layer");
+}
+
+/* The hold's tail (NV2A_OVL_HOLD_MS): a toast right after the menu closes,
+ * or a quick reopen, keeps the one hold; play layers alone never start
+ * one, and the tail ends. */
+static void test_hold_output(void)
+{
+    uint32_t menu = 1u << NV2A_OVL_MENU, toast = 1u << NV2A_OVL_TOAST;
+    double until = 0;
+
+    CHECK(!nv2a_overlay_hold_output(toast, 100.0, &until), "a toast alone");
+    CHECK(nv2a_overlay_hold_output(menu, 1000.0, &until), "menu open");
+    CHECK(nv2a_overlay_hold_output(toast, 1100.0, &until), "toast after close");
+    CHECK(nv2a_overlay_hold_output(0, 1000.0 + NV2A_OVL_HOLD_MS - 1.0, &until), "tail");
+    CHECK(!nv2a_overlay_hold_output(toast, 1000.0 + NV2A_OVL_HOLD_MS, &until), "tail over");
+    CHECK(nv2a_overlay_hold_output(menu, 5000.0, &until), "reopen");
+    CHECK(nv2a_overlay_hold_output(0, 5000.0 + NV2A_OVL_HOLD_MS / 2, &until), "reopen tail");
+}
+
 int main(void)
 {
     s_ref_out = getenv("OVERLAY_REF_OUT");
@@ -1274,6 +1313,8 @@ int main(void)
     test_display_scale();
     test_display_ready();
     test_shown_size();
+    test_wants_output();
+    test_hold_output();
     test_rebake();
     nv2a_overlay_reset_for_test();
     if (fails) {

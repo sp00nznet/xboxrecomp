@@ -5575,6 +5575,8 @@ static int blit_init(void)
 
 /* Resize the swap chain to cw x ch (FLIP_DISCARD keeps no contents worth
  * keeping) and re-read the back buffer's size. */
+static UINT s_resize_fail_w, s_resize_fail_h;   /* the size ResizeBuffers last refused */
+
 static void swap_resize(UINT cw, UINT ch)
 {
     HRESULT hr;
@@ -5590,14 +5592,22 @@ static void swap_resize(UINT cw, UINT ch)
         s_back = NULL;
     }
     hr = IDXGISwapChain_ResizeBuffers(s_swap, 0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
-    if (FAILED(hr))
+    /* Said once per size: output_surface retries every flip while it
+     * fails, and a line per flip would bury the log. */
+    if (FAILED(hr) && (cw != s_resize_fail_w || ch != s_resize_fail_h))
         fprintf(stderr, LOGP "ResizeBuffers %ux%u hr=0x%08lX\n", cw, ch, (unsigned long)hr);
+    s_resize_fail_w = FAILED(hr) ? cw : 0;
+    s_resize_fail_h = FAILED(hr) ? ch : 0;
     IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&s_back);
     if (s_back) {
         D3D11_TEXTURE2D_DESC td;
         ID3D11Texture2D_GetDesc(s_back, &td);
         s_back_w = td.Width;
         s_back_h = td.Height;
+    } else {
+        /* No buffer: no size either, so the next caller that compares
+         * sizes (output_surface, present_resize) tries again. */
+        s_back_w = s_back_h = 0;
     }
 }
 
@@ -5692,6 +5702,23 @@ static void present_extent(RenderTarget *rt, UINT *w, UINT *h)
  * point-sampled for integer as Metal's internal present is. */
 #ifdef XBOXRECOMP_ENHANCE
 static struct nv2a_rect s_ovl_place;    /* where this present put the frame; 0x0: nothing copied */
+static int s_held;                      /* the last present held the output (output_surface) */
+static int s_held_end;                  /* this present ended a hold */
+static int s_hold_win;                  /* output_surface kept the window at the hold's start */
+#endif
+
+#ifdef XBOXRECOMP_ENHANCE
+/* The held blit shrinks the frame: the part of rt a flip shows (cw x ch
+ * guest pixels, at rt's host scale) is larger than the back buffer on
+ * either axis, so the aspect fit scales it below 1. A grown target's
+ * margin is not shown and does not count. */
+static int held_down(const RenderTarget *rt, UINT cw, UINT ch)
+{
+    if (!rt->w || !rt->h)
+        return 0;
+    return (uint64_t)cw * rt->hw > (uint64_t)rt->w * s_back_w
+        || (uint64_t)ch * rt->hh > (uint64_t)rt->h * s_back_h;
+}
 #endif
 static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int internal)
 {
@@ -5913,31 +5940,78 @@ static void lrs_set_param(void *ctx, const char *name, float v)
         nv2a_present_chain_error(e, msg, sizeof msg);
 }
 
-/* While a chain is wanted under present.surface=internal the surface is
- * the output, not the frame. The chain draws its mask and scanlines per
- * output pixel; drawn into a frame-sized surface and scaled after by the
- * compositor (gamescope on the Deck: 640x480 to 1280x800, bilinear), they
- * are resampled into colour fringes and moire. Under gamescope or
- * present.fullscreen a borderless window covers the monitor and the swap
- * chain takes its size; otherwise the swap chain follows the client area as
- * under window. With the chain off the window style comes back and
- * internal_resize returns the frame's size. present.surface=window already
- * draws at the client size (present_resize). Returns 1 while the surface is
- * the output. */
-static int chain_surface(int on, int internal)
+static int s_popup;                     /* output_surface made the window a popup */
+static int s_hold_on;                   /* output_surface holds the output */
+static UINT s_hold_bw, s_hold_bh;       /* the swap chain at the hold's start */
+
+/* The hold's end: exactly the window and swap chain the hold found, not a
+ * size worked out again from the frame. internal_resize leaves a frame
+ * cropped from a grown target (rt_grow) alone, so a size derived after
+ * the hold kept the output's 1280x800 and stretched the 4:3 frame to
+ * 16:10 until the next render.scale change; and a window the player sized
+ * under present.surface=internal must not snap back to the frame's size.
+ * A render.scale change made during the hold is internal_resize's, on the
+ * next present. Under gamescope the style stays borderless (only the
+ * client area is shown, and a restyle is most of the switch's cost). */
+static void output_release(void)
 {
-    static int s_popup;
+    const struct nv2a_host_opts *eo = nv2a_host_opts();
+    double t0 = d3d11_host_now_ms(), t1;
+
+    if (s_popup && s_hold_win) {
+        d3d11_host_hold_restore(!recomp_env_on(RENV_HOST_GAMESCOPE));
+    } else if (!s_hold_win) {
+        /* present.fullscreen changed during the hold (fullscreen_switch
+         * then sized the window for the output): the window the frame's
+         * size gets under the new mode. */
+        UINT fw, fh;
+        internal_client(s_hold_bw, s_hold_bh, &fw, &fh);
+        d3d11_host_fullscreen(eo->fullscreen, 1, fw, fh, nv2a_host_window_w(640, 480, 1), 480);
+    }
+    t1 = d3d11_host_now_ms();
+    if (s_hold_bw && s_hold_bh && (s_hold_bw != s_back_w || s_hold_bh != s_back_h))
+        swap_resize(s_hold_bw, s_hold_bh);
+    fprintf(stderr, LOGP "output surface released: back buffer %ux%u"
+            " (window %.1f ms, swap chain %.1f ms)\n", s_back_w, s_back_h, t1 - t0,
+            d3d11_host_now_ms() - t1);
+    s_popup = 0;
+    s_hold_on = 0;
+}
+
+/* While a chain is built or the menu is open (nv2a_overlay_hold_output,
+ * with a short tail after it closes) under present.surface=internal the
+ * surface is the output, not the frame. The chain draws its mask and
+ * scanlines per output pixel, the menu its text; drawn into a frame-sized
+ * surface and scaled after by the compositor (gamescope on the Deck:
+ * 640x480 to 1280x800, bilinear), the one is resampled into colour fringes
+ * and moire, the other is soft at render.scale 1 and changes with every
+ * scale. Under gamescope or present.fullscreen a borderless
+ * window covers the monitor and the swap chain takes its size; otherwise
+ * the swap chain follows the client area as under window. At the end
+ * output_release puts back what the hold found. Each switch logs its cost,
+ * split into the window's and the swap chain's. present.surface=window
+ * already draws at the client size (present_resize). Returns 1 while the
+ * surface is the output. */
+static int output_surface(int on, int internal)
+{
     const struct nv2a_host_opts *eo = nv2a_host_opts();
     int over = recomp_env_on(RENV_HOST_GAMESCOPE) || eo->fullscreen;
+    double t0 = d3d11_host_now_ms(), t1;
     UINT w, h;
 
-    d3d11_host_client_size(&w, &h);
     if (!on || !internal) {
-        if (s_popup && !eo->fullscreen)
-            d3d11_host_framed();
-        s_popup = 0;
+        if (s_hold_on)
+            output_release();
         return 0;
     }
+    if (!s_hold_on) {
+        s_hold_bw = s_back_w;
+        s_hold_bh = s_back_h;
+        d3d11_host_hold_save();
+        s_hold_win = 1;
+        s_hold_on = 1;
+    }
+    d3d11_host_client_size(&w, &h);
     if (over) {
         int x, y;
         d3d11_host_monitor_rect(&x, &y, &w, &h);
@@ -5946,14 +6020,18 @@ static int chain_surface(int on, int internal)
             s_popup = 1;
         }
     }
+    t1 = d3d11_host_now_ms();
     if (w && h && (w != s_back_w || h != s_back_h)) {
         unsigned crw, crh;
         swap_resize(w, h);
+        if (!s_back)
+            return 1;           /* swap_resize said it, once */
         /* The client area beside it: a window the compositor sees at
          * another size than the swap chain is scaled by it. */
         d3d11_host_client_rect(&crw, &crh);
         fprintf(stderr, "[SHADER] present.shader: back buffer %ux%u (the output's size),"
-                " client %ldx%ld\n", s_back_w, s_back_h, (long)crw, (long)crh);
+                " client %ldx%ld (window %.1f ms, swap chain %.1f ms)\n", s_back_w, s_back_h,
+                (long)crw, (long)crh, t1 - t0, d3d11_host_now_ms() - t1);
     }
     return 1;
 }
@@ -6247,7 +6325,9 @@ static void *lrs_chain(void)
     return NULL;
 }
 
-static int chain_surface(int on, int internal)
+/* No popup on the SDL host (d3d11_host_popup is a no-op there): the
+ * surface stays the frame, the menu at its pixels (the hold's follow-up). */
+static int output_surface(int on, int internal)
 {
     (void)on; (void)internal;
     return 0;
@@ -6497,6 +6577,16 @@ static void ovl_present(void)
         float xf[4] = { sx * 2.0f / (float)s_back_w, -sy * 2.0f / (float)s_back_h,
                         (float)r.x * 2.0f / (float)s_back_w - 1.0f,
                         1.0f - (float)r.y * 2.0f / (float)s_back_h };
+#ifdef XBOXRECOMP_ENHANCE
+        /* The first present of a hold has the menu's list composed for the
+         * frame-sized surface (4:3) on the output's (16:10 on the Deck), and
+         * the present that ends it the other way round: skipped rather than
+         * stretched for that one present. Its writer rebuilds it for the
+         * new placement by the next one. */
+        if ((s_held || s_held_end) && l->out_w && l->out_h
+            && (sx > sy ? sx - sy > 0.01f * sx : sy - sx > 0.01f * sy))
+            continue;
+#endif
         if (!ovl_fill(&s_ovl_vb, &s_ovl_vb_cap, D3D11_BIND_VERTEX_BUFFER, l->vtx,
                       l->nvtx * (UINT)sizeof *l->vtx)
             || !ovl_fill(&s_ovl_ib, &s_ovl_ib_cap, D3D11_BIND_INDEX_BUFFER, l->idx,
@@ -6918,16 +7008,35 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
         UINT cw, ch;
         int same;
         int internal = eo->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
+        int filter = eo->present_filter;
         present_extent(s_drawn, &cw, &ch);
         s_shown_w = cw;
         s_shown_h = ch;
 #ifdef XBOXRECOMP_ENHANCE
-        /* A shader draws at the output: everything below is as under
-         * present.surface=window. Gated on a built chain, as Metal: a
-         * missing library or preset must not flash a monitor-sized popup
-         * for the one flip its build takes to fail. */
-        if (chain_surface(nv2a_present_chain_wanted() && lrs_chain(), internal))
-            internal = 0;
+        /* A shader or the open menu draws at the output: everything below
+         * is as under present.surface=window. Gated on a built chain, as
+         * Metal: a missing library or preset must not flash a
+         * monitor-sized popup for the one flip its build takes to fail.
+         * The menu alone blits the frame where the compositor showed it
+         * (nv2a_present_held_filter); a chain has its own rule. */
+        {
+            static double s_menu_until;
+            int menu = nv2a_overlay_hold_output(nv2a_overlay_visible(), d3d11_host_now_ms(),
+                                                &s_menu_until);
+            int chain = nv2a_present_chain_wanted() && lrs_chain();
+            if (output_surface(chain || menu, internal)) {
+                if (!chain)
+                    filter = nv2a_present_held_filter(filter,
+                                                      recomp_env_on(RENV_HOST_GAMESCOPE),
+                                                      held_down(s_drawn, cw, ch));
+                internal = 0;
+                s_held = 1;
+                s_held_end = 0;
+            } else {
+                s_held_end = s_held;
+                s_held = 0;
+            }
+        }
 #endif
         if (internal)
             internal_resize(s_drawn, cw, ch);
@@ -6938,7 +7047,7 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
          * scale > 1 too (the compositor gets the scaled frame whole). */
         /* A display.overscan crop always blits: a copy shows the edges. */
         int blit = !stock && (eo->overscan
-                || !(same && (eo->present_filter != NV2A_PRESENT_LINEAR || internal)));
+                || !(same && (filter != NV2A_PRESENT_LINEAR || internal)));
 #ifdef XBOXRECOMP_ENHANCE
         /* present.shader: the chain reads the whole frame, so a display.overscan
          * crop has no place in it. */
@@ -6962,7 +7071,7 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
             if (!said_nb++)
                 fprintf(stderr, LOGP "no back buffer (resize failed): frame not shown\n");
         } else if (blit) {
-            present_blit(s_drawn, eo->present_filter, eo->overscan, internal);
+            present_blit(s_drawn, filter, eo->overscan, internal);
             s_dump_rt = 1;
         } else if (same) {
             ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_back,
@@ -7131,11 +7240,14 @@ static void fullscreen_switch(int full)
     int internal = nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
 
 #ifdef XBOXRECOMP_ENHANCE
-    /* With a chain the back buffer is the output's size (chain_surface),
-     * not the frame's: the switch goes as under present.surface=window, or
-     * leaving fullscreen would keep a monitor-sized window. */
-    if (s_lrs_chain)
+    /* With a chain or the open menu the back buffer is the output's size
+     * (output_surface), not the frame's: the switch goes as under
+     * present.surface=window, or leaving fullscreen would keep a
+     * monitor-sized window. */
+    if (s_held) {
         internal = 0;
+        s_hold_win = 0;         /* output_release sizes the window for the new mode */
+    }
 #endif
     if (internal)
         internal_client(s_back_w, s_back_h, &fw, &fh);

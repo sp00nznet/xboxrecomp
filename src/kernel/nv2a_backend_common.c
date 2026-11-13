@@ -1629,6 +1629,13 @@ int nv2a_present_chain_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint
     return nv2a_present_rect(src_w, src_h, dst_w, dst_h, filter, r);
 }
 
+int nv2a_present_held_filter(int filter, int compositor, int down)
+{
+    if (!compositor && !down && filter == NV2A_PRESENT_NEAREST)
+        return NV2A_PRESENT_NEAREST;
+    return NV2A_PRESENT_LINEAR;
+}
+
 void nv2a_present_chain_source(uint32_t hw, uint32_t hh, unsigned n, int lines,
                                uint32_t *sw, uint32_t *sh)
 {

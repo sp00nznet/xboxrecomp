@@ -515,6 +515,20 @@ uint32_t nv2a_overlay_visible(void)
     return __atomic_load_n(&s_visible, __ATOMIC_RELAXED);
 }
 
+int nv2a_overlay_wants_output(uint32_t visible)
+{
+    return (visible & (1u << NV2A_OVL_MENU)) != 0;
+}
+
+int nv2a_overlay_hold_output(uint32_t visible, double now_ms, double *until)
+{
+    if (nv2a_overlay_wants_output(visible)) {
+        *until = now_ms + NV2A_OVL_HOLD_MS;
+        return 1;
+    }
+    return *until > 0 && now_ms < *until;
+}
+
 const struct nv2a_ovl_list *nv2a_overlay_acquire(enum nv2a_overlay_layer l)
 {
     struct layer *y = &s_layer[l];

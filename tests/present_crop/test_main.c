@@ -181,6 +181,38 @@ int main(void)
         CHECK(sh == 1441);
     }
 
+    /* The menu holds the output under present.surface=internal:
+     * the frame goes where the compositor (gamescope, the Metal layer)
+     * fitted the frame-sized surface a present earlier. Never integer, so
+     * render.scale 1, 2 and 3 all land on the same 1067x800 fit on the
+     * Deck's 1280x800, under every present.filter. */
+    {
+        static const int filters[] = {NV2A_PRESENT_NEAREST, NV2A_PRESENT_LINEAR,
+                                      NV2A_PRESENT_INTEGER};
+        struct nv2a_rect hr;
+        unsigned i, k;
+
+        CHECK(nv2a_present_held_filter(NV2A_PRESENT_NEAREST, 1, 0) == NV2A_PRESENT_LINEAR);
+        CHECK(nv2a_present_held_filter(NV2A_PRESENT_LINEAR, 1, 0) == NV2A_PRESENT_LINEAR);
+        CHECK(nv2a_present_held_filter(NV2A_PRESENT_INTEGER, 1, 0) == NV2A_PRESENT_LINEAR);
+        CHECK(nv2a_present_held_filter(NV2A_PRESENT_NEAREST, 0, 0) == NV2A_PRESENT_NEAREST);
+        CHECK(nv2a_present_held_filter(NV2A_PRESENT_LINEAR, 0, 0) == NV2A_PRESENT_LINEAR);
+        CHECK(nv2a_present_held_filter(NV2A_PRESENT_INTEGER, 0, 0) == NV2A_PRESENT_LINEAR);
+        /* A frame larger than the output: nearest would drop host rows. */
+        CHECK(nv2a_present_held_filter(NV2A_PRESENT_NEAREST, 0, 1) == NV2A_PRESENT_LINEAR);
+        CHECK(nv2a_present_held_filter(NV2A_PRESENT_LINEAR, 0, 1) == NV2A_PRESENT_LINEAR);
+        for (k = 1; k <= 3; k++) {
+            for (i = 0; i < 3; i++) {
+                int comp;
+                for (comp = 0; comp <= 1; comp++) {
+                    int hf = nv2a_present_held_filter(filters[i], comp, k > 1);
+                    whole = nv2a_present_rect(640 * k, 480 * k, 1280, 800, hf, &hr);
+                    CHECK(whole == 0 && rect_is(&hr, 106, 0, 1067, 800));
+                }
+            }
+        }
+    }
+
     printf("present_crop: ok\n");
     return 0;
 }
