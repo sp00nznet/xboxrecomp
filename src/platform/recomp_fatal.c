@@ -3,6 +3,7 @@
  * (recomp_fatal.h).
  */
 #include "recomp_fatal.h"
+#include "recomp_stdio.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -224,6 +225,20 @@ static LONG WINAPI fatal_filter(PEXCEPTION_POINTERS ep)
             *at++ = num[--k];
     }
     *at = 0;
+    /* Where the streams are buffered (recomp_stdio.h), the lines still held
+     * go out first, so the log keeps its order and the last lines before the
+     * death. After a stack overflow the few KB of stack left would not carry
+     * the CRT's write, so the backstop thread writes them, bounded in case
+     * this thread died holding a stream's lock. Not at all when this thread
+     * died inside the flush: the stream is mid-write. */
+    if (recomp_stdio_flushing_here()) {
+        /* nothing: see above */
+    } else if (code == 0xC00000FDu) {
+        recomp_stdio_flush_from_backstop(250);
+    } else {
+        fflush(stdout);
+        fflush(stderr);
+    }
     recomp_fatal_format(line, sizeof line, what,
                         recomp_fatal_exception_name(code),
                         ep && ep->ExceptionRecord
@@ -242,6 +257,8 @@ static void fatal_abort(int sig)
     (void)sig;
     if (InterlockedExchange((volatile LONG *)&s_reported, 1))
         return;
+    fflush(stdout);   /* the held lines first, as above */
+    fflush(stderr);
     recomp_fatal_format(line, sizeof line, "SIGABRT", "abort()", NULL);
     win_write(line);
     recomp_fatal_run_on_death();

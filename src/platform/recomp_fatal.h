@@ -8,13 +8,18 @@
  * integer divide by zero, a stack overflow, a breakpoint. On the Deck that
  * reads exactly like a hang, because the log simply stops. This
  * names what ended the run, on stderr, which the games point at the log
- * (RECOMP_STDIO_LOG) unbuffered, so the line is on disk before the process
- * goes.
+ * (RECOMP_STDIO_LOG). The line bypasses stdio, so it is on disk before the
+ * process goes; on Windows the buffered streams (recomp_stdio.h) are flushed
+ * first (after a stack overflow by the backstop thread, waited on up to
+ * 250 ms).
  *
  * Not covered: on Windows (and under Wine) __fastfail, which the CRT uses
  * for a failed stack cookie or an invalid parameter, and heap corruption
  * (0xC0000374) end the process without calling any exception filter, so they
- * still leave nothing. A Windows access violation gets two lines: the game's
+ * still leave nothing, and where the streams are buffered they also lose the
+ * lines held since the last flush (at most a flip, or a second with no
+ * flips). No invalid-parameter handler is installed for it: that would change
+ * what the CRT does on a bad argument. A Windows access violation gets two lines: the game's
  * [CRASH] report, then [FATAL] once nothing handled it.
  *
  * It only reports: each death still ends the process as it did before

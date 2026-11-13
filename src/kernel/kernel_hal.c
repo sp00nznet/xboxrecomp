@@ -1193,6 +1193,8 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
     xbox_kernel_summary_report("bugcheck");
+    fflush(stdout);   /* nor the CRT's flush of buffered streams */
+    fflush(stderr);
     ExitProcess(BugCheckCode);
 }
 
@@ -1216,6 +1218,8 @@ VOID __stdcall xbox_KeBugCheckEx(
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
     xbox_kernel_summary_report("bugcheck");
+    fflush(stdout);   /* nor the CRT's flush of buffered streams */
+    fflush(stderr);
     ExitProcess(BugCheckCode);
 }
 
@@ -1264,6 +1268,8 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
     /* stderr too: the kernel log file is rewritten on every run, so a title
      * that ends itself otherwise leaves no trace in the run's own log. */
     fprintf(stderr, "[EXIT] HalReturnToFirmware routine=%u\n", (unsigned)Routine);
+    fflush(stdout);   /* ExitProcess skips the CRT's flush */
+    fflush(stderr);
     ExitProcess(0);
 }
 
@@ -1271,6 +1277,8 @@ VOID __stdcall xbox_HalInitiateShutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL, "HalInitiateShutdown (exiting)");
     fprintf(stderr, "[EXIT] HalInitiateShutdown\n");
+    fflush(stdout);   /* ExitProcess skips the CRT's flush */
+    fflush(stderr);
     ExitProcess(0);
 }
 

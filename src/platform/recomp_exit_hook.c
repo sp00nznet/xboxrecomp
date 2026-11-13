@@ -47,6 +47,11 @@ void recomp_exit_hook_run(const char *why)
         if (fn != NULL)
             fn(why);
     }
+    /* The ExitProcess or TerminateProcess that follows skips the CRT's own
+     * flush, and the streams may be buffered (recomp_stdio.h): the hooks'
+     * reports and the lines before them go out here. */
+    fflush(stdout);
+    fflush(stderr);
 }
 
 static recomp_quit_fn volatile s_quit;

@@ -30,6 +30,7 @@
 #include "xbe_sections.h"
 #include "platform/host_time.h"
 #include "platform/recomp_fatal.h"   /* the watchdog runs the last words */
+#include "platform/recomp_stdio.h"   /* the watchdog's bounded flush */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2651,9 +2652,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * with the completed fence, so two hosts' logs can be lined up
                  * by time and by GPU progress (Proton's fence was seen
                  * advancing ~100x slower than macOS's). */
-                /* One write for the whole line: stderr is unbuffered, so
-                 * four calls were four writes, each of which another
-                 * thread's line could land between. */
+                /* One write for the whole line: on an unbuffered stderr
+                 * (a console, POSIX) four calls were four writes, each of
+                 * which another thread's line could land between. */
                 if (s_nv2a_trace) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
@@ -3826,7 +3827,11 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
         if (hi + lo)
             fprintf(stderr, "  [FILE] missing at watchdog: %u high, %u low\n",
                     (unsigned)hi, (unsigned)lo);
-        fflush(stderr);
+        /* What the buffered streams hold (recomp_stdio.h), stdout then
+         * stderr, written by the backstop thread and waited on a bounded
+         * time: the wedged thread may hold a stream's lock, and _exit must
+         * still come. */
+        recomp_stdio_flush_from_backstop(250);
     }
     /* And the debug writers' last words (the store trace's rings). */
     recomp_fatal_run_on_death();

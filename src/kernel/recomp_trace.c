@@ -7,8 +7,11 @@
  * with three unresolved symbols and no hint that the fix was to go and copy a
  * file. They belong with the runtime that declares them.
  *
- * Output goes to stderr, unbuffered, because the question tracing answers is
- * usually "what was the last thing that happened before it died".
+ * Output goes to stderr because the question tracing answers is usually
+ * "what was the last thing that happened before it died". On a console and
+ * on POSIX it is unbuffered; a Windows log file is written once a flip and
+ * flushed by every crash and exit report (recomp_stdio.h), so only a death
+ * no handler sees (__fastfail, a stack overflow) loses the last lines.
  */
 
 #include <stdio.h>

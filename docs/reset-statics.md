@@ -2865,6 +2865,20 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/platform/recomp_fatal.c | - | s_on_death | file_static | keep | - | crash handler: last-words callbacks |
 | src/platform/recomp_fatal.c | - | s_died | file_static | keep | - | crash handler: last words run once per process |
 
+### src/platform/recomp_stdio.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/platform/recomp_stdio.c | - | s_marked | file_static | keep | - | host stdio: the buffered streams |
+| src/platform/recomp_stdio.c | - | s_buf | file_static | keep | - | host stdio: their buffers |
+| src/platform/recomp_stdio.c | - | s_nmarked | file_static | keep | - | host stdio: the buffered streams |
+| src/platform/recomp_stdio.c | - | s_any | file_static | keep | - | host stdio: whether the flush a flip has work |
+| src/platform/recomp_stdio.c | - | s_last_ms | file_static | keep | - | host stdio: the backstop's last flush |
+| src/platform/recomp_stdio.c | - | s_flusher | file_static | keep | - | host stdio: the thread inside the flush |
+| src/platform/recomp_stdio.c | - | s_kick | file_static | keep | - | host stdio: the backstop's flush request |
+| src/platform/recomp_stdio.c | - | s_done | file_static | keep | - | host stdio: the backstop's reply |
+| src/platform/recomp_stdio.c | recomp_stdio_buffer | done | local_static | keep | - | no rerun: the streams keep their buffers |
+
 ### src/platform/win32_compat.c
 
 | file | scope | name | kind | class | hook | why |

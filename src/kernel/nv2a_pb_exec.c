@@ -29,6 +29,7 @@
 #include "pb_backend.h"
 #include "img_dump.h"
 #include "recomp_exit_hook.h"
+#include "recomp_stdio.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -8038,6 +8039,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 }
             }
         }
+        /* The log's one write a flip, where the streams are buffered
+         * (recomp_stdio.h): the lines since the last flip, this one's
+         * included. Counted with the log lines it writes. */
+        recomp_stdio_flush();
         nv2a_pb_cost_mark(&cost_t, NV2A_COST_F_LOG);
         /* The first few always, so a log says whether flips happen at all
          * and which surface each one put on screen; more with VERBOSE. */
