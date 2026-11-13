@@ -4678,7 +4678,10 @@ void xbox_HeapFree(uint32_t xbox_va)
          * test. Keeps large contiguous requests satisfiable after a lot of
          * small churn. Under RECOMP_HEAP_RECLAIM the neighbour search steps
          * over the empty slots (size 0) earlier merges leave behind; without
-         * that, one merge stops every later one dead. */
+         * that, one merge stops every later one dead.
+         *
+         * An emptied slot keeps its address: heap_block_at binary-searches
+         * the table by address. */
         {
             int n = i + 1, p = i - 1, m = i;
             if (xbox_HeapReclaimEnabled()) {
@@ -4689,13 +4692,11 @@ void xbox_HeapFree(uint32_t xbox_va)
                 g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[n].addr) {
                 g_heap_blocks[i].size += g_heap_blocks[n].size;
                 g_heap_blocks[n].size = 0;
-                g_heap_blocks[n].addr = 0;
             }
             if (p >= 0 && g_heap_blocks[p].free &&
                 g_heap_blocks[p].addr + g_heap_blocks[p].size == g_heap_blocks[i].addr) {
                 g_heap_blocks[p].size += g_heap_blocks[i].size;
                 g_heap_blocks[i].size = 0;
-                g_heap_blocks[i].addr = 0;
                 m = p;
             }
             /* After the merge, so a page this block shared with a neighbour

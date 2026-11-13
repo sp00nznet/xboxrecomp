@@ -17,6 +17,9 @@
  *   2. Freeing three neighbours in an awkward order merges all three. Merging
  *      left an empty slot behind that later frees did not step over, so the
  *      third block never joined the other two.
+ *   2b. A live block before a run of merged frees is still found by address.
+ *      A merge zeroed the emptied slot's address, which broke the binary
+ *      search, so naming the block (MmGetPhysicalAddress) was lost.
  *   3. NtFreeVirtualMemory(MEM_RELEASE) on memory NtAllocateVirtualMemory took
  *      from the heap gives it back. It handed the 32-bit guest slot to the host
  *      VirtualFree as a pointer, which failed, so none of it ever returned.
@@ -285,6 +288,25 @@ int main(int argc, char **argv)
         snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", m, x);
         check(y == x + 64 && z == y + 64 && m == x,
               "three freed neighbours merge into one 192-byte block", d);
+    }
+
+    /* 2b. A run of merges after a live block leaves empty slots that must
+     * keep their addresses, or lookups by address miss the block. */
+    if (reclaim) {
+        enum { RUN = 256 };
+        uint32_t t = xbox_HeapAlloc(64, 16), run[RUN], guard;
+        int k;
+
+        for (k = 0; k < RUN; k++)
+            run[k] = xbox_HeapAlloc(64, 16);
+        guard = xbox_HeapAlloc(64, 16);
+        (void)guard;
+        for (k = 0; k < RUN; k++)
+            xbox_HeapFree(run[k]);           /* each merges into run[0] */
+        xbox_PhysNoteRamName(t);
+        snprintf(d, sizeof d, "block 0x%08X, run 0x%08X..", t, run[0]);
+        check(xbox_PhysRamNamedAt(t),
+              "a named block before 255 merged-away slots stays named", d);
     }
 
     /* 3. Releasing NtAllocateVirtualMemory memory returns it. */
