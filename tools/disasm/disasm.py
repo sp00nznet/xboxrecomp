@@ -90,7 +90,8 @@ class Disassembler:
                                              self.text_only,
                                              self.extra_sections,
                                              self.seed_functions,
-                                             self.skip_library_immediates):
+                                             self.skip_library_immediates,
+                                             self.observed_seeds):
                 last_time = cache.get_last_run_time()
                 print(f"Cache hit - results unchanged (last run: "
                       f"{last_time:.1f}s)")
@@ -266,7 +267,7 @@ class Disassembler:
             if json_path:
                 cache.save(self.xbe_path, json_path, self.text_only, elapsed,
                            self.extra_sections, self.seed_functions,
-                           self.skip_library_immediates)
+                           self.skip_library_immediates, self.observed_seeds)
 
             if self.verbose:
                 print(f"\n  Output written to {self.output_dir}/")

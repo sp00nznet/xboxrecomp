@@ -60,7 +60,7 @@ class AnalysisCache:
 
     @staticmethod
     def _opts_key(text_only, extra_sections=None, seed_functions=None,
-                  skip_library_immediates=False):
+                  skip_library_immediates=False, observed_seeds=None):
         """Fingerprint every input that changes the result.
 
         Not just the files: --seed-functions and --extra-sections change what
@@ -75,6 +75,10 @@ class AnalysisCache:
         h.update(repr(sorted(seed_functions or [])).encode())
         if skip_library_immediates:     # adds nothing to the key when off
             h.update(b"skip_library_immediates")
+        # An observed seed passes the mid-instruction guard, so marking one
+        # changes the result. Adds nothing when there are none.
+        if observed_seeds:
+            h.update(b"observed" + repr(sorted(observed_seeds)).encode())
         # The disassembler's own source is an input. Without this a change to a
         # detection pass hands back the previous run's functions.json and reads
         # as "the change did nothing" -- the same silent wrong answer the option
@@ -86,7 +90,8 @@ class AnalysisCache:
 
     def is_valid(self, xbe_path: str, analysis_json_path: str,
                  text_only: bool = False, extra_sections=None,
-                 seed_functions=None, skip_library_immediates=False) -> bool:
+                 seed_functions=None, skip_library_immediates=False,
+                 observed_seeds=None) -> bool:
         """
         Check if cached results are still valid.
 
@@ -110,7 +115,8 @@ class AnalysisCache:
         # Check every option that affects the output, not just text_only
         if cache.get("opts_key") != self._opts_key(text_only, extra_sections,
                                                    seed_functions,
-                                                   skip_library_immediates):
+                                                   skip_library_immediates,
+                                                   observed_seeds):
             return False
 
         # Verify output files exist
@@ -127,7 +133,7 @@ class AnalysisCache:
     def save(self, xbe_path: str, analysis_json_path: str,
              text_only: bool, elapsed_seconds: float,
              extra_sections=None, seed_functions=None,
-             skip_library_immediates=False) -> None:
+             skip_library_immediates=False, observed_seeds=None) -> None:
         """
         Save cache metadata after a successful analysis run.
         """
@@ -140,7 +146,8 @@ class AnalysisCache:
             "text_only": text_only,
             "opts_key": self._opts_key(text_only, extra_sections,
                                        seed_functions,
-                                       skip_library_immediates),
+                                       skip_library_immediates,
+                                       observed_seeds),
             "timestamp": time.time(),
             "elapsed_seconds": elapsed_seconds,
         }
