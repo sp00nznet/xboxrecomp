@@ -2184,6 +2184,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_tc | file_static | reset | renderer.metal | textures keyed by guest offset/format, from guest memory |
 | src/d3d/nv2a_pb_metal.m | tex_cache_n | n | local_static | keep | - | cached env read |
 | src/d3d/nv2a_pb_metal.m | - | s_tc_clock | file_static | keep | - | monotonic texture LRU clock |
+| src/d3d/nv2a_pb_metal.m | - | s_tc_hint | file_static | reset | renderer.metal | key hash to s_tc slot hints |
 | src/d3d/nv2a_pb_metal.m | - | s_texels | file_static | keep | - | host decode scratch buffer |
 | src/d3d/nv2a_pb_metal.m | - | s_texels_cap | file_static | keep | - | scratch buffer capacity |
 | src/d3d/nv2a_pb_metal.m | - | s_black | file_static | keep | - | fixed black texture |

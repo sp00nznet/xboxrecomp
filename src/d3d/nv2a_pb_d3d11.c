@@ -1797,19 +1797,13 @@ static uint32_t tex_cache_n(void)
     return (uint32_t)n;
 }
 static uint64_t  s_tc_clock;
-/* Key hash -> entry + 1, checked before the scan. A live entry with a key
- * is the only one (one is made only when the scan finds none), so a hint
- * that matches is the entry the scan would find; a stale or colliding one
- * just falls through to it. */
-#define TC_HINTS 2048
-static uint16_t  s_tc_hint[TC_HINTS];
+/* Key hash -> entry + 1, checked before the scan (nv2a_tex_cache_slot). */
+static uint16_t  s_tc_hint[NV2A_TEX_CACHE_HINTS];
 
 static uint32_t tc_slot(const Stage *t, int cube)
 {
-    uint32_t h = (t->offset + (uint32_t)cube) * 0x9E3779B1u;
-    h ^= (t->color + (t->width << 8) + (t->height << 20)) * 0x85EBCA77u;
-    h ^= (t->pitch ^ t->palette ^ (t->levels << 27)) * 0xC2B2AE3Du;
-    return (h >> 16) & (TC_HINTS - 1);
+    return nv2a_tex_cache_slot(t->offset, t->color, t->width, t->height, t->pitch, t->palette,
+                               t->levels, cube);
 }
 static uint32_t *s_texels;
 static size_t    s_texels_cap;

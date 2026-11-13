@@ -241,6 +241,24 @@ static inline int nv2a_tex_cache_older(int c_live, uint64_t c_used, int v_live, 
     return !c_live || (v_live && c_used < v_used);
 }
 
+/* The key hint table checked before the scan: slot -> entry + 1. A live
+ * entry with a key is the only one (one is made only when the scan finds
+ * none), so a hint whose entry matches the whole key is the entry the scan
+ * would find; a stale or colliding one just falls through to it. Without
+ * it a bind walks the cache from its first entry every batch (Metal's
+ * px_stages was 4-7x D3D11's). */
+#define NV2A_TEX_CACHE_HINTS 2048u
+
+static inline uint32_t nv2a_tex_cache_slot(uint32_t offset, uint32_t color, uint32_t width,
+                                           uint32_t height, uint32_t pitch, uint32_t palette,
+                                           uint32_t levels, int cube)
+{
+    uint32_t h = (offset + (uint32_t)cube) * 0x9E3779B1u;
+    h ^= (color + (width << 8) + (height << 20)) * 0x85EBCA77u;
+    h ^= (pitch ^ palette ^ (levels << 27)) * 0xC2B2AE3Du;
+    return (h >> 16) & (NV2A_TEX_CACHE_HINTS - 1u);
+}
+
 /* The mip LOD bias, signed 5.8 fixed point. */
 static inline float nv2a_tex_lod_bias(uint32_t f)
 {

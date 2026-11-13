@@ -191,6 +191,55 @@ int main(void)
         }
     }
 
+    /* The key hint (nv2a_tex_cache_slot): in range, and a lookup through
+     * the hint then the scan binds the entry the scan alone would, through
+     * evictions, stale hints and colliding slots. The rule is the
+     * backends' tex_bind_body. */
+    {
+        enum { CAP = 6, KEYS = 40 };
+        struct { uint32_t key; int live; uint64_t used; } c[CAP] = { { 0 } };
+        static uint16_t hint[NV2A_TEX_CACHE_HINTS];
+        uint64_t clock = 0;
+        uint32_t d, i, hits = 0, coll = 0;
+        CHECK(nv2a_tex_cache_slot(~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, 1)
+              < NV2A_TEX_CACHE_HINTS);
+        CHECK(nv2a_tex_cache_slot(0x1000, 6, 256, 256, 0, 0, 9, 0)
+              != nv2a_tex_cache_slot(0x2000, 6, 256, 256, 0, 0, 9, 0));
+        for (d = 0; d < 4000; d++) {
+            /* Keys bound in runs (a draw's stages, repeated batches) over
+             * more keys than entries; slot key % 4 folds them onto four
+             * slots, so each slot is shared by many keys. */
+            uint32_t key = ((d / 6u) * 7u + (d % 3u)) % KEYS, slot = key % 4u;
+            int e = -1, scan = -1, v = 0;
+            for (i = 0; i < CAP; i++)
+                if (c[i].live && c[i].key == key)
+                    scan = (int)i;
+            if (hint[slot] && c[hint[slot] - 1].live && c[hint[slot] - 1].key == key) {
+                e = hint[slot] - 1;
+                hits++;
+            } else if (hint[slot]) {
+                coll++;
+            }
+            for (i = 0; e < 0 && i < CAP; i++) {
+                if (c[i].live && c[i].key == key) {
+                    e = (int)i;
+                    break;
+                }
+                if (nv2a_tex_cache_older(c[i].live, c[i].used, c[v].live, c[v].used))
+                    v = (int)i;
+            }
+            CHECK(e == scan);
+            if (e < 0) {
+                e = v;
+                c[e].key = key;
+                c[e].live = 1;
+            }
+            c[e].used = ++clock;
+            hint[slot] = (uint16_t)(e + 1);
+        }
+        CHECK(hits > 0 && coll > 0);
+    }
+
     puts("nv2a_tex: all passed");
     return 0;
 }

@@ -1273,6 +1273,9 @@ typedef struct {
 _Static_assert(sizeof(((TexEntry *)0)->used) == 8, "TexEntry.used must be 64-bit");
 
 static TexEntry       s_tc[TEX_CACHE];
+/* Key hash -> entry + 1, checked before the scan (nv2a_tex_cache_slot), as
+ * D3D11's s_tc_hint. */
+static uint16_t       s_tc_hint[NV2A_TEX_CACHE_HINTS];
 
 /* Entries in use: RECOMP_DEBUG=tex_cache=n, NV2A_TEX_CACHE_MIN..TEX_CACHE
  * (nv2a_tex_cache_entries). Default 256, this backend's value since its
@@ -1668,7 +1671,17 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
         return s_magenta;
     }
     uint32_t n = tex_cache_n();
-    for (i = 0; i < n; i++) {
+    uint32_t slot = nv2a_tex_cache_slot(t->offset, t->color, t->width, t->height, t->pitch,
+                                        t->palette, t->levels, cube);
+    if (memo_on() && s_tc_hint[slot]) {
+        TexEntry *c = &s_tc[s_tc_hint[slot] - 1];
+        if (c->live && c->offset == t->offset && c->color == t->color
+                && c->width == t->width && c->height == t->height
+                && c->pitch == t->pitch && c->palette == t->palette
+                && c->levels == t->levels && c->cube == cube)
+            e = c;
+    }
+    for (i = 0; !e && i < n; i++) {
         TexEntry *c = &s_tc[i];
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
@@ -1735,6 +1748,7 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
         e->live = 1;
     }
     e->used = ++s_tc_clock;
+    s_tc_hint[slot] = (uint16_t)(e - s_tc + 1);
     s_tex_last = e;
     return e->tex;
 }
