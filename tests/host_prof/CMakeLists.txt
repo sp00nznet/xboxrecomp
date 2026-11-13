@@ -12,8 +12,11 @@ set(PROF_SRC ${P}/host_prof.c ${P}/recomp_env.c ${P}/recomp_fatal.c ${P}/recomp_
     ${P}/recomp_exit_hook.c ${P}/host_time.c)
 enable_testing()
 # host_prof_test samples a spinner; host_prof_delay_test dumps during the
-# start delay. One process each, since a dump ends the sampler for good.
-foreach(t host_prof_test:test_main.c host_prof_delay_test:test_delay.c)
+# start delay; host_prof_dur_test lets a window (prof_dur) end and write the
+# report itself; host_prof_dur_exit_test dumps as the window ends and needs
+# the whole report on return. One process each, since a dump ends the sampler for good.
+foreach(t host_prof_test:test_main.c host_prof_delay_test:test_delay.c
+          host_prof_dur_test:test_dur.c host_prof_dur_exit_test:test_dur_exit.c)
     string(REPLACE ":" ";" t ${t})
     list(GET t 0 name)
     list(GET t 1 src)

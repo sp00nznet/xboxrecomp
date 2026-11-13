@@ -20,14 +20,19 @@ here is opt-in and changes nothing the game draws.
 | Per-flip walker split | `RECOMP_TRACE=flip` | every host | `[PB-PERF] flip N wall W ms walk K ms (draw D, decode C) ... present P ... kickwait Q ... settle S`: the walker's time per flip, split into backend submission (draw), the occlusion settle's wait for the GPU inside the walk (settle, up to `occ_settle_us` a frame) and command decoding (the rest); kickwait is the walker waiting for the guest. With `RECOMP_TRACE=pb_cost` the `[PB-COST]` line splits it further by stage and ends with the same wait as `d_settle`. Decode now excludes settle: against an older log, add settle back to decode before comparing. `d_settle` is a subset of `d_poll`, so a sum over every `d_*` field counts it twice |
 | Flip times | `RECOMP_TRACE=pacing=all` | every host | `[PACING] flip N t_us T batches B`: flips/s, and the batch count that tells a heavy flip from a light one |
 | GPU frame span and Present | `RECOMP_TRACE=d3d11_prof=all` | D3D11 | `[D3D11-PROF] flip N gpu G ms present P ms`: timestamp queries from the flip's first command to its last, and the Present call's own time. The span includes the GPU's idle gaps between submissions, so it is an upper bound (it reads close to the frame time when the walker submits all through the frame); pair it with the GPU's busy % below. Metal's `metal_prof` gpu figure is a different measure (the sum of each command buffer's GPU start-to-end, gaps left out), so the two backends' gpu ms do not compare |
-| In-process sampler | `RECOMP_TRACE=prof=HZ,prof_delay=S,prof_out=PATH` | Windows, Wine, macOS | every thread's pc HZ times a second from S s on, written at exit (`host_prof.h`) |
+| In-process sampler | `RECOMP_TRACE=prof=HZ,prof_delay=S,prof_dur=D,prof_out=PATH` | Windows, Wine, macOS | every thread's pc HZ times a second from S s on, for D s then written by the sampler itself, or at exit without `prof_dur` (`host_prof.h`) |
 | Deck-shaped CPU | `RECOMP_DEBUG=host_cpus=0xFF` | native Windows | the whole process on 8 logical CPUs (4 cores with SMT), as the Deck has |
 | Wine's ack nap | `RECOMP_DEBUG=kick_nap=delay` | native Windows | the walker naps as it does under Wine (`hybrid` spins on native Windows) |
 | GPU busy | sysfs `gpu_busy_percent`, `nvidia-smi` | Deck, PC | how much of the time the GPU works, and at what clock |
 | Bucketing | `tools/prof/prof_buckets.py` | the Mac | the sampler report in ms per flip per bucket and thread |
 
-The sampler needs the game to exit by itself (`RECOMP_WINDOW_QUIT_AFTER`)
-so its exit hook writes the report. Under Wine it samples every thread on
+Without `prof_dur` the sampler needs the game to exit by itself
+(`RECOMP_WINDOW_QUIT_AFTER`) so its exit hook writes the report. A Proton
+bench run ends on its time limit by a signal to umu-run, which kills the game
+with no exit hook, so there set `prof_dur` (and a `prof_out` path outside the
+run's working directory): the sampler ends the sampling window and writes the
+report itself (to `<prof_out>.tmp`, renamed into place when whole). `[PROF] window opens` in the game log marks where the window
+starts among the flip lines, and the `[PROF] N samples` line where it ends. Under Wine it samples every thread on
 every round (mode `all`: waits included, sorted out by module); on native
 Windows only threads that ran since the last round (`running-since`), and a
 thread counts busy for the whole round if it ran at all in it, so a thread

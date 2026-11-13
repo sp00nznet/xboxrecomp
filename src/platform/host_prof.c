@@ -50,6 +50,10 @@ static uint64_t s_samples, s_dropped, s_rounds;
 static unsigned s_hz;
 static char s_out[1024];
 static volatile int s_running, s_stop, s_dumped;
+/* Set once the report is renamed into place (or failed): a dump that lost
+ * the race to another caller waits on it, so the exit does not tear stdio
+ * down under a prof_dur dump still writing. */
+static volatile int s_dump_done;
 /* Set while the sampler is inside a round (refresh and sample), not while
  * it naps: the dump waits on this, not on s_running, so a dump during the
  * start delay or between rounds sorts the table instead of finding the
@@ -391,7 +395,7 @@ static void module_of(uintptr_t pc, uintptr_t *base, char *path, size_t n)
 
 #ifdef HOST_PROF_OK
 
-static unsigned s_delay_ms;
+static unsigned s_delay_ms, s_dur_ms;
 
 static void sampler_loop(void)
 {
@@ -402,8 +406,23 @@ static void sampler_loop(void)
     nap_ms(s_delay_ms);
     probe_cycles();
     t0 = now_ms();
+    /* The window's start in the game log, between its flip lines, so a
+     * report written before the exit (prof_dur) can be matched to them. */
+    if (!s_stop) {
+        fprintf(stderr, "[PROF] window opens (%u ms after start)\n", s_delay_ms);
+        fflush(stderr);
+    }
     while (!s_stop) {
         uint64_t now = now_ms();
+        /* prof_dur: the sampler ends the window and writes the report
+         * itself. A bench run that ends on its time limit kills the game
+         * (under Proton the SIGINT reaches umu-run, not the game), so the
+         * exit hook never runs and a report left for the exit is lost. */
+        if (s_dur_ms && now - t0 >= s_dur_ms) {
+            s_running = 0;
+            host_prof_dump();
+            return;
+        }
         /* Flag first, then look at s_stop again (both seq_cst, as the dump
          * stores s_stop then reads the flag): either the dump sees the
          * round or the round sees the stop. */
@@ -469,17 +488,35 @@ static const char *prof_mode(void)
 #endif
 }
 
+static void dump_report(void);
+
 void host_prof_dump(void)
+{
+    if (__atomic_exchange_n(&s_dumped, 1, __ATOMIC_ACQ_REL)) {
+        /* Another caller is writing (prof_dur's sampler, the exit hook or
+         * atexit): wait up to 2 s for it, so an exit after a window ended
+         * does not cut its report short. */
+        for (int i = 0; i < 400 && !__atomic_load_n(&s_dump_done, __ATOMIC_ACQUIRE); i++)
+            nap_ms(5);
+        return;
+    }
+    dump_report();
+    __atomic_store_n(&s_dump_done, 1, __ATOMIC_RELEASE);
+}
+
+/* Written to <out>.tmp, then renamed over <out>: a reader (a bench polling
+ * for the prof_dur report, or one after a kill mid-write) sees the whole
+ * report or none. */
+static void dump_report(void)
 {
     static uintptr_t mbase[MODS];
     static char mpath[MODS][512];
+    char tmp[sizeof s_out + 8];
     int nmods = 0;
     FILE *f;
     uint32_t n = 0;
     int idle;
 
-    if (__atomic_exchange_n(&s_dumped, 1, __ATOMIC_ACQ_REL))
-        return;
     __atomic_store_n(&s_stop, 1, __ATOMIC_SEQ_CST);
     for (int i = 0; i < 200 && __atomic_load_n(&s_in_round, __ATOMIC_SEQ_CST); i++)
         nap_ms(5);
@@ -487,9 +524,10 @@ void host_prof_dump(void)
      * hold SuspendThread up); its in-flight record() calls could still land
      * in s_tab, so the table is then dumped in place, unsorted. */
     idle = !__atomic_load_n(&s_in_round, __ATOMIC_SEQ_CST);
-    f = fopen(s_out, "w");
+    snprintf(tmp, sizeof tmp, "%s.tmp", s_out);
+    f = fopen(tmp, "w");
     if (!f) {
-        fprintf(stderr, "[PROF] cannot write %s\n", s_out);
+        fprintf(stderr, "[PROF] cannot write %s\n", tmp);
         return;
     }
     /* Compact the table, hottest first, so the report reads top-down. */
@@ -529,7 +567,19 @@ void host_prof_dump(void)
         fprintf(f, "s %u %d 0x%llx %u\n", s_tab[i].slot1 - 1, m,
                 (unsigned long long)(s_tab[i].pc - (m >= 0 ? mbase[m] : 0)), s_tab[i].count);
     }
-    fclose(f);
+    if (fclose(f) != 0) {
+        fprintf(stderr, "[PROF] cannot write %s\n", tmp);
+        remove(tmp);
+        return;
+    }
+#if defined(_WIN32)
+    if (!MoveFileExA(tmp, s_out, MOVEFILE_REPLACE_EXISTING)) {
+#else
+    if (rename(tmp, s_out) != 0) {
+#endif
+        fprintf(stderr, "[PROF] cannot rename %s to %s\n", tmp, s_out);
+        return;
+    }
     fprintf(stderr, "[PROF] %llu samples in %llu rounds at %u Hz (%s threads) -> %s\n",
             (unsigned long long)s_samples, (unsigned long long)s_rounds, s_hz,
             prof_mode(), s_out);
@@ -549,10 +599,16 @@ static void dump_atexit(void)
 
 int host_prof_start(unsigned hz, unsigned delay_ms, const char *out)
 {
+    return host_prof_start_for(hz, delay_ms, 0, out);
+}
+
+int host_prof_start_for(unsigned hz, unsigned delay_ms, unsigned dur_ms, const char *out)
+{
     if (__atomic_exchange_n(&s_running, 1, __ATOMIC_ACQ_REL))
         return 0;
     s_hz = hz < 10 ? 10 : hz > 2000 ? 2000 : hz;
     s_delay_ms = delay_ms;
+    s_dur_ms = dur_ms;
     snprintf(s_out, sizeof s_out, "%s", out && out[0] ? out : "recomp-prof.txt");
     recomp_exit_hook_add(dump_hook);
     atexit(dump_atexit);
@@ -575,8 +631,12 @@ int host_prof_start(unsigned hz, unsigned delay_ms, const char *out)
         pthread_detach(t);
     }
 #endif
-    fprintf(stderr, "[PROF] sampling every thread at %u Hz after %u ms -> %s\n", s_hz, delay_ms,
-            s_out);
+    if (dur_ms)
+        fprintf(stderr, "[PROF] sampling every thread at %u Hz after %u ms for %u ms -> %s\n",
+                s_hz, delay_ms, dur_ms, s_out);
+    else
+        fprintf(stderr, "[PROF] sampling every thread at %u Hz after %u ms -> %s\n", s_hz,
+                delay_ms, s_out);
     return 1;
 }
 
@@ -588,14 +648,28 @@ void host_prof_dump(void)
 
 int host_prof_start(unsigned hz, unsigned delay_ms, const char *out)
 {
+    return host_prof_start_for(hz, delay_ms, 0, out);
+}
+
+int host_prof_start_for(unsigned hz, unsigned delay_ms, unsigned dur_ms, const char *out)
+{
     (void)hz;
     (void)delay_ms;
+    (void)dur_ms;
     (void)out;
     fprintf(stderr, "[PROF] no sampler on this host (Windows and macOS only)\n");
     return 0;
 }
 
 #endif
+
+/* Seconds to ms, 0 when negative, NaN or past ~46 days: the cast of an
+ * out-of-range double to unsigned is undefined. */
+static unsigned env_ms(recomp_env_id id)
+{
+    double d = recomp_env_double(id, 0);
+    return d > 0 && d < 4e6 ? (unsigned)(d * 1000.0) : 0;
+}
 
 void host_prof_start_from_env(void)
 {
@@ -607,6 +681,6 @@ void host_prof_start_from_env(void)
     hz = strtoul(v, NULL, 10);
     if (hz <= 1)
         hz = 250;
-    host_prof_start((unsigned)hz, (unsigned)(recomp_env_double(RENV_PROF_DELAY, 0) * 1000.0),
-                    recomp_env(RENV_PROF_OUT));
+    host_prof_start_for((unsigned)hz, env_ms(RENV_PROF_DELAY), env_ms(RENV_PROF_DUR),
+                        recomp_env(RENV_PROF_OUT));
 }

@@ -367,6 +367,7 @@ extern "C" {
     X(PACING_TRACE,      TRACE, "pacing",          NULL,                       "[PACING] flip intervals, vblank gaps, the flip hold (holds, held ms, timeouts, intervals), CPU and spin-wait sites every 600 flips; =all also every flip") \
     X(PROF,              TRACE, "prof",            NULL,                       "=hz (1: 250): sample every thread's pc in-process (Windows, Wine, macOS); report at exit, module offsets for the bench to symbolise (host_prof.h)") \
     X(PROF_DELAY,        TRACE, "prof_delay",      NULL,                       "=s: prof starts sampling after this many seconds (default 0)") \
+    X(PROF_DUR,          TRACE, "prof_dur",        NULL,                       "=s: prof samples for this many seconds, then writes its report without waiting for the exit (default 0: at exit)") \
     X(PROF_OUT,          TRACE, "prof_out",        NULL,                       "=path: prof's report (default recomp-prof.txt in the working directory)") \
     X(MEM_TRACE,         TRACE, "mem",             NULL,                       "=s (bare: 1): a [MEM] sample line (process RAM and GPU memory) every s seconds; the [MEM] exit line prints always (mem_stats.h)") \
     X(GUEST_CPU_TRACE,   TRACE, "guest_cpu",       "RECOMP_GUEST_CPU_TRACE",   "=ms: [GUEST] each hold of the guest CPU (RECOMP_GUEST_LOCK) longer than ms and where it ended (first 50, then one a second)") \

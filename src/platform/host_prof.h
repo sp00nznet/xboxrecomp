@@ -35,8 +35,13 @@ extern "C" {
  * or it was started already. Any thread. */
 int host_prof_start(unsigned hz, unsigned delay_ms, const char *out);
 
+/* host_prof_start with a window: after dur_ms of sampling (0: until the
+ * exit) the sampler stops and writes the report itself, so a run that is
+ * killed at its time limit, as the Proton bench's is, still leaves one. */
+int host_prof_start_for(unsigned hz, unsigned delay_ms, unsigned dur_ms, const char *out);
+
 /* The RECOMP_TRACE keys: prof=HZ (1 or empty: 250), prof_delay=seconds,
- * prof_out=path. Does nothing when prof is unset or 0. */
+ * prof_dur=seconds, prof_out=path. Does nothing when prof is unset or 0. */
 void host_prof_start_from_env(void);
 
 /* Writes the report now (stops sampling first). Safe to call twice: the

@@ -2752,6 +2752,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/platform/host_prof.c | - | s_running | file_static | keep | - | host profiler state |
 | src/platform/host_prof.c | - | s_stop | file_static | keep | - | host profiler state |
 | src/platform/host_prof.c | - | s_dumped | file_static | keep | - | host profiler state |
+| src/platform/host_prof.c | - | s_dump_done | file_static | keep | - | host profiler state |
 | src/platform/host_prof.c | - | s_in_round | file_static | keep | - | host profiler state |
 | src/platform/host_prof.c | - | s_all_threads | file_static | keep | - | host profiler state |
 | src/platform/host_prof.c | - | s_th | file_static | keep | - | host profiler state |
@@ -2759,8 +2760,9 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/platform/host_prof.c | thread_name | get_desc | local_static | constant | - | resolved host function pointer |
 | src/platform/host_prof.c | thread_name | resolved | local_static | constant | - | guard for resolved function pointer |
 | src/platform/host_prof.c | - | s_delay_ms | file_static | keep | - | host profiler state |
-| src/platform/host_prof.c | host_prof_dump | mbase | local_static | keep | - | host profiler state |
-| src/platform/host_prof.c | host_prof_dump | mpath | local_static | keep | - | host profiler state |
+| src/platform/host_prof.c | - | s_dur_ms | file_static | keep | - | host profiler state |
+| src/platform/host_prof.c | dump_report | mbase | local_static | keep | - | host profiler state |
+| src/platform/host_prof.c | dump_report | mpath | local_static | keep | - | host profiler state |
 
 ### src/platform/host_time.c
 
