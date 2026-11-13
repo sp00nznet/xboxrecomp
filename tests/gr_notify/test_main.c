@@ -342,6 +342,37 @@ int main(void)
     check(!nv2a_run_ahead_may_ack(1, 1, 0, 64), "no ack while a flip is held");
     check(!nv2a_run_ahead_may_ack(0, 0, 0, 64), "no ack without a kick");
 
+    /* The checkpoint's defer rule: args enabled, owed, notify
+     * due, pending. */
+    check(!nv2a_ckpt_defer_asks(0, 1, 0) && !nv2a_ckpt_defers(0, 1, 0, 3),
+          "defer off: the checkpoint settles");
+    check(!nv2a_ckpt_defer_asks(1, 0, 0) && !nv2a_ckpt_defers(1, 0, 0, 3),
+          "nothing owed: no backend ask, no defer");
+    check(nv2a_ckpt_defer_asks(1, 1, 0) && nv2a_ckpt_defers(1, 1, 0, 2),
+          "a report still on the GPU: the checkpoint defers");
+    check(nv2a_ckpt_defer_asks(1, 1, 0) && !nv2a_ckpt_defers(1, 1, 0, 0),
+          "every owed report landed: the checkpoint settles and acks");
+    check(!nv2a_ckpt_defer_asks(1, 1, 1) && !nv2a_ckpt_defers(1, 1, 1, 2),
+          "a notify due: its raise settles, so no defer");
+
+    /* The GET a deferring checkpoint stores: args owed, va, last GET. */
+    check(nv2a_ckpt_held_get(0x1000, 0x5000, 0x0800) == 0x1000,
+          "GET lands at the oldest owed report");
+    check(nv2a_ckpt_held_get(0, 0x5000, 0x0800) == 0,
+          "nothing owed: GET left alone");
+    check(nv2a_ckpt_held_get(0x6000, 0x0400, 0x0200) == 0,
+          "owed past va (ring wrap): GET held");
+    check(nv2a_ckpt_held_get(0x1000, 0x5000, 0x2000) == 0,
+          "owed behind the last GET: GET never moves back");
+    check(nv2a_ckpt_held_get(0x2000, 0x5000, 0x2000) == 0,
+          "owed at the last GET: GET stays");
+    /* A GET_REPORT carried over from the last walk runs first: the scan
+     * latches this walk's start, where the last walk's end left GET. */
+    check(nv2a_ckpt_held_get(0x3000, 0x7000, 0x3000) == 0,
+          "carried-over report: latched at the walk start, GET stays");
+    check(nv2a_ckpt_held_get(0x1800, 0x7000, 0x3000) == 0,
+          "a stale latch from the last walk: GET does not go back");
+
     /* The depth from RECOMP_DEBUG=run_ahead (on by default). */
     check(nv2a_run_ahead_depth(NULL, 0) == NV2A_RUN_AHEAD_DEFAULT_DEPTH
               && nv2a_run_ahead_depth("", 0) == NV2A_RUN_AHEAD_DEFAULT_DEPTH,

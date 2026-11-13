@@ -7411,6 +7411,26 @@ static void d3d11_on_poll(void)
         nv2a_occ_settle(&s_occ);
 }
 
+/* At a run-ahead checkpoint under occ_ckpt_defer: the queries ended so far
+ * go to the GPU once, behind the fence occ_wait waits on, and the poll
+ * takes what is in without a flush each. */
+static int d3d11_on_report_pending(void)
+{
+    if (!s_occ.npend || !s_dev)
+        return 0;
+    if (!occ_fence_on()) {
+        nv2a_occ_poll(&s_occ, 1);
+        return s_occ.npend;
+    }
+    if (s_occ_ends > s_occ_fends) {
+        ID3D11DeviceContext4_Signal(s_occ_ctx4, s_occ_fence, ++s_occ_fval);
+        ID3D11DeviceContext_Flush(s_ctx);
+        s_occ_fends = s_occ_ends;
+    }
+    nv2a_occ_poll(&s_occ, 0);
+    return s_occ.npend;
+}
+
 /* Under Hor+ or render.snap_2d, at a batch's END: whether the walker may
  * hold it for a merged list (nv2a_merge_placed), as metal_merge_placed.
  * The program and stages are the ones its draw would look up (both
@@ -7755,6 +7775,7 @@ WORK_VOID(d3d11_on_zpass, (int enable), (enable))
 WORK_VOID(d3d11_on_zpass_clear, (void), ())
 WORK_INT(d3d11_on_report, (uint32_t va), (va))
 WORK_VOID(d3d11_on_poll, (void), ())
+WORK_INT(d3d11_on_report_pending, (void), ())
 WORK_INT(d3d11_merge_placed, (int program), (program))
 WORK_VOID(d3d11_on_blit, (const struct nv2a_pb_blit *b), (b))
 #undef WORK_VOID
@@ -7774,6 +7795,7 @@ static const struct nv2a_pb_backend s_d3d11_backend = {
     1,                  /* merge_draws */
     d3d11_merge_placed_w,
     d3d11_on_blit_w,
+    d3d11_on_report_pending_w,
 };
 
 /* For tests/d3d11_backend_smoke: the size of the target at a colour offset

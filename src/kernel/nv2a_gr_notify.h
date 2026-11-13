@@ -277,6 +277,44 @@ static inline int nv2a_run_ahead_may_ack(int kick_set, int flip_held,
     return kick_set && !flip_held && acks_this_walk < depth;
 }
 
+/* The run-ahead checkpoint's defer rule (RECOMP_DEBUG=occ_ckpt_defer),
+ * in two steps so the backend is asked only when it can matter.
+ *
+ * A checkpoint settles the walk's visibility reports before it moves GET or
+ * acks, as the walk end does, and that waits out the GPU's latency mid-walk.
+ * With the rule on, a checkpoint that owes reports asks the backend whether
+ * any is still on the GPU; one that is holds the ack (and GET at the oldest
+ * owed report) until a later checkpoint, the notify raise, a semaphore
+ * release, the walk end or the flip settles it. A notify due raises now and
+ * its raise settles everything, so it never defers. */
+static inline int nv2a_ckpt_defer_asks(int enabled, int report_owed,
+                                       int notify_due)
+{
+    return enabled && report_owed && !notify_due;
+}
+
+static inline int nv2a_ckpt_defers(int enabled, int report_owed,
+                                   int notify_due, int pending)
+{
+    return nv2a_ckpt_defer_asks(enabled, report_owed, notify_due)
+        && pending > 0;
+}
+
+/* The GET a deferring checkpoint at va stores: the walk's place before its
+ * oldest owed report (owed, 0 for none), or 0 to leave GET where it is
+ * (last_get, the GET last stored). GET only moves forward: never past va
+ * (an owed report after a ring wrap the walk has not reached), and never
+ * back to or behind last_get (a latch from before it, or a wrap between
+ * them, where address order is not ring order: holding is the safe side).
+ * All three in GET's form (va & 0x0FFFFFFF). */
+static inline uint32_t nv2a_ckpt_held_get(uint32_t owed, uint32_t va,
+                                          uint32_t last_get)
+{
+    if (!owed || owed > va || owed <= last_get)
+        return 0;
+    return owed;
+}
+
 /* The depth when nothing sets one: deep enough that D3D's own bounds
  * (MakeSpace on GET, BlockOnTime on the fence and its notify) hold the
  * title, as on the console, where the flush is acked at once. BLiNX 1's

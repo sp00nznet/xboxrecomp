@@ -310,6 +310,7 @@ extern "C" {
     X(OCC_DELAY_US,      DEBUG, "occ_delay_us",    NULL,                       "=us: hold every visibility result back this long (test hook)") \
     X(OCC_SETTLE_US,     DEBUG, "occ_settle_us",   NULL,                       "=us: per-frame wait for pending visibility results before settling them at a walk end, semaphore release or flip (8000; 0 none)") \
     X(OCC_SETTLE_SPIN,   DEBUG, "occ_settle_spin", NULL,                       "poll every pending visibility query in a loop during occ_settle_us instead of waiting on the GPU's fence or completion (the old settle, for an A/B)") \
+    X(OCC_CKPT_DEFER,    DEBUG, "occ_ckpt_defer",  NULL,                       "a run-ahead checkpoint with a visibility result still pending holds the ack, and GET at the oldest owed report; a later checkpoint, the notify raise, a semaphore release, the walk end or the flip settles it (off until the per-game A/B)") \
     X(RT_ALIAS_CHECK,    DEBUG, "rt_alias_check",  NULL,                       "=0: Metal and D3D11 keep render targets whose guest memory the title rewrote (before rt-stale-alias)") \
     X(FB_VA,             DEBUG, "fb_va",           "RECOMP_FB_VA",             "=va: framebuffer window shows that address") \
     X(USB,               DEBUG, "ohci",            "RECOMP_USB",               "emulated OHCI/XID USB: the pad through the title's own XAPI driver (=0 off)") \

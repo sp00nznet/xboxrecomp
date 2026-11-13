@@ -1314,6 +1314,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_pb_exec.c | raster_batch | ab | local_static | keep | - | cached env read for A/B check |
 | src/kernel/nv2a_pb_exec.c | - | s_backend | file_static | constant | - | backend function table set at init |
 | src/kernel/nv2a_pb_exec.c | - | s_report_owed | file_static | reset | pgraph | pending guest report writes |
+| src/kernel/nv2a_pb_exec.c | - | s_report_owed_va | file_static | reset | pgraph | walk place of the oldest owed report |
+| src/kernel/nv2a_pb_exec.c | nv2a_pb_exec_checkpoint_try | defer | local_static | keep | - | cached env override |
 | src/kernel/nv2a_pb_exec.c | get_report | fixed_set | local_static | keep | - | cached env override |
 | src/kernel/nv2a_pb_exec.c | get_report | fixed | local_static | keep | - | cached env override |
 | src/kernel/nv2a_pb_exec.c | - | s_gpu_backend_batches | file_static | keep | - | stats totals |
@@ -1384,6 +1386,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_pb_scan.c | - | s_method | file_static | reset | pgraph | method header carried over between walks |
 | src/kernel/nv2a_pb_scan.c | - | s_noninc | file_static | reset | pgraph | method header carried over between walks |
 | src/kernel/nv2a_pb_scan.c | - | s_in_call | file_static | reset | pgraph | pushbuffer CALL nesting state of guest stream |
+| src/kernel/nv2a_pb_scan.c | - | s_top_va | file_static | reset | pgraph | top-level word the walk last started on |
 | src/kernel/nv2a_pb_scan.c | - | s_checkpoint | file_static | keep | - | run_ahead callback set at init |
 | src/kernel/nv2a_pb_scan.c | nv2a_pb_scan | inject | local_static | keep | - | debug inject env and log-once |
 | src/kernel/nv2a_pb_scan.c | nv2a_pb_scan | said | local_static | keep | - | debug inject env and log-once |

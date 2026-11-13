@@ -675,6 +675,33 @@ static int case_wait(void)
     return 0;
 }
 
+/* occ_ckpt_defer: a run-ahead checkpoint asks with an
+ * unflushed poll, which waits for nothing and leaves a report still on the
+ * GPU pending (the checkpoint then defers). The walk decodes on while the
+ * GPU counts, and the walk end's settle completes the report within its
+ * budget, waiting only the latency the walk did not already cover. */
+static int case_ckpt_defer(void)
+{
+    uint64_t t0;
+    fresh();
+    nv2a_occ_init(&s_o, &s_ops_wait, (uint8_t *)s_mem);
+    nv2a_occ_set_scale(&s_o, 1);
+    nv2a_occ_set_settle(&s_o, NV2A_OCC_SETTLE_US);
+    s_tick = 10;
+    vtest(A, 3000, 7);
+    nv2a_occ_poll(&s_o, 0);             /* the checkpoint's ask */
+    CHECK(s_o.npend == 1 && status_at(A) == 0xFFFFFFFFu);
+    CHECK(s_o.settle_wait_us == 0 && s_waits == 0);
+    s_clock += 2000;                    /* the rest of the walk */
+    t0 = s_clock;
+    nv2a_occ_settle(&s_o);              /* the walk end */
+    CHECK(count_at(A) == 7 && s_o.settled == 0 && s_o.npend == 0);
+    CHECK(s_clock - t0 <= 1100 && s_o.settle_wait_us <= 1100);
+    CHECK(s_o.settle_wait_us < NV2A_OCC_SETTLE_US);
+    CHECK(drained());
+    return 0;
+}
+
 int main(void)
 {
     static const struct {
@@ -700,6 +727,7 @@ int main(void)
         { "scale change", case_scale },
         { "accounting", case_accounting },
         { "the settle waits, not spins", case_wait },
+        { "a checkpoint's ask defers, the walk end settles", case_ckpt_defer },
     };
     unsigned i, fail = 0;
     for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {

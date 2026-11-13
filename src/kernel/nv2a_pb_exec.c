@@ -39,6 +39,7 @@
 #include "kernel_reset_probe.h"
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 #include "nv2a_flip_hold.h"
+#include "nv2a_gr_notify.h"
 #include "platform/host_time.h"   /* xbox_HostNowNs */
 #include "guest_time.h"   /* the flip hold on the virtual clock */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
@@ -6106,8 +6107,11 @@ static const struct nv2a_pb_backend s_cpu_backend = {
     cpu_on_flip,                         /* on_flip   */
 };
 static const struct nv2a_pb_backend *s_backend = &s_cpu_backend;
-/* A GET_REPORT the backend took and has not been polled for since. */
+/* A GET_REPORT the backend took and has not been polled for since, and
+ * where the walk stood (nv2a_pb_scan_top_va) when the first of them was
+ * taken: a checkpoint that defers on them stops GET there. */
 static int s_report_owed;
+static uint32_t s_report_owed_va;
 
 /* The title can read a deferred report as soon as the walker hands back
  * anything it waits on: a semaphore release, GET at the end of the walk.
@@ -6140,6 +6144,39 @@ void nv2a_pb_exec_checkpoint(void)
 {
     merge_flush();
     reports_settle();
+}
+
+/* The run-ahead checkpoint's form (RECOMP_DEBUG=occ_ckpt_defer): 0 when a
+ * report taken is still on the GPU (nv2a_ckpt_defers), and the checkpoint
+ * then holds the ack, and GET at nv2a_pb_exec_report_owed_va. Settling here
+ * waited out the GPU's latency mid-walk, ~4 ms a stage1 flip on Proton;
+ * left pending, the walk decodes on while the GPU counts, and a
+ * later checkpoint, the notify raise, a semaphore release, the walk end or
+ * the flip settles it with the same budget. notify_due: a raise follows,
+ * which settles anyway. */
+int nv2a_pb_exec_checkpoint_try(int notify_due)
+{
+    static int defer = -1;
+
+    if (defer < 0)
+        defer = recomp_env_on(RENV_OCC_CKPT_DEFER);
+    merge_flush();
+    if (nv2a_ckpt_defer_asks(defer, s_report_owed, notify_due)
+        && s_backend->on_report_pending) {
+        uint64_t t = nv2a_pb_cost_start();
+        int pend = s_backend->on_report_pending();
+        nv2a_pb_cost_add(t, NV2A_COST_D_POLL);
+        if (nv2a_ckpt_defers(defer, s_report_owed, notify_due, pend))
+            return 0;
+    }
+    reports_settle();
+    return 1;
+}
+
+/* The walk's place before its oldest owed report; 0 when none is owed. */
+uint32_t nv2a_pb_exec_report_owed_va(void)
+{
+    return s_report_owed ? s_report_owed_va : 0;
 }
 
 int nv2a_pb_exec_flip_held(void)
@@ -6178,7 +6215,10 @@ static void get_report(uint32_t param)
         nv2a_pb_cost_add(t, NV2A_COST_D_REPORT);
     }
     if (took) {
+        extern uint32_t nv2a_pb_scan_top_va(void);
         s_reports++;                       /* the backend completes it */
+        if (!s_report_owed)
+            s_report_owed_va = nv2a_pb_scan_top_va();
         s_report_owed = 1;
         return;
     }

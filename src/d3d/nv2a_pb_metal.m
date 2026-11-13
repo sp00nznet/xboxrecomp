@@ -4457,6 +4457,19 @@ static void metal_on_poll(void)
     }
 }
 
+/* At a run-ahead checkpoint under occ_ckpt_defer: metal_on_report has
+ * committed the buffer a report counts in, so an unflushed poll suffices
+ * (a commit per checkpoint would end the pass each time). */
+static int metal_on_report_pending(void)
+{
+    if (!s_occ.npend)
+        return 0;
+    @autoreleasepool {
+        nv2a_occ_poll(&s_occ, 0);
+    }
+    return s_occ.npend;
+}
+
 /* After a wait every command buffer is done: retired slots free. */
 static void occ_after_wait(void)
 {
@@ -5222,6 +5235,7 @@ static const struct nv2a_pb_backend s_metal_backend = {
     1,                  /* merge_draws */
     metal_merge_placed,
     metal_on_blit,
+    metal_on_report_pending,
 };
 
 const struct nv2a_pb_backend *nv2a_pb_metal_backend(void)

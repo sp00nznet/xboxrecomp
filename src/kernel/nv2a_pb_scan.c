@@ -299,6 +299,12 @@ static int s_noninc;
  * lives in this walk alone. */
 static int s_in_call;
 int nv2a_pb_scan_in_call(void) { return s_in_call; }
+/* The top-level word the walk last started on, a method header or a call:
+ * all before it has been executed, so GET may stand there. The executor
+ * keeps the one of its oldest owed report, where a checkpoint that defers
+ * on it stops GET. */
+static uint32_t s_top_va;
+uint32_t nv2a_pb_scan_top_va(void) { return s_top_va; }
 
 /* RECOMP_DEBUG=run_ahead (xbox_memory_layout.c): called at a method header
  * of the top level every NV2A_PB_CHECKPOINT_WORDS words or more, with the
@@ -325,6 +331,10 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         s_scan_enabled = recomp_env(RENV_PB_SCAN) != NULL;
     if (!(s_scan_enabled || s_exec_enabled) || end_va == start_va)
         return;
+    /* GET as the title holds it: a GET_REPORT that a method carried over
+     * from the last walk runs first must not latch that walk's header,
+     * behind the GET its end stored. */
+    s_top_va = start_va;
     if (s_exec_enabled) {
         extern void nv2a_pb_exec_walk_begin(void);
         uint64_t t;
@@ -423,6 +433,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             tgt = w & ~3u;
             if (in_call) { why = "call inside a call"; break; }
             if (tgt >= XBOX_CONTIG_SIZE) { why = "call outside the window"; break; }
+            s_top_va = at;
             ret_va = va;
             in_call = s_in_call = 1;
             va = XBOX_CONTIG_BASE | tgt;
@@ -444,6 +455,8 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
                 s_checkpoint(at);
                 nv2a_pb_cost_add(t, NV2A_COST_D_CKPT);
             }
+            if (!in_call)
+                s_top_va = at;
             s_left   = (w >> 18) & 0x7FFu;
             s_subch  = (w >> 13) & 7u;
             s_method =  w & 0x1FFCu;

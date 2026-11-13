@@ -428,6 +428,14 @@ struct nv2a_pb_backend {
      * a target holding the copy; otherwise it calls nv2a_pb_blit_guest.
      * The backend owns the whole blit: the executor writes nothing. */
     void (*on_blit)(const struct nv2a_pb_blit *b);
+    /* on_report_pending (optional; NULL: a run-ahead checkpoint settles as
+     * the walk end does): the reports taken are submitted to the GPU,
+     * without waiting, and the number still pending comes back. A
+     * checkpoint that gets nonzero holds the ack (and GET at the oldest
+     * owed report) for later, so the GPU's latency overlaps the rest of
+     * the walk and the title still reads no report before it is written.
+     * The walker's thread. */
+    int  (*on_report_pending)(void);
 };
 
 /* Route the executor's events to `backend`. NULL restores the CPU rasteriser.

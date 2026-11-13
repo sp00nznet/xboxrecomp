@@ -1975,8 +1975,8 @@ static Nv2aGrState g_gr;
 /* Trace counters: the walker's thread adds, the report reads and resets. */
 static struct {
     long checkpoints, early_acks, notifies, serviced, timeouts, relatched,
-         late;
-    uint64_t stall_ns;
+         late, deferred;
+    uint64_t stall_ns, held_words;
 } g_ra;
 #define RA_ADD(f, n) __atomic_fetch_add(&g_ra.f, (n), __ATOMIC_RELAXED)
 #define RA_TAKE(f) __atomic_exchange_n(&g_ra.f, 0, __ATOMIC_RELAXED)
@@ -2100,13 +2100,42 @@ static void run_ahead_checkpoint(uint32_t va)
 {
     volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
     volatile uint32_t *kr = (volatile uint32_t *)((char *)regs + NV2A_KICK_REG);
+    extern int nv2a_pb_exec_checkpoint_try(int notify_due);
     extern void nv2a_pb_exec_checkpoint(void);
+    extern uint32_t nv2a_pb_exec_report_owed_va(void);
     extern int nv2a_pb_exec_flip_held(void);
 
     RA_ADD(checkpoints, 1);
     /* The walk's reports first, as at its end: the title may read them
-     * once GET passes them. */
-    nv2a_pb_exec_checkpoint();
+     * once GET passes them. One still on the GPU under occ_ckpt_defer
+     * (nv2a_ckpt_defers): GET goes up to the oldest owed report and no
+     * further, and the ack waits for a later checkpoint, the notify raise,
+     * a semaphore release, the walk end or the flip to settle it. GET
+     * keeps moving so the title's MakeSpace never waits on a walk that has
+     * long passed its space (the KickOff lockstep run-ahead removed); the
+     * held words say what the hold costs. */
+    if (!nv2a_pb_exec_checkpoint_try(nv2a_gr_due(&g_gr))) {
+        volatile uint32_t *get =
+            (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
+        uint32_t owed = nv2a_pb_exec_report_owed_va() & 0x0FFFFFFFu;
+        uint32_t at = va & 0x0FFFFFFFu;
+        uint32_t held = nv2a_ckpt_held_get(owed, at, *get);
+
+        RA_ADD(deferred, 1);
+        if (held) {
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            *get = held;
+        }
+        if (owed && owed <= at)
+            RA_ADD(held_words, (at - owed) / 4u);
+        xbox_Nv2aPgraphFenceTick();
+        (void)gr_poll_watch();
+        /* A notify that came due meanwhile: settle as the stock checkpoint
+         * does and go on in its order, GET first, then the raise. */
+        if (!nv2a_gr_due(&g_gr))
+            return;
+        nv2a_pb_exec_checkpoint();
+    }
     __atomic_thread_fence(__ATOMIC_RELEASE);
     *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET) = va & 0x0FFFFFFFu;
     xbox_Nv2aPgraphFenceTick();
@@ -2238,14 +2267,15 @@ static void run_ahead_report(void)
     fprintf(stderr, "[PACING]   run ahead: checkpoints %ld early_acks %ld"
             " notifies %ld delivered %ld claimed %ld serviced %ld (late %ld)"
             " timeouts %ld queued %ld dropped %ld relatched %ld stall_ms %.1f"
-            " pending %d\n",
+            " pending %d deferred %ld held_kwords %.1f\n",
             RA_TAKE(checkpoints), RA_TAKE(early_acks), RA_TAKE(notifies),
             delivered, claimed, RA_TAKE(serviced), RA_TAKE(late),
             RA_TAKE(timeouts),
             __atomic_exchange_n(&g_gr.queued, 0, __ATOMIC_RELAXED),
             __atomic_exchange_n(&g_gr.dropped, 0, __ATOMIC_RELAXED),
             RA_TAKE(relatched), RA_TAKE(stall_ns) / 1e6,
-            xbox_Nv2aGrPending());
+            xbox_Nv2aGrPending(), RA_TAKE(deferred),
+            RA_TAKE(held_words) / 1e3);
 }
 
 uint32_t xbox_Nv2aKickStats(uint64_t *wait_ns)
