@@ -506,6 +506,7 @@ struct MCPXAPUState {
     bool pace_frames;           /* pace each frame, not each period
                                  * (RECOMP_APU_PACE_FRAMES, default on) */
     int pace_span_us;           /* eight frames take this long (pace_frames) */
+    unsigned pace_full_asks;    /* pacing asks refused at a full queue */
     bool seq_ran;               /* the VP has rendered since the sequencer last
                                  * stayed off (mcpx_apu_frame_kind) */
     bool seq_off;               /* the sequencer reads off; since seq_off_us */

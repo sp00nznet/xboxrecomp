@@ -993,8 +993,10 @@ static int64_t pace_frames(MCPXAPUState *d, int64_t now_us)
 
             pace_watch_stall(d, q, high, now_us);
             if (!d->pace_stalled) {
-                if (q >= high)
+                if (q >= high) {
+                    d->pace_full_asks++;
                     return EP_FRAME_US / 8;
+                }
                 if (q < low / 2)
                     span = 0;
                 else if (q <= low)
@@ -1071,8 +1073,10 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
         pace_watch_stall(d, q, high, now_us);
         if (d->pace_stalled)
             ;                              /* host clock, as without a queue */
-        else if (q >= high)
+        else if (q >= high) {
+            d->pace_full_asks++;
             return EP_FRAME_US;
+        }
         else if (q <= low)
             ahead_us = (int64_t)high * EP_FRAME_US / MIXER_FRAME_SAMPLES;
         else
@@ -1239,13 +1243,51 @@ static void apu_irq_stats_line(void)
     s_irq_next_ns = now + 5000000000ull;
 }
 
+/* A stretch without a frame (APU_GAP_WARN_US) is reported with what the
+ * thread was doing meanwhile. No frame means no idle-voice trap, so a title
+ * that stops a voice and waits for it to be retired (DirectSound's StopEx,
+ * then GetStatus) waits all of it: a 102 ms stop froze Burnout 3 once in
+ * ~5000. The time is the host's QueryPerformanceCounter in ms, as
+ * xbox_HostNowNs gives it, so it lines up with other host-timed logs. */
+#define APU_GAP_WARN_US 20000
+#define APU_GAP_WARN_MAX 50
+
+typedef struct {
+    int64_t from_us;            /* the last frame; 0 after an idle pause */
+    int64_t slept_us;           /* in throttle since */
+    unsigned trapped, held, full0, passes;
+} ApuFrameGap;
+
+static void apu_frame_gap_check(MCPXAPUState *d, ApuFrameGap *g, int64_t now_us)
+{
+    static int shown;
+
+    if (g->from_us && now_us - g->from_us > APU_GAP_WARN_US
+            && shown < APU_GAP_WARN_MAX) {
+        fprintf(stderr, "[APU] no frame for %.1f ms from %.3f ms: %u passes,"
+                        " front end trapped %u, sequencer held %u, queue full"
+                        " %u (%d queued now), throttle slept %.1f ms%s\n",
+                (now_us - g->from_us) / 1000.0, g->from_us / 1000.0,
+                g->passes, g->trapped, g->held, d->pace_full_asks - g->full0,
+                xa2_is_active() ? xa2_queued_samples() : -1,
+                g->slept_us / 1000.0,
+                ++shown == APU_GAP_WARN_MAX ? " (no more shown)" : "");
+    }
+    g->from_us = now_us;
+    g->slept_us = 0;
+    g->trapped = g->held = g->passes = 0;
+    g->full0 = d->pace_full_asks;
+}
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    ApuFrameGap gap = { 0 };
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
+            gap.from_us = 0;
             d->is_idle = true;
             if (xa2_is_active())
                 xa2_expect_drain();     /* a pause, not an underrun */
@@ -1259,7 +1301,11 @@ static void *mcpx_apu_frame_thread(void *arg)
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
+        int64_t throttle_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         throttle(d);
+        int64_t pass_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        gap.slept_us += pass_us - throttle_us;
+        gap.passes++;
         int div0 = d->ep_frame_div;
 
         /* The doorbell ack stands in for the GP DSP, which on hardware runs
@@ -1274,6 +1320,8 @@ static void *mcpx_apu_frame_thread(void *arg)
         bool seq_held = kind == APU_FRAME_HELD;
 
         hs_trap(fe_trapped || seq_held);
+        gap.trapped += fe_trapped;
+        gap.held += seq_held;
 
         if (kind == APU_FRAME_RENDER) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
@@ -1304,6 +1352,7 @@ static void *mcpx_apu_frame_thread(void *arg)
         }
 
         if (d->ep_frame_div != div0) {
+            apu_frame_gap_check(d, &gap, pass_us);
             if (d->pace_frames)
                 mcpx_apu_pace_frame_rendered(d, div0);
             else if (div0 % 8 == 0)
