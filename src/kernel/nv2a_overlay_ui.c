@@ -14,6 +14,7 @@
 #include "nv2a_stats.h"
 #include "kernel_pacing.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -130,6 +131,31 @@ int nv2a_overlay_is_deck_board(const char *vendor, const char *product)
 {
     return vendor && product && board_is(vendor, "Valve") &&
            (board_is(product, "Jupiter") || board_is(product, "Galileo"));
+}
+
+/* hint is one of words, in any case. */
+static int word_in(const char *hint, const char *const *words)
+{
+    for (; *words; words++) {
+        const char *a = hint, *b = *words;
+        while (*a && *b && tolower((unsigned char)*a) == *b)
+            a++, b++;
+        if (!*a && !*b)
+            return 1;
+    }
+    return 0;
+}
+
+int nv2a_overlay_steam_hint_wanted(int deck, const char *game_id, const char *app_id,
+                                   const char *hint)
+{
+    static const char *const no[] = { "0", "off", "false", "no", NULL };
+    static const char *const yes[] = { "1", "on", "true", "yes", NULL };
+    if (hint && word_in(hint, no))
+        return 0;
+    if (hint && word_in(hint, yes))
+        return 1;
+    return deck && !(game_id && *game_id) && !(app_id && *app_id);
 }
 
 static void probe_once(void)

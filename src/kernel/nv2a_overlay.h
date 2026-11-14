@@ -148,6 +148,17 @@ void nv2a_overlay_display_mark_deck(struct nv2a_ovl_display *d, const char *stea
  * (the probe reads /sys's DMI on Linux, the BIOS registry key on Windows,
  * which Wine fills from the same DMI). Trailing whitespace is ignored. */
 int nv2a_overlay_is_deck_board(const char *vendor, const char *product);
+/* Whether to warn that the game runs outside Steam on a Steam Deck:
+ * Steam's desktop controller layout then turns the Deck's pad
+ * into keys (D-pad = arrows, A = Enter, B = Escape) unless the game was
+ * started from its Steam shortcut. deck: the machine is a Deck (SteamDeck=1
+ * or its SMBIOS names); game_id, app_id: SteamGameId and SteamAppId, which
+ * Steam sets for every game it starts, a non-Steam shortcut included;
+ * hint: RECOMP_STEAM_HINT, where 0/off/false/no (any case) never warns
+ * (the harnesses) and 1/on/true/yes always does (a test on another
+ * machine); any other value leaves the rule. */
+int nv2a_overlay_steam_hint_wanted(int deck, const char *game_id, const char *app_id,
+                                   const char *hint);
 /* The display the probe found, set directly (ctests); NULL forgets it. */
 void nv2a_overlay_set_display(const struct nv2a_ovl_display *d);
 int nv2a_overlay_armed(void);
@@ -260,6 +271,13 @@ int nv2a_overlay_image_set(uint16_t tex, const uint32_t *rgba, int w, int h);
 void nv2a_overlay_toast(const char *fmt, ...)
 #if defined(__GNUC__) || defined(__clang__)
     __attribute__((format(printf, 1, 2)))
+#endif
+    ;
+/* nv2a_overlay_toast shown for ms instead of 2 s (0: 2 s), for a line
+ * the player must read whole, such as a launch warning. */
+void nv2a_overlay_toast_for(unsigned ms, const char *fmt, ...)
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 2, 3)))
 #endif
     ;
 

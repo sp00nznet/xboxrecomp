@@ -85,6 +85,9 @@ int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)
 void nv2a_overlay_set_stats(int on) { (void)on; }
 float nv2a_overlay_set_ui_scale(float mul) { return mul; }
 void enhance_display_start(void) {}
+/* The outside-Steam warning reads the host environment. */
+void enhance_display_steam_hint(void);
+void enhance_display_steam_hint(void) {}
 int nv2a_overlay_stats(void) { return 0; }
 void nv2a_overlay_toast(const char *fmt, ...) { (void)fmt; }
 void enhance_menu_start(void);

@@ -140,3 +140,29 @@ void enhance_display_start(void)
     if (enhance_cfg_source_of("overlay.ui_fit") != ENHANCE_SRC_DEFAULT)
         fprintf(stderr, "[ENHANCE] overlay.ui_fit=%s\n", k_fit[fit]);
 }
+
+/* How long the toast stays: two lines to read, not a 2 s "Saved". Two
+ * of TOAST_SHOWN's three, so a toast the game raises meanwhile still shows. */
+#define STEAM_HINT_MS 12000u
+
+void enhance_display_steam_hint(void)
+{
+    const char *deck = recomp_env(RENV_STEAM_DECK);
+    int on_deck = (deck && strcmp(deck, "1") == 0) || deck_hardware();
+    if (!nv2a_overlay_steam_hint_wanted(on_deck, recomp_env(RENV_STEAM_GAME_ID),
+                                        recomp_env(RENV_STEAM_APP_ID),
+                                        recomp_env(RENV_STEAM_HINT)))
+        return;
+    /* Steam keeps its desktop layout on every pad while it runs, and only
+     * a game it started gets the pad back (the user's Deck, Desktop Mode,
+     * 2026-11-13: the native build from a terminal saw arrows, Enter and
+     * Escape; from its Steam shortcut, the pad). */
+    fprintf(stderr, "[ENHANCE] warning: started outside Steam on a Steam Deck (no SteamGameId "
+                    "or SteamAppId): Steam's desktop controller layout may turn the pad into "
+                    "keys (D-pad = arrows, A = Enter, B = Escape); start the game from its Steam "
+                    "shortcut\n");
+    nv2a_overlay_toast_for(STEAM_HINT_MS, "Started outside Steam: the pad may act as keys "
+                                          "(D-pad = arrows, A = Enter).");
+    nv2a_overlay_toast_for(STEAM_HINT_MS, "Start the game from its Steam shortcut for the "
+                                          "full pad.");
+}

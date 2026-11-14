@@ -123,6 +123,9 @@ void enhance_display_start(void)
     if (s_display)
         nv2a_overlay_set_display(s_display);
 }
+/* The outside-Steam warning reads the host environment. */
+void enhance_display_steam_hint(void);
+void enhance_display_steam_hint(void) {}
 
 static int s_pacing = 1;
 int xbox_PacingMode(void);

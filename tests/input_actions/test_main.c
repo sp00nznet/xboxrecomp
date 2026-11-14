@@ -109,6 +109,9 @@ void nv2a_overlay_set_stats(int on) { s_ovl_stats = on; }
 float nv2a_overlay_set_ui_scale(float mul) { return mul; }
 /* The display probe needs a window system. */
 void enhance_display_start(void) {}
+/* The outside-Steam warning reads the host environment. */
+void enhance_display_steam_hint(void);
+void enhance_display_steam_hint(void) {}
 int nv2a_overlay_stats(void) { return s_ovl_stats; }
 static int s_toasts;
 static char s_toast[128];

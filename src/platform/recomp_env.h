@@ -169,6 +169,8 @@ extern "C" {
     X(PAD_DEADZONE,      CONFIG, "RECOMP_PAD_DEADZONE",      NULL, "stick deadzone, 0..32767 (default 0); input.pad_deadzone_left/_right (percent) win over it") \
     X(STEAM_GAME_ID,     CONFIG, "SteamGameId",              NULL, "set by Steam, read only: Steam launched the game; on the XInput backend (Windows, Proton) Steam Input may then stand between the pad and the game (xbox_InputSteamInput: maybe)") \
     X(STEAM_DECK,        CONFIG, "SteamDeck",                NULL, "set by Steam, read only: 1 on a Steam Deck; on the XInput backend Steam Input may then stand between the pad and the game (xbox_InputSteamInput: maybe)") \
+    X(STEAM_APP_ID,      CONFIG, "SteamAppId",               NULL, "set by Steam, read only: with SteamGameId, Steam started the game; on a Steam Deck neither set shows the outside-Steam warning (RECOMP_STEAM_HINT)") \
+    X(STEAM_HINT,        CONFIG, "RECOMP_STEAM_HINT",        NULL, "the warning (log line and overlay toast) that a Steam Deck game started outside Steam gets Steam's desktop controller layout (the pad as keys): 0/off/false/no never (the harnesses set 0), 1/on/true/yes always (a test off a Deck); default: on a Deck with neither SteamGameId nor SteamAppId set") \
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
     X(AUDIO_BUF_SAMPLES, CONFIG, "RECOMP_AUDIO_BUF_SAMPLES", NULL, "audio output buffer size in samples") \

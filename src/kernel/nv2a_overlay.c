@@ -571,24 +571,24 @@ const struct nv2a_ovl_atlas *nv2a_overlay_atlas(void)
 #define TOAST_SHOWN 3
 #define TOAST_MS 2000u
 
-static struct { unsigned seq; char text[TOAST_LEN]; } s_toast[TOASTS];
+static struct { unsigned seq; unsigned ms; char text[TOAST_LEN]; } s_toast[TOASTS];
 static unsigned s_toast_head;       /* atomic: pushes so far */
 
 /* The presenting thread's: what it has drained and what it shows. */
 static unsigned s_toast_read;
-static struct { char text[TOAST_LEN]; uint64_t t0; } s_shown[TOAST_SHOWN];
+static struct { char text[TOAST_LEN]; uint64_t t0; unsigned ms; } s_shown[TOAST_SHOWN];
 static int s_nshown;
 static void (*s_toast_hook)(const char *line);   /* the ctest's */
 static void (*s_toast_mid)(void);                /* the ctest's */
 
-void nv2a_overlay_toast(const char *fmt, ...)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 2, 0)))
+#endif
+static void toast_push(unsigned ms, const char *fmt, va_list ap)
 {
     char line[TOAST_LEN];
-    va_list ap;
     unsigned n, k;
-    va_start(ap, fmt);
     vsnprintf(line, sizeof line, fmt, ap);
-    va_end(ap);
     fprintf(stderr, "[TOAST] %s\n", line);
     if (!nv2a_overlay_armed() || !layer_armed(NV2A_OVL_TOAST))
         return;
@@ -601,9 +601,26 @@ void nv2a_overlay_toast(const char *fmt, ...)
     __atomic_store_n(&s_toast[k].seq, 2 * n + 1, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     memcpy(s_toast[k].text, line, sizeof line);
+    s_toast[k].ms = ms;
     __atomic_store_n(&s_toast[k].seq, 2 * n + 2, __ATOMIC_RELEASE);
     show(NV2A_OVL_TOAST, 1);
     wake();                         /* already visible: the drain is due */
+}
+
+void nv2a_overlay_toast(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    toast_push(TOAST_MS, fmt, ap);
+    va_end(ap);
+}
+
+void nv2a_overlay_toast_for(unsigned ms, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    toast_push(ms ? ms : TOAST_MS, fmt, ap);
+    va_end(ap);
 }
 
 /* New toasts into the shown stack; returns 1 when it changed. */
@@ -614,7 +631,7 @@ static int toast_drain(uint64_t now_ms)
     if (head - s_toast_read > TOASTS)
         s_toast_read = head - TOASTS;
     for (; s_toast_read != head; s_toast_read++) {
-        unsigned n = s_toast_read, k = n % TOASTS, seq;
+        unsigned n = s_toast_read, k = n % TOASTS, seq, ms;
         int d;
         char text[TOAST_LEN];
         seq = __atomic_load_n(&s_toast[k].seq, __ATOMIC_ACQUIRE);
@@ -627,6 +644,7 @@ static int toast_drain(uint64_t now_ms)
         if (d > 0)
             continue;
         memcpy(text, s_toast[k].text, sizeof text);
+        ms = s_toast[k].ms;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         /* The sequence only grows: a change under the copy is a lap. */
         if (__atomic_load_n(&s_toast[k].seq, __ATOMIC_RELAXED) != seq)
@@ -639,11 +657,12 @@ static int toast_drain(uint64_t now_ms)
             s_nshown--;
         }
         memcpy(s_shown[s_nshown].text, text, sizeof text);
+        s_shown[s_nshown].ms = ms ? ms : TOAST_MS;
         s_shown[s_nshown++].t0 = now_ms;
         changed = 1;
     }
     for (i = 0; i < s_nshown;) {
-        if (now_ms - s_shown[i].t0 >= TOAST_MS) {
+        if (now_ms - s_shown[i].t0 >= s_shown[i].ms) {
             memmove(&s_shown[i], &s_shown[i + 1], sizeof s_shown[0] * (size_t)(s_nshown - i - 1));
             s_nshown--;
             changed = 1;

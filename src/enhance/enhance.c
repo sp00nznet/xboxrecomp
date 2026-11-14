@@ -542,6 +542,8 @@ int xbox_enhance_init(const char *root, const char *title)
     /* The menu (menu.enabled) arms its own layer and the actions hook's
      * menu step; off, it logs that and nothing more. */
     enhance_menu_start();
+    /* After the toast layer's arm, so the warning shows as well as logs. */
+    enhance_display_steam_hint();
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (game.mode, say) after this, and calls it then. */
     return rc;

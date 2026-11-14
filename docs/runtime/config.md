@@ -1799,6 +1799,23 @@ on BLiNX 2's layout over a synthetic file, the derived archive and its
 import), `tests/saves_keys` (the keys stay zero), `tests/kernel_directory_posix` (the busy table and the
 generation), `tests/enhance_menu` (the page).
 
+### Started outside Steam on a Steam Deck
+
+A native Linux build started on a Steam Deck from a file manager, a
+terminal or a desktop entry gets Steam's desktop controller layout, which
+turns the pad into keys (D-pad = arrows, A = Enter, B = Escape), so the
+game sees a keyboard instead of its pad. When the Deck is known
+(`SteamDeck=1`, or the SMBIOS names Valve Jupiter or Galileo) and neither
+`SteamGameId` nor `SteamAppId` is set, the start logs `[ENHANCE] warning:
+started outside Steam on a Steam Deck ...` and shows a 12 s two-line toast saying
+so and to start the game from its Steam shortcut (two lines, so a toast the
+game raises meanwhile still has its line). `RECOMP_STEAM_HINT=0` (or `off`,
+`false`, `no`, in any case) turns it off (every harness run sets it, so
+goldens and benches never show it), `1` (`on`, `true`, `yes`) shows it
+anywhere; another value keeps the rule. Under Proton umu sets the Steam ids
+itself, so a Proton run outside Steam does not warn. Tests:
+`tests/overlay` (the rule, and the 12 s toast beside a 2 s one).
+
 ### Pad recordings
 
 With the menu on (`menu.enabled`), the menu's Recordings page and the

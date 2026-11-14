@@ -15,6 +15,12 @@ extern "C" {
  * probe. Before the first overlay arm (xbox_enhance_init). */
 void enhance_display_start(void);
 
+/* On a Steam Deck started outside Steam (no SteamGameId nor SteamAppId),
+ * a warning line and a toast: Steam's desktop controller layout then turns
+ * the pad into keys. RECOMP_STEAM_HINT=0 (the harnesses) keeps
+ * both out. After the toast layer's arm (xbox_enhance_init). */
+void enhance_display_steam_hint(void);
+
 #ifdef __cplusplus
 }
 #endif

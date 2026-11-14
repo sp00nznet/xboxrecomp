@@ -324,6 +324,25 @@ static void test_frames(void)
     }
 }
 
+/* A toast shown for longer than 2 s (nv2a_overlay_toast_for), beside a
+ * 2 s one: each line expires on its own clock. */
+static void test_toast_for(void)
+{
+    nv2a_overlay_reset_for_test();
+    CHECK(nv2a_overlay_arm(1u << NV2A_OVL_TOAST, 1080) == 0, "arm");
+    nv2a_overlay_set_placement(0, 0, 1280, 720);
+    nv2a_overlay_toast_for(12000, "long");
+    nv2a_overlay_toast("short");
+    nv2a_overlay_poll(1000);
+    CHECK(nv2a_overlay_visible() & 1u << NV2A_OVL_TOAST, "toasts not shown");
+    nv2a_overlay_poll(3500);
+    CHECK(nv2a_overlay_visible() & 1u << NV2A_OVL_TOAST, "the 12 s toast went with the 2 s one");
+    nv2a_overlay_poll(12500);
+    CHECK(nv2a_overlay_visible() & 1u << NV2A_OVL_TOAST, "the 12 s toast expired early");
+    nv2a_overlay_poll(13100);
+    CHECK(!(nv2a_overlay_visible() & 1u << NV2A_OVL_TOAST), "the 12 s toast outlived 12 s");
+}
+
 static void test_layers(void)
 {
     const struct nv2a_ovl_list *l;
@@ -1045,6 +1064,29 @@ static void test_display_scale(void)
         nv2a_overlay_display_mark_deck(&tv, "1");
         CHECK(!tv.handheld, "a docked Deck is a desktop");
     }
+    /* The outside-Steam warning: a Deck with neither Steam
+     * variable; RECOMP_STEAM_HINT=0 (the harnesses) never, =1 always. */
+    CHECK(nv2a_overlay_steam_hint_wanted(1, NULL, NULL, NULL) &&
+              nv2a_overlay_steam_hint_wanted(1, "", "", ""),
+          "a Deck started outside Steam warns");
+    CHECK(!nv2a_overlay_steam_hint_wanted(1, "12345", NULL, NULL) &&
+              !nv2a_overlay_steam_hint_wanted(1, NULL, "0", NULL) &&
+              !nv2a_overlay_steam_hint_wanted(1, "3373755694", "3373755694", NULL),
+          "a game Steam started never warns");
+    CHECK(!nv2a_overlay_steam_hint_wanted(0, NULL, NULL, NULL), "a desktop never warns");
+    CHECK(!nv2a_overlay_steam_hint_wanted(1, NULL, NULL, "0"), "RECOMP_STEAM_HINT=0 warns");
+    CHECK(nv2a_overlay_steam_hint_wanted(0, "1", "1", "1"), "RECOMP_STEAM_HINT=1 is silent");
+    CHECK(!nv2a_overlay_steam_hint_wanted(1, NULL, NULL, "off") &&
+              !nv2a_overlay_steam_hint_wanted(1, NULL, NULL, "False") &&
+              !nv2a_overlay_steam_hint_wanted(1, NULL, NULL, "NO"),
+          "RECOMP_STEAM_HINT off/false/no warns");
+    CHECK(nv2a_overlay_steam_hint_wanted(0, NULL, NULL, "on") &&
+              nv2a_overlay_steam_hint_wanted(0, NULL, NULL, "TRUE") &&
+              nv2a_overlay_steam_hint_wanted(0, NULL, NULL, "yes"),
+          "RECOMP_STEAM_HINT on/true/yes is silent");
+    CHECK(nv2a_overlay_steam_hint_wanted(1, NULL, NULL, "maybe") &&
+              !nv2a_overlay_steam_hint_wanted(0, NULL, NULL, "offf"),
+          "another RECOMP_STEAM_HINT value leaves the rule");
 
     /* Nothing known: the stock rule. */
     CHECK(nv2a_ovl_ui_scale(800) == 800.0f / 1080.0f, "no display at 800: %.3f",
@@ -1301,6 +1343,7 @@ int main(void)
     test_disarmed();
     test_frames();
     test_layers();
+    test_toast_for();
     test_threads();
     test_toasts();
     test_lock();
