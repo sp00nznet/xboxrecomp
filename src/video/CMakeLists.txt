@@ -16,7 +16,10 @@ if(TARGET xbox_d3d8)
 endif()
 if(WIN32)
     # gpu_present.c: the framebuffer window's D3D11 presenter.
-    target_sources(xbox_video PRIVATE gpu_present.c)
+    # nv2a_hw_d3d11.c: the executor's D3D11 renderer (RECOMP_HW_RENDER); it
+    # calls the executor's back-end interface in xbox_kernel.
+    target_sources(xbox_video PRIVATE gpu_present.c nv2a_hw_d3d11.c)
+    target_link_libraries(xbox_video PUBLIC xbox_kernel)
     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32
                           d3d11 dxgi dxguid d3dcompiler)
 else()

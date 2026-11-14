@@ -779,12 +779,19 @@ static void surface_apply_clip(void)
 
 static const Nv2aBackend *s_backend;
 static void (*s_backend_present_sync)(void);
+static int s_backend_programs;              /* nv2a_backend_set_program_batches */
 
 void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
                                              void (*present_sync)(void))
 {
     s_backend = backend;
     s_backend_present_sync = backend ? present_sync : NULL;
+    s_backend_programs = 0;
+}
+
+void nv2a_backend_set_program_batches(int enable)
+{
+    s_backend_programs = enable != 0;
 }
 
 void nv2a_backend_register(const Nv2aBackend *backend)
@@ -797,6 +804,9 @@ static int backend_draws(void)
     return s_backend && s_backend->draw;
 }
 
+static void surface_swizzle_update(void);
+static int s_swz_on;
+
 static void current_surface(Nv2aSurface *out)
 {
     out->color_va        = dma_resolve(s_gpu.color_offset);
@@ -806,6 +816,10 @@ static void current_surface(Nv2aSurface *out)
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    surface_swizzle_update();
+    out->swizzled        = s_swz_on;
+    out->swz_width       = 1u << ((s_gpu.format >> 16) & 0xF);
+    out->swz_height      = 1u << ((s_gpu.format >> 24) & 0xF);
 }
 
 /* Render state in the NV2A's own values, gathered from what the executor
@@ -831,6 +845,7 @@ static void current_render_state(Nv2aRenderState *r)
     r->zeta_va           = s_gpu.zeta_offset ? dma_resolve(s_gpu.zeta_offset) : 0;
     r->depth_min         = reg_f(0x0394);            /* SET_CLIP_MIN */
     r->depth_max         = reg_f(0x0398);            /* SET_CLIP_MAX */
+    r->zeta_format       = (s_gpu.format >> 4) & 0xF;  /* 1 Z16, 2 Z24S8 */
     r->stencil_enable    = s_reg[0x032C / 4];        /* SET_STENCIL_TEST_ENABLE */
     r->stencil_write_mask = s_reg[0x0360 / 4];       /* SET_STENCIL_MASK */
     r->stencil_func      = s_reg[0x0364 / 4];        /* SET_STENCIL_FUNC */
@@ -856,7 +871,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
     s_gpu.texs[0].color  = tex->color;
     s_gpu.texs[0].addr_u = 3;
     s_gpu.texs[0].addr_v = 3;
-    s_gpu.texs[0].palette = 0;          /* ponytail: no palettised formats */
+    s_gpu.texs[0].palette = tex->palette;   /* P8: the CLUT the stage named */
     s_gpu.texs[0].levels = 1;
     s_gpu.texs[0].filter = 0;
     s_gpu.texs[0].cube   = 0;
@@ -2185,6 +2200,75 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
     o->v = v->tex[0][1] * sv;
 }
 
+/* Texture stage `st` as a back end sees it, or NULL when none is bound. */
+static const Nv2aTexture *backend_stage_texture(int st, Nv2aTexture *tex)
+{
+    const Texture *t = &s_gpu.texs[st];
+
+    if (!t->valid)
+        return NULL;
+    tex->offset  = t->offset;
+    tex->width   = t->width;
+    tex->height  = t->height;
+    tex->pitch   = t->pitch;
+    tex->color   = t->color;
+    tex->addr_u  = t->addr_u;
+    tex->addr_v  = t->addr_v;
+    tex->levels  = t->pitch ? 1 : t->levels;
+    tex->filter  = t->filter;
+    tex->palette = t->palette;
+    return tex;
+}
+
+/* Stage 0, the one a back end draws when there is no pixel state. */
+static const Nv2aTexture *backend_texture(Nv2aTexture *tex)
+{
+    return backend_stage_texture(0, tex);
+}
+
+/* Each vertex's full outputs for the batch being collected, while every one of
+ * them came through raster_xf_triangle (s_bxf_count == s_bcount). */
+static Nv2aVshOutput *s_bxf;
+static uint32_t s_bxf_count;
+
+/* The combiner pipeline, when the CPU rasteriser would draw the batch through
+ * it (raster_xf_triangle's use_rc), else NULL. The stage filter rule is
+ * rc_texel's. */
+static const Nv2aPixelState *backend_pixel_state(Nv2aPixelState *ps)
+{
+    static int no_rc = -1;
+    int st, bi, an;
+
+    if (no_rc < 0)
+        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+    if (!s_gpu.rc_seen || no_rc)
+        return NULL;
+    tex_filter_config(&bi, &an);
+    memset(ps, 0, sizeof *ps);
+    ps->rc = s_gpu.rc;
+    for (st = 0; st < 4; st++) {
+        const Texture *t = &s_gpu.texs[st];
+        Nv2aStage *s = &ps->stage[st];
+        uint32_t min = (t->filter >> 16) & 0xFF, mag = (t->filter >> 24) & 0xF;
+
+        s->mode = (s_gpu.rc.stage_program >> (5 * st)) & 0x1F;
+        s->valid = backend_stage_texture(st, &s->tex) != NULL;
+        s->size_from_format = tex_size_from_format(t->color) != 0;
+        s->bilinear = bi || mag == 2 || min == 2 || min == 4 || min == 6;
+        s->border_u = t->border_color && t->addr_u == 4;
+        s->border_v = t->border_color && t->addr_v == 4;
+        s->border_argb = t->border;
+        s->cube = t->cube != 0;
+    }
+    ps->clip_plane_mode = s_gpu.clip_plane_mode;
+    ps->fog_enable = s_gpu.fog_enable;
+    ps->fog_mode = s_gpu.fog_mode;
+    ps->fog_color = s_gpu.fog_color;
+    ps->fog_param[0] = s_gpu.fog_param[0];
+    ps->fog_param[1] = s_gpu.fog_param[1];
+    return ps;
+}
+
 /* `textured`: the batch carried texture coordinates, so the bound texture is
  * part of it. */
 static void backend_flush(int textured)
@@ -2193,6 +2277,7 @@ static void backend_flush(int textured)
     Nv2aRenderState rs;
     Nv2aTexture tex;
     Nv2aBatch batch;
+    Nv2aPixelState ps;
 
     if (!s_bcount)
         return;
@@ -2200,20 +2285,17 @@ static void backend_flush(int textured)
     current_render_state(&rs);
     batch.vertices = s_bverts;
     batch.count = s_bcount;
-    batch.texture = NULL;
+    batch.texture = textured ? backend_texture(&tex) : NULL;
     batch.state = &rs;
-    if (textured && s_gpu.texs[0].valid) {
-        tex.offset = s_gpu.texs[0].offset;
-        tex.width  = s_gpu.texs[0].width;
-        tex.height = s_gpu.texs[0].height;
-        tex.pitch  = s_gpu.texs[0].pitch;
-        tex.color  = s_gpu.texs[0].color;
-        tex.addr_u = s_gpu.texs[0].addr_u;
-        tex.addr_v = s_gpu.texs[0].addr_v;
-        tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
-        tex.filter = s_gpu.texs[0].filter;
-        batch.texture = &tex;
+    batch.program = NULL;
+    batch.pixel = NULL;
+    batch.xf = NULL;
+    if (s_bxf && s_bxf_count == s_bcount) {     /* all through raster_xf_triangle */
+        batch.pixel = backend_pixel_state(&ps);
+        if (batch.pixel)
+            batch.xf = (const float (*)[32])s_bxf;
     }
+    s_bxf_count = 0;
     s_backend->draw(&surf, &batch);
     s_gpu.tris_drawn += s_bcount / 3;
     s_bcount = 0;
@@ -3074,6 +3156,14 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
             backend_from_xf(va, &o[0]);
             backend_from_xf(vb, &o[1]);
             backend_from_xf(vc, &o[2]);
+            if (s_bxf || (s_bxf = (Nv2aVshOutput *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bxf))) {
+                if (s_bxf_count == s_bcount) {
+                    s_bxf[s_bcount] = *va;
+                    s_bxf[s_bcount + 1] = *vb;
+                    s_bxf[s_bcount + 2] = *vc;
+                    s_bxf_count = s_bcount + 3;
+                }
+            }
             s_bcount += 3;
         }
         return;
@@ -3321,10 +3411,263 @@ static void xf_set_viewport(void)
     s_xf_o[2] = of[2];
 }
 
+/* The attribute formats batches use, for the report. */
+static void note_attr_formats(void)
+{
+    uint32_t i, j;
+
+    for (i = 0; i < NV2A_VSH_INPUTS; i++) {
+        const VertexAttr *at = &s_gpu.attr[i];
+        uint32_t f = at->type | (at->size << 4) | (i << 8);
+        if (!at->size || !at->stride)
+            continue;
+        for (j = 0; j < (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_fmt[j] != f; j++)
+            ;
+        if (j == (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_nfmt < 16)
+            s_gpu.xf_fmt[s_gpu.xf_nfmt++] = f;
+    }
+}
+
+/* ---- Vertex-program batches for a back end that runs the program -------- *
+ *
+ * A back end that asked (nv2a_backend_set_program_batches) gets a program batch
+ * before transform: for each distinct index of the batch, the inputs the
+ * program reads, fetched exactly as transform_vertex fetches them; the
+ * triangle list over them in the order and winding raster_batch_program
+ * would rasterise; the constants; and the program as HLSL. It then runs the
+ * program, the w and AA fixes, the clip and the raster itself, and nothing
+ * of the batch runs on the CPU. Batches it cannot take -- no back end that
+ * wants them, fixed function, constant writes on, points or lines, no
+ * program, no memory -- run on the CPU exactly as before. */
+static uint32_t s_vsh_cxt_write;          /* _PROGRAM_CXT_WRITE_EN as set */
+
+#define PB_HASH_BITS 17                   /* 131072 >= 2 * NV_MAX_INDICES */
+#define PB_HASH_SIZE (1u << PB_HASH_BITS)
+#define PB_HLSL_CAP  (256u * 1024u)       /* a 136-instruction program fits */
+#define PB_PROGRAMS  256                  /* emitted programs kept */
+
+static int backend_takes_programs(void)
+{
+    return backend_draws() && s_backend_programs;
+}
+
+static int backend_program_batch(void)
+{
+    static struct { uint64_t key; char *hlsl; uint32_t len, inputs, ninputs; } progs[PB_PROGRAMS];
+    static uint32_t nprogs, evict, cur_rev, have_cur;
+    static int pcur = -1;
+    static char *emit_buf;
+    const char *hlsl;
+    uint32_t hlsl_len, inputs, ninputs;
+    static uint32_t *map, *uniq, *tri;
+    static float (*in)[4];
+    static size_t in_cap;                 /* float4s */
+    static uint32_t key[PB_HASH_SIZE], val[PB_HASH_SIZE], gen[PB_HASH_SIZE], cur;
+    static float consts[NV2A_VSH_CONSTANTS][4];
+    static int near_z = -1;
+    uint32_t n = s_gpu.idx_count, i, u = 0, t = 0, a, k;
+    Nv2aProgramBatch pb;
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    Nv2aTexture tex;
+    Nv2aBatch batch;
+    Nv2aPixelState ps;
+
+    if (!backend_takes_programs() || !batch_uses_program() || s_vsh_cxt_write
+        || s_gpu.prim < NV_PRIM_TRIANGLES || s_gpu.prim > NV_PRIM_POLYGON)
+        return 0;
+    /* The program as HLSL, emitted once per distinct program: a title can
+     * switch programs between almost every batch (Raw 2 about 450 times a
+     * frame), and nv2a_vsh_program_key names a program across switches. */
+    if (!have_cur || nv2a_vsh_program_revision() != cur_rev) {
+        uint64_t pkey = nv2a_vsh_program_key();
+        uint32_t j;
+
+        cur_rev = nv2a_vsh_program_revision();
+        have_cur = 1;
+        pcur = -1;
+        for (j = 0; pkey && j < nprogs; j++)
+            if (progs[j].key == pkey) {
+                pcur = (int)j;
+                break;
+            }
+        if (pkey && pcur < 0) {
+            uint32_t slot = nprogs < PB_PROGRAMS ? nprogs++ : evict++ % PB_PROGRAMS;
+            size_t len;
+
+            if (!emit_buf && !(emit_buf = (char *)malloc(PB_HLSL_CAP))) {
+                have_cur = 0;
+                return 0;
+            }
+            len = nv2a_vsh_emit_hlsl(emit_buf, PB_HLSL_CAP);
+            free(progs[slot].hlsl);
+            progs[slot].hlsl = len ? (char *)malloc(len) : NULL;
+            if (!progs[slot].hlsl) {
+                progs[slot].key = 0;
+                progs[slot].len = 0;
+                have_cur = 0;
+                return 0;
+            }
+            memcpy(progs[slot].hlsl, emit_buf, len);
+            progs[slot].len = (uint32_t)len;
+            progs[slot].key = pkey;
+            progs[slot].inputs = nv2a_vsh_inputs_read();
+            for (progs[slot].ninputs = 0, a = 0; a < NV2A_VSH_INPUTS; a++)
+                progs[slot].ninputs += (progs[slot].inputs >> a) & 1u;
+            pcur = (int)slot;
+        }
+    }
+    if (pcur < 0)
+        return 0;                         /* no program: the CPU path draws nothing either */
+    hlsl = progs[pcur].hlsl;
+    hlsl_len = progs[pcur].len;
+    inputs = progs[pcur].inputs;
+    ninputs = progs[pcur].ninputs;
+    if (!map) {
+        map = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *map);
+        uniq = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *uniq);
+        tri = (uint32_t *)malloc(3u * NV_MAX_INDICES * sizeof *tri);
+        if (!map || !uniq || !tri) {
+            free(map); free(uniq); free(tri);
+            map = uniq = tri = NULL;
+            return 0;
+        }
+    }
+
+    /* Distinct indices, in first-use order. */
+    if (++cur == 0) {                     /* generation wrapped: clear once */
+        memset(gen, 0, sizeof gen);
+        cur = 1;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t idx = s_gpu.idx[i], h = (idx * 2654435761u) >> (32 - PB_HASH_BITS);
+
+        while (gen[h] == cur && key[h] != idx)
+            h = (h + 1) & (PB_HASH_SIZE - 1);
+        if (gen[h] != cur) {
+            gen[h] = cur;
+            key[h] = idx;
+            val[h] = u;
+            uniq[u++] = idx;
+        }
+        map[i] = val[h];
+    }
+
+    /* Their inputs, as transform_vertex reads them. */
+    if ((size_t)u * ninputs > in_cap) {
+        size_t want = (size_t)u * ninputs;
+        float (*grown)[4] = (float (*)[4])realloc(in, want * sizeof *in);
+        if (!grown)
+            return 0;
+        in = grown;
+        in_cap = want;
+    }
+    for (i = 0; i < u; i++) {
+        float (*dst)[4] = in + (size_t)i * ninputs;
+        for (a = 0, k = 0; a < NV2A_VSH_INPUTS; a++) {
+            if (!(inputs & (1u << a)))
+                continue;
+            if (!s_gpu.attr[a].size && a < NV_VERTEX_ATTRS)
+                memcpy(dst[k], s_gpu.imm_attr[a], sizeof dst[k]);
+            else
+                fetch_attr(&s_gpu.attr[a], uniq[i], dst[k]);
+            k++;
+        }
+    }
+
+    /* The triangles, as raster_batch_program assembles them. */
+#define PB_TRI(p, q, r) (tri[t++] = map[p], tri[t++] = map[q], tri[t++] = map[r])
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3)
+            PB_TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) {
+            if ((i & 1) && strip_alt_winding())
+                PB_TRI(i + 1, i, i + 2);
+            else
+                PB_TRI(i, i + 1, i + 2);
+        }
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++)
+            PB_TRI(0, i, i + 1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            PB_TRI(i, i + 1, i + 2);
+            PB_TRI(i, i + 2, i + 3);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            PB_TRI(i, i + 1, i + 3);
+            PB_TRI(i, i + 3, i + 2);
+        }
+        break;
+    default:
+        break;
+    }
+#undef PB_TRI
+
+    for (i = 0; i < NV2A_VSH_CONSTANTS; i++)
+        memcpy(consts[i], nv2a_vsh_constant(i), sizeof consts[i]);
+    if (near_z < 0) {
+        const char *e = getenv("RECOMP_CLIP_NEAR_Z");
+        near_z = !(e && e[0] == '0');
+    }
+    pb.inputs = (const float (*)[4])in;
+    pb.input_count = u;
+    pb.inputs_read = inputs;
+    pb.indices = tri;
+    pb.index_count = t;
+    pb.constants = (const float (*)[4])consts;
+    pb.hlsl = hlsl;
+    pb.hlsl_len = hlsl_len;
+    pb.program_revision = cur_rev;
+    pb.program_key = progs[pcur].key;
+    pb.aa_sx = s_gpu.aa_sx;
+    pb.aa_sy = s_gpu.aa_sy;
+    pb.near_z = consts[59][2];
+    pb.near_clip = (uint32_t)near_z;
+    pb.tex0_scale[0] = pb.tex0_scale[1] = 1.0f;   /* as backend_from_xf scales */
+    if (tex_size_from_format(s_gpu.texs[0].color)) {
+        pb.tex0_scale[0] = (float)s_gpu.texs[0].width;
+        pb.tex0_scale[1] = (float)s_gpu.texs[0].height;
+    }
+
+    /* The bookkeeping raster_batch_program does for a program batch. */
+    xf_set_viewport();
+    s_xf_no_tex = 0;
+    s_gpu.batches_program++;
+    s_gpu.verts_program += n;
+    note_attr_formats();
+    if (s_gpu.texs[0].valid)
+        note_texture_use();
+
+    current_surface(&surf);
+    current_render_state(&rs);
+    batch.vertices = NULL;
+    batch.count = 0;
+    batch.texture = backend_texture(&tex);
+    batch.state = &rs;
+    batch.program = &pb;
+    batch.pixel = backend_pixel_state(&ps);
+    batch.xf = NULL;
+    s_backend->draw(&surf, &batch);
+    s_gpu.tris_drawn += t / 3;
+    note_drawn();
+    return 1;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
+    if (backend_program_batch())
+        return;                         /* the back end runs the program */
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
     for (i = 0; i < n; i++)
@@ -3415,16 +3758,7 @@ static void raster_batch_program(void)
                         s_xf[i].pos[3]);
         }
     }
-    for (i = 0; i < NV2A_VSH_INPUTS; i++) {
-        const VertexAttr *at = &s_gpu.attr[i];
-        uint32_t f = at->type | (at->size << 4) | (i << 8), j;
-        if (!at->size || !at->stride)
-            continue;
-        for (j = 0; j < (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_fmt[j] != f; j++)
-            ;
-        if (j == (uint32_t)s_gpu.xf_nfmt && s_gpu.xf_nfmt < 16)
-            s_gpu.xf_fmt[s_gpu.xf_nfmt++] = f;
-    }
+    note_attr_formats();
     if (s_gpu.texs[0].valid)
         note_texture_use();
 
@@ -4117,6 +4451,38 @@ static uint32_t flip_clock(uint64_t now_ns, int *ok)
     return c;
 }
 
+/* No two flips on one vblank. The hold paces flips between walks, but a
+ * walk that reaches a second FLIP_STALL (two frames queued, when the drawing
+ * fell a frame behind) or a stall inside a CALL (never held) flipped at once,
+ * and a title that steps its game once per flip ran fast: Raw 2's ring went
+ * at 80 flips a second on the GPU renderer with vblanks at 60. The walker
+ * waits here instead, as the GPU waits at FLIP_STALL, until the vblank count
+ * has moved since the last flip was armed. Only with a running clock, and
+ * never longer than a hold may last. */
+static uint32_t s_flip_waits;             /* flips the walker waited for in place */
+
+static void flip_one_per_vblank(int clock_ok)
+{
+    static uint32_t last;
+    static int have;
+
+    if (have && clock_ok && xbox_VblankCount() == last) {
+        uint64_t t0 = xbox_HostNowNs();
+        while (xbox_VblankCount() == last
+               && xbox_HostNowNs() - t0 < XBOX_FLIP_HOLD_MAX_NS) {
+#if defined(_WIN32)
+            Sleep(1);                     /* 1 ms: the paced timer set timeBeginPeriod(1) */
+#else
+            struct timespec ts = { 0, 1000000L };
+            nanosleep(&ts, NULL);
+#endif
+        }
+        s_flip_waits++;
+    }
+    last = xbox_VblankCount();
+    have = 1;
+}
+
 /* Once per pass of the ack loop: 1 while a flip is held. */
 int nv2a_pb_exec_flip_poll(void)
 {
@@ -4139,10 +4505,11 @@ static void flip_hold_report(void)
         return;
     fprintf(stderr, "[GPU] flip hold: holds %u held_ms %.1f hold_timeouts %u"
             " clock_stops %u iv0 %u iv1 %u iv2 %u iv3 %u nonop %u"
-            " counters_owned %u\n", h->holds, h->held_ns / 1e6, h->timeouts,
+            " counters_owned %u waits_in_walk %u\n", h->holds, h->held_ns / 1e6, h->timeouts,
             h->clock_stops, h->iv[0], h->iv[1], h->iv[2], h->iv[3], h->nonop,
-            xbox_Nv2aFrameCountersOwned());
+            xbox_Nv2aFrameCountersOwned(), s_flip_waits);
     h->holds = h->timeouts = h->clock_stops = h->nonop = 0;
+    s_flip_waits = 0;
     h->iv[0] = h->iv[1] = h->iv[2] = h->iv[3] = 0;
     h->held_ns = 0;
 }
@@ -4580,6 +4947,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * early. */
         if (nv2a_pb_exec_flip_pacing()) {
             extern int nv2a_pb_scan_in_call(void);
+            flip_one_per_vblank(clock_ok);
             xbox_FlipHoldStall(&s_flip_hold, stall_vbl, stall_ns,
                                clock_ok && !nv2a_pb_scan_in_call());
         }
@@ -4592,6 +4960,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case 0x1E98:                                  /* _PROGRAM_CXT_WRITE_EN */
         nv2a_vsh_set_cxt_write(param);
+        s_vsh_cxt_write = param;
         break;
     case 0x1E9C:                                  /* _PROGRAM_LOAD */
         nv2a_vsh_set_load_slot(param);

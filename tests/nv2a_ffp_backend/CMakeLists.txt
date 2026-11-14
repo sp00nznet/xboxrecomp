@@ -8,7 +8,8 @@ set(NV2A_BACKEND_TEST_SOURCES
     ../../src/kernel/nv2a_flip_hold.c)
 add_executable(nv2a-ffp-backend-test nv2a_ffp_backend_test.c ${NV2A_BACKEND_TEST_SOURCES})
 add_executable(nv2a-present-sync-test nv2a_present_sync_test.c ${NV2A_BACKEND_TEST_SOURCES})
-foreach(target nv2a-ffp-backend-test nv2a-present-sync-test)
+add_executable(nv2a-program-backend-test nv2a_program_backend_test.c ${NV2A_BACKEND_TEST_SOURCES})
+foreach(target nv2a-ffp-backend-test nv2a-present-sync-test nv2a-program-backend-test)
     target_include_directories(${target} PRIVATE ../../src/kernel ../../src)
     if(MSVC)
         target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -25,3 +26,7 @@ set_tests_properties(nv2a-present-sync PROPERTIES ENVIRONMENT
 # checks the unchanged order without it (the test above) and the swapped one with it.
 add_test(NAME nv2a-ffp-backend-strip-winding COMMAND nv2a-ffp-backend-test)
 set_tests_properties(nv2a-ffp-backend-strip-winding PROPERTIES ENVIRONMENT "RECOMP_STRIP_ALT_WINDING=1")
+# Vertex-program batches before transform (nv2a_backend_set_program_batches), both strip windings.
+add_test(NAME nv2a-program-backend COMMAND nv2a-program-backend-test)
+add_test(NAME nv2a-program-backend-strip-winding COMMAND nv2a-program-backend-test)
+set_tests_properties(nv2a-program-backend-strip-winding PROPERTIES ENVIRONMENT "RECOMP_STRIP_ALT_WINDING=1")

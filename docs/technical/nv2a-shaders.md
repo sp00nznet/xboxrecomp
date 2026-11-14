@@ -60,12 +60,28 @@ emit them so that the MAC and ILU results are written from the *pre-instruction*
 register values — reading a register the paired op just wrote is the classic
 way to get this subtly wrong.
 
+### Programs run by the pushbuffer executor
+
+Titles that run through the pushbuffer executor (`RECOMP_PB_EXEC`) do not use
+that translator: the executor forwards the program and constant uploads to
+`src/kernel/nv2a_vsh_interp.c`, which runs the program on the CPU, one vertex
+at a time (`nv2a_vsh_run`). For a GPU renderer the same file also emits the
+current program as HLSL (`nv2a_vsh_emit_hlsl`), written from the interpreter's
+own decoded instructions, so both decode the microcode the same way. The text
+is a library, not a whole shader: the constants at `register(b1)`,
+`struct Nv2aVshIn` (only the inputs the program reads, see
+`nv2a_vsh_inputs_read`), `struct Nv2aVshOut` and `nv2a_vsh()`. The renderer
+writes `main()` around it (screen to clip space, fog, clipping).
+`tests/nv2a_vsh_hlsl` runs programs both ways on D3D11 and compares every
+output: MAC ops bit for bit, ILU ops within the GPU's precision.
+
 ## Where the code lives
 
 | Piece | File |
 |---|---|
 | Combiner → HLSL | `src/d3d/d3d8_combiners.c`, `src/d3d/d3d8_combiners.h` |
-| Vertex microcode → HLSL | `src/nv2a/nv2a_pgraph_d3d11.c` |
+| Vertex microcode → HLSL (D3D8 layer) | `src/d3d/d3d8_vsh.c` |
+| Vertex programs in the pushbuffer executor: CPU interpreter and HLSL emission | `src/kernel/nv2a_vsh_interp.c` |
 | Texture unswizzling | `src/d3d/d3d8_swizzle.h` |
 
 `d3d8_combiners.h` and `d3d8_swizzle.h` cite xemu as a reference for the

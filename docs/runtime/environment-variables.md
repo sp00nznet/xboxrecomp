@@ -83,6 +83,7 @@ The executor is itself opt-in: set `RECOMP_PB_EXEC=1` to execute the pushbuffer.
 | Variable | Default | What it does | Where |
 |---|---|---|---|
 | `RECOMP_PB_EXEC` | off | Executes the title's pushbuffer. | `nv2a_pb_scan.c`, `xbox_memory_layout.c` |
+| `RECOMP_HW_RENDER` | off | `1`: the executor's draws go to the D3D11 renderer instead of the CPU rasteriser, vertex programs run as GPU shaders (Windows; the game calls `xbox_Nv2aHwRendererInstall`, as the template does). `warp`: the same on WARP. It turns on `RECOMP_STRIP_ALT_WINDING` when that is unset, since the GPU culls. | `nv2a_hw_d3d11.c` |
 | `RECOMP_PB_SCAN` | off | Read-only survey of the pushbuffer; ranks what is not implemented. | `nv2a_pb_scan.c`, `xbox_memory_layout.c` |
 | `RECOMP_PB_WALK=dma` | off | Walks the pushbuffer as the DMA engine does, which delivers D3D's software-method interrupt. | `nv2a_pb_scan.c` |
 | `RECOMP_NV2A_TRACE` | off | Shows whether `DMA_PUT` moves at all. | `xbox_memory_layout.c` |

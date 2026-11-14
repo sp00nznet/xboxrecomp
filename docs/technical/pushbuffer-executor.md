@@ -203,6 +203,31 @@ contiguous window); a read outside it returns no vertex and the batch is dropped
 All calls come from the NV2A poll thread, one at a time, so a back end can
 create its window and device lazily and pump messages from `flip`.
 
+### Vertex programs on the GPU, and the D3D11 renderer
+
+A back end that runs vertex programs itself calls
+`nv2a_backend_set_program_batches(1)` after registering. Each vertex-program
+batch then arrives before transform, in `Nv2aBatch.program`
+(`Nv2aProgramBatch`): the inputs the program reads for each distinct vertex,
+the triangle list over them in the order the executor would rasterise, the
+constants, the program as an HLSL library (`nv2a_vsh_emit_hlsl`), and the fixes
+and clip planes the executor applies after `nv2a_vsh_run`. Batches whose
+program writes constants, points and lines, and fixed-function or
+pre-transformed batches still arrive as surface pixels.
+`tests/nv2a_ffp_backend/nv2a_program_backend_test.c` checks that a program
+batch, run through the interpreter, gives the vertices the pixel path gives.
+
+`src/video/nv2a_hw_d3d11.c` is such a back end, in this tree:
+`RECOMP_HW_RENDER=1` (`xbox_Nv2aHwRendererInstall`, called by the game template)
+draws the executor's work on a D3D11 device. Colour surfaces live on the GPU
+for the frame and are written back to guest memory in `present_sync`; depth
+stays on the GPU; window z is compared as it is. It draws what the contract
+carries: the register combiners over the four texture stages and fog (one
+generated pixel shader per combiner program, `nv2a_rc_eval` written out as
+HLSL), stage 0 times diffuse when there is no combiner state, alpha test,
+blend, depth, stencil, cull and colour mask. `tests/nv2a_hw_backend` draws
+scenes both ways, on WARP, and compares them with the CPU rasteriser's output.
+
 Things a back end should get right. These come from a Direct3D 11 back end
 written against this interface for one title; that back end is not in this
 tree, so treat them as advice from one implementation, not as tested behaviour
@@ -221,10 +246,14 @@ of the code here:
   from the projected, mirrored one. Decide culling per triangle from the
   projected screen positions and draw with the rasteriser's culling off.
 
-Not passed on yet: the register-combiner state, and texture stages 1–3 (a back
-end sees stage 0 and the diffuse colour), so effects that need a second stage
-or a combiner program only appear on the CPU rasteriser. Extend `Nv2aBatch`
-when it matters rather than adding callbacks.
+Combiner state. Once the title has programmed the register combiners (as
+every title does), a batch the CPU rasteriser would draw through them carries
+`Nv2aBatch.pixel`: the combiner words, the four texture stages (mode, texture,
+filter and border rule) and fog. A surface-pixel batch then also carries
+`Nv2aBatch.xf`, each vertex's full outputs (both colours, fog, four texture
+coordinates), since `vertices` holds only what stage 0 needs. A back end that
+ignores `pixel` draws stage 0 times diffuse, as before. Extend `Nv2aBatch`
+when more matters rather than adding callbacks.
 
 ## Switches
 
