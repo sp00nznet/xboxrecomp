@@ -5963,7 +5963,6 @@ static void lrs_set_param(void *ctx, const char *name, float v)
         nv2a_present_chain_error(e, msg, sizeof msg);
 }
 
-#ifdef _WIN32
 static int s_popup;                     /* output_surface made the window a popup */
 static int s_hold_on;                   /* output_surface holds the output */
 static UINT s_hold_bw, s_hold_bh;       /* the swap chain at the hold's start */
@@ -6019,7 +6018,10 @@ static void output_release(void)
  * present.fullscreen included (its internal window is the frame's size,
  * d3d11_host_fullscreen), the screen shows the client area 1:1, so the
  * swap chain takes the client's size and the window stays. At the end
- * output_release puts back what the hold found. Each switch logs its cost,
+ * output_release puts back what the hold found. The SDL host (dxvk-native)
+ * holds the same way: its popup and restore are resize requests
+ * the presenter's main thread makes, a frame or two later, and dxvk scales
+ * the swap chain into the window meanwhile. Each switch logs its cost,
  * split into the window's and the swap chain's. present.surface=window
  * already draws at the client size (present_resize). Returns 1 while the
  * surface is the output. */
@@ -6065,8 +6067,11 @@ static int output_surface(int on, int internal)
     if (w && h && (w != s_back_w || h != s_back_h)) {
         unsigned crw, crh;
         swap_resize(w, h);
-        if (!s_back)
-            return 1;           /* swap_resize said it, once */
+        /* swap_resize said it, once. A failed ResizeBuffers can leave the
+         * old buffer in place: no size line then, or it would print every
+         * flip while the retry keeps failing. */
+        if (!s_back || s_back_w != w || s_back_h != h)
+            return 1;
         /* The client area beside it: a window the compositor sees at
          * another size than the swap chain is scaled by it. */
         d3d11_host_client_rect(&crw, &crh);
@@ -6076,16 +6081,6 @@ static int output_surface(int on, int internal)
     }
     return 1;
 }
-#else /* XBOXRECOMP_DXVK_NATIVE */
-/* No popup on the SDL host (d3d11_host_popup is a no-op there): the
- * surface stays the frame, the chain and the menu at its pixels (the
- * hold's follow-up). */
-static int output_surface(int on, int internal)
-{
-    (void)on; (void)internal;
-    return 0;
-}
-#endif /* _WIN32 */
 
 /* The resolve to the guest's lines: each output row the mean of its n host
  * rows, at the whole host width (the extra sharpness stays across). */

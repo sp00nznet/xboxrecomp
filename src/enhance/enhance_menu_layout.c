@@ -84,13 +84,20 @@ static void row_controls(const struct menu_layout_in *in, struct menu_layout *l,
         }
     } else if (kind == MENU_ROW_CHOICE) {
         int aw = in->arrow_w, sp = menu_layout_px(s, 10);
+        int lo = r.x + l->pad + (in->row_lead_w ? in->row_lead_w[vr->index] : 0);
         vr->next = rect(right - aw, r.y, aw, r.h);
         vr->value = rect(vr->next.x - sp - vw, r.y, vw, r.h);
         vr->prev = rect(vr->value.x - sp - aw, r.y, aw, r.h);
-        /* As for a range: the prev arrow stops at the row's pad and the
-         * value takes what is left between the arrows. */
-        if (vr->prev.x < r.x + l->pad) {
-            vr->prev.x = r.x + l->pad;
+        /* The prev arrow stops after the label (a pack's path
+         * was drawn over it, and a tap on the label stepped back) and the
+         * value takes what is left between the arrows. A label wider than
+         * the row still leaves the arrows apart. */
+        if (lo > vr->next.x - 2 * sp - aw)
+            lo = vr->next.x - 2 * sp - aw;
+        if (lo < r.x + l->pad)
+            lo = r.x + l->pad;
+        if (vr->prev.x < lo) {
+            vr->prev.x = lo;
             vr->value.x = vr->prev.x + aw + sp;
             vr->value.w = vr->next.x - sp - vr->value.x;
             if (vr->value.w < 0)

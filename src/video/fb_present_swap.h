@@ -31,7 +31,9 @@ void xbox_FramebufferWindowSwapSize(unsigned *w, unsigned *h);
  * unknown. */
 void xbox_FramebufferWindowSwapDisplay(unsigned *w, unsigned *h);
 /* Asks the main thread to make the window's client area w x h pixels
- * (present.surface=internal); a fullscreen window keeps its size. */
+ * (present.surface=internal, and the overlay hold's popup and its restore
+ * on the D3D11 host, d3d11_host_sdl.c); a fullscreen window keeps its
+ * size. */
 void xbox_FramebufferWindowSwapResize(unsigned w, unsigned h);
 /* 1 when present.surface=internal: the client area is the frame's size and
  * the backend sizes it; otherwise the window keeps the presenter's size

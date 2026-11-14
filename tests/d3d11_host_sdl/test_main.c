@@ -9,6 +9,10 @@
  *     presenter's size (its w x h is the 1x client size), a framed open of
  *     another size under present.surface=internal asks for a resize and a
  *     popup does not; the sizes are the presenter's;
+ *   - the overlay's output hold: the popup asks for its size,
+ *     the restore for the drawable the save found, once, and a restore
+ *     with no save asks for nothing; a menu reopened before the restore
+ *     is made still saves the size before the popup;
  *   - the compiler: load and id from the version, a compile's bytes and
  *     messages in blobs, a failure's HRESULT, a cache hit's empty blob;
  *   - the blob, called the way COM's C binding calls it (lpVtbl first:
@@ -150,7 +154,6 @@ static void check_window(void)
     d3d11_host_ready();
     d3d11_host_pump();
     d3d11_host_title();
-    d3d11_host_popup(0, 0, 10, 10);
     d3d11_host_framed();
     d3d11_host_fullscreen(1, 0, 640, 480, 1920, 1080);
     CHECK(s_reqs == 2, "a no-op asked for a resize");
@@ -162,6 +165,117 @@ static void check_window(void)
     d3d11_host_work_begin();
     d3d11_host_work_end();
     CHECK(s_wbegin == 1 && s_wend == 1, "work bracket %d/%d", s_wbegin, s_wend);
+}
+
+/* The hold under gamescope as output_surface drives it: save the window,
+ * pop it up at the output's shape, put the saved size back at the end. The
+ * presenter makes the requests later, so the restore never compares. */
+static void check_hold(void)
+{
+    s_win = &s_win_obj;
+    s_w = 1536;
+    s_h = 960;
+    s_reqs = 0;
+    d3d11_host_hold_restore(0);
+    CHECK(s_reqs == 0, "a restore with no save asked for a resize");
+
+    d3d11_host_hold_save();
+    CHECK(s_reqs == 0, "the save asked for a resize");
+    d3d11_host_popup(0, 0, 1280, 800);
+    CHECK(s_reqs == 1 && s_req_w == 1280 && s_req_h == 800, "popup %ux%u", s_req_w, s_req_h);
+    /* Not made yet: the drawable is still the hold's start. */
+    d3d11_host_hold_restore(1);
+    CHECK(s_reqs == 2 && s_req_w == 1536 && s_req_h == 960, "restore %ux%u", s_req_w, s_req_h);
+    d3d11_host_hold_restore(1);
+    CHECK(s_reqs == 2, "a second restore asked again");
+
+    /* Made: the drawable is the popup's, the restore still goes back. */
+    d3d11_host_hold_save();
+    d3d11_host_popup(0, 0, 1280, 800);
+    s_w = 1280;
+    s_h = 800;
+    d3d11_host_hold_restore(0);
+    CHECK(s_reqs == 4 && s_req_w == 1536 && s_req_h == 960, "restore after the popup %ux%u",
+          s_req_w, s_req_h);
+
+    /* No drawable yet (the presenter has not noted one): nothing to put back. */
+    s_w = s_h = 0;
+    d3d11_host_hold_save();
+    d3d11_host_hold_restore(0);
+    CHECK(s_reqs == 4, "a restore to 0x0");
+    s_w = 640;
+    s_h = 480;
+}
+
+/* SDL_SetWindowSize is asynchronous on X11: the menu opened again before
+ * the restore is made must still save the size before the popup, or its
+ * close leaves the window at the popup's size. The restore stays out until
+ * the drawable shows it, a third size comes, a popup replaces it or the
+ * wait runs out. */
+static void check_hold_reopen(void)
+{
+    unsigned w = 0, h = 0;
+    s_win = &s_win_obj;
+    s_w = 1536;
+    s_h = 960;
+    s_reqs = 0;
+    d3d11_host_hold_save();
+    d3d11_host_popup(0, 0, 1280, 800);
+    s_w = 1280;
+    s_h = 800;
+    d3d11_host_hold_restore(0);
+    CHECK(s_reqs == 2 && s_req_w == 1536 && s_req_h == 960, "restore %ux%u", s_req_w, s_req_h);
+    /* Not made yet: the client size is the restore's target, the rect the
+     * drawable. */
+    d3d11_host_client_size(&w, &h);
+    CHECK(w == 1536 && h == 960, "client_size while the restore is out %ux%u", w, h);
+    d3d11_host_client_rect(&w, &h);
+    CHECK(w == 1280 && h == 800, "client_rect while the restore is out %ux%u", w, h);
+    /* Reopened before it was made: the save keeps the target, the popup
+     * replaces the restore, and the close goes back to the target. */
+    d3d11_host_hold_save();
+    d3d11_host_popup(0, 0, 1280, 800);
+    d3d11_host_client_size(&w, &h);
+    CHECK(w == 1280 && h == 800, "client_size after the popup %ux%u", w, h);
+    d3d11_host_hold_restore(0);
+    CHECK(s_reqs == 4 && s_req_w == 1536 && s_req_h == 960, "restore after a reopen %ux%u",
+          s_req_w, s_req_h);
+    /* Made: the drawable again. */
+    s_w = 1536;
+    s_h = 960;
+    d3d11_host_client_size(&w, &h);
+    CHECK(w == 1536 && h == 960, "client_size once made %ux%u", w, h);
+    s_w = 1280;
+    s_h = 800;
+    d3d11_host_client_size(&w, &h);
+    CHECK(w == 1280 && h == 800, "the restore outlived its ack %ux%u", w, h);
+
+    /* A third size (a fullscreen switch) ends it. */
+    s_w = 1536;
+    s_h = 960;
+    d3d11_host_hold_save();
+    d3d11_host_popup(0, 0, 1280, 800);
+    s_w = 1280;
+    s_h = 800;
+    d3d11_host_hold_restore(0);
+    s_w = 1920;
+    s_h = 1080;
+    d3d11_host_client_size(&w, &h);
+    CHECK(w == 1920 && h == 1080, "client_size after a third size %ux%u", w, h);
+
+    /* A size the window manager refused: the wait runs out. */
+    s_w = 1536;
+    s_h = 960;
+    d3d11_host_hold_save();
+    d3d11_host_popup(0, 0, 1280, 800);
+    s_w = 1280;
+    s_h = 800;
+    d3d11_host_hold_restore(0);
+    usleep(700000);
+    d3d11_host_client_size(&w, &h);
+    CHECK(w == 1280 && h == 800, "the restore never ran out %ux%u", w, h);
+    s_w = 640;
+    s_h = 480;
 }
 
 static void check_compiler(void)
@@ -238,6 +352,8 @@ int main(void)
 {
     check_clocks();
     check_window();
+    check_hold();
+    check_hold_reopen();
     check_compiler();
     check_mkdir();
     printf("d3d11_host_sdl: %s\n", s_fail ? "FAIL" : "ok");

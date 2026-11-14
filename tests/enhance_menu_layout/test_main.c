@@ -375,6 +375,46 @@ int main(void)
         CHECK(vr->prev.x == vr->r.x + l.pad && vr->value.w >= 0);
         CHECK(vr->prev.x + vr->prev.w <= vr->value.x && vr->value.x + vr->value.w <= vr->next.x);
     }
+    /* With the label's width given, a cut choice's arrows and
+     * value start after the label (draw_row puts "<" at prev.x and the
+     * value at value.x, cut to value.w), so a tap on the "<" drawn steps
+     * back and a tap on the label steps nothing. A label wider than the
+     * row still leaves the arrows apart. */
+    {
+        static int lead[NROW];
+        for (int big = 0; big < 2; big++) {
+            g_w = 1280, g_h = 800, g_u = 1.0f, g_mode = 0;
+            input(&in, 1280, 800, eff_scale(800, 1.0f), MENU_SIZE_COMPACT, 0);
+            for (int i = 0; i < NROW; i++)
+                lead[i] = menu_layout_px(in.s, big ? 3000 : 150);
+            in.row_lead_w = lead;
+            menu_layout_compute(&in, &l);
+            for (int i = 0; i < l.nvrow; i++) {
+                const struct menu_layout_row *vr = &l.row[i];
+                int sp = menu_layout_px(l.s, 10), cy = vr->r.y + vr->r.h / 2;
+                struct menu_hit ht;
+                if (!vr->next.w || vr->clipped)
+                    continue;
+                CHECK(vr->prev.x + vr->prev.w <= vr->value.x && vr->value.w >= 0
+                      && vr->value.x + vr->value.w <= vr->next.x);
+                CHECK(vr->value.x == vr->prev.x + in.arrow_w + sp);
+                if (!big) {
+                    int lab = vr->r.x + l.pad + lead[vr->index];
+                    CHECK(vr->prev.x == lab && vr->value.w > 0);
+                    ht = menu_hit(&l, vr->r.x + l.pad + lead[vr->index] / 2, cy);
+                    CHECK(ht.region == MENU_HIT_ROW && ht.part == MENU_PART_NONE);
+                    ht = menu_hit(&l, vr->value.x + vr->value.w / 2, cy);
+                    CHECK(ht.part == MENU_PART_VALUE);
+                } else {
+                    CHECK(vr->value.w == 0 && vr->prev.x >= vr->r.x + l.pad);
+                }
+                ht = menu_hit(&l, vr->prev.x + vr->prev.w / 2, cy);
+                CHECK(ht.part == MENU_PART_PREV && ht.index == vr->index);
+                ht = menu_hit(&l, vr->next.x + vr->next.w / 2, cy);
+                CHECK(ht.part == MENU_PART_NEXT && ht.index == vr->index);
+            }
+        }
+    }
     for (int i = 0; i < NROW; i++)
         s_vw[i] = 40 + i;
 

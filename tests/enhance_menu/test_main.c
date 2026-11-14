@@ -1416,6 +1416,67 @@ static void test_pack_long_path(void)
     nv2a_tex_pack_unload();
 }
 
+/* A configured absolute path to a pack in the textures folder is that
+ * pack's name: the row shows the name, not a path drawn over its label,
+ * and the list has no second slot for the same file. The
+ * Deck's launch.env names it so in RECOMP_TEXTURES_PACK: the same name,
+ * and the row is read-only (a step is refused, Save writes no pack). */
+static int row_at(const char *label);
+
+static void test_pack_abs_path(void)
+{
+    char home[1024], toml[1400];
+    int i;
+    CHECK(getcwd(home, sizeof home) != NULL);
+    for (i = 0; home[i]; i++)
+        if (home[i] == '\\')
+            home[i] = '/';
+    MKDIR("textures");
+    write_menu_pack("textures/a.pack");
+    write_menu_pack("textures/b.pack");
+    snprintf(toml, sizeof toml, ARMED "[textures]\npack = \"%s/textures/a.pack\"\n", home);
+    start_with(toml, NULL);
+    CHECK(nv2a_tex_pack_count() == 1);
+    open_menu();
+    CHECK(enhance_menu_set_page("Pack"));
+    CHECK(row_value("Pack") && !strcmp(row_value("Pack"), "a.pack"));
+    CHECK(enhance_menu_select_row("Pack"));
+    tap(0x27);                                      /* b.pack, the next name */
+    flip();
+    CHECK(!strcmp(row_value("Pack"), "b.pack"));
+    tap(0x25);                                      /* back: a.pack, once */
+    flip();
+    CHECK(!strcmp(row_value("Pack"), "a.pack"));
+    tap(0x25);
+    flip();
+    CHECK(!strcmp(row_value("Pack"), "none"));
+    open_menu();
+
+    snprintf(toml, sizeof toml, "%s/textures/a.pack", home);
+    set_env("RECOMP_TEXTURES_PACK", toml);
+    start_with(ARMED, NULL);
+    CHECK(nv2a_tex_pack_count() == 1);
+    open_menu();
+    CHECK(enhance_menu_set_page("Pack"));
+    CHECK(row_value("Pack") && !strcmp(row_value("Pack"), "a.pack"));
+    CHECK(enhance_menu_row_state(row_at("Pack")) & ENHANCE_ROW_FORCED);
+    CHECK(enhance_menu_select_row("Pack"));
+    tap(0x27);
+    flip();
+    CHECK(!strcmp(row_value("Pack"), "a.pack"));
+    CHECK(!strncmp(enhance_menu_status(), "Set by ", 7));
+    CHECK(enhance_menu_unsaved() == 0);
+    tap(VK_F5);
+    CHECK(strstr(read_file("config/config.toml"), "pack =") == NULL);
+    CHECK(nv2a_tex_pack_count() == 1);
+    set_env("RECOMP_TEXTURES_PACK", NULL);
+    open_menu();
+    remove("textures/a.pack");
+    remove("textures/b.pack");
+    start_with(ARMED, NULL);
+    nv2a_tex_pack_unload();
+}
+
 /* ---- 8. each page's draw list -------------------------------------------- */
 
 /* ---- 3b. a descriptor mod's page (mod-settings D5) ----------------------- */
@@ -7218,6 +7279,7 @@ int main(int argc, char **argv)
     test_pack_picker();
     test_pack_beside_config();
     test_pack_long_path();
+    test_pack_abs_path();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();
     enhance_actions_reset();

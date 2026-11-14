@@ -1611,6 +1611,14 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | file | scope | name | kind | class | hook | why |
 |---|---|---|---|---|---|---|
 | src/d3d/d3d11_host_sdl.c | - | s_hlsl | file_static | constant | - | HLSL compiler version, the shader cache key |
+| src/d3d/d3d11_host_sdl.c | - | s_hold_w | file_static | keep | - | drawable size at the output hold's start |
+| src/d3d/d3d11_host_sdl.c | - | s_hold_h | file_static | keep | - | drawable size at the output hold's start |
+| src/d3d/d3d11_host_sdl.c | - | s_hold_saved | file_static | keep | - | the hold's drawable size is saved |
+| src/d3d/d3d11_host_sdl.c | - | s_rest_w | file_static | keep | - | the hold restore's target until the drawable shows it |
+| src/d3d/d3d11_host_sdl.c | - | s_rest_h | file_static | keep | - | the hold restore's target until the drawable shows it |
+| src/d3d/d3d11_host_sdl.c | - | s_rest_from_w | file_static | keep | - | the drawable when the hold restore was asked |
+| src/d3d/d3d11_host_sdl.c | - | s_rest_from_h | file_static | keep | - | the drawable when the hold restore was asked |
+| src/d3d/d3d11_host_sdl.c | - | s_rest_t | file_static | keep | - | when the hold restore was asked |
 
 ### src/d3d/d3d11_host_win32.c
 
@@ -3396,6 +3404,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/enhance/enhance_menu.c | - | s_lay_pages | file_static | keep | - | per-page layout cache |
 | src/enhance/enhance_menu.c | enhance_menu_draw | kinds | local_static | keep | - | scratch row kinds |
 | src/enhance/enhance_menu.c | enhance_menu_draw | vw | local_static | keep | - | scratch row widths |
+| src/enhance/enhance_menu.c | enhance_menu_draw | lead | local_static | keep | - | scratch label widths (a choice's arrows stop after them) |
 | src/enhance/enhance_menu.c | saves_signing_load | said | local_static | keep | - | the missing saves-signing.toml logged once per process |
 | src/enhance/enhance_menu.c | - | s_ao | file_static | keep | - | the AO menu items; note and help set from render.ao_suited |
 | src/enhance/enhance_menu.c | - | s_prf | file_static | keep | - | Recordings page state (file list, start point text) |

@@ -220,8 +220,8 @@ int d3d11_host_blob(size_t n, struct ID3D10Blob **out)
  * size (present.window_scale), which a windowed start keeps: the backend's
  * w x h there is the 1x client size, not the window's. Only
  * present.surface=internal asks for the frame's size, as the Win32 host
- * makes its client area. A popup (present.shader's output surface) is the
- * presenter's fullscreen on SDL, so it keeps its size. */
+ * makes its client area. A popup open is the presenter's fullscreen on SDL,
+ * so it keeps its size. */
 int d3d11_host_window_open(int popup, unsigned w, unsigned h)
 {
     unsigned cw = 0, ch = 0;
@@ -269,9 +269,29 @@ void d3d11_host_work_end(void)
 }
 void d3d11_host_title(void) {}
 
+/* The hold's last restore, until the drawable shows it. SDL_SetWindowSize
+ * is asynchronous on X11: a menu opened again a few frames after the close
+ * read the popup's size as the hold's start, and its own close then left
+ * the window at the popup's size. While the restore is out, the
+ * client size is its target; it ends when the drawable is the target, or
+ * becomes a third size (a fullscreen switch), or after RESTORE_MS (a
+ * window manager that refused the size). */
+#define RESTORE_MS 500.0
+static unsigned s_rest_w, s_rest_h, s_rest_from_w, s_rest_from_h;
+static double s_rest_t;
+
 void d3d11_host_client_size(unsigned *w, unsigned *h)
 {
     xbox_FramebufferWindowSwapSize(w, h);
+    if (!s_rest_w)
+        return;
+    if ((*w == s_rest_w && *h == s_rest_h) || *w != s_rest_from_w || *h != s_rest_from_h
+        || d3d11_host_now_ms() - s_rest_t > RESTORE_MS) {
+        s_rest_w = s_rest_h = 0;
+        return;
+    }
+    *w = s_rest_w;
+    *h = s_rest_h;
 }
 
 void d3d11_host_client_rect(unsigned *w, unsigned *h)
@@ -294,20 +314,51 @@ void d3d11_host_monitor_rect(int *x, int *y, unsigned *w, unsigned *h)
 void d3d11_host_set_client_size(unsigned w, unsigned h, int framed)
 {
     (void)framed;
+    s_rest_w = s_rest_h = 0;
     xbox_FramebufferWindowSwapResize(w, h);
 }
 
 /* Borderless and framed are the presenter's present.fullscreen on SDL; the
- * backend's own switches are not followed (phase 2 decides whether
- * present.shader's popup needs one). */
+ * backend's own style switches are not followed. The popup is only the
+ * output surface's hold under gamescope, which shows a window's
+ * client area alone, scaled to its output: there the popup is the size
+ * alone, and a fullscreen window keeps the display's (the presenter drops
+ * the request). */
 void d3d11_host_popup(int x, int y, unsigned w, unsigned h)
 {
-    (void)x; (void)y; (void)w; (void)h;
+    (void)x; (void)y;
+    s_rest_w = s_rest_h = 0;        /* the restore's request is replaced */
+    xbox_FramebufferWindowSwapResize(w, h);
 }
 
 void d3d11_host_framed(void) {}
-void d3d11_host_hold_save(void) {}
-void d3d11_host_hold_restore(int restyle) { (void)restyle; }
+
+/* The hold's window: only its drawable size, since the style, place and
+ * fullscreen are the presenter's and the hold never changes them. */
+static unsigned s_hold_w, s_hold_h;
+static int s_hold_saved;
+
+void d3d11_host_hold_save(void)
+{
+    d3d11_host_client_size(&s_hold_w, &s_hold_h);   /* a restore still out: its target */
+    s_hold_saved = s_hold_w && s_hold_h;
+}
+
+/* The size the hold found, asked again even when it looks unchanged: the
+ * main thread may not have made the popup's size yet, and a request for
+ * the size the window has costs nothing. */
+void d3d11_host_hold_restore(int restyle)
+{
+    (void)restyle;
+    if (!s_hold_saved)
+        return;
+    s_hold_saved = 0;
+    xbox_FramebufferWindowSwapSize(&s_rest_from_w, &s_rest_from_h);
+    s_rest_w = s_hold_w;
+    s_rest_h = s_hold_h;
+    s_rest_t = d3d11_host_now_ms();
+    xbox_FramebufferWindowSwapResize(s_hold_w, s_hold_h);
+}
 
 void d3d11_host_fullscreen(int full, int internal, unsigned fw, unsigned fh,
                            unsigned dw, unsigned dh)

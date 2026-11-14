@@ -584,9 +584,54 @@ static const struct enhance_item k_items[] = {
 #define PACKS_MAX 32
 static char s_pack_name[PACKS_MAX + 2][VAL_MAX];
 static const char *s_pack_choice[PACKS_MAX + 4];
+
+/* a and b name one file. */
+static int pack_same_file(const char *a, const char *b)
+{
+#ifdef _WIN32
+    char fa[1024], fb[1024];
+    return _fullpath(fa, a, sizeof fa) && _fullpath(fb, b, sizeof fb) && !_stricmp(fa, fb);
+#else
+    struct stat sa, sb;
+    return stat(a, &sa) == 0 && stat(b, &sb) == 0 && sa.st_dev == sb.st_dev
+        && sa.st_ino == sb.st_ino;
+#endif
+}
+
+/* The value as the picker shows it: a path to a pack in the textures
+ * folder is that pack's listed name, which loads the same file. A Linux
+ * install's launch.env names its pack by the whole path: the
+ * row showed the path over its own label, and the listed name beside it
+ * was a second choice for the same file. Any other path, as
+ * it is. */
+static const char *pack_shown(const char *v, char *b, size_t n)
+{
+    const char *a, *c, *name;
+    char path[1024], vpath[1024];
+    if (!v || !*v)
+        return v;
+    a = strrchr(v, '/');
+    c = strrchr(v, '\\');
+    name = a > c ? a + 1 : c ? c + 1 : NULL;
+    /* v resolved as the loader does: a relative path is the executable's
+     * directory's, not the cwd's. */
+    if (!name || !*name || strlen(name) >= n
+        || !xbox_enhance_pack_path(name, path, sizeof path)
+        || !xbox_enhance_pack_path(v, vpath, sizeof vpath) || !pack_same_file(path, vpath))
+        return v;
+    snprintf(b, n, "%s", name);
+    return b;
+}
+
+static const char *get_pack_file(const struct enhance_item *it, char *b, size_t n)
+{
+    (void)it;
+    return pack_shown(enhance_cfg_string("textures.pack", "none"), b, n);
+}
+
 static struct enhance_item s_pack_pick = {
     ITEM("textures.pack", "Pack", "Pack", ENHANCE_ITEM_CHOICE), .choices = s_pack_choice,
-    .set = set_pack_file, .live = ENHANCE_LIVE_FLUSH, .def = "none",
+    .set = set_pack_file, .get = get_pack_file, .live = ENHANCE_LIVE_FLUSH, .def = "none",
     .help = "The texture pack in use: the .pack files in the textures folder"
 };
 
@@ -652,6 +697,7 @@ static void pack_choices(const char *cur)
     char user[1024], exe[1024];
     struct pack_list l = { 0 };
     const char *keep[2];
+    char shown[VAL_MAX];
     int k = 0;
     xbox_enhance_pack_dirs(user, exe, sizeof user);
     l.dir = user;
@@ -663,7 +709,7 @@ static void pack_choices(const char *cur)
     s_pack_choice[k++] = "none";
     for (int i = 0; i < l.n; i++)
         s_pack_choice[k++] = s_pack_name[i];
-    keep[0] = enhance_cfg_string("textures.pack", "none");
+    keep[0] = pack_shown(enhance_cfg_string("textures.pack", "none"), shown, sizeof shown);
     keep[1] = cur;
     for (int j = 0; j < 2; j++) {
         const char *v = keep[j];
@@ -8368,6 +8414,51 @@ static int row_kind(const struct row *rw, mu_Font fb, mu_Font fv, int *vw)
     return MENU_ROW_PLAIN;
 }
 
+/* The words after a row's label: its class (who forced it, or when a
+ * change applies; none for one that shows now) and its note. */
+static void row_lead(const struct row *rw, const char **cls, const char **note, char *forced,
+                     size_t n)
+{
+    const struct slot *sl;
+    const struct enhance_item *it = row_item(rw, &sl);
+    const char *envname = sl ? sl->envname : rw->type == R_PROFILE ? shader_edit_forced() : NULL;
+    int ro = (sl && sl->env) || (rw->type == R_PROFILE && envname);
+    *cls = *note = NULL;
+    if (it && it->kind != ENHANCE_ITEM_INFO) {
+        if (ro) {
+            if (envname)
+                snprintf(forced, n, "set by %s", envname);
+            else
+                snprintf(forced, n, "(environment)");
+            *cls = forced;
+        } else if (it->live == ENHANCE_LIVE || it->live == ENHANCE_LIVE_FLUSH) {
+            /* Applies now: no mark (D10 keeps the dot for "unsaved"). */
+        } else {
+            *cls = it->live == ENHANCE_LIVE_RESTART ? "applies at restart"
+                 : it->live == ENHANCE_LIVE_ACTIVATE ? "next activation"
+                 : "next stage";
+        }
+        *note = it->note;
+    } else if (rw->note && *rw->note) {
+        *note = rw->note;   /* a control's "while flying" */
+    }
+}
+
+/* The label and the words after it, with their gaps (draw_row's x before
+ * the value): a choice's arrows stop there. */
+static int row_lead_w(const struct row *rw, mu_Font fb, mu_Font fs, float s)
+{
+    char forced[96];
+    const char *cls, *note;
+    int w = text_w(fb, rw->label) + nv2a_ovl_px(s, 8);
+    row_lead(rw, &cls, &note, forced, sizeof forced);
+    if (cls)
+        w += text_w(fs, cls) + nv2a_ovl_px(s, 8);
+    if (note)
+        w += text_w(fs, note) + nv2a_ovl_px(s, 8);
+    return w;
+}
+
 static void draw_row(mu_Context *ctx, const struct row *rw, const struct menu_layout_row *vr,
                      int selected, float s)
 {
@@ -8384,7 +8475,7 @@ static void draw_row(mu_Context *ctx, const struct row *rw, const struct menu_la
     int ro = (sl && sl->env) || (rw->type == R_PROFILE && envname);
     mu_Color tint = rw->tint == TINT_BAD ? t->bad : rw->tint == TINT_WARN ? t->warn : t->text_dim;
     char cut[VAL_MAX * 2], forced[96], uv[VAL_MAX + 32];
-    const char *v;
+    const char *v, *cls, *note;
     /* D10: a dot before the label while unsaved, and the value bright only
      * where it differs from stock, so a page shows what was changed. */
     int marked = rw->type == R_SLOT || rw->type == R_MOD || rw->type == R_BIND
@@ -8436,34 +8527,18 @@ static void draw_row(mu_Context *ctx, const struct row *rw, const struct menu_la
      * common case), words for one that waits. */
     mu_draw_text(ctx, fb, rw->label, -1, mu_vec2(x, ty), ro || rw->dim ? t->text_dim : t->text);
     x += text_w(fb, rw->label) + nv2a_ovl_px(s, 8);
-    if (it && it->kind != ENHANCE_ITEM_INFO) {
+    row_lead(rw, &cls, &note, forced, sizeof forced);
+    {
         int fsh = nv2a_ovl_text_height(fs), fy = r.y + (r.h - fsh) / 2;
-        if (ro) {
-            if (envname)
-                snprintf(forced, sizeof forced, "set by %s", envname);
-            else
-                snprintf(forced, sizeof forced, "(environment)");
-            mu_draw_text(ctx, fs, forced, -1, mu_vec2(x, fy), t->text_dim);
-            x += text_w(fs, forced) + nv2a_ovl_px(s, 8);
-        } else if (it->live == ENHANCE_LIVE || it->live == ENHANCE_LIVE_FLUSH) {
-            /* Applies now: no mark (D10 keeps the dot for "unsaved"). */
-        } else {
-            const char *w = it->live == ENHANCE_LIVE_RESTART ? "applies at restart"
-                          : it->live == ENHANCE_LIVE_ACTIVATE ? "next activation"
-                          : "next stage";
-            mu_draw_text(ctx, fs, w, -1, mu_vec2(x, fy),
-                         it->live == ENHANCE_LIVE_RESTART ? t->warn : t->text_dim);
-            x += text_w(fs, w) + nv2a_ovl_px(s, 8);
+        if (cls) {
+            mu_draw_text(ctx, fs, cls, -1, mu_vec2(x, fy),
+                         !ro && it && it->live == ENHANCE_LIVE_RESTART ? t->warn : t->text_dim);
+            x += text_w(fs, cls) + nv2a_ovl_px(s, 8);
         }
-        if (it->note) {
-            mu_draw_text(ctx, fs, it->note, -1, mu_vec2(x, fy), t->text_dim);
-            x += text_w(fs, it->note) + nv2a_ovl_px(s, 8);
+        if (note) {
+            mu_draw_text(ctx, fs, note, -1, mu_vec2(x, fy), t->text_dim);
+            x += text_w(fs, note) + nv2a_ovl_px(s, 8);
         }
-    } else if (rw->note && *rw->note) {
-        /* A control's "while flying". */
-        int fsh = nv2a_ovl_text_height(fs), fy = r.y + (r.h - fsh) / 2;
-        mu_draw_text(ctx, fs, rw->note, -1, mu_vec2(x, fy), t->text_dim);
-        x += text_w(fs, rw->note) + nv2a_ovl_px(s, 8);
     }
     row_uv(rw, uv, sizeof uv);
 
@@ -8502,8 +8577,12 @@ static void draw_row(mu_Context *ctx, const struct row *rw, const struct menu_la
         return;
     }
     if (it && it->kind == ENHANCE_ITEM_CHOICE) {
+        /* The layout stops the arrows after the label (row_lead_w), so a
+         * value wider than the room it left (a pack's path) is cut there
+         * and a tap lands on the arrow drawn. */
+        v = fit(fb, uv, vr->value.w, cut, sizeof cut);
         mu_draw_text(ctx, fb, ">", -1, mu_vec2(vr->next.x, ty), t->text_dim);
-        mu_draw_text(ctx, fb, uv, -1, mu_vec2(vr->value.x, ty),
+        mu_draw_text(ctx, fb, v, -1, mu_vec2(vr->value.x, ty),
                      ro ? t->text_dim : rw->tint ? tint : vcol);
         mu_draw_text(ctx, fb, "<", -1, mu_vec2(vr->prev.x, ty), t->text_dim);
         return;
@@ -8820,7 +8899,7 @@ void enhance_menu_draw(uint64_t now_ms)
 {
     const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
     static unsigned char kinds[ROWS_MAX];
-    static int vw[ROWS_MAX];
+    static int vw[ROWS_MAX], lead[ROWS_MAX];
     const struct menu_layout *l = &s_lay;
     struct menu_layout_in in;
     mu_Context *ctx;
@@ -8844,8 +8923,10 @@ void enhance_menu_draw(uint64_t now_ms)
     fb = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(s, t->font_body), 0);
     fs = OVL_FONT(OVL_FONT_SMALL, nv2a_ovl_px(s, t->font_small), 0);
     fv = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(s, t->font_body), 1);
-    for (int i = 0; i < s_nrow; i++)
+    for (int i = 0; i < s_nrow; i++) {
         kinds[i] = (unsigned char)row_kind(&s_row[i], fb, fv, &vw[i]);
+        lead[i] = kinds[i] == MENU_ROW_CHOICE ? row_lead_w(&s_row[i], fb, fs, s) : 0;
+    }
     in.toolbar_open = enhance_menu_toolbar_open(now_ms);
     in.nrow = s_nrow;
     in.scroll = s_scroll[s_page];
@@ -8854,6 +8935,7 @@ void enhance_menu_draw(uint64_t now_ms)
     in.hint_h = s_hints == MENU_HINTS_INLINE ? in.small_h + nv2a_ovl_px(s, 4) : 0;
     in.row_kind = kinds;
     in.row_value_w = vw;
+    in.row_lead_w = lead;
     in.extra_h = s_page == PAGE_STATS ? nv2a_ovl_px(s, 110) : 0;
     un = enhance_menu_unsaved();
     news = s_status[0] && s_status_t && now_ms - s_status_t < STATUS_MS;

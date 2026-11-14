@@ -89,6 +89,10 @@ struct menu_layout_in {
     int hint_h;
     const unsigned char *row_kind;
     const int *row_value_w;
+    /* The label and the words after it ("set by ...", a note) with their
+     * gap, from the row's pad: a choice's arrows and value stop after
+     * them, so the draw and the hit test cut the same row. NULL: the pad. */
+    const int *row_lead_w;
     int extra_h;           /* a block under the rows (the Stats graph), or 0 */
     /* The footer: the Cancel and Save labels' widths (glyph and text) and
      * the summary's ("3 unsaved"). */
