@@ -5943,6 +5943,7 @@ static void lrs_set_param(void *ctx, const char *name, float v)
 static int s_popup;                     /* output_surface made the window a popup */
 static int s_hold_on;                   /* output_surface holds the output */
 static UINT s_hold_bw, s_hold_bh;       /* the swap chain at the hold's start */
+static UINT s_hold_cw, s_hold_ch;       /* the client area at the hold's start */
 
 /* The hold's end: exactly the window and swap chain the hold found, not a
  * size worked out again from the frame. internal_resize leaves a frame
@@ -5985,17 +5986,22 @@ static void output_release(void)
  * surface and scaled after by the compositor (gamescope on the Deck:
  * 640x480 to 1280x800, bilinear), the one is resampled into colour fringes
  * and moire, the other is soft at render.scale 1 and changes with every
- * scale. Under gamescope or present.fullscreen a borderless
- * window covers the monitor and the swap chain takes its size; otherwise
- * the swap chain follows the client area as under window. At the end
+ * scale. The hold never changes the picture's size, shape or
+ * place: under gamescope a borderless window grows to the
+ * largest rectangle of the client area's shape in the monitor
+ * (nv2a_present_hold_size), which gamescope fits to its output as it
+ * fitted the client. The monitor itself was letterboxed: Wine reports
+ * gamescope's nested size (1920x1080 on the Deck's 1280x800). Elsewhere,
+ * present.fullscreen included (its internal window is the frame's size,
+ * d3d11_host_fullscreen), the screen shows the client area 1:1, so the
+ * swap chain takes the client's size and the window stays. At the end
  * output_release puts back what the hold found. Each switch logs its cost,
  * split into the window's and the swap chain's. present.surface=window
  * already draws at the client size (present_resize). Returns 1 while the
  * surface is the output. */
 static int output_surface(int on, int internal)
 {
-    const struct nv2a_host_opts *eo = nv2a_host_opts();
-    int over = recomp_env_on(RENV_HOST_GAMESCOPE) || eo->fullscreen;
+    int over = recomp_env_on(RENV_HOST_GAMESCOPE);
     double t0 = d3d11_host_now_ms(), t1;
     UINT w, h;
 
@@ -6007,6 +6013,7 @@ static int output_surface(int on, int internal)
     if (!s_hold_on) {
         s_hold_bw = s_back_w;
         s_hold_bh = s_back_h;
+        d3d11_host_client_size(&s_hold_cw, &s_hold_ch);
         d3d11_host_hold_save();
         s_hold_win = 1;
         s_hold_on = 1;
@@ -6014,10 +6021,20 @@ static int output_surface(int on, int internal)
     d3d11_host_client_size(&w, &h);
     if (over) {
         int x, y;
-        d3d11_host_monitor_rect(&x, &y, &w, &h);
-        if (!s_popup && w && h) {
-            d3d11_host_popup(x, y, w, h);
+        UINT mw, mh;
+        uint32_t hw, hh;
+        d3d11_host_monitor_rect(&x, &y, &mw, &mh);
+        nv2a_present_hold_size(1, s_hold_cw, s_hold_ch, mw, mh, &hw, &hh);
+        if (!s_popup && hw && hh) {
+            d3d11_host_popup(x, y, hw, hh);
             s_popup = 1;
+        }
+        /* Only while the hold still owns the window: a present.fullscreen
+         * switch from the open menu (fullscreen_switch) resizes it, and a
+         * swap chain kept at the hold's size would stretch into it. */
+        if (s_popup && s_hold_win) {
+            w = hw;
+            h = hh;
         }
     }
     t1 = d3d11_host_now_ms();
@@ -7015,8 +7032,8 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
 #ifdef XBOXRECOMP_ENHANCE
         /* A shader or the open menu draws at the output: everything below
          * is as under present.surface=window. Gated on a built chain, as
-         * Metal: a missing library or preset must not flash a
-         * monitor-sized popup for the one flip its build takes to fail.
+         * Metal: a missing library or preset must not flash the hold's
+         * popup for the one flip its build takes to fail.
          * The menu alone blits the frame where the compositor showed it
          * (nv2a_present_held_filter); a chain has its own rule. */
         {

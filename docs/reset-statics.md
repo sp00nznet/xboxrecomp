@@ -2006,6 +2006,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_hold_on | file_static | keep | - | output_surface holds the output-sized surface |
 | src/d3d/nv2a_pb_d3d11.c | - | s_hold_bw | file_static | keep | - | swap chain width at the hold's start |
 | src/d3d/nv2a_pb_d3d11.c | - | s_hold_bh | file_static | keep | - | swap chain height at the hold's start |
+| src/d3d/nv2a_pb_d3d11.c | - | s_hold_cw | file_static | keep | - | client width at the hold's start |
+| src/d3d/nv2a_pb_d3d11.c | - | s_hold_ch | file_static | keep | - | client height at the hold's start |
 | src/d3d/nv2a_pb_d3d11.c | d3d11_flip | s_menu_until | local_static | keep | - | end of the menu's output hold tail, host clock |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_chain | file_static | keep | - | librashader present chain |
 | src/d3d/nv2a_pb_d3d11.c | lrs_chain | said | local_static | keep | - | log-once guard (dxvk-native: no D3D11 filter chain) |

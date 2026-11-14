@@ -1636,6 +1636,34 @@ int nv2a_present_held_filter(int filter, int compositor, int down)
     return NV2A_PRESENT_LINEAR;
 }
 
+void nv2a_present_hold_size(int compositor, uint32_t cw, uint32_t ch, uint32_t mw, uint32_t mh,
+                            uint32_t *w, uint32_t *h)
+{
+    *w = cw;
+    *h = ch;
+    if (!compositor || !mw || !mh)
+        return;
+    if (!cw || !ch) {
+        *w = mw;
+        *h = mh;
+        return;
+    }
+    /* The largest cw:ch rectangle in the monitor, rounded to the nearest
+     * pixel: the compositor fits it to its output exactly as it fitted
+     * the client area. */
+    if ((uint64_t)cw * mh > (uint64_t)ch * mw) {
+        *w = mw;
+        *h = (uint32_t)(((uint64_t)ch * mw * 2 + cw) / ((uint64_t)cw * 2));
+    } else {
+        *h = mh;
+        *w = (uint32_t)(((uint64_t)cw * mh * 2 + ch) / ((uint64_t)ch * 2));
+    }
+    if (!*w)
+        *w = 1;
+    if (!*h)
+        *h = 1;
+}
+
 void nv2a_present_chain_source(uint32_t hw, uint32_t hh, unsigned n, int lines,
                                uint32_t *sw, uint32_t *sh)
 {

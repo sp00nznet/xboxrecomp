@@ -213,6 +213,38 @@ int main(void)
         }
     }
 
+    /* The hold's swap chain: under gamescope the client
+     * area's shape grown into the monitor Wine reports, never the
+     * monitor's shape; elsewhere the client area itself. */
+    {
+        uint32_t w, h;
+
+        /* The Deck's log: a 1536x960 client (16:10, render.scale 2) and
+         * Wine's 1920x1080; the monitor's 16:9 was letterboxed. */
+        nv2a_present_hold_size(1, 1536, 960, 1920, 1080, &w, &h);
+        CHECK(w == 1728 && h == 1080);
+        CHECK((uint64_t)w * 960 == (uint64_t)h * 1536);
+        /* Wine reporting the panel itself: the panel. */
+        nv2a_present_hold_size(1, 768, 480, 1280, 800, &w, &h);
+        CHECK(w == 1280 && h == 800);
+        /* 4:3 under a 16:10 or 16:9 monitor: pillarboxed as before. */
+        nv2a_present_hold_size(1, 1280, 960, 1920, 1080, &w, &h);
+        CHECK(w == 1440 && h == 1080);
+        nv2a_present_hold_size(1, 1067, 800, 1280, 800, &w, &h);
+        CHECK(w == 1067 && h == 800);
+        /* Wider than the monitor: the width binds. */
+        nv2a_present_hold_size(1, 2560, 1080, 1920, 1200, &w, &h);
+        CHECK(w == 1920 && h == 810);
+        /* No scaling compositor (present.fullscreen, a window): the client. */
+        nv2a_present_hold_size(0, 1536, 960, 1920, 1080, &w, &h);
+        CHECK(w == 1536 && h == 960);
+        /* No client yet: the monitor; no monitor: the client. */
+        nv2a_present_hold_size(1, 0, 0, 1920, 1080, &w, &h);
+        CHECK(w == 1920 && h == 1080);
+        nv2a_present_hold_size(1, 1536, 960, 0, 0, &w, &h);
+        CHECK(w == 1536 && h == 960);
+    }
+
     printf("present_crop: ok\n");
     return 0;
 }

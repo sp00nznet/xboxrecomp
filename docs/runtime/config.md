@@ -487,18 +487,19 @@ same requests at given flips, to check a switch without the menu.
   `window` does, so the menu is rasterised at the display's own pixels at
   every `render.scale` instead of being resampled with the frame by the
   compositor. D3D11 makes the same switch as for a shader
-  (below): a borderless window over the monitor under gamescope or
-  fullscreen, else a swap chain at the client area's size. Metal's
-  drawable follows the window. The frame is drawn where the compositor
-  showed it a moment earlier: the aspect fit, centred, never `integer`;
-  linear under gamescope or when the frame is larger than the output,
-  otherwise `nearest` stays nearest and the rest are linear. While the
-  menu is open Steam's *Scaling filter* and FSR do not apply to the frame
-  (the surface is already the output's size), and the switch at open and
-  close can cost a frame on D3D11 (a swap chain resize; the window is
-  restyled only the first time under gamescope). The hold lasts 1.5 s
-  past the close, so a quick reopen or the toast the close shows costs no
-  second switch. Then the window and the swap chain go back to exactly
+  (below): under gamescope a borderless window of the client area's shape,
+  as large as fits the monitor Wine reports, else a swap chain at the
+  client area's size, so opening the menu never moves or reshapes the
+  picture. Metal's drawable follows the window. The frame is
+  drawn where the compositor showed it a moment earlier: the aspect fit,
+  centred, never `integer`; linear under gamescope or when the frame is
+  larger than the output, otherwise `nearest` stays nearest and the rest
+  are linear. While the menu is open Steam's *Scaling filter* and FSR do
+  not apply to the frame (the surface is already the output's size), and
+  the switch at open and close can cost a frame on D3D11 (a swap chain
+  resize; the window is restyled only the first time under gamescope).
+  The hold lasts 1.5 s past the close, so a quick reopen or the toast the
+  close shows costs no second switch. Then the window and the swap chain go back to exactly
   what they were when the menu opened; a `render.scale` change made in
   the menu resizes them at the next present. The stats strip, toasts, the pad-recording strip and mods'
   status panels on their own keep the frame-sized surface, so FSR stays on
@@ -550,12 +551,15 @@ same requests at given flips, to check a switch without the menu.
   While a shader runs, `present.surface = internal` draws at the output
   size, as `window` does: the chain's mask and scanlines are drawn per
   output pixel and per source line, and a compositor that scaled a
-  frame-sized result (gamescope's 640x480 to 1280x800) resampled them
-  into colour fringes and moiré. D3D11 under gamescope or fullscreen turns
-  the window into a borderless one over the monitor, with the swap chain
-  at that size; otherwise the swap chain follows the window's client
-  area. Metal's drawable follows the window. With the shader set back to
-  `none` the frame-sized surface comes back at the next present.
+  frame-sized result (gamescope's 640x480 to 1280x800) resampled them into
+  colour fringes and moiré. D3D11 under gamescope turns the window into a
+  borderless one of the client area's shape, as large as fits the monitor,
+  with the swap chain at that size: under gamescope Wine reports the
+  nested size (1920x1080 on a 1280x800 Deck), and a surface of the
+  monitor's shape was letterboxed. Otherwise the swap chain
+  follows the window's client area. Metal's drawable follows the window.
+  With the shader set back to `none` the frame-sized surface comes back at
+  the next present.
 
   The pass order, the same on D3D11 and Metal:
   1. The game draws its frame at `render.scale` (1280x960 at 2x).

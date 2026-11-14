@@ -2472,6 +2472,20 @@ int nv2a_present_chain_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint
  * LINEAR too. */
 int nv2a_present_held_filter(int filter, int compositor, int down);
 
+/* The swap chain's size while the menu or a shader holds the output
+ * under present.surface=internal: never another shape than the
+ * client area cw x ch the hold found, so the compositor shows the picture
+ * at the same size and place. With a scaling compositor
+ * (gamescope) the window may grow to the largest rectangle of that shape
+ * in the monitor mw x mh, so the menu gets more pixels than the frame;
+ * the monitor Wine reports under gamescope is the nested size, not the
+ * panel (1920x1080 on a 1280x800 Deck), and a monitor-sized surface of
+ * its shape was letterboxed by gamescope. Without one the client area is
+ * what the screen shows 1:1: its own size. A client of 0 (no window yet)
+ * takes the monitor. */
+void nv2a_present_hold_size(int compositor, uint32_t cw, uint32_t ch, uint32_t mw, uint32_t mh,
+                            uint32_t *w, uint32_t *h);
+
 /* present.shader: the chain's input for a frame of host size hw x hh at
  * render scale n. A preset that draws one scanline per source line (lines:
  * a CRT) gets the guest's line count, hh / n rows of the whole host width,
