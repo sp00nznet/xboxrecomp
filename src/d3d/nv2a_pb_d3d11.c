@@ -67,7 +67,20 @@
 #include "nv2a_overlay.h"
 #include "nv2a_present_chain.h"
 #define LIBRA_RUNTIME_D3D11
+#if defined(XBOXRECOMP_DXVK_NATIVE) && !defined(_WIN32)
+/* The header declares its D3D11 API under _WIN32 only. dxvk-native gives
+ * the same d3d11.h types (already included above), and the Linux library
+ * is built with that runtime (third_party/librashader/build-linux.sh), so
+ * the declarations are taken here as on Windows. Re-check this on every
+ * librashader bump: _WIN32 may come to gate more than the D3D11 API in the
+ * header (Win32-only types or calling conventions), which would then reach
+ * the Linux build. */
+#define _WIN32 1
 #include "librashader.h"
+#undef _WIN32
+#else
+#include "librashader.h"
+#endif
 #endif
 #include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
 #include "nv2a_scene_ao.h"
@@ -5809,8 +5822,10 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
  * when the frame fills it, else a copy of the frame's part (a grown target
  * holds more); for a CRT preset at render.scale > 1, the frame resolved to
  * the guest's lines (nv2a_present_chain_source). Built on this thread when
- * the request's generation moves; "none" never loads the library. */
-#ifdef _WIN32
+ * the request's generation moves; "none" never loads the library. On
+ * dxvk-native the same runtime runs over dxvk's D3D11 (librashader.so, a
+ * Linux build of it), so the chain is shared; only the output surface's
+ * hold below is Win32's. */
 static libra_d3d11_filter_chain_t s_lrs_chain;
 static unsigned s_lrs_gen;
 static size_t s_lrs_frames;
@@ -5948,6 +5963,7 @@ static void lrs_set_param(void *ctx, const char *name, float v)
         nv2a_present_chain_error(e, msg, sizeof msg);
 }
 
+#ifdef _WIN32
 static int s_popup;                     /* output_surface made the window a popup */
 static int s_hold_on;                   /* output_surface holds the output */
 static UINT s_hold_bw, s_hold_bh;       /* the swap chain at the hold's start */
@@ -6060,6 +6076,16 @@ static int output_surface(int on, int internal)
     }
     return 1;
 }
+#else /* XBOXRECOMP_DXVK_NATIVE */
+/* No popup on the SDL host (d3d11_host_popup is a no-op there): the
+ * surface stays the frame, the chain and the menu at its pixels (the
+ * hold's follow-up). */
+static int output_surface(int on, int internal)
+{
+    (void)on; (void)internal;
+    return 0;
+}
+#endif /* _WIN32 */
 
 /* The resolve to the guest's lines: each output row the mean of its n host
  * rows, at the whole host width (the extra sharpness stays across). */
@@ -6331,39 +6357,6 @@ static int present_chain(RenderTarget *rt, int filter, int internal, int surface
     s_ovl_place = r;
     return 1;
 }
-#else /* XBOXRECOMP_DXVK_NATIVE */
-/* librashader has no D3D11 runtime off Windows, so present.shader has no
- * chain in the dxvk-native build: the frame is presented as with
- * present.shader=none, said once. */
-static void *const s_lrs_chain = NULL;
-static int s_lrs_ov_said;
-
-static void lrs_free(void) {}
-
-static void *lrs_chain(void)
-{
-    static int said;
-    if (!said++)
-        fprintf(stderr, "[SHADER] present.shader: no D3D11 filter chain in this"
-                " build (librashader's D3D11 runtime is Windows-only); presenting"
-                " without it\n");
-    return NULL;
-}
-
-/* No popup on the SDL host (d3d11_host_popup is a no-op there): the
- * surface stays the frame, the menu at its pixels (the hold's follow-up). */
-static int output_surface(int on, int internal)
-{
-    (void)on; (void)internal;
-    return 0;
-}
-
-static int present_chain(RenderTarget *rt, int filter, int internal, int surface_internal)
-{
-    (void)rt; (void)filter; (void)internal; (void)surface_internal;
-    return 0;
-}
-#endif /* _WIN32 */
 #endif /* XBOXRECOMP_ENHANCE */
 
 #ifdef XBOXRECOMP_ENHANCE

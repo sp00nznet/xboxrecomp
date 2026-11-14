@@ -187,7 +187,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `present.profile` | string | `"none"` or a shader profile's slug, its file `config/shader-profiles/<slug>.toml`: a chain of slang presets run in place of the final present, on Metal and D3D11 ([shader profiles](#shaderprofiles)); in the layer that sets it, it wins over `present.shader` | `"none"` | `RECOMP_PRESENT_PROFILE` |
 | `present.shader` | string | `"none"`, `"crt-lottes"`, `"crt-lottes-fast"`, `"crt-hyllian"`, `"fsr"`, `"smaa"`, `"cas"`, or a `.slangp` path: a RetroArch slang preset run by librashader in place of the final present, on Metal and D3D11 ([present.shader](#presentshader)) | `"none"` | `RECOMP_PRESENT_SHADER` |
 | `present.shader_params.<preset>.<param>` | number | a slang preset's runtime parameter, per preset: `<preset>` is the bundled name or a path's file stem, `<param>` a `#pragma parameter` name. Clamped to the parameter's range ([shader parameters](#shaderparams)) | the preset's own value | none |
-| `present.shader_lib` | string | the librashader library; relative to the executable's directory. Loaded as given, with no hash check (the sha256 pin covers only the build's own copy) | `librashader.dll` beside the executable; macOS `librashader.dylib` beside it, then `../Frameworks/librashader.dylib` | `RECOMP_PRESENT_SHADER_LIB` |
+| `present.shader_lib` | string | the librashader library; relative to the executable's directory. Loaded as given, with no hash check (the sha256 pin covers only the build's own copy) | `librashader.dll` beside the executable; macOS `librashader.dylib` beside it, then `../Frameworks/librashader.dylib`; Linux `librashader.so` beside it | `RECOMP_PRESENT_SHADER_LIB` |
 | `present.shader_lines` | string | `"auto"`, `"guest"`, `"host"`: whether the shader chain gets the guest's line count or the frame at `render.scale` ([pass order](#presentshader)); `auto` decides by the preset's name. Over a profile's `lines` | `"auto"` | none |
 | `present.surface` | string | `"auto"`, `"window"`, `"internal"`: who scales the frame to the screen, the game or the compositor | `"auto"` | `RECOMP_PRESENT_SURFACE` |
 | `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); a bare file name is looked for in the `textures` folder beside the user `config` folder (the parent of RECOMP_CONFIG's folder, else `<user root>`), then `<exe dir>/textures`; any other relative path is relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
@@ -527,7 +527,9 @@ same requests at given flips, to check a switch without the menu.
   stays stock. The library is loaded on first use, never linked:
   `cmake/librashader.cmake` stages a prebuilt release (pinned by
   sha256; upstream's on macOS, our D3D11-only build of the same source on
-  x86-64 Windows, which needs no DirectX 9 or Visual C++ runtime) beside
+  x86-64 Windows, which needs no DirectX 9 or Visual C++ runtime, and on
+  x86-64 Linux with dxvk-native, the same D3D11 runtime over dxvk, its
+  shaders compiled by the bundled vkd3d-shader) beside
   every executable that links `xbox_enhance`, directly or through the
   `xboxrecomp` umbrella, with no line in the game; a configure that cannot
   download it warns and builds without it. `present.shader_lib` points at

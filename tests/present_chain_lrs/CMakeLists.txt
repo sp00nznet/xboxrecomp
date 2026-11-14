@@ -12,7 +12,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/librashader.cmake)
-_xboxrecomp_librashader_fetch(_lrs_lib _lrs_notices)
+_xboxrecomp_librashader_fetch(_lrs_lib _lrs_notices _lrs_extra)
 
 set(XR_SRC ${CMAKE_CURRENT_LIST_DIR}/../../src)
 add_executable(present_chain_lrs_test

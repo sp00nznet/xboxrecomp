@@ -67,15 +67,20 @@ profile the next stage gets the frame at its own size.
 ## librashader
 
 The presets run in [librashader](https://github.com/SnowflakePowered/librashader)
-v0.12.0, `librashader.dll` / `librashader.dylib` beside the executable: on
-macOS the upstream prebuilt library, on x86-64 Windows a build of the
-unmodified source with only the D3D11 runtime and a static C++ runtime, so
-it needs nothing beyond a stock Windows 10 or 11 (arm64 Windows still takes
-the upstream library, which needs the DirectX 9 and Visual C++ runtimes). It
-is MPL-2.0: the licence is `LICENSE-librashader.txt` in this directory, and
-the source is at
+v0.12.0, `librashader.dll` / `librashader.dylib` / `librashader.so` beside
+the executable: on macOS the upstream prebuilt library, on x86-64 Windows a
+build of the unmodified source with only the D3D11 runtime and a static C++
+runtime, so it needs nothing beyond a stock Windows 10 or 11 (arm64 Windows
+still takes the upstream library, which needs the DirectX 9 and Visual C++
+runtimes). On x86-64 Linux (the dxvk-native build) it is the same D3D11
+runtime, built for Linux with `librashader-linux-d3d11.patch` here, which
+only lets that runtime compile off Windows, so presets draw through
+dxvk-native as they do on Windows; its shader compiler is the game's own
+vkd3d-shader (`lib/libvkd3d-shader.so.1`), the one Proton's d3dcompiler
+uses. It is MPL-2.0: the licence is `LICENSE-librashader.txt` in this
+directory, and the source is at
 https://github.com/SnowflakePowered/librashader/tree/librashader-v0.12.0.
-On macOS and x86-64 Windows, `THIRDPARTY-librashader.txt` here lists the
-licences and copyrights of the crates and C/C++ libraries built into it.
+On macOS, x86-64 Windows and Linux, `THIRDPARTY-librashader.txt` here lists
+the licences and copyrights of the crates and C/C++ libraries built into it.
 If the library cannot load, the game names the reason in its log and
 presents without the shader.

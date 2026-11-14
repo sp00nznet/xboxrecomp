@@ -2010,7 +2010,6 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_hold_ch | file_static | keep | - | client height at the hold's start |
 | src/d3d/nv2a_pb_d3d11.c | d3d11_flip | s_menu_until | local_static | keep | - | end of the menu's output hold tail, host clock |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_chain | file_static | keep | - | librashader present chain |
-| src/d3d/nv2a_pb_d3d11.c | lrs_chain | said | local_static | keep | - | log-once guard (dxvk-native: no D3D11 filter chain) |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_gen | file_static | keep | - | present chain request generation applied |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_frames | file_static | keep | - | frames fed to the present chain |
 | src/d3d/nv2a_pb_d3d11.c | - | s_lrs_lines | file_static | keep | - | present chain preset lines per source line |

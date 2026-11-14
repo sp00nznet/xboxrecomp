@@ -1,0 +1,75 @@
+# librashader's D3D11 runtime for dxvk-native on x86-64 Linux, built in the
+# Steam Linux Runtime sniper SDK image so it links against sniper's glibc
+# like the game (tools/linux/Dockerfile.sniper). Run only as
+# `docker build --output` (or podman's) by build-linux.sh, whose context is
+# this directory's patch and shim plus vkd3d-shader's headers and library;
+# no bind mounts. The output is the raw parts (library, licences, crate
+# notices, compiler name); build-linux.sh writes the zip from them.
+#
+# The Rust toolchain is the pinned standalone tarball, sha256-checked, not
+# rustup. The C++ runtime is linked statically and kept out of the dynamic
+# symbol table, as dxvk-native's is: the bundle ships no libstdc++, and the
+# Steam runtime's may be older than the SDK compiler's. The windows crates
+# are cfg(windows) as a whole, so the patch builds copies of windows,
+# windows-core and windows-strings with those gates opened (their COM types
+# are what dxvk-native implements) and an empty windows-future. -z defs makes any
+# Windows function the patched build still references, beyond the two
+# d3dcompiler_vkd3d.c defines, a link error instead of a dlopen failure.
+FROM registry.gitlab.steamos.cloud/steamrt/sniper/sdk@sha256:9ae8083ee9ae6298361a62f289e62f0a2b0779d23fc8c276304157f0c06010c5 AS build
+ARG VERSION
+ARG COMMIT
+ARG RUST
+ARG RUST_SHA256
+ARG CARGO_ABOUT
+ARG JOBS=8
+ENV SOURCE_DATE_EPOCH=1783123200 CARGO_HOME=/cargo PATH=/opt/rust/bin:/opt/about/bin:/usr/local/bin:/usr/bin:/bin
+RUN set -e; cd /tmp \
+ && curl -fsSL -o rust.tar.xz "https://static.rust-lang.org/dist/rust-${RUST}-x86_64-unknown-linux-gnu.tar.xz" \
+ && echo "${RUST_SHA256}  rust.tar.xz" | sha256sum -c - \
+ && tar -xJf rust.tar.xz \
+ && ./rust-${RUST}-x86_64-unknown-linux-gnu/install.sh --prefix=/opt/rust \
+        --components=rustc,cargo,rust-std-x86_64-unknown-linux-gnu --disable-ldconfig > /dev/null \
+ && rm -rf rust.tar.xz rust-${RUST}-x86_64-unknown-linux-gnu
+RUN cargo install --locked -j "$JOBS" cargo-about --version "${CARGO_ABOUT}" --features cli \
+        --root /opt/about > /dev/null 2>&1
+RUN git -c advice.detachedHead=false clone -q --depth 1 --branch "librashader-v${VERSION}" \
+        https://github.com/SnowflakePowered/librashader.git /src \
+ && test "$(git -C /src rev-parse HEAD)" = "${COMMIT}" \
+ && cd /src && cargo fetch --locked > /dev/null 2>&1
+# The windows crates linux-d3d11.patch opens to Linux (its [patch.crates-io]),
+# copied from the registry as cargo fetch checked them against Cargo.lock.
+RUN set -e; reg=$(ls -d /cargo/registry/src/index.crates.io-*) && mkdir /src/linux-stubs \
+ && for c in windows-0.62.2 windows-core-0.62.2 windows-strings-0.5.1; do \
+        cp -r "$reg/$c" "/src/linux-stubs/${c%-*}"; done
+COPY linux-d3d11.patch d3dcompiler_vkd3d.c notices-linux.py about.toml about.hbs /ctx/
+COPY vkd3d/ /ctx/vkd3d/
+RUN set -e; cd /src && git apply /ctx/linux-d3d11.patch \
+ && mkdir -p /shim \
+ && gcc -std=c11 -O2 -fPIC -fvisibility=hidden -Wall -Werror -I/ctx/vkd3d/include/vkd3d \
+        -ffile-prefix-map=/ctx=. -c /ctx/d3dcompiler_vkd3d.c -o /shim/d3dcompiler_vkd3d.o \
+ && export CXXSTDLIB_x86_64_unknown_linux_gnu= \
+ && export RUSTFLAGS="-C link-arg=/shim/d3dcompiler_vkd3d.o \
+-C link-arg=-L/ctx/vkd3d/lib -C link-arg=-l:libvkd3d-shader.so.1 \
+-C link-arg=-Wl,-Bstatic -C link-arg=-lstdc++ -C link-arg=-Wl,-Bdynamic \
+-C link-arg=-Wl,--exclude-libs,ALL \
+-C link-arg=-Wl,-z,defs -C link-arg=-Wl,--build-id=none" \
+ && cargo build --locked --offline -j "$JOBS" -p librashader-capi --profile optimized \
+        --no-default-features --features runtime-d3d11 \
+ && mkdir -p /out \
+ && cp target/optimized/liblibrashader_capi.so /out/librashader.so \
+ && strip --strip-unneeded /out/librashader.so \
+ && cp LICENSE.md /out/LICENSE.md \
+ && cp /ctx/linux-d3d11.patch /out/linux-d3d11.patch \
+ && cargo about generate --frozen --fail -c /ctx/about.toml -m librashader-capi/Cargo.toml \
+        --target x86_64-unknown-linux-gnu --no-default-features --features runtime-d3d11 \
+        /ctx/about.hbs -o /tmp/crates.txt \
+ && cargo metadata --frozen --format-version 1 --manifest-path librashader-capi/Cargo.toml \
+        > /tmp/meta.json \
+ && stdcxx=$(ls -d /usr/share/doc/libstdc++6/copyright /usr/share/doc/gcc-*-base/copyright \
+        2>/dev/null | head -n 1) && test -n "$stdcxx" \
+ && python3 -I /ctx/notices-linux.py /tmp/meta.json /tmp/crates.txt "$stdcxx" \
+        "$(dpkg-query -W -f '${Version}' libstdc++6)" \
+        /opt/rust/share/doc/rust/licenses/Apache-2.0.txt "${RUST}" /out/THIRDPARTY.txt \
+ && gcc --version | head -n 1 > /out/gcc.txt
+FROM scratch
+COPY --from=build /out /

@@ -14,10 +14,10 @@
 #
 # Before each build of a staged target its directory gets shaders/
 # (assets/shaders, the PD/MIT presets) and, with XBOXRECOMP_LIBRASHADER on,
-# librashader.dll or librashader.dylib. The runtime loads the library at run
-# time and never links it (the D3D11 runtime does not build with MinGW), so
-# the game builds and runs without it: present.shader then says the library
-# is missing and the present stays stock.
+# librashader.dll, librashader.dylib or librashader.so. The runtime loads the
+# library at run time and never links it (the D3D11 runtime does not build
+# with MinGW), so the game builds and runs without it: present.shader then
+# says the library is missing and the present stays stock.
 #
 # The library is a prebuilt release, never built here (no Rust toolchain on
 # the build machines), pinned by sha256 like cmake/dsp56300.cmake. macOS and
@@ -25,6 +25,11 @@
 # the same source (third_party/librashader/build-windows.sh), hosted on the
 # toolkit fork's releases: the upstream dll imports D3DX9_43.dll and the
 # VC++ runtime, which a stock Windows 11 lacks (LoadLibrary error 126).
+# x86-64 Linux with dxvk-native (XBOXRECOMP_DXVK_NATIVE) takes our build
+# too (build-linux.sh): upstream has no D3D11 runtime off Windows, so the
+# same source is built with linux-d3d11.patch, which only widens those
+# gates. The zip's patch is staged as shaders/librashader-linux-d3d11.patch,
+# the modified source MPL-2.0 asks a binary to point to.
 # It is MPL-2.0: LICENSES/MPL-2.0-librashader.txt is staged as
 # shaders/LICENSE-librashader.txt, and shaders/README.md has the source link.
 # Our zip also holds THIRDPARTY.txt, the licences of the crates and C/C++
@@ -55,6 +60,15 @@ set(_lrs_zip_x86_64-windows
     "librashader-x86_64-windows-d3d11-v${XBOXRECOMP_LIBRASHADER_VERSION}-xbr1.zip"
     CACHE INTERNAL "")
 set(_lrs_notices_x86_64-windows THIRDPARTY.txt CACHE INTERNAL "")
+# Our D3D11-only x86-64 Linux build, for dxvk-native: the same release tag.
+set(_lrs_url_x86_64-linux "${_lrs_url_x86_64-windows}" CACHE INTERNAL "")
+set(_lrs_zip_x86_64-linux
+    "librashader-x86_64-linux-d3d11-v${XBOXRECOMP_LIBRASHADER_VERSION}-xbr1.zip"
+    CACHE INTERNAL "")
+set(_lrs_notices_x86_64-linux THIRDPARTY.txt CACHE INTERNAL "")
+# Other files of the zip, staged in shaders/ under the second name.
+set(_lrs_extra_x86_64-linux "linux-d3d11.patch=librashader-linux-d3d11.patch"
+    CACHE INTERNAL "")
 # The macOS notices, from the repository rather than the zip.
 get_filename_component(_lrs_macos_notices
     "${CMAKE_CURRENT_LIST_DIR}/../third_party/librashader/THIRDPARTY-macos.txt" ABSOLUTE)
@@ -63,13 +77,16 @@ set(_lrs_repo_notices_x86_64-macos "${_lrs_macos_notices}" CACHE INTERNAL "")
 # sha256 of each release zip: upstream's from the release's asset digests
 # (the Mac one checked against a downloaded copy), ours from
 # third_party/librashader/build-windows.sh with its pinned Rust, llvm-mingw
-# and cargo-about (two runs on macOS arm64 gave these bytes).
+# and cargo-about (two runs on macOS arm64 gave these bytes); the Linux one
+# from third_party/librashader/build-linux.sh in the pinned sniper SDK image.
 set(_lrs_sha256_aarch64-macos
     49808004a4904f6a99e0231092dcfdfe52b7b61f68430a4c9f1e165749c4c90e CACHE INTERNAL "")
 set(_lrs_sha256_x86_64-macos
     8b2a50cefacf4073e8fa4757bec30242a788068c4096a580d94430688c184767 CACHE INTERNAL "")
 set(_lrs_sha256_x86_64-windows
     c01a5ed3c3d9b53f1b21bfbca54ad8e012670416241477b1773ef93f16314e90 CACHE INTERNAL "")
+set(_lrs_sha256_x86_64-linux
+    590703ee6212eecee915a80034111415e23125a15e9b9a4bf27f5080c3f5fef4 CACHE INTERNAL "")
 set(_lrs_sha256_aarch64-windows
     acea3871d7c1cf345ae9da47378b399d89a1e05496160a652103ba5b7b5eb775 CACHE INTERNAL "")
 
@@ -100,18 +117,25 @@ function(_xboxrecomp_librashader_platform out)
         set(plat ${arch}-macos)
     elseif(arch AND WIN32)
         set(plat ${arch}-windows)
+    elseif(arch STREQUAL "x86_64" AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
+           AND XBOXRECOMP_DXVK_NATIVE)
+        # Only the D3D11 runtime is built, which only the dxvk-native
+        # backend can drive.
+        set(plat x86_64-linux)
     endif()
     set(${out} "${plat}" PARENT_SCOPE)
 endfunction()
 
 # The library file for this build into <out-var>, or empty with a message,
-# and the zip's third-party notices into <notices-var>, or empty when the
-# zip has none.
-function(_xboxrecomp_librashader_fetch out notices)
+# the zip's third-party notices into <notices-var>, or empty when the zip
+# has none, and its other staged files into <extra-var> as
+# "<extracted file>=<name in shaders/>".
+function(_xboxrecomp_librashader_fetch out notices extra)
     _xboxrecomp_librashader_platform(plat)
     if(NOT plat)
         set(${out} "" PARENT_SCOPE)
         set(${notices} "" PARENT_SCOPE)
+        set(${extra} "" PARENT_SCOPE)
         message(STATUS "librashader: no prebuilt release for this target; present.shader"
                        " will say the library is missing")
         return()
@@ -119,6 +143,14 @@ function(_xboxrecomp_librashader_fetch out notices)
     _xboxrecomp_librashader_fetch_plat(${plat} lib note)
     set(${out} "${lib}" PARENT_SCOPE)
     set(${notices} "${note}" PARENT_SCOPE)
+    set(more "")
+    if(lib)
+        get_filename_component(dir "${lib}" DIRECTORY)
+        foreach(e IN LISTS _lrs_extra_${plat})
+            list(APPEND more "${dir}/${e}")
+        endforeach()
+    endif()
+    set(${extra} "${more}" PARENT_SCOPE)
 endfunction()
 
 # The same for release platform <plat> (aarch64-macos, x86_64-windows, ...),
@@ -129,6 +161,8 @@ function(_xboxrecomp_librashader_fetch_plat plat out notices)
     set(${notices} "" PARENT_SCOPE)
     if(plat MATCHES "-windows$")
         set(libname librashader.dll)
+    elseif(plat MATCHES "-linux$")
+        set(libname librashader.so)
     else()
         set(libname librashader.dylib)
     endif()
@@ -149,7 +183,16 @@ function(_xboxrecomp_librashader_fetch_plat plat out notices)
     elseif(DEFINED _lrs_repo_notices_${plat})
         set(note "${_lrs_repo_notices_${plat}}")
     endif()
-    if(EXISTS "${lib}" AND EXISTS "${dir}/.sha256" AND (NOT note OR EXISTS "${note}"))
+    set(have_extra TRUE)
+    foreach(e IN LISTS _lrs_extra_${plat})
+        string(REGEX REPLACE "=.*" "" e "${e}")
+        list(APPEND want "${e}")
+        if(NOT EXISTS "${dir}/${e}")
+            set(have_extra FALSE)
+        endif()
+    endforeach()
+    if(EXISTS "${lib}" AND EXISTS "${dir}/.sha256" AND (NOT note OR EXISTS "${note}")
+       AND have_extra)
         file(READ "${dir}/.sha256" have)
         if(have STREQUAL sha)
             set(${out} "${lib}" PARENT_SCOPE)
@@ -240,7 +283,7 @@ function(_xboxrecomp_present_shaders_stage target)
     set(copies COMMAND ${CMAKE_COMMAND} -DSRC=${root}/assets/shaders
             -DDST=${dir}/shaders -P "${root}/cmake/present_shaders_copy.cmake")
     if(XBOXRECOMP_LIBRASHADER)
-        _xboxrecomp_librashader_fetch(lib notices)
+        _xboxrecomp_librashader_fetch(lib notices extra)
         if(lib)
             # The MPL-2.0 text, the third-party notices and the source link
             # travel in shaders/, so the packaging carries one directory and
@@ -254,6 +297,12 @@ function(_xboxrecomp_present_shaders_stage target)
                 list(APPEND copies COMMAND ${CMAKE_COMMAND} -E copy_if_different
                      "${notices}" "${dir}/shaders/THIRDPARTY-librashader.txt")
             endif()
+            foreach(e IN LISTS extra)
+                string(REGEX MATCH "^[^=]*" from "${e}")
+                string(REGEX REPLACE "^[^=]*=" "" to "${e}")
+                list(APPEND copies COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                     "${from}" "${dir}/shaders/${to}")
+            endforeach()
         endif()
     endif()
     add_custom_target(${target}_present_shaders ${copies}

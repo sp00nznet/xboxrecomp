@@ -4,8 +4,9 @@
 [librashader](https://github.com/SnowflakePowered/librashader) v0.12.0 release
 zips (C ABI 2, API 5), unmodified. The header is MIT (its comment); the
 library is MPL-2.0 and is never linked: `src/kernel/nv2a_present_chain.c`
-loads a prebuilt `librashader.dylib` / `librashader.dll` at run time, and
-the packaging that ships it adds the MPL-2.0 notice and the source link.
+loads a prebuilt `librashader.dylib` / `librashader.dll` / `librashader.so`
+at run time, and the packaging that ships it adds the MPL-2.0 notice and the
+source link.
 macOS and aarch64 Windows take the upstream release; x86-64 Windows takes a
 D3D11-only build of the same source that imports no D3DX9 or Visual C++
 runtime, made by `build-windows.sh` here (it sits outside `tools/` so it
@@ -13,6 +14,21 @@ does not stale every game's generated code). `cmake/librashader.cmake` pins
 both by sha256. `about.toml` and `about.hbs` drive the cargo-about run that
 writes that zip's `THIRDPARTY.txt`; the licence of the MinGW-w64 runtime it
 links is `LICENSES/MinGW-w64-runtime.txt` at the top of the repository.
+
+x86-64 Linux, for the dxvk-native build, takes `build-linux.sh`'s zip: the
+same source and features, built in the pinned Steam Linux Runtime sniper
+SDK image (`Dockerfile.linux`, run as `docker build --output`, no bind
+mounts) so it needs no glibc newer than sniper's. Upstream builds the D3D11
+runtime on Windows only; `linux-d3d11.patch` widens its `target_os` gates
+and the `windows` crate dependency to Linux and changes no code, since
+dxvk-native gives the same D3D11 interfaces. `d3dcompiler_vkd3d.c`, linked
+into the library, defines the two d3dcompiler_47 functions the runtime
+calls (`D3DCompile`, `D3DCreateBlob`) over the game's libvkd3d-shader.so.1,
+with vkd3d-utils' options, so presets compile to the DXBC they get under
+Proton. `notices-linux.py` writes the zip's `THIRDPARTY.txt` (the crates,
+the -sys crates' native licences, the static libstdc++ and Rust's std); the
+zip also carries the patch and `SOURCE.txt`, and the patch is staged beside
+the presets.
 
 Upstream's macOS zips carry no third-party notices, so `notices-macos.sh`
 writes them for its dylib from the same source, config and pinned tools

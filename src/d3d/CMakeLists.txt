@@ -96,8 +96,9 @@ else()
         target_link_libraries(xbox_d3d8 PUBLIC dxvk::d3d11 dxvk::dxgi xbox_input)
         xboxrecomp_vkd3d_shader(xbox_d3d8)
         if(XBOXRECOMP_ENHANCE)
-            # librashader.h's types; its D3D11 runtime is Windows-only, so
-            # present.shader is stubbed out in this build.
+            # librashader.h: present.shader runs librashader's D3D11 runtime
+            # as on Windows, from the Linux build of it
+            # (third_party/librashader/build-linux.sh), loaded at run time.
             target_include_directories(xbox_d3d8 PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/librashader)
         endif()

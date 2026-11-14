@@ -60,12 +60,14 @@ endif()
 # the games that call it and for an executable that does not link the layer.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/librashader.cmake)
 # The staged Windows library must load on a stock Windows (an objdump reads
-# its import table). Other hosts check the same pinned zip on request: it is
-# a 12 MB download no macOS or Linux game needs.
+# its import table), and the dxvk-native Linux one in the Steam runtime (its
+# NEEDED and glibc versions). Other hosts check the same pinned zips on
+# request: they are downloads no macOS game needs.
 option(XBOXRECOMP_LIBRASHADER_TEST_WIN64
-    "Check the x86-64 Windows librashader.dll's imports from a non-Windows build" OFF)
+    "Check the x86-64 Windows and Linux librashader libraries from any build" OFF)
 if(CMAKE_OBJDUMP AND XBOXRECOMP_LIBRASHADER AND
-   ((WIN32 AND XBOXRECOMP_ENHANCE) OR (NOT WIN32 AND XBOXRECOMP_LIBRASHADER_TEST_WIN64)))
+   ((WIN32 AND XBOXRECOMP_ENHANCE) OR XBOXRECOMP_DXVK_NATIVE
+    OR XBOXRECOMP_LIBRASHADER_TEST_WIN64))
     add_subdirectory(tests/librashader_imports)
 endif()
 
