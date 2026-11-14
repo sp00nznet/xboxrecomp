@@ -50,14 +50,24 @@ static void q_put(void *c, void *q)
     s_puts++;
 }
 
+static struct fq *s_open;           /* the query begun and not ended */
+
 static void q_begin(void *c, void *q)
 {
     (void)c;
     ((struct fq *)q)->ready_at = s_clock + s_lat;
     ((struct fq *)q)->value = s_val;
+    s_open = (struct fq *)q;
 }
 
-static void q_end(void *c, void *q) { (void)c; (void)q; }
+static void q_end(void *c, void *q) { (void)c; (void)q; s_open = NULL; }
+
+/* A draw of n samples: the open query, if any, counts them. */
+static void draw(uint64_t n)
+{
+    if (s_open)
+        s_open->value += n;
+}
 
 static int q_result(void *c, void *q, int flush, uint64_t *n)
 {
@@ -111,6 +121,7 @@ static void fresh(void)
     memset(s_q, 0, sizeof s_q);
     memset(s_mem, 0, sizeof s_mem);
     s_qn = 0;
+    s_open = NULL;
     s_clock = 1000000;
     s_tick = 0;
     s_lat = 0;
@@ -702,6 +713,35 @@ static int case_ckpt_defer(void)
     return 0;
 }
 
+/* A host pass (D3D11 AO) between pause and resume, inside a
+ * test, adds none of its samples; the test's own draws either side do.
+ * With ZPASS off, resume begins nothing. */
+static int case_pause(void)
+{
+    fresh();
+    s_val = 0;
+    s_mem[A / 4 + 3] = 0xFFFFFFFFu;
+    nv2a_occ_zpass_clear(&s_o);
+    nv2a_occ_zpass(&s_o, 1);
+    draw(40);
+    nv2a_occ_pause(&s_o);
+    CHECK(!s_o.open && s_o.pauses == 1);
+    draw(640 * 480);                    /* the fullscreen pass */
+    nv2a_occ_resume(&s_o);
+    CHECK(s_o.open);
+    draw(10);
+    nv2a_occ_zpass(&s_o, 0);
+    nv2a_occ_report(&s_o, A, 0);
+    nv2a_occ_flip(&s_o);
+    CHECK(count_at(A) == 50 && status_at(A) == 0);
+    /* Off: pause closes nothing, resume opens nothing. */
+    nv2a_occ_pause(&s_o);
+    nv2a_occ_resume(&s_o);
+    CHECK(!s_o.open && s_o.pauses == 1 && !s_open);
+    CHECK(drained());
+    return 0;
+}
+
 int main(void)
 {
     static const struct {
@@ -728,6 +768,7 @@ int main(void)
         { "accounting", case_accounting },
         { "the settle waits, not spins", case_wait },
         { "a checkpoint's ask defers, the walk end settles", case_ckpt_defer },
+        { "a host pass inside a test is not counted", case_pause },
     };
     unsigned i, fail = 0;
     for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {

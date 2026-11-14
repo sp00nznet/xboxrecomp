@@ -4535,13 +4535,22 @@ static void ao_apply(RenderTarget *rt)
     }
 }
 
+static struct nv2a_occ s_occ;           /* see "Visibility tests" below */
+
 /* A pass the trigger fired; one ao_apply declines (no readable depth of
  * the target's size, a record that no longer fits) goes back to the
  * trigger, which then does not count it as run. */
 static void ao_run(const void *fire)
 {
     uint64_t r = s_ao_runs;
+    /* The passes fire mid-frame, before the draw that stops writing depth:
+     * often a visibility test's own proxy draw (BLiNX 1's lamp flares), its
+     * query open. Their fullscreen triangles would count into it, so a lamp
+     * behind a wall reads in full view. Metal's passes run in
+     * their own encoders, which count nothing. */
+    nv2a_occ_pause(&s_occ);
     ao_apply((RenderTarget *)(uintptr_t)fire);
+    nv2a_occ_resume(&s_occ);
     if (s_ao_runs == r)
         nv2a_ao_dropped(&s_ao);
 }
@@ -5377,7 +5386,6 @@ static void dump_frame(void)
     }
 }
 
-static struct nv2a_occ s_occ;           /* see "Visibility tests" below */
 
 /* The surface a flip puts on screen: the walker's pick (present_pick in
  * nv2a_pb_exec.c, the same for every backend), as the render target at that

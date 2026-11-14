@@ -967,7 +967,8 @@ void nv2a_occ_summary(const struct nv2a_occ *o, const char *tag)
             " settled %llu (stale %llu, beside %llu, first %llu),"
             " %llu amended,"
             " %llu retired dropped,"
-            " settle wait %llu us (%llu waits, %llu polls)\n", tag,
+            " settle wait %llu us (%llu waits, %llu polls),"
+            " %llu host-pass pauses\n", tag,
             (unsigned long long)o->reports,
             (unsigned long long)o->vis,
             (unsigned long long)o->late,
@@ -980,7 +981,8 @@ void nv2a_occ_summary(const struct nv2a_occ *o, const char *tag)
             (unsigned long long)o->ret_drop,
             (unsigned long long)o->settle_wait_us,
             (unsigned long long)o->waits,
-            (unsigned long long)o->settle_polls);
+            (unsigned long long)o->settle_polls,
+            (unsigned long long)o->pauses);
     if (o->trace)
         fprintf(stderr, "%s occ result age: <1ms %llu <2 %llu <4 %llu <8 %llu"
                 " <16 %llu <33 %llu <66 %llu >=66 %llu\n", tag,
@@ -997,6 +999,24 @@ void nv2a_occ_zpass(struct nv2a_occ *o, int enable)
         occ_begin(o);
     else
         occ_end(o);
+}
+
+void nv2a_occ_pause(struct nv2a_occ *o)
+{
+    if (!o->open)
+        return;
+    occ_end(o);
+    o->paused = 1;
+    o->pauses++;
+}
+
+void nv2a_occ_resume(struct nv2a_occ *o)
+{
+    if (!o->paused)
+        return;
+    o->paused = 0;
+    if (o->en)
+        occ_begin(o);
 }
 
 void nv2a_occ_zpass_clear(struct nv2a_occ *o)

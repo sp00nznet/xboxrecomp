@@ -2902,6 +2902,9 @@ static void ao_apply(RenderTarget *rt)
         pre = ao_dump_copy(rt->tex, rt);
     if (dump && fb)
         snap = ao_dump_copy(s_ao_snap[0], rt);
+    /* No visibilityResultBuffer on these encoders: an open visibility test
+     * counts none of the passes' samples (D3D11 pauses its query for the
+     * same reason). */
     rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = s_ao_tex;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;

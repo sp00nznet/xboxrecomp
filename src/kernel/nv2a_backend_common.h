@@ -1691,6 +1691,8 @@ struct nv2a_occ {
     uint8_t *mem;                       /* guest memory base */
     void    *seg[NV2A_OCC_SEG];         /* since the last clear */
     int      nseg, open, en, ovf;
+    /* nv2a_occ_pause closed the open stretch; resume reopens it. */
+    int      paused;
     struct nv2a_occ_report pend[NV2A_OCC_PENDING];
     int      npend;
     /* Settled, their queries still out: a result updates last[] and amends
@@ -1713,6 +1715,8 @@ struct nv2a_occ {
     /* Settle waits through ops->wait, and the polls the settle made after
      * its first (one a wake with the wait op, one a loop turn without). */
     uint64_t waits, settle_polls;
+    /* nv2a_occ_pause calls that closed an open stretch. */
+    uint64_t pauses;
     /* nv2a_occ_flip calls, and the age (GET_REPORT to the poll that found
      * it) of every result taken: <1, <2, <4, <8, <16, <33, <66, >=66 ms. */
     uint64_t flips, age[NV2A_OCC_AGES];
@@ -1741,6 +1745,14 @@ void nv2a_occ_init(struct nv2a_occ *o, const struct nv2a_occ_ops *ops,
                    uint8_t *mem);
 void nv2a_occ_zpass(struct nv2a_occ *o, int enable);
 void nv2a_occ_zpass_clear(struct nv2a_occ *o);
+/* Host draws of the backend's own (enhancement passes) between pause and
+ * resume are kept out of the title's visibility test: pause ends the open
+ * stretch, resume begins a new one if ZPASS is still on. A query counts
+ * every sample of the context while it is open, NULL depth target or not,
+ * so a fullscreen pass inside a test reads as the tested object being in
+ * full view (BLiNX 1's lamp flares through walls with AO on). */
+void nv2a_occ_pause(struct nv2a_occ *o);
+void nv2a_occ_resume(struct nv2a_occ *o);
 /* GET_REPORT at va; sync waits (up to NV2A_OCC_LATE_US) for the result. */
 void nv2a_occ_report(struct nv2a_occ *o, uint32_t va, int sync);
 void nv2a_occ_poll(struct nv2a_occ *o, int flush);
