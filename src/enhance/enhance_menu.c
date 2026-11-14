@@ -7536,8 +7536,8 @@ static void keys_latch(void)
 }
 
 /* ---- View and L3: on release, never as part of the menu's chord (A.6) ----
- * Cancel, the hints toggle and the size (R3) sit on buttons a title may use in its
- * menu.open chord (BLiNX 2: back+left_thumb@400). They fire when let go,
+ * Cancel, the hints toggle and the size (R3) sit on buttons a menu.open
+ * chord may use (the default back+left_thumb@400). They fire when let go,
  * and not at all once a chord mate was held with them or the toggle fired
  * while they were down: that hold was the chord, not a press. */
 

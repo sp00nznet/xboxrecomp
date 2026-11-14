@@ -512,7 +512,7 @@ static void test_start(void)
     CHECK(!enhance_menu_is_open());
 
     out = start_with(ARMED, NULL);
-    CHECK(strstr(out, "[ENHANCE] menu.enabled=on (F10, guide+a, paddle1)\n") != NULL);
+    CHECK(strstr(out, "[ENHANCE] menu.enabled=on (F10, guide+a, paddle1, back+left_thumb@400)\n") != NULL);
     set_env("RECOMP_MENU", "0");
     out = start_with(ARMED, NULL);
     CHECK(strstr(out, "[ENHANCE] menu.enabled=off\n") != NULL);
@@ -915,7 +915,7 @@ static void test_capture_and_save(void)
     hold_btn(XBOX_GAMEPAD_BACK, 1);
     advance(16);
     poll0();
-    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 1);
+    hold_btn(XBOX_GAMEPAD_RIGHT_THUMB, 1);
     advance(16);
     poll0();
     advance(200);
@@ -924,8 +924,8 @@ static void test_capture_and_save(void)
     advance(250);
     poll0();
     CHECK(!enhance_menu_capturing());
-    CHECK(!strcmp(row_value("Poke"), "F6, F7, back+left_stick_click@400"));
-    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB, 0);
+    CHECK(!strcmp(row_value("Poke"), "F6, F7, back+right_stick_click@400"));
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_RIGHT_THUMB, 0);
     advance(16);
     poll0();
 
@@ -934,7 +934,7 @@ static void test_capture_and_save(void)
     tap(0x77);  /* F8 */
     CHECK(!enhance_menu_capturing());
     CHECK(strstr(enhance_menu_status(), "F8 refused") != NULL);
-    CHECK(!strcmp(row_value("Poke"), "F6, F7, back+left_stick_click@400"));
+    CHECK(!strcmp(row_value("Poke"), "F6, F7, back+right_stick_click@400"));
     /* Esc cancels. */
     tap(0x0D);
     tap(0x1B);
@@ -945,7 +945,7 @@ static void test_capture_and_save(void)
     CHECK(enhance_menu_select_row("Open the menu"));
     tap(0x2E);
     CHECK(strstr(enhance_menu_status(), "keeps a binding") != NULL);
-    CHECK(!strcmp(row_value("Open the menu"), "F10, guide+a, paddle1"));
+    CHECK(!strcmp(row_value("Open the menu"), "F10, guide+a, paddle1, back+left_thumb@400"));
 
     /* An item, then one moved and moved back: neither that nor the
      * untouched keys reach the file. */
@@ -962,14 +962,14 @@ static void test_capture_and_save(void)
         CHECK(n >= 1 && !strcmp(keys[0], "present.filter") && vals[0]
               && !strcmp(vals[0], "\"linear\""));
         CHECK(n >= 2 && !strcmp(keys[1], "input.actions.testmod.poke") && vals[1]
-              && !strcmp(vals[1], "[\"F6\", \"F7\", \"back+left_stick_click@400\"]"));
+              && !strcmp(vals[1], "[\"F6\", \"F7\", \"back+right_stick_click@400\"]"));
     }
     tap(VK_F5);
     CHECK(strstr(enhance_menu_status(), "Saved 2 changes") != NULL);
     CHECK(enhance_menu_unsaved() == 0);
     f = read_file("config/config.toml");
     CHECK(strstr(f, "filter = \"linear\"") != NULL);
-    CHECK(strstr(f, "\"testmod.poke\" = [\"F6\", \"F7\", \"back+left_stick_click@400\"]") != NULL);
+    CHECK(strstr(f, "\"testmod.poke\" = [\"F6\", \"F7\", \"back+right_stick_click@400\"]") != NULL);
     CHECK(strstr(f, "scale") == NULL);
     CHECK(strstr(f, "walk_key = \"F8\"") != NULL);
     tap(VK_F5);
@@ -980,7 +980,7 @@ static void test_capture_and_save(void)
     start_with(read_file("config/config.toml"), k_mods);
     open_menu();
     CHECK(enhance_menu_set_page("Controls"));
-    CHECK(row_value("Poke") && !strcmp(row_value("Poke"), "F6, F7, back+left_stick_click@400"));
+    CHECK(row_value("Poke") && !strcmp(row_value("Poke"), "F6, F7, back+right_stick_click@400"));
     CHECK(enhance_menu_set_page("Render"));
     CHECK(row_value("Scaling filter") && !strcmp(row_value("Scaling filter"), "linear"));
 
@@ -3001,7 +3001,7 @@ static void test_pages(void)
      * cpu. */
     static const uint32_t k_sum[11] = {
         0x3C4817E6u, 0xC58D4BA2u, 0x1B88F742u, 0x775B0691u, 0x109DEB36u,
-        0x6930FCBFu, 0xC1417056u, 0x6C69666Cu, 0xE13F4B8Bu, 0x5548E3AAu, 0xE2E461FFu };
+        0x6930FCBFu, 0xD6ADEED9u, 0x6C69666Cu, 0xE13F4B8Bu, 0x5548E3AAu, 0xE2E461FFu };
     /* Files shows Open exports folder only off Game Mode. Pack with a pack
      * loaded: with none it names the packs folder, an absolute path that
      * moves with the build folder. */

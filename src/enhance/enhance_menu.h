@@ -3,10 +3,11 @@
  * RECOMP_MENU; built with -DXBOXRECOMP_ENHANCE=ON).
  *
  * The menu is a page of rows drawn into the overlay's MENU layer
- * (nv2a_overlay.h). The menu.open action (F10, guide+a, paddle1 by
- * default; enhance_actions.h) opens and closes it. While it is open the
- * title reads a neutral pad with a frozen packet number, and the menu reads
- * the host pad and keys itself; the guest keeps running (no pause hook).
+ * (nv2a_overlay.h). The menu.open action (F10, guide+a, paddle1 and
+ * back+left_thumb@400 by default; enhance_actions.h) opens and closes it.
+ * While it is open the title reads a neutral pad with a frozen packet
+ * number, and the menu reads the host pad and keys itself; the guest keeps
+ * running (no pause hook).
  *
  * Items are a flat table: the toolkit's own (render, pack, stats, the mouse
  * group), a title's (enhance_menu_add, on the Game page) and a mod's
@@ -108,8 +109,8 @@ int enhance_menu_page_intro(const char *page, const char *text);
 
 /* From xbox_enhance_init, after the overlay arm: when menu.enabled is on,
  * arms the MENU layer, sets the actions hook and logs
- * "[ENHANCE] menu.enabled=on (F10, guide+a, paddle1)"; otherwise logs
- * "[ENHANCE] menu.enabled=off" and does nothing more. */
+ * "[ENHANCE] menu.enabled=on (F10, guide+a, paddle1, back+left_thumb@400)";
+ * otherwise logs "[ENHANCE] menu.enabled=off" and does nothing more. */
 void enhance_menu_start(void);
 
 /* The actions hook (enhance_actions_set_menu_hook): one step. Opens on a

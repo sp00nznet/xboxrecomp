@@ -1171,16 +1171,22 @@ The toolkit's actions:
 
 | Action | Default bindings | Does |
 |---|---|---|
-| `menu.open` | `F10`, `guide+a`, `paddle1` | opens and closes the menu when `menu.enabled` is on |
-| `overlay.stats` | none | toggles the stats strip |
+| `menu.open` | `F10`, `guide+a`, `paddle1`, `back+left_thumb@400` | opens and closes the menu when `menu.enabled` is on |
+| `overlay.stats` | `F3` | toggles the stats strip |
 | `shot.window` | none | a window shot (a log line for now) |
 | `padrec.record` | `F1` | starts or stops a pad recording ([Pad recordings](#pad-recordings)) |
 | `padrec.play` | `F2` | plays the recording picked on the Recordings page, or the last one |
 | `padrec.stop` | `F5` | stops a recording or its playback |
 
-A game's `config.default.toml` adds to these, for example a fallback chord
-for hosts where Guide is not seen (BLiNX 2: `back+left_thumb@400`). A mod
-registers its own actions, named after the mod (`camera.free.toggle`).
+Back+L3 held 0.4 s (`back+left_thumb@400`) is for the hosts that never
+pass Guide on: the Xbox Game Bar on Windows, Steam under Proton, SteamOS.
+It is a chord of two buttons the game uses: a lone Back or L3 press still
+reaches the game, and so does the first of the two until the second is
+down. While both are down the game sees neither; held 0.4 s, they open
+the menu. Every game gets these
+defaults; a game's `config.default.toml` names an action only to change it
+(`xbr doctor` reports a `menu.open` without Back+L3). A mod registers its
+own actions, named after the mod (`camera.free.toggle`).
 
 **A binding** is one of:
 
@@ -1402,7 +1408,7 @@ the rest of the hook unless another feature key arms it. On, the log names
 the bindings that open it:
 
 ```
-[ENHANCE] menu.enabled=on (F10, guide+a, paddle1)
+[ENHANCE] menu.enabled=on (F10, guide+a, paddle1, back+left_thumb@400)
 ```
 
 `menu.open` opens and closes it. While it is open the game keeps running

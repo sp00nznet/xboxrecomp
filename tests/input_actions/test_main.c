@@ -136,6 +136,7 @@ void nv2a_overlay_toast(const char *fmt, ...)
 /* Win32 virtual-key codes, as the key table holds them. */
 #define VK_F1  0x70
 #define VK_F2  0x71
+#define VK_F3  0x72
 #define VK_F5  0x74
 #define VK_F6  0x75
 #define VK_F7  0x76
@@ -2629,6 +2630,87 @@ static void test_padrec_defaults(void)
     remove("config/config.toml");
 }
 
+/* ---- the toolkit's default sources: every game's menu and strip -------- */
+
+/* The defaults are the one setup every game ships, with no
+ * [input.actions] in any file. Back+L3 is a guest chord, so a lone Back or
+ * L3 is still the game's. With the menu off (the goldens' RECOMP_MENU=0)
+ * the pair is the game's too, but only while nothing else arms the hook:
+ * the stats strip on or a mod's key arms it, and then the pair is masked
+ * and toasts "Menu is off". */
+static void test_default_sources(void)
+{
+    static const char *const menu[] = { "F10", "guide+a", "paddle1", "back+left_thumb@400" };
+    const uint16_t pair = XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB;
+    char l[ENHANCE_ACTION_BINDS][ENHANCE_ACTION_TEXT];
+    XBOX_INPUT_STATE st;
+    const char *out;
+    int n;
+
+    out = start(NULL);
+    CHECK(strstr(out, "[ENHANCE] actions hook=off\n") != NULL);
+    hold_btn(pair, 1);
+    poll0();
+    advance(500);
+    st = poll0();
+    CHECK((st.Gamepad.wButtons & pair) == pair);
+    CHECK(menu_fires() == 0);
+    hold_btn(pair, 0);
+    poll0();
+    advance(16);
+
+    out = start(ARMED);
+    CHECK(strstr(out, "refused") == NULL);
+    CHECK(strstr(out, "inactive") == NULL);
+    n = enhance_action_bindings(enhance_action_find("menu.open"), l, ENHANCE_ACTION_BINDS);
+    CHECK(n == 4);
+    for (int i = 0; i < n && i < 4; i++)
+        CHECK(!strcmp(l[i], menu[i]));
+    n = enhance_action_bindings(enhance_action_find("overlay.stats"), l, ENHANCE_ACTION_BINDS);
+    CHECK(n == 1 && !strcmp(l[0], "F3"));
+
+    /* A lone Back, then a lone L3, held past the hold: the game's. */
+    hold_btn(XBOX_GAMEPAD_BACK, 1);
+    poll0();
+    advance(500);
+    st = poll0();
+    CHECK(st.Gamepad.wButtons & XBOX_GAMEPAD_BACK);
+    hold_btn(XBOX_GAMEPAD_BACK, 0);
+    poll0();
+    advance(16);
+    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 1);
+    poll0();
+    advance(500);
+    st = poll0();
+    CHECK(st.Gamepad.wButtons & XBOX_GAMEPAD_LEFT_THUMB);
+    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 0);
+    poll0();
+    advance(16);
+    CHECK(menu_fires() == 0);
+
+    /* The pair held 0.4 s: one fire, and the game never sees it. */
+    capture_begin();
+    hold_btn(pair, 1);
+    st = poll0();
+    CHECK(!(st.Gamepad.wButtons & pair));
+    advance(400);
+    st = poll0();
+    out = capture_end();
+    CHECK(!(st.Gamepad.wButtons & pair));
+    CHECK(menu_fires() == 1);
+    CHECK(strstr(out, "[ACTION] menu.open via back+left_thumb@400\n") != NULL);
+    hold_btn(pair, 0);
+    poll0();
+    advance(16);
+
+    /* F3 shows the strip and hides it again. */
+    s_ovl_stats = 0;
+    tap_key(VK_F3);
+    CHECK(s_ovl_stats == 1);
+    tap_key(VK_F3);
+    CHECK(s_ovl_stats == 0);
+}
+
 int main(void)
 {
     MKDIR("config");
@@ -2667,6 +2749,7 @@ int main(void)
     test_live_arm();
 #endif
     test_padrec_defaults();
+    test_default_sources();
     test_record();
     test_record_chord();
     test_record_mouse();

@@ -2272,20 +2272,28 @@ void enhance_actions_init(void)
      * button and Steam+A is its screen recording, so guide+a is no use on
      * the Deck. The SDL3 backend reads the paddle; XInput has none, so
      * under Proton Steam Input maps R4 to F10 instead (config.md, "Host
-     * actions"). Host-only, so it never takes a press from the game. */
-    static const char *const menu_open[] = { "F10", "guide+a", "paddle1", NULL };
-    /* F1, F2 and F5 are free in every game the toolkit runs: F3 is the
-     * stats strip's suggestion, F6, F7, F9, F10, Home and End are taken
-     * (the free camera, the mouse release, the menu). In the menu F5 is
-     * Save: the menu drops the requests made while it is open (its
-     * Recordings page has the same commands). */
+     * actions"). F10 and paddle1 are host-only, so they never take a
+     * press from the game; guide+a is a modifier chord (rule 7), so it
+     * takes the A pressed while Guide is held. Back+L3 held 0.4 s is for
+     * the hosts that never pass Guide on (the Xbox Game Bar on Windows,
+     * Steam under Proton, SteamOS): a guest chord (rule 1), so a lone Back
+     * or L3 still reaches the game and only the pair, from the moment both
+     * are down, is masked (rule 3). A default rather than a line in each
+     * game, so every game opens the menu the same way. */
+    static const char *const menu_open[] = { "F10", "guide+a", "paddle1",
+                                             "back+left_thumb@400", NULL };
+    /* F1, F2, F3 and F5 are free in every game the toolkit runs: F6, F7,
+     * F9, F10, Home and End are taken (the free camera, the mouse release,
+     * the menu). In the menu F5 is Save: the menu drops the requests made
+     * while it is open (its Recordings page has the same commands). */
+    static const char *const stats_keys[] = { "F3", NULL };
     static const char *const rec_keys[] = { "F1", NULL };
     static const char *const play_keys[] = { "F2", NULL };
     static const char *const stop_keys[] = { "F5", NULL };
 
     enhance_actions_reset();
     s_menu_act = enhance_action_register("menu.open", "Open the menu", menu_open);
-    s_stats_act = enhance_action_register("overlay.stats", "Stats strip", NULL);
+    s_stats_act = enhance_action_register("overlay.stats", "Stats strip", stats_keys);
     enhance_action_register("shot.window", "Window screenshot", NULL);
     s_padrec_act[0] = enhance_action_register("padrec.record", "Record the pad", rec_keys);
     s_padrec_act[1] = enhance_action_register("padrec.play", "Play a recording", play_keys);
