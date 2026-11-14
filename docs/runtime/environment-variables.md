@@ -143,6 +143,7 @@ See the [APU](../../src/apu/README.md) and [DirectSound](../../src/audio/README.
 | `RECOMP_APU_RING` | off | Ring monitor: finds a streaming writer that falls behind the play cursor. | `apu_vp.c` |
 | `RECOMP_APU_SOLO=<voice>` | off | Mutes every other voice, to find where a sound comes from. | `apu_core.c` |
 | `RECOMP_APU_VOICE_DUMP=<voice\|all>` | off | Dumps voices as raw PCM to `RECOMP_APU_VOICE_DUMP_FILE`. | `apu_vp.c` |
+| `RECOMP_APU_PACE_FRAMES` | on | The frame thread paces each 32-sample voice-processor frame (0.67 ms apart, as the hardware runs them), with the device queue setting the rate. `0`: one 256-sample period at a time, with the eight frames back to back, so a title waiting for a voice to stop (DirectSound's StopEx, then GetStatus) waits up to a period for the next bunch. | `apu_core.c` |
 | `RECOMP_AUDIO_WAV=<path>` | off | Records exactly what the device is given. | `apu_core.c` |
 | `RECOMP_AUDIO_WAV_SECS=N` | unlimited | Caps the recording. | `apu_core.c` |
 | `RECOMP_APU_HRTF` | on | `0` turns HRTF for 3D voices off. | `apu_vp.c` |
