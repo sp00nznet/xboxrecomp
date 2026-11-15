@@ -77,3 +77,34 @@ def test_an_epilogue_before_a_table_is_not_a_slot():
     engine, _ = _engine(data)
     assert engine.jump_tables.get(table) == table + 12
     assert BASE in engine.instructions
+
+
+def _lead_switch():
+    # MSVC memcpy/memmove's lead-byte dispatch, index 1..3:
+    # +0:  jmp dword ptr [eax*4 + TABLE-4]    ff 24 85 <TABLE-4>
+    # +7:  lea ecx, [ecx] ; mov edi, edi      8d 49 00 8b ff   (padding)
+    # +12: TABLE: arm1, arm2, arm3            (slot 0 is padding bytes, not a pointer)
+    # +24: arms
+    table = BASE + 12
+    arms = (BASE + 24, BASE + 27, BASE + 33)
+    data = b"\xff\x24\x85" + struct.pack("<I", table - 4) + b"\x8d\x49\x00\x8b\xff"
+    data += struct.pack("<III", *arms) + ARMS
+    return data + b"\xcc" * 16, table, arms
+
+
+def test_table_indexed_from_one_is_measured_one_slot_on():
+    # MechAssault's memmove ended at such a table (0x001D05E4), so its arms and
+    # epilogue became indirect calls nothing resolved.
+    data, table, arms = _lead_switch()
+    engine, _ = _engine(data)
+    assert engine.jump_tables.get(table) == table + 12
+    assert engine.jump_table_entries(table - 4) == list(arms)
+    assert BASE in engine.instructions
+
+
+def test_function_keeps_the_arms_after_a_table_indexed_from_one():
+    data, _, arms = _lead_switch()
+    engine, image = _engine(data)
+    det = FunctionDetector(engine, image, XRefTracker(), LabelManager())
+    det.detect_all([image.section])
+    assert det.functions[BASE].end >= arms[2] + 6, hex(det.functions[BASE].end)
