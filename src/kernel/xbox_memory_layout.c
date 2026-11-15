@@ -3855,6 +3855,15 @@ static int heap_insert_free(int at, uint32_t addr, uint32_t size)
     g_heap_blocks[at].addr = addr;
     g_heap_blocks[at].size = size;
     g_heap_blocks[at].free = 1; g_heap_blocks[at].named = 0;
+    /* The empty slots after a reused one kept addresses from inside the block
+     * that was carved, which can be below `addr` now. Left there they break
+     * the address order heap_block_at searches by: DOAX's replayed movie ring
+     * sat at the front of such a block, lookups in its second half found the
+     * free remainder (not named), and the APU read those pages from the
+     * window instead of the RAM the title wrote. */
+    for (int j = at + 1; j < g_heap_block_count && g_heap_blocks[j].size == 0 &&
+                         g_heap_blocks[j].addr < addr; j++)
+        g_heap_blocks[j].addr = addr;
     return 1;
 }
 
