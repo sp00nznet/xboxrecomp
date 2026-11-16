@@ -1671,6 +1671,11 @@ static void vp_trace_positions(MCPXAPUState *d)
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    /* Idle voices found by the walk: the first in walk order, and the first
+     * after the voice trapped last time. */
+    uint16_t first_idle = 0xFFFF, next_idle = 0xFFFF;
+    bool past_last = d->vp.idle_trap_last == 0xFFFF;
+
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {
@@ -1693,20 +1698,38 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                /* One trap at a time: once the front end is trapped, a second
-                 * idle voice in the same frame would overwrite FEDECPARAM
-                 * before the ISR has read the first. The rest trap on later
-                 * frames, after the ISR has resumed the front end. */
-                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
-                        != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
-                    fe_method(d, SE2FE_IDLE_VOICE, v);
+                if (first_idle == 0xFFFF)
+                    first_idle = v;
+                if (past_last && next_idle == 0xFFFF)
+                    next_idle = v;
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_spin_lock(d, v);
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
                 voice_spin_unlock(d, v);
             }
+            if (v == d->vp.idle_trap_last)
+                past_last = true;
             d->regs[current] = d->regs[next];
+        }
+    }
+
+    /* One trap at a time: a second idle voice in the same frame would
+     * overwrite FEDECPARAM before the ISR has read the first; the rest trap
+     * on later frames, once the ISR has resumed the front end. Each frame
+     * takes the next idle voice after the one trapped last, wrapping round.
+     * Starting from the list head every frame starved the voices behind one
+     * the title leaves listed: DirectSound frees a multi-voice stream only on
+     * its last voice's notice and ignores the others, and MechAssault spun
+     * for ever stopping its menu music (voice 0xF2 trapped every frame, 0xF4
+     * never). */
+    {
+        uint16_t pick = next_idle != 0xFFFF ? next_idle : first_idle;
+        if (pick != 0xFFFF
+                && (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                       != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+            fe_method(d, SE2FE_IDLE_VOICE, pick);
+            d->vp.idle_trap_last = pick;
         }
     }
 
@@ -1774,6 +1797,7 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
     memset((void *)d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
+    d->vp.idle_trap_last = 0xFFFF;
     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         hrtf_filter_init(&d->vp.filters[v].hrtf);
     }

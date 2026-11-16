@@ -430,6 +430,7 @@ typedef struct MCPXAPUVPState {
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
     volatile uint8_t voice_locked[MCPX_HW_MAX_VOICES];
     volatile LONG voice_spin[MCPX_HW_MAX_VOICES];   /* see voice_spin_lock */
+    uint16_t idle_trap_last;   /* the idle voice trapped last; see mcpx_apu_vp_frame */
 
     struct {
         int current_entry;
