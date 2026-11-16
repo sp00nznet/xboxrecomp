@@ -997,6 +997,17 @@ static void bridge_NtClose(void)
     g_eax = 0; /* STATUS_SUCCESS */
 }
 
+/* A new contiguous block gets the protection asked for. A title may make its
+ * own blocks read-only (MmSetAddressProtect), free them, and get the same
+ * pages back: MechAssault crashed zeroing a fresh buffer whose pages it had
+ * marked PAGE_READONLY before freeing them. The allocator makes the pages
+ * writable before it zeroes them; this applies the requested protection. */
+static void contig_protect(uint32_t xbox_va, uint32_t size, uint32_t prot)
+{
+    if (xbox_va && size)
+        xbox_MmSetAddressProtect(XBOX_TO_NATIVE(xbox_va), size, prot);
+}
+
 /* ── MmAllocateContiguousMemory (ordinal 165) ─────────────
  * PVOID MmAllocateContiguousMemory(ULONG NumberOfBytes)
  */
@@ -1009,6 +1020,8 @@ static void bridge_MmAllocateContiguousMemory(void)
      * is how a driver converts between the address it holds and the one it
      * hands the hardware. See xbox_ContiguousAlloc. */
     uint32_t xbox_va = xbox_ContiguousAlloc(size, 4096);
+
+    contig_protect(xbox_va, size, 0x04);   /* PAGE_READWRITE */
 
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemory: size=%u → Xbox VA 0x%08X\n",
@@ -1075,8 +1088,6 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     uint32_t prot = STACK_ARG(4);
     uint32_t xbox_va;
 
-    (void)prot;
-
     /*
      * A caller that constrains the range to exactly one allocation's worth is
      * demanding a specific physical address, not expressing a preference.
@@ -1088,12 +1099,14 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
      */
     if (low && high >= low && (high - low + 1) <= size + 0x1000) {
         xbox_va = XBOX_PHYSICAL_MIRROR_BASE + low;
+        contig_protect(xbox_va, size, 0x04);   /* writable for the zeroing */
 
         /* The console hands out zeroed pages here, and titles rely on it:
          * pool headers and free-list roots are assumed clear, so whatever the
          * backing view happened to contain shows up later as structures that
          * are "allocated" but full of garbage. */
         memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
+        contig_protect(xbox_va, size, prot);
         /* Keep the arena from handing the same pages to someone else. */
         xbox_ContiguousClaim(xbox_va, size);
 
@@ -1115,6 +1128,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
         return;
     }
     xbox_va = xbox_ContiguousAllocEx(size, align, low, high);
+    contig_protect(xbox_va, size, prot);
 
     /* A refusal is the title's problem only if it says who asked: the guest
      * return address and the stack above it (the XDK wrapper's callers). */
