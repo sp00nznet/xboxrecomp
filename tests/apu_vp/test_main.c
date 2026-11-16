@@ -12,6 +12,8 @@
  *   - mono_hrtf_*: a mono 3D voice was filtered into two HRTF channels, but
  *     the bin mixer still selected channels using the one-channel source
  *     format and copied the left result into every bin.
+ *   - ssl_*: a stream voice stayed on an empty segment list for good and
+ *     replayed a list it had played (RECOMP_APU_SSL_ADVANCE).
  *
  * Run with: ctest --test-dir <build> */
 #include "../../src/apu/apu_vp.c"
@@ -257,6 +259,79 @@ static void mono_hrtf_keeps_binaural_channels(void)
     }
 }
 
+/* Stream voice 1: 16-bit mono, persistent, lists A (page 0) and B (page 1)
+ * of one 32-sample segment each. A segment's samples all hold its tag, so
+ * the level tells which segment played. */
+#define SSL_BASE 0x40000u
+static void ssl_segment(unsigned page, unsigned slot, int16_t tag)
+{
+    uint32_t at = DATA_BASE + slot * 0x100u;
+    uint32_t desc[2] = { at, NUM_SAMPLES_PER_FRAME
+                             | (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 16) };
+    for (unsigned i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+        memcpy(s_ram + at + i * 2, &tag, 2);
+    memcpy(s_ram + SSL_BASE + page * 8, desc, sizeof(desc));
+}
+
+static float ssl_frame(MCPXAPUState *d)
+{
+    float samples[NUM_SAMPLES_PER_FRAME][2];
+    memset(samples, 0, sizeof(samples));
+    return voice_get_samples(d, 1, samples, NUM_SAMPLES_PER_FRAME) > 0
+         ? samples[0][0] * 32768.0f : 0.0f;
+}
+
+static void ssl_set(MCPXAPUState *d, int list, unsigned base, unsigned count)
+{
+    d->regs[NV_PAPU_FECV] = 1;
+    fe_method(d, list ? NV1BA0_PIO_SET_VOICE_SSL_B : NV1BA0_PIO_SET_VOICE_SSL_A,
+              (base << 8) | count);
+}
+
+/* What DirectSound does when the packet after list B comes late: B plays
+ * out with A empty, and the next packet goes in B, the list that finished.
+ * The voice must go on to it through the empty A, and must not replay a
+ * list it has played. */
+static void ssl_empty_list_passes_on(void)
+{
+    static MCPXAPUState d;
+
+    memset(s_ram, 0, RAM_SIZE);
+    memset(&d, 0, sizeof(d));
+    d.regs[NV_PAPU_VPVADDR] = VOICE_BASE;
+    d.regs[NV_PAPU_VPSSLADDR] = SSL_BASE;
+    set_voice_reg(1, NV_PAVS_VOICE_CFG_FMT,
+                  NV_PAVS_VOICE_CFG_FMT_DATA_TYPE | NV_PAVS_VOICE_CFG_FMT_PERSIST
+                  | (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28)
+                  | ((uint32_t)NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30));
+    ssl_segment(0, 0, 100);
+    ssl_segment(1, 1, 200);
+    ssl_set(&d, 0, 0, 1);
+    ssl_set(&d, 1, 1, 1);
+
+    s_ssl_advance = 1;
+    CHECK(ssl_frame(&d) == 100.0f, "list A did not play first");
+    CHECK(ssl_frame(&d) == 200.0f, "list B did not play second");
+    CHECK(ssl_frame(&d) == 0.0f, "a played list A was replayed");
+    CHECK(ssl_frame(&d) == 0.0f, "a played list was replayed");
+
+    ssl_segment(2, 2, 300);             /* the late packet, in list B */
+    ssl_set(&d, 1, 2, 1);
+    CHECK(ssl_frame(&d) == 300.0f, "the voice stayed on the empty list A");
+    CHECK(ssl_frame(&d) == 0.0f, "the late packet was replayed");
+
+    /* xemu's rule, kept as the default: on the empty list for good. */
+    memset(&d.vp.ssl, 0, sizeof(d.vp.ssl));
+    s_ssl_advance = 0;
+    ssl_set(&d, 0, 0, 1);
+    ssl_set(&d, 1, 1, 1);
+    ssl_frame(&d); ssl_frame(&d);
+    ssl_set(&d, 0, 0, 0);
+    ssl_set(&d, 1, 2, 1);
+    CHECK(ssl_frame(&d) == 0.0f && ssl_frame(&d) == 0.0f,
+          "default: the voice left the empty list");
+}
+
 int main(void)
 {
     s_ram = (uint8_t *)calloc(1, RAM_SIZE);
@@ -267,6 +342,7 @@ int main(void)
     adpcm_whole_field_fits();
     gain_ramps_across_a_frame();
     mono_hrtf_keeps_binaural_channels();
+    ssl_empty_list_passes_on();
 
     free(s_ram);
     if (s_failures) {
@@ -275,6 +351,7 @@ int main(void)
     }
     puts("PASS: every ADPCM block count the descriptor can name decodes, "
          "VOICE_LOCK waits only for its own voice, and volume "
-         "changes ramp across a frame; mono HRTF keeps both output channels.");
+         "changes ramp across a frame; mono HRTF keeps both output channels; "
+         "a stream voice passes through an empty segment list.");
     return 0;
 }
