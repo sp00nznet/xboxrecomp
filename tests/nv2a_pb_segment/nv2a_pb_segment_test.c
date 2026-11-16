@@ -49,6 +49,7 @@ void xbox_Nv2aAckBusyBits(void) {}
 void nv2a_pb_exec_walk_begin(void) {}
 
 void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va);
+int nv2a_pb_scan_wrap(uint32_t start_va, uint32_t put_va);
 
 static int s_fail;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); s_fail = 1; } } while (0)
@@ -120,6 +121,42 @@ int main(void)
         nv2a_pb_scan_segment(seg, seg + 12);
         CHECK(s_n == n0 + 1);
         CHECK(s_last_method == 0x0104 && s_last_param == 9);
+    }
+
+    /* PUT wraps: the title wrote one method at the last PUT and a JUMP back
+     * to the ring's start, then one method there. The scan runs the first,
+     * follows the JUMP and runs the second. */
+    {
+        const uint32_t ring = WINDOW_END - 0x8000u, last = ring + 0x100u;
+        int n0 = s_n;
+
+        put(last, hdr(1, 0, 0x0304)); put(last + 4, 2);
+        put(last + 8, ring | 1u);                          /* JUMP ring */
+        put(ring, hdr(1, 0, 0x0300)); put(ring + 4, 1);
+        CHECK(nv2a_pb_scan_wrap(last, ring + 8) == 1);
+        CHECK(s_n == n0 + 2);
+        CHECK(s_last_method == 0x0300 && s_last_param == 1);
+    }
+
+    /* PUT moved down with no JUMP before the window's end (a reset, a new
+     * device): nothing runs, and the caller falls back. The method the
+     * look-ahead meets (the CALL target above) is stale. */
+    {
+        int n0 = s_n;
+
+        CHECK(nv2a_pb_scan_wrap(WINDOW_END - 0x40u, WINDOW_END - 0x8000u) == 0);
+        CHECK(s_n == n0);
+    }
+
+    /* A stale JUMP whose target is above PUT is not the wrap: nothing runs. */
+    {
+        const uint32_t ring = WINDOW_END - 0x6000u, last = ring + 0x100u;
+        int n0 = s_n;
+
+        put(last, hdr(1, 0, 0x0308)); put(last + 4, 3);
+        put(last + 8, (ring + 0x200u) | 1u);               /* JUMP past PUT */
+        CHECK(nv2a_pb_scan_wrap(last, ring + 8) == 0);
+        CHECK(s_n == n0);
     }
 
     if (!s_fail)
