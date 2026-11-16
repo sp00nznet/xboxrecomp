@@ -913,6 +913,7 @@ enum {
     XBOX_IRQ_VBLANK,
     XBOX_IRQ_APU,
     XBOX_IRQ_OHCI,
+    XBOX_IRQ_PGRAPH,        /* a software-method trap (RECOMP_PGRAPH_TRAP) */
     XBOX_IRQ_LINES
 };
 /* What xbox_IrqPost tells the device model to do. */
@@ -931,6 +932,9 @@ int     xbox_IrqSafePointsOn(void);
  * calls it on g_esp (a worker stack the caller set up) at the device IRQL. */
 void    xbox_IrqSetHandler(int line, void (*run)(void));
 int     xbox_IrqPost(int line);
+/* PGRAPH has latched a trap (xbox_Nv2aPgraphRaise): call the NV2A ISR from
+ * the timer thread, which has a guest stack. */
+void    xbox_Nv2aRaiseGpuIrq(void);
 void    xbox_IrqSafePoint(void);
 /* The [IRQ] summary line, once per 600 vblanks when anything was posted. */
 void    xbox_IrqReport(void);

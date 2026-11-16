@@ -182,6 +182,16 @@ void xbox_Nv2aFrameCounterFlip(void);
 /* A word of the NV2A register file (offset from the register base); NULL until
  * the aperture is mapped. */
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
+/* Software-method traps (RECOMP_PGRAPH_TRAP=1, Windows only): the pushbuffer
+ * executor latches a NO_OPERATION with a value into PGRAPH's trap registers
+ * and raises the graphics interrupt, as the GPU does, and the title's own
+ * handler runs it. Raise returns 0 when traps are off or the title has not
+ * enabled the interrupt in PGRAPH_INTR_EN; then nothing was latched. WaitAck
+ * blocks until the title acknowledges (PGRAPH_INTR back to 0); past timeout_ms
+ * it clears the trap itself and returns 0. */
+int xbox_Nv2aPgraphTrapOn(void);
+int xbox_Nv2aPgraphRaise(uint32_t trapped_addr, uint32_t data);
+int xbox_Nv2aPgraphWaitAck(uint32_t timeout_ms);
 /* Registered counters the title turned out to move itself (its vblank DPC),
  * which the toolkit has stopped bumping; for the [GPU] report. */
 uint32_t xbox_Nv2aFrameCountersOwned(void);

@@ -42,6 +42,9 @@ int nv2a_pb_scan_in_call(void) { return 0; }
 uint32_t xbox_VblankCount(void) { return 0; }
 uint64_t xbox_HostNowNs(void) { return 0; }
 uint32_t xbox_Nv2aFrameCountersOwned(void) { return 0; }
+/* The software-method trap (RECOMP_PGRAPH_TRAP): never raised here. */
+int xbox_Nv2aPgraphRaise(uint32_t addr, uint32_t data) { (void)addr; (void)data; return 0; }
+int xbox_Nv2aPgraphWaitAck(uint32_t timeout_ms) { (void)timeout_ms; return 1; }
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset) { (void)offset; return NULL; }
 
 /* ---- driving the executor ---------------------------------------------- */
