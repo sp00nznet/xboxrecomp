@@ -3302,8 +3302,11 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
      * are already surface units. The hardware draws such a vertex (xemu
      * clamps w away from zero, in front of the eye), but raster_xf_clipped
      * would count it behind the eye. w = 1 draws it at the same place and
-     * keeps 1/w finite. -0 stays behind the eye and is clipped, as on xemu. */
-    if (out->pos[3] == 0.0f && !signbit(out->pos[3]))
+     * keeps 1/w finite. -0 stays behind the eye and is clipped, as on xemu.
+     * +inf is the reciprocal of a pre-transformed vertex's 0 RHW (2D quads,
+     * movies) and is drawn at w = 1 too; xemu clamps it to 2^64, the same
+     * result when a triangle's corners share one w. */
+    if ((out->pos[3] == 0.0f || isinf(out->pos[3])) && !signbit(out->pos[3]))
         out->pos[3] = 1.0f;
     /* The program's viewport is in logical pixels; the surface may be larger
      * (anti-aliasing). */
