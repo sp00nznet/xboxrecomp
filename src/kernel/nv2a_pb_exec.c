@@ -2544,6 +2544,12 @@ static float fog_factor(float d)
     float f, px = s_gpu.fog_param[0], py = s_gpu.fog_param[1];
     if (!s_gpu.fog_enable)
         return 1.0f;
+    /* An infinite distance -- W fog on a pre-transformed vertex whose RHW is
+     * 0, as 2D quads and movies send -- means no fog in LINEAR and EXP and
+     * full fog in the others (xemu vsh.c). */
+    if (isinf(d))
+        return s_gpu.fog_mode == 0x801 || s_gpu.fog_mode == 0x802
+               || s_gpu.fog_mode == 0x803 ? 0.0f : 1.0f;
     switch (s_gpu.fog_mode) {
     case 0x800: case 0x802:                       /* EXP, EXP_ABS */
         f = px + exp2f(d * py * 16.0f) - 1.5f;

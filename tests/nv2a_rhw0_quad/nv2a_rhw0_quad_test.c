@@ -6,9 +6,12 @@
  * them straight from the vertex (w = +inf in v0.w):
  *
  *   mov o[0], v0          position, w = +inf
+ *   mov o[5], v0.w        fog distance, +inf (the fog cases)
  *   mov o[3], v3          diffuse
  *
- * and the test checks that the quad is drawn, in its diffuse colour.
+ * and the test checks that the quad is drawn, in its diffuse colour, and that
+ * fog left on (titles do, for 2D) treats the infinite distance as the
+ * hardware does: no fog in LINEAR and EXP, full fog in EXP2.
  *
  * No back end is registered, so the executor rasterises into guest memory, a
  * buffer here, addressed by the offsets the title would use. */
@@ -52,16 +55,17 @@ static void putf(uint32_t at, float f) { memcpy(s_mem + at, &f, 4); }
 enum { W = 16, H = 16, SURF = 0x8000, PITCH = W * 4 };
 enum { V = 2 };                                 /* source mux: input */
 #define XYZW 0x1B
+#define WWWW 0xFF
 
 static int s_fail;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); s_fail = 1; } } while (0)
 
-/* mov o[out].xyzw, v[in] */
-static void mov(uint32_t slot, uint32_t out, uint32_t in, int final)
+/* mov o[out].xyzw, v[in].swz */
+static void mov(uint32_t slot, uint32_t out, uint32_t in, uint32_t swz, int final)
 {
     uint32_t w[4] = {0};
     w[1] = (1u << 21) | (in << 9);              /* MAC mov, input index */
-    w[1] |= XYZW;
+    w[1] |= swz;
     w[2] = (uint32_t)V << 26;                   /* A: input */
     w[3] = (0xFu << 12) | (1u << 11) | (out << 3) | (final ? 1u : 0u);
     nv2a_vsh_set_instruction(slot, w);
@@ -103,12 +107,30 @@ int main(void)
     m(0x1720, 0x2000); m(0x1760, 2 | (4 << 4) | (16 << 8));      /* v0: float4 */
     m(0x172C, 0x3000); m(0x176C, 0 | (4 << 4) | (4 << 8));       /* v3: D3DCOLOR */
 
-    mov(0, 0, 0, 0);                            /* oPos = v0 */
-    mov(1, 3, 3, 1);                            /* oD0 = v3, final */
+    mov(0, 0, 0, XYZW, 0);                      /* oPos = v0 */
+    mov(1, 3, 3, XYZW, 1);                      /* oD0 = v3, final */
     m(0x1E94, 2);                               /* TRANSFORM_EXECUTION_MODE: program */
 
     /* w = +inf is drawn, as w = 0 is: the quad covers the surface. */
     CHECK(draw_quad() == 0x0000FFu);
+
+    /* Fog on, with D3D's final combiner: mix(fog colour, diffuse, fog.a).
+     * Green fog, so a fogged pixel is green and an unfogged one blue. */
+    mov(1, 5, 0, WWWW, 0);                      /* oFog = v0.w = +inf */
+    mov(2, 3, 3, XYZW, 1);                      /* oD0 = v3, final */
+    m(0x1E60, 0);                               /* COMBINER_CONTROL: no stages */
+    m(0x0288, 0x13040300u);                     /* final: A fog.a, B v0, C fog, D 0 */
+    m(0x028C, 0);
+    m(0x02A8, 0x0000FF00u);                     /* SET_FOG_COLOR: green */
+    mf(0x09C0, 2.0f); mf(0x09C4, -0.01f);       /* SET_FOG_PARAMS */
+    m(0x02A4, 1);                               /* SET_FOG_ENABLE */
+
+    m(0x029C, 0x2601);                          /* LINEAR: no fog */
+    CHECK(draw_quad() == 0x0000FFu);
+    m(0x029C, 0x800);                           /* EXP: no fog */
+    CHECK(draw_quad() == 0x0000FFu);
+    m(0x029C, 0x801);                           /* EXP2: full fog */
+    CHECK(draw_quad() == 0x00FF00u);
 
     if (!s_fail)
         printf("nv2a RHW-0 quad: ok\n");
