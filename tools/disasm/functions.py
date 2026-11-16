@@ -79,6 +79,8 @@ class FunctionDetector:
 
         # Candidate function starts: address -> (confidence, method)
         self._candidates: Dict[int, Tuple[float, str]] = {}
+        # Never function starts ("not_function" seed entries).
+        self.not_functions: Set[int] = set()
 
         # Final function list
         self.functions: Dict[int, Function] = {}
@@ -609,6 +611,8 @@ class FunctionDetector:
 
     def _add_candidate(self, addr: int, confidence: float, method: str) -> None:
         """Add a function start candidate, keeping highest confidence."""
+        if addr in self.not_functions:
+            return
         existing = self._candidates.get(addr)
         if existing is None or confidence > existing[0]:
             self._candidates[addr] = (confidence, method)

@@ -105,11 +105,14 @@ def main():
         extra = [s.strip() for s in args.extra_sections.split(",")] if args.extra_sections else []
         seed_funcs = []
         observed = set()
+        not_functions = set()
         for _seed_path in (args.seed_functions or []):
-            _got = _load_seed_functions(_seed_path, observed)
+            _before = len(not_functions)
+            _got = _load_seed_functions(_seed_path, observed, not_functions)
             seed_funcs.extend(_got)
             if args.verbose:
-                print(f"  Seed file {_seed_path}: {len(_got)} addresses")
+                print(f"  Seed file {_seed_path}: {len(_got)} addresses, "
+                      f"{len(not_functions) - _before} not-function")
         seed_funcs = sorted(set(seed_funcs))
         disassembler = Disassembler(
             xbe_path=args.xbe_path,
@@ -122,6 +125,7 @@ def main():
             extra_sections=extra,
             seed_functions=seed_funcs,
             observed_seeds=observed,
+            not_functions=not_functions,
             skip_library_immediates=args.skip_library_immediates,
         )
         success = disassembler.run()
@@ -143,19 +147,26 @@ def main():
         sys.exit(2)
 
 
-def _load_seed_functions(path, observed=None):
+def _load_seed_functions(path, observed=None, not_functions=None):
     """Load seed function addresses from a JSON file.
 
     Entries marked "observed" (tools.seed_from_log writes them: a run
     actually called or started a thread there) are also added to `observed`.
     Entries written by seed_from_log before it set the field say so in their
     note, and count too.
+
+    Entries marked "not_function": true go into `not_functions` instead:
+    addresses never to accept as a function start.
     """
     import json
     with open(path) as f:
         data = json.load(f)
     addrs = []
     for entry in data:
+        if isinstance(entry, dict) and "start" in entry and entry.get("not_function"):
+            if not_functions is not None:
+                not_functions.add(int(entry["start"], 16))
+            continue
         if isinstance(entry, dict) and "start" in entry:
             addr = int(entry["start"], 16)
             addrs.append(addr)
