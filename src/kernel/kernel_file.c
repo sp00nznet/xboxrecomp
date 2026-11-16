@@ -403,11 +403,16 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         if (cache_volume && h != INVALID_HANDLE_VALUE)
             cache_vol_mark(h);
     } else {
-        if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
+        DWORD access = xbox_access_to_win32(DesiredAccess);
+        /* Read-only opens go through the host cache even when the title asks
+         * for no buffering: reads are synchronous here, and a title that holds
+         * a lock across an async stream read otherwise waits out every disk
+         * stall; read-ahead hides most of them. Writers keep no buffering. */
+        if ((CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
+            && (access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA)))
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
-        DWORD access = xbox_access_to_win32(DesiredAccess);
         WIN32_FILE_ATTRIBUTE_DATA fad;
         /* An overwrite of an existing non-empty file is deferred (see
          * s_overwrite_pending). It needs write access to settle later. */
