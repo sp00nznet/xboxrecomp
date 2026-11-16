@@ -142,7 +142,8 @@ See the [APU](../../src/apu/README.md) and [DirectSound](../../src/audio/README.
 
 | Variable | Default | What it does | Where |
 |---|---|---|---|
-| `RECOMP_APU_TRACE` | off | Voice statistics and host playback accounting. | `apu_core.c`, `apu_vp.c`, `apu_mmio_hook.c` |
+| `RECOMP_APU_TRACE` | off | Voice statistics and host playback accounting, written by a logger thread so the audio never waits on stderr. | `apu_core.c`, `apu_vp.c` |
+| `RECOMP_APU_TRACE_REGS` | off | A line for every APU register access. Thousands a second: slows the title's audio interrupt. | `apu_core.c`, `apu_mmio_hook.c` |
 | `RECOMP_AUDIO_HOST` | off | Host playback accounting without the rest of the trace. | `apu_core.c` |
 | `RECOMP_APU_RING` | off | Ring monitor: finds a streaming writer that falls behind the play cursor. | `apu_vp.c` |
 | `RECOMP_APU_SOLO=<voice>` | off | Mutes every other voice, to find where a sound comes from. | `apu_core.c` |

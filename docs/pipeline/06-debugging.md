@@ -390,12 +390,23 @@ them off.
   with `pending_ms` (not yet reported), `refused=` (submits the backend
   turned away: in the WAV, never played, each also logged), and front-end
   trap spells over 20 ms.
-- `RECOMP_APU_TRACE=1` (which also prints the first register accesses)
-  adds the host lines above, `[APU-VSTAT]` once a second for each voice
+- `RECOMP_APU_TRACE=1` adds the host lines above, `[APU-VSTAT]` once a
+  second for each voice
   that played (format, source address and how it resolved, envelope,
   volumes, RMS and zero-crossing rate: about 0.5 is white noise, music sits
   near 0.1-0.2), `[APU] voice N pos=` every 60 frames, and `[APU-IRQ]`
   every 5 s (front-end traps, VP frames, trapped frames, underruns).
+  These lines and the host lines are formatted on the audio threads into a
+  buffer that a logger thread writes every 50 ms. They appear up to 50 ms
+  late against other stderr lines, and a slow reader (a PowerShell `2>`
+  pipe) loses lines, counted in `[APU] trace: N lines dropped`, instead of
+  stalling the audio. The last 50 ms of lines before a crash or exit are
+  lost.
+- `RECOMP_APU_TRACE_REGS=1` prints every access to the APU's own registers
+  and, on Windows, the first 400 the title makes anywhere in the APU
+  (`[APUMMIO]`). It is thousands
+  of lines a second and slows the title's audio interrupt even buffered:
+  use it to find what a title waits on, not while listening.
 - `RECOMP_APU_SOLO=<voice>` mixes only that voice.
   `RECOMP_APU_VOICE_DUMP=<voice>|all` writes a voice's fetched samples as
   raw s16 stereo to `RECOMP_APU_VOICE_DUMP_FILE` (default `voice_dump.raw`;

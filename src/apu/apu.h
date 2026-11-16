@@ -31,6 +31,18 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
  * set, non-empty and not starting with '0'. */
 int apu_env_on(const char *name);
 
+/* Trace lines that must not slow the audio (RECOMP_APU_TRACE and the like).
+ * The caller formats the line into a buffer, and a logger thread writes it
+ * to stderr every 50 ms, so the caller never waits on stderr, which may be a
+ * pipe its reader drains slowly. Lines appear up to 50 ms late. When the
+ * buffer is full they are dropped, and the drop is counted. */
+void apu_trace(const char *fmt, ...);
+
+/* RECOMP_APU_TRACE_REGS: a line for every APU register access. Off under
+ * RECOMP_APU_TRACE: it is thousands of lines a second and, even buffered,
+ * slows the title's audio interrupt. */
+int apu_trace_regs_on(void);
+
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);
