@@ -4464,9 +4464,12 @@ int xbox_PhysRamNamedAt(uint32_t pa)
  * named va + the RAM size, which is where the first mirror shows the same
  * bytes; the console's memory controller wraps such an address back onto the
  * page too. The window keeps every number below 64 MB to itself, and each
- * device reads the right copy without a guess: the APU wraps the alias
- * (mcpx_apu_phys), and the NV2A executor and the OHCI, finding it above the
- * window's high-water mark, read it as a guest address in the mirror. With no
+ * device reads the right copy without a guess: the APU and the OHCI wrap the
+ * alias (mcpx_apu_phys, bus_resolve), and the NV2A executor, finding it above
+ * the window's high-water mark, reads it as a guest address in the mirror. The
+ * OHCI cannot read it there: its bounds check admits RAM only below the mapped
+ * size, so without the wrap XAPI's pad report buffer (a heap block) got no
+ * reports and Splinter Cell's pad was dead from the first menu. With no
  * first mirror (a map too large for one) or RECOMP_PHYS_RAM_ALIAS=0 the name
  * is the identity and the record above decides, as before. */
 uint32_t xbox_PhysRamAlias(void)
