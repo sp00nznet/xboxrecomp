@@ -148,7 +148,7 @@ See the [APU](../../src/apu/README.md) and [DirectSound](../../src/audio/README.
 | `RECOMP_APU_HRTF` | on | `0` turns HRTF for 3D voices off. | `apu_vp.c` |
 | `RECOMP_APU_MIXDOWN_ALL` | on | `0` limits the mixdown. | `apu_dsp.c` |
 | `RECOMP_APU_DSP_ACK` | auto | DSP doorbell acknowledgement: `auto` derives it, `0`/`off` disables, or a list of addresses. | `apu_dsp.c` |
-| `RECOMP_AUDIO_BUF_COUNT`, `RECOMP_AUDIO_BUF_SAMPLES` | built-in | Device buffer count and size. | `apu_sdl2.c`, `apu_xaudio2.c` |
+| `RECOMP_AUDIO_BUF_COUNT`, `RECOMP_AUDIO_BUF_SAMPLES` | 6 x 512 (XAudio2), 4 x 512 (SDL2) | Device buffer count (2-8) and size in samples (128-4096). | `apu_sdl2.c`, `apu_xaudio2.c` |
 
 ## Input
 
