@@ -956,9 +956,7 @@ static void clear_surface(uint32_t param)
         uint32_t sh = 1u << ((s_gpu.format >> 24) & 0xF);
         uint32_t x0 = s_gpu.clip_x, x1 = s_gpu.clip_x + s_gpu.clip_w;
         uint32_t y0 = s_gpu.clip_y, y1 = s_gpu.clip_y + s_gpu.clip_h;
-        uint16_t v16 = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
-                                | ((s_gpu.clear_color >> 5) & 0x07E0)
-                                | ((s_gpu.clear_color >> 3) & 0x001F));
+        uint16_t v16 = (uint16_t)s_gpu.clear_color;   /* packed R5G6B5 (see below) */
         if ((s_gpu.clear_rect_set & 3) == 3) {
             x0 = s_gpu.clear_rect_h & 0xFFFF; x1 = (s_gpu.clear_rect_h >> 16) + 1;
             y0 = s_gpu.clear_rect_v & 0xFFFF; y1 = (s_gpu.clear_rect_v >> 16) + 1;
@@ -982,11 +980,11 @@ static void clear_surface(uint32_t param)
             for (x = 0; x < s_gpu.clip_w; x++)
                 p[x] = s_gpu.clear_color;
         } else if (bpp == 2) {
-            /* The clear value is always given as A8R8G8B8; a 16-bit surface
-             * takes the same colour reduced to 5:6:5. */
-            uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
-                                  | ((s_gpu.clear_color >> 5) & 0x07E0)
-                                  | ((s_gpu.clear_color >> 3) & 0x001F));
+            /* The clear value is in the surface's own format: a 16-bit
+             * surface gets it packed as R5G6B5 (Raw 2 clears its ring-mat
+             * light map with 0x0000FFFF = white; reduced from A8R8G8B8 it
+             * was cyan). */
+            uint16_t v = (uint16_t)s_gpu.clear_color;
             uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
             for (x = 0; x < s_gpu.clip_w; x++)
                 p[x] = v;

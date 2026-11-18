@@ -1511,8 +1511,17 @@ static void hw_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
     }
     if (flags & 0xF0u) {
         HwSurf *t = surface_for(&ns, (flags & 0xF0u) != 0xF0u);   /* a full colour clear needs no load */
-        const float c[4] = { (float)((argb >> 16) & 0xFF) / 255.0f, (float)((argb >> 8) & 0xFF) / 255.0f,
-                             (float)(argb & 0xFF) / 255.0f, (float)((argb >> 24) & 0xFF) / 255.0f };
+        float c[4] = { (float)((argb >> 16) & 0xFF) / 255.0f, (float)((argb >> 8) & 0xFF) / 255.0f,
+                       (float)(argb & 0xFF) / 255.0f, (float)((argb >> 24) & 0xFF) / 255.0f };
+        /* SET_COLOR_CLEAR_VALUE is in the surface's own format: a 16-bit
+         * surface gets a packed R5G6B5 value. Raw 2 clears its ring-mat light
+         * map with 0x0000FFFF (white); read as A8R8G8B8 it was cyan. */
+        if (s->bytes_per_pixel == 2) {
+            c[0] = (float)((argb >> 11) & 0x1F) / 31.0f;
+            c[1] = (float)((argb >> 5) & 0x3F) / 63.0f;
+            c[2] = (float)(argb & 0x1F) / 31.0f;
+            c[3] = 1.0f;
+        }
         if (!t)
             return;
         ID3D11DeviceContext_ClearRenderTargetView(g.ctx, t->rtv, c);
