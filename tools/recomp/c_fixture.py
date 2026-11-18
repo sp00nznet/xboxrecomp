@@ -14,6 +14,17 @@ def is_msvc(cc):
     return Path(cc).stem.lower() == 'cl'
 
 
+def _is_link_flag(flag):
+    """Flags GNU ld only honours after the objects that need them.
+
+    `-lm` before the source is dropped under --as-needed (Debian/Ubuntu's
+    default): the linker has not yet seen a reference to floor, so libm is
+    skipped and the later undefined reference fails the link.
+    """
+    return (flag.startswith('-l') or flag.startswith('-L')
+            or flag.startswith('-Wl,'))
+
+
 def command(cc, sources, output, *, include_dirs=(), defines=(),
             compile_only=False, gnu_flags=()):
     """Build/link or compile only, preserving GNU-specific checks on GNU tools."""
@@ -27,7 +38,11 @@ def command(cc, sources, output, *, include_dirs=(), defines=(),
                  *('/D' + str(d) for d in defines), *sources]
                 + (['/c', '/Fo:' + str(output)] if compile_only
                    else ['/Fe:' + str(output)]))
-    return ([cc, '-w', '-O2', *gnu_flags,
+    compile_flags = [f for f in gnu_flags if not _is_link_flag(f)]
+    link_flags = ([] if compile_only
+                  else [f for f in gnu_flags if _is_link_flag(f)])
+    return ([cc, '-w', '-O2', *compile_flags,
              *(arg for p in include_dirs for arg in ('-I', str(p))),
              *('-D' + str(d) for d in defines), *sources,
-             *(['-c'] if compile_only else []), '-o', str(output)])
+             *(['-c'] if compile_only else []), '-o', str(output),
+             *link_flags])
