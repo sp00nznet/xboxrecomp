@@ -70,7 +70,9 @@ static ULONG s_utility_sectors_per_cluster = XBOX_SECTORS_PER_CLUSTER;
  * file needs no guest memory of its own. Until then, 16 KB. */
 void xbox_file_set_init_flags(uint32_t init_flags)
 {
-    s_utility_sectors_per_cluster = XBOX_SECTORS_PER_CLUSTER << (init_flags >> 30);
+    /* 0..2 name 16, 32 and 64 KB; 3 names nothing, so it gets the largest. */
+    uint32_t shift = init_flags >> 30;
+    s_utility_sectors_per_cluster = XBOX_SECTORS_PER_CLUSTER << (shift > 2 ? 2 : shift);
 }
 
 static ULONG xbox_utility_sectors_per_cluster(void)
