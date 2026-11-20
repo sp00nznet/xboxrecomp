@@ -4247,9 +4247,15 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
     }
     contig_unlock();
 
-    if (result)
+    /* Freed pages keep any protection the title gave them (MmSetAddressProtect):
+     * make them writable before zeroing. Callers then apply what they asked for. */
+    if (result) {
+        DWORD old;
+        VirtualProtect((void *)((uintptr_t)result + g_memory_offset),
+                       (size_t)n * CONTIG_PAGE, PAGE_READWRITE, &old);
         memset((void *)((uintptr_t)result + g_memory_offset), 0,
                (size_t)n * CONTIG_PAGE);
+    }
     return result;
 }
 

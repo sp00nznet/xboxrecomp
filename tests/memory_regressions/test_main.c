@@ -38,6 +38,9 @@
  *      unconstrained requests have filled up to it -- XDK D3D's visibility
  *      test report pages ask for exactly that, and a bump pointer refused
  *      every one -- and a request for a range above the pointer lands in it.
+ *   9. (default too) Contiguous pages a title made read-only (MmSetAddressProtect)
+ *      and freed come back writable and zeroed, reused by the allocator or
+ *      asked for by physical range. Zeroing them faulted.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
@@ -66,11 +69,14 @@ extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
-enum { S_ALLOC, S_FREE, S_QUERY, N_SLOTS };
+enum { S_ALLOC, S_FREE, S_QUERY, S_CALLOC, S_CFREE, S_PROTECT, N_SLOTS };
 static const uint32_t ORD[N_SLOTS] = {
     184,   /* NtAllocateVirtualMemory */
     199,   /* NtFreeVirtualMemory */
     217,   /* NtQueryVirtualMemory */
+    166,   /* MmAllocateContiguousMemoryEx */
+    171,   /* MmFreeContiguousMemory */
+    182,   /* MmSetAddressProtect */
 };
 
 static uint32_t scratch;                 /* guest VA of a 64 KB block */
@@ -156,6 +162,22 @@ static uint32_t nt_query(uint32_t base, uint32_t mbi[7])
     for (i = 0; i < 7; i++)
         mbi[i] = *G(OUT_VA + 0x100 + 4 * i);
     return st;
+}
+
+/* MmAllocateContiguousMemoryEx(size, low, high, align, PAGE_READWRITE). */
+static uint32_t mm_contig_alloc(uint32_t size, uint32_t low, uint32_t high)
+{
+    uint32_t args[5] = { size, low, high, 4096, 0x04 };
+    return call(S_CALLOC, 5, args);
+}
+
+/* MmSetAddressProtect(va, size, PAGE_READONLY), then MmFreeContiguousMemory(va). */
+static void mm_contig_protect_and_free(uint32_t va, uint32_t size)
+{
+    uint32_t args[3] = { va, size, 0x02 };
+    call(S_PROTECT, 3, args);
+    args[0] = va;
+    call(S_CFREE, 1, args);
 }
 
 static unsigned char *load_file(const char *path, size_t *len)
@@ -402,6 +424,37 @@ int main(int argc, char **argv)
             check(c1 && c2 == c1, "a freed contiguous block is reused", d2);
         } else {
             check(c1 && c2 != c1, "default: contiguous memory is never reused", d);
+        }
+    }
+
+    /* 9. A title that marks its contiguous block read-only and frees it gets
+     * the pages back writable and zeroed, by the allocator (reclaim reuses the
+     * block) and by a request pinned to the same physical range. Both faulted
+     * zeroing the read-only pages. */
+    if (!ext) {
+        const uint32_t size = 0x2000;
+        uint32_t c1 = mm_contig_alloc(size, 0, 0xFFFFFFFFu), c2, c3;
+
+        *G(c1) = 0x11111111u;
+        mm_contig_protect_and_free(c1, size);
+        c2 = mm_contig_alloc(size, 0, 0xFFFFFFFFu);
+        if (reclaim) {
+            snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", c2, c1);
+            check(c1 && c2 == c1, "a read-only freed block is reused", d);
+        }
+        if (c2) {
+            check(*G(c2) == 0 && *G(c2 + size - 4) == 0, "it comes back zeroed", NULL);
+            *G(c2 + size - 4) = 0x22222222u;
+            check(*G(c2 + size - 4) == 0x22222222u, "and writable", NULL);
+        }
+
+        mm_contig_protect_and_free(c2, size);
+        c3 = mm_contig_alloc(size, c2 - XBOX_CONTIG_BASE, c2 - XBOX_CONTIG_BASE + size - 1);
+        snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", c3, c2);
+        check(c3 == c2, "a request pinned to its physical range gets it", d);
+        if (c3 == c2) {
+            *G(c3) = 0x33333333u;
+            check(*G(c3) == 0x33333333u && *G(c3 + 4) == 0, "pinned: zeroed and writable", NULL);
         }
     }
 
