@@ -2787,6 +2787,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         memcpy(XBOX_VA(XBOX_BASE_ADDRESS), xbe, header_size);
         fprintf(stderr, "  XBE header: %u bytes at %p (Xbox VA 0x%08X)\n",
                 header_size, XBOX_VA(XBOX_BASE_ADDRESS), XBOX_BASE_ADDRESS);
+        /* The utility drive's cluster size lives in the init flags; the
+         * file layer reports it for the cache partitions. */
+        if (xbe_size >= 0x128)
+            xbox_file_set_init_flags(*(const DWORD *)(xbe + 0x0124));
     }
 
     /*
