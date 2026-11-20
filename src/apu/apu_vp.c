@@ -115,13 +115,25 @@ static uint32_t voice_get_mask(MCPXAPUState *d, uint16_t voice_handle,
            ctz32(mask);
 }
 
+/* Atomic per field. The frame thread writes a voice's envelope phase and
+ * count while the title's methods (VOICE_OFF, PAUSE, RELEASE) arrive on its
+ * own thread and write other fields of the same words. A plain read-modify-
+ * write lost one of the two: a VOICE_OFF landing between the frame thread's
+ * read and write of PAR_STATE came back active, so the voice played its
+ * sample out before it went idle, and DirectSound's StopEx, which waits for
+ * the idle-voice trap, waited with it (Burnout 3: 79-929 ms, about once in
+ * 5000 stops, the game frozen meanwhile). */
 static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
                            hwaddr offset, uint32_t mask, uint32_t val)
 {
     hwaddr voice = d->regs[NV_PAPU_VPVADDR] + voice_handle * NV_PAVS_SIZE;
-    uint32_t v = ldl_le_phys(address_space_memory, voice + offset) & ~mask;
-    stl_le_phys(address_space_memory, voice + offset,
-                v | ((val << ctz32(mask)) & mask));
+    volatile LONG *p = (volatile LONG *)mcpx_apu_phys(voice + offset);
+    LONG old, upd;
+
+    do {
+        old = *p;
+        upd = (LONG)(((uint32_t)old & ~mask) | ((val << ctz32(mask)) & mask));
+    } while (InterlockedCompareExchange(p, upd, old) != old);
 }
 
 /* ============================================================
