@@ -17,6 +17,12 @@
  *   2. Freeing three neighbours in an awkward order merges all three. Merging
  *      left an empty slot behind that later frees did not step over, so the
  *      third block never joined the other two.
+ *   2b. A live block before a run of merged frees is still found by address.
+ *      A merge zeroed the emptied slot's address, which broke the binary
+ *      search, so naming the block (MmGetPhysicalAddress) was lost.
+ *   2c. A block carved from the front of a merged run is found by address in
+ *      its second half. The empty slots after the reused one kept addresses
+ *      from inside the carved block, so lookups there found the free remainder.
  *   3. NtFreeVirtualMemory(MEM_RELEASE) on memory NtAllocateVirtualMemory took
  *      from the heap gives it back. It handed the 32-bit guest slot to the host
  *      VirtualFree as a pointer, which failed, so none of it ever returned.
@@ -285,6 +291,58 @@ int main(int argc, char **argv)
         snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", m, x);
         check(y == x + 64 && z == y + 64 && m == x,
               "three freed neighbours merge into one 192-byte block", d);
+    }
+
+    /* 2b. A run of merges after a live block leaves empty slots that must
+     * keep their addresses, or lookups by address miss the block. */
+    if (reclaim) {
+        enum { RUN = 256 };
+        uint32_t t = xbox_HeapAlloc(64, 16), run[RUN], guard;
+        int k;
+
+        for (k = 0; k < RUN; k++)
+            run[k] = xbox_HeapAlloc(64, 16);
+        guard = xbox_HeapAlloc(64, 16);
+        (void)guard;
+        for (k = 0; k < RUN; k++)
+            xbox_HeapFree(run[k]);           /* each merges into run[0] */
+        xbox_PhysNoteRamName(t);
+        snprintf(d, sizeof d, "block 0x%08X, run 0x%08X..", t, run[0]);
+        check(xbox_PhysRamNamedAt(t),
+              "a named block before 255 merged-away slots stays named", d);
+    }
+
+    /* 2c. Carving the front of a merged run reuses the slot after it for the
+     * free remainder; the empty slots further on must not stay below that
+     * remainder's address, or lookups in the carved block find the remainder.
+     * Pieces that land in holes earlier cases left stay allocated, filling
+     * them, until RUN pieces in a row sit back to back: every free block
+     * before the run is then too small for TAKE, so the carve takes its front. */
+    if (reclaim) {
+        enum { RUN = 512, PIECE = 64, TAKE = RUN * PIECE * 3 / 4 };
+        uint32_t run[RUN], big, tail;
+        int k = 0, tries;
+
+        for (tries = 0; k < RUN && tries < 64 * RUN; tries++) {
+            uint32_t p = xbox_HeapAlloc(PIECE, 16);
+            if (k && p != run[k - 1] + PIECE)
+                k = 0;
+            run[k++] = p;
+        }
+        snprintf(d, sizeof d, "%d in a row after %d", k, tries);
+        check(k == RUN, "a run of pieces back to back", d);
+        if (k == RUN) {
+            for (k = 0; k < RUN; k++)
+                xbox_HeapFree(run[k]);       /* each merges into run[0] */
+            big = xbox_HeapAlloc(TAKE, 16);
+            snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", big, run[0]);
+            check(big == run[0], "a large request carves the merged run's front", d);
+            tail = big + TAKE - PIECE;
+            xbox_PhysNoteRamName(tail);
+            snprintf(d, sizeof d, "block 0x%08X+0x%X, looked up 0x%08X", big, TAKE, tail);
+            check(xbox_PhysRamNamedAt(tail),
+                  "the carved block's second half is found by address", d);
+        }
     }
 
     /* 3. Releasing NtAllocateVirtualMemory memory returns it. */
