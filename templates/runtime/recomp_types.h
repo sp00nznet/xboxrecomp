@@ -946,6 +946,8 @@ RECOMP_XMM_BITWISE(XMM_OR,   a.u[i] | b.u[i])
 RECOMP_XMM_BITWISE(XMM_XOR,  a.u[i] ^ b.u[i])
 /* ANDNPS is ~dst & src, not dst & ~src. */
 RECOMP_XMM_BITWISE(XMM_ANDN, (~a.u[i]) & b.u[i])
+/* PCMPGTD: signed dword greater-than, dst = (dst > src). */
+RECOMP_XMM_BITWISE(XMM_PCMPGTD, ((int32_t)a.u[i] > (int32_t)b.u[i]) ? 0xFFFFFFFFu : 0u)
 
 /* Compares produce an all-ones or all-zero mask per lane. EQ/LT/LE are
  * the ordered forms (false when either lane is NaN); NEQ is the
