@@ -1889,6 +1889,8 @@ class FunctionTranslator:
                 cc = m[3:]
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
+            elif m.startswith("fcmov") and len(m) > 5:
+                cc = m[5:]
             elif m in ("pushfd", "lahf"):
                 # Both copy CF out of the tracked setter, through _cf when
                 # that setter keeps its carry there.
