@@ -129,7 +129,7 @@ def main():
     output_dir = args.output_dir or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "output")
     output_path = args.output or os.path.join(output_dir, "abi_functions.json")
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
