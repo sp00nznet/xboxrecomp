@@ -1,8 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
 project(idex_channel_regression LANGUAGES C)
-if(NOT WIN32)
-    message(FATAL_ERROR "This regression harness currently targets Windows.")
-endif()
 add_subdirectory(../.. xboxrecomp)
 add_executable(idex-channel-test idex_channel_test.c)
 target_include_directories(idex-channel-test PRIVATE ../../src/kernel)

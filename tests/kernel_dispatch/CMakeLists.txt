@@ -1,8 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_dispatch_regression LANGUAGES C)
-if(NOT WIN32)
-    message(FATAL_ERROR "This regression harness currently targets Windows.")
-endif()
 add_subdirectory(../.. xboxrecomp)
 add_executable(kernel-dispatch-thread-test kernel_dispatch_thread_test.c)
 target_include_directories(kernel-dispatch-thread-test PRIVATE ../../src/kernel)
