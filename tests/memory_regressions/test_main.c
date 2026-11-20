@@ -41,6 +41,8 @@
  *   9. (default too) Contiguous pages a title made read-only (MmSetAddressProtect)
  *      and freed come back writable and zeroed, reused by the allocator or
  *      asked for by physical range. Zeroing them faulted.
+ *  10. (default too) NtAllocateVirtualMemory with no base returns a 64 KB-
+ *      aligned address, as on the console. It returned page-aligned ones.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
@@ -492,6 +494,19 @@ int main(int argc, char **argv)
             snprintf(d, sizeof d, "got 0x%08X", again);
             check(again == 0, "a partly overlapped claim keeps its free pages", d);
         }
+    }
+
+    /* 8. Kernel-chosen virtual memory is 64 KB-aligned. A page-sized block
+     * first, so the next request would land on a page boundary. */
+    if (!ext) {
+        uint32_t b1 = 0, b2 = 0, b3 = 0;
+
+        nt_alloc(0x1000, &b1);
+        nt_alloc(0x3000, &b2);
+        nt_alloc(0x11000, &b3);
+        snprintf(d, sizeof d, "got 0x%08X, 0x%08X, 0x%08X", b1, b2, b3);
+        check(b1 && b2 && b3 && !(b1 & 0xFFFF) && !(b2 & 0xFFFF) && !(b3 & 0xFFFF),
+              "NtAllocateVirtualMemory addresses are 64 KB-aligned", d);
     }
 
     /* 4. Above the RAM mirrors: [0x74000000, 0x7FFE0000) at 64 MB. */
