@@ -14,6 +14,8 @@
  *     format and copied the left result into every bin.
  *   - voice_fields_*: voice_set_mask was a plain read-modify-write, so the
  *     frame thread's envelope write could put back a VOICE_OFF's active bit.
+ *   - idle_traps_*: each frame trapped on the first idle voice in the list,
+ *     so one the title left listed hid every idle voice behind it.
  *
  * Run with: ctest --test-dir <build> */
 #include "../../src/apu/apu_vp.c"
@@ -301,6 +303,41 @@ static void voice_fields_survive_concurrent_writes(void)
           lo, hi, FIELD_RACE_N & 0xFFFF);
 }
 
+/* Two idle voices left listed (0xF2 then 0xF4, as DirectSound leaves a
+ * stopped two-voice stream until its last voice's notice): the front end
+ * traps on one per frame, and the ISR resumes it between frames. Each must
+ * get its turn; starting from the list head every frame, 0xF4 never did. */
+static void idle_traps_take_turns(void)
+{
+    static MCPXAPUState d;
+    static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    static const uint16_t expect[4] = { 0xF2, 0xF4, 0xF2, 0xF4 };
+
+    memset(s_ram, 0, RAM_SIZE);
+    memset(&d, 0, sizeof(d));
+    d.regs[NV_PAPU_VPVADDR] = VOICE_BASE;
+    d.regs[NV_PAPU_FETFORCE1] = NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE;
+    d.regs[NV_PAPU_TVL2D] = 0xF2;
+    d.regs[NV_PAPU_TVL3D] = 0xFFFF;
+    d.regs[NV_PAPU_TVLMP] = 0xFFFF;
+    d.vp.idle_trap_last = 0xFFFF;
+    voice_set_mask(&d, 0xF2, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                   NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE, 0xF4);
+    voice_set_mask(&d, 0xF4, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                   NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE, 0xFFFF);
+
+    for (int f = 0; f < 4; f++) {
+        mcpx_apu_vp_frame(&d, mixbins);
+        CHECK((d.regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                  == NV_PAPU_FECTL_FEMETHMODE_TRAPPED,
+              "frame %d raised no idle-voice trap", f);
+        CHECK(d.regs[NV_PAPU_FEDECPARAM] == expect[f],
+              "frame %d trapped on voice 0x%X, expected 0x%X",
+              f, d.regs[NV_PAPU_FEDECPARAM], expect[f]);
+        d.regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FEMETHMODE;   /* the ISR resumes */
+    }
+}
+
 int main(void)
 {
     s_ram = (uint8_t *)calloc(1, RAM_SIZE);
@@ -312,6 +349,7 @@ int main(void)
     gain_ramps_across_a_frame();
     mono_hrtf_keeps_binaural_channels();
     voice_fields_survive_concurrent_writes();
+    idle_traps_take_turns();
 
     free(s_ram);
     if (s_failures) {
@@ -321,6 +359,7 @@ int main(void)
     puts("PASS: every ADPCM block count the descriptor can name decodes, "
          "VOICE_LOCK waits only for its own voice, and volume "
          "changes ramp across a frame; mono HRTF keeps both output channels; "
-         "voice fields survive concurrent writes.");
+         "voice fields survive concurrent writes; "
+         "idle-voice traps take turns.");
     return 0;
 }
