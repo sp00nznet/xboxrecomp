@@ -139,6 +139,22 @@ def test_non_xdvdfs_fails_loudly():
             raise AssertionError("expected XisoError")
 
 
+def test_unpack_refuses_names_that_escape_the_output_dir():
+    # Names come from the disc, so an entry like '../x' must not write outside
+    # the output directory. Checked on every host: '../' escapes everywhere.
+    from tools.xiso.__main__ import main as xiso_main
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write(tmp, _build_image(files=(
+            ("default.xbe", b"XBEH"), ("../escape.bin", b"X"),
+            ("a\\..\\b.bin", b"Y"))))
+        out = os.path.join(tmp, "out")
+        assert xiso_main(["unpack", p, "-o", out]) == 0
+        with open(os.path.join(out, "default.xbe"), "rb") as f:
+            assert f.read() == b"XBEH"
+        assert not os.path.exists(os.path.join(tmp, "escape.bin"))
+        assert not os.path.exists(os.path.join(tmp, "b.bin"))
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

@@ -39,11 +39,24 @@ def cmd_get(args):
     return 0
 
 
+def _safe_component(name):
+    """A disc-supplied name that can be a single path component under the output.
+
+    The names come from the image, not from the user, so a crafted entry such as
+    '../x' or 'a\\b' would otherwise escape the output directory on extraction.
+    """
+    return name not in ("", ".", "..") and not any(c in name for c in "/\\:")
+
+
 def cmd_unpack(args):
     with Xiso(args.iso) as iso:
         n = 0
         for d, e in iso.walk():
-            dest = os.path.join(args.output, *(d.split("/") if d else []), e.name)
+            parts = (d.split("/") if d else []) + [e.name]
+            if not all(_safe_component(p) for p in parts):
+                print("skipping unsafe disc path: %r" % "/".join(parts), file=sys.stderr)
+                continue
+            dest = os.path.join(args.output, *parts)
             iso.extract(e, dest)
             n += 1
         print("extracted %d files to %s" % (n, args.output))
