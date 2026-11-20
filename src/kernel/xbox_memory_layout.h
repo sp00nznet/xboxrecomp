@@ -213,6 +213,15 @@ const volatile uint8_t *xbox_ContiguousPageMap(void);
 /* MmGetPhysicalAddress named this VA; recorded if it is a heap page below
  * 64 MB (the image and stacks are not recorded). */
 void xbox_PhysNoteRamName(uint32_t va);
+/* The physical number MmGetPhysicalAddress gives a RAM address (one outside
+ * the window): a heap page below 64 MB gets its alias in the first RAM mirror
+ * (va + xbox_PhysRamAlias()), so no window page shares the number; anything
+ * else, or every address when there is no alias, is the identity, and a heap
+ * page is then recorded with xbox_PhysNoteRamName. */
+uint32_t xbox_PhysRamName(uint32_t va);
+/* What xbox_PhysRamName adds to a heap page: the RAM size when the first
+ * mirror is mapped and RECOMP_PHYS_RAM_ALIAS is not 0, else 0. */
+uint32_t xbox_PhysRamAlias(void);
 /* One byte per 4 KB physical page below 64 MB, nonzero while the title holds
  * a RAM name for a heap page there (see xbox_PhysNoteRamName); cleared when
  * no live heap block covers the page any more. Read without a lock; a device

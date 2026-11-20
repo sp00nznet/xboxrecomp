@@ -514,9 +514,18 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * never hands out contiguous memory that overlaps the image, so an address
  * inside it is the image. Sending that one to the window delivered the
  * descriptor where the driver never looked, and it reset the port and asked
- * again, forever. */
+ * again, forever.
+ *
+ * A heap page's name is its alias in the first RAM mirror
+ * (xbox_PhysRamName); fold it back to the heap address, as mcpx_apu_phys
+ * does, since guest_ok only admits RAM below the mapped size. XAPI's pad
+ * report buffer is one. */
 static uint32_t bus_resolve(uint32_t addr)
 {
+    uint32_t alias = xbox_PhysRamAlias();
+
+    if (alias && addr >= alias && addr - alias < XBOX_CONTIG_SIZE)
+        return addr - alias;
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
     if (addr && addr < xbox_ContiguousAllocatedBytes())
