@@ -33,13 +33,29 @@ static ULONG query(ULONG index)
     return v;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     uint8_t blk[256];
-    ULONG type = 0, len = 0, v;
+    ULONG expected_video, type = 0, len = 0, v;
     LONG bias = (LONG)query(XC_TIMEZONE_BIAS);
+    char *end;
     size_t i;
 
+    if (argc != 2) {
+        fprintf(stderr, "expected the XC_VIDEO flags\n");
+        return 2;
+    }
+    expected_video = (ULONG)strtoul(argv[1], &end, 0);
+    if (!argv[1][0] || *end) {
+        fprintf(stderr, "invalid XC_VIDEO flags: %s\n", argv[1]);
+        return 2;
+    }
+    if (query(XC_VIDEO) != expected_video) {
+        fprintf(stderr, "FAIL: XC_VIDEO 0x%08lX, expected 0x%08lX\n",
+                (unsigned long)query(XC_VIDEO),
+                (unsigned long)expected_video);
+        return 1;
+    }
     if (bias != host_bias()) {
         fprintf(stderr, "FAIL: XC_TIMEZONE_BIAS %ld, host bias %ld\n", (long)bias, (long)host_bias());
         return 1;
@@ -84,7 +100,8 @@ int main(void)
             fprintf(stderr, "FAIL: byte 0x%02X past the block is 0x%02X\n", (unsigned)i, blk[i]);
             return 1;
         }
-    printf("PASS: time zone bias %ld (host), XC_MAX_OS block matches the single queries.\n",
-           (long)bias);
+    printf("PASS: time zone bias %ld (host), XC_VIDEO 0x%08lX, "
+           "XC_MAX_OS block matches the single queries.\n",
+           (long)bias, (unsigned long)expected_video);
     return 0;
 }
