@@ -406,6 +406,60 @@ def cases():
                      "mov dword ptr [esi+32], eax",
                      "mov dword ptr [esi+36], edx",
                      "mov word ptr [esi+40], cx", "mov eax, 0"], "sse")
+    for op in ("div", "idiv"):
+        signed = op == "idiv"
+        for width, reg, alias in ((8, "bl", "al"), (16, "bx", "ax"),
+                                  (32, "ebx", "eax")):
+            size = {8: "byte", 16: "word", 32: "dword"}[width]
+            for form, source in (("reg", reg),
+                                 ("mem", f"{size} ptr [esi+16]"),
+                                 ("alias", alias)):
+                asm = ["mov esi, eax", "mov ebx, dword ptr [esi+16]",
+                       "mov eax, dword ptr [esi]", "mov edx, 0xa5a55a5a"]
+                if width == 8:
+                    if signed:
+                        if form != "alias":
+                            asm += ["and ebx, 0x7f", "or bl, 1"]
+                        else:
+                            asm += ["or al, 1"]
+                        asm += ["cbw"]
+                    else:
+                        asm += ["and eax, 0xffff00ff"]
+                        if form != "alias":
+                            asm += ["or bl, 1"]
+                        else:
+                            asm += ["or al, 1"]
+                elif width == 16:
+                    if signed:
+                        if form != "alias":
+                            asm += ["and ebx, 0x7fff", "or bx, 1"]
+                        else:
+                            asm += ["or ax, 1"]
+                        asm += ["cwd"]
+                    else:
+                        asm += ["and edx, 0xffff0000"]
+                        if form != "alias":
+                            asm += ["or bx, 1"]
+                        else:
+                            asm += ["or ax, 1"]
+                elif signed:
+                    if form != "alias":
+                        asm += ["and ebx, 0x7fffffff", "or ebx, 1"]
+                    else:
+                        asm += ["or eax, 1"]
+                    asm += ["cdq"]
+                else:
+                    asm += ["xor edx, edx"]
+                    if form != "alias":
+                        asm += ["or ebx, 1"]
+                    else:
+                        asm += ["or eax, 1"]
+                if form == "mem":
+                    asm += [f"mov {size} ptr [esi+16], {reg}"]
+                asm += [f"{op} {source}",
+                        "mov dword ptr [esi+32], eax",
+                        "mov dword ptr [esi+36], edx", "mov eax, 0"]
+                add(f"intops_{op}{width}_{form}", asm, "sse")
     for action in ("reset", "restore"):
         asm = ["sub esp, 108"] + two + ["ftst", "fnsave [esp]"]
         if action == "restore":
