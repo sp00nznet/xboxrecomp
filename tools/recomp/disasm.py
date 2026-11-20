@@ -162,6 +162,9 @@ class Disassembler:
         # probes) decode each instruction once. The instructions are shared:
         # with the cache on, callers must not modify them.
         self._cfg_cache = {} if cache_cfg_decodes else None
+        # Every decode: (address, its bytes) -> Instruction. Discovery decodes
+        # each function about three times; the same key decodes the same way.
+        self._decoded = {}
 
     def _cfg_decode_at(self, raw_bytes, offset, address):
         """One instruction at raw_bytes[offset], or None where Capstone
@@ -195,6 +198,13 @@ class Disassembler:
 
     def _decode_instruction(self, cs_insn):
         """Convert one Capstone instruction into the translator model."""
+        key = (cs_insn.address, bytes(cs_insn.bytes))
+        insn = self._decoded.get(key)
+        if insn is None:
+            insn = self._decoded[key] = self._decode_uncached(cs_insn)
+        return insn
+
+    def _decode_uncached(self, cs_insn):
         insn = Instruction(
             address=cs_insn.address,
             size=cs_insn.size,

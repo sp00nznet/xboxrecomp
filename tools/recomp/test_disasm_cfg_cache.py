@@ -59,3 +59,15 @@ def test_random_bytes_match_without_the_cache():
         _both(cached, raw, BASE + lower, BASE + upper,
               {BASE + e for e in entries},
               stop_mnemonics=("int3", "ud2", "hlt"))
+
+
+def test_function_decodes_are_shared_and_keyed_by_their_bytes():
+    # Discovery decodes each function several times with one Disassembler.
+    d = Disassembler()
+    first = d.disassemble_function(CODE, BASE, BASE + len(CODE))
+    again = d.disassemble_function(CODE, BASE, BASE + len(CODE))
+    assert [a is b for a, b in zip(first, again)] == [True] * len(first)
+    # Other bytes at the same address decode afresh: 31c0 becomes 33c0.
+    other = CODE[:11] + bytes.fromhex("33c0") + CODE[13:]
+    changed = d.disassemble_function(other, BASE, BASE + len(other))
+    assert changed[-2].bytes_hex == "33c0" and changed[-2] is not first[-2]
