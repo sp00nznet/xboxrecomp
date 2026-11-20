@@ -2549,6 +2549,12 @@ static float fog_factor(float d)
     float f, px = s_gpu.fog_param[0], py = s_gpu.fog_param[1];
     if (!s_gpu.fog_enable)
         return 1.0f;
+    /* An infinite distance -- W fog on a pre-transformed vertex whose RHW is
+     * 0, as 2D quads and movies send -- means no fog in LINEAR and EXP and
+     * full fog in the others (xemu vsh.c). */
+    if (isinf(d))
+        return s_gpu.fog_mode == 0x801 || s_gpu.fog_mode == 0x802
+               || s_gpu.fog_mode == 0x803 ? 0.0f : 1.0f;
     switch (s_gpu.fog_mode) {
     case 0x800: case 0x802:                       /* EXP, EXP_ABS */
         f = px + exp2f(d * py * 16.0f) - 1.5f;
@@ -3307,8 +3313,11 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
      * are already surface units. The hardware draws such a vertex (xemu
      * clamps w away from zero, in front of the eye), but raster_xf_clipped
      * would count it behind the eye. w = 1 draws it at the same place and
-     * keeps 1/w finite. -0 stays behind the eye and is clipped, as on xemu. */
-    if (out->pos[3] == 0.0f && !signbit(out->pos[3]))
+     * keeps 1/w finite. -0 stays behind the eye and is clipped, as on xemu.
+     * +inf is the reciprocal of a pre-transformed vertex's 0 RHW (2D quads,
+     * movies) and is drawn at w = 1 too; xemu clamps it to 2^64, the same
+     * result when a triangle's corners share one w. */
+    if ((out->pos[3] == 0.0f || isinf(out->pos[3])) && !signbit(out->pos[3]))
         out->pos[3] = 1.0f;
     /* The program's viewport is in logical pixels; the surface may be larger
      * (anti-aliasing). */
