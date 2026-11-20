@@ -1,7 +1,7 @@
 """
 RenderWare module identification.
 
-Uses the 67 RW source file ID strings embedded in .rdata to classify
+Uses RenderWare source-file ID strings found in the input to classify
 functions as belonging to specific RenderWare modules.
 
 Strategy:
@@ -199,7 +199,7 @@ def _parse_rw_strings(strings):
     """Extract RenderWare ID strings and parse their paths."""
     rw_strings = []
     rw_pattern = re.compile(
-        r'@@?\(?#\)?\$Id:\s*//RenderWare/RW36Active/rwsdk/(.+?)#\d+\s*\$'
+        r'@@?\(?#\)?\$Id:\s*//RenderWare/RW[0-9]+Active/rwsdk/(.+?)#\d+\s*\$'
     )
 
     for s in strings:
