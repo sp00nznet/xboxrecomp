@@ -31,6 +31,32 @@
 #define DPRINTF(fmt, ...) do { } while (0)
 #endif
 
+/* RECOMP_APU_SSL_ADVANCE=1: a stream voice passes through an empty segment
+ * list to the other one, and a list it has played is empty until the title
+ * writes it again.
+ *
+ * xemu leaves a stream voice whose next list is empty on that list for good,
+ * repeating its done notification every frame, and replays a finished list
+ * the title has not refilled yet. DirectSound (XDK 5849) refills the list
+ * that just finished and expects the voice to go on through an empty one:
+ * starved for a moment, it puts the next packet in the other list. Under
+ * xemu's rule that packet waited behind the empty list, was played after
+ * later segments or replayed, and DirectSound's lists stayed out of step
+ * with the voice for the rest of the stream. Burnout 3's attract-mode
+ * trailer then dropped 15-40 ms at every packet (every 0.8-1.5 s) from the
+ * first starved moment to the end of the movie. With this the stream misses
+ * one frame or a few and carries on. Off by default: one title so far. */
+static int s_ssl_advance = -1;
+
+static bool apu_ssl_advance(void)
+{
+    if (s_ssl_advance < 0) {
+        const char *e = getenv("RECOMP_APU_SSL_ADVANCE");
+        s_ssl_advance = e && *e && strcmp(e, "0");
+    }
+    return s_ssl_advance != 0;
+}
+
 /* ============================================================
  * Voice list register table
  * ============================================================ */
@@ -1152,6 +1178,24 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         page = d->vp.ssl[v].base[ssl_index] + ssl_seg;
         count = d->vp.ssl[v].count[ssl_index];
 
+        /* An empty list is passed through like a finished one when the
+         * other holds segments the title wrote since it was played
+         * (apu_ssl_advance; played lists are emptied below). */
+        if (count == 0 && persist && apu_ssl_advance()
+                && d->vp.ssl[v].count[ssl_index ^ 1] != 0) {
+            set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
+                              NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
+            ssl_index ^= 1;
+            ssl_seg = 0;
+            d->vp.ssl[v].ssl_index = ssl_index;
+            d->vp.ssl[v].ssl_seg = 0;
+            voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
+                           NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
+            cbo = 0;
+            page = d->vp.ssl[v].base[ssl_index];
+            count = d->vp.ssl[v].count[ssl_index];
+        }
+
         if (count == 0) {
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
@@ -1306,6 +1350,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 /* Move to next segment */
             } else {
                 int next_index = (ssl_index + 1) % 2;
+                if (apu_ssl_advance())
+                    d->vp.ssl[v].count[ssl_index] = 0;
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
