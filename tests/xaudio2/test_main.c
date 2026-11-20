@@ -228,11 +228,11 @@ int main(void)
     }
     xa2_shutdown();
 
-    /* Buffer size and count: defaults 512 x 4, overrides reach the
+    /* Buffer size and count: defaults 512 x 6, overrides reach the
      * submitted buffers and the queue limit, out-of-range values clamp. */
     {
         struct { const char *samples, *count; UINT32 want_s, want_n; } c[] = {
-            { "RECOMP_AUDIO_BUF_SAMPLES=",     "RECOMP_AUDIO_BUF_COUNT=",   512, 4 },
+            { "RECOMP_AUDIO_BUF_SAMPLES=",     "RECOMP_AUDIO_BUF_COUNT=",   512, 6 },
             { "RECOMP_AUDIO_BUF_SAMPLES=256",  "RECOMP_AUDIO_BUF_COUNT=6",  256, 6 },
             { "RECOMP_AUDIO_BUF_SAMPLES=9999", "RECOMP_AUDIO_BUF_COUNT=1", 4096, 2 },
             { "RECOMP_AUDIO_BUF_SAMPLES=16",   "RECOMP_AUDIO_BUF_COUNT=99", 128, 8 },
@@ -267,13 +267,13 @@ int main(void)
         put_env("RECOMP_AUDIO_BUF_SAMPLES=");
         put_env("RECOMP_AUDIO_BUF_COUNT=");
         reset();
-        max_queue = 4;
+        max_queue = 6;
         CHECK(xa2_init() == 1);
         {
             int low;
             xa2_pacing_marks(xa2_get_buffer_size(), xa2_get_buffer_count(),
                              256, &low, &high);
-            CHECK(high == 2048 && low == 1024);
+            CHECK(high == 3072 && low == 1536);
         }
         for (int step = 0; step < 300; step++) {
             /* The voice starts playing once the queue has filled (a
