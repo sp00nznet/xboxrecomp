@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "nv2a_backend.h"
+#include "nv2a_backend_fixture.h"
 
 #define MEM_BYTES 0x10000u
 #define FB_ADDR 0x8000u
@@ -17,6 +18,7 @@ static int s_fail;
 static unsigned s_events[8], s_event_count, s_present_count, s_draw_count;
 static uint32_t s_presented[4], s_presented_va[4];
 static int s_flip_writes, s_flip_presents;
+static Nv2aBackendFixture s_backend;
 
 #define CHECK(c) do { if (!(c)) { \
     fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); s_fail = 1; \
@@ -63,22 +65,32 @@ void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch)
 }
 
 static void write_pixel(uint32_t pixel) { memcpy(s_mem + FB_ADDR, &pixel, sizeof pixel); }
-static void sync_surface(void) { event(EVENT_SYNC); write_pixel(NEW_PIXEL); }
-static void draw_surface(const Nv2aSurface *s, const Nv2aBatch *batch)
+static void observe_backend(Nv2aBackendFixture *fixture,
+                            const Nv2aBackendFixtureEvent *backend_event,
+                            void *opaque)
 {
-    (void)batch;
-    CHECK(s->color_va == FB_ADDR);
-    s_draw_count++;
-}
-static void flip_backend(void)
-{
-    event(EVENT_FLIP);
-    if (s_flip_writes)
+    (void)fixture;
+    (void)opaque;
+    switch (backend_event->type) {
+    case NV2A_BACKEND_FIXTURE_DRAW:
+        CHECK(backend_event->surface.color_va == FB_ADDR);
+        s_draw_count++;
+        break;
+    case NV2A_BACKEND_FIXTURE_PRESENT_SYNC:
+        event(EVENT_SYNC);
         write_pixel(NEW_PIXEL);
-    if (s_flip_presents)
-        xbox_FramebufferWindowPresent(FB_ADDR, 4);
+        break;
+    case NV2A_BACKEND_FIXTURE_FLIP:
+        event(EVENT_FLIP);
+        if (s_flip_writes)
+            write_pixel(NEW_PIXEL);
+        if (s_flip_presents)
+            xbox_FramebufferWindowPresent(FB_ADDR, 4);
+        break;
+    case NV2A_BACKEND_FIXTURE_CLEAR:
+        break;
+    }
 }
-static const Nv2aBackend s_backend = {NULL, draw_surface, flip_backend};
 
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 static void method(uint32_t number, uint32_t value) { nv2a_pb_exec_method(0, number, value); }
@@ -90,7 +102,9 @@ static void reset_events(void)
     memset(s_presented, 0, sizeof s_presented);
     memset(s_presented_va, 0, sizeof s_presented_va);
     s_event_count = s_present_count = 0;
+    s_draw_count = 0;
     s_flip_writes = s_flip_presents = 0;
+    nv2a_backend_fixture_reset(&s_backend);
 }
 
 static void dump_path(char *path, size_t size, const char *prefix, unsigned sequence)
@@ -159,6 +173,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "expected the framebuffer dump prefix\n");
         return 2;
     }
+    nv2a_backend_fixture_init(&s_backend);
+    nv2a_backend_fixture_set_observer(&s_backend, observe_backend, NULL);
     method(0x0208, 0x0008);
     method(0x0200, 1u << 16);
     method(0x0204, 1u << 16);
@@ -171,7 +187,7 @@ int main(int argc, char **argv)
     CHECK(s_event_count == 1 && s_events[0] == EVENT_PRESENT);
     CHECK(s_present_count == 1 && s_presented[0] == OLD_PIXEL);
 
-    nv2a_backend_register(&s_backend);
+    nv2a_backend_register(nv2a_backend_fixture_bind(&s_backend));
     reset_events();
     write_pixel(OLD_PIXEL);
     s_flip_writes = s_flip_presents = 1;
@@ -180,7 +196,9 @@ int main(int argc, char **argv)
           s_events[1] == EVENT_FLIP && s_events[2] == EVENT_PRESENT);
     CHECK(s_present_count == 2 && s_presented[0] == OLD_PIXEL && s_presented[1] == NEW_PIXEL);
 
-    nv2a_backend_register_with_present_sync(&s_backend, sync_surface);
+    nv2a_backend_register_with_present_sync(
+        nv2a_backend_fixture_bind(&s_backend),
+        nv2a_backend_fixture_present_sync);
     reset_events();
     write_pixel(OLD_PIXEL);
     draw_to_first_surface();
@@ -189,35 +207,42 @@ int main(int argc, char **argv)
           s_events[1] == EVENT_PRESENT && s_events[2] == EVENT_FLIP);
     CHECK(s_present_count == 1 && s_presented_va[0] == FB_ADDR && s_presented[0] == NEW_PIXEL);
 
-    nv2a_backend_register_with_present_sync(&s_backend, NULL);
+    nv2a_backend_register_with_present_sync(
+        nv2a_backend_fixture_bind(&s_backend), NULL);
     reset_events();
     write_pixel(OLD_PIXEL);
     flip_and_check_dump(argv[1], 3, OLD_PIXEL);
     CHECK(s_event_count == 2 && s_events[0] == EVENT_PRESENT && s_events[1] == EVENT_FLIP);
     CHECK(s_present_count == 1 && s_presented[0] == OLD_PIXEL);
 
-    nv2a_backend_register_with_present_sync(&s_backend, sync_surface);
-    nv2a_backend_register(&s_backend);
+    nv2a_backend_register_with_present_sync(
+        nv2a_backend_fixture_bind(&s_backend),
+        nv2a_backend_fixture_present_sync);
+    nv2a_backend_register(nv2a_backend_fixture_bind(&s_backend));
     reset_events();
     write_pixel(OLD_PIXEL);
     flip_and_check_dump(argv[1], 4, OLD_PIXEL);
     CHECK(s_event_count == 2 && s_events[0] == EVENT_PRESENT && s_events[1] == EVENT_FLIP);
     CHECK(s_present_count == 1 && s_presented[0] == OLD_PIXEL);
 
-    nv2a_backend_register_with_present_sync(NULL, sync_surface);
+    nv2a_backend_register_with_present_sync(
+        NULL, nv2a_backend_fixture_present_sync);
     reset_events();
     write_pixel(OLD_PIXEL);
     flip_and_check_dump(argv[1], 5, OLD_PIXEL);
     CHECK(s_event_count == 1 && s_events[0] == EVENT_PRESENT);
     CHECK(s_present_count == 1 && s_presented[0] == OLD_PIXEL);
 
-    nv2a_backend_register_with_present_sync(&s_backend, sync_surface);
+    nv2a_backend_register_with_present_sync(
+        nv2a_backend_fixture_bind(&s_backend),
+        nv2a_backend_fixture_present_sync);
     nv2a_backend_register(NULL);
     reset_events();
     write_pixel(OLD_PIXEL);
     flip_and_check_dump(argv[1], 6, OLD_PIXEL);
     CHECK(s_event_count == 1 && s_events[0] == EVENT_PRESENT);
     CHECK(s_present_count == 1 && s_presented[0] == OLD_PIXEL);
+    CHECK(s_backend.thread_mismatches == 0 && s_backend.dropped_events == 0);
 
     if (!s_fail)
         puts("NV2A present synchronization: ok");

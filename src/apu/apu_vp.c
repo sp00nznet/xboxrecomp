@@ -31,6 +31,32 @@
 #define DPRINTF(fmt, ...) do { } while (0)
 #endif
 
+/* RECOMP_APU_SSL_ADVANCE=1: a stream voice passes through an empty segment
+ * list to the other one, and a list it has played is empty until the title
+ * writes it again.
+ *
+ * xemu leaves a stream voice whose next list is empty on that list for good,
+ * repeating its done notification every frame, and replays a finished list
+ * the title has not refilled yet. DirectSound (XDK 5849) refills the list
+ * that just finished and expects the voice to go on through an empty one:
+ * starved for a moment, it puts the next packet in the other list. Under
+ * xemu's rule that packet waited behind the empty list, was played after
+ * later segments or replayed, and DirectSound's lists stayed out of step
+ * with the voice for the rest of the stream. Burnout 3's attract-mode
+ * trailer then dropped 15-40 ms at every packet (every 0.8-1.5 s) from the
+ * first starved moment to the end of the movie. With this the stream misses
+ * one frame or a few and carries on. Off by default: one title so far. */
+static int s_ssl_advance = -1;
+
+static bool apu_ssl_advance(void)
+{
+    if (s_ssl_advance < 0) {
+        const char *e = getenv("RECOMP_APU_SSL_ADVANCE");
+        s_ssl_advance = e && *e && strcmp(e, "0");
+    }
+    return s_ssl_advance != 0;
+}
+
 /* ============================================================
  * Voice list register table
  * ============================================================ */
@@ -115,13 +141,25 @@ static uint32_t voice_get_mask(MCPXAPUState *d, uint16_t voice_handle,
            ctz32(mask);
 }
 
+/* Atomic per field. The frame thread writes a voice's envelope phase and
+ * count while the title's methods (VOICE_OFF, PAUSE, RELEASE) arrive on its
+ * own thread and write other fields of the same words. A plain read-modify-
+ * write lost one of the two: a VOICE_OFF landing between the frame thread's
+ * read and write of PAR_STATE came back active, so the voice played its
+ * sample out before it went idle, and DirectSound's StopEx, which waits for
+ * the idle-voice trap, waited with it (Burnout 3: 79-929 ms, about once in
+ * 5000 stops, the game frozen meanwhile). */
 static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
                            hwaddr offset, uint32_t mask, uint32_t val)
 {
     hwaddr voice = d->regs[NV_PAPU_VPVADDR] + voice_handle * NV_PAVS_SIZE;
-    uint32_t v = ldl_le_phys(address_space_memory, voice + offset) & ~mask;
-    stl_le_phys(address_space_memory, voice + offset,
-                v | ((val << ctz32(mask)) & mask));
+    volatile LONG *p = (volatile LONG *)mcpx_apu_phys(voice + offset);
+    LONG old, upd;
+
+    do {
+        old = *p;
+        upd = (LONG)(((uint32_t)old & ~mask) | ((val << ctz32(mask)) & mask));
+    } while (InterlockedCompareExchange(p, upd, old) != old);
 }
 
 /* ============================================================
@@ -1140,6 +1178,24 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         page = d->vp.ssl[v].base[ssl_index] + ssl_seg;
         count = d->vp.ssl[v].count[ssl_index];
 
+        /* An empty list is passed through like a finished one when the
+         * other holds segments the title wrote since it was played
+         * (apu_ssl_advance; played lists are emptied below). */
+        if (count == 0 && persist && apu_ssl_advance()
+                && d->vp.ssl[v].count[ssl_index ^ 1] != 0) {
+            set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
+                              NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
+            ssl_index ^= 1;
+            ssl_seg = 0;
+            d->vp.ssl[v].ssl_index = ssl_index;
+            d->vp.ssl[v].ssl_seg = 0;
+            voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
+                           NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
+            cbo = 0;
+            page = d->vp.ssl[v].base[ssl_index];
+            count = d->vp.ssl[v].count[ssl_index];
+        }
+
         if (count == 0) {
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
@@ -1294,6 +1350,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 /* Move to next segment */
             } else {
                 int next_index = (ssl_index + 1) % 2;
+                if (apu_ssl_advance())
+                    d->vp.ssl[v].count[ssl_index] = 0;
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
@@ -1671,6 +1729,11 @@ static void vp_trace_positions(MCPXAPUState *d)
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    /* Idle voices found by the walk: the first in walk order, and the first
+     * after the voice trapped last time. */
+    uint16_t first_idle = 0xFFFF, next_idle = 0xFFFF;
+    bool past_last = d->vp.idle_trap_last == 0xFFFF;
+
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {
@@ -1693,20 +1756,38 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                /* One trap at a time: once the front end is trapped, a second
-                 * idle voice in the same frame would overwrite FEDECPARAM
-                 * before the ISR has read the first. The rest trap on later
-                 * frames, after the ISR has resumed the front end. */
-                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
-                        != NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
-                    fe_method(d, SE2FE_IDLE_VOICE, v);
+                if (first_idle == 0xFFFF)
+                    first_idle = v;
+                if (past_last && next_idle == 0xFFFF)
+                    next_idle = v;
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_spin_lock(d, v);
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
                 voice_spin_unlock(d, v);
             }
+            if (v == d->vp.idle_trap_last)
+                past_last = true;
             d->regs[current] = d->regs[next];
+        }
+    }
+
+    /* One trap at a time: a second idle voice in the same frame would
+     * overwrite FEDECPARAM before the ISR has read the first; the rest trap
+     * on later frames, once the ISR has resumed the front end. Each frame
+     * takes the next idle voice after the one trapped last, wrapping round.
+     * Starting from the list head every frame starved the voices behind one
+     * the title leaves listed: DirectSound frees a multi-voice stream only on
+     * its last voice's notice and ignores the others, and MechAssault spun
+     * for ever stopping its menu music (voice 0xF2 trapped every frame, 0xF4
+     * never). */
+    {
+        uint16_t pick = next_idle != 0xFFFF ? next_idle : first_idle;
+        if (pick != 0xFFFF
+                && (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                       != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+            fe_method(d, SE2FE_IDLE_VOICE, pick);
+            d->vp.idle_trap_last = pick;
         }
     }
 
@@ -1774,6 +1855,7 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
     memset((void *)d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
+    d->vp.idle_trap_last = 0xFFFF;
     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         hrtf_filter_init(&d->vp.filters[v].hrtf);
     }

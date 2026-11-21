@@ -65,6 +65,34 @@
 #include <emmintrin.h>
 #endif
 
+/* The x87 transcendentals (fsin, fcos, fptan, fpatan, fyl2x, fyl2xp1, f2xm1).
+ * Hosts' libm need not agree in the last bit, so a project that compares
+ * guest state across machines, such as netplay, defines RECOMP_PORTABLE_MATH
+ * and links one implementation of these for every host. */
+#ifdef RECOMP_PORTABLE_MATH
+#ifdef __cplusplus
+extern "C" {
+#endif
+double recomp_sin(double x);
+double recomp_cos(double x);
+double recomp_tan(double x);
+double recomp_atan2(double y, double x);
+double recomp_log2(double x);
+double recomp_log1p(double x);
+double recomp_expm1(double x);
+#ifdef __cplusplus
+}
+#endif
+#else
+static inline double recomp_sin(double x) { return sin(x); }
+static inline double recomp_cos(double x) { return cos(x); }
+static inline double recomp_tan(double x) { return tan(x); }
+static inline double recomp_atan2(double y, double x) { return atan2(y, x); }
+static inline double recomp_log2(double x) { return log2(x); }
+static inline double recomp_log1p(double x) { return log1p(x); }
+static inline double recomp_expm1(double x) { return expm1(x); }
+#endif
+
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
 #if !defined(_MSC_VER) && !defined(__forceinline)
 #define __forceinline inline __attribute__((always_inline))
@@ -432,38 +460,38 @@ static inline int recomp_x87_reduces(double x) {
     return isfinite(x) && fabs(x) > 0.78539816339744830962;
 }
 static inline void recomp_x87_sincos_pi66(double x, double *s, double *c) {
-    double e = x * RECOMP_X87_PI66_D, se, v, sx = sin(x), cx = cos(x);
+    double e = x * RECOMP_X87_PI66_D, se, v, sx = recomp_sin(x), cx = recomp_cos(x);
     if (fabs(e) < 1.4901161193847656e-08) { /* 2^-26 */
         se = e; v = 0.0;
     } else {
-        double h = sin(0.5 * e);
-        se = sin(e); v = 2.0 * h * h;
+        double h = recomp_sin(0.5 * e);
+        se = recomp_sin(e); v = 2.0 * h * h;
     }
     *s = sx + (cx * se - sx * v);
     *c = cx - (sx * se + cx * v);
 }
 static inline double recomp_x87_sin(double x) {
     double s, c;
-    if (!recomp_x87_reduces(x)) return sin(x);
+    if (!recomp_x87_reduces(x)) return recomp_sin(x);
     recomp_x87_sincos_pi66(x, &s, &c);
     return s;
 }
 static inline double recomp_x87_cos(double x) {
     double s, c;
-    if (!recomp_x87_reduces(x)) return cos(x);
+    if (!recomp_x87_reduces(x)) return recomp_cos(x);
     recomp_x87_sincos_pi66(x, &s, &c);
     return c;
 }
 /* Returns the sine; *c is the cosine FSINCOS then pushes. */
 static inline double recomp_x87_sincos(double x, double *c) {
     double s;
-    if (!recomp_x87_reduces(x)) { *c = cos(x); return sin(x); }
+    if (!recomp_x87_reduces(x)) { *c = recomp_cos(x); return recomp_sin(x); }
     recomp_x87_sincos_pi66(x, &s, c);
     return s;
 }
 static inline double recomp_x87_tan(double x) {
     double s, c;
-    if (!recomp_x87_reduces(x)) return tan(x);
+    if (!recomp_x87_reduces(x)) return recomp_tan(x);
     recomp_x87_sincos_pi66(x, &s, &c);
     return s / c;
 }
@@ -946,6 +974,8 @@ RECOMP_XMM_BITWISE(XMM_OR,   a.u[i] | b.u[i])
 RECOMP_XMM_BITWISE(XMM_XOR,  a.u[i] ^ b.u[i])
 /* ANDNPS is ~dst & src, not dst & ~src. */
 RECOMP_XMM_BITWISE(XMM_ANDN, (~a.u[i]) & b.u[i])
+/* PCMPGTD: signed dword greater-than, dst = (dst > src). */
+RECOMP_XMM_BITWISE(XMM_PCMPGTD, ((int32_t)a.u[i] > (int32_t)b.u[i]) ? 0xFFFFFFFFu : 0u)
 
 /* Compares produce an all-ones or all-zero mask per lane. EQ/LT/LE are
  * the ordered forms (false when either lane is NaN); NEQ is the

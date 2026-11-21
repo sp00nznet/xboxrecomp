@@ -709,55 +709,74 @@ static void mkdir_p(const char* path)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "mkdir %s: %s", tmp, strerror(errno));
 }
 
-/* The Xbox's file systems ignore case and titles rely on it: a title asks for
- * D:\Data\movies\INTRO.bik where the disc has Movies/intro.bik.
- * Linux's do not, so each component of path after its first `keep` bytes
- * that is not there as spelled takes the spelling of the one entry in its
- * directory that matches it ignoring case. A component nothing matches
- * (a file about to be created) and everything after it stays as asked.
- * Free on a case-insensitive host (macOS): every lstat succeeds. */
+/* The Xbox's file systems ignore case and titles rely on it: a title asks
+ * for D:\Data\movies\INTRO.bik where the disc has Movies/intro.bik. Each
+ * component of `path` after its first `keep` bytes takes the spelling of the
+ * entry in its directory that matches it ignoring case. A component nothing
+ * matches -- a file about to be created -- and everything after it stays as
+ * asked.
+ *
+ * Every component is read from its directory, including ones lstat already
+ * finds. Returning early when the path exists as spelled is tempting, and was
+ * how this was written: the folding is only needed where the open would
+ * otherwise fail. True of the open, false of the name. On a case-insensitive
+ * host lstat succeeds for any spelling, so macOS handed back whatever the
+ * title asked for while Linux handed back what the disc holds, and two hosts
+ * disagreeing about a translated path is worse than the readdir. */
 static void fold_case(char *path, size_t keep)
 {
-    struct stat st;
     char *comp = path + keep;
 
-    if (lstat(path, &st) == 0)
-        return;                             /* as spelled: the common case */
     while (*comp == '/')
         comp++;
+
     while (*comp) {
         char *end = strchr(comp, '/');
         char save = end ? *end : '\0';
-        int found = 0;
+        char cand[256];
+        int exact = 0, folded = 0;
+        size_t len;
+        DIR *d;
+        struct dirent *e;
+        char parent_end;
+
         if (end)
             *end = '\0';
-        if (lstat(path, &st) != 0) {
-            DIR *d;
-            struct dirent *e;
-            char parent_end = comp[-1];
-            comp[-1] = '\0';
-            d = opendir(comp == path + 1 ? "/" : path);
-            comp[-1] = parent_end;
-            while (d && (e = readdir(d)) != NULL) {
-                if (strcasecmp(e->d_name, comp) == 0) {
-                    memcpy(comp, e->d_name, strlen(comp));   /* same length */
-                    found = 1;
-                    break;
-                }
+        len = strlen(comp);
+
+        parent_end = comp[-1];
+        comp[-1] = '\0';
+        d = opendir(comp == path + 1 ? "/" : path);
+        comp[-1] = parent_end;
+
+        /* `comp` is left alone until the directory has been read. Folding it
+         * in place mid-scan would leave later comparisons matching the
+         * spelling this loop just wrote rather than the one the caller asked
+         * for, so an exact match after a case-insensitive one would never be
+         * seen. */
+        while (d && (e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, comp) == 0) {
+                exact = 1;                        /* as asked: nothing to do */
+                break;
             }
-            if (d)
-                closedir(d);
-        } else {
-            found = 1;
+            if (!folded && len < sizeof cand && strlen(e->d_name) == len
+                    && strcasecmp(e->d_name, comp) == 0) {
+                memcpy(cand, e->d_name, len);
+                folded = 1;                       /* keep reading for an exact */
+            }
         }
+        if (d)
+            closedir(d);
+        if (!exact && folded)
+            memcpy(comp, cand, len);              /* case differs, length does not */
+
         if (end)
             *end = save;
-        if (!found || !end)
+        if (!(exact || folded) || !end)
             return;
         comp = end + 1;
     }
 }
-
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
     if (game_dir) {

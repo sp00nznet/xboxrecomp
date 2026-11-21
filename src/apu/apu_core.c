@@ -92,6 +92,13 @@ static inline uint32_t apu_mapped_ram(void)
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    uint32_t alias = xbox_PhysRamAlias();
+    /* A heap page's name: its alias in the first RAM mirror
+     * (xbox_PhysRamName), so it is RAM whatever the window holds at the same
+     * offset. Before the 64 MB case, which would read a 128 MB map's alias as
+     * plain RAM. */
+    if (alias && a >= alias && a - alias < (64u << 20))
+        return g_apu_ram_ptr + (a - alias);
     /* RAM above the window's 64 MB. On a 128 MB layout (a devkit) most of
      * the heap sits above 0x04000000, and so do the sound buffers a title
      * malloc()s and hands to DirectSound as plain pointers, which
@@ -133,7 +140,7 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
 
 /* Which of the cases above resolved an address, for the RECOMP_APU_TRACE
  * per-voice line and the doorbell line: "named" (a heap page
- * MmGetPhysicalAddress named), "win" (a page the contiguous allocator handed
+ * MmGetPhysicalAddress named: its mirror alias, or one the record holds), "win" (a page the contiguous allocator handed
  * out), "img" (inside the XBE image), "hiwin" (below the arena's high-water
  * mark but not a live page), "ram" (plain RAM: below 64 MB, or above it
  * where the host mapped RAM) or "wrap" (above the mapping, folded into the
@@ -142,6 +149,9 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
 const char *mcpx_apu_phys_class(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    uint32_t alias = xbox_PhysRamAlias();
+    if (alias && a >= alias && a - alias < (64u << 20))
+        return "named";
     if (a >= (64u << 20))
         return a < apu_mapped_ram() ? "ram" : "wrap";
     if (xbox_PhysRamNamedAt(a))
@@ -937,6 +947,87 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * accept (4096 samples, 85 ms) still fit. */
 #define PACE_STALL_US 200000
 
+/* pace_stalled once the queue has sat at high for PACE_STALL_US (the host
+ * clock paces and periods are dropped), cleared when it falls again. */
+static void pace_watch_stall(MCPXAPUState *d, int q, int high, int64_t now_us)
+{
+    if (q < high || q < d->pace_q_seen || d->pace_drain_us == 0) {
+        d->pace_drain_us = now_us;
+        if (d->pace_stalled) {
+            d->pace_stalled = false;
+            fprintf(stderr, "[APU] audio device consuming again: the"
+                            " queue paces the APU\n");
+        }
+    }
+    d->pace_q_seen = q;
+    if (!d->pace_stalled && q >= high &&
+        now_us - d->pace_drain_us >= PACE_STALL_US) {
+        static int shown;
+        d->pace_stalled = true;
+        if (!shown++)
+            fprintf(stderr, "[APU] audio device stopped consuming (%d"
+                            " samples queued for %d ms): the host clock"
+                            " paces the APU and periods are dropped\n",
+                    q, PACE_STALL_US / 1000);
+    }
+}
+
+/* Pacing one frame at a time (pace_frames, RECOMP_APU_PACE_FRAMES, on by
+ * default). Paced a period at a time, the eight frames ran back to back and
+ * the thread slept out the rest, where the hardware runs one every 0.67 ms:
+ * a title that stops a voice and spins until the voice walk retires it
+ * (DirectSound's StopEx, then GetStatus) waited for the next bunch, up to
+ * 7 ms each (Burnout 3: 924 stops in 5 minutes). The idea is from
+ * DMFBMX2/xboxrecomp#21, which measured the same waits in another title.
+ *
+ * Each frame is due an eighth of a span after the one before it
+ * (mcpx_apu_pace_frame_rendered). The queue is read where a period starts
+ * and sets the span, so the level is held by small changes of rate instead
+ * of a render-ahead burst and the wait that pays it back:
+ *
+ *   q >= high          no frame; ask again in an eighth of a period
+ *   q <  low / 2       span 0, the period at once (start-up, after a stall)
+ *   q <= low           3/4 of a period, faster than the device takes it
+ *   above mid-band     9/8 of a period, slower
+ *   otherwise          one period
+ *
+ * The stall rule and the restart from now are as in pace_step. */
+static int64_t pace_frames(MCPXAPUState *d, int64_t now_us)
+{
+    if (d->ep_frame_div % 8 == 0) {
+        int span = EP_FRAME_US;
+        if (xa2_is_active()) {
+            int q    = xa2_queued_samples();
+            int low  = d->monitor.queued_bytes_low / SAMPLE_BYTES;
+            int high = d->monitor.queued_bytes_high / SAMPLE_BYTES;
+
+            pace_watch_stall(d, q, high, now_us);
+            if (!d->pace_stalled) {
+                if (q >= high) {
+                    d->pace_full_asks++;
+                    return EP_FRAME_US / 8;
+                }
+                if (q < low / 2)
+                    span = 0;
+                else if (q <= low)
+                    span = EP_FRAME_US * 3 / 4;
+                else if (q > (low + high) / 2)
+                    span = EP_FRAME_US * 9 / 8;
+            }
+        } else {
+            d->pace_stalled = false;
+        }
+        d->pace_span_us = span;
+    }
+
+    if (d->next_frame_time_us == 0 ||
+        now_us - d->next_frame_time_us > EP_FRAME_US)
+        d->next_frame_time_us = now_us;
+    if (d->next_frame_time_us > now_us)
+        return d->next_frame_time_us - now_us;
+    return 0;
+}
+
 /* One pacing decision, taken at an EP-period boundary. Returns 0 to render
  * the next period now, or how many microseconds to wait before asking again.
  *
@@ -971,12 +1062,16 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * let a trap that began on a period boundary eat the queue's lead.
  *
  * A clock that has fallen more than a period behind (after a stall, or the
- * first call) restarts from now instead of rendering the backlog in a burst. */
+ * first call) restarts from now instead of rendering the backlog in a burst.
+ *
+ * With pace_frames, pace_frames() above paces instead. */
 int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
 {
     int64_t ahead_us = 0;
     int mid_band = 0;
 
+    if (d->pace_frames)
+        return pace_frames(d, now_us);
     if (d->ep_frame_div % 8)
         return 0;
 
@@ -985,30 +1080,13 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
         int low  = d->monitor.queued_bytes_low / SAMPLE_BYTES;
         int high = d->monitor.queued_bytes_high / SAMPLE_BYTES;
 
-        if (q < high || q < d->pace_q_seen || d->pace_drain_us == 0) {
-            d->pace_drain_us = now_us;
-            if (d->pace_stalled) {
-                d->pace_stalled = false;
-                fprintf(stderr, "[APU] audio device consuming again: the"
-                                " queue paces the APU\n");
-            }
-        }
-        d->pace_q_seen = q;
-        if (!d->pace_stalled && q >= high &&
-            now_us - d->pace_drain_us >= PACE_STALL_US) {
-            static int shown;
-            d->pace_stalled = true;
-            if (!shown++)
-                fprintf(stderr, "[APU] audio device stopped consuming (%d"
-                                " samples queued for %d ms): the host clock"
-                                " paces the APU and periods are dropped\n",
-                        q, PACE_STALL_US / 1000);
-        }
-
+        pace_watch_stall(d, q, high, now_us);
         if (d->pace_stalled)
             ;                              /* host clock, as without a queue */
-        else if (q >= high)
+        else if (q >= high) {
+            d->pace_full_asks++;
             return EP_FRAME_US;
+        }
         else if (q <= low)
             ahead_us = (int64_t)high * EP_FRAME_US / MIXER_FRAME_SAMPLES;
         else
@@ -1036,6 +1114,15 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us)
 void mcpx_apu_pace_rendered(MCPXAPUState *d)
 {
     d->next_frame_time_us += EP_FRAME_US;
+}
+
+/* With pace_frames, frame (its ep_frame_div before rendering) has been
+ * rendered: an eighth of the span, eight of them exactly one span. */
+void mcpx_apu_pace_frame_rendered(MCPXAPUState *d, int frame)
+{
+    int k = frame % 8;
+    d->next_frame_time_us += (int64_t)(k + 1) * d->pace_span_us / 8
+                           - (int64_t)k * d->pace_span_us / 8;
 }
 
 static void throttle(MCPXAPUState *d)
@@ -1166,13 +1253,51 @@ static void apu_irq_stats_line(void)
     s_irq_next_ns = now + 5000000000ull;
 }
 
+/* A stretch without a frame (APU_GAP_WARN_US) is reported with what the
+ * thread was doing meanwhile. No frame means no idle-voice trap, so a title
+ * that stops a voice and waits for it to be retired (DirectSound's StopEx,
+ * then GetStatus) waits all of it: a 102 ms stop froze Burnout 3 once in
+ * ~5000. The time is the host's QueryPerformanceCounter in ms, as
+ * xbox_HostNowNs gives it, so it lines up with other host-timed logs. */
+#define APU_GAP_WARN_US 20000
+#define APU_GAP_WARN_MAX 50
+
+typedef struct {
+    int64_t from_us;            /* the last frame; 0 after an idle pause */
+    int64_t slept_us;           /* in throttle since */
+    unsigned trapped, held, full0, passes;
+} ApuFrameGap;
+
+static void apu_frame_gap_check(MCPXAPUState *d, ApuFrameGap *g, int64_t now_us)
+{
+    static int shown;
+
+    if (g->from_us && now_us - g->from_us > APU_GAP_WARN_US
+            && shown < APU_GAP_WARN_MAX) {
+        fprintf(stderr, "[APU] no frame for %.1f ms from %.3f ms: %u passes,"
+                        " front end trapped %u, sequencer held %u, queue full"
+                        " %u (%d queued now), throttle slept %.1f ms%s\n",
+                (now_us - g->from_us) / 1000.0, g->from_us / 1000.0,
+                g->passes, g->trapped, g->held, d->pace_full_asks - g->full0,
+                xa2_is_active() ? xa2_queued_samples() : -1,
+                g->slept_us / 1000.0,
+                ++shown == APU_GAP_WARN_MAX ? " (no more shown)" : "");
+    }
+    g->from_us = now_us;
+    g->slept_us = 0;
+    g->trapped = g->held = g->passes = 0;
+    g->full0 = d->pace_full_asks;
+}
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    ApuFrameGap gap = { 0 };
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
+            gap.from_us = 0;
             d->is_idle = true;
             if (xa2_is_active())
                 xa2_expect_drain();     /* a pause, not an underrun */
@@ -1186,7 +1311,11 @@ static void *mcpx_apu_frame_thread(void *arg)
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
+        int64_t throttle_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         throttle(d);
+        int64_t pass_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        gap.slept_us += pass_us - throttle_us;
+        gap.passes++;
         int div0 = d->ep_frame_div;
 
         /* The doorbell ack stands in for the GP DSP, which on hardware runs
@@ -1201,6 +1330,8 @@ static void *mcpx_apu_frame_thread(void *arg)
         bool seq_held = kind == APU_FRAME_HELD;
 
         hs_trap(fe_trapped || seq_held);
+        gap.trapped += fe_trapped;
+        gap.held += seq_held;
 
         if (kind == APU_FRAME_RENDER) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
@@ -1230,8 +1361,13 @@ static void *mcpx_apu_frame_thread(void *arg)
             d->ep_frame_div++;
         }
 
-        if (div0 % 8 == 0 && d->ep_frame_div != div0)
-            mcpx_apu_pace_rendered(d);
+        if (d->ep_frame_div != div0) {
+            apu_frame_gap_check(d, &gap, pass_us);
+            if (d->pace_frames)
+                mcpx_apu_pace_frame_rendered(d, div0);
+            else if (div0 % 8 == 0)
+                mcpx_apu_pace_rendered(d);
+        }
 
         /* The SSL tick: the sequencer's periodic sample-limit interrupt.
          *
@@ -1404,6 +1540,11 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     mcpx_apu_monitor_init(d, &local_err);
     if (local_err) {
         warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
+    }
+
+    {
+        const char *pf = getenv("RECOMP_APU_PACE_FRAMES");
+        d->pace_frames = !pf || !*pf || *pf != '0';
     }
 
     /* Start background frame thread */

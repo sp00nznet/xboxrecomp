@@ -430,6 +430,7 @@ typedef struct MCPXAPUVPState {
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
     volatile uint8_t voice_locked[MCPX_HW_MAX_VOICES];
     volatile LONG voice_spin[MCPX_HW_MAX_VOICES];   /* see voice_spin_lock */
+    uint16_t idle_trap_last;   /* the idle voice trapped last; see mcpx_apu_vp_frame */
 
     struct {
         int current_entry;
@@ -503,6 +504,10 @@ struct MCPXAPUState {
     int64_t pace_drain_us;      /* when that queue last fell or sat below high */
     bool pace_stalled;          /* device stopped consuming: host-clock pacing,
                                  * periods dropped (mcpx_apu_pace_step) */
+    bool pace_frames;           /* pace each frame, not each period
+                                 * (RECOMP_APU_PACE_FRAMES, default on) */
+    int pace_span_us;           /* eight frames take this long (pace_frames) */
+    unsigned pace_full_asks;    /* pacing asks refused at a full queue */
     bool seq_ran;               /* the VP has rendered since the sequencer last
                                  * stayed off (mcpx_apu_frame_kind) */
     bool seq_off;               /* the sequencer reads off; since seq_off_us */
@@ -559,6 +564,9 @@ int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
 /* The period pace_step admitted was rendered: spend its credit. A pass that
  * renders nothing (front end trapped) spends none. */
 void mcpx_apu_pace_rendered(MCPXAPUState *d);
+/* With pace_frames, pace_step asks per frame and this charges each one
+ * (frame: its ep_frame_div before rendering). */
+void mcpx_apu_pace_frame_rendered(MCPXAPUState *d, int frame);
 
 /* What the frame thread does with the next 32-sample frame, from SECTL and
  * FECTL: render it through the VP, nothing while the front end is trapped or

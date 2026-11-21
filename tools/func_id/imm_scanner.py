@@ -54,7 +54,7 @@ def scan_immediate_refs(xbe_data, functions, verbose=False):
     i = 0
     end = len(text_bytes) - 5  # Need at least opcode + 4 bytes
 
-    while i < end:
+    while i <= end:
         b = text_bytes[i]
         imm_val = None
 

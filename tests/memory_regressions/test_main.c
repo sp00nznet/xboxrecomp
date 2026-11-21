@@ -9,7 +9,10 @@
  * One process per mode, because the switches are read once:
  *
  *   default       No switch set. Pins what every title gets today, so a change
- *                 that alters the default shows up here.
+ *                 that alters the default shows up here. A freed block with
+ *                 64 KB or more to spare is split on reuse (check 1).
+ *   heap-split-off RECOMP_HEAP_SPLIT=0: reuse hands a freed block over whole
+ *                 again, as before the split.
  *   heap-reclaim  RECOMP_HEAP_RECLAIM=1. Each check fails without the fix:
  *
  *   1. A small request after a large free takes only what it needs. Reuse used
@@ -17,6 +20,12 @@
  *   2. Freeing three neighbours in an awkward order merges all three. Merging
  *      left an empty slot behind that later frees did not step over, so the
  *      third block never joined the other two.
+ *   2b. A live block before a run of merged frees is still found by address.
+ *      A merge zeroed the emptied slot's address, which broke the binary
+ *      search, so naming the block (MmGetPhysicalAddress) was lost.
+ *   2c. A block carved from the front of a merged run is found by address in
+ *      its second half. The empty slots after the reused one kept addresses
+ *      from inside the carved block, so lookups there found the free remainder.
  *   3. NtFreeVirtualMemory(MEM_RELEASE) on memory NtAllocateVirtualMemory took
  *      from the heap gives it back. It handed the 32-bit guest slot to the host
  *      VirtualFree as a pointer, which failed, so none of it ever returned.
@@ -29,6 +38,11 @@
  *      unconstrained requests have filled up to it -- XDK D3D's visibility
  *      test report pages ask for exactly that, and a bump pointer refused
  *      every one -- and a request for a range above the pointer lands in it.
+ *   9. (default too) Contiguous pages a title made read-only (MmSetAddressProtect)
+ *      and freed come back writable and zeroed, reused by the allocator or
+ *      asked for by physical range. Zeroing them faulted.
+ *  10. (default too) NtAllocateVirtualMemory with no base returns a 64 KB-
+ *      aligned address, as on the console. It returned page-aligned ones.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
@@ -57,11 +71,14 @@ extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
-enum { S_ALLOC, S_FREE, S_QUERY, N_SLOTS };
+enum { S_ALLOC, S_FREE, S_QUERY, S_CALLOC, S_CFREE, S_PROTECT, N_SLOTS };
 static const uint32_t ORD[N_SLOTS] = {
     184,   /* NtAllocateVirtualMemory */
     199,   /* NtFreeVirtualMemory */
     217,   /* NtQueryVirtualMemory */
+    166,   /* MmAllocateContiguousMemoryEx */
+    171,   /* MmFreeContiguousMemory */
+    182,   /* MmSetAddressProtect */
 };
 
 static uint32_t scratch;                 /* guest VA of a 64 KB block */
@@ -149,6 +166,22 @@ static uint32_t nt_query(uint32_t base, uint32_t mbi[7])
     return st;
 }
 
+/* MmAllocateContiguousMemoryEx(size, low, high, align, PAGE_READWRITE). */
+static uint32_t mm_contig_alloc(uint32_t size, uint32_t low, uint32_t high)
+{
+    uint32_t args[5] = { size, low, high, 4096, 0x04 };
+    return call(S_CALLOC, 5, args);
+}
+
+/* MmSetAddressProtect(va, size, PAGE_READONLY), then MmFreeContiguousMemory(va). */
+static void mm_contig_protect_and_free(uint32_t va, uint32_t size)
+{
+    uint32_t args[3] = { va, size, 0x02 };
+    call(S_PROTECT, 3, args);
+    args[0] = va;
+    call(S_CFREE, 1, args);
+}
+
 static unsigned char *load_file(const char *path, size_t *len)
 {
     FILE *f = fopen(path, "rb");
@@ -187,13 +220,14 @@ int main(int argc, char **argv)
     int ext128 = !strcmp(mode, "ext-vma-128");
     int ext = ext128 || !strcmp(mode, "ext-vma");
     int avoid = !strcmp(mode, "contig-avoid-image");
+    int split_off = !strcmp(mode, "heap-split-off");
     size_t xbe_len = 0;
     unsigned char *xbe;
     char d[160];
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && !avoid && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !avoid && !split_off && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -203,6 +237,8 @@ int main(int argc, char **argv)
         set_env("RECOMP_EXT_VMA", "1");
     if (avoid)
         set_env("RECOMP_CONTIG_AVOID_IMAGE", "1");
+    if (split_off)
+        set_env("RECOMP_HEAP_SPLIT", "0");
     if (ext128)
         xbox_SetTotalRam(XBOX_DEVKIT_RAM);
 
@@ -257,7 +293,9 @@ int main(int argc, char **argv)
         s1 = xbox_HeapAlloc(16, 16);
         s2 = xbox_HeapAlloc(16, 16);
 
-        if (reclaim) {
+        if (reclaim || !split_off) {
+            /* RECOMP_HEAP_RECLAIM carves every reuse; by default a freed block
+             * with 64 KB or more to spare is split too. */
             snprintf(d, sizeof d, "block is %u bytes, expected 16", xbox_HeapBlockSize(s1));
             check(xbox_HeapBlockSize(s1) == 16, "16-byte request takes 16 bytes of a freed 2 MB", d);
             snprintf(d, sizeof d, "second request at 0x%08X, outside 0x%08X", s2, a);
@@ -285,6 +323,58 @@ int main(int argc, char **argv)
         snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", m, x);
         check(y == x + 64 && z == y + 64 && m == x,
               "three freed neighbours merge into one 192-byte block", d);
+    }
+
+    /* 2b. A run of merges after a live block leaves empty slots that must
+     * keep their addresses, or lookups by address miss the block. */
+    if (reclaim) {
+        enum { RUN = 256 };
+        uint32_t t = xbox_HeapAlloc(64, 16), run[RUN], guard;
+        int k;
+
+        for (k = 0; k < RUN; k++)
+            run[k] = xbox_HeapAlloc(64, 16);
+        guard = xbox_HeapAlloc(64, 16);
+        (void)guard;
+        for (k = 0; k < RUN; k++)
+            xbox_HeapFree(run[k]);           /* each merges into run[0] */
+        xbox_PhysNoteRamName(t);
+        snprintf(d, sizeof d, "block 0x%08X, run 0x%08X..", t, run[0]);
+        check(xbox_PhysRamNamedAt(t),
+              "a named block before 255 merged-away slots stays named", d);
+    }
+
+    /* 2c. Carving the front of a merged run reuses the slot after it for the
+     * free remainder; the empty slots further on must not stay below that
+     * remainder's address, or lookups in the carved block find the remainder.
+     * Pieces that land in holes earlier cases left stay allocated, filling
+     * them, until RUN pieces in a row sit back to back: every free block
+     * before the run is then too small for TAKE, so the carve takes its front. */
+    if (reclaim) {
+        enum { RUN = 512, PIECE = 64, TAKE = RUN * PIECE * 3 / 4 };
+        uint32_t run[RUN], big, tail;
+        int k = 0, tries;
+
+        for (tries = 0; k < RUN && tries < 64 * RUN; tries++) {
+            uint32_t p = xbox_HeapAlloc(PIECE, 16);
+            if (k && p != run[k - 1] + PIECE)
+                k = 0;
+            run[k++] = p;
+        }
+        snprintf(d, sizeof d, "%d in a row after %d", k, tries);
+        check(k == RUN, "a run of pieces back to back", d);
+        if (k == RUN) {
+            for (k = 0; k < RUN; k++)
+                xbox_HeapFree(run[k]);       /* each merges into run[0] */
+            big = xbox_HeapAlloc(TAKE, 16);
+            snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", big, run[0]);
+            check(big == run[0], "a large request carves the merged run's front", d);
+            tail = big + TAKE - PIECE;
+            xbox_PhysNoteRamName(tail);
+            snprintf(d, sizeof d, "block 0x%08X+0x%X, looked up 0x%08X", big, TAKE, tail);
+            check(xbox_PhysRamNamedAt(tail),
+                  "the carved block's second half is found by address", d);
+        }
     }
 
     /* 3. Releasing NtAllocateVirtualMemory memory returns it. */
@@ -339,6 +429,37 @@ int main(int argc, char **argv)
         }
     }
 
+    /* 9. A title that marks its contiguous block read-only and frees it gets
+     * the pages back writable and zeroed, by the allocator (reclaim reuses the
+     * block) and by a request pinned to the same physical range. Both faulted
+     * zeroing the read-only pages. */
+    if (!ext) {
+        const uint32_t size = 0x2000;
+        uint32_t c1 = mm_contig_alloc(size, 0, 0xFFFFFFFFu), c2, c3;
+
+        *G(c1) = 0x11111111u;
+        mm_contig_protect_and_free(c1, size);
+        c2 = mm_contig_alloc(size, 0, 0xFFFFFFFFu);
+        if (reclaim) {
+            snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", c2, c1);
+            check(c1 && c2 == c1, "a read-only freed block is reused", d);
+        }
+        if (c2) {
+            check(*G(c2) == 0 && *G(c2 + size - 4) == 0, "it comes back zeroed", NULL);
+            *G(c2 + size - 4) = 0x22222222u;
+            check(*G(c2 + size - 4) == 0x22222222u, "and writable", NULL);
+        }
+
+        mm_contig_protect_and_free(c2, size);
+        c3 = mm_contig_alloc(size, c2 - XBOX_CONTIG_BASE, c2 - XBOX_CONTIG_BASE + size - 1);
+        snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", c3, c2);
+        check(c3 == c2, "a request pinned to its physical range gets it", d);
+        if (c3 == c2) {
+            *G(c3) = 0x33333333u;
+            check(*G(c3) == 0x33333333u && *G(c3 + 4) == 0, "pinned: zeroed and writable", NULL);
+        }
+    }
+
     /* 7. The physical range of MmAllocateContiguousMemoryEx is honoured. */
     if (!ext) {
         const uint32_t MB = 1024u * 1024u;
@@ -373,6 +494,19 @@ int main(int argc, char **argv)
             snprintf(d, sizeof d, "got 0x%08X", again);
             check(again == 0, "a partly overlapped claim keeps its free pages", d);
         }
+    }
+
+    /* 8. Kernel-chosen virtual memory is 64 KB-aligned. A page-sized block
+     * first, so the next request would land on a page boundary. */
+    if (!ext) {
+        uint32_t b1 = 0, b2 = 0, b3 = 0;
+
+        nt_alloc(0x1000, &b1);
+        nt_alloc(0x3000, &b2);
+        nt_alloc(0x11000, &b3);
+        snprintf(d, sizeof d, "got 0x%08X, 0x%08X, 0x%08X", b1, b2, b3);
+        check(b1 && b2 && b3 && !(b1 & 0xFFFF) && !(b2 & 0xFFFF) && !(b3 & 0xFFFF),
+              "NtAllocateVirtualMemory addresses are 64 KB-aligned", d);
     }
 
     /* 4. Above the RAM mirrors: [0x74000000, 0x7FFE0000) at 64 MB. */

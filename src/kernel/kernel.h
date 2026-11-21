@@ -721,6 +721,11 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass);
 
+/* The XBE header's init flags (offset 0x124). Their top two bits are the
+ * utility drive's cluster size, which a cache partition then reports.
+ * xbox_MemoryLayoutInit calls it; without the call it is 16 KB. */
+void xbox_file_set_init_flags(uint32_t init_flags);
+
 /* NtSetInformationFile(FileRenameInformation), with the guest's
  * FILE_RENAME_INFORMATION already unpacked: its FileName is a guest pointer,
  * so only the bridge can read it. NewName->RootDirectory is a host HANDLE or

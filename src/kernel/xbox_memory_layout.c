@@ -2787,6 +2787,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         memcpy(XBOX_VA(XBOX_BASE_ADDRESS), xbe, header_size);
         fprintf(stderr, "  XBE header: %u bytes at %p (Xbox VA 0x%08X)\n",
                 header_size, XBOX_VA(XBOX_BASE_ADDRESS), XBOX_BASE_ADDRESS);
+        /* The utility drive's cluster size lives in the init flags; the
+         * file layer reports it for the cache partitions. */
+        if (xbe_size >= 0x128)
+            xbox_file_set_init_flags(*(const DWORD *)(xbe + 0x0124));
     }
 
     /*
@@ -3855,36 +3859,53 @@ static int heap_insert_free(int at, uint32_t addr, uint32_t size)
     g_heap_blocks[at].addr = addr;
     g_heap_blocks[at].size = size;
     g_heap_blocks[at].free = 1; g_heap_blocks[at].named = 0;
+    /* The empty slots after a reused one kept addresses from inside the block
+     * that was carved, which can be below `addr` now. Left there they break
+     * the address order heap_block_at searches by: DOAX's replayed movie ring
+     * sat at the front of such a block, lookups in its second half found the
+     * free remainder (not named), and the APU read those pages from the
+     * window instead of the RAM the title wrote. */
+    for (int j = at + 1; j < g_heap_block_count && g_heap_blocks[j].size == 0 &&
+                         g_heap_blocks[j].addr < addr; j++)
+        g_heap_blocks[j].addr = addr;
     return 1;
 }
 
-/* Take exactly `size` bytes, aligned, out of the first free block that has room
- * for them; what is left in front of and behind the piece stays free. Returns 0
- * when no free block fits. Caller holds g_heap_lock. */
+/* Take exactly `size` bytes, aligned, out of free block `i`; what is left in
+ * front of and behind the piece stays free. Returns 0 when the block has no
+ * room for them. Caller holds g_heap_lock. */
+static uint32_t heap_carve_block(int i, uint32_t size, uint32_t alignment)
+{
+    uint32_t a, start, end, front, back;
+    if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size)
+        return 0;
+    a = g_heap_blocks[i].addr;
+    start = (a + alignment - 1) & ~(alignment - 1);
+    end = a + g_heap_blocks[i].size;
+    if (start + size > end || start + size < start)
+        return 0;   /* not enough room once aligned */
+    front = start - a;
+    back = end - (start + size);
+    if (front && !heap_insert_free(i, a, front))
+        return 0;   /* table full: leave this block alone */
+    if (front)
+        i++;        /* the taken piece moved up one slot */
+    g_heap_blocks[i].addr = start;
+    g_heap_blocks[i].size = size;
+    g_heap_blocks[i].free = 0; g_heap_blocks[i].named = 0;
+    if (back && !heap_insert_free(i + 1, start + size, back))
+        g_heap_blocks[i].size += back;   /* table full: keep it attached */
+    memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
+    return start;
+}
+
+/* The same, out of the first free block that has room. */
 static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
 {
     for (int i = 0; i < g_heap_block_count; i++) {
-        uint32_t a, start, end, front, back;
-        if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size)
-            continue;
-        a = g_heap_blocks[i].addr;
-        start = (a + alignment - 1) & ~(alignment - 1);
-        end = a + g_heap_blocks[i].size;
-        if (start + size > end || start + size < start)
-            continue;   /* not enough room once aligned */
-        front = start - a;
-        back = end - (start + size);
-        if (front && !heap_insert_free(i, a, front))
-            continue;   /* table full: leave this block alone */
-        if (front)
-            i++;        /* the taken piece moved up one slot */
-        g_heap_blocks[i].addr = start;
-        g_heap_blocks[i].size = size;
-        g_heap_blocks[i].free = 0; g_heap_blocks[i].named = 0;
-        if (back && !heap_insert_free(i + 1, start + size, back))
-            g_heap_blocks[i].size += back;   /* table full: keep it attached */
-        memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
-        return start;
+        uint32_t r = heap_carve_block(i, size, alignment);
+        if (r)
+            return r;
     }
     return 0;
 }
@@ -4230,9 +4251,15 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
     }
     contig_unlock();
 
-    if (result)
+    /* Freed pages keep any protection the title gave them (MmSetAddressProtect):
+     * make them writable before zeroing. Callers then apply what they asked for. */
+    if (result) {
+        DWORD old;
+        VirtualProtect((void *)((uintptr_t)result + g_memory_offset),
+                       (size_t)n * CONTIG_PAGE, PAGE_READWRITE, &old);
         memset((void *)((uintptr_t)result + g_memory_offset), 0,
                (size_t)n * CONTIG_PAGE);
+    }
     return result;
 }
 
@@ -4450,6 +4477,53 @@ int xbox_PhysRamNamedAt(uint32_t pa)
     return named;
 }
 
+/* A heap page's physical number in the first RAM mirror.
+ *
+ * The record above cannot settle one case: a live heap block the title named
+ * and a live window buffer on the same physical numbers. Whichever copy the
+ * APU picks, one of the two plays the other's bytes. In Def Jam: Fight for NY
+ * the music stream is a window buffer; a string table 21 KB larger (a
+ * translation) moved a named heap page over its numbers, and the stream read
+ * RAM for those pages: about 1,300 one-slice gaps a minute in the opening
+ * scene, heard as crackling.
+ *
+ * So the heap is not given those numbers at all. A heap page below 64 MB is
+ * named va + the RAM size, which is where the first mirror shows the same
+ * bytes; the console's memory controller wraps such an address back onto the
+ * page too. The window keeps every number below 64 MB to itself, and each
+ * device reads the right copy without a guess: the APU and the OHCI wrap the
+ * alias (mcpx_apu_phys, bus_resolve), and the NV2A executor, finding it above
+ * the window's high-water mark, reads it as a guest address in the mirror. The
+ * OHCI cannot read it there: its bounds check admits RAM only below the mapped
+ * size, so without the wrap XAPI's pad report buffer (a heap block) got no
+ * reports and Splinter Cell's pad was dead from the first menu. With no
+ * first mirror (a map too large for one) or RECOMP_PHYS_RAM_ALIAS=0 the name
+ * is the identity and the record above decides, as before. */
+uint32_t xbox_PhysRamAlias(void)
+{
+    static int alias = -1;
+    if (alias < 0) {
+        const char *e = getenv("RECOMP_PHYS_RAM_ALIAS");
+        alias = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+        if (alias)
+            fprintf(stderr, "  Physical names: heap pages below 64 MB alias"
+                            " into the first RAM mirror\n");
+    }
+    return alias && g_mirror_views[0] && g_memory_size >= XBOX_CONTIG_SIZE &&
+           g_memory_size <= 2u * XBOX_CONTIG_SIZE ? (uint32_t)g_memory_size : 0;
+}
+
+uint32_t xbox_PhysRamName(uint32_t va)
+{
+    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE) {
+        uint32_t alias = xbox_PhysRamAlias();
+        if (alias)
+            return va + alias;
+        xbox_PhysNoteRamName(va);
+    }
+    return va;
+}
+
 /* Heap block m is free (and merged with any free neighbours): its pages name
  * nothing now, except an edge page it shares with a live block. Index order is
  * address order, so the blocks that can share an edge page are the nearest
@@ -4541,6 +4615,24 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
             }
             if (g_heap_blocks[i].addr & (alignment - 1)) {
                 continue;   /* wrong alignment for this request */
+            }
+            /* A freed block far bigger than the request is split, not handed
+             * out whole. Kung Fu Chaos frees a level's 6.8 MB buffers when it
+             * leaves a match load with B; the next small requests each took one
+             * of them whole (15 MB of slack in reused blocks), and reloading
+             * the menu then found no room for its own 6.8 MB buffer: malloc
+             * returned 0, the asset stayed empty and the game crashed. Small
+             * slack keeps the old behaviour, so most reuse is unchanged.
+             * RECOMP_HEAP_SPLIT=0 hands blocks out whole again. */
+            static int split = -1;
+            if (split < 0) {
+                const char *e = getenv("RECOMP_HEAP_SPLIT");
+                split = !(e && e[0] == '0');
+            }
+            if (split && g_heap_blocks[i].size - size >= 0x10000u) {
+                result = heap_carve_block(i, (size + 15) & ~15u, alignment);
+                if (result)
+                    return result;
             }
             g_heap_blocks[i].free = 0; g_heap_blocks[i].named = 0;
             result = g_heap_blocks[i].addr;
@@ -4678,7 +4770,10 @@ void xbox_HeapFree(uint32_t xbox_va)
          * test. Keeps large contiguous requests satisfiable after a lot of
          * small churn. Under RECOMP_HEAP_RECLAIM the neighbour search steps
          * over the empty slots (size 0) earlier merges leave behind; without
-         * that, one merge stops every later one dead. */
+         * that, one merge stops every later one dead.
+         *
+         * An emptied slot keeps its address: heap_block_at binary-searches
+         * the table by address. */
         {
             int n = i + 1, p = i - 1, m = i;
             if (xbox_HeapReclaimEnabled()) {
@@ -4689,13 +4784,11 @@ void xbox_HeapFree(uint32_t xbox_va)
                 g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[n].addr) {
                 g_heap_blocks[i].size += g_heap_blocks[n].size;
                 g_heap_blocks[n].size = 0;
-                g_heap_blocks[n].addr = 0;
             }
             if (p >= 0 && g_heap_blocks[p].free &&
                 g_heap_blocks[p].addr + g_heap_blocks[p].size == g_heap_blocks[i].addr) {
                 g_heap_blocks[p].size += g_heap_blocks[i].size;
                 g_heap_blocks[i].size = 0;
-                g_heap_blocks[i].addr = 0;
                 m = p;
             }
             /* After the merge, so a page this block shared with a neighbour

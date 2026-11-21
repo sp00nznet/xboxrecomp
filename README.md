@@ -22,7 +22,7 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 ### Recent Changes
 
-**Current version: v0.17.0 — _"Empty Promises"_ (November 2026).**
+**Current version: v0.18.0 — _"Wrong Grain"_ (November 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
@@ -476,7 +476,7 @@ definitions — they are the real proof for the shift, flag and x87 work, and
 each is paired with a negative control that feeds the harness the pre-fix
 expression and requires it to fail. They need a C compiler on `PATH`, and
 **skip rather than fail without one**, so check the skip count: a clean run is
-988 passed / 1 skipped (a POSIX-only test). If clang is installed but not on `PATH`:
+1023 passed / 1 skipped (a POSIX-only test). If clang is installed but not on `PATH`:
 
 ```bash
 export PATH="/c/Program Files/LLVM/bin:$PATH"   # Git Bash
@@ -594,6 +594,155 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.18.0 — *"Wrong Grain"* (November 2026)
+
+*Thirty-two PRs, and most of them are the right thing counted in the wrong
+unit. The kernel handed out virtual memory on 4 KB boundaries where the console
+uses 64 KB, so Unreal Engine 2 freed Splinter Cell's level table into the wrong
+pool. The utility drive always reported 16 KB clusters, so Turok: Evolution,
+which asks for 64 KB, quit at boot. The voice processor ran a 256-sample period
+in one burst where the hardware runs a 32-sample frame every 0.67 ms. MSVC's
+`memcpy` jump table starts at slot 1, so a measurer that counted from slot 0
+found nothing there. In every case the value was close enough to look right.*
+
+**Contributed: kernel and memory**
+
+- **Kernel-chosen virtual addresses are 64 KB-aligned**, as on the console.
+  Unreal Engine 2's `FMallocXbox` indexes its pools by address bits 16-23, so a
+  4 KB-aligned pool straddled two slots. In Splinter Cell a live pool holding
+  the level table was released and re-zeroed, and the game crashed at startup —
+  *[@rtaranu](https://github.com/rtaranu)* (#331)
+- **A merged-away heap slot keeps its address.** The block table is
+  binary-searched by address, and zeroing a merged slot sent lookups to the
+  wrong block. That cost `MmGetPhysicalAddress` its names, and Dead or Alive
+  Xtreme Beach Volleyball's intro movie hissed on every lap —
+  *[@rtaranu](https://github.com/rtaranu)* (#330)
+- **Reused contiguous pages come back writable**, with the protection the
+  caller asked for. `MmAllocateContiguousMemoryEx` ignored `Protect`, so a
+  block a title had made read-only faulted when the allocator zeroed it —
+  *[@rtaranu](https://github.com/rtaranu)* (#337)
+- **Large free heap blocks are split.** A freed 6.8 MB streaming buffer was
+  handed whole to the next small request, so Kung Fu Chaos ran out of heap
+  when a load was cancelled and restarted. `RECOMP_HEAP_SPLIT=0` turns the
+  split off —
+  *[@maxiumpro](https://github.com/maxiumpro)* (#268)
+- **Heap pages are named by their RAM-mirror alias**, so a heap page and a
+  contiguous-window page never share a physical number. On Def Jam: Fight for
+  NY a fan translation's larger string table put a heap block over the music
+  stream's numbers and the music crackled. The OHCI fold from
+  *[@rtaranu](https://github.com/rtaranu)* keeps Splinter Cell's pad alive.
+  `RECOMP_PHYS_RAM_ALIAS=0` restores the old naming —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#286)
+- **The utility drive reports the cluster size the XBE asked for.** XAPI
+  formats the cache partition with the size in the init flags, then checks it.
+  Turok: Evolution asks for 64 KB and exited at boot —
+  *[@danfreitas97](https://github.com/danfreitas97)* (#321)
+- **Opt-in widescreen and 480p EEPROM flags** (`RECOMP_VIDEO_WIDESCREEN=1`,
+  `RECOMP_VIDEO_480P=1`), the follow-up to #301. The default stays NTSC 4:3
+  480i —
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#320)
+- **Case folding runs on every host.** On a case-insensitive host the fold
+  returned early and handed back the spelling the title asked for, so macOS
+  and Linux resolved Burnout 3's `D:\tracks` to different names —
+  *[@dplewis](https://github.com/dplewis)* (#317)
+- **`FILE_NON_DIRECTORY_FILE` refuses a directory on POSIX**, as the Win32
+  backend already did —
+  *[@dplewis](https://github.com/dplewis)* (#316)
+
+**Contributed: audio**
+
+- **The voice processor runs one 32-sample frame at a time**, 0.67 ms apart as
+  on the hardware, instead of eight back to back and then a sleep. A title that
+  stops a voice and spins until the walk retires it waited up to 7 ms each
+  time, and Burnout 3's crash mode stops about 900 sounds in five minutes. On
+  by default; `RECOMP_APU_PACE_FRAMES=0` restores the old pacing —
+  *[@rtaranu](https://github.com/rtaranu)* (#341)
+- **Idle-voice traps take turns.** Each frame trapped on the first idle voice
+  in the list, so a voice the title left listed hid every one behind it.
+  MechAssault hung loading its first mission —
+  *[@rtaranu](https://github.com/rtaranu)* (#340)
+- **`voice_set_mask` writes its field atomically.** The frame thread's
+  envelope write could put back a `VOICE_OFF`'s active bit —
+  *[@rtaranu](https://github.com/rtaranu)* (#334)
+- **`RECOMP_APU_SSL_ADVANCE=1`** lets a stream voice go on through an empty
+  segment list, which is what DirectSound expects, instead of keeping it there
+  as xemu does. Off by default —
+  *[@rtaranu](https://github.com/rtaranu)* (#342)
+
+**Contributed: NV2A**
+
+- **2D quads sent with RHW 0 are drawn.** The reciprocal makes `w` infinite,
+  and the clip test dropped them: menus and movie frames went missing —
+  *[@rtaranu](https://github.com/rtaranu)* (#343)
+- **A colour clear marks its surface as drawn.** A frame that only cleared and
+  then CPU-blitted presented the previous buffer, so Splinter Cell's Bink intro
+  never showed —
+  *[@rtaranu](https://github.com/rtaranu)* (#332)
+- **A reusable fake-backend fixture and contract test**, the first step from
+  #306 —
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#319)
+
+**Contributed: lifter and disassembler**
+
+- **xmm `pand`/`pandn`/`por`/`pxor`/`pcmpgtd`, `movq` on xmm, and
+  `fincstp`/`fdecstp` are lifted** instead of compiling to a comment. Every
+  remaining comment-only SSE and x87 fallback now counts as unimplemented and
+  shows under `RECOMP_UNIMPL`, so expect that report to grow —
+  *[@MattSG](https://github.com/MattSG)* (#329)
+- **`fcmovb`/`fcmovnb`/`fcmovbe`/`fcmovnbe` request carry tracking**, as `jcc`
+  and `cmov` already did; without it they read an undeclared `_cf` —
+  *[@Tzeentchnet](https://github.com/Tzeentchnet)* (#314)
+- **A project can pin the x87 transcendentals.** Generated code calls
+  `recomp_sin` and friends, which use the host libm unless
+  `RECOMP_PORTABLE_MATH` supplies its own, so netplay and rollback get the
+  same bits on every host —
+  *[@NoRain211](https://github.com/NoRain211)* (#335)
+- **Direct jumps that land past an inline table are resynced.** The target
+  was swallowed by the table's decode and the `goto` dropped; Dead or Alive 3
+  lost a whole switch case and never reached character select —
+  *[@NoRain211](https://github.com/NoRain211)* (#275)
+- **Decoded instructions are reused across discovery passes**: the recomp
+  stage is 34-39% faster on four titles, for about 1 GB more peak memory —
+  *[@NoRain211](https://github.com/NoRain211)* (#336), measured by
+  *[@rtaranu](https://github.com/rtaranu)*
+- **A jump table indexed from slot 1 is measured**, so MSVC's `memcpy`
+  dispatch no longer ends the function at its own `jmp` —
+  *[@rtaranu](https://github.com/rtaranu)* (#338)
+- **Seed entries can mark an address `not_function`**, and observed seeds
+  are part of the cache key, so changing either takes effect on the next run —
+  *[@rtaranu](https://github.com/rtaranu)* (#339, #333)
+
+**Contributed: tools**
+
+- **`xiso unpack` skips disc names that would leave the output directory**
+  (`../x`, `a\..\b`) —
+  *[@MattSG](https://github.com/MattSG)* (#322)
+- **`func_id`**: an immediate in the last instruction of `.text` is read
+  (#325), a CRT name replaced by a longer signature is freed (#324), SSE chain
+  stubs are not capped at 120 bytes (#327), and RenderWare IDs match any
+  `RWnnActive` branch (#326) —
+  *[@MattSG](https://github.com/MattSG)*
+- **`rtti` reads stay inside file-backed bytes** and executable sections
+  count as code (#328), and **`abi_analysis --output` takes a bare file
+  name** (#323) —
+  *[@MattSG](https://github.com/MattSG)*
+
+**Contributed: tests**
+
+- **Six regression tests stop being Windows-only.** Tests that really are
+  Windows-only now report a skip on POSIX instead of failing —
+  *[@dplewis](https://github.com/dplewis)* (#313)
+
+**Maintainer**
+
+- Utility-drive init-flag value 3 clamps to 64 KB rather than 128 KB (follow-up
+  to #321), and `RECOMP_PHYS_RAM_ALIAS` gets its environment-variables row.
+
+**Testing**
+
+- A clean run is now **1023 passed / 1 skipped** (the skip is a POSIX-only test on Windows), up from 988, plus
+  6,368 conformance vectors with no mismatches on an AMD host.
 
 ### v0.17.0 — *"Empty Promises"* (November 2026)
 

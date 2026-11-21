@@ -281,6 +281,9 @@ direction.
   geometry helper.
 - **A lone switch arm before a null slot (#310)** and **`wbinvd` (#309)**.
 
+*v0.18.0*
+- **Pinnable x87 transcendentals (#335)** for netplay and rollback, **jumps past inline tables resynced (#275)** — Dead or Alive 3's character select — and **a decode cache (#336)** that cuts the recomp stage by a third.
+
 ### DarthSidious666 — [@DarthSidious666](https://github.com/DarthSidious666)
 - **Implemented the missing `tools/abi_analysis` (#6)** — the pipeline had a
   hole in it: `tools.recomp` looked for `abi_functions.json`, warned when it
@@ -453,6 +456,9 @@ direction.
   of failing.
 - **`RECOMP_RASTER_THREADS` on POSIX (#242)** — documented, and silently one
   thread: 110 → 278 Mpx/s on an M4.
+
+*v0.18.0*
+- **Case folding on every host (#317)**, **`FILE_NON_DIRECTORY_FILE` on POSIX (#316)**, and **six regression tests no longer Windows-only (#313)**.
 
 ### GTTeancum — [@GTTeancum](https://github.com/GTTeancum)
 Fourteen fixes in two days, found by driving a real title through the pipeline
@@ -881,6 +887,9 @@ fails on the old code and a real-CPU conformance case where one applies.
   per text.
 - **The README's ports table (#256).**
 
+*v0.18.0*
+- **Heap pages named by their RAM-mirror alias (#286)** — the Def Jam music crackle — reworked with cross-title testing from rtaranu and maxiumpro.
+
 ### Leonardo Valdes Arteaga — [@eolandro](https://github.com/eolandro)
 - **The runtime did not build with GCC on Linux (#172)** — the VEH code
   needed real `EXCEPTION_POINTERS`/`CONTEXT` shapes and `EXCEPTION_SINGLE_STEP`,
@@ -1039,6 +1048,10 @@ Found while bringing up *SSX 3* (PAL); see
   `\Device\CdRom0`, a directory opened without the directory flag, and DVD
   SCSI commands that reported success over the title's own heap bytes.
 
+*v0.18.0*
+- **Lifts that compiled to a comment (#329)** — xmm bitwise ops, `movq` on xmm and the x87 stack-pointer ops — with every remaining fallback now counted.
+- **`xiso unpack` path traversal (#322)**, and edge-case fixes across `func_id`, `rtti` and `abi_analysis` (#323-#328), each with a test that fails on the old code.
+
 ### Madiyar — [@kaskabayev](https://github.com/kaskabayev)
 - **XDK register constants cut `.text` functions (#234).** D3D's NV2A
   constants equal `.text` addresses, and the immediate-reference pass took
@@ -1071,6 +1084,9 @@ Found on *SSX 3* (PAL) on Linux.
 - **`PMADDWD` overflow (#284)**, **the MMX test on ARM64 (#283)** and **the
   unimplemented-instruction report's wording (#299)**.
 
+*v0.18.0*
+- **The NV2A fake-backend fixture and contract test (#319)**, the first step agreed on #306; **opt-in widescreen and 480p EEPROM flags (#320)**; and **carry tracking for `fcmov` (#314)**.
+
 ### maxiumpro — [@maxiumpro](https://github.com/maxiumpro)
 Found on *Kung Fu Chaos*; see
 [kungfuchaos-recomp](https://github.com/maxiumpro/kungfuchaos-recomp).
@@ -1079,6 +1095,9 @@ Found on *Kung Fu Chaos*; see
   passed the guest object's address to Windows as a thread handle, so every
   call failed.
 - **Kung Fu Chaos in the ports table (#271).**
+
+*v0.18.0*
+- **Large free heap blocks split (#268)** — Kung Fu Chaos ran out of heap after a cancelled load.
 
 ### Raajik — [@Raajik](https://github.com/Raajik)
 Found bringing up *SSX On Tour* on Linux.
@@ -1168,6 +1187,18 @@ Found bringing up *SSX On Tour* on Linux.
 
   All three are fixed in v0.15.0 (#235 and its follow-up). The report kept
   its one unproven workaround clearly apart from the fixes.
+
+### rtaranu — [@rtaranu](https://github.com/rtaranu)
+Twelve PRs in one release, found across *Splinter Cell*, *Dead or Alive Xtreme Beach Volleyball*, *MechAssault* and *Burnout 3*, and a regular tester of other people's PRs on the same four titles.
+
+- **Memory at the console's grain (#331, #330, #337)** — 64 KB-aligned virtual addresses (Splinter Cell's level table freed into the wrong Unreal pool), heap slots that keep their address (DOAX's movie hiss), and reused contiguous pages that come back writable.
+- **The voice processor (#341, #340, #334, #342)** — one 32-sample frame at a time, idle-voice traps that take turns (MechAssault's mission-load hang), an atomic `voice_set_mask`, and `RECOMP_APU_SSL_ADVANCE`.
+- **NV2A (#343, #332)** — 2D quads with RHW 0, and a colour clear that counts as drawing, which brought back Splinter Cell's Bink intro.
+- **Disassembler (#338, #339, #333)** — jump tables indexed from slot 1, `not_function` seeds, and observed seeds in the cache key.
+- **Found the OHCI break in #286** before it merged, with the four-line fold that fixed it, and measured #336 and #275 for regressions.
+
+### Daniel Freitas — [@danfreitas97](https://github.com/danfreitas97)
+- **The utility drive's cluster size (#321)** — XAPI formats the cache partition with the size the XBE's init flags ask for and then checks it, so *Turok: Evolution*, which asks for 64 KB, exited at boot.
 
 ---
 

@@ -11,3 +11,6 @@ target_link_libraries(apu_phys_test PRIVATE xboxrecomp)
 enable_testing()
 add_test(NAME apu_phys
          COMMAND apu_phys_test ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
+add_test(NAME apu_phys_record
+         COMMAND apu_phys_test ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
+set_tests_properties(apu_phys_record PROPERTIES ENVIRONMENT RECOMP_PHYS_RAM_ALIAS=0)

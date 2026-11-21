@@ -619,6 +619,172 @@ static void stall_fallback_case(void)
     free(d);
 }
 
+/* ---- pacing each frame ----
+ * The frame thread one 32-sample frame per pass, as it runs: throttle in
+ * whole milliseconds (the real wait rounds up), render, submit on the
+ * period's last frame, charge at the boundary. A title that stops a voice
+ * waits for the next frame to start; stop requests are sampled every 10 us
+ * of simulated time. The device drains sample by sample, or in whole
+ * 512-sample buffers as an XAudio2 voice does. Per period, the eight frames
+ * run back to back and the next bunch is up to a period away; spread, about
+ * a millisecond. The queue, the rate and the sample sequence must come out
+ * as with period pacing. */
+struct frame_pacing {
+    double mean_ms, max_ms;
+    int underruns, minq, maxq;
+    int64_t end;
+};
+
+static void frame_pacing_run(int per_frame, int granule, struct frame_pacing *r)
+{
+    MCPXAPUState *d = loop_device();
+    int64_t now = 0, last = 0, probe = 300000;
+    double sum = 0;
+    long probes = 0;
+    int frames = 0;
+
+    if (!d) { failures++; return; }
+    d->pace_frames = per_frame;
+    memset(r, 0, sizeof(*r));
+    r->minq = 1 << 30;
+    while (frames < 8 * 1000) {
+        for (;;) {                           /* throttle */
+            uint64_t c = sim_consumed_at(now, 1LL << 60, 0) / granule * granule;
+            if (c > dev_tail) { r->underruns++; dev_head = dev_tail; }
+            else if (c > dev_head) dev_head = c;
+            if (d->ep_frame_div % 8 == 0 && now > 300000) {
+                int q = xa2_queued_samples() / PERIOD;
+                if (q < r->minq) r->minq = q;
+                if (q > r->maxq) r->maxq = q;
+            }
+            int64_t w = mcpx_apu_pace_step(d, now);
+            if (w <= 0) break;
+            now += (w + 999) / 1000 * 1000;
+        }
+        /* The stops that came in since the last frame wait until now. */
+        for (; probe <= now; probe += 10) {
+            if (probe <= last) continue;
+            double ms = (now - probe) / 1000.0;
+            sum += ms; probes++;
+            if (ms > r->max_ms) r->max_ms = ms;
+        }
+        int div0 = d->ep_frame_div;
+        if (div0 % 8 == 7) {
+            for (int i = 0; i < PERIOD; i++) {
+                uint64_t k = dev_tail + (uint64_t)i;
+                d->monitor.frame_buf[i][0] = (int16_t)(k & 0x7FFF);
+                d->monitor.frame_buf[i][1] = (int16_t)(uint16_t)(k >> 15);
+            }
+            mcpx_apu_monitor_frame(d);
+        }
+        d->ep_frame_div++;
+        if (per_frame)
+            mcpx_apu_pace_frame_rendered(d, div0);
+        else if (div0 % 8 == 0)
+            mcpx_apu_pace_rendered(d);
+        frames++;
+        last = now;
+    }
+    r->mean_ms = probes ? sum / probes : 0;
+    r->end = now;
+    CHECK("frame pacing: no sample dropped or duplicated", dev_seq_errors == 0
+          && dev_tail == 1000ull * PERIOD);
+    dev_model = 0;
+    free(d);
+}
+
+static void frame_pacing_case(void)
+{
+    static const int granules[2] = { 1, 512 };
+    struct frame_pacing r[2][2];
+
+    for (int g = 0; g < 2; g++) {
+        for (int pf = 0; pf < 2; pf++)
+            frame_pacing_run(pf, granules[g], &r[g][pf]);
+        printf("frame pacing (device takes %d): next frame per period"
+               " %.2f ms mean, %.2f max; spread %.2f mean, %.2f max; queue"
+               " %d..%d, %d underruns, 1000 periods in %.3f s\n", granules[g],
+               r[g][0].mean_ms, r[g][0].max_ms, r[g][1].mean_ms,
+               r[g][1].max_ms, r[g][1].minq, r[g][1].maxq, r[g][1].underruns,
+               r[g][1].end / 1e6);
+        CHECK("per period: frames come in bunches (wait > 3 ms)",
+              r[g][0].max_ms > 3.0);
+        CHECK("spread: the next frame is at most 2 ms away", r[g][1].max_ms <= 2.0);
+        CHECK("spread: mean wait under a millisecond", r[g][1].mean_ms < 1.0);
+        CHECK("spread: queue as with period pacing",
+              r[g][1].minq >= r[g][0].minq && r[g][1].maxq <= 8);
+        CHECK("spread: no underrun after start",
+              r[g][1].underruns <= r[g][0].underruns);
+        CHECK("spread: runs at the device rate (1000 periods ~ 5.33 s)",
+              r[g][1].end > 5200000 && r[g][1].end < 5500000);
+    }
+}
+
+/* Spread, the device stops at 2 s and resumes at 3 s (as stall_fallback_case
+ * for period pacing): the frames keep coming on the host clock, the periods
+ * are dropped, and the queue paces again afterwards. */
+static void frame_pacing_stall_case(void)
+{
+    MCPXAPUState *d = loop_device();
+    const int64_t stall_from = 2000000, stall_us = 1000000;
+    int64_t now = 0;
+    int in_stall_frames = 0, in_stall_submits = 0, after_underruns = 0;
+    int minq = 1 << 30, maxq = 0, max_q = 0;
+
+    if (!d) { failures++; return; }
+    d->pace_frames = 1;
+    while (now < 5000000) {
+        for (;;) {
+            uint64_t c = sim_consumed_at(now, stall_from, stall_us) / 512 * 512;
+            if (c > dev_tail) {
+                if (now >= stall_from + stall_us) after_underruns++;
+                dev_head = dev_tail;
+            } else if (c > dev_head) {
+                dev_head = c;
+            }
+            if (d->ep_frame_div % 8 == 0 && now >= stall_from + stall_us + 300000) {
+                int q = xa2_queued_samples() / PERIOD;
+                if (q < minq) minq = q;
+                if (q > maxq) maxq = q;
+            }
+            int64_t w = mcpx_apu_pace_step(d, now);
+            if (w <= 0) break;
+            now += (w + 999) / 1000 * 1000;
+        }
+        int div0 = d->ep_frame_div;
+        uint64_t tail0 = dev_tail;
+        if (div0 % 8 == 7) {
+            for (int i = 0; i < PERIOD; i++) {
+                uint64_t k = dev_tail + (uint64_t)i;
+                d->monitor.frame_buf[i][0] = (int16_t)(k & 0x7FFF);
+                d->monitor.frame_buf[i][1] = (int16_t)(uint16_t)(k >> 15);
+            }
+            mcpx_apu_monitor_frame(d);
+        }
+        d->ep_frame_div++;
+        mcpx_apu_pace_frame_rendered(d, div0);
+        if (now >= stall_from + 250000 && now < stall_from + stall_us) {
+            in_stall_frames++;
+            in_stall_submits += dev_tail != tail0;
+        }
+        if (xa2_queued_samples() / PERIOD > max_q)
+            max_q = xa2_queued_samples() / PERIOD;
+    }
+    printf("frame pacing stall: %d frames rendered and %d periods submitted in"
+           " the last 750 ms of a 1 s stall; after it queue %d..%d, %d"
+           " underruns; queue %d at most\n", in_stall_frames,
+           in_stall_submits, minq, maxq, after_underruns, max_q);
+    CHECK("spread, stalled device: the clock keeps running (~1125 frames)",
+          in_stall_frames > 1000 && in_stall_frames < 1250);
+    CHECK("spread, stalled device: periods are dropped", in_stall_submits == 0);
+    CHECK("spread: queue never grows past high + one period", max_q <= 9);
+    CHECK("spread, device back: the queue paces again", minq >= 4 && maxq <= 8);
+    CHECK("spread, device back: no underrun", after_underruns == 0);
+    CHECK("spread: no sample dropped or duplicated", dev_seq_errors == 0);
+    dev_model = 0;
+    free(d);
+}
+
 /* ---- the frame decision ----
  * DirectSound's SSL service routine stops the sequencer and starts it again
  * (SECTL 0x07, then 0x0F a few hundred microseconds later). A frame that
@@ -767,6 +933,8 @@ int main(int argc, char **argv)
     trapped_case();
     stall_fallback_case();
     starve_case();
+    frame_pacing_case();
+    frame_pacing_stall_case();
     frame_kind_case();
     switch_case();
     voice_trace_case();                      /* last: they redirect stderr */

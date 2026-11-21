@@ -55,6 +55,8 @@ Opt-ins that change how the kernel layer behaves. Each fixes a class of titles; 
 |---|---|---|---|
 | `RECOMP_SAVE_DIR=<dir>` | off | Root for the title's `UDATA`, `TDATA` and cache folders; created if missing. Absolute. Saves left in the game folder are then not used. | `kernel_path.c` |
 | `RECOMP_HEAP_RECLAIM` | off | Gives freed guest heap back. | `xbox_memory_layout.c` |
+| `RECOMP_HEAP_SPLIT=0` | on | Hands a freed heap block over whole on reuse instead of splitting one with 64 KB or more to spare. | `xbox_memory_layout.c` |
+| `RECOMP_PHYS_RAM_ALIAS=0` | on | `MmGetPhysicalAddress` names a heap page below 64 MB by its own address again, instead of its alias in the first RAM mirror. | `xbox_memory_layout.c` |
 | `RECOMP_EXT_VMA` | off | Extended virtual-memory areas above the mirrors. | `guest_vmem.c`, `xbox_memory_layout.c` |
 | `RECOMP_CONTIG_AVOID_IMAGE=1` | off | Keeps contiguous allocations out of the image range. | `xbox_memory_layout.c` |
 | `RECOMP_WIN_PLACEHOLDER` | off | Reserves the guest window with placeholders on Windows hosts where fixed bases are taken. | `xbox_memory_layout.c` |
@@ -133,6 +135,8 @@ The executor is itself opt-in: set `RECOMP_PB_EXEC=1` to execute the pushbuffer.
 | `RECOMP_D3D_PRESENT` | off | Presents through a D3D11 swap chain. | `gpu_present.c` |
 | `RECOMP_PRESENT_VSYNC` | on | `0` turns vsync off. | `gpu_present.c`, `fb_present_sdl.c` |
 | `RECOMP_PRESENT_FILTER` | default | Sampler filter for the D3D11 present. | `gpu_present.c` |
+| `RECOMP_VIDEO_WIDESCREEN=1` | off | Advertises the widescreen EEPROM flag to the title. This does not resize the host window or renderer output. | `kernel_xbox.c` |
+| `RECOMP_VIDEO_480P=1` | off | Advertises the 480p EEPROM flag to the title. This does not change host presentation by itself. | `kernel_xbox.c` |
 | `RECOMP_FMV_HOST` | off | Plays a movie through the host player when the title asks to. A substitute for the title's own output. | `kernel_bridge.c` |
 | `RECOMP_FMV_DUMP=<prefix>` | off | Writes two frames of a movie as BMP evidence. | `video_pump.c` |
 
@@ -147,6 +151,8 @@ See the [APU](../../src/apu/README.md) and [DirectSound](../../src/audio/README.
 | `RECOMP_APU_RING` | off | Ring monitor: finds a streaming writer that falls behind the play cursor. | `apu_vp.c` |
 | `RECOMP_APU_SOLO=<voice>` | off | Mutes every other voice, to find where a sound comes from. | `apu_core.c` |
 | `RECOMP_APU_VOICE_DUMP=<voice\|all>` | off | Dumps voices as raw PCM to `RECOMP_APU_VOICE_DUMP_FILE`. | `apu_vp.c` |
+| `RECOMP_APU_SSL_ADVANCE` | off | `1`: a stream voice goes on through an empty segment list to the other one, and does not replay a list it has played (xemu does both). DirectSound refills the list that finished, so under xemu's rule one late packet put its lists out of step for the rest of the stream. | `apu_vp.c` |
+| `RECOMP_APU_PACE_FRAMES` | on | The frame thread paces each 32-sample voice-processor frame (0.67 ms apart, as the hardware runs them), with the device queue setting the rate. `0`: one 256-sample period at a time, with the eight frames back to back, so a title waiting for a voice to stop (DirectSound's StopEx, then GetStatus) waits up to a period for the next bunch. | `apu_core.c` |
 | `RECOMP_AUDIO_WAV=<path>` | off | Records exactly what the device is given. | `apu_core.c` |
 | `RECOMP_AUDIO_WAV_SECS=N` | unlimited | Caps the recording. | `apu_core.c` |
 | `RECOMP_APU_HRTF` | on | `0` turns HRTF for 3D voices off. | `apu_vp.c` |

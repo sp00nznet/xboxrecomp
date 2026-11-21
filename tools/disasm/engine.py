@@ -340,6 +340,32 @@ class DisasmEngine:
                 if target is None or not (lo <= target < hi):
                     break
                 entries += 1
+            ARM_WINDOW = 0x400
+            # MSVC's memcpy/memmove dispatch their lead bytes through
+            # `jmp [eax*4 + LeadUpVec - 4]` with eax 1..3: slot 0 is whatever
+            # sits in front of the table (the tail of the previous jmp, a nop)
+            # and is never read. The lifter already looks one slot on
+            # (_analyze_switch_table); measure the table from there too, or the
+            # function ends at its own dispatch and every arm after the table
+            # becomes an indirect call nothing resolves (MechAssault's memmove
+            # at 0x001D0580 ended at 0x001D05E4).
+            if entries == 0:
+                first = self.image.read_u32_at_va(tbl + 4)
+                ahead = 0
+                while (first is not None and lo <= first < hi
+                       and ahead < max_entries):
+                    slot = tbl + 4 + ahead * 4
+                    if slot in self.byte_tables:
+                        break
+                    target = self.image.read_u32_at_va(slot)
+                    if (target is None or not (lo <= target < hi)
+                            or abs(target - first) > ARM_WINDOW):
+                        break
+                    ahead += 1
+                if ahead >= min_entries:
+                    self._jt_base[tbl] = tbl + 4
+                    tbl += 4
+                    entries = ahead
             # The displacement need not be the first slot. MSVC's memmove
             # dispatches its backward tail through `jmp [ecx*4 + LAST]`, the
             # table's last entry, with the index counting down from there --
@@ -359,10 +385,11 @@ class DisasmEngine:
             # the one entry known to be real. Not of the whole forward run:
             # that can over-read into a following byte-index table, whose
             # `00 01 02 00` is itself an in-section address, and a window that
-            # wide let HL2's `leave; ret 4` in as a slot.
-            ARM_WINDOW = 0x400
+            # wide let HL2's `leave; ret 4` in as a slot. A table measured one
+            # slot on has nothing below it: slot 0 is not a pointer.
             sites = self._jt_sites.get(tbl, ())
-            anchor = self.image.read_u32_at_va(tbl) if entries else None
+            anchor = (self.image.read_u32_at_va(tbl)
+                      if entries and tbl not in self._jt_base.values() else None)
             back = 0
             while anchor is not None and entries + back < max_entries:
                 slot = tbl - (back + 1) * 4

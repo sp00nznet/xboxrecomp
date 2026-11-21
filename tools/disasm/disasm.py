@@ -40,7 +40,8 @@ class Disassembler:
                  extra_sections: Optional[list] = None,
                  seed_functions: Optional[list] = None,
                  observed_seeds: Optional[set] = None,
-                 skip_library_immediates: bool = False):
+                 skip_library_immediates: bool = False,
+                 not_functions: Optional[set] = None):
         self.xbe_path = xbe_path
         self.analysis_json = analysis_json
         self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
@@ -54,6 +55,8 @@ class Disassembler:
         # Seeds a run actually reached (see _load_seed_functions). They are
         # not guesses, so the mid-instruction guard below does not apply.
         self.observed_seeds = observed_seeds or set()
+        # Never accepted as function starts ("not_function" seed entries).
+        self.not_functions = set(not_functions or ())
 
         # Components (initialized during run)
         self.image: Optional[BinaryImage] = None
@@ -90,7 +93,9 @@ class Disassembler:
                                              self.text_only,
                                              self.extra_sections,
                                              self.seed_functions,
-                                             self.skip_library_immediates):
+                                             self.skip_library_immediates,
+                                             self.observed_seeds,
+                                             self.not_functions):
                 last_time = cache.get_last_run_time()
                 print(f"Cache hit - results unchanged (last run: "
                       f"{last_time:.1f}s)")
@@ -178,6 +183,7 @@ class Disassembler:
         self.func_detector = FunctionDetector(
             self.engine, self.image, self.xrefs, self.labels,
             skip_library_immediates=self.skip_library_immediates)
+        self.func_detector.not_functions = self.not_functions
 
         # Measure bodies before accepting a seed inside a sweep instruction.
         if self.seed_functions:
@@ -208,6 +214,7 @@ class Disassembler:
             self.func_detector = FunctionDetector(
                 self.engine, self.image, self.xrefs, self.labels,
                 skip_library_immediates=self.skip_library_immediates)
+            self.func_detector.not_functions = self.not_functions
             for addr in accepted:
                 self.func_detector._add_candidate(addr, 0.95, "seed_vtable_thunk")
             if realigned:
@@ -266,7 +273,8 @@ class Disassembler:
             if json_path:
                 cache.save(self.xbe_path, json_path, self.text_only, elapsed,
                            self.extra_sections, self.seed_functions,
-                           self.skip_library_immediates)
+                           self.skip_library_immediates, self.observed_seeds,
+                           self.not_functions)
 
             if self.verbose:
                 print(f"\n  Output written to {self.output_dir}/")
