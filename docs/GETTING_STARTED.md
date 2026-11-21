@@ -63,6 +63,20 @@ cmake -S ../xboxrecomp -B ../xboxrecomp/build
 cmake --build ../xboxrecomp/build --config Release
 ```
 
+If you want to use the optional [xboxrecomp-cli](https://github.com/apexJCL/xboxrecomp-cli)
+front end later, emit a `game.toml` into the new project (from the toolkit
+clone; `--toml` will not overwrite an existing file, and will not recopy the
+template if `my_xbox_game` is already there):
+
+```bash
+cd xboxrecomp
+py -3 -m tools.new_game ../my_xbox_game --toml
+```
+
+`regen.sh` and the rest of this guide stay the documented route. Fill in
+`title_id` (and the `[cli]` / `[toolkit]` pins, if you are not on a release
+checkout) before running the CLI.
+
 ## Step 1: Extract the XBE
 
 Extract `default.xbe` and game data files from your disc image:
