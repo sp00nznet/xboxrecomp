@@ -1061,7 +1061,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if flag_setter in ("rol", "ror", "rcl", "rcr"):
         # rcl/rcr leave their carry-out in _cf (RC_ROT writes it back), and
         # _function_needs_cf declares _cf for any function containing them.
-        if flag_setter in ("rcl", "rcr"):
+        # rol/ror write it too, when the function declares it for a carry
+        # condition after one.
+        if flag_setter in ("rcl", "rcr", "rol", "ror"):
             if jcc in ("jb", "jnae", "jc"):
                 return "_cf", desc
             if jcc in ("jae", "jnb", "jnc"):
@@ -1648,6 +1650,11 @@ class Lifter:
         # ── Misc ──
         if m == "cdq":
             return ["edx = ((int32_t)eax < 0) ? 0xFFFFFFFF : 0; /* cdq */"]
+        if m == "cwd":
+            # dx:ax = ax sign-extended; the top half of edx is untouched.
+            # Unhandled until the conformance fuzzer reached it, so it went
+            # to recomp_unimpl: a silent no-op in a title.
+            return ["SET_LO16(edx, (LO16(eax) & 0x8000u) ? 0xFFFFu : 0u); /* cwd */"]
         if m == "cwde":
             return ["eax = SX16(eax); /* cwde */"]
         if m == "cbw":
@@ -2018,6 +2025,22 @@ class Lifter:
                     f"  /* {m} */",
                 ]
 
+        # xadd on a register, or on narrower memory: no other thread shares a
+        # register, so a plain sequence in Intel's order -- TEMP = SRC + DEST;
+        # SRC = DEST; DEST = TEMP -- which leaves `xadd eax, eax` with the sum.
+        # The sum is snapshotted like the atomic form's. These lifted to
+        # recomp_unimpl until the conformance fuzzer reached them.
+        if atomic_m == "xadd" and len(ops) >= 2:
+            dst = _fmt_operand_read(ops[0])
+            src = _fmt_operand_read(ops[1])
+            return [
+                f"{{ uint32_t _xd = {dst}, _xs = {src};",
+                "  " + _fmt_operand_write(ops[1], "_xd"),
+                "  " + _fmt_operand_write(ops[0], "_xd + _xs") + " }"
+                f"  /* {m} */",
+                self._result_snapshot(ops, m),
+            ]
+
         # ── Unhandled ──
         #
         # Recorded, not merely commented -- see self.unimplemented.
@@ -2353,15 +2376,36 @@ class Lifter:
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
         src = _fmt_operand_read(ops[0])
+        w = _operand_width(ops[0]) or 4
         if m == "mul":
             return self._lift_product(ops, signed=False)
+        # A narrow divisor divides a narrow dividend: ax by an 8-bit operand
+        # (al quotient, ah remainder), dx:ax by a 16-bit one. Both used to
+        # divide edx:eax at 32 bits, so `div cl` wrote the whole quotient to
+        # eax and the remainder to edx (conformance fuzzer).
         elif m == "div":
+            if w == 1:
+                return [f"{{ uint32_t _n = LO16(eax), _d = (uint8_t)({src});",
+                        "  SET_LO8(eax, _n / _d); SET_HI8(eax, _n % _d); } /* div r/m8 */"]
+            if w == 2:
+                return [f"{{ uint32_t _n = ((uint32_t)LO16(edx) << 16) | LO16(eax),"
+                        f" _d = (uint16_t)({src});",
+                        "  SET_LO16(eax, _n / _d); SET_LO16(edx, _n % _d); } /* div r/m16 */"]
             return [
                 f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
                 f"  eax = (uint32_t)(_dividend / (uint32_t){src});",
                 f"  edx = (uint32_t)(_dividend % (uint32_t){src}); }}"
             ]
         elif m == "idiv":
+            if w == 1:
+                return [f"{{ int32_t _n = (int16_t)LO16(eax), _d = (int8_t)({src});",
+                        "  SET_LO8(eax, (uint32_t)(_n / _d));"
+                        " SET_HI8(eax, (uint32_t)(_n % _d)); } /* idiv r/m8 */"]
+            if w == 2:
+                return [f"{{ int32_t _n = (int32_t)(((uint32_t)LO16(edx) << 16) | LO16(eax)),"
+                        f" _d = (int16_t)({src});",
+                        "  SET_LO16(eax, (uint32_t)(_n / _d));"
+                        " SET_LO16(edx, (uint32_t)(_n % _d)); } /* idiv r/m16 */"]
             return [
                 f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax;",
                 f"  eax = (uint32_t)((int32_t)(_dividend / (int32_t){src}));",
@@ -2480,7 +2524,17 @@ class Lifter:
         bits = (_operand_width(ops[0]) or 4) * 8
         suffix = {8: "8", 16: "16"}.get(bits, "32")
         func = ("ROL" if m == "rol" else "ROR") + suffix
-        return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+        out = [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+        if self.needs_cf:
+            # CF is the bit that wrapped round -- bit 0 of the result after
+            # rol, the top bit after ror -- unless the masked count is zero,
+            # which leaves every flag alone. It was never written, so an adc
+            # after a rotate added whatever carry came before (fuzz).
+            res = _fmt_operand_read(ops[0])
+            take = (f"(({res}) & 1u)" if m == "rol"
+                    else f"((({res}) >> {bits - 1}) & 1u)")
+            out.append(f"if (({cnt}) & 31u) _cf = (int){take};")
+        return out
 
     # ── Compare / Test (standalone) ──
 
