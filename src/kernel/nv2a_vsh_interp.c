@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 static uint32_t s_program[NV2A_VSH_SLOTS][4];
 static float    s_const[NV2A_VSH_CONSTANTS][4];
@@ -269,7 +270,13 @@ static vec4 splat(float f)
     return r;
 }
 
-static vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
+#if defined(__GNUC__)
+#define VSH_INLINE inline __attribute__((always_inline))
+#else
+#define VSH_INLINE inline
+#endif
+
+static VSH_INLINE vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
 {
     vec4 r = a;
     int i;
@@ -506,7 +513,7 @@ static void dec_program(void)
     s_dec_valid = 1;
 }
 
-static vec4 dec_read(const DecSrc *d, const float in[NV2A_VSH_INPUTS][4],
+static VSH_INLINE vec4 dec_read(const DecSrc *d, const float in[NV2A_VSH_INPUTS][4],
                      const vec4 *regs, int a0)
 {
     const float *s;
@@ -706,4 +713,252 @@ static int vsh_run_fields(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out
         }
     }
     return 0;
+}
+
+/* ---- the same program as HLSL, for a GPU renderer --------------------- *
+ *
+ * A hardware renderer runs the title's vertex program as a vertex shader
+ * instead of calling nv2a_vsh_run per vertex. The shader is written from the
+ * decoded instructions above (dec_program), so it decodes the microcode
+ * exactly as the interpreter does, and keeps the interpreter's rules:
+ *  - an instruction reads all its sources before either unit writes;
+ *  - an ILU paired with a MAC op writes R1 (dec_program settles that);
+ *  - temps 13..15 read R0 and are not written; a c[] read out of range
+ *    reads c[0]; ARL rounds as run_mac does;
+ *  - c[] writes are dropped: a caller uses the shader only while
+ *    _CXT_WRITE_EN is 0 and keeps nv2a_vsh_run for the rest;
+ *  - run_mac / run_ilu / vsh_init_regs / vsh_finish formulas, written out
+ *    with `precise` and left-to-right sums, so the compiler neither fuses a
+ *    multiply into an add nor reorders a dot product. Built without FMA, as
+ *    the toolkit is, the MAC results then match nv2a_vsh_run bit for bit; the
+ *    ILU ops (1/x, 1/sqrt, exp2, log2, pow) are within the GPU's precision.
+ *
+ * What is emitted is a library, not a whole shader: the constants (cbuffer
+ * register b1, c[0..191]), struct Nv2aVshIn (ATTRk inputs, only those the
+ * program reads, see nv2a_vsh_inputs_read), struct Nv2aVshOut (the
+ * Nv2aVshOutput fields, colours clamped) and Nv2aVshOut nv2a_vsh(Nv2aVshIn).
+ * The renderer writes main() around it: the AA scale and w fixes the executor
+ * applies after nv2a_vsh_run, screen to clip space, fog, clipping. */
+
+typedef struct { char *p; size_t cap, len; int overflow; } HlslBuf;
+
+static void hb(HlslBuf *b, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    if (b->overflow)
+        return;
+    va_start(ap, fmt);
+    n = vsnprintf(b->p + b->len, b->cap - b->len, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= b->cap - b->len) {
+        b->overflow = 1;
+        return;
+    }
+    b->len += (size_t)n;
+}
+
+static void hlsl_mask(char out[6], uint32_t mask)
+{
+    int n = 0;
+
+    out[n++] = '.';
+    if (mask & 8) out[n++] = 'x';
+    if (mask & 4) out[n++] = 'y';
+    if (mask & 2) out[n++] = 'z';
+    if (mask & 1) out[n++] = 'w';
+    out[n] = 0;
+}
+
+static void hlsl_src(HlslBuf *b, const DecSrc *d)
+{
+    static const char comp[4] = { 'x', 'y', 'z', 'w' };
+
+    hb(b, d->neg ? "-(" : "(");
+    if (d->mux == DEC_TEMP)
+        hb(b, "r%u", d->idx);
+    else if (d->mux == DEC_INPUT)
+        hb(b, "I.v%u", d->idx);
+    else if (!d->rel)
+        hb(b, "c[%u]", d->c < NV2A_VSH_CONSTANTS ? d->c : 0);
+    else
+        hb(b, "nv2a_rd_c(%u + a0)", d->c);
+    if (!d->ident)
+        hb(b, ".%c%c%c%c", comp[d->sw[0]], comp[d->sw[1]], comp[d->sw[2]], comp[d->sw[3]]);
+    hb(b, ")");
+}
+
+static void hlsl_mac(HlslBuf *b, uint32_t op)
+{
+    switch (op) {
+    case 2:  hb(b, "    M = A * B;\n"); break;
+    case 3:  hb(b, "    M = A + C;\n"); break;
+    case 4:  hb(b, "    { precise float4 t = A * B; M = t + C; }\n"); break;
+    case 5:  hb(b, "    { precise float d = A.x * B.x + A.y * B.y + A.z * B.z; M = float4(d, d, d, d); }\n"); break;
+    case 6:  hb(b, "    { precise float d = A.x * B.x + A.y * B.y + A.z * B.z + B.w; M = float4(d, d, d, d); }\n"); break;
+    case 7:  hb(b, "    { precise float d = A.x * B.x + A.y * B.y + A.z * B.z + A.w * B.w; M = float4(d, d, d, d); }\n"); break;
+    case 8:  hb(b, "    { precise float y = A.y * B.y; M = float4(1.0f, y, A.z, B.w); }\n"); break;
+    case 9:  hb(b, "    M = (A < B) ? A : B;\n"); break;
+    case 10: hb(b, "    M = (A >= B) ? A : B;\n"); break;
+    case 11: hb(b, "    M = (A < B) ? float4(1, 1, 1, 1) : float4(0, 0, 0, 0);\n"); break;
+    case 12: hb(b, "    M = (A >= B) ? float4(1, 1, 1, 1) : float4(0, 0, 0, 0);\n"); break;
+    case 13: hb(b, "    M = A; a0 = (int)floor(A.x + 0.001f);\n"); break;
+    default: hb(b, "    M = A;\n"); break;                     /* mov; 14, 15 */
+    }
+}
+
+static void hlsl_ilu(HlslBuf *b, uint32_t op)
+{
+    switch (op) {
+    case 2:
+        hb(b, "    { float x = C.x; precise float f = (x == 0.0f) ? NV2A_INF : 1.0f / x; IL = float4(f, f, f, f); }\n");
+        break;
+    case 3:
+        hb(b, "    { precise float f = 1.0f / C.x;\n"
+              "      if (abs(f) < 5.42101e-20f) f = (f < 0) ? -5.42101e-20f : 5.42101e-20f;\n"
+              "      if (abs(f) > 1.884467e19f) f = (f < 0) ? -1.884467e19f : 1.884467e19f;\n"
+              "      IL = float4(f, f, f, f); }\n");
+        break;
+    case 4:
+        hb(b, "    { precise float f = 1.0f / sqrt(abs(C.x)); IL = float4(f, f, f, f); }\n");
+        break;
+    case 5:
+        hb(b, "    { float x = C.x; float fl = floor(x); precise float fr = x - fl;"
+              " IL = float4(exp2(fl), fr, exp2(x), 1.0f); }\n");
+        break;
+    case 6:
+        hb(b, "    { float ax = abs(C.x);\n"
+              "      if (ax == 0.0f) IL = float4(-NV2A_INF, 1.0f, -NV2A_INF, 1.0f);\n"
+              "      else { float e = floor(log2(ax)); precise float m = ax / exp2(e);"
+              " IL = float4(e, m, log2(ax), 1.0f); } }\n");
+        break;
+    case 7:   /* powf(nh, p), with powf's zero and infinity cases */
+        hb(b, "    { float nl = (C.x > 0.0f) ? C.x : 0.0f, nh = (C.y > 0.0f) ? C.y : 0.0f;\n"
+              "      float p = (C.w < -127.9961f) ? -127.9961f : ((C.w > 127.9961f) ? 127.9961f : C.w);\n"
+              "      float s = (p == 0.0f) ? 1.0f : ((nh == 0.0f) ? ((p > 0.0f) ? 0.0f : NV2A_INF)"
+              " : exp2(p * log2(nh)));\n"
+              "      IL = float4(1.0f, nl, (C.x > 0.0f) ? s : 0.0f, 1.0f); }\n");
+        break;
+    default:
+        hb(b, "    IL = C;\n");                                  /* mov */
+        break;
+    }
+}
+
+static int hlsl_decoded(void)
+{
+    if (!s_dec_valid || s_dec_rev != s_program_revision)
+        dec_program();
+    return s_dec_count && s_dec[s_dec_count - 1].final;
+}
+
+uint32_t nv2a_vsh_program_revision(void)
+{
+    return s_program_revision;
+}
+
+uint64_t nv2a_vsh_program_key(void)
+{
+    static uint32_t rev;
+    static uint64_t key;
+    static int valid;
+    uint32_t i, k;
+
+    if (valid && rev == s_program_revision)
+        return key;
+    rev = s_program_revision;
+    valid = 1;
+    key = 0;
+    if (!hlsl_decoded())
+        return 0;
+    key = 1469598103934665603ull ^ s_start_slot;
+    for (i = 0; i < s_dec_count && s_start_slot + i < NV2A_VSH_SLOTS; i++)
+        for (k = 0; k < 4; k++)
+            key = (key ^ s_program[s_start_slot + i][k]) * 1099511628211ull;
+    if (!key)
+        key = 1;
+    return key;
+}
+
+uint32_t nv2a_vsh_inputs_read(void)
+{
+    uint32_t i, k, mask = 0;
+
+    if (!hlsl_decoded())
+        return 0;
+    for (i = 0; i < s_dec_count; i++)
+        for (k = 0; k < 3; k++)
+            if ((s_dec[i].reads & (1u << k)) && s_dec[i].src[k].mux == DEC_INPUT)
+                mask |= 1u << s_dec[i].src[k].idx;
+    return mask;
+}
+
+size_t nv2a_vsh_emit_hlsl(char *buf, size_t cap)
+{
+    HlslBuf b = { buf, cap, 0, 0 };
+    uint32_t i, k, inputs;
+    char m[6];
+
+    if (!hlsl_decoded())
+        return 0;                        /* no FINAL: nv2a_vsh_run fails too */
+    inputs = nv2a_vsh_inputs_read();
+    hb(&b, "#define NV2A_INF asfloat(0x7f800000)\n"
+           "cbuffer Nv2aVshConstants : register(b1) { float4 c[%u]; };\n"
+           "float4 nv2a_rd_c(int i) { int j = (i < 0 || i >= %u) ? 0 : i; return c[j]; }\n"
+           "float4 nv2a_sat01(float4 v) { return (v > 1.0f) ? float4(1, 1, 1, 1)"
+           " : ((v >= 0.0f) ? v : float4(0, 0, 0, 0)); }\n"
+           "struct Nv2aVshIn {", NV2A_VSH_CONSTANTS, NV2A_VSH_CONSTANTS);
+    for (k = 0; k < NV2A_VSH_INPUTS; k++)
+        if (inputs & (1u << k))
+            hb(&b, " float4 v%u : ATTR%u;", k, k);
+    if (!inputs)                         /* HLSL has no empty struct */
+        hb(&b, " uint nv2a_vertex_id : SV_VertexID;");
+    hb(&b, " };\n"
+           "struct Nv2aVshOut { float4 pos, d0, d1, fog, t0, t1, t2, t3; };\n"
+           "Nv2aVshOut nv2a_vsh(Nv2aVshIn I)\n{\n"
+           "    int a0 = 0;\n    precise float4 A, B, C, M, IL;\n");
+    for (k = 0; k <= 12; k++)            /* R0..R11, then oPos */
+        hb(&b, "    float4 r%u = float4(0, 0, 0, 0);\n", k);
+    for (k = 1; k <= 12; k++)            /* o[1..12]: colours and texcoords start at w = 1 */
+        hb(&b, "    float4 o%u = float4(0, 0, 0, %s);\n", k,
+           (k == 3 || k == 4 || k >= 9) ? "1" : "0");
+    for (i = 0; i < s_dec_count; i++) {
+        const DecIns *d = &s_dec[i];
+
+        for (k = 0; k < 3; k++) {
+            if (!(d->reads & (1u << k)))
+                continue;
+            hb(&b, "    %c = ", "ABC"[k]);
+            hlsl_src(&b, &d->src[k]);
+            hb(&b, ";\n");
+        }
+        hb(&b, "    M = float4(0, 0, 0, 0); IL = float4(0, 0, 0, 0);\n");
+        if (d->mac)
+            hlsl_mac(&b, d->mac);
+        if (d->ilu)
+            hlsl_ilu(&b, d->ilu);
+        if (d->mac_mask && d->mac_dst != DEC_NO_DST) {
+            hlsl_mask(m, d->mac_mask);
+            hb(&b, "    r%u%s = M%s;\n", d->mac_dst, m, m);
+        }
+        if (d->ilu_mask && d->ilu_dst != DEC_NO_DST) {
+            hlsl_mask(m, d->ilu_mask);
+            hb(&b, "    r%u%s = IL%s;\n", d->ilu_dst, m, m);
+        }
+        if (d->omask && d->to_o && d->oaddr < 13) {
+            hlsl_mask(m, d->omask);
+            if (d->oaddr == 0)
+                hb(&b, "    r12%s = %s%s;\n", m, d->from_ilu ? "IL" : "M", m);
+            else
+                hb(&b, "    o%u%s = %s%s;\n", d->oaddr, m, d->from_ilu ? "IL" : "M", m);
+        }
+        if (d->final)
+            break;
+    }
+    hb(&b, "    Nv2aVshOut O;\n"
+           "    O.pos = r12; O.d0 = nv2a_sat01(o3); O.d1 = nv2a_sat01(o4); O.fog = o5;\n"
+           "    O.t0 = o9; O.t1 = o10; O.t2 = o11; O.t3 = o12;\n"
+           "    return O;\n}\n");
+    return b.overflow ? 0 : b.len;
 }

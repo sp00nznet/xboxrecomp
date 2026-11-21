@@ -20,6 +20,12 @@
  * so a back end only ever sees surface pixels. Blend, depth, alpha, cull and
  * stencil state arrive in Nv2aRenderState.
  *
+ * The exception is a back end that asks for them with
+ * nv2a_backend_set_program_batches(1): it receives each
+ * vertex-program batch before transform instead (Nv2aBatch.program), and runs
+ * the program on the GPU itself (nv2a_vsh_emit_hlsl). Fixed-function and
+ * pre-transformed batches still arrive as surface pixels.
+ *
  * ponytail: register-combiner state and texture stages 1-3 are not passed on:
  * a back end sees stage 0 and the diffuse colour. Extend Nv2aBatch when that
  * matters rather than adding callbacks.
@@ -28,6 +34,7 @@
 #define NV2A_BACKEND_H
 
 #include <stdint.h>
+#include "nv2a_combiner.h"
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
@@ -38,6 +45,11 @@ typedef struct {
     uint32_t pitch;             /* bytes per row */
     uint32_t bytes_per_pixel;   /* 2 or 4 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
+    /* Swizzled (SURFACE_FORMAT type 2, render-to-texture): pixel (x, y) is
+     * at the Morton offset of a swz_width x swz_height texture (powers of
+     * two), not at row y; pitch does not apply. */
+    uint32_t swizzled;
+    uint32_t swz_width, swz_height;
 } Nv2aSurface;
 
 /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
@@ -51,6 +63,7 @@ typedef struct {
      * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
      * 16-23). A back end that ignores them samples level 0. */
     uint32_t levels, filter;
+    uint32_t palette;           /* P8 (format 0x0B): guest address of the CLUT */
 } Nv2aTexture;
 
 typedef struct {
@@ -80,13 +93,86 @@ typedef struct {
      * that ignores these draws that pass over the whole surface. */
     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
+    /* SET_SURFACE_FORMAT's zeta format: 1 Z16, 2 Z24S8. Window z is in that
+     * format's units (0..65535 or 0..16777215), as is the clear value's depth
+     * (zstencil & 0xFFFF, or zstencil >> 8). */
+    uint32_t zeta_format;
 } Nv2aRenderState;
+
+/* A vertex-program batch before transform, for a back end that runs the
+ * program itself (nv2a_backend_set_program_batches). The executor sends one only
+ * while _CXT_WRITE_EN is 0 (a program that writes c[] runs on the CPU) and for
+ * the triangle topologies; anything else arrives as surface pixels.
+ *
+ * The program's vertex shader is `hlsl`, the library nv2a_vsh_emit_hlsl
+ * writes; the back end adds main(). After the program, as the executor does
+ * after nv2a_vsh_run, a back end must turn oPos.w == +0 into 1 (a program
+ * that never divides by w) and multiply oPos.x and .y by aa_sx and aa_sy.
+ * oPos is then in surface pixels with w the clip w, as the executor's own
+ * path sees it: clip at w = 0.001 and, when near_clip is set, at window z =
+ * near_z (z * w >= near_z * w), then divide. */
+typedef struct {
+    const float    (*inputs)[4];    /* per distinct vertex, the inputs the program
+                                       reads (inputs_read), in ascending v order */
+    uint32_t         input_count;   /* distinct vertices */
+    uint32_t         inputs_read;   /* bit k: v[k] is carried (nv2a_vsh_inputs_read) */
+    const uint32_t  *indices;       /* triangle list over the distinct vertices, in
+                                       the order the executor would rasterise */
+    uint32_t         index_count;   /* a multiple of 3 */
+    const float    (*constants)[4]; /* c[0..191] as the batch sees them */
+    const char      *hlsl;          /* the program (nv2a_vsh_emit_hlsl) */
+    uint32_t         hlsl_len;
+    uint32_t         program_revision;  /* nv2a_vsh_program_revision: hlsl changes with it */
+    uint64_t         program_key;   /* nv2a_vsh_program_key: equal keys, equal hlsl */
+    float            aa_sx, aa_sy;  /* oPos.x / .y scale after the program */
+    float            near_z;        /* window z of the near plane (c[59].z) */
+    uint32_t         near_clip;     /* 0: clip at w only (RECOMP_CLIP_NEAR_Z=0) */
+    /* Texture coordinates are what the program writes (o[9..12]). The surface
+     * pixel path hands stage 0's over multiplied by this (Nv2aVertex.u/v are
+     * texels): the texture's size for the formats addressed in 0..1, 1 for
+     * the linear ones addressed in texels. */
+    float            tex0_scale[2];
+} Nv2aProgramBatch;
+
+/* One texture stage as the register combiners read it. */
+typedef struct {
+    Nv2aTexture tex;            /* valid only when `valid` */
+    uint32_t mode;              /* SET_SHADER_STAGE_PROGRAM's 5 bits for this stage */
+    uint32_t valid;             /* a texture is bound */
+    uint32_t size_from_format;  /* normalised coordinates (swizzled/DXT): times width/height */
+    uint32_t bilinear;          /* the executor's tent filter: MAG 2, MIN 2/4/6, or RECOMP_TEX_BILINEAR */
+    uint32_t border_u, border_v;/* this axis reads border_argb outside the texture */
+    uint32_t border_argb;       /* SET_TEXTURE_BORDER_COLOR */
+    uint32_t cube;              /* six faces (mode 3 picks one); decode gives face 0 */
+} Nv2aStage;
+
+/* The pixel pipeline when the title has programmed the register combiners:
+ * what nv2a_rc_eval reads, the four stages and fog. See the executor's
+ * raster_xf_triangle and xf_rows for the CPU reference a back end matches. */
+typedef struct {
+    Nv2aCombiner rc;            /* as the title set it (stage_program included) */
+    Nv2aStage    stage[4];
+    uint32_t     clip_plane_mode;   /* stage mode 5: which coordinates kill the pixel */
+    uint32_t     fog_enable, fog_mode, fog_color;   /* fog colour R in bits 0-7 */
+    float        fog_param[2];
+} Nv2aPixelState;
 
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
     const Nv2aTexture *texture;     /* NULL: untextured */
     const Nv2aRenderState *state;
+    /* Non-NULL: a vertex-program batch before transform (only for a back end
+     * that asked, nv2a_backend_set_program_batches); vertices and count are
+     * then NULL and 0. */
+    const Nv2aProgramBatch *program;
+    /* Non-NULL: draw through the register combiners (the executor's CPU
+     * rasteriser would). NULL: texture stage 0 times diffuse, as before. */
+    const Nv2aPixelState *pixel;
+    /* With pixel, for a surface-pixel batch: each vertex's full outputs, in
+     * Nv2aVshOutput's layout (pos as `vertices` has it, d0, d1, fog, tex[4]),
+     * parallel to `vertices`. NULL for program batches. */
+    const float (*xf)[32];
 } Nv2aBatch;
 
 typedef struct {
@@ -112,6 +198,11 @@ void nv2a_backend_register(const Nv2aBackend *backend);
 void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
                                              void (*present_sync)(void));
 
+/* Nonzero: the registered back end's draw() also takes vertex-program batches
+ * before transform (Nv2aBatch.program, Nv2aProgramBatch). Off by default and
+ * after every nv2a_backend_register*: call it after registering. */
+void nv2a_backend_set_program_batches(int enable);
+
 /* Decode a whole texture to 0xAARRGGBB, row-major, width*height entries.
  * Handles every format the executor can sample (swizzled, linear, DXT).
  * Returns 0 if the format is not supported. */
@@ -126,5 +217,9 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
  * ponytail: the title supplies the address instead of the executor resolving
  * the semaphore context DMA object through RAMIN. */
 void nv2a_pb_set_semaphore_target(uint32_t guest_va);
+
+/* Optional title-specific HLE of consumed software methods. Nonzero means handled.
+ * Install before guest execution. It runs on the executor thread, not a guest CPU. */
+void nv2a_pb_set_software_method_handler(int (*handler)(uint32_t));
 
 #endif /* NV2A_BACKEND_H */

@@ -40,6 +40,9 @@
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
+#ifdef _WIN32
+#include "nv2a_hw_d3d11.h"
+#endif
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -362,6 +365,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
     printf("Initializing kernel bridge...\n");
     xbox_kernel_bridge_init();
+
+#ifdef _WIN32
+    /* RECOMP_HW_RENDER=1: the pushbuffer executor draws on the GPU (D3D11),
+     * vertex programs included, instead of rasterising on the CPU. Unset, it
+     * does nothing. */
+    xbox_Nv2aHwRendererInstall();
+#endif
 
     /* Step 6: Initialize stack */
     g_esp = XBOX_STACK_TOP;

@@ -20,6 +20,7 @@
 #ifndef XBOXRECOMP_NV2A_VSH_INTERP_H
 #define XBOXRECOMP_NV2A_VSH_INTERP_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define NV2A_VSH_SLOTS      136     /* program memory, 128-bit instructions */
@@ -57,5 +58,22 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
  * (scale) and c[59] (offset) a word at a time rather than via _CONSTANT. */
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
+
+/* The current program as an HLSL (vs_5_0) library, for a GPU renderer: see
+ * the comment above nv2a_vsh_emit_hlsl in nv2a_vsh_interp.c for what is
+ * emitted and the rules it keeps. Returns the length written, or 0 if there
+ * is no program (no FINAL instruction) or buf is too small. Use it only while
+ * _CXT_WRITE_EN is 0. */
+size_t   nv2a_vsh_emit_hlsl(char *buf, size_t cap);
+/* Bit k set: the program reads input v[k] (0 without a program). */
+uint32_t nv2a_vsh_inputs_read(void);
+/* Changes whenever the program memory or the start slot changes: a caller
+ * re-emits only then. Not a content hash; key a shader cache on the text. */
+uint32_t nv2a_vsh_program_revision(void);
+/* A 64-bit name for the current program: its instruction words from the start
+ * slot to FINAL, and the start slot. Programs with the same key emit the same
+ * HLSL; 0 when there is no program. Unlike the revision, switching back to a
+ * program gives its old key, so a caller can cache per program. */
+uint64_t nv2a_vsh_program_key(void);
 
 #endif
