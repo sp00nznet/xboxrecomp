@@ -159,6 +159,10 @@ volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
 volatile uint64_t g_icall_count;
 ptrdiff_t g_xbox_mem_offset;
 void recomp_icall_fail_log(uint32_t va) { (void)va; }
+/* An instruction the lifter has no translation for runs as a no-op in a
+   title. Here it would be a link error that hides every other result, so
+   define it and let the comparison report the case as wrong. */
+void recomp_unimpl(const char *text, uint32_t va) { (void)text; (void)va; }
 
 extern unsigned int g_in_a, g_in_b;
 extern unsigned int g_out_eax;

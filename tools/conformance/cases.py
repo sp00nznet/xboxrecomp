@@ -596,3 +596,40 @@ for _name, _setup, _count, _copy, _result in (
         ("rep_copy_zero", ["mov esi, eax", "lea edi, [eax+16]"], 0, "rep movsd", "mov eax, [edi]")):
     CASES.append(Case(_name, "REP copy preserves element order, direction and count",
         ["cld"] + _setup + ["mov ecx, %d" % _count, _copy, "cld", _result], _SSE, "sse"))
+
+# Found by the conformance fuzzer. Narrow div/idiv divided edx:eax at 32 bits,
+# cwd and register-form xadd lifted to recomp_unimpl, and rol/ror never wrote
+# CF. Divisors are kept off 0 and -1 and dividends small, so no vector raises
+# a divide error on the real CPU.
+CASES.extend([
+    Case("div_r8", "div cl: al quotient, ah remainder of ax, upper eax kept",
+         ["and eax, 0xFFFF3FFF", "or ecx, 0x40", "div cl"], _PAIRS),
+    Case("div_r16", "div cx: ax quotient, dx remainder of dx:ax",
+         ["mov edx, eax", "shr edx, 18", "or ecx, 0x4000", "div cx",
+          "shl edx, 16", "mov dx, ax", "mov eax, edx"], _PAIRS),
+    Case("idiv_r8", "idiv cl: signed al quotient, ah remainder of ax",
+         ["movsx eax, al", "or ecx, 2", "and ecx, 0xFFFFFFFE", "idiv cl"], _PAIRS),
+    Case("idiv_r16", "idiv cx: signed ax quotient, dx remainder of dx:ax",
+         ["movsx eax, ax", "mov edx, eax", "sar edx, 16",
+          "or ecx, 2", "and ecx, 0xFFFFFFFE", "idiv cx",
+          "shl edx, 16", "mov dx, ax", "mov eax, edx"], _PAIRS),
+    Case("rol_adc", "the bit a rotate wrapped round, read by adc",
+         ["rol ax, 3", "mov ax, cx", "adc al, cl"], _PAIRS),
+    Case("rol_setc", "CF after rol is bit 0 of the result",
+         ["rol eax, 1", "setc dl", "movzx eax, dl"], _PAIRS),
+    Case("ror_setc_r8", "CF after ror is the top bit of the narrow result",
+         ["ror al, 1", "setc dl", "movzx eax, dl"], _PAIRS),
+    Case("cwd", "dx = sign of ax, upper edx kept",
+         ["mov edx, ecx", "cwd", "mov eax, edx"], _PAIRS),
+    Case("xadd_reg", "xadd eax, ecx: eax = sum, ecx = old eax",
+         ["xadd eax, ecx", "sub eax, ecx"], _PAIRS),
+    Case("xadd_reg_old", "xadd eax, ecx: ecx receives the old eax",
+         ["xadd eax, ecx", "mov eax, ecx"], _PAIRS),
+    Case("xadd_same", "xadd eax, eax ends with the sum", ["xadd eax, eax"], _PAIRS),
+    Case("xadd_r8", "xadd al, cl at byte width",
+         ["xadd al, cl", "movzx ecx, cl", "shl ecx, 16", "xor eax, ecx"], _PAIRS),
+    Case("xadd_setz", "ZF after register xadd", ["xadd eax, ecx", "setz dl",
+                                                  "movzx eax, dl"], _PAIRS),
+    Case("xadd_sets_r8", "SF after byte xadd is the byte's sign",
+         ["xadd al, cl", "sets dl", "movzx eax, dl"], _PAIRS),
+])

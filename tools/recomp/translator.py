@@ -1897,7 +1897,7 @@ class FunctionTranslator:
                 cc = "b"
             if (cc in FunctionTranslator._CARRY_CC
                     and (last_setter in CF_TRACKED
-                         or last_setter in ("inc", "dec")
+                         or last_setter in ("inc", "dec", "rol", "ror")
                          or last_setter in BT_MODIFY
                          or last_setter == "rep-compare")):
                 return True
