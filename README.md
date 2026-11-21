@@ -268,6 +268,17 @@ toolchains, cross-builds, packaging and a player build wizard. It is
 maintained outside this repo and tracks its tags. `regen.sh` and the steps
 above stay the documented route (#223).
 
+To emit a starter `game.toml` into a project copied from
+[`templates/new-game/`](templates/new-game/), from this toolkit's root:
+
+```bash
+py -3 -m tools.new_game ../mygame --toml
+```
+
+If `../mygame` does not exist yet, that command copies the template first.
+The file follows xboxrecomp-cli's `xbr new` schema; edit the title ID and
+pins before using the CLI.
+
 ### What To Expect
 
 The first time you run a recompiled game, **it will crash**. That's normal. The process is iterative:

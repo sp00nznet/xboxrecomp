@@ -66,7 +66,7 @@ See the [README](README.md) for the detailed directory tree and architecture dia
 
 The most valuable contribution is trying the toolkit on a new game. Follow the Quick Start in the README, and report what works and what breaks. Even partial results (e.g., "disassembly finds 2,000 functions but the lifter chokes on SSE2 code in function X") help improve the toolkit.
 
-To get started with a new game project, copy the template from `templates/new-game/` and customize it. See the template files for detailed comments.
+To get started with a new game project, copy the template from `templates/new-game/` and customize it. See the template files for detailed comments. To also emit a `game.toml` for the optional [xboxrecomp-cli](https://github.com/apexJCL/xboxrecomp-cli) front end, run `py -3 -m tools.new_game DIR --toml` from this toolkit's root.
 
 ### Add New Kernel Imports
 
