@@ -209,6 +209,25 @@ def _fmt_fpu_operand(op):
     return None
 
 
+_LEGACY_PREFIXES = frozenset({0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26,
+                              0x64, 0x65, 0x66, 0x67})
+
+
+def _legacy_prefixes(insn):
+    """The legacy prefix bytes in front of the opcode, for instructions whose
+    implicit memory operand capstone does not hand over as an operand."""
+    try:
+        raw = bytes.fromhex(insn.bytes_hex or "")
+    except (AttributeError, ValueError):
+        return frozenset()
+    out = set()
+    for b in raw:
+        if b not in _LEGACY_PREFIXES:
+            break
+        out.add(b)
+    return frozenset(out)
+
+
 def _fmt_mem(op):
     """Format a memory operand as a C expression (the address computation).
 
@@ -495,7 +514,9 @@ _EFLAGS_PRESERVE = frozenset({
     "psubb", "psubw", "psubd",
     "paddsb", "paddsw", "paddusb", "psubsb", "psubsw", "psubusb",
     "pavgb", "pavgw", "pminsw", "pmaxsw", "psadbw",
+    "pminub", "pmaxub",
     "pmullw", "pmulhw", "pmulhuw", "pmaddwd",
+    "maskmovq",
     "pand", "pandn", "por", "pxor",
     "pcmpeqb", "pcmpeqw", "pcmpeqd",
     "pcmpgtb", "pcmpgtw", "pcmpgtd",
@@ -3233,6 +3254,8 @@ class Lifter:
         "pmaddwd": "MMX_PMADDWD",
         "pavgb": "MMX_PAVGB", "pavgw": "MMX_PAVGW",
         "pminsw": "MMX_PMINSW", "pmaxsw": "MMX_PMAXSW",
+        "pminub": "MMX_PMINUB", "pmaxub": "MMX_PMAXUB",
+        "pmulhuw": "MMX_PMULHUW",
         "pcmpeqb": "MMX_PCMPEQB", "pcmpeqw": "MMX_PCMPEQW",
         "pcmpeqd": "MMX_PCMPEQD",
         "pcmpgtb": "MMX_PCMPGTB", "pcmpgtw": "MMX_PCMPGTW",
@@ -3355,6 +3378,23 @@ class Lifter:
 
         if m == "pmovmskb" and len(ops) >= 2 and is_mm(ops[1]):
             return [f"{dst.reg} = MMX_PMOVMSKB({ops[1].reg}); /* pmovmskb */"]
+
+        # maskmovq mmA, mmB: store the bytes of mmA whose byte in mmB has its
+        # top bit set, to DS:[EDI] -- an implicit operand capstone does not
+        # list, so the address is built here rather than by _fmt_mem. DS is
+        # flat; an fs override is offset the way _fmt_mem offsets it. A 67
+        # prefix would make the address DI and a gs override has no base in
+        # this model: neither is something MSVC emits, so both stay loud.
+        if m == "maskmovq" and len(ops) >= 2 and is_mm(dst) and is_mm(ops[1]):
+            prefixes = _legacy_prefixes(insn)
+            if 0x67 in prefixes:
+                return self._unimplemented(insn, m, " (16-bit address)")
+            if 0x65 in prefixes:
+                return self._unimplemented(insn, m, " (gs override)")
+            addr = _fmt_reg("edi")
+            if 0x64 in prefixes:
+                addr = f"XBOX_FS_BASE + {addr}"
+            return [f"MMX_MASKMOVQ({addr}, {dst.reg}, {ops[1].reg}); /* maskmovq */"]
 
         # movq / movd between mm, memory and GPRs.
         if m in ("movq", "movd") and len(ops) >= 2:

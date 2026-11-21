@@ -338,6 +338,12 @@ CASES = [
          ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pxor mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
     Case("mmx_pavgb", "unsigned byte average rounds up",
          ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pavgb mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pminub", "unsigned byte minimum, not signed",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pminub mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pmaxub", "unsigned byte maximum, not signed",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pmaxub mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
+    Case("mmx_pmulhuw", "packed unsigned word multiply, high half",
+         ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pmulhuw mm0, mm1', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
     Case("mmx_pshufw", "word shuffle by immediate",
          ['push eax', 'push ecx', 'push eax', 'push ecx', 'movq mm0, qword ptr [esp]', 'push eax', 'push eax', 'push ecx', 'push ecx', 'movq mm1, qword ptr [esp]', 'add esp, 32', 'pshufw mm0, mm1, 0x1B', 'push 0', 'push 0', 'movq qword ptr [esp], mm0', 'mov eax, dword ptr [esp+0]', 'add esp, 8', 'emms'], _PAIRS),
     Case("mmx_paddw_hi", "the high lane too, not just lane 0",
@@ -570,6 +576,7 @@ for _op in (
         "psubsb mm0, mm1", "psubsw mm0, mm1", "psubusb mm0, mm1",
         "pavgb mm0, mm1", "pavgw mm0, mm1", "pminsw mm0, mm1",
         "pmaxsw mm0, mm1", "psadbw mm0, mm1",
+        "pminub mm0, mm1", "pmaxub mm0, mm1", "pmulhuw mm0, mm1",
         "cvtps2pi mm0, xmm0", "cvttps2pi mm0, xmm0",
         "pinsrw mm0, ecx, 0", "pextrw edx, mm0, 0"):
     for _consumer, _before, _after in (

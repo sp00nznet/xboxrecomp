@@ -1699,6 +1699,24 @@ static inline void MMX_STORE(uint32_t addr, RecompMmx v) {
     memcpy((void *)XBOX_PTR(addr), &v, 8);
 }
 
+/** maskmovq: store the bytes of `v` whose `mask` byte has its top bit set,
+ * to the guest address the instruction takes implicitly from EDI. The other
+ * bytes of the destination are not touched -- not read, not rewritten.
+ *
+ * Deliberately a byte loop on every host. SSE2's _mm_maskmoveu_si128 would
+ * need the value widened to 16 bytes, and Intel leaves it implementation-
+ * dependent whether masked-off bytes can still fault, so a store at the end
+ * of a mapping could fault on bytes 8-15 the guest never addressed. It is
+ * also a weakly-ordered non-temporal store that would need an sfence to be
+ * seen in order. A blend through an 8-byte read-modify-write is no better:
+ * it rewrites the unselected bytes, which another thread, the GPU or an MMIO
+ * register may own. MEM8 is the lifter's ordinary per-byte guest store. */
+static inline void MMX_MASKMOVQ(uint32_t addr, RecompMmx v, RecompMmx mask) {
+    int i;
+    for (i = 0; i < 8; i++)
+        if (mask.ub[i] & 0x80) MEM8(addr + (uint32_t)i) = v.ub[i];
+}
+
 static inline RecompMmx MMX_FROM32(uint32_t v) {
     RecompMmx r; r.q = 0; r.ud[0] = v; return r;
 }
@@ -1764,6 +1782,12 @@ RECOMP_MMX_INTRIN2(MMX_PAVGB, _mm_avg_epu8)
 RECOMP_MMX_INTRIN2(MMX_PAVGW, _mm_avg_epu16)
 RECOMP_MMX_INTRIN2(MMX_PMINSW, _mm_min_epi16)
 RECOMP_MMX_INTRIN2(MMX_PMAXSW, _mm_max_epi16)
+/* The SSE-integer additions (Pentium III, so legal on the Xbox) that the
+ * lifter forwards here: unsigned byte min/max and the unsigned high
+ * multiply. SSE2 carries each as one instruction over the low 64 bits. */
+RECOMP_MMX_INTRIN2(MMX_PMINUB, _mm_min_epu8)
+RECOMP_MMX_INTRIN2(MMX_PMAXUB, _mm_max_epu8)
+RECOMP_MMX_INTRIN2(MMX_PMULHUW, _mm_mulhi_epu16)
 RECOMP_MMX_INTRIN2(MMX_PCMPEQB, _mm_cmpeq_epi8)
 RECOMP_MMX_INTRIN2(MMX_PCMPEQW, _mm_cmpeq_epi16)
 RECOMP_MMX_INTRIN2(MMX_PCMPEQD, _mm_cmpeq_epi32)
@@ -1917,6 +1941,10 @@ RECOMP_MMX_BINOP(MMX_PAVGB, 8, ub, (uint8_t)(((int32_t)a.ub[i] + b.ub[i] + 1) >>
 RECOMP_MMX_BINOP(MMX_PAVGW, 4, uw, (uint16_t)(((int32_t)a.uw[i] + b.uw[i] + 1) >> 1))
 RECOMP_MMX_BINOP(MMX_PMINSW, 4, w, (a.w[i] < b.w[i] ? a.w[i] : b.w[i]))
 RECOMP_MMX_BINOP(MMX_PMAXSW, 4, w, (a.w[i] > b.w[i] ? a.w[i] : b.w[i]))
+RECOMP_MMX_BINOP(MMX_PMINUB, 8, ub, (a.ub[i] < b.ub[i] ? a.ub[i] : b.ub[i]))
+RECOMP_MMX_BINOP(MMX_PMAXUB, 8, ub, (a.ub[i] > b.ub[i] ? a.ub[i] : b.ub[i]))
+RECOMP_MMX_BINOP(MMX_PMULHUW, 4, uw,
+                 (uint16_t)(((uint32_t)a.uw[i] * b.uw[i]) >> 16))
 RECOMP_MMX_BINOP(MMX_PCMPEQB, 8, b, (int8_t)(a.b[i] == b.b[i] ? -1 : 0))
 RECOMP_MMX_BINOP(MMX_PCMPEQW, 4, w, (int16_t)(a.w[i] == b.w[i] ? -1 : 0))
 RECOMP_MMX_BINOP(MMX_PCMPEQD, 2, d, (int32_t)(a.d[i] == b.d[i] ? -1 : 0))
