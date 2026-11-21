@@ -17,7 +17,8 @@ The flow, per case:
   2. Those bytes go through our real Disassembler + Lifter.
   3. A harness runs both versions over the same inputs and compares eax.
 
-Needs a 32-bit MSVC (vcvars32) or Docker linux/386 container.
+Needs a 32-bit MSVC (vcvars32) or Docker linux/386 container -- or, for the
+snippet phase, a 64-bit Linux whose gcc builds and runs -m32 programs.
 Guest addresses map 1:1 onto host addresses here (g_xbox_mem_offset = 0),
 so a memory operand reads the same bytes on both sides.
 """
@@ -25,6 +26,7 @@ so a memory operand reads the same bytes on both sides.
 import argparse
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -130,6 +132,44 @@ class _Container:
             self.cid = None
 
 
+class _Local:
+    """The container's job done on the host: a 64-bit Linux with 32-bit
+    multilib runs gcc -m32 output natively, which is all the snippet phase
+    asks of the container. Same interface; the container's /rt mount is the
+    runtime include directory here."""
+
+    def __init__(self, workdir, runtime_inc):
+        self.workdir, self.runtime_inc = workdir, runtime_inc
+        self.cid, self.error = "local", ""
+
+    def run(self, script):
+        script = script.replace("-I/rt", "-I" + shlex.quote(self.runtime_inc))
+        return subprocess.run(["sh", "-c", script], cwd=self.workdir,
+                              capture_output=True, text=True)
+
+    def close(self):
+        pass
+
+
+def _local_gcc32_works():
+    """Whether gcc -m32 can build and run a program here (32-bit libc)."""
+    import shutil
+    if not shutil.which("gcc"):
+        return False
+    d = tempfile.mkdtemp(prefix="xboxrecomp-m32-")
+    try:
+        with open(os.path.join(d, "t.c"), "w") as f:
+            f.write("int main(void){return 0;}\n")
+        built = subprocess.run(["gcc", "-m32", "t.c", "-o", "t"], cwd=d,
+                               capture_output=True)
+        return (built.returncode == 0
+                and subprocess.run([os.path.join(d, "t")]).returncode == 0)
+    except OSError:
+        return False
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # MSVC under Wine, for the corpus phase, in two images.
 #
@@ -160,8 +200,13 @@ _MSVC_BUILD_HINT = (
 
 
 def _image_present(name):
-    return subprocess.run(["docker", "image", "inspect", name],
-                          capture_output=True).returncode == 0
+    # Guarded like _docker_image_present: on the host backend there may be no
+    # docker at all, and the corpus phase then skips with its own message.
+    try:
+        return subprocess.run(["docker", "image", "inspect", name],
+                              capture_output=True).returncode == 0
+    except OSError:
+        return False
 
 
 def _msvc(image, platform, workdir, script, mounts=()):
@@ -283,11 +328,16 @@ def main_with_args(argv, allow_container=True):
     # containers during a unit-test pass.
     if not backend and allow_container and _docker_image_present():
         backend = "docker"
+    # The host itself, when it can run 32-bit code (Linux multilib). Only for
+    # the snippet phase, which needs nothing but gcc -m32.
+    if not backend and allow_container and _local_gcc32_works():
+        backend = "local"
 
     if not backend:
         print("ERROR: no 32-bit x86 toolchain. Either a 32-bit MSVC "
-              "(vcvars32.bat under Visual Studio), or Docker running so a "
-              "linux/386 container can supply the CPU.", file=sys.stderr)
+              "(vcvars32.bat under Visual Studio), Docker running so a "
+              "linux/386 container can supply the CPU, or on Linux a gcc "
+              "that builds -m32 programs (gcc-multilib).", file=sys.stderr)
         return 2
 
     cases = [c for c in CASES if not args.k or args.k in c["name"]]
@@ -303,6 +353,8 @@ def main_with_args(argv, allow_container=True):
         print(f"workdir: {workdir}")
 
     dk = None
+    if backend == "local":
+        dk = _Local(workdir, runtime_inc)
     if backend == "docker":
         dk = _Container(workdir, mounts=[(runtime_inc, "/rt")])
         if not dk.cid:

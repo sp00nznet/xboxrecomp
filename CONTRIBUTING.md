@@ -147,6 +147,12 @@ will not reach for the containers on its own, because building and running them
 is far too heavy a side effect for a unit-test pass. That check is not going
 unrun — `py -3 -m tools.conformance` is where it lives off Windows.
 
+On a 64-bit Linux whose gcc can build 32-bit programs (`gcc-multilib` on
+Debian and Ubuntu), the snippet phase and `tools.conformance.fuzz` need no
+containers: the host runs the native side itself, when neither MSVC nor the
+`xboxrecomp-gcc-i386` image is there. The corpus phase still needs MSVC and
+says so when it skips.
+
 To run it from pytest anyway, opt in explicitly:
 
 ```
