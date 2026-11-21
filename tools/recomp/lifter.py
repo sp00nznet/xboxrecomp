@@ -3844,11 +3844,34 @@ class Lifter:
         # FPU is complex. We translate common patterns to double operations.
         # Full accuracy would require an x87 stack emulator.
 
-        if m in ("fnsave", "frstor") and ops and ops[0].type == "mem":
-            # Capstone reports this aggregate operand as a dword. The 66
-            # prefix, not mem_size, selects the 14-byte environment.
-            short_env = int(bytes.fromhex(insn.bytes_hex).split(b"\xdd", 1)[0].find(b"\x66") >= 0)
-            return [f"recomp_{m}({_fmt_mem(ops[0])}, {short_env});"]
+        # State save and restore, built from the state the model tracks; the
+        # runtime helpers spell out what is derived (the tag word) and what
+        # is stored as zero (exception flags, pointers). FNINIT is the reset
+        # FNSAVE ends with. Capstone splits a waiting form (9B) into `wait`
+        # and the no-wait mnemonic; the waiting names are accepted anyway.
+        if m in ("fninit", "finit"):
+            return [f"recomp_fninit(); /* {m} */"]
+        if m in ("fnsave", "fsave", "frstor", "fnstenv", "fstenv", "fldenv") \
+                and ops and ops[0].type == "mem":
+            # Capstone reports these aggregate operands as a dword (the
+            # saves) or 28 bytes (the environments) either way. The 66
+            # prefix, not mem_size, selects the 16-bit layout: a 14-byte
+            # environment and a 94-byte save.
+            opcode = b"\xdd" if m in ("fnsave", "fsave", "frstor") else b"\xd9"
+            prefixes = bytes.fromhex(insn.bytes_hex or "").split(opcode, 1)[0]
+            short_env = int(b"\x66" in prefixes)
+            helper = {"fsave": "fnsave", "fstenv": "fnstenv"}.get(m, m)
+            return [f"recomp_{helper}({_fmt_mem(ops[0])}, {short_env});"
+                    f" /* {m} {insn.op_str} */"]
+        if m in ("fxsave", "fxrstor") and ops and ops[0].type == "mem":
+            return [f"recomp_{m}({_fmt_mem(ops[0])}); /* {m} {insn.op_str} */"]
+        if m == "fxtract":
+            # st0 becomes the exponent and the significand is pushed above
+            # it. C1 is cleared (it is set only on a stack fault, which the
+            # model does not have); C0, C2 and C3 are undefined and kept.
+            return ["{ double _sig; fp_top() = recomp_fxtract(fp_top(), &_sig);"
+                    " fp_push(_sig); g_fp_cc = (uint16_t)(g_fp_cc & ~0x0200u); }"
+                    " /* fxtract */"]
 
         if m == "fld":
             if len(ops) >= 1:
