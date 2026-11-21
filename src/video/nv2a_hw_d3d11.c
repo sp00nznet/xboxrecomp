@@ -76,6 +76,8 @@ typedef struct {
     int next;                           /* the staging copy the next frame goes to */
     uint64_t written;                   /* hash of the guest bytes last written back */
     int written_valid;
+    uint32_t checked;                   /* frame whose guest bytes surf_current hashed */
+    int guest_same;                     /* ...and found them as written back */
     uint32_t epoch;                     /* frame that last used it */
     int dirty;                          /* drawn since its last copy */
     uint32_t used;                      /* LRU clock */
@@ -323,17 +325,105 @@ static const char k_rc_head[] =
     " float4 t3 : TEXCOORD3; };\n"
     "float4 main(PIn i) : SV_Target\n{\n";
 
+/* RECOMP_HW_SHADER_CACHE=<folder>: compiled shaders kept on disk. D3DCompile
+ * takes 10-50 ms a shader, and a title meets most of its shaders on the first
+ * frames of a new screen, so each new screen hitched while they compiled. With
+ * the folder set, a shader is compiled once ever: the file name is two hashes
+ * of the source and its length, the content the DXBC bytecode (written to .tmp
+ * and renamed, so a killed process leaves no half file). Unset: off. */
+#define HW_COMPILE_FLAGS (D3DCOMPILE_IEEE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3)
+static uint32_t s_cache_hits, s_cache_compiled;
+
+static int shader_cache_path(char *path, size_t cap, const char *src, size_t len, const char *target)
+{
+    static const char *dir = (const char *)-1;
+    uint64_t a = 1469598103934665603ull, b = 0x84222325CBF29CE4ull;
+    char head[64];
+    size_t i, n;
+
+    if (dir == (const char *)-1) {
+        dir = getenv("RECOMP_HW_SHADER_CACHE");
+        if (dir && !*dir)
+            dir = NULL;
+        if (dir) {
+            CreateDirectoryA(dir, NULL);
+            fprintf(stderr, "[HWRENDER] shader cache on: %s\n", dir);
+        }
+    }
+    if (!dir)
+        return 0;
+    n = (size_t)snprintf(head, sizeof head, "%s|%u|main|", target, (unsigned)HW_COMPILE_FLAGS);
+    for (i = 0; i < n; i++) {
+        a = (a ^ (uint8_t)head[i]) * 1099511628211ull;
+        b = (b ^ (uint8_t)head[i]) * 0x100000001B3ull + 0x9E3779B97F4A7C15ull;
+    }
+    for (i = 0; i < len; i++) {
+        a = (a ^ (uint8_t)src[i]) * 1099511628211ull;
+        b = (b ^ (uint8_t)src[i]) * 0x100000001B3ull + 0x9E3779B97F4A7C15ull;
+    }
+    return snprintf(path, cap, "%s\\%s_%016llx_%016llx_%zu.cso", dir, target,
+                    (unsigned long long)a, (unsigned long long)b, len) < (int)cap;
+}
+
+static ID3DBlob *shader_cache_load(const char *path)
+{
+    ID3DBlob *code = NULL;
+    FILE *f = fopen(path, "rb");
+    long size;
+
+    if (!f)
+        return NULL;
+    if (fseek(f, 0, SEEK_END) == 0 && (size = ftell(f)) > 32 && size < (16l << 20)
+        && fseek(f, 0, SEEK_SET) == 0 && SUCCEEDED(D3DCreateBlob((SIZE_T)size, &code))) {
+        uint8_t *p = (uint8_t *)ID3D10Blob_GetBufferPointer(code);
+        if (fread(p, 1, (size_t)size, f) != (size_t)size || memcmp(p, "DXBC", 4) != 0) {
+            ID3D10Blob_Release(code);
+            code = NULL;
+        }
+    }
+    fclose(f);
+    return code;
+}
+
+static void shader_cache_store(const char *path, ID3DBlob *code)
+{
+    char tmp[MAX_PATH + 8];
+    FILE *f;
+    size_t size = ID3D10Blob_GetBufferSize(code);
+
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp || !(f = fopen(tmp, "wb")))
+        return;
+    if (fwrite(ID3D10Blob_GetBufferPointer(code), 1, size, f) != size) {
+        fclose(f);
+        DeleteFileA(tmp);
+        return;
+    }
+    fclose(f);
+    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+        DeleteFileA(tmp);
+}
+
 static ID3DBlob *compile(const char *src, size_t len, const char *target)
 {
     ID3DBlob *code = NULL, *err = NULL;
-    HRESULT h = D3DCompile(src, len, "nv2a_hw", NULL, NULL, "main", target,
-                           D3DCOMPILE_IEEE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    char path[MAX_PATH];
+    int cached = shader_cache_path(path, sizeof path, src, len, target);
+    HRESULT h;
 
+    if (cached && (code = shader_cache_load(path)) != NULL) {
+        s_cache_hits++;
+        return code;
+    }
+    h = D3DCompile(src, len, "nv2a_hw", NULL, NULL, "main", target, HW_COMPILE_FLAGS, 0, &code, &err);
     if (FAILED(h)) {
         if (g.told++ < 16)
             fprintf(stderr, "[HWRENDER] %s compile failed: %s\n", target,
                     err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
         code = NULL;
+    } else {
+        s_cache_compiled++;
+        if (cached)
+            shader_cache_store(path, code);
     }
     if (err)
         ID3D10Blob_Release(err);
@@ -700,6 +790,10 @@ static void surf_write_back(HwSurf *s)
     surf_drain(s, s->next ^ 1);         /* what was just copied */
 }
 
+/* The surface the last draw or clear went to: at a flip, the frame the window
+ * is about to show (render-to-texture passes come earlier in a frame). */
+static HwSurf *s_last_target;
+
 /* The surface the executor draws into, loaded from guest memory once a frame. */
 static HwSurf *surface_for(const Nv2aSurface *ns, int load)
 {
@@ -835,18 +929,41 @@ static HwDepth *depth_for(uint32_t va, uint32_t w, uint32_t h)
 
 /* ---- textures ----------------------------------------------------------- */
 
-/* A hash of the guest bytes behind a texture, so a decoded copy is reused
- * until the title changes it. The span is generous (4 bytes a texel) and
- * stays inside the RAM or contiguous window the address is in. */
+/* Bytes a texel of an uncompressed swizzled format takes (the executor's
+ * tex_texel_bytes). */
+static uint32_t texel_bytes(uint32_t fmt)
+{
+    switch (fmt) {
+    case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
+        return 1;
+    case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
+    case 0x1C: case 0x1D:
+        return 2;
+    default:
+        return 4;
+    }
+}
+
+/* A hash of the guest bytes behind a texture (level 0, its exact size, and a
+ * P8 texture's palette), so a decoded copy is reused until the title changes
+ * it. Hashed at 4 bytes a texel, a DXT texture took in the memory after it
+ * too, and anything the title rewrote there each frame -- Raw 2 had a
+ * 512x1024 DXT3 decoded again every frame. The span stays inside the RAM or
+ * contiguous window the address is in. */
 static uint64_t texture_hash(const Nv2aTexture *t)
 {
-    uint64_t bytes = (uint64_t)t->width * t->height * 4, h = 1469598103934665603ull, i;
+    uint64_t bytes, h = 1469598103934665603ull, i;
     uint32_t end = t->offset < 0x04000000u ? 0x04000000u
                  : (t->offset >= 0x80000000u && t->offset < 0x84000000u) ? 0x84000000u : t->offset;
+    uint32_t block = d3d8_format_dxt_block_bytes(t->color);
     const uint8_t *p = guest(t->offset);
 
     if (t->pitch)
         bytes = (uint64_t)t->pitch * t->height;
+    else if (block)
+        bytes = (uint64_t)((t->width + 3) / 4) * ((t->height + 3) / 4) * block;
+    else
+        bytes = (uint64_t)t->width * t->height * texel_bytes(t->color);
     if (t->offset + bytes > end)
         bytes = end - t->offset;
     for (i = 0; i + 8 <= bytes; i += 8) {
@@ -854,7 +971,165 @@ static uint64_t texture_hash(const Nv2aTexture *t)
         memcpy(&w, p + i, 8);
         h = (h ^ w) * 1099511628211ull;
     }
+    for (; i < bytes; i++)
+        h = (h ^ p[i]) * 1099511628211ull;
+    if (t->color == 0x0B && t->palette) {
+        const uint8_t *pal = guest(t->palette);
+        for (i = 0; i < 1024; i += 8) {
+            uint64_t w;
+            memcpy(&w, pal + i, 8);
+            h = (h ^ w) * 1099511628211ull;
+        }
+    }
     return h ^ bytes;
+}
+
+/* One DXT1/3/5 block's sixteen texels, with d3d8_dxt_decode_texel's
+ * arithmetic (which decodes the whole block for each texel it is asked for). */
+static void dxt_block(const uint8_t *b, uint32_t fmt, uint32_t px[16])
+{
+    uint32_t alpha[16], c[4], c0, c1, i, bits;
+    int alpha_block = fmt != 0x0C;
+
+    for (i = 0; i < 16; i++)
+        alpha[i] = 255u;
+    if (alpha_block) {
+        if (fmt == 0x0E) {                        /* DXT3: 4 bits a texel */
+            for (i = 0; i < 16; i++) {
+                uint32_t nib = b[i >> 1];
+                alpha[i] = d3d8_expand_channel((i & 1u) ? (nib >> 4) : (nib & 0x0Fu), 4);
+            }
+        } else {                                  /* DXT5: two endpoints, 3-bit index */
+            uint32_t a0 = b[0], a1 = b[1], a[8];
+            uint64_t sel = 0;
+            for (i = 0; i < 6; i++)
+                sel |= (uint64_t)b[2 + i] << (8 * i);
+            a[0] = a0; a[1] = a1;
+            if (a0 > a1) {
+                for (i = 1; i < 7; i++)
+                    a[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+            } else {
+                for (i = 1; i < 5; i++)
+                    a[i + 1] = ((5 - i) * a0 + i * a1) / 5;
+                a[6] = 0; a[7] = 255;
+            }
+            for (i = 0; i < 16; i++)
+                alpha[i] = a[(sel >> (3 * i)) & 7u];
+        }
+        b += 8;
+    }
+    c0 = (uint32_t)b[0] | ((uint32_t)b[1] << 8);
+    c1 = (uint32_t)b[2] | ((uint32_t)b[3] << 8);
+    for (i = 0; i < 2; i++) {
+        uint32_t rgb = i ? c1 : c0;
+        c[i] = (d3d8_expand_channel((rgb >> 11) & 0x1Fu, 5) << 16)
+             | (d3d8_expand_channel((rgb >> 5) & 0x3Fu, 6) << 8)
+             |  d3d8_expand_channel(rgb & 0x1Fu, 5);
+    }
+    c[2] = c[3] = 0;
+    for (i = 0; i < 3; i++) {
+        uint32_t sh = i * 8, m0 = (c[0] >> sh) & 0xFFu, m1 = (c[1] >> sh) & 0xFFu;
+        if (c0 > c1 || alpha_block) {
+            c[2] |= ((2 * m0 + m1) / 3) << sh;
+            c[3] |= ((m0 + 2 * m1) / 3) << sh;
+        } else {
+            c[2] |= ((m0 + m1) / 2) << sh;        /* c[3] stays transparent black */
+        }
+    }
+    bits = (uint32_t)b[4] | ((uint32_t)b[5] << 8) | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
+    for (i = 0; i < 16; i++) {
+        uint32_t idx = (bits >> (2 * i)) & 3u, a = alpha[i];
+        if (!alpha_block && c0 <= c1 && idx == 3)
+            a = 0;                                /* DXT1's one bit of alpha */
+        px[i] = (a << 24) | (c[idx] & 0x00FFFFFFu);
+    }
+}
+
+/* A whole texture at once for the formats a title rewrites every frame --
+ * video (YUY2, UYVY), plain 32-bit -- with the arithmetic of the executor's
+ * sample_tex, which nv2a_backend_decode_texture calls once per texel: Raw 2's
+ * superstar select spent 21 ms a frame decoding its 576x448 movie that way.
+ * Returns 0 for anything else, which then takes the per-texel path. */
+static int decode_fast(const Nv2aTexture *t, uint32_t *out)
+{
+    const uint8_t *base = guest(t->offset);
+    uint32_t w = t->width, h = t->height, x, y;
+    int pow2 = w && h && !(w & (w - 1)) && !(h & (h - 1));
+
+    switch (t->color) {
+    case 0x06: case 0x07:                         /* A8R8G8B8, X8R8G8B8 (swizzled) */
+        if (!pow2)
+            return 0;
+        xbox_unswizzle_rect(out, base, w, h, 4);
+        if (t->color == 0x07)
+            for (x = 0; x < w * h; x++)
+                out[x] |= 0xFF000000u;
+        return 1;
+    case 0x12: case 0x1E:                         /* LIN_A8R8G8B8, LIN_X8R8G8B8 */
+        if (t->pitch < w * 4)
+            return 0;
+        for (y = 0; y < h; y++) {
+            memcpy(out + (size_t)y * w, base + (size_t)y * t->pitch, (size_t)w * 4);
+            if (t->color == 0x1E)
+                for (x = 0; x < w; x++)
+                    out[(size_t)y * w + x] |= 0xFF000000u;
+        }
+        return 1;
+    case 0x0C: case 0x0E: case 0x0F: {            /* DXT1/3/5: each block once, in block order */
+        uint32_t bb = d3d8_format_dxt_block_bytes(t->color), bw = (w + 3) / 4, bh = (h + 3) / 4, bx, by, i;
+        uint32_t px[16];
+        for (by = 0; by < bh; by++)
+            for (bx = 0; bx < bw; bx++) {
+                dxt_block(base + ((size_t)by * bw + bx) * bb, t->color, px);
+                for (i = 0; i < 16; i++) {
+                    uint32_t xx = bx * 4 + (i & 3), yy = by * 4 + (i >> 2);
+                    if (xx < w && yy < h)
+                        out[(size_t)yy * w + xx] = px[i];
+                }
+            }
+        return 1;
+    }
+    case 0x24: case 0x25: {                       /* YUY2, UYVY: BT.601 as sample_tex */
+        uint32_t yoff = t->color == 0x24 ? 0u : 1u;
+        if (t->pitch < ((w + 1) & ~1u) * 2)
+            return 0;
+        for (y = 0; y < h; y++) {
+            const uint8_t *row = base + (size_t)y * t->pitch;
+            uint32_t *o = out + (size_t)y * w;
+            for (x = 0; x < w; x++) {
+                const uint8_t *g = row + (size_t)(x & ~1u) * 2;
+                int c = (int)g[(x & 1u) ? 2 + yoff : yoff] - 16;
+                int cu = (int)g[1 - yoff] - 128, cv = (int)g[3 - yoff] - 128;
+                int r = (298 * c + 409 * cv + 128) >> 8;
+                int gg = (298 * c - 100 * cu - 208 * cv + 128) >> 8;
+                int b = (298 * c + 516 * cu + 128) >> 8;
+                r = r < 0 ? 0 : r > 255 ? 255 : r;
+                gg = gg < 0 ? 0 : gg > 255 ? 255 : gg;
+                b = b < 0 ? 0 : b > 255 ? 255 : b;
+                o[x] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)gg << 8) | (uint32_t)b;
+            }
+        }
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
+
+/* Whether a surface's GPU copy is what the title would read at its address:
+ * drawn this frame, or with a write-back still on its way (guest memory is
+ * older then), or with guest memory unchanged since the last write-back
+ * (hashed at most once a frame). A render target sampled the frame after it
+ * was drawn used to be decoded from guest memory, a frame late, every frame. */
+static int surf_current(HwSurf *s)
+{
+    if (s->epoch == g.epoch || s->dirty || s->pending[0] || s->pending[1])
+        return 1;
+    if (s->checked != g.epoch) {
+        s->checked = g.epoch;
+        s->guest_same = s->written_valid && surf_guest_hash(s) == s->written;
+    }
+    return s->guest_same;
 }
 
 static ID3D11ShaderResourceView *texture_view(const Nv2aTexture *t, HwSurf *target)
@@ -867,7 +1142,7 @@ static ID3D11ShaderResourceView *texture_view(const Nv2aTexture *t, HwSurf *targ
     for (i = 0; i < HW_SURFACES; i++) {
         HwSurf *s = &g.surf[i];
         if (s->tex && s->va == t->offset && s != target && s->width == t->width
-            && s->height == t->height && s->epoch == g.epoch)
+            && s->height == t->height && surf_current(s))
             return s->srv;
         if (s->tex && s == target && s->va == t->offset)
             surf_write_back(s);                   /* feedback: read what is drawn so far */
@@ -909,8 +1184,49 @@ static ID3D11ShaderResourceView *texture_view(const Nv2aTexture *t, HwSurf *targ
         D3D11_SUBRESOURCE_DATA sd;
         HRESULT h;
 
-        if (!argb || !nv2a_backend_decode_texture(t, argb))
+        if (!argb || !(decode_fast(t, argb) || nv2a_backend_decode_texture(t, argb))) {
+            /* The stage reads white then: say so once per format, or a missing
+             * texture only shows as flat colour on screen. */
+            static uint32_t told[32];
+            static int ntold;
+            int k;
+            for (k = 0; k < ntold && told[k] != t->color; k++)
+                ;
+            if (k == ntold && ntold < 32) {
+                told[ntold++] = t->color;
+                fprintf(stderr, "[HWRENDER] texture format 0x%02X (%ux%u, pitch %u, palette 0x%08X) could not be "
+                        "decoded: drawn as white\n", t->color, t->width, t->height, t->pitch, t->palette);
+            }
             return NULL;
+        }
+        {
+            /* RECOMP_HW_TEX_DUMP=<folder>: each decoded texture as a BMP, named
+             * by address, format and size, to see what a draw was given. */
+            static const char *dir = (const char *)-1;
+            if (dir == (const char *)-1)
+                dir = getenv("RECOMP_HW_TEX_DUMP");
+            if (dir && t->width <= 4096 && t->height <= 4096) {
+                char path[512];
+                FILE *f;
+                snprintf(path, sizeof path, "%s/tex_%08X_f%02X_%ux%u_%016llX.bmp", dir, t->offset, t->color,
+                         t->width, t->height, (unsigned long long)hash);
+                if ((f = fopen(path, "wb")) != NULL) {
+                    uint32_t w = t->width, hh = t->height, sz = 54 + w * hh * 4, y;
+                    uint8_t hdr[54];
+                    memset(hdr, 0, sizeof hdr);
+                    hdr[0] = 'B'; hdr[1] = 'M';
+                    memcpy(hdr + 2, &sz, 4);
+                    hdr[10] = 54; hdr[14] = 40;
+                    memcpy(hdr + 18, &w, 4);
+                    memcpy(hdr + 22, &hh, 4);
+                    hdr[26] = 1; hdr[28] = 32;
+                    fwrite(hdr, 1, 54, f);
+                    for (y = 0; y < hh; y++)              /* bottom-up rows, BGRA as decoded */
+                        fwrite(argb + (size_t)(hh - 1 - y) * w, 4, w, f);
+                    fclose(f);
+                }
+            }
+        }
         if (victim->tex) {
             ID3D11ShaderResourceView_Release(victim->srv);
             ID3D11Texture2D_Release(victim->tex);
@@ -1448,6 +1764,12 @@ static ID3D11PixelShader *rc_prepare(const Nv2aPixelState *ps, const Nv2aRenderS
 
         have[k] = 0;
         c.tex_inv[k][0] = c.tex_inv[k][1] = 1.0f;
+        if (fetch && used[k] && !(st->valid && st->tex.width && st->tex.height)) {
+            static int told;
+            if (told++ < 4)
+                fprintf(stderr, "[HWRENDER] stage %d (mode %u) is read with no usable texture bound: white\n",
+                        k, st->mode);
+        }
         if (!fetch || !used[k] || !st->valid || !st->tex.width || !st->tex.height)
             continue;
         if (st->mode == 3 && st->cube)            /* ponytail: one face decoded -- reads white */
@@ -1511,6 +1833,8 @@ static void hw_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
     }
     if (flags & 0xF0u) {
         HwSurf *t = surface_for(&ns, (flags & 0xF0u) != 0xF0u);   /* a full colour clear needs no load */
+        if (t)
+            s_last_target = t;
         float c[4] = { (float)((argb >> 16) & 0xFF) / 255.0f, (float)((argb >> 8) & 0xFF) / 255.0f,
                        (float)(argb & 0xFF) / 255.0f, (float)((argb >> 24) & 0xFF) / 255.0f };
         /* SET_COLOR_CLEAR_VALUE is in the surface's own format: a 16-bit
@@ -1540,6 +1864,8 @@ static void hw_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
 static void hw_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 {
     HwSurf *t = surface_for(s, 1);
+    if (t)
+        s_last_target = t;
     HwDepth *d = NULL;
     HwTarget tc;
     HwPixel pc;
@@ -1721,6 +2047,14 @@ static void hw_report(void)
             g.n_rc / f, g.n_rc_shaders,
             g.ms_draw / f, g.ms_hash / f, g.n_hashes / f, g.ms_decode / f, g.ms_upload / f, g.ms_compile / f,
             g.ms_writeback / f, g.ms_load / f);
+    {
+        static uint32_t last_hits, last_compiled;
+        if (s_cache_hits != last_hits || s_cache_compiled != last_compiled)
+            fprintf(stderr, "[HWRENDER] shaders: %u from the disk cache, %u compiled (totals)\n",
+                    s_cache_hits, s_cache_compiled);
+        last_hits = s_cache_hits;
+        last_compiled = s_cache_compiled;
+    }
     g.ms_draw = g.ms_hash = g.ms_decode = g.ms_compile = g.ms_upload = g.ms_writeback = g.ms_load = 0.0;
     g.n_frames = g.n_draws = g.n_programs = g.n_hashes = g.n_switches = g.n_rc = 0;
     g.report_at = now;
@@ -1735,11 +2069,23 @@ static void hw_present_sync(void)
 
     /* Last frame's copies are finished on the GPU by now: write them to guest
      * memory without waiting, then queue this frame's. The window and frame
-     * dumps show the guest copy, so they run one frame behind. */
+     * dumps show the guest copy, so they run one frame behind.
+     *
+     * RECOMP_HW_LOW_LATENCY: except the surface drawn last -- the frame the
+     * window shows next -- which is written back now, waiting for the GPU,
+     * so the window shows this frame and the player sees a move one frame
+     * (16.7 ms) sooner. Read every present, so it can be switched live. */
+    const char *ll = getenv("RECOMP_HW_LOW_LATENCY");
+    int low = ll && *ll && *ll != '0';
+
     for (i = 0; i < HW_SURFACES; i++) {
         HwSurf *s = &g.surf[i];
         if (!s->tex)
             continue;
+        if (low && s == s_last_target) {
+            surf_write_back(s);         /* this frame, now */
+            continue;
+        }
         surf_drain(s, s->next ^ 1);     /* copied at the last present */
         surf_copy(s);
     }
@@ -1876,4 +2222,10 @@ int xbox_Nv2aHwRendererInstall(void)
 void nv2a_hw_d3d11_stats(uint32_t out[6])
 {
     memcpy(out, g.stats, sizeof g.stats);
+}
+
+void nv2a_hw_d3d11_shader_cache_counts(uint32_t out[2])
+{
+    out[0] = s_cache_hits;
+    out[1] = s_cache_compiled;
 }

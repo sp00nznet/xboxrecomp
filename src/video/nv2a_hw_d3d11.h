@@ -26,4 +26,8 @@ int nv2a_hw_d3d11_register(int warp);
  * memory, [4] surfaces written back, [5] textures decoded. */
 void nv2a_hw_d3d11_stats(uint32_t out[6]);
 
+/* RECOMP_HW_SHADER_CACHE: shaders read from the disk cache [0] and compiled
+ * [1], since process start. */
+void nv2a_hw_d3d11_shader_cache_counts(uint32_t out[2]);
+
 #endif
