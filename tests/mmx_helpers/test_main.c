@@ -56,6 +56,9 @@ REF_BINOP(REF_PAVGB, 8, ub, (uint8_t)(((int32_t)a.ub[i] + b.ub[i] + 1) >> 1))
 REF_BINOP(REF_PAVGW, 4, uw, (uint16_t)(((int32_t)a.uw[i] + b.uw[i] + 1) >> 1))
 REF_BINOP(REF_PMINSW, 4, w, (a.w[i] < b.w[i] ? a.w[i] : b.w[i]))
 REF_BINOP(REF_PMAXSW, 4, w, (a.w[i] > b.w[i] ? a.w[i] : b.w[i]))
+REF_BINOP(REF_PMINUB, 8, ub, (a.ub[i] < b.ub[i] ? a.ub[i] : b.ub[i]))
+REF_BINOP(REF_PMAXUB, 8, ub, (a.ub[i] > b.ub[i] ? a.ub[i] : b.ub[i]))
+REF_BINOP(REF_PMULHUW, 4, uw, (uint16_t)(((uint32_t)a.uw[i] * b.uw[i]) >> 16))
 REF_BINOP(REF_PCMPEQB, 8, b, (int8_t)(a.b[i] == b.b[i] ? -1 : 0))
 REF_BINOP(REF_PCMPEQW, 4, w, (int16_t)(a.w[i] == b.w[i] ? -1 : 0))
 REF_BINOP(REF_PCMPEQD, 2, d, (int32_t)(a.d[i] == b.d[i] ? -1 : 0))
@@ -192,6 +195,8 @@ int main(void) {
     CHECK2(REF_PMULLW, MMX_PMULLW);   CHECK2(REF_PMULHW, MMX_PMULHW);
     CHECK2(REF_PAVGB, MMX_PAVGB);     CHECK2(REF_PAVGW, MMX_PAVGW);
     CHECK2(REF_PMINSW, MMX_PMINSW);   CHECK2(REF_PMAXSW, MMX_PMAXSW);
+    CHECK2(REF_PMINUB, MMX_PMINUB);   CHECK2(REF_PMAXUB, MMX_PMAXUB);
+    CHECK2(REF_PMULHUW, MMX_PMULHUW);
     CHECK2(REF_PCMPEQB, MMX_PCMPEQB); CHECK2(REF_PCMPEQW, MMX_PCMPEQW);
     CHECK2(REF_PCMPEQD, MMX_PCMPEQD);
     CHECK2(REF_PCMPGTB, MMX_PCMPGTB); CHECK2(REF_PCMPGTW, MMX_PCMPGTW);

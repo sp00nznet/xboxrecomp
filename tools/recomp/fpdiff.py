@@ -313,6 +313,11 @@ def cases():
     add("movd_gpr", mmx + ["movd ecx, mm1", "mov eax, ecx", "emms"], "sse")
     add("movq_reg", mmx + ["movq mm0, mm1"] + keep, "sse")
     add("movntq_store", mmx + ["movntq qword ptr [eax+32], mm1", "emms"], "sse")
+    # maskmovq: mm0's bytes where mm1's byte has bit 7 set, to [edi]; the
+    # unselected bytes of the output keep the input's values. Aligned and not.
+    add("maskmovq", mmx + ["lea edi, [eax+32]", "maskmovq mm0, mm1", "emms"], "sse")
+    add("maskmovq_unaligned",
+        mmx + ["lea edi, [eax+37]", "maskmovq mm0, mm1", "emms"], "sse")
 
     # Integer flags: [0] a, [4] path selector / carry-in, [16] b; the
     # destination is stored to [32]. Each setter is followed directly by every

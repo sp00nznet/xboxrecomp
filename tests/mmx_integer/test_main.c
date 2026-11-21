@@ -26,6 +26,10 @@
 
 static unsigned checks, failures;
 
+/* MMX_MASKMOVQ stores through XBOX_PTR; point guest address 0 at a test
+ * buffer. */
+ptrdiff_t g_xbox_mem_offset;
+
 static uint64_t to_u64(__m64 v)
 {
     uint64_t r;
@@ -122,6 +126,9 @@ int main(void)
             BINARY(MMX_PAVGW,    _mm_avg_pu16);
             BINARY(MMX_PMINSW,   _mm_min_pi16);
             BINARY(MMX_PMAXSW,   _mm_max_pi16);
+            BINARY(MMX_PMINUB,   _mm_min_pu8);
+            BINARY(MMX_PMAXUB,   _mm_max_pu8);
+            BINARY(MMX_PMULHUW,  _mm_mulhi_pu16);
             BINARY(MMX_PCMPEQB,  _mm_cmpeq_pi8);
             BINARY(MMX_PCMPEQW,  _mm_cmpeq_pi16);
             BINARY(MMX_PCMPEQD,  _mm_cmpeq_pi32);
@@ -184,6 +191,28 @@ int main(void)
 #undef LANE_CASE
                 check("MMX_PMOVMSKB", MMX_PMOVMSKB(ra),
                       (uint32_t)_mm_movemask_pi8(to_m64(a)), a, 0);
+                /* maskmovq: the same 8 bytes stored, and the same bytes
+                 * left alone, as the instruction writing into an identical
+                 * buffer. Both sit inside a larger one so a byte written
+                 * past either end shows up too. The offset walks so the
+                 * store is misaligned most of the time. */
+                {
+                    static unsigned char got[24], want[24];
+                    unsigned k, off = 4 + (i + j) % 9;
+                    RecompMmx rb;
+                    rb.q = b;
+                    for (k = 0; k < sizeof got; k++)
+                        got[k] = want[k] = (unsigned char)(k * 37u + i);
+                    g_xbox_mem_offset = (ptrdiff_t)(uintptr_t)got;
+                    MMX_MASKMOVQ((uint32_t)off, ra, rb);
+                    _mm_maskmove_si64(to_m64(a), to_m64(b), (char *)want + off);
+                    _mm_sfence();
+                    for (k = 0; k < sizeof got; k += 8) {
+                        uint64_t g, w;
+                        memcpy(&g, got + k, 8); memcpy(&w, want + k, 8);
+                        check("MMX_MASKMOVQ", g, w, a, b);
+                    }
+                }
             }
         }
     }
