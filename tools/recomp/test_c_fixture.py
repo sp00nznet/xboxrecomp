@@ -52,8 +52,8 @@ def test_libm_links_when_floor_is_not_folded(tmp_path):
     cc = c_fixture.compiler()
     if not cc:
         pytest.skip('C compiler unavailable')
-    if c_fixture.is_msvc(cc):
-        pytest.skip('MSVC does not take -lm')
+    if c_fixture.targets_msvc_abi(cc):
+        pytest.skip('MSVC ABI has no libm')
     c, exe = tmp_path / 't.c', tmp_path / 't.exe'
     c.write_text(
         '#include <math.h>\n'
@@ -68,3 +68,24 @@ def test_libm_links_when_floor_is_not_folded(tmp_path):
     assert built.returncode == 0, built.stdout + built.stderr
     # argc == 1 => floor(1.5) == 1
     assert subprocess.run([str(exe)], timeout=5).returncode == 1
+
+
+def test_command_drops_lib_flags_on_windows_msvc_clang(monkeypatch):
+    """Windows clang is not cl.exe, but it still drives the MSVC linker."""
+    monkeypatch.setattr(c_fixture, '_dumpmachine',
+                        lambda cc: 'x86_64-pc-windows-msvc')
+    cmd = c_fixture.command('clang', ['a.c'], 'a.exe',
+                            gnu_flags=['-std=c11', '-Werror', '-lm'])
+    assert '-lm' not in cmd
+    assert '-std=c11' in cmd and '-Werror' in cmd
+    # MinGW clang still has libm; only the MSVC ABI is special.
+    monkeypatch.setattr(c_fixture, '_dumpmachine',
+                        lambda cc: 'x86_64-w64-windows-gnu')
+    mingw = c_fixture.command('clang', ['a.c'], 'a.exe',
+                              gnu_flags=['-std=c11', '-lm'])
+    assert mingw.index('-lm') > mingw.index('a.c')
+    monkeypatch.setattr(c_fixture, '_dumpmachine',
+                        lambda cc: 'x86_64-pc-linux-gnu')
+    linux = c_fixture.command('clang', ['a.c'], 'a.exe', gnu_flags=['-lm'])
+    assert linux.index('-lm') > linux.index('a.c')
+

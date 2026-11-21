@@ -1,6 +1,8 @@
 """Compiler dialects for synthetic C fixtures; assertions stay in the caller."""
+from functools import lru_cache
 from pathlib import Path
 import shutil
+import subprocess
 
 
 def compiler():
@@ -12,6 +14,31 @@ def compiler():
 
 def is_msvc(cc):
     return Path(cc).stem.lower() == 'cl'
+
+
+@lru_cache(maxsize=None)
+def _dumpmachine(cc):
+    """`cc -dumpmachine` stdout, or '' if the compiler cannot answer."""
+    try:
+        r = subprocess.run([cc, '-dumpmachine'], capture_output=True,
+                           text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+    if r.returncode != 0:
+        return ''
+    return (r.stdout or '').strip()
+
+
+def targets_msvc_abi(cc):
+    """True when this compiler drives the MSVC linker, which has no libm.
+
+    `is_msvc()` is only true for cl.exe. Windows clang reports a GNU-looking
+    driver but `-dumpmachine` ends in `-windows-msvc`, and `-lm` then becomes
+    a request for m.lib, which the MSVC linker cannot open.
+    """
+    if is_msvc(cc):
+        return True
+    return _dumpmachine(cc).endswith('-windows-msvc')
 
 
 def _is_link_flag(flag):
@@ -39,7 +66,7 @@ def command(cc, sources, output, *, include_dirs=(), defines=(),
                 + (['/c', '/Fo:' + str(output)] if compile_only
                    else ['/Fe:' + str(output)]))
     compile_flags = [f for f in gnu_flags if not _is_link_flag(f)]
-    link_flags = ([] if compile_only
+    link_flags = ([] if compile_only or targets_msvc_abi(cc)
                   else [f for f in gnu_flags if _is_link_flag(f)])
     return ([cc, '-w', '-O2', *compile_flags,
              *(arg for p in include_dirs for arg in ('-I', str(p))),
