@@ -357,6 +357,24 @@ static inline uint16_t recomp_fxam(double value) {
          value == 0.0 ? 0x4000u : 0x0400u));
 }
 
+/* FXTRACT: st0 = x becomes st1 = exponent, st0 = significand, with x equal
+ * to significand * 2^exponent and |significand| in [1, 2). Returns the
+ * exponent and stores the significand; both are exact in a double, binary64
+ * subnormals included (they are normal in the x87's extended format). The
+ * edge cases are the masked responses: a zero gives -inf and keeps its
+ * signed zero (the divide-by-zero flag it raises is not recorded, as no x87
+ * exception flag is), an infinity gives +inf and keeps itself, a NaN goes to
+ * both. */
+static inline double recomp_fxtract(double value, double *significand) {
+    int exponent;
+    *significand = value;
+    if (isnan(value)) return value;
+    if (isinf(value)) return INFINITY;
+    if (value == 0.0) return -INFINITY;
+    *significand = 2.0 * frexp(value, &exponent);
+    return (double)(exponent - 1);
+}
+
 /* Result of an x87 compare, in the shape the status word wants:
  *   -1 less, 0 equal, 1 greater, 2 unordered (either operand is NaN).
  * The unordered case is not a curiosity: `fucompp` of a value with itself
@@ -649,46 +667,135 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
 #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
 
-/* FSAVE's protected-mode image. Only state represented by the double-stack
- * model is restored: CW, TOP, condition codes and eight registers.
- * Tags, exception bits and the instruction/data pointers are not modeled; the
- * image holds zeros there until the x87 environment is tracked. */
-static inline void recomp_fnsave(uint32_t address, int short_env) {
-    unsigned stride = short_env ? 2u : 4u;
-    unsigned env = 7u * stride;
-    unsigned i;
-    for (i = 0; i < env; ++i) MEM8(address + i) = 0;
-    MEM16(address) = g_fp_control_word;
-    MEM16(address + stride) = (uint16_t)((g_fp_top << 11) | g_fp_cc);
-    for (i = 0; i < 8; ++i) {
-        uint64_t mant;
-        uint16_t se = recomp_f80_store(g_fp_stack[(g_fp_top + i) & 7u], &mant);
-        uint32_t slot = address + env + 10u * i;
-        MEM32(slot) = (uint32_t)mant;
-        MEM32(slot + 4) = (uint32_t)(mant >> 32);
-        MEM16(slot + 8) = se;
-    }
+/* ================================================================
+ * x87 environment and state images: FNINIT, FNSTENV/FLDENV,
+ * FNSAVE/FRSTOR, FXSAVE/FXRSTOR
+ *
+ * The images are built from what the double-stack model tracks: the control
+ * word, TOP, the condition codes C0-C3 and eight register values (plus MXCSR
+ * and the XMM file for FXSAVE). Everything else is approximated:
+ *
+ * - The tag word is derived, not tracked. A register is empty unless TOP is
+ *   non-zero and the register is at or above TOP, which is the shape of a
+ *   stack that started empty at TOP=0, as the runtime's does and as MSVC
+ *   code keeps it between calls. So a full stack (eight values, TOP back at 0) reads as empty, and a value
+ *   ffree or fincstp left behind reads as valid. A non-empty register is
+ *   tagged from its value: zero, special (NaN or infinity) or valid.
+ * - The exception flags, ES and B are not recorded by any lifted operation
+ *   and are stored clear.
+ * - The last instruction and operand pointers and the last opcode are not
+ *   modelled and are stored as zero.
+ * - On a load, the tags and pointers in the image are ignored.
+ *
+ * The 32-bit layouts fill the reserved upper half of the control, status and
+ * tag words and of the data selector with ones, as the CPU does.
+ * ================================================================ */
+
+/* Tag of physical register reg: 0 valid, 1 zero, 2 special, 3 empty. The
+ * model's g_fp_stack index is the physical register number. */
+static inline unsigned recomp_fp_tag(unsigned reg) {
+    unsigned top = (unsigned)g_fp_top & 7u;
+    double value;
+    reg &= 7u;
+    if (top == 0 || reg < top)
+        return 3u;
+    value = g_fp_stack[reg];
+    return value == 0.0 ? 1u : (isnan(value) || isinf(value)) ? 2u : 0u;
+}
+
+static inline uint16_t recomp_fp_tag_word(void) {
+    unsigned reg, word = 0;
+    for (reg = 0; reg < 8; ++reg)
+        word |= recomp_fp_tag(reg) << (2u * reg);
+    return (uint16_t)word;
+}
+
+static inline uint16_t recomp_fp_status_word(void) {
+    return (uint16_t)((((unsigned)g_fp_top & 7u) << 11) | g_fp_cc);
+}
+
+/* TOP and C0-C3 from a stored status word, and the compare result the
+ * condition codes describe. */
+static inline void recomp_fp_status_load(uint16_t status) {
+    g_fp_top = (status >> 11) & 7u;
+    g_fp_cc = status & 0x4700u;
+    g_fp_cmp = (g_fp_cc & 0x0400u) ? 2 : (g_fp_cc & 0x4000u) ? 0
+        : (g_fp_cc & 0x0100u) ? -1 : 1;
+}
+
+/* One register as the 80-bit extended value the images hold. */
+static inline void recomp_fp_reg_store(uint32_t slot, double value) {
+    uint64_t mant;
+    uint16_t se = recomp_f80_store(value, &mant);
+    MEM32(slot) = (uint32_t)mant;
+    MEM32(slot + 4) = (uint32_t)(mant >> 32);
+    MEM16(slot + 8) = se;
+}
+
+static inline double recomp_fp_reg_load(uint32_t slot) {
+    uint64_t mant = ((uint64_t)MEM32(slot + 4) << 32) | MEM32(slot);
+    return recomp_f80_load(mant, MEM16(slot + 8));
+}
+
+/* FNINIT: control word 0x037F (every exception masked, 64-bit precision,
+ * round to nearest), status clear, every register tagged empty -- which the
+ * derived tags read from TOP=0. The register values themselves are kept. */
+static inline void recomp_fninit(void) {
     g_fp_control_word = 0x037fu;
     g_fp_top = 0;
     g_fp_cc = 0;
     g_fp_cmp = 0;
 }
 
-static inline void recomp_frstor(uint32_t address, int short_env) {
+/* The protected-mode environment: seven words (the 66-prefixed, 14-byte
+ * form) or seven dwords (28 bytes). */
+static inline void recomp_fp_env_store(uint32_t address, int short_env) {
     unsigned stride = short_env ? 2u : 4u;
-    unsigned env = 7u * stride;
     unsigned i;
-    uint16_t status = MEM16(address + stride);
-    g_fp_control_word = MEM16(address);
-    g_fp_top = (status >> 11) & 7u;
-    g_fp_cc = status & 0x4700u;
-    g_fp_cmp = (g_fp_cc & 0x0400u) ? 2 : (g_fp_cc & 0x4000u) ? 0
-        : (g_fp_cc & 0x0100u) ? -1 : 1;
-    for (i = 0; i < 8; ++i) {
-        uint32_t slot = address + env + 10u * i;
-        uint64_t mant = ((uint64_t)MEM32(slot + 4) << 32) | MEM32(slot);
-        g_fp_stack[(g_fp_top + i) & 7u] = recomp_f80_load(mant, MEM16(slot + 8));
+    for (i = 0; i < 7u * stride; ++i) MEM8(address + i) = 0;
+    if (!short_env) {
+        MEM16(address + 2) = 0xffffu;
+        MEM16(address + 6) = 0xffffu;
+        MEM16(address + 10) = 0xffffu;
+        MEM16(address + 26) = 0xffffu;
     }
+    MEM16(address) = g_fp_control_word;
+    MEM16(address + stride) = recomp_fp_status_word();
+    MEM16(address + 2u * stride) = recomp_fp_tag_word();
+}
+
+static inline void recomp_fp_env_load(uint32_t address, int short_env) {
+    unsigned stride = short_env ? 2u : 4u;
+    g_fp_control_word = MEM16(address);
+    recomp_fp_status_load(MEM16(address + stride));
+}
+
+/* FNSTENV stores the environment, then masks every exception. */
+static inline void recomp_fnstenv(uint32_t address, int short_env) {
+    recomp_fp_env_store(address, short_env);
+    g_fp_control_word |= 0x003fu;
+}
+
+static inline void recomp_fldenv(uint32_t address, int short_env) {
+    recomp_fp_env_load(address, short_env);
+}
+
+/* FNSAVE: the environment, then ST(0)..ST(7), then FNINIT. */
+static inline void recomp_fnsave(uint32_t address, int short_env) {
+    unsigned env = 7u * (short_env ? 2u : 4u);
+    unsigned i;
+    recomp_fp_env_store(address, short_env);
+    for (i = 0; i < 8; ++i)
+        recomp_fp_reg_store(address + env + 10u * i, g_fp_stack[(g_fp_top + i) & 7u]);
+    recomp_fninit();
+}
+
+static inline void recomp_frstor(uint32_t address, int short_env) {
+    unsigned env = 7u * (short_env ? 2u : 4u);
+    unsigned i;
+    recomp_fp_env_load(address, short_env);
+    for (i = 0; i < 8; ++i)
+        g_fp_stack[(g_fp_top + i) & 7u] = recomp_fp_reg_load(address + env + 10u * i);
 }
 
 /* ================================================================
@@ -728,6 +835,63 @@ typedef union RecompXmm {
 
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+
+/* XMMn by number, for the state images below. */
+static inline RecompXmm *recomp_xmm_reg(unsigned n) {
+    switch (n & 7u) {
+    case 0: return &g_xmm0; case 1: return &g_xmm1;
+    case 2: return &g_xmm2; case 3: return &g_xmm3;
+    case 4: return &g_xmm4; case 5: return &g_xmm5;
+    case 6: return &g_xmm6; default: return &g_xmm7;
+    }
+}
+
+/* FXSAVE/FXRSTOR's 512-byte image, in the 32-bit layout the console's CPU
+ * writes. The x87 part follows the environment notes above: FCW, FSW and
+ * MXCSR are exact, the abridged tag byte (bit set = register not empty) is
+ * derived the same way, and FOP and the pointers are zero. ST(0)..ST(7) go in
+ * stack order, with the 16-byte slots' upper six bytes zero (as current CPUs
+ * write them). MXCSR_MASK is zero, which by definition means the default
+ * mask 0xFFBF, i.e. no DAZ -- processors older than the field store zero.
+ *
+ * MMX: the hardware aliases MM0-7 onto the x87 registers, the model keeps
+ * them apart (see the MMX notes below), so the register slots hold the x87
+ * stack and g_mm0..g_mm7 are neither stored nor loaded.
+ *
+ * Bytes 288-511 are not written: reserved in the 32-bit layout, and 464-511
+ * are explicitly left to software. FXRSTOR loads MXCSR as stored; the reserved-bit
+ * #GP is not modelled, as LDMXCSR's is not. */
+static inline void recomp_fxsave(uint32_t address) {
+    unsigned i, k;
+    unsigned ftw = 0;
+    for (i = 0; i < 32; ++i) MEM8(address + i) = 0;
+    for (i = 0; i < 8; ++i)
+        if (recomp_fp_tag(i) != 3u) ftw |= 1u << i;
+    MEM16(address) = g_fp_control_word;
+    MEM16(address + 2) = recomp_fp_status_word();
+    MEM8(address + 4) = (uint8_t)ftw;
+    MEM32(address + 24) = g_mxcsr;
+    for (i = 0; i < 8; ++i) {
+        uint32_t slot = address + 32u + 16u * i;
+        recomp_fp_reg_store(slot, g_fp_stack[(g_fp_top + i) & 7u]);
+        MEM16(slot + 10) = 0;
+        MEM32(slot + 12) = 0;
+        for (k = 0; k < 4; ++k)
+            MEM32(address + 160u + 16u * i + 4u * k) = recomp_xmm_reg(i)->u[k];
+    }
+}
+
+static inline void recomp_fxrstor(uint32_t address) {
+    unsigned i, k;
+    g_fp_control_word = MEM16(address);
+    recomp_fp_status_load(MEM16(address + 2));
+    g_mxcsr = MEM32(address + 24);
+    for (i = 0; i < 8; ++i) {
+        g_fp_stack[(g_fp_top + i) & 7u] = recomp_fp_reg_load(address + 32u + 16u * i);
+        for (k = 0; k < 4; ++k)
+            recomp_xmm_reg(i)->u[k] = MEM32(address + 160u + 16u * i + 4u * k);
+    }
+}
 
 /* -- construction -- */
 

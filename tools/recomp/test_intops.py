@@ -15,7 +15,8 @@ def test_intops_native(tmp_path, group):
     elif group == "product":
         corpus = [c for c in corpus if c["name"].startswith(("intops_mul", "intops_imul"))]
     else:
-        corpus = [c for c in corpus if c["name"].startswith("intops_fnsave")]
+        corpus = [c for c in corpus
+                  if c["name"].startswith(("intops_fnsave", "intops_fpenv"))]
     result = run(tmp_path, corpus)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "UNSUPPORTED" not in result.stdout, result.stdout

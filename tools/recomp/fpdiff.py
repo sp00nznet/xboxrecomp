@@ -139,6 +139,10 @@ def cases():
     for op, tol, domain in (("fpatan", 1e-13, "1"), ("fyl2x", 1e-13, "1"),
                             ("fyl2xp1", 1e-13, "fabs(a) < 0.29"), ("fscale", 0.0, "1")):
         add(op, two + [op], tol=tol, domain=domain)
+    # FXTRACT: exponent below, significand on top; zero, infinity and NaN
+    # take the masked responses. C1 is the only status bit it defines.
+    add("fxtract", two + ["fxtract"])
+    status("fxtract_sw", two + ["fxtract"], 0x0200)
     # One partial step reduces by an implementation-chosen 32..63 bits, so
     # single steps are compared only where one step completes; the loops
     # (what fmod and the CRT's trig reduction run) cover the rest.
@@ -413,6 +417,43 @@ def cases():
         asm += ["fnstcw word ptr [eax+32]", "fnstsw word ptr [eax+36]",
                 "and word ptr [eax+36], 0x7f00", "add esp, 108"]
         add(f"intops_fnsave_{action}", asm)
+    # The rest of the state save family. Only the fields the model keeps are
+    # copied out: the status word without its exception byte (a NaN compare
+    # raises IE on the CPU, and no lifted op records flags), and never the
+    # instruction or operand pointers. The tag word is derived from TOP in
+    # the model, which these balanced stacks agree with. Every field goes
+    # out zero-extended, 16 bits at a time: the scratch compare lets any two
+    # NaN-shaped dwords match, and 0xFFFF in a top half is one.
+    def word(src, dst, mask=None):
+        return [f"movzx ecx, word ptr [esp+{src}]"] \
+            + ([f"and ecx, {mask:#x}"] if mask else []) \
+            + [f"mov dword ptr [eax+{dst}], ecx"]
+    env = word(0, 32) + word(4, 36, 0x7f00) + word(8, 40)
+    add("intops_fpenv_fninit", two + ["ftst", "fninit", "sub esp, 28",
+                                      "fnstenv [esp]"] + env + ["add esp, 28"])
+    add("intops_fpenv_fnstenv", two + ["ftst", "sub esp, 28", "fnstenv [esp]"] + env
+        + word(2, 44) + word(26, 48)
+        + ["fnstcw word ptr [eax+52]", "add esp, 28"])
+    add("intops_fpenv_fldenv", two + ["ftst", "sub esp, 28", "fnstenv [esp]",
+                                      "fld1", "fld1", "fchs", "ftst", "fldenv [esp]",
+                                      "fnstsw word ptr [eax+32]",
+                                      "and word ptr [eax+32], 0x7f00",
+                                      "fnstcw word ptr [eax+36]", "add esp, 28"])
+    fx = ["mov edx, esp", "sub esp, 528", "and esp, 0xfffffff0"]
+    add("intops_fpenv_fxsave", two + ["ftst"] + fx + [
+        "fxsave [esp]",
+        "movzx ecx, byte ptr [esp+4]", "shl ecx, 16", "mov cx, word ptr [esp]",
+        "mov dword ptr [eax+32], ecx"] + word(2, 36, 0x7f00) + [
+        "mov ecx, dword ptr [esp+24]", "mov dword ptr [eax+40], ecx"]
+        + word(32, 44) + word(34, 48) + word(36, 52) + word(38, 56) + word(40, 60)
+        + ["fld1", "fchs", "fxrstor [esp]", "mov esp, edx"])
+    add("intops_fpenv_fxrstor_xmm", sse + fx + [
+        "fxsave [esp]", "xorps xmm0, xmm0", "xorps xmm1, xmm1",
+        "mov dword ptr [esp+24], 0x3f80",
+        "fxrstor [esp]", "stmxcsr dword ptr [eax+32]",
+        "mov ecx, dword ptr [esp+164]", "mov dword ptr [eax+36], ecx",
+        "mov ecx, dword ptr [esp+188]", "mov dword ptr [eax+40], ecx",
+        "mov dword ptr [esp+24], 0x1f80", "fxrstor [esp]", "mov esp, edx"], "sse")
 
     # Joins: two paths set the flags differently and one jcc reads them.
     joins = {
