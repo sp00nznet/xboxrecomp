@@ -94,7 +94,7 @@ static float read_alpha(float R[16][4], uint32_t byte)
     return map_in((byte & 0x10) ? r[3] : r[2], byte);
 }
 
-void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
+static void eval_generic(const Nv2aCombiner *rc, const float v0[4],
                   const float v1[4], const float fog[4],
                   const float t[4][4], float out[4])
 {
@@ -214,3 +214,67 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
     for (i = 0; i < 4; i++)
         out[i] = clampf(out[i], 0.0f, 1.0f);
 }
+
+/* The usual fixed-function MODULATE and texture-copy programs have no
+ * constants, mux, dot products or temporary-register dependencies. The copy
+ * program takes RGB from texture 0 and alpha from the diffuse vertex colour.
+ * Evaluating them directly
+ * avoids constructing the register file and interpreting twelve inputs
+ * for every shaded pixel. Guard every instruction that affects its result;
+ * all other programs retain the general interpreter above.
+ *
+ * Keep the interpreter's unsigned input mapping, stage saturation and final
+ * arithmetic order, including for interpolants outside [0,1]. Fog.a is an
+ * unsigned input, not a saturated interpolation factor. */
+void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
+                  const float v1[4], const float fog[4],
+                  const float t[4][4], float out[4])
+{
+    if (rc->control == 1 && rc->stage_program == 1 &&
+        ((rc->color_icw[0] == 0x04080000u &&
+          rc->alpha_icw[0] == 0x14180000u) ||
+         (rc->color_icw[0] == 0x08200000u &&
+          rc->alpha_icw[0] == 0x14200000u &&
+          rc->final0 == 0x0000000Cu)) &&
+        rc->color_ocw[0] == 0x00000C00u &&
+        rc->alpha_ocw[0] == 0x00000C00u &&
+        rc->final1 == 0x00001C80u &&
+        (rc->final0 == 0x130C0300u || rc->final0 == 0x0000000Cu)) {
+        float r0[4];
+        int copy = rc->color_icw[0] == 0x08200000u;
+        int i;
+        for (i = 0; i < 4; i++) {
+            float av = copy ? (i == 3 ? v0[i] : t[0][i]) : v0[i];
+            float bv = copy ? 1.0f : t[0][i];
+            float a = av < 0.0f ? 0.0f : av;
+            float b = bv < 0.0f ? 0.0f : bv;
+            r0[i] = clampf(a * b + 0.0f, -1.0f, 1.0f);
+        }
+        if (rc->final0 == 0x130C0300u) {
+            float a = fog[3] < 0.0f ? 0.0f : fog[3];
+            for (i = 0; i < 3; i++) {
+                float b = r0[i] < 0.0f ? 0.0f : r0[i];
+                float c = fog[i] < 0.0f ? 0.0f : fog[i];
+                out[i] = clampf(0.0f + c * (1.0f - a) + b * a,
+                                0.0f, 1.0f);
+            }
+        } else {
+            for (i = 0; i < 3; i++)
+                out[i] = clampf(r0[i] + 0.0f + 0.0f, 0.0f, 1.0f);
+        }
+        out[3] = clampf(r0[3], 0.0f, 1.0f);
+        return;
+    }
+    eval_generic(rc, v0, v1, fog, t, out);
+}
+
+#ifdef NV2A_RC_TEST
+/* Independent interpreter entry for differential tests and microbenchmarks;
+ * it is absent from production builds. */
+void nv2a_rc_eval_generic(const Nv2aCombiner *rc, const float v0[4],
+                          const float v1[4], const float fog[4],
+                          const float t[4][4], float out[4])
+{
+    eval_generic(rc, v0, v1, fog, t, out);
+}
+#endif
