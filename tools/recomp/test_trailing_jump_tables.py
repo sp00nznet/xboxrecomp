@@ -92,8 +92,65 @@ def test_callback_discovery_leaves_the_arms_to_their_function():
     print("ok  callback_discovery_leaves_the_arms_to_their_function")
 
 
+
+# A compiled switch, arms first: Alter Echo's object_Buddies.dll at
+# 0x74662570. The function list ended the method at a ret before its arms and
+# made the mov edi, edi aligning the table an entry of its own; the arm that
+# branches back to the shared epilogue then had no body and the game hung.
+SW_EPI = BASE + 0x0C     # ret, the shared epilogue; the function list ends here
+SW_ARM0 = BASE + 0x0D    # ret
+SW_ARM1 = BASE + 0x0E    # dec eax; jne SW_EPI; ret
+SW_FILLER = BASE + 0x12  # mov edi, edi
+SW_TABLE = BASE + 0x14   # SW_ARM0, SW_ARM1
+
+
+def _switch_translator(filler_method):
+    image = bytearray(b"\xCC" * 0x40)
+
+    def put(va, data):
+        image[va - BASE:va - BASE + len(data)] = data
+
+    put(BASE, b"\x83\xF8\x01")                                    # cmp eax, 1
+    put(BASE + 3, b"\x77\x07")                                    # ja SW_EPI
+    put(BASE + 5, b"\xFF\x24\x85" + SW_TABLE.to_bytes(4, "little"))
+    put(SW_EPI, b"\xC3")
+    put(SW_ARM0, b"\xC3")
+    put(SW_ARM1, b"\x48\x75\xFB\xC3")
+    put(SW_FILLER, b"\x8B\xFF")
+    put(SW_TABLE, SW_ARM0.to_bytes(4, "little") + SW_ARM1.to_bytes(4, "little"))
+    put(NEXT, b"\xC3")
+    config._install(
+        [config.Section(".text", BASE, len(image), 0x0000, len(image), True)],
+        entry_point=BASE, kernel_thunk_addr=BASE, origin="trailing-table-test")
+    return FunctionTranslator(bytes(image), {
+        BASE: _entry(BASE, SW_EPI + 1),
+        SW_FILLER: _entry(SW_FILLER, NEXT, filler_method),
+        NEXT: _entry(NEXT, NEXT + 1),
+    })
+
+
+def test_table_padding_entry_does_not_cut_the_switch():
+    translator = _switch_translator("gap_prologue")
+    assert translator.discover_jump_table_entries() == set()
+    assert translator.func_db[BASE]["end"] == SW_FILLER
+    code = translator.translate_function(BASE, translator.func_db[BASE])
+    assert (f"goto loc_{SW_ARM0:08X};" in code
+            and f"goto loc_{SW_ARM1:08X};" in code), code
+    assert f"goto loc_{SW_EPI:08X};" in code, code
+    print("ok  table_padding_entry_does_not_cut_the_switch")
+
+
+def test_strong_entry_before_the_table_keeps_the_cut():
+    translator = _switch_translator("call_target")
+    translator.discover_jump_table_entries()
+    assert translator.func_db[BASE]["end"] == SW_EPI + 1
+    print("ok  strong_entry_before_the_table_keeps_the_cut")
+
+
 if __name__ == "__main__":
     test_arms_after_their_table_become_in_function_gotos()
     test_arm_leaving_the_gap_keeps_the_cut()
     test_callback_discovery_leaves_the_arms_to_their_function()
+    test_table_padding_entry_does_not_cut_the_switch()
+    test_strong_entry_before_the_table_keeps_the_cut()
     print("trailing_jump_tables: ALL PASS")
