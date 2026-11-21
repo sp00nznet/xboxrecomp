@@ -12,6 +12,10 @@ collide, it expands: `void isnan(void);` becomes
 declarator inside `corecrt_math.h`, naming neither the guest function nor the
 clash. Reported from a FIFA Street 2 port, where it cost a day.
 
+On GCC the same declaration expands to `void __builtin_isnan(void);`, which
+the compiler accepts, so a bare redeclaration is not a portable negative
+control. The probe also `#error`s when the name is defined as a macro.
+
 Both checks compile against the headers a generated TU actually includes, and
 the positive sweep is paired with a negative control that feeds the same
 harness the unmangled name and requires it to fail -- a sweep that passes
@@ -113,10 +117,19 @@ class ReservedIdentTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIn(name, _FUNC_RESERVED_IDENT,
                               f"{name} is missing from the reserved set")
-                rc, _ = _compile(f"void {name}(void);\nvoid {name}(void) {{ }}")
+                # A function-like math macro may expand `void isnan(void);`
+                # to `void __builtin_isnan(void);`, which GCC accepts. The
+                # #ifdef catches that case; the redeclaration still catches
+                # ordinary libc functions (exit, abs, round, ...).
+                rc, _ = _compile(
+                    f"#ifdef {name}\n"
+                    f"#error \"{name} is a reserved macro\"\n"
+                    f"#endif\n"
+                    f"void {name}(void);\n"
+                    f"void {name}(void) {{ }}")
                 self.assertNotEqual(
                     rc, 0,
-                    f"`void {name}(void);` compiled clean, so it does not "
+                    f"unmangled {name} compiled clean, so it does not "
                     f"need to be in the reserved set -- or the headers this "
                     f"test includes no longer match a generated TU")
 
