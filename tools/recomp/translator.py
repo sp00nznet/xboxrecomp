@@ -421,7 +421,7 @@ _FLAG_READERS = frozenset({
 _FLAG_WRITERS = frozenset({
     "add", "sub", "cmp", "test", "and", "or", "xor", "inc", "dec", "neg",
     "shl", "sal", "shr", "sar", "mul", "imul", "bsf", "bsr", "bt", "bts",
-    "btr", "btc", "cmpxchg", "xadd", "popf", "popfd", "sahf", "comiss",
+    "btr", "btc", "cmpxchg", "cmpxchg8b", "xadd", "popf", "popfd", "sahf", "comiss",
     "ucomiss", "comisd", "ucomisd", "fcomi", "fcomip", "fucomi", "fucomip",
 })
 
@@ -3187,7 +3187,8 @@ class FunctionTranslator:
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg", "inc", "dec", "imul", "mul", "sahf", "fcomi",
+                                 "lock cmpxchg", "cmpxchg8b",
+                                 "lock cmpxchg8b", "inc", "dec", "imul", "mul", "sahf", "fcomi",
                                  "fcomip", "fcompi", "fucomi", "fucomip", "fucompi")
                or insn.mnemonic.removeprefix("lock ") in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
