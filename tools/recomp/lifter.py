@@ -419,6 +419,7 @@ _EFLAGS_SETTERS = frozenset({
     "bsf", "bsr",       # Bit scan sets ZF
     "bt", "bts", "btr", "btc",  # Bit test sets CF
     "cmpxchg",           # Compare-and-exchange sets ZF
+    "cmpxchg8b",         # 64-bit compare-and-exchange sets ZF (only)
     "xadd",              # Exchange-and-add sets flags
 })
 
@@ -1118,10 +1119,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
 
     # ── cmpxchg: compares accumulator with dest, sets ZF on match ──
-    if flag_setter == "cmpxchg":
+    if flag_setter in ("cmpxchg", "cmpxchg8b"):
         # ZF comes from the compare the instruction already did, and the lift
         # snapshots it into _fa/_fb. Re-reading eax here would test a value
-        # cmpxchg may have just replaced.
+        # cmpxchg may have just replaced. cmpxchg8b compares 64 bits, which
+        # do not fit the pair, so its lift stores the outcome instead --
+        # _fa = (mismatch), _fb = 0 -- and the same test reads it. It writes
+        # no other flag, so everything but ZF stays unanswered here.
         if jcc in ("je", "jz"):
             return "(_fa == _fb)", desc
         if jcc in ("jne", "jnz"):
@@ -2017,6 +2021,32 @@ class Lifter:
                     "  if (_old != _cmp) eax = _old; }"
                     f"  /* {m} */",
                 ]
+
+        # cmpxchg8b m64: compare edx:eax with the qword; on a match store
+        # ecx:ebx, else load the qword into edx:eax. This is
+        # InterlockedCompareExchange64, and the SList push/pop that pair a
+        # pointer with a sequence count, so it has to be one 64-bit CAS --
+        # two 32-bit ones would let the halves tear between threads.
+        #
+        # Only ZF is defined. It is snapshotted as the comparison's outcome
+        # (_fa = mismatch, _fb = 0) rather than as the operands, which are 64
+        # bits wide and do not fit the 32-bit pair; the condition for a
+        # "cmpxchg8b" setter tests _fa == _fb either way. edx:eax is only
+        # written on a mismatch, as on hardware.
+        if (atomic_m == "cmpxchg8b" and len(ops) == 1
+                and ops[0].type == "mem"):
+            addr = _fmt_mem(ops[0])
+            return [
+                "{ uint64_t _cmp8 = ((uint64_t)edx << 32) | eax;",
+                "  uint64_t _new8 = ((uint64_t)ecx << 32) | ebx;",
+                "  uint64_t _old8 = RECOMP_ATOMIC_CAS64("
+                f"XBOX_PTR({addr}), _cmp8, _new8);",
+                "  _fa = (uint32_t)(_old8 != _cmp8); _fb = 0;",
+                "  _fas = (int32_t)_fa; _fbs = 0;",
+                "  if (_old8 != _cmp8) {"
+                " eax = (uint32_t)_old8; edx = (uint32_t)(_old8 >> 32); } }"
+                f"  /* {m} */",
+            ]
 
         # ── Unhandled ──
         #
@@ -4500,7 +4530,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # Flags are undefined after these - clear tracking
             last_flag_setter = None
             last_flag_ops = []
-        elif curr.mnemonic in ("lock xadd", "lock cmpxchg"):
+        elif curr.mnemonic in ("lock xadd", "lock cmpxchg",
+                               "lock cmpxchg8b"):
             # Capstone keeps the lock prefix in the mnemonic; the flags are
             # those of the bare instruction, which the lowering snapshots.
             last_flag_setter = curr.mnemonic[5:]

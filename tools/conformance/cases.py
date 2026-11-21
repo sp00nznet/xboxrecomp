@@ -596,3 +596,19 @@ for _name, _setup, _count, _copy, _result in (
         ("rep_copy_zero", ["mov esi, eax", "lea edi, [eax+16]"], 0, "rep movsd", "mov eax, [edi]")):
     CASES.append(Case(_name, "REP copy preserves element order, direction and count",
         ["cld"] + _setup + ["mov ecx, %d" % _count, _copy, "cld", _result], _SSE, "sse"))
+
+# cmpxchg8b: compare edx:eax with the qword; on a match ZF=1 and ecx:ebx is
+# stored, else ZF=0 and the qword is loaded into edx:eax. The qword on the
+# stack is ecx:0 (or ecx:1), against edx:eax = 0:eax, so the equal pairs take
+# the store and the rest the reload; the result folds the qword after, ZF and
+# (second case) the reloaded edx into eax. ebx is saved because the GCC
+# harness does not list it as clobbered.
+for _name, _hi, _fold in (
+        ("cmpxchg8b_lo", "0", []),
+        ("cmpxchg8b_hi_mismatch", "1", ["shl edx, 4", "add eax, edx"])):
+    CASES.append(Case(_name, "cmpxchg8b stores ecx:ebx or reloads edx:eax, ZF says which",
+        ["push ebx", "push " + _hi, "push ecx", "xor edx, edx",
+         "mov ebx, 0xA5A5A5A5", "mov ecx, 0x5A5A5A5A",
+         "lock cmpxchg8b qword ptr [esp]", "setz cl", "movzx ecx, cl",
+         "xor eax, dword ptr [esp]", "add eax, dword ptr [esp+4]",
+         "add eax, ecx"] + _fold + ["add esp, 8", "pop ebx"], _PAIRS))

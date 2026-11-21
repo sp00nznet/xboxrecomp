@@ -249,14 +249,23 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
  * Genuinely atomic, not merely correct in isolation: the guest's own threads
  * now run on real host threads, so a read-modify-write that races is exactly
  * the bug these instructions exist to prevent.
+ *
+ * RECOMP_ATOMIC_CAS64 is "lock cmpxchg8b", which is what
+ * InterlockedCompareExchange64 and the SList push/pop compile to. It is one
+ * 64-bit compare-and-swap, not two 32-bit ones: a lock-free list puts a
+ * pointer and a sequence count in the two halves precisely so they change
+ * together, and splitting them reopens the ABA race the count is there to
+ * close. On an x86-64 host both spellings are a single lock cmpxchg.
  */
 #if defined(_MSC_VER)
 #include <intrin.h>
 #define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)))
 #define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)_InterlockedCompareExchange((volatile long *)(p),                                            (long)(val), (long)(cmp)))
+#define RECOMP_ATOMIC_CAS64(p, cmp, val)     ((uint64_t)_InterlockedCompareExchange64((volatile __int64 *)(p),                                            (__int64)(val), (__int64)(cmp)))
 #else
 #define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)__sync_fetch_and_add((volatile uint32_t *)(p), (uint32_t)(v)))
 #define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p),                                            (uint32_t)(cmp), (uint32_t)(val)))
+#define RECOMP_ATOMIC_CAS64(p, cmp, val)     ((uint64_t)__sync_val_compare_and_swap((volatile uint64_t *)(p),                                            (uint64_t)(cmp), (uint64_t)(val)))
 #endif
 
 #include <setjmp.h>
