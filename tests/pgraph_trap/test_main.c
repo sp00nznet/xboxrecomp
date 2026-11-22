@@ -23,6 +23,8 @@
  *     5. A trap nobody acknowledges is cleared at the timeout; the wait
  *        returns 0.
  *   off       No switch: nothing is latched, and the page stays writable.
+ *   spin-off  RECOMP_PGRAPH_TRAP=1, RECOMP_TRAP_SPIN=0: check 3 with the
+ *             2 ms waits.
  */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
@@ -212,6 +214,15 @@ static void run_off(void)
     check(xbox_Nv2aPgraphRaise(TRAP_ADDR, TRAP_DATA) == 0, "the raise returns 0");
     check(*reg(PGRAPH_TRAPPED_ADDR) == 0 && *reg(PGRAPH_INTR) == 0, "and latches nothing");
 }
+
+static void run_spin_off(void)
+{
+    check(xbox_Nv2aPgraphTrapOn() == 1, "traps are on");
+    *reg(PGRAPH_INTR_EN) = INTR_NOTIFY;
+    *reg(PGRAPH_FIFO) = 0;
+    printf("3. a handler that writes 0, then the bit (2 ms waits)\n");
+    raise_and_ack();
+}
 #endif
 
 static void set_env(const char *name, const char *value)
@@ -231,12 +242,14 @@ int main(int argc, char **argv)
     unsigned char *xbe;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (strcmp(mode, "on") && strcmp(mode, "off")) {
+    if (strcmp(mode, "on") && strcmp(mode, "off") && strcmp(mode, "spin-off")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
     if (strcmp(mode, "off"))
         set_env("RECOMP_PGRAPH_TRAP", "1");
+    if (!strcmp(mode, "spin-off"))
+        set_env("RECOMP_TRAP_SPIN", "0");
 
     xbe = load_file(path, &xbe_len);
     if (!xbe) {
@@ -252,8 +265,10 @@ int main(int argc, char **argv)
 #ifdef _WIN32
     if (!strcmp(mode, "on"))
         run_on();
-    else
+    else if (!strcmp(mode, "off"))
         run_off();
+    else
+        run_spin_off();
 #else
     /* Traps need the Windows page handler; elsewhere they stay off. */
     check(xbox_Nv2aPgraphTrapOn() == 0, "traps are off on this host");

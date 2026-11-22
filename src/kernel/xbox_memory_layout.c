@@ -20,6 +20,7 @@
 #include "guest_vmem.h"
 #include "kernel_missing.h"
 #include "nv2a_flip_hold.h"
+#include "platform/host_time.h"   /* xbox_HostNowNs */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1637,10 +1638,42 @@ int xbox_Nv2aPgraphWaitAck(uint32_t timeout_ms)
     static volatile LONG giveups;
     uint32_t waited;
     DWORD old;
+    static int spin = -1;
+
+    if (spin < 0) {
+        const char *e = getenv("RECOMP_TRAP_SPIN");
+        spin = !(e && !strcmp(e, "0"));
+    }
+    /* The title's handler can KickOff before it acknowledges, spinning on
+     * the PFB flush that only this thread clears: answered once per 2 ms
+     * wait, every trap cost milliseconds. So poll, and answer the flush as
+     * it appears. RECOMP_TRAP_SPIN=0: the 2 ms waits. */
+    if (spin) {
+        volatile LONG *flush = (volatile LONG *)((char *)g_nv2a_memory + NV2A_ACK_PFB_FLUSH);
+        uint64_t start = xbox_HostNowNs(), raised = 0, now;
+
+        for (;;) {
+            if (pgraph_trap_over()
+                    || WaitForSingleObject(g_pgraph_acked, 0) == WAIT_OBJECT_0)
+                return 1;
+            if (*flush & (LONG)NV2A_ACK[0].busy_mask)
+                InterlockedAnd(flush, ~(LONG)NV2A_ACK[0].busy_mask);
+            now = xbox_HostNowNs();
+            if (now - start >= (uint64_t)timeout_ms * 1000000u)
+                break;
+            /* Asked again every 2 ms, as below. */
+            if (!raised || now - raised >= 2000000u) {
+                nv2a_ack_busy_bits(0);
+                xbox_Nv2aRaiseGpuIrq();
+                raised = now;
+            }
+            YieldProcessor();
+        }
+    }
 
     /* Asked again every 2 ms: a raise that found the ISR masked stays
      * latched for the DPC, which may have finished its pass just before. */
-    for (waited = 0; waited < timeout_ms; waited += 2) {
+    for (waited = spin ? timeout_ms : 0; waited < timeout_ms; waited += 2) {
         if (pgraph_trap_over())
             return 1;
         /* This is the walker's thread, which answers D3D's kickoffs

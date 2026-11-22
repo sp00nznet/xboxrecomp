@@ -13,3 +13,4 @@ set(XBE ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
 # One process per mode: the switches are read once and cached.
 add_test(NAME pgraph_trap_on COMMAND pgraph_trap_test on ${XBE})
 add_test(NAME pgraph_trap_off COMMAND pgraph_trap_test off ${XBE})
+add_test(NAME pgraph_trap_spin_off COMMAND pgraph_trap_test spin-off ${XBE})
