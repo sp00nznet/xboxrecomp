@@ -3921,7 +3921,11 @@ static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 #define XBOX_THREAD_STACK_SIZE  (512 * 1024)
-#define XBOX_MAX_THREAD_STACKS  8
+/* Live workers at once. The console has no such limit, only memory, and a
+ * title past it gets its worker run inline, which deadlocks when the worker
+ * idles waiting for requests. Eight was too few for an engine with a pool of
+ * I/O and streaming workers (ten alive at boot). */
+#define XBOX_MAX_THREAD_STACKS  32
 
 static int g_thread_stacks_used = 0;
 
