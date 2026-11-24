@@ -25,6 +25,10 @@
 #include "apu_wav.h"
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 
 /* ============================================================
  * Globals
@@ -1292,6 +1296,17 @@ static void apu_frame_gap_check(MCPXAPUState *d, ApuFrameGap *g, int64_t now_us)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#if defined(__APPLE__)
+    /* At the default QoS, XNU coalesces this thread's timed waits: a 5 ms
+     * pace wait came back after up to 73 ms while the game loaded its title
+     * movie, and the device queue (64 ms) ran dry. The vblank thread has a
+     * time-constraint policy and held 16.7 ms meanwhile. User-interactive
+     * gets the smallest timer leeway short of a real-time policy, which a
+     * thread running guest ISRs could overrun. */
+    if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) != 0)
+        fprintf(stderr, "[APU] frame thread: user-interactive QoS refused;"
+                        " pace waits may run late\n");
+#endif
     ApuFrameGap gap = { 0 };
     qemu_mutex_lock(&d->lock);
 
