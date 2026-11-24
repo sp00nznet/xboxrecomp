@@ -370,9 +370,12 @@ int xbox_enhance_init(const char *root, const char *title)
     xbox_SetLanguage(enhance_cfg_string("system.language", "en"));
     /* The master volume (apu_gain.h): 100 is stock and touches
      * no sample. A line only when it is set, so the stock log stays as it
-     * was; the menu's slider changes it live. */
+     * was; the menu's slider changes it live. The default is
+     * APU_MASTER_VOLUME_MAX written as a literal, since the CLI's
+     * config-defaults check reads each default from the call as written. */
     {
-        long long vol = enhance_cfg_int("audio.volume", APU_MASTER_VOLUME_MAX);
+        _Static_assert(APU_MASTER_VOLUME_MAX == 100, "audio.volume's literal default");
+        long long vol = enhance_cfg_int("audio.volume", 100);
         int got = apu_master_volume_set(vol < 0 ? 0 : vol > APU_MASTER_VOLUME_MAX
                                                       ? APU_MASTER_VOLUME_MAX : (int)vol);
         if (got != vol)
