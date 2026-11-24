@@ -2598,6 +2598,7 @@ typedef struct {
     const float *a, *b, *c;
     float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
     float dl[3][2];                  /* d(l0,l1,l2)/dx and /dy, for texel gradients */
+    float zmax;                      /* largest depth the zeta format holds */
     float *zb;
     int minx, maxx, miny, maxy, use_rc, textured;
 } XfTri;
@@ -2659,6 +2660,13 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
             /* w1 is opposite a, w2 opposite b, w0 opposite c. */
             l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
+            /* The NV2A keeps depth in fixed point and clamps it to the zeta
+             * range. Interpolated in float, a quad drawn exactly at the far
+             * plane (z = 0xFFFFFF, as 2D movie backdrops are) rounds to
+             * 0x1000000 in scattered pixels and then fails LEQUAL against
+             * the cleared buffer: vertical streaks through every movie. */
+            if (z > T->zmax) z = T->zmax;
+            else if (z < 0.0f) z = 0.0f;
             {
                 float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
                 int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
@@ -3063,6 +3071,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     T.bpp = surface_bpp();
     T.textured = s_gpu.texs[0].valid && !s_xf_no_tex;
     T.use_rc = s_gpu.rc_seen && !no_rc;
+    T.zmax = ((s_gpu.format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
     T.va = va; T.vb = vb; T.vc = vc;
 
     v[0] = va; v[1] = vb; v[2] = vc;
