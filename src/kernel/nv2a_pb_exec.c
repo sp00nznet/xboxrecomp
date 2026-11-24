@@ -3621,6 +3621,17 @@ static void frame_trace_flip(void)
     }
 }
 
+/* Read once: asked for every method and every draw, and a getenv searches the
+ * whole environment. */
+static int exec_verbose(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    return on;
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -3701,7 +3712,7 @@ static void draw_primitive(void)
         }
     }
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (exec_verbose()) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -4218,12 +4229,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_reg[(method & 0x1FFCu) / 4] = param;
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
-     * the values are visible. Cached: this runs for every method, and an
-     * uncached getenv here was a quarter of the executor's time. */
-    static int verbose = -1;
-    if (verbose < 0)
-        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
-    if (verbose) {
+     * the values are visible. */
+    if (exec_verbose()) {
         static int shown[8];
         int slot = -1;
         switch (method) {
@@ -4576,7 +4583,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (s_backend && s_backend->flip)
             s_backend->flip();
 
-        if (verbose) {
+        if (exec_verbose()) {
             static unsigned n;
             if (n++ < 8) {
                 fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
