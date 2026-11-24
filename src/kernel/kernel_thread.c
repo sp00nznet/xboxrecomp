@@ -361,6 +361,19 @@ void xbox_GuestPriorityReloadConfig(void)
     InterlockedExchange(&s_guest_priority, -1);
 }
 
+int xbox_GuestSuspendPoint(void)
+{
+#ifdef _WIN32
+    return 0;
+#else
+    /* Under the guest CPU lock the thread holds the one guest CPU here, and
+     * parking with it would stop every guest thread. */
+    if (xbox_GuestCpuOn())
+        return 0;
+    return w32_suspend_point();
+#endif
+}
+
 LONG __stdcall xbox_KeSetBasePriorityThread(PVOID Thread, LONG Increment)
 {
     HANDLE hThread = (HANDLE)Thread;

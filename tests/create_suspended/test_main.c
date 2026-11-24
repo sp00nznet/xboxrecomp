@@ -17,7 +17,10 @@
  *    its gate, still lets it run (the gate stays open for it);
  *  - KeResumeThread on its object (ObReferenceObjectByHandle) counts too;
  *  - a reset while the gate holds a thread unwinds it from there: it never
- *    runs its routine, and the reset does not wait on it.
+ *    runs its routine, and the reset does not wait on it;
+ *  - xbox_GuestSuspendPoint parks a host thread another thread suspended
+ *    with the lock off, and does nothing with it on: there the core is
+ *    the gate, and a parked holder would stall every guest thread.
  * A watchdog fails the test instead of hanging it.
  */
 #include "kernel.h"
@@ -110,6 +113,20 @@ static int wait_ran(LONG v, int ms)
         Sleep(1);
     }
     return 1;
+}
+
+static HANDLE s_ready, s_go;
+static volatile LONG s_point_ret = -1;
+
+/* Past its start before the suspend, or the shim holds it at its start
+ * gate instead of the point. */
+static DWORD WINAPI calls_point(LPVOID unused)
+{
+    (void)unused;
+    SetEvent(s_ready);
+    WaitForSingleObject(s_go, INFINITE);
+    InterlockedExchange(&s_point_ret, xbox_GuestSuspendPoint());
+    return 0;
 }
 
 static DWORD WINAPI watchdog(LPVOID unused)
@@ -259,6 +276,36 @@ int main(int argc, char **argv)
     Sleep(100);
     check(s_ran == ran, "reset: and it never ran its routine");
     xbox_GuestCpuAcquire();
+
+    /* The suspend lands before the thread reaches the point (the event
+     * holds it), so the order does not hang on timing. */
+    {
+        HANDLE t;
+        DWORD w;
+
+        s_ready = CreateEventA(NULL, TRUE, FALSE, NULL);
+        s_go = CreateEventA(NULL, TRUE, FALSE, NULL);
+        t = CreateThread(NULL, 0, calls_point, NULL, 0, NULL);
+        check(t && WaitForSingleObject(s_ready, 5000) == WAIT_OBJECT_0,
+              "point: the host thread starts");
+        check(SuspendThread(t) == 0, "point: SuspendThread counts (0)");
+        SetEvent(s_go);
+        w = WaitForSingleObject(t, lock ? 5000 : 100);
+        if (lock) {
+            check(w == WAIT_OBJECT_0 && s_point_ret == 0,
+                  "point: with the guest lock on it returns 0 at once");
+            ResumeThread(t);
+        } else {
+            check(w == WAIT_TIMEOUT, "point: with the lock off it parks");
+            check(ResumeThread(t) == 1, "point: ResumeThread reports 1");
+            w = WaitForSingleObject(t, 5000);
+            check(w == WAIT_OBJECT_0 && s_point_ret == 1,
+                  "point: and it runs on, reporting the park");
+        }
+        CloseHandle(t);
+        CloseHandle(s_go);
+        CloseHandle(s_ready);
+    }
     if (lock)
         xbox_GuestCpuPart();
 

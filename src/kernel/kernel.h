@@ -894,6 +894,14 @@ int      xbox_GuestPriorityPolicy(long mode, int host_strict, int one_core,
                                   int guest_lock);
 int      xbox_GuestPriorityOn(void);
 void     xbox_GuestPriorityReloadConfig(void);
+/* A point where a guest thread another thread suspended stops until it is
+ * resumed (kernel_thread.c). Native Windows and Wine stop a suspended thread
+ * wherever it is, so this does nothing there; the POSIX shim can only count
+ * another thread's suspend, and the thread parks here instead. Call it only
+ * where the thread holds no lock, guest or host: a title's idle spin. Under
+ * the guest CPU lock (RECOMP_GUEST_LOCK) it does nothing, since the thread
+ * holds the guest CPU there. Returns 1 when it parked. */
+int      xbox_GuestSuspendPoint(void);
 NTSTATUS __stdcall xbox_KeAlertThread(PVOID Thread, KPROCESSOR_MODE AlertMode);
 NTSTATUS __stdcall xbox_NtYieldExecution(void);
 NTSTATUS __stdcall xbox_NtDuplicateObject(HANDLE SourceHandle, PHANDLE TargetHandle, ULONG Options);

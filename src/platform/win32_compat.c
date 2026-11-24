@@ -1155,7 +1155,8 @@ DWORD SuspendThread(HANDLE h)
      * different matter: it is at a known point, and it parks on the same gate
      * CREATE_SUSPENDED uses until a ResumeThread brings the count to zero.
      * Worker pools idle that way; returning at once turned one title's pool
-     * into a suspend/check spin of millions of calls a second. */
+     * into a suspend/check spin of millions of calls a second. A thread
+     * another one suspended parks at its next w32_suspend_point. */
     if (h == PSEUDO_CURRENT_THREAD) h = GetCurrentThread();
     w32_object *o = (w32_object *)h;
     if (!o || o == (w32_object *)PSEUDO_CURRENT_THREAD || o->kind != K_THREAD)
@@ -1168,6 +1169,24 @@ DWORD SuspendThread(HANDLE h)
             pthread_cond_wait(&o->gate, &o->lock);
     pthread_mutex_unlock(&o->lock);
     return prev;
+}
+
+int w32_suspend_point(void)
+{
+    w32_object *o = t_self_obj;
+    int parked = 0;
+
+    /* Threads the shim did not create (the host main thread) have no
+     * object and no count. */
+    if (!o || o->kind != K_THREAD)
+        return 0;
+    pthread_mutex_lock(&o->lock);
+    while (o->suspend_count > 0) {
+        parked = 1;
+        pthread_cond_wait(&o->gate, &o->lock);
+    }
+    pthread_mutex_unlock(&o->lock);
+    return parked;
 }
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)

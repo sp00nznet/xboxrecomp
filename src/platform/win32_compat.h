@@ -178,6 +178,14 @@ VOID   ExitThread(DWORD exitCode);
 BOOL   GetExitCodeThread(HANDLE h, LPDWORD exitCode);
 DWORD  ResumeThread(HANDLE h);
 DWORD  SuspendThread(HANDLE h);
+/* A safe point for the shim's suspend: SuspendThread on another thread only
+ * counts (pthreads cannot stop a thread mid-run), so a thread that calls this
+ * while its count is above zero parks here, as SuspendThread on itself does,
+ * until ResumeThread brings the count to zero. Returns 1 when it parked. For
+ * a loop that knows it holds no lock at that point, such as a helper's idle
+ * spin the title suspends from another thread. Not Win32: there the suspend
+ * itself stops the thread. */
+int    w32_suspend_point(void);
 BOOL   TerminateThread(HANDLE h, DWORD exitCode);
 DWORD  GetCurrentThreadId(void);
 HANDLE GetCurrentThread(void);
