@@ -4198,6 +4198,39 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
     return 1;
 }
 
+/* A run of one method's words, without the general dispatch: the indices and
+ * inline vertices of a draw, most of what a title sends. The same is done with
+ * each of them as below. 0: not such a method, nothing done. */
+int nv2a_pb_exec_run(uint32_t method, const uint32_t *p, uint32_t n)
+{
+    uint32_t i;
+
+    if (!s_exec_inited || !n
+            || (method != NV097_ARRAY_ELEMENT16 && method != 0x1808
+                && method != NV097_INLINE_ARRAY))
+        return 0;
+    s_reg[method / 4] = p[n - 1];
+    if (!s_gpu.prim)
+        return 1;
+    switch (method) {
+    case NV097_ARRAY_ELEMENT16:
+        for (i = 0; i < n && s_gpu.idx_count + 2 <= NV_MAX_INDICES; i++) {
+            s_gpu.idx[s_gpu.idx_count++] = p[i] & 0xFFFF;
+            s_gpu.idx[s_gpu.idx_count++] = p[i] >> 16;
+        }
+        break;
+    case 0x1808:                            /* ARRAY_ELEMENT32 */
+        for (i = 0; i < n && s_gpu.idx_count < NV_MAX_INDICES; i++)
+            s_gpu.idx[s_gpu.idx_count++] = p[i];
+        break;
+    default:
+        for (i = 0; i < n && s_gpu.inline_count < NV_MAX_INLINE; i++)
+            s_gpu.inline_buf[s_gpu.inline_count++] = p[i];
+        break;
+    }
+    return 1;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the

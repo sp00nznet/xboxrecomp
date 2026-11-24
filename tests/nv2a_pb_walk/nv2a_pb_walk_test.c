@@ -53,6 +53,19 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
     (void)method; (void)param;
     return 0;
 }
+static uint32_t s_runs, s_run_words, s_run_sum;
+int nv2a_pb_exec_run(uint32_t method, const uint32_t *p, uint32_t n)
+{
+    uint32_t i;
+
+    if (method != 0x1800)
+        return 0;
+    for (i = 0; i < n; i++)
+        s_run_sum += p[i] * (s_run_words + i + 1);
+    s_run_words += n;
+    s_runs++;
+    return 1;
+}
 void nv2a_pb_exec_report(void) {}
 void xbox_Nv2aAckBusyBits(void) {}
 void nv2a_pb_exec_walk_begin(void) {}       /* the flip hold's vblank sample */
@@ -134,6 +147,27 @@ int main(void)
     expect(5, 0x0200, 1);
     expect(6, 0x0200, 2);
     expect(7, 0x0200, 3);
+
+    /* And in runs, as far as PUT is, where the executor takes them so. */
+    {
+        uint32_t i, sum = 0, at = 0x1000;
+        int n0 = s_n;
+
+        title_sets_get(at);
+        put(at, 0x40000000u | hdr(200, 0, 0x1800));
+        for (i = 0; i < 200; i++) {
+            put(at + 4 + 4 * i, i * 5 + 2);
+            sum += (i * 5 + 2) * (i + 1);
+        }
+        put(at + 804, hdr(1, 0, 0x17FC)); put(at + 808, 6);
+        nv2a_pb_scan(at + 4 + 4 * 10);
+        CHECK(s_run_words == 10 && s_get_reg == at + 44);
+        nv2a_pb_scan(at + 812);
+        CHECK(s_run_words == 200 && s_run_sum == sum && s_n == n0 + 1);
+        expect(n0, 0x17FC, 6);
+        s_n = n0;
+        title_sets_get(0x418);
+    }
 
     /* The title resets the ring: the walk starts where GET now is, not where
      * it had got to. */

@@ -44,6 +44,7 @@ static uint32_t s_tot_calls;
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param);
+extern int nv2a_pb_exec_run(uint32_t method, const uint32_t *p, uint32_t n);
 extern void nv2a_pb_exec_report(void);
 
 /* One word to the executor. SET_TRANSFORM_CONSTANT words, the bulk of a
@@ -82,12 +83,12 @@ static int pb_walk_enabled(void)
  * (about 40% of its thread in X-Men Legends' levels). */
 static uint16_t s_seen_slot[8][0x2000 / 4];
 
-static void note(uint32_t subch, uint32_t method)
+static void note(uint32_t subch, uint32_t method, uint32_t words)
 {
     uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
 
     if (*slot) {
-        s_seen[*slot - 1].count++;
+        s_seen[*slot - 1].count += words;
         return;
     }
     if (s_seen_count >= PB_MAX_METHODS) {
@@ -104,7 +105,7 @@ static void note(uint32_t subch, uint32_t method)
     if (s_seen_count < PB_MAX_METHODS) {
         s_seen[s_seen_count].method = method;
         s_seen[s_seen_count].subch  = subch;
-        s_seen[s_seen_count].count  = 1;
+        s_seen[s_seen_count].count  = words;
         s_seen_count++;
         *slot = (uint16_t)s_seen_count;
     }
@@ -286,15 +287,40 @@ void nv2a_pb_resync(uint32_t get_phys)
     s_pub = s_get;
 }
 
+/* How many of the `left` words at `p` the executor took at once, all for one
+ * method: no more than it does in a fraction of a microsecond. */
+#define PB_RUN_WORDS 128u
+static uint32_t exec_run(uint32_t subch, uint32_t method, int noninc, const uint32_t *p,
+                         uint32_t left)
+{
+    uint32_t n = left < PB_RUN_WORDS ? left : PB_RUN_WORDS;
+
+    if (!s_exec_enabled || !noninc || subch || n < 2 || !nv2a_pb_exec_run(method, p, n))
+        return 0;
+    note(subch, method, n);
+    return n;
+}
+
 /* Feed the parameters of the method in progress to the survey and the
  * executor, up to PUT. */
 static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
 {
     while (s_pend_left && s_get < PB_RAM_BYTES && s_get != put) {
         uint32_t m = s_pend_noninc ? s_pend_method : s_pend_method + s_pend_i * 4;
-        uint32_t param = *(const uint32_t *)(mem + (0x80000000u | s_get));
+        const uint32_t *p = (const uint32_t *)(mem + (0x80000000u | s_get));
+        uint32_t param = *p, end = put > s_get && put < PB_RAM_BYTES ? put : PB_RAM_BYTES;
+        uint32_t room = (end - s_get) / 4;
+        uint32_t n = exec_run(s_pend_subch, m, s_pend_noninc, p,
+                              s_pend_left < room ? s_pend_left : room);
 
-        note(s_pend_subch, m);
+        if (n) {
+            s_get = (s_get + 4 * n) & PB_PHYS_MASK;
+            s_pend_i += n;
+            s_pend_left -= n;
+            *words += n;
+            continue;
+        }
+        note(s_pend_subch, m, 1);
         /* Same walk, two consumers: the survey counts, the executor
          * acts. Keeping them on one decode means they can never
          * disagree about what the stream said. */
@@ -522,11 +548,18 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
 
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
-                if (s_exec_enabled)
-                    exec_word(subch, m, *(const uint32_t *)(mem + va));
-                va += 4;
-                words++;
+                uint32_t room = (end_va - va) / 4;
+                uint32_t n = exec_run(subch, m, noninc, (const uint32_t *)(mem + va),
+                                      count - i < room ? count - i : room);
+                if (!n) {
+                    n = 1;
+                    note(subch, m, 1);
+                    if (s_exec_enabled)
+                        exec_word(subch, m, *(const uint32_t *)(mem + va));
+                }
+                va += 4 * n;
+                words += n;
+                i += n - 1;
             }
             continue;
         }
