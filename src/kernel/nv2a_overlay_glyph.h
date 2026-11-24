@@ -56,6 +56,7 @@ enum {
     NV2A_OVL_ICON_RESET = 0xE144,
     NV2A_OVL_ICON_UPLOAD = 0xE19E,
     NV2A_OVL_ICON_DOWNLOAD = 0xE0B2,
+    NV2A_OVL_ICON_VOLUME = 0xE1AB,
 };
 
 /* Whole controls, past the InputSource values (input/input_map.h), for

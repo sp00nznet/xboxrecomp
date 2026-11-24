@@ -15,6 +15,7 @@
 #include <unistd.h>
 #endif
 
+#include "../apu/apu_gain.h"
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
 #include "enhance_display.h"
@@ -367,6 +368,19 @@ int xbox_enhance_init(const char *root, const char *title)
      * before the guest, since titles read it once at boot; the menu's
      * choice applies at the next start. */
     xbox_SetLanguage(enhance_cfg_string("system.language", "en"));
+    /* The master volume (apu_gain.h): 100 is stock and touches
+     * no sample. A line only when it is set, so the stock log stays as it
+     * was; the menu's slider changes it live. */
+    {
+        long long vol = enhance_cfg_int("audio.volume", APU_MASTER_VOLUME_MAX);
+        int got = apu_master_volume_set(vol < 0 ? 0 : vol > APU_MASTER_VOLUME_MAX
+                                                      ? APU_MASTER_VOLUME_MAX : (int)vol);
+        if (got != vol)
+            fprintf(stderr, LOGP "audio.volume=%lld out of range 0..%d; using %d\n", vol,
+                    APU_MASTER_VOLUME_MAX, got);
+        else if (enhance_cfg_source_of("audio.volume") != ENHANCE_SRC_DEFAULT)
+            fprintf(stderr, LOGP "audio.volume=%d\n", got);
+    }
     /* Who scales the frame to the screen. Under gamescope the compositor
      * should: its filter (Steam's FSR) upscales only a surface smaller than
      * its output, and a window at the screen size leaves it nothing to do.

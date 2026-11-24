@@ -2429,6 +2429,12 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/apu/apu_dsp_run.c | - | s | file_static | reset | dsp | DSP cores; keep workers and env fields |
 | src/apu/apu_dsp_run.c | sg_rw | logs | local_static | keep | - | log guard |
 
+### src/apu/apu_gain.c
+
+| file | scope | name | kind | class | hook | why |
+|---|---|---|---|---|---|---|
+| src/apu/apu_gain.c | - | g_master_volume | file_static | keep | - | menu setting (audio.volume), the master volume |
+
 ### src/apu/apu_lockstat.c
 
 | file | scope | name | kind | class | hook | why |

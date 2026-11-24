@@ -24,6 +24,7 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "apu_wav.h"
+#include "apu_gain.h"                       /* audio.volume */
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 #include "../kernel/kernel_prof.h"          /* RECOMP_TRACE=dpc: ISR, se_frame */
@@ -1012,6 +1013,10 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         }
         mixer_render(extra, MIXER_FRAME_SAMPLES);
         mix_into(period, (const int16_t (*)[2])extra, MIXER_FRAME_SAMPLES);
+        /* The master volume, once, on the whole mix: the DSP's or the
+         * stub's period and the mixer's alike. The dump gets it too, so a
+         * capture is what the player hears. Unity returns at once. */
+        apu_master_gain_apply(&period[0][0], MIXER_FRAME_SAMPLES * 2);
     }
 
     /* A period dropped while pacing is stalled never reaches the device,

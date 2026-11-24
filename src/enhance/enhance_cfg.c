@@ -102,6 +102,7 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("textures.detile", RENV_TEXTURES_DETILE);
     enhance_cfg_bind_env("input.pad_square_left", RENV_INPUT_PAD_SQUARE_LEFT);
     enhance_cfg_bind_env("input.pad_square_right", RENV_INPUT_PAD_SQUARE_RIGHT);
+    enhance_cfg_bind_env("audio.volume", RENV_AUDIO_VOLUME);
     enhance_cfg_bind_env("overlay.stats", RENV_OVERLAY_STATS);
     enhance_cfg_bind_env("overlay.ui_scale", RENV_OVERLAY_UI_SCALE);
     enhance_cfg_bind_env("overlay.ui_fit", RENV_OVERLAY_UI_FIT);

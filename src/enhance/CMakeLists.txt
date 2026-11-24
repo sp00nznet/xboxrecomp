@@ -51,7 +51,8 @@
 #                  (enhance_padrec.h)
 # docs/runtime/config.md has the file format and the keys.
 #
-# The layer links the runtime (xbox_kernel, for nv2a_host_opts_set), never
+# The layer links the runtime (xbox_kernel, for nv2a_host_opts_set; xbox_apu,
+# for the master volume), never
 # the other way round: with the layer off the options stay zero (stock).
 
 add_library(xbox_enhance STATIC recomp_cfg.c enhance_cfg.c enhance.c enhance_input.c
@@ -65,6 +66,8 @@ target_sources(xbox_enhance PRIVATE enhance_mod_status.c enhance_menu_input.c en
 target_sources(xbox_enhance PRIVATE saves_zip.c saves_store.c saves_sign.c)
 target_sources(xbox_enhance PRIVATE enhance_display.c)
 target_sources(xbox_enhance PRIVATE enhance_padrec.c)
+# audio.volume sets the APU's master gain (apu_gain.h).
+target_link_libraries(xbox_enhance PUBLIC xbox_apu)
 if(WIN32)
     # enhance_display.c reads the SMBIOS names from the registry.
     target_link_libraries(xbox_enhance PRIVATE advapi32)

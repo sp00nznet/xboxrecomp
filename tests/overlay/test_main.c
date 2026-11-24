@@ -709,8 +709,8 @@ static const struct nv2a_ovl_list *frame_glyphs(uint32_t w, uint32_t h)
 static void test_glyphs(void)
 {
     static const struct { uint32_t w, h, list, ref; } k[] = {
-        { 1920, 1080, 0xC52EFB2D, 0xB1EF752D },
-        { 3840, 2160, 0xE13B42EC, 0x661A4547 },
+        { 1920, 1080, 0x0183E721, 0xB1EF752D },
+        { 3840, 2160, 0x9C9F72C0, 0xCDC9E146 },
     };
     int fam, src, i;
     unsigned j;
@@ -771,7 +771,7 @@ static void test_glyphs(void)
             NV2A_OVL_ICON_HELP, NV2A_OVL_ICON_MAXIMIZE, NV2A_OVL_ICON_MINIMIZE,
             NV2A_OVL_ICON_CLOSE, NV2A_OVL_ICON_CHECK, NV2A_OVL_ICON_CHEVRON_LEFT,
             NV2A_OVL_ICON_CHEVRON_RIGHT, NV2A_OVL_ICON_RESET, NV2A_OVL_ICON_UPLOAD,
-            NV2A_OVL_ICON_DOWNLOAD,
+            NV2A_OVL_ICON_DOWNLOAD, NV2A_OVL_ICON_VOLUME,
         };
         for (j = 0; j < sizeof icons / sizeof icons[0]; j++)
             CHECK(nv2a_ovl_glyph_icon(icons[j]) == NV2A_OVL_GLYPH(NV2A_OVL_GLYPH_ICON, icons[j]),

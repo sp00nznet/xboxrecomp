@@ -21,6 +21,7 @@ add_executable(mod_demo_test
     ${XR_SRC}/enhance/recomp_cfg.c
     ${XR_SRC}/enhance/enhance_cfg.c
     ${XR_SRC}/enhance/enhance.c
+    ${XR_SRC}/apu/apu_gain.c
     ${XR_SRC}/kernel/nv2a_scene_ao.c
     ${XR_SRC}/kernel/nv2a_present_chain.c
     ${XR_SRC}/kernel/nv2a_dbg_draw.c

@@ -40,6 +40,7 @@
  * Runs in its working directory, where it writes config/config.toml. A
  * checksum of 0 below means "not pinned yet": the run prints the value.
  */
+#include "../../src/apu/apu_gain.h"
 #include "enhance.h"
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
@@ -531,7 +532,7 @@ static void test_navigate(void)
     CHECK(enhance_menu_is_open());
     CHECK(enhance_menu_page() == 0);
     CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
-    CHECK(enhance_menu_page_count() == 11);
+    CHECK(enhance_menu_page_count() == 12);
 
     /* The title: no buttons, one packet number while the pad changes. A
      * trigger: the menu reads none, so the press does nothing there. */
@@ -2993,15 +2994,15 @@ static uint32_t sum_of(const struct nv2a_ovl_list *l)
 
 static void test_pages(void)
 {
-    /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Saves,
-     * Recordings, Files. Saves with no title yet: its rows hold no dates;
+    /* Render, Shaders, Pack, Audio, Game, Mods, Stats, Controls, Debug,
+     * Saves, Recordings, Files. Saves with no title yet: its rows hold no dates;
      * Recordings with no folder yet: no file rows. RECOMP_PB_BACKEND is
      * unset, so the backend is this build's default, cpu (pb_backend.h):
      * Render's AO rows say they do nothing, Pack says ignored, Debug names
      * cpu. */
-    static const uint32_t k_sum[11] = {
-        0x3C4817E6u, 0xC58D4BA2u, 0x1B88F742u, 0x775B0691u, 0x109DEB36u,
-        0x6930FCBFu, 0xD6ADEED9u, 0x6C69666Cu, 0xE13F4B8Bu, 0x5548E3AAu, 0xE2E461FFu };
+    static const uint32_t k_sum[12] = {
+        0x480616DAu, 0x3ED5CDB2u, 0x569DC396u, 0xA87EE47Du, 0x348F895Fu, 0x864825F3u,
+        0x4FDE531Bu, 0x9F2616E0u, 0x6E28437Au, 0x1239F05Cu, 0x3F57887Bu, 0xE4B1DCECu };
     /* Files shows Open exports folder only off Game Mode. Pack with a pack
      * loaded: with none it names the packs folder, an absolute path that
      * moves with the build folder. */
@@ -3013,7 +3014,7 @@ static void test_pages(void)
     CHECK(enhance_menu_is_open());
     for (int p = 0; p < enhance_menu_page_count(); p++) {
         const struct nv2a_ovl_list *l;
-        uint32_t want = p < 11 ? k_sum[p] : 0;  /* a twelfth page lands unpinned */
+        uint32_t want = p < 12 ? k_sum[p] : 0;  /* a thirteenth page lands unpinned */
         CHECK(enhance_menu_set_page(enhance_menu_page_name(p)));
         enhance_menu_draw(100000);
         l = nv2a_overlay_acquire(NV2A_OVL_MENU);
@@ -4282,6 +4283,88 @@ static void test_ui_scale_row(void)
     open_menu();
 }
 
+/* audio.volume: the Audio page's one row, live, 5% steps; a
+ * step sets the APU's level at once, Cancel puts it back, Save writes the
+ * key alone, and the start reads it back and clamps it. */
+static void test_volume_row(void)
+{
+    const char *f;
+    start_with(ARMED, k_mods);
+    CHECK(apu_master_volume() == 100);
+    open_menu();
+    CHECK(enhance_menu_set_page("Audio"));
+    CHECK(row_value("Master volume") && !strcmp(row_value("Master volume"), "100"));
+    for (int i = 0; i < enhance_menu_rows(); i++) {
+        char lb[96];
+        enhance_menu_row(i, lb, sizeof lb, NULL, 0, NULL);
+        if (!strcmp(lb, "Master volume"))
+            CHECK(enhance_menu_row_live(i) == ENHANCE_LIVE);
+    }
+    CHECK(enhance_menu_select_row("Master volume"));
+    press(XBOX_GAMEPAD_DPAD_RIGHT);   /* at the top already */
+    CHECK(!strcmp(row_value("Master volume"), "100"));
+    press(XBOX_GAMEPAD_DPAD_LEFT);
+    CHECK(!strcmp(row_value("Master volume"), "95"));
+    CHECK(apu_master_volume() == 95);
+    enhance_menu_revert();
+    CHECK(apu_master_volume() == 100);
+    CHECK(enhance_menu_is_open());   /* Cancel keeps the menu up */
+    CHECK(enhance_menu_select_row("Master volume"));
+    press(XBOX_GAMEPAD_DPAD_LEFT);
+    press(XBOX_GAMEPAD_DPAD_LEFT);
+    CHECK(apu_master_volume() == 90);
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "[audio]\nvolume = 90") != NULL);
+
+    /* Back to 100 and saved: stock again, so the key leaves the file. */
+    start_with(ARMED "[audio]\nvolume = 90\n", k_mods);
+    CHECK(apu_master_volume() == 90);
+    open_menu();
+    CHECK(enhance_menu_set_page("Audio"));
+    CHECK(enhance_menu_select_row("Master volume"));
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    CHECK(apu_master_volume() == 100);
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "volume") == NULL);
+
+    start_with(ARMED "[audio]\nvolume = 40\n", k_mods);
+    CHECK(apu_master_volume() == 40);
+    start_with(ARMED "[audio]\nvolume = 250\n", k_mods);
+    CHECK(apu_master_volume() == 100);
+    /* Below the range: silence, with a warning, never a wrap. */
+    f = start_with(ARMED "[audio]\nvolume = -20\n", k_mods);
+    CHECK(apu_master_volume() == 0);
+    CHECK(strstr(f, "audio.volume=-20 out of range") != NULL);
+
+    /* The environment over the file: the row shows it and is read-only. */
+    set_env("RECOMP_AUDIO_VOLUME", "30");
+    start_with(ARMED "[audio]\nvolume = 80\n", k_mods);
+    CHECK(apu_master_volume() == 30);
+    CHECK(enhance_cfg_source_of("audio.volume") == ENHANCE_SRC_ENV);
+    open_menu();
+    CHECK(enhance_menu_set_page("Audio"));
+    CHECK(row_value("Master volume") && !strcmp(s_val, "30"));
+    CHECK(enhance_menu_row_state(row_at("Master volume")) & ENHANCE_ROW_FORCED);
+    CHECK(enhance_menu_select_row("Master volume"));
+    press(XBOX_GAMEPAD_DPAD_LEFT);
+    CHECK(!strcmp(row_value("Master volume"), "30"));
+    CHECK(apu_master_volume() == 30);
+    CHECK(!strncmp(enhance_menu_status(), "Set by ", 7));
+
+    /* A value that is not a number is refused, and the file decides. */
+    set_env("RECOMP_AUDIO_VOLUME", "abc");
+    f = start_with(ARMED "[audio]\nvolume = 80\n", k_mods);
+    CHECK(strstr(f, "RECOMP_AUDIO_VOLUME=abc is not an integer; ignored") != NULL);
+    CHECK(apu_master_volume() == 80);
+    set_env("RECOMP_AUDIO_VOLUME", NULL);
+
+    start_with(ARMED, k_mods);
+    CHECK(apu_master_volume() == 100);
+}
+
 /* system.language: no Language row for a game that names no
  * languages; with a list, a restart row on the Game page offering those
  * only, its value from the config, and enhance.c hands the kernel the
@@ -4423,7 +4506,7 @@ static void test_help(void)
         CHECK(enhance_menu_page_intro_text(p) && enhance_menu_page_intro_text(p)[0]);
     CHECK(enhance_menu_page_intro("Game", "Options this title adds."));
     CHECK(!enhance_menu_page_intro("Nope", "x"));
-    CHECK(!strcmp(enhance_menu_page_intro_text(3), "Options this title adds."));
+    CHECK(!strcmp(enhance_menu_page_intro_text(4), "Options this title adds."));
     open_menu();
     CHECK(!enhance_menu_is_open());
 }
@@ -7243,6 +7326,7 @@ int main(int argc, char **argv)
     test_toolbar_fold();
     test_header_game();
     test_ui_scale_row();
+    test_volume_row();
     test_language_row();
     test_help();
     test_owner_table();

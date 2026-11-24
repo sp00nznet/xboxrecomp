@@ -9,6 +9,8 @@
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
+#include "apu_gain.h"
+#include "apu_wav.h"
 #include "apu_regs.h"
 #include "recomp_env.h"
 
@@ -118,6 +120,73 @@ extern uint8_t *g_apu_ram_ptr;
  * in parallel. */
 static const char *g_mode = "unset";
 static int g_expect_on;
+
+/* ---- the master volume: once, on the whole mix, before dump and device ----
+ * A mixer voice plays over the DSP period, so a gain applied before the
+ * mixer (or to the DSP stage only) gives a different sum, and one applied
+ * twice gives (1/4)^2 instead of 1/4. The WAV tap must hold exactly what the
+ * device got. At 100 the period is bit-identical to the run with no gain. */
+static int16_t gain50(int v)
+{
+    /* 50%: (0.5)^2 = 8192 in Q15, rounded as apu_gain.c does. */
+    return (int16_t)(((int32_t)v * 8192 + 16384) >> 15);
+}
+
+static void volume_case(MCPXAPUState *d)
+{
+    static int16_t pcm[64][2];
+    static int16_t wav[PERIOD][2];
+    char path[64];
+    int slot = apu_mixer_alloc_voice();
+    APUMixerVoice *v = apu_mixer_get_voice(slot);
+    int ok, i;
+    FILE *f;
+    CHECK("volume: mixer voice allocated", slot >= 0 && v);
+    if (slot < 0 || !v)
+        return;
+    for (i = 0; i < 64; i++) { pcm[i][0] = 1000; pcm[i][1] = -2000; }
+    v->pcm_data = &pcm[0][0];
+    v->pcm_bytes = sizeof(pcm);
+    v->num_channels = 2;
+    v->sample_rate = 48000;
+    v->volume = 1.0f;
+    apu_mixer_play(slot, 1);
+
+    CHECK("volume: set 50", apu_master_volume_set(50) == 50);
+    snprintf(path, sizeof(path), "apu_monitor_volume_%s.wav", g_mode);
+    CHECK("volume: wav opens", apu_wav_open(path, 0));
+    got_calls = got_samples = 0;
+    run_period(d);
+    apu_wav_close();
+    CHECK("volume: one submit, 256 samples", got_calls == 1 && got_samples == PERIOD);
+    for (ok = 1, i = 0; i < PERIOD; i++)
+        if (got[i][0] != gain50(clamp16(want_l(i) + 1000))
+                || got[i][1] != gain50(clamp16(want_r(i) - 2000))) ok = 0;
+    CHECK("volume: 50 is a quarter of the mixed period, once", ok);
+    CHECK("volume: 50 is not unity",
+          got[PERIOD - 1][0] != clamp16(want_l(PERIOD - 1) + 1000));
+
+    f = fopen(path, "rb");
+    CHECK("volume: wav readable", f != NULL);
+    if (f) {
+        size_t n = 0;
+        if (fseek(f, 44, SEEK_SET) == 0)
+            n = fread(wav, sizeof(wav[0]), PERIOD, f);
+        fclose(f);
+        CHECK("volume: wav holds one period", n == PERIOD);
+        CHECK("volume: wav is what the device got", memcmp(wav, got, sizeof(wav)) == 0);
+    }
+    remove(path);
+
+    CHECK("volume: set 100", apu_master_volume_set(100) == 100);
+    got_calls = got_samples = 0;
+    run_period(d);
+    for (ok = 1, i = 0; i < PERIOD; i++)
+        if (got[i][0] != clamp16(want_l(i) + 1000)
+                || got[i][1] != clamp16(want_r(i) - 2000)) ok = 0;
+    CHECK("volume: 100 is bit-identical to stock", ok);
+    apu_mixer_free_voice(slot);
+}
 
 static void wr32(uint32_t addr, uint32_t v) { memcpy(g_apu_ram_ptr + addr, &v, 4); }
 
@@ -707,6 +776,9 @@ int main(int argc, char **argv)
     for (i = 0; i < 10; i++) run_period(d);
     CHECK("ten periods, ten submits", got_calls == 10);
     CHECK("ten periods, 2560 samples", got_samples == 10 * PERIOD);
+
+    /* 5. The master volume. */
+    volume_case(d);
 
     free(d);
     pacing_case();

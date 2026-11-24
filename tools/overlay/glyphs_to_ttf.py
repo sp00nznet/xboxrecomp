@@ -325,6 +325,7 @@ LUCIDE_ICONS = (
     "refresh-ccw",
     "upload",
     "download",
+    "volume-2",
 )
 
 UPM = 1024

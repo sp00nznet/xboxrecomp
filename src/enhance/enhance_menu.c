@@ -29,6 +29,7 @@
 #include <direct.h>
 #endif
 
+#include "../apu/apu_gain.h"
 #include "enhance.h"
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
@@ -86,12 +87,12 @@
 #define PEEK_MS      1500u  /* Q10: LB/RB show the toolbar's labels this long */
 
 enum page {
-    PAGE_RENDER, PAGE_SHADERS, PAGE_PACK, PAGE_GAME, PAGE_MODS, PAGE_STATS, PAGE_CONTROLS,
-    PAGE_DEBUG, PAGE_SAVES, PAGE_RECORDINGS, PAGE_FILES, PAGE_COUNT
+    PAGE_RENDER, PAGE_SHADERS, PAGE_PACK, PAGE_AUDIO, PAGE_GAME, PAGE_MODS, PAGE_STATS,
+    PAGE_CONTROLS, PAGE_DEBUG, PAGE_SAVES, PAGE_RECORDINGS, PAGE_FILES, PAGE_COUNT
 };
 static const char *const s_page_name[PAGE_COUNT] = {
-    "Render", "Shaders", "Pack", "Game", "Mods", "Stats", "Controls", "Debug", "Saves", "Recordings",
-    "Files"
+    "Render", "Shaders", "Pack", "Audio", "Game", "Mods", "Stats", "Controls", "Debug", "Saves",
+    "Recordings", "Files"
 };
 /* Each section's intro line (A.8): the toolkit's below, a title's through
  * enhance_menu_page_intro. Held for the section header to draw. */
@@ -100,6 +101,7 @@ static const char *const k_page_intro[PAGE_COUNT] = {
     "How the game is drawn and shown: resolution, filtering, aspect and pacing.",
     "Post-processing shaders over the picture, saved as profiles.",
     "A pack made from your game: world textures, art, font and text; a blend hides tile repeats.",
+    "How loud the game plays, over everything it mixes.",
     "Options this game adds.",
     "Mods built into this game: turn them on or off and set their options.",
     "Live numbers: frame rate, frame time and the draw counts.",
@@ -480,6 +482,21 @@ static void set_padrec(const struct enhance_item *it, const char *v)
     enhance_padrec_set_key(it->key, v);
 }
 
+/* audio.volume (apu_gain.h): the APU frame thread reads the level each
+ * period, so a change is heard within a few milliseconds. */
+static void set_volume(const struct enhance_item *it, const char *v)
+{
+    (void)it;
+    apu_master_volume_set((int)(atof(v) + 0.5));
+}
+
+static const char *get_volume(const struct enhance_item *it, char *b, size_t n)
+{
+    (void)it;
+    snprintf(b, n, "%d", apu_master_volume());
+    return b;
+}
+
 static const struct enhance_item k_items[] = {
     { ITEM("render.scale", "Render scale", "Render", ENHANCE_ITEM_RANGE), .lo = 1, .hi = 4,
       .step = 1, .set = set_scale, .get = get_scale, .live = ENHANCE_LIVE_FLUSH, .def = "1",
@@ -550,6 +567,11 @@ static const struct enhance_item k_items[] = {
       .choices = k_onoff, .set = set_detile, .get = get_detile, .def = "off",
       .help = "Blends shifted copies of the ground textures the pack marks, so their "
               "repeat does not show" },
+    { ITEM("audio.volume", "Master volume", "Audio", ENHANCE_ITEM_RANGE), .lo = 0,
+      .hi = APU_MASTER_VOLUME_MAX, .step = 5, .set = set_volume, .get = get_volume,
+      .def = "100",
+      .help = "The whole game's sound: 100 is as the game mixes it; the scale follows the "
+              "ear, so 50 is -12 dB" },
     { ITEM("overlay.stats", "Stats strip", "Stats", ENHANCE_ITEM_TOGGLE), .set = set_stats,
       .get = get_stats, .def = "false",
       .help = "Shows frame time and rate in a strip over the game" },
@@ -1647,9 +1669,9 @@ static void slot_rows(int page, int mod)
 
 /* The section toolbar's icon for each page (Q10). */
 static const uint32_t k_page_icon[PAGE_COUNT] = {
-    NV2A_OVL_ICON_SLIDERS, NV2A_OVL_ICON_SPARKLES, NV2A_OVL_ICON_PACKAGE, NV2A_OVL_ICON_GAMEPAD,
-    NV2A_OVL_ICON_PUZZLE, NV2A_OVL_ICON_ACTIVITY, NV2A_OVL_ICON_KEYBOARD, NV2A_OVL_ICON_BUG,
-    NV2A_OVL_ICON_DOWNLOAD, NV2A_OVL_ICON_RESET, NV2A_OVL_ICON_FOLDER
+    NV2A_OVL_ICON_SLIDERS, NV2A_OVL_ICON_SPARKLES, NV2A_OVL_ICON_PACKAGE, NV2A_OVL_ICON_VOLUME,
+    NV2A_OVL_ICON_GAMEPAD, NV2A_OVL_ICON_PUZZLE, NV2A_OVL_ICON_ACTIVITY, NV2A_OVL_ICON_KEYBOARD,
+    NV2A_OVL_ICON_BUG, NV2A_OVL_ICON_DOWNLOAD, NV2A_OVL_ICON_RESET, NV2A_OVL_ICON_FOLDER
 };
 
 /* Q11: the footer's buttons carry the shortcut that presses them. */
@@ -2872,6 +2894,9 @@ static void build_rows(void)
     case PAGE_SHADERS:
         slot_rows(PAGE_SHADERS, -1);
         shader_rows();
+        break;
+    case PAGE_AUDIO:
+        slot_rows(PAGE_AUDIO, -1);
         break;
     case PAGE_GAME:
         slot_rows(PAGE_GAME, -1);

@@ -196,6 +196,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
 | `textures.world` | string | `"on"`, `"off"`: the pack's world entries (version 3) | `"on"` | `RECOMP_TEXTURES_WORLD` |
 | `textures.detile` | string | `"on"`, `"off"`: hex-tile sampling of the world entries the pack marks (version 4) | `"off"` | `RECOMP_TEXTURES_DETILE` |
+| `audio.volume` | int | the master volume, 0 to 100 percent, applied once to the final mix before the host output (SDL, XAudio2, waveOut) and the WAV dump, after the DSP and the software mixer, so every path takes it. The gain is the square of the fraction, close to how loudness is heard: 50 is -12 dB, 0 is silence. At 100 no sample is touched, so the stock output is bit-identical. Live from the menu's Audio page in 5% steps | `100` | `RECOMP_AUDIO_VOLUME` |
 | `overlay.stats` | bool | the stats strip in the window's top right corner: fps, frame ms (average and worst of the last second), pacing, scale and backend, at 2 Hz; never in a frame dump | `false` | `RECOMP_OVERLAY_STATS` |
 | `overlay.ui_scale` | number | the menu's and the overlays' size over the automatic scale (`overlay.ui_fit`), 0.75 to 2 in quarter steps: larger for a TV across the room. Live from the menu: the font atlas is baked again between frames | `1` | `RECOMP_OVERLAY_UI_SCALE` |
 | `overlay.ui_fit` | string | what the automatic scale follows: `"display"` (the larger of the output height over 1080 and the display's floor: the OS's UI scale, and on a Steam Deck's own 1280x800 panel (`SteamDeck=1` or its SMBIOS names) its 216 ppi over 160, held to the output height over 600; [Overlay scale](#overlay-scale)) or `"output"` (the output height over 1080 alone, the rule before the display floor; the height shown, so under gamescope the window's lines after the compositor's fit to the screen). Live from the menu, like `overlay.ui_scale` | `"display"` | `RECOMP_OVERLAY_UI_FIT` |
@@ -1531,8 +1532,9 @@ the atlas is baked again then (between frames when a layer already drew). A head
 or one whose window does not open, never probes. Tests:
 `tests/overlay` (`test_display_scale`), `tests/enhance_menu_layout`.
 
-The pages are Render, Shaders, Pack, Game (a title's own items, from
-`enhance_menu_add`), Mods, Stats, Controls, Debug and Save.
+The pages are Render, Shaders, Pack, Audio (the master volume), Game (a
+title's own items, from `enhance_menu_add`), Mods, Stats, Controls, Debug,
+Saves, Recordings and Files.
 
 - **Controls** lists every action with its bindings, grouped by owner
   under a header: Toolkit first, then Game (actions a title registered),
@@ -1629,7 +1631,7 @@ points, its live class; the footer names the selected row's:
 
 | Class | Takes effect | Items |
 |---|---|---|
-| live | at the next flip | `render.aniso`, `render.snap_2d`, `render.ao`, `render.ao_strength`, `render.ao_radius`, `textures.detile`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `overlay.stats`, `overlay.ui_scale`, `overlay.ui_fit`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
+| live | at the next flip | `render.aniso`, `render.snap_2d`, `render.ao`, `render.ao_strength`, `render.ao_radius`, `textures.detile`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `audio.volume`, `overlay.stats`, `overlay.ui_scale`, `overlay.ui_fit`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
 | at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.art`, `textures.font`, `textures.text`, `textures.world` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
@@ -1934,6 +1936,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_TEXTURES_TEXT` | overrides `textures.text` |
 | `RECOMP_TEXTURES_WORLD` | overrides `textures.world` |
 | `RECOMP_TEXTURES_DETILE` | overrides `textures.detile` |
+| `RECOMP_AUDIO_VOLUME` | overrides `audio.volume` |
 | `RECOMP_OVERLAY_STATS` | overrides `overlay.stats` |
 | `RECOMP_MENU` | overrides `menu.enabled` |
 | `RECOMP_KEYBOARD` | overrides `input.keyboard` (an older name, outside the naming rule) |
