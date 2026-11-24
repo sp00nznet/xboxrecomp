@@ -17,6 +17,9 @@
  *                       own with enhance_cfg_set_code_default) | spin
  *                       (stock, the console-original timing): how lowered
  *                       guest spin waits wait (kernel_pacing.h)
+ *   present.vsync       stock | on | off: whether presents wait for the
+ *                       display (nv2a_host_vsync); stock is each
+ *                       presenter's own default
  *   display.aspect      4:3 (stock) or a wider W:H: Hor+ (Metal, D3D11)
  *   display.movie       black | fit | fill: full-screen movies with a wide aspect
  *
@@ -68,6 +71,16 @@ int xbox_enhance_pack_dirs(char *user, char *exe, size_t n);
  * ignored. Any thread; logs one line. The other live keys go through
  * nv2a_host_opts_request (nv2a_backend_common.h). */
 void xbox_enhance_set_pacing(int mode);
+
+/* Whether this is a Steam Deck: SteamDeck=1 (Steam's Game Mode) or the
+ * Deck's SMBIOS names (Valve Jupiter or Galileo; Linux's DMI, the Windows
+ * registry, which Proton fills from DMI). Needs no SDL nor video, so a
+ * game or host calls it before xbox_enhance_init for its own defaults:
+ *   if (xbox_host_is_deck())
+ *       enhance_cfg_set_code_default("present.vsync", "on");
+ * xbox_host_deck_board is the SMBIOS half alone (0 on macOS). */
+int xbox_host_is_deck(void);
+int xbox_host_deck_board(void);
 
 #ifdef __cplusplus
 }

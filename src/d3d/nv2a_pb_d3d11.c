@@ -247,11 +247,15 @@ int xbox_path_shader_cache(char *out, size_t n);
 /* ---- device ------------------------------------------------------------ */
 
 static int                     s_failed;        /* init failed: draw nothing */
-/* Present's sync interval. Stock D3D11 presents without waiting for the
- * display (0): the guest's vblank clock paces the frames. RECOMP_PRESENT_VSYNC
- * is the SDL window's knob (default on there); here only a value that turns
- * it on changes anything, so an unset key keeps the stock behaviour. */
+/* Present's stock sync interval. Stock D3D11 presents without waiting for
+ * the display (0): the guest's vblank clock paces the frames.
+ * RECOMP_PRESENT_VSYNC is the SDL window's knob (default on there); here only
+ * a value that turns it on changes anything, so an unset key keeps the stock
+ * behaviour. present.vsync (nv2a_host_vsync) replaces it at each present, so
+ * the menu's choice takes the next frame; s_sync_said is the last interval
+ * named in the log. */
 static UINT                    s_sync_interval;
+static int                     s_sync_said = -1;
 static ID3D11Device           *s_dev;
 static ID3D11DeviceContext    *s_ctx;
 static ID3D11DeviceContext1   *s_ctx1;   /* NULL below D3D 11.1: partial clears clear it all */
@@ -645,7 +649,7 @@ static int init(void)
     if (!d3d11_host_window_open(full, full && !internal ? bw : (unsigned)r.right,
                                 full && !internal ? bh : (unsigned)r.bottom))
         return 0;
-    s_sync_interval = recomp_env_on(RENV_PRESENT_VSYNC) ? 1 : 0;
+    s_sync_interval = (UINT)nv2a_host_vsync_stock(recomp_env(RENV_PRESENT_VSYNC), 0);
     if (recomp_env(RENV_PRESENT_VSYNC))
         fprintf(stderr, LOGP "present vsync %s (RECOMP_PRESENT_VSYNC=%s)\n",
                 s_sync_interval ? "on" : "off", recomp_env(RENV_PRESENT_VSYNC));
@@ -6986,6 +6990,7 @@ static void d11p_after_present(double present_ms)
 static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
 {
     HRESULT hr;
+    UINT sync;
 
     if (!init())
         return;
@@ -7140,15 +7145,23 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     ovl_present();
     nv2a_stats_add(NV2A_STAT_PRESENTS, 1);
 #endif
+    sync = (UINT)nv2a_host_vsync((int)s_sync_interval);
+    if ((int)sync != s_sync_said) {
+        /* Said at a change only: a stock run logs what it logged before. */
+        if (s_sync_said >= 0 || sync != s_sync_interval)
+            fprintf(stderr, LOGP "present.vsync: sync interval %u%s\n", sync,
+                    s_sync_said >= 0 ? " (live)" : "");
+        s_sync_said = (int)sync;
+    }
     d3d11_host_present_begin();
     if (d11p_on()) {
         double t0;
         d11p_end();
         t0 = d3d11_host_now_ms();
-        hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
+        hr = IDXGISwapChain_Present(s_swap, sync, 0);
         d11p_after_present(d3d11_host_now_ms() - t0);
     } else {
-        hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
+        hr = IDXGISwapChain_Present(s_swap, sync, 0);
     }
     d3d11_host_present_end();
     if (FAILED(hr) && s_presents < 4)

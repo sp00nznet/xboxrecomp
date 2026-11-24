@@ -8,6 +8,7 @@
  * starts the video itself.
  */
 #include "enhance_display.h"
+#include "enhance.h"
 
 #include "enhance_cfg.h"
 #include "recomp_env.h"
@@ -23,46 +24,6 @@
 #include <pthread.h>
 #endif
 #endif
-
-/* Whether the machine is a Steam Deck by its SMBIOS names: Steam sets
- * SteamDeck only in Game Mode, and a Desktop Mode run (or one outside
- * Steam) still holds the Deck's 7" panel (the Deck check). */
-static int deck_hardware(void)
-{
-    char vendor[64] = "", product[64] = "";
-#if defined(_WIN32)
-    /* Windows keeps the SMBIOS names here, and Wine's wineboot fills the
-     * same key from Linux's DMI, so one read serves Proton too. */
-    HKEY k;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\BIOS", 0,
-                      KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
-        return 0;
-    {
-        DWORD n = sizeof vendor - 1, m = sizeof product - 1, t;
-        if (RegQueryValueExA(k, "SystemManufacturer", NULL, &t, (BYTE *)vendor, &n) != ERROR_SUCCESS ||
-            t != REG_SZ)
-            vendor[0] = 0;
-        if (RegQueryValueExA(k, "SystemProductName", NULL, &t, (BYTE *)product, &m) !=
-                ERROR_SUCCESS ||
-            t != REG_SZ)
-            product[0] = 0;
-    }
-    RegCloseKey(k);
-#elif defined(__linux__)
-    static const char *const k_path[] = {"/sys/class/dmi/id/sys_vendor",
-                                         "/sys/class/dmi/id/product_name"};
-    char *dst[] = {vendor, product};
-    for (int i = 0; i < 2; i++) {
-        FILE *f = fopen(k_path[i], "r");
-        if (!f)
-            return 0;
-        if (!fgets(dst[i], 64, f))
-            dst[i][0] = 0;
-        fclose(f);
-    }
-#endif
-    return nv2a_overlay_is_deck_board(vendor, product);
-}
 
 static int probe(struct nv2a_ovl_display *d)
 {
@@ -123,7 +84,7 @@ static int probe(struct nv2a_ovl_display *d)
      * sets 0 in the Deck's Desktop Mode is not pinned down, and the panel
      * is the same either way. ui_fit = output is the way out. */
     deck = recomp_env(RENV_STEAM_DECK);
-    if (!(deck && strcmp(deck, "1") == 0) && deck_hardware())
+    if (!(deck && strcmp(deck, "1") == 0) && xbox_host_deck_board())
         deck = "1";
     nv2a_overlay_display_mark_deck(d, deck);
     return 1;
@@ -148,7 +109,7 @@ void enhance_display_start(void)
 void enhance_display_steam_hint(void)
 {
     const char *deck = recomp_env(RENV_STEAM_DECK);
-    int on_deck = (deck && strcmp(deck, "1") == 0) || deck_hardware();
+    int on_deck = (deck && strcmp(deck, "1") == 0) || xbox_host_deck_board();
     if (!nv2a_overlay_steam_hint_wanted(on_deck, recomp_env(RENV_STEAM_GAME_ID),
                                         recomp_env(RENV_STEAM_APP_ID),
                                         recomp_env(RENV_STEAM_HINT)))

@@ -280,6 +280,14 @@ static void layer_filter(int filter)
     s_layer.minificationFilter = f;
 }
 
+void fbm_set_vsync(int vsync)
+{
+    @autoreleasepool {
+        if (s_layer)
+            s_layer.displaySyncEnabled = vsync ? YES : NO;
+    }
+}
+
 #ifdef XBOXRECOMP_ENHANCE
 static void chain_free(void);
 #endif

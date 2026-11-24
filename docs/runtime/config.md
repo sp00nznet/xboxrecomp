@@ -184,6 +184,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"sleep"`, `"spin"` (stock, the console-original timing): how a lowered guest busy-wait waits | `"sleep"` | `RECOMP_PRESENT_PACING` |
+| `present.vsync` | string | `"stock"`, `"on"`, `"off"`: whether a present waits for the display. `stock` keeps each presenter's own default: the SDL window (Metal, GL, CPU) and the Win32 framebuffer present wait, the D3D11 backend does not. `on` and `off` replace it on every presenter and switch live. The environment's older `1` and `0` mean `on` and `off`; any other value of it (`yes`, an empty one) still wins over the file and leaves each presenter its older reading: on unless empty or starting with `0` (D3D11, the SDL window), on unless starting with `0` (the Win32 framebuffer present). On D3D11, `on` is Present(1) on top of the guest's own vblank clock and flip hold, so two clocks pace the frame: they beat against each other on a 59.94 Hz panel and on any display that is not 60 Hz, with an extra frame of latency; stock keeps the guest's clock alone. A game or host picks another default with `enhance_cfg_set_code_default("present.vsync", "on")` before `xbox_enhance_init`, for instance a Deck build with `if (xbox_host_is_deck())` (`enhance.h`: `SteamDeck=1` or the Deck's SMBIOS names, no SDL needed). Logged as `[ENHANCE] present.vsync=<value>` only when not stock. The legacy d3d8 GL path always waits | `"stock"` | `RECOMP_PRESENT_VSYNC` |
 | `present.profile` | string | `"none"` or a shader profile's slug, its file `config/shader-profiles/<slug>.toml`: a chain of slang presets run in place of the final present, on Metal and D3D11 ([shader profiles](#shaderprofiles)); in the layer that sets it, it wins over `present.shader` | `"none"` | `RECOMP_PRESENT_PROFILE` |
 | `present.shader` | string | `"none"`, `"crt-lottes"`, `"crt-lottes-fast"`, `"crt-hyllian"`, `"fsr"`, `"smaa"`, `"cas"`, or a `.slangp` path: a RetroArch slang preset run by librashader in place of the final present, on Metal and D3D11 ([present.shader](#presentshader)) | `"none"` | `RECOMP_PRESENT_SHADER` |
 | `present.shader_params.<preset>.<param>` | number | a slang preset's runtime parameter, per preset: `<preset>` is the bundled name or a path's file stem, `<param>` a `#pragma parameter` name. Clamped to the parameter's range ([shader parameters](#shaderparams)) | the preset's own value | none |
@@ -364,7 +365,13 @@ options generation move and sets the texture's scale mode or calls
 `SDL_SetWindowFullscreen`; the D3D11 window, which the walker thread owns,
 swaps its style with `SetWindowPos` in the same on_flip, and the next
 flip resizes the swap chain. `present.pacing` changes through
-`xbox_enhance_set_pacing(mode)` (`enhance.h`), from any thread. Each shows
+`xbox_enhance_set_pacing(mode)` (`enhance.h`), from any thread, and
+`present.vsync` through `nv2a_host_vsync_set` (`nv2a_backend_common.h`),
+which every presenter reads at its next present on its own thread: the
+D3D11 backend's Present interval, the Win32 framebuffer's, the SDL
+renderer's `SDL_SetRenderVSync` and the Metal layer's
+`displaySyncEnabled` (a renderer that refuses keeps its vsync and logs
+it once, until the value changes again). Each shows
 within two flips. `RECOMP_DEBUG=opts_at=<flip>:<key>=<value>,...` makes the
 same requests at given flips, to check a switch without the menu.
 
@@ -1631,7 +1638,7 @@ points, its live class; the footer names the selected row's:
 
 | Class | Takes effect | Items |
 |---|---|---|
-| live | at the next flip | `render.aniso`, `render.snap_2d`, `render.ao`, `render.ao_strength`, `render.ao_radius`, `textures.detile`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `audio.volume`, `overlay.stats`, `overlay.ui_scale`, `overlay.ui_fit`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
+| live | at the next flip | `render.aniso`, `render.snap_2d`, `render.ao`, `render.ao_strength`, `render.ao_radius`, `textures.detile`, `present.filter`, `present.shader`, `present.pacing`, `present.vsync`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `audio.volume`, `overlay.stats`, `overlay.ui_scale`, `overlay.ui_fit`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
 | at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.art`, `textures.font`, `textures.text`, `textures.world` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
@@ -1928,6 +1935,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_PRESENT_FILTER` | overrides `present.filter` |
 | `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |
 | `RECOMP_PRESENT_PACING` | overrides `present.pacing` |
+| `RECOMP_PRESENT_VSYNC` | overrides `present.vsync`; `1` and `0` also mean `on` and `off`, any other value keeps each presenter's older reading of it |
 | `RECOMP_PRESENT_SURFACE` | overrides `present.surface` |
 | `RECOMP_HOST_GAMESCOPE` | set by the SteamOS launcher (`1`) when it runs under gamescope; `present.surface = "auto"` then means `internal`. No file key binds it; a line in the bundle's `config/launch.env` overrides it |
 | `RECOMP_TEXTURES_PACK` | overrides `textures.pack` |

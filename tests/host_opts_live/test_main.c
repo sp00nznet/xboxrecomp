@@ -395,6 +395,31 @@ static void test_r1(void)
     nv2a_host_opts_set(&stock);
 }
 
+/* present.vsync: the mode replaces a presenter's stock answer or passes it
+ * through, and the raw env's words give the stock answer without the older
+ * rule reading "stock" and "off" as on. */
+static void test_vsync(void)
+{
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_STOCK, "starts stock");
+    CHECK(nv2a_host_vsync(0) == 0 && nv2a_host_vsync(1) == 1, "stock passes through");
+    nv2a_host_vsync_set(NV2A_VSYNC_ON);
+    CHECK(nv2a_host_vsync(0) == 1 && nv2a_host_vsync(1) == 1, "on");
+    nv2a_host_vsync_set(NV2A_VSYNC_OFF);
+    CHECK(nv2a_host_vsync(0) == 0 && nv2a_host_vsync(1) == 0, "off");
+    nv2a_host_vsync_set(7);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_STOCK, "out of range is stock");
+    nv2a_host_vsync_set(-1);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_STOCK, "negative is stock");
+
+    CHECK(nv2a_host_vsync_stock(NULL, 0) == 0 && nv2a_host_vsync_stock(NULL, 1) == 1, "unset");
+    CHECK(nv2a_host_vsync_stock("stock", 0) == 0, "stock keeps D3D11's off");
+    CHECK(nv2a_host_vsync_stock("stock", 1) == 1, "stock keeps SDL's on");
+    CHECK(nv2a_host_vsync_stock("on", 0) == 1 && nv2a_host_vsync_stock("off", 1) == 0, "words");
+    CHECK(nv2a_host_vsync_stock("1", 0) == 1 && nv2a_host_vsync_stock("0", 1) == 0, "digits");
+    CHECK(nv2a_host_vsync_stock("", 1) == 0, "empty is off, as before");
+    CHECK(nv2a_host_vsync_stock("yes", 0) == 1, "other values: on unless 0");
+}
+
 int main(void)
 {
     test_request();
@@ -402,6 +427,7 @@ int main(void)
     test_merge();
     test_race();
     test_r1();
+    test_vsync();
     if (fails) {
         printf("host_opts_live: %d failure(s)\n", fails);
         return 1;

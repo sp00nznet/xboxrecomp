@@ -13,7 +13,8 @@
  * Linear filtering, RECOMP_PRESENT_FILTER=point (or nearest) for sharp
  * pixels when the enhancements layer is built;
  * RECOMP_PRESENT_VSYNC=0 presents without waiting for the display, as the
- * SDL window does.
+ * SDL window does; present.vsync (nv2a_host_vsync) replaces that at each
+ * present, so the menu's choice takes the next frame.
  */
 #if defined(_WIN32)
 #define COBJMACROS
@@ -27,6 +28,7 @@
 #include <string.h>
 #include "gpu_present.h"
 #include "recomp_env.h"
+#include "../kernel/nv2a_backend_common.h"
 
 static ID3D11Device             *s_dev;
 static ID3D11DeviceContext      *s_ctx;
@@ -40,7 +42,7 @@ static ID3D11PixelShader        *s_ps;
 static HWND                      s_hwnd;
 static uint32_t                  s_w, s_h;      /* frame size */
 static uint32_t                  s_bw, s_bh;    /* back buffer (client) size */
-static int                       s_vsync = 1;
+static int                       s_vsync = 1;   /* stock: on unless =0 */
 
 /* A triangle covering the viewport, from the vertex id; uv 0..1. */
 static const char s_hlsl[] =
@@ -109,8 +111,9 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
     const char *f = NULL;
 #endif
 
-    if (v && v[0] == '0')
-        s_vsync = 0;
+    /* Its older rule: on unless the value starts with '0', an empty value
+     * included (the SDL window reads empty as off). */
+    s_vsync = nv2a_host_vsync_stock(v && *v ? v : NULL, 1);
     s_hwnd = hwnd;
     s_w = width; s_h = height;
     client_size(&s_bw, &s_bh);
@@ -170,7 +173,7 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
     ID3D10Blob_Release(vsb);
     ID3D10Blob_Release(psb);
     fprintf(stderr, "  [D3D] presenting through D3D11 (%ux%u frame, vsync %s, %s filter)\n",
-            width, height, s_vsync ? "on" : "off",
+            width, height, nv2a_host_vsync(s_vsync) ? "on" : "off",
             smp.Filter == D3D11_FILTER_MIN_MAG_MIP_POINT ? "point" : "linear");
     return 1;
 }
@@ -184,6 +187,7 @@ int gpu_present_frame(const uint32_t *pixels)
     D3D11_VIEWPORT vp;
     uint32_t cw, ch;
     float sx, sy;
+    int vsync;
 
     if (!s_rtv || !pixels)
         return 0;
@@ -218,9 +222,11 @@ int gpu_present_frame(const uint32_t *pixels)
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_srv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_samp);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
-    /* Paced only when Present waited for the vblank: with RECOMP_PRESENT_VSYNC=0
-     * the caller keeps its own 16 ms sleep instead of spinning a core. */
-    return IDXGISwapChain_Present(s_chain, (UINT)s_vsync, 0) == S_OK && s_vsync;
+    /* Paced only when Present waited for the vblank: with vsync off
+     * (RECOMP_PRESENT_VSYNC=0, present.vsync = "off") the caller keeps its
+     * own 16 ms sleep instead of spinning a core. */
+    vsync = nv2a_host_vsync(s_vsync);
+    return IDXGISwapChain_Present(s_chain, (UINT)vsync, 0) == S_OK && vsync;
 }
 
 void gpu_present_shutdown(void)

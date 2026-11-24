@@ -1883,6 +1883,34 @@ uint32_t nv2a_host_opts_gen(void);
 /* render_scale as a factor: 1 when unset. */
 unsigned nv2a_host_render_scale(void);
 
+/* present.vsync: whether a present waits for the display. Each
+ * presenter has its own stock answer, which it still works out from
+ * RECOMP_PRESENT_VSYNC as before: the SDL renderer and the CAMetalLayer
+ * wait, gpu_present.c waits, the D3D11 backend does not (the guest's vblank
+ * clock paces it). STOCK keeps that answer; ON and OFF replace it on every
+ * path. Outside nv2a_host_opts because it is read at each present on the
+ * presenter's own thread (the SDL main loop, the D3D11 ack thread), never
+ * at the walker's flip, and a change needs no target rebuilt. Indexes match
+ * the key's choices (enhance.c). Without the enhancements layer it stays
+ * STOCK. */
+enum nv2a_vsync {
+    NV2A_VSYNC_STOCK = 0,
+    NV2A_VSYNC_ON,
+    NV2A_VSYNC_OFF
+};
+/* Any thread; a presenter takes it at its next present. A value out of
+ * range is STOCK. */
+void nv2a_host_vsync_set(int mode);
+int nv2a_host_vsync_mode(void);
+/* The answer for a presenter whose stock answer is `stock` (0 or 1). */
+int nv2a_host_vsync(int stock);
+/* A presenter's stock answer from RECOMP_PRESENT_VSYNC's raw value `v`, the
+ * env tier of present.vsync: unset or "stock" is `dflt`, "on" 1, "off" 0,
+ * and any other value the older rule (on unless empty or starting with 0).
+ * The words must not read as the older rule's "on": RECOMP_PRESENT_VSYNC=
+ * stock would then turn the D3D11 backend's stock off into on. */
+int nv2a_host_vsync_stock(const char *v, int dflt);
+
 /* The stages of a draw that a later stage reads as its input
  * (OTHER_STAGE_INPUT): BUMPENVMAP(_LUMINANCE)'s offsets, the dot-product
  * family's normal and DEPENDENT_AR/GB's coordinates (every mode from 8 on),

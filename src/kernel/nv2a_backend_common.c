@@ -1307,6 +1307,38 @@ uint32_t nv2a_host_opts_gen(void)
     return atomic_load_explicit(&s_opts_gen, memory_order_acquire);
 }
 
+/* present.vsync: written by the menu's thread, read at every present. */
+static atomic_int s_vsync_mode;
+
+void nv2a_host_vsync_set(int mode)
+{
+    if (mode != NV2A_VSYNC_ON && mode != NV2A_VSYNC_OFF)
+        mode = NV2A_VSYNC_STOCK;
+    atomic_store_explicit(&s_vsync_mode, mode, memory_order_relaxed);
+}
+
+int nv2a_host_vsync_mode(void)
+{
+    return atomic_load_explicit(&s_vsync_mode, memory_order_relaxed);
+}
+
+int nv2a_host_vsync(int stock)
+{
+    int m = nv2a_host_vsync_mode();
+    return m == NV2A_VSYNC_ON ? 1 : m == NV2A_VSYNC_OFF ? 0 : stock != 0;
+}
+
+int nv2a_host_vsync_stock(const char *v, int dflt)
+{
+    if (!v || !strcmp(v, "stock"))
+        return dflt != 0;
+    if (!strcmp(v, "on"))
+        return 1;
+    if (!strcmp(v, "off"))
+        return 0;
+    return *v && *v != '0';
+}
+
 const struct nv2a_host_opts *nv2a_host_opts(void)
 {
     return &s_host_opts;

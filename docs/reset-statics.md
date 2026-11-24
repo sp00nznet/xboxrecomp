@@ -1009,6 +1009,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_backend_common.c | - | s_req_opts | file_static | keep | - | enhance options and pending menu requests, host settings |
 | src/kernel/nv2a_backend_common.c | - | s_req_mask | file_static | keep | - | enhance options and pending menu requests, host settings |
 | src/kernel/nv2a_backend_common.c | - | s_req_lock | file_static | keep | - | host spinlock |
+| src/kernel/nv2a_backend_common.c | - | s_vsync_mode | file_static | keep | - | present.vsync mode (stock, on, off), host setting |
 | src/kernel/nv2a_backend_common.c | - | s_req_pending | file_static | keep | - | enhance options and pending menu requests, host settings |
 | src/kernel/nv2a_backend_common.c | - | s_opts_gen | file_static | keep | - | options generation; backends cache it, must not go back |
 | src/kernel/nv2a_backend_common.c | - | s_req_pack | file_static | keep | - | pack file the menu asked for, host settings |
@@ -1768,7 +1769,8 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | file | scope | name | kind | class | hook | why |
 |---|---|---|---|---|---|---|
 | src/d3d/nv2a_pb_d3d11.c | - | s_failed | file_static | keep | - | device init failed flag, host |
-| src/d3d/nv2a_pb_d3d11.c | - | s_sync_interval | file_static | keep | - | present vsync interval from env |
+| src/d3d/nv2a_pb_d3d11.c | - | s_sync_interval | file_static | keep | - | stock present vsync interval from env |
+| src/d3d/nv2a_pb_d3d11.c | - | s_sync_said | file_static | keep | - | last vsync interval logged (present.vsync) |
 | src/d3d/nv2a_pb_d3d11.c | - | s_dev | file_static | keep | - | D3D11 device |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ctx | file_static | keep | - | D3D11 immediate context |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ctx1 | file_static | keep | - | D3D11.1 context for partial clears |

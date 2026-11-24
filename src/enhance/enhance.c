@@ -278,6 +278,8 @@ static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };
 static const char *const s_pacing[] = { "spin", "sleep", NULL };
 /* present.shader_lines, in NV2A_PRESENT_LINES_* order. */
 static const char *const s_shader_lines[] = { "auto", "guest", "host", NULL };
+/* present.vsync: indexes match enum nv2a_vsync. */
+static const char *const s_vsync[] = { "stock", "on", "off", NULL };
 /* present.surface: "auto" (index 0) is resolved here, never stored. */
 static const char *const s_surface[] = { "auto", "window", "internal", NULL };
 /* textures.art, .font, .text and .world: words, as the menu shows them. */
@@ -383,6 +385,32 @@ int xbox_enhance_init(const char *root, const char *title)
                     APU_MASTER_VOLUME_MAX, got);
         else if (enhance_cfg_source_of("audio.volume") != ENHANCE_SRC_DEFAULT)
             fprintf(stderr, LOGP "audio.volume=%d\n", got);
+    }
+    /* Whether a present waits for the display (nv2a_host_vsync).
+     * "stock" leaves each presenter's own answer: the SDL window and the
+     * CAMetalLayer wait, the D3D11 backend does not. RECOMP_PRESENT_VSYNC
+     * is the key's env tier and keeps its older 1 and 0. A game or host
+     * picks another default with enhance_cfg_set_code_default before
+     * xbox_enhance_init (a Deck build on: `if (xbox_host_is_deck())
+     * enhance_cfg_set_code_default("present.vsync", "on");`). Named only when not stock, so the stock log
+     * stays as it was; the menu changes it live. */
+    {
+        const char *ev = enhance_cfg_env("present.vsync");
+        int vs;
+        if (ev && (!strcmp(ev, "1") || !strcmp(ev, "0")))
+            vs = ev[0] == '1' ? NV2A_VSYNC_ON : NV2A_VSYNC_OFF;
+        else if (ev && strcmp(ev, "stock") && strcmp(ev, "on") && strcmp(ev, "off")) {
+            /* Any other value is an older spelling ("yes", "", "00"): it
+             * still wins over the file, and each presenter reads it as it
+             * always did (nv2a_host_vsync_stock), so stock here. */
+            vs = NV2A_VSYNC_STOCK;
+            fprintf(stderr, LOGP "present.vsync: RECOMP_PRESENT_VSYNC=\"%s\" read as"
+                    " before by each presenter\n", ev);
+        } else
+            vs = enhance_cfg_choice("present.vsync", s_vsync, NV2A_VSYNC_STOCK);
+        nv2a_host_vsync_set(vs);
+        if (vs != NV2A_VSYNC_STOCK)
+            fprintf(stderr, LOGP "present.vsync=%s\n", s_vsync[vs]);
     }
     /* Who scales the frame to the screen. Under gamescope the compositor
      * should: its filter (Steam's FSR) upscales only a surface smaller than

@@ -3001,7 +3001,7 @@ static void test_pages(void)
      * Render's AO rows say they do nothing, Pack says ignored, Debug names
      * cpu. */
     static const uint32_t k_sum[12] = {
-        0x480616DAu, 0x3ED5CDB2u, 0x569DC396u, 0xA87EE47Du, 0x348F895Fu, 0x864825F3u,
+        0x4A5A6345u, 0x3ED5CDB2u, 0x569DC396u, 0xA87EE47Du, 0x348F895Fu, 0x864825F3u,
         0x4FDE531Bu, 0x9F2616E0u, 0x6E28437Au, 0x1239F05Cu, 0x3F57887Bu, 0xE4B1DCECu };
     /* Files shows Open exports folder only off Game Mode. Pack with a pack
      * loaded: with none it names the packs folder, an absolute path that
@@ -4363,6 +4363,125 @@ static void test_volume_row(void)
 
     start_with(ARMED, k_mods);
     CHECK(apu_master_volume() == 100);
+}
+
+/* present.vsync: a live row on the Render page; stock is each
+ * presenter's own answer (nv2a_host_vsync passes it through), on and off
+ * replace it. RECOMP_PRESENT_VSYNC is the env tier and keeps its 1 and 0;
+ * a code default (a Deck build's "on") is the menu's stock and the start's. */
+static void test_vsync_row(void)
+{
+    const char *f;
+    start_with(ARMED, k_mods);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_STOCK);
+    CHECK(nv2a_host_vsync(1) == 1 && nv2a_host_vsync(0) == 0);
+    open_menu();
+    CHECK(enhance_menu_set_page("Render"));
+    CHECK(row_value("VSync") && !strcmp(s_val, "stock"));
+    CHECK(enhance_menu_row_live(row_at("VSync")) == ENHANCE_LIVE);
+    CHECK(enhance_menu_select_row("VSync"));
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    CHECK(!strcmp(row_value("VSync"), "on"));
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_ON);
+    CHECK(nv2a_host_vsync(0) == 1);   /* D3D11's stock off becomes on */
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    CHECK(!strcmp(row_value("VSync"), "off"));
+    CHECK(nv2a_host_vsync(1) == 0);   /* the SDL window's stock on becomes off */
+    enhance_menu_revert();
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_STOCK);
+    CHECK(enhance_menu_select_row("VSync"));
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "[present]\nvsync = \"off\"") != NULL);
+
+    /* Read back at the start, logged when not stock; stock saved drops the
+     * key, and a stock start logs nothing about it. */
+    f = start_with(ARMED "[present]\nvsync = \"off\"\n", k_mods);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_OFF);
+    CHECK(strstr(f, "present.vsync=off") != NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Render"));
+    CHECK(enhance_menu_select_row("VSync"));
+    press(XBOX_GAMEPAD_DPAD_RIGHT);   /* wraps to stock */
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_STOCK);
+    tap(VK_F5);
+    CHECK(strstr(read_file("config/config.toml"), "vsync") == NULL);
+    f = start_with(ARMED, k_mods);
+    CHECK(strstr(f, "present.vsync") == NULL);
+    f = start_with(ARMED "[present]\nvsync = \"maybe\"\n", k_mods);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_STOCK);
+
+    /* The environment: the older 1 and 0, and the words; forced in the menu. */
+    set_env("RECOMP_PRESENT_VSYNC", "1");
+    start_with(ARMED "[present]\nvsync = \"off\"\n", k_mods);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_ON);
+    open_menu();
+    CHECK(enhance_menu_set_page("Render"));
+    CHECK(row_value("VSync") && !strcmp(s_val, "on"));
+    CHECK(enhance_menu_row_state(row_at("VSync")) & ENHANCE_ROW_FORCED);
+    CHECK(enhance_menu_select_row("VSync"));
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_ON);
+    set_env("RECOMP_PRESENT_VSYNC", "0");
+    start_with(ARMED, k_mods);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_OFF);
+    set_env("RECOMP_PRESENT_VSYNC", "stock");
+    start_with(ARMED "[present]\nvsync = \"on\"\n", k_mods);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_STOCK);
+    /* An older spelling beside a file value: the env still wins, and each
+     * presenter reads it by its own older rule (SDL and D3D11 alike). */
+    set_env("RECOMP_PRESENT_VSYNC", "yes");
+    f = start_with(ARMED "[present]\nvsync = \"off\"\n", k_mods);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_STOCK);
+    CHECK(strstr(f, "present.vsync=") == NULL);
+    CHECK(nv2a_host_vsync(nv2a_host_vsync_stock("yes", 1)) == 1);
+    CHECK(nv2a_host_vsync(nv2a_host_vsync_stock("yes", 0)) == 1);
+    set_env("RECOMP_PRESENT_VSYNC", "00");
+    start_with(ARMED "[present]\nvsync = \"on\"\n", k_mods);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_STOCK);
+    CHECK(nv2a_host_vsync(nv2a_host_vsync_stock("00", 1)) == 0);
+    CHECK(nv2a_host_vsync_stock("", 1) == 0 && nv2a_host_vsync_stock(NULL, 1) == 1);
+    set_env("RECOMP_PRESENT_VSYNC", NULL);
+
+    /* A host's Deck default (xbox_host_is_deck, no SDL): SteamDeck=1 says
+     * so; otherwise the SMBIOS board, which no test host is. */
+    set_env("SteamDeck", "1");
+    CHECK(xbox_host_is_deck());
+    if (xbox_host_is_deck())
+        CHECK(enhance_cfg_set_code_default("present.vsync", "on"));
+    start_with(ARMED, k_mods);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_ON);
+    CHECK(enhance_cfg_set_code_default("present.vsync", NULL));
+    set_env("SteamDeck", NULL);
+    CHECK(xbox_host_is_deck() == xbox_host_deck_board());
+#if defined(__APPLE__)
+    CHECK(!xbox_host_is_deck());
+#endif
+
+    /* The default hook: a game or host's code default is the start's value
+     * and the menu's stock, so Reset and Save treat "on" as the default. */
+    CHECK(enhance_cfg_set_code_default("present.vsync", "on"));
+    f = start_with(ARMED, k_mods);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_ON);
+    CHECK(strstr(f, "present.vsync=on") != NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Render"));
+    CHECK(row_value("VSync") && !strcmp(s_val, "on"));
+    CHECK(enhance_menu_select_row("VSync"));
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    press(XBOX_GAMEPAD_DPAD_RIGHT);
+    press(XBOX_GAMEPAD_DPAD_RIGHT);   /* off, stock, on */
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_ON);
+    tap(VK_F5);
+    CHECK(strstr(read_file("config/config.toml"), "vsync") == NULL);
+    start_with(ARMED "[present]\nvsync = \"stock\"\n", k_mods);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_STOCK);
+    CHECK(enhance_cfg_set_code_default("present.vsync", NULL));
+
+    start_with(ARMED, k_mods);
+    CHECK(nv2a_host_vsync_mode() == NV2A_VSYNC_STOCK);
 }
 
 /* system.language: no Language row for a game that names no
@@ -7327,6 +7446,7 @@ int main(int argc, char **argv)
     test_header_game();
     test_ui_scale_row();
     test_volume_row();
+    test_vsync_row();
     test_language_row();
     test_help();
     test_owner_table();

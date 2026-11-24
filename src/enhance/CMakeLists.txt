@@ -17,6 +17,7 @@
 #   enhance_menu.c the in-game menu (menu.enabled): items, pages, Save
 #                  (enhance_menu.h)
 #   enhance_display.c the display probe behind overlay.ui_fit
+#   enhance_host.c    xbox_host_is_deck, for a game's or host's defaults
 #   shader_profile.c shader profiles: the profile files, the composer (one
 #                  .slangp from a chain of presets; shader_profile.h)
 #   shader_profile_req.c a profile as the chain's request, the start's
@@ -64,12 +65,12 @@ target_link_libraries(xbox_enhance PUBLIC recomp_env xbox_kernel xbox_input xbox
 target_sources(xbox_enhance PRIVATE enhance_text.c enhance_menu_layout.c)
 target_sources(xbox_enhance PRIVATE enhance_mod_status.c enhance_menu_input.c enhance_osk.c)
 target_sources(xbox_enhance PRIVATE saves_zip.c saves_store.c saves_sign.c)
-target_sources(xbox_enhance PRIVATE enhance_display.c)
+target_sources(xbox_enhance PRIVATE enhance_display.c enhance_host.c)
 target_sources(xbox_enhance PRIVATE enhance_padrec.c)
 # audio.volume sets the APU's master gain (apu_gain.h).
 target_link_libraries(xbox_enhance PUBLIC xbox_apu)
 if(WIN32)
-    # enhance_display.c reads the SMBIOS names from the registry.
+    # enhance_host.c reads the SMBIOS names from the registry.
     target_link_libraries(xbox_enhance PRIVATE advapi32)
 endif()
 # The saves zip's manifest names the toolkit that wrote it (overlay-saves).

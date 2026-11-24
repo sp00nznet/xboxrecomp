@@ -1,6 +1,7 @@
 # host_opts_live - live host options (nv2a_backend_common): a request from
 # another thread applied at a fake flip, the changed-field mask, the options
-# and pack generations, merging and no-op requests. POSIX (pthreads):
+# and pack generations, merging and no-op requests; the present.vsync mode
+# and its stock answers. POSIX (pthreads):
 #   cmake -S tests/host_opts_live -B build/host_opts_live
 #   cmake --build build/host_opts_live && ctest --test-dir build/host_opts_live
 cmake_minimum_required(VERSION 3.20)

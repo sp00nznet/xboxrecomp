@@ -10,6 +10,9 @@
 /* Device, queue, pipeline and the window's layer; 0 with a reason in err. */
 int   fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn);
 void  fbm_destroy(void);
+/* The layer's displaySyncEnabled (present.vsync live); main thread, the
+ * thread that takes the drawables. */
+void  fbm_set_vsync(int vsync);
 void  fbm_get(void **device, void **queue);
 /* Slot k (0..2) at w x h: its id<MTLTexture>, or NULL. */
 void *fbm_slot(int k, uint32_t w, uint32_t h);

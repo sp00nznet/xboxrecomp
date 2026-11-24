@@ -140,7 +140,7 @@ extern "C" {
     X(FB_FULLSCREEN,     CONFIG, "RECOMP_FULLSCREEN",        NULL, "Win32 framebuffer window: 1 starts in borderless fullscreen (F11 / Alt+Enter toggle)") \
     X(D3D_PRESENT,       CONFIG, "RECOMP_D3D_PRESENT",       NULL, "Win32 framebuffer window: 1 presents through D3D11 instead of GDI (falls back to GDI on failure)") \
     X(CLOSE_KEEPS_RUNNING, CONFIG, "RECOMP_CLOSE_KEEPS_RUNNING", NULL, "Win32 framebuffer window: 1 closing the window only closes it; default ends the process") \
-    X(PRESENT_VSYNC,     CONFIG, "RECOMP_PRESENT_VSYNC",     NULL, "vsync: SDL host 0 = off (default on); D3D11 1 = on (default off)") \
+    X(PRESENT_VSYNC,     CONFIG, "RECOMP_PRESENT_VSYNC",     NULL, "vsync at present; with enhancements the env tier of present.vsync: stock (each path's own: SDL window and Metal layer on, D3D11 off), on or off, 1 = on, 0 = off; without the layer SDL host 0 = off (default on), D3D11 1 = on (default off)") \
     X(WINDOW_QUIT_AFTER, CONFIG, "RECOMP_WINDOW_QUIT_AFTER", NULL, "close the window after this many seconds") \
     X(FB_WINDOW,         CONFIG, "RECOMP_FB_WINDOW",         NULL, "Windows: show the framebuffer window (not beside the d3d11 backend)") \
     X(GAME_FILES,        CONFIG, "RECOMP_GAME_FILES",        NULL, "game files directory; the launcher sets it, the game's main.c has the default") \

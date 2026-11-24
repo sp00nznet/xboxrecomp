@@ -40,7 +40,9 @@
  * RECOMP_HEADLESS=1 (or no display, or SDL video failing to start) skips all
  * of it: the guest runs on the main thread exactly as before.
  *
- * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display;
+ * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display
+ * (with the enhancements layer the env tier of present.vsync, which the
+ * menu changes live: nv2a_host_vsync, read each loop);
  * RECOMP_PRESENT_STATS=1 prints a [PRESENT] line every 5 s (one is always
  * printed at exit); RECOMP_WINDOW_SCALE=<n> sizes the window (default 2).
  *
@@ -989,7 +991,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     struct xbox_title_clock title_clock = {0};
     int title_stats = recomp_env_on(RENV_TITLE_STATS);
     uint64_t upload_ns = 0;
-    int vsync = !recomp_env(RENV_PRESENT_VSYNC) || recomp_env_on(RENV_PRESENT_VSYNC);
+    /* Stock: wait for the display unless RECOMP_PRESENT_VSYNC turns it off;
+     * present.vsync replaces it (nv2a_host_vsync). */
+    int vsync_stock = nv2a_host_vsync_stock(recomp_env(RENV_PRESENT_VSYNC), 1);
+    int vsync = nv2a_host_vsync(vsync_stock);
+    int vsync_refused = -1;   /* the value the renderer last refused */
     int stats = recomp_env_on(RENV_PRESENT_STATS);
     int scale = recomp_env(RENV_WINDOW_SCALE) ? atoi(recomp_env(RENV_WINDOW_SCALE)) : 2;
     int quit = 0, guest_done = 0, dirty = 0, shoot = 0;
@@ -1251,6 +1257,35 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 }
                 dirty = 1;
             }
+        }
+
+        /* present.vsync from the menu: the renderer and the layer are this
+         * thread's. The D3D11 swap chain's is the backend's own. */
+        /* A renderer that refuses keeps its vsync; vsync_refused stops the
+         * loop asking again each frame until the menu picks another value. */
+        int want_vsync = nv2a_host_vsync(vsync_stock);
+        if (!s_swap_win && want_vsync != vsync && want_vsync != vsync_refused) {
+            int ok = 1;
+#if defined(__APPLE__)
+            if (s_layer)
+                fbm_set_vsync(want_vsync);
+            else
+#endif
+            if (!SDL_SetRenderVSync(ren, want_vsync)) {
+                ok = 0;
+                vsync_refused = want_vsync;
+                fprintf(stderr, "[PRESENT] present.vsync: renderer vsync %s failed (%s),"
+                        " stays %s\n", want_vsync ? "on" : "off", SDL_GetError(),
+                        vsync ? "on" : "off");
+            }
+            if (ok) {
+                vsync = want_vsync;
+                vsync_refused = -1;
+                fprintf(stderr, "[PRESENT] present.vsync: vsync %s (live)\n",
+                        vsync ? "on" : "off");
+            }
+        } else if (want_vsync == vsync) {
+            vsync_refused = -1;
         }
 
         pthread_mutex_lock(&s_lock);

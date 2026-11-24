@@ -117,6 +117,8 @@ static const char *const k_page_intro[PAGE_COUNT] = {
 static const char *const k_aniso[] = { "0", "2", "4", "8", "16", NULL };
 static const char *const k_filter[] = { "nearest", "linear", "integer", NULL };
 static const char *const k_pacing[] = { "spin", "sleep", NULL };
+/* present.vsync: indexes match enum nv2a_vsync. */
+static const char *const k_vsync[] = { "stock", "on", "off", NULL };
 static const char *const k_aspect[] = { "4:3", "16:9", "16:10", "21:9", NULL };
 static const char *const k_movie[] = { "black", "fit", "fill", NULL };
 static const char *const k_surface[] = { "auto", "window", "internal", NULL };
@@ -184,6 +186,18 @@ static void set_pacing(const struct enhance_item *it, const char *v)
 {
     (void)it;
     xbox_enhance_set_pacing(strcmp(v, "spin") ? XBOX_PACING_SLEEP : XBOX_PACING_SPIN);
+}
+
+/* present.vsync (nv2a_host_vsync): every presenter reads it at its next
+ * present, on its own thread, so the switch needs no flip. */
+static void set_vsync(const struct enhance_item *it, const char *v)
+{
+    int i;
+    (void)it;
+    for (i = 0; k_vsync[i] && strcmp(k_vsync[i], v); i++)
+        ;
+    if (k_vsync[i])
+        nv2a_host_vsync_set(i);
 }
 
 /* The pack toggle and the kinds: bits of the one pack_off field. */
@@ -298,6 +312,14 @@ static const char *get_pacing(const struct enhance_item *it, char *b, size_t n)
 {
     (void)it;
     snprintf(b, n, "%s", xbox_PacingMode() == XBOX_PACING_SPIN ? "spin" : "sleep");
+    return b;
+}
+
+static const char *get_vsync(const struct enhance_item *it, char *b, size_t n)
+{
+    int m = nv2a_host_vsync_mode();
+    (void)it;
+    snprintf(b, n, "%s", k_vsync[m >= 0 && m <= NV2A_VSYNC_OFF ? m : 0]);
     return b;
 }
 
@@ -517,6 +539,10 @@ static const struct enhance_item k_items[] = {
     { ITEM("present.pacing", "Frame pacing", "Render", ENHANCE_ITEM_CHOICE),
       .choices = k_pacing, .set = set_pacing, .get = get_pacing, .def = "sleep",
       .help = "How the frame rate is held steady: sleep saves power, spin is tighter" },
+    { ITEM("present.vsync", "VSync", "Render", ENHANCE_ITEM_CHOICE), .choices = k_vsync,
+      .set = set_vsync, .get = get_vsync, .def = "stock",
+      .help = "Waits for the display before showing a frame: no tearing, a frame more"
+              " latency. Stock keeps the renderer's own default" },
     { ITEM("display.aspect", "Aspect ratio", "Render", ENHANCE_ITEM_CHOICE),
       .choices = k_aspect, .live = ENHANCE_LIVE_RESTART, .def = "4:3",
       .help = "The picture shape the game is told to draw for" },

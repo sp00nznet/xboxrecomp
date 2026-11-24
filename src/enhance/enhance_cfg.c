@@ -90,6 +90,7 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("present.filter", RENV_PRESENT_FILTER);
     enhance_cfg_bind_env("present.fullscreen", RENV_PRESENT_FULLSCREEN);
     enhance_cfg_bind_env("present.pacing", RENV_PRESENT_PACING);
+    enhance_cfg_bind_env("present.vsync", RENV_PRESENT_VSYNC);
     enhance_cfg_bind_env("present.surface", RENV_PRESENT_SURFACE);
     enhance_cfg_bind_env("present.shader", RENV_PRESENT_SHADER);
     enhance_cfg_bind_env("present.shader_lib", RENV_PRESENT_SHADER_LIB);

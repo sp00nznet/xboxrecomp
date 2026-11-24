@@ -93,6 +93,7 @@ add_executable(enhance_menu_test
     ${XR_SRC}/kernel/nv2a_tex_pack.c
     ${XR_SRC}/kernel/nv2a_overlay.c
     ${XR_SRC}/kernel/nv2a_overlay_ui.c
+    ${XR_SRC}/enhance/enhance_host.c
     ${XR_SRC}/kernel/nv2a_overlay_font.c
     ${XR_SRC}/kernel/nv2a_overlay_glyph.c
     ${XR_SRC}/kernel/nv2a_overlay_ref.c
