@@ -23,6 +23,10 @@ LGPL-2.1-or-later — extracted from xemu
                           is this project's own)
                           (c) 2012, 2015 espes; 2018-2019 Jannik Vogel;
                           2019-2025 Matt Borgerson
+    src/apu/apu_dsp_run.c MCPX APU GP/EP frame loop on the dsp56300 JIT
+                          (gp_ep.c), built with XBOXRECOMP_APU_DSP
+                          (c) 2012, 2015 espes; 2018-2019 Jannik Vogel;
+                          2019-2025 Matt Borgerson
     src/apu/apu_vp.c      MCPX APU voice processor
                           (c) 2012 espes; 2018-2019 Jannik Vogel;
                           2019-2025 Matt Borgerson
@@ -43,8 +47,9 @@ LGPL-2.1-or-later — extracted from xemu
     src/apu/apu.h         MCPX APU public API
                           (header has no copyright line)
 
-  src/apu/apu_shim.h is this project's own file but is released under the
-  same licence, because it exists only to host the extracted APU code.
+  src/apu/apu_shim.h is based on xemu code ((c) 2012 espes, 2018-2025
+  Matt Borgerson et al.; the stand-alone shims are (c) 2026 the Burnout 3
+  Static Recompilation Project) and is under the same licence.
 
   Licensed under the GNU Lesser General Public License, version 2.1 or (at
   your option) any later version. The full text is in LICENSES/LGPL-2.1.txt;
@@ -103,12 +108,26 @@ MIT and permissive — dsp56300 (XBOXRECOMP_APU_DSP)
   archive's own third-party file, verbatim, with each crate's copyright.
 
 
+MIT — stb_image_write, in every build
+-------------------------------------
+
+  third_party/stb/stb_image_write.h v1.16, vendored unmodified
+  (third_party/stb/VERSION names the commit and the sha256), writes the
+  PNG frame and texture dumps (src/platform/img_dump.c) and is compiled
+  into every build. https://github.com/nothings/stb, (c) 2017 Sean
+  Barrett. MIT or public domain, at the user's choice; the text is in
+  LICENSES/MIT-stb.txt. stb_image.h beside it is read only by the
+  img_dump test and is in no game binary.
+
+
 MIT and permissive — the enhancements overlay (XBOXRECOMP_ENHANCE)
 -------------------------------------------------------------------
 
-  Vendored unmodified under third_party/ and compiled only in builds with
-  -DXBOXRECOMP_ENHANCE=ON. Each directory's VERSION file names the
-  upstream commit and the sha256 of every file.
+  Vendored under third_party/ and compiled only in builds with
+  -DXBOXRECOMP_ENHANCE=ON. microui, stb_truetype and the fonts are
+  unmodified; the Lucide font is a subset and the Kenney prompts are SVGs
+  converted to a font, as said below. Each directory's VERSION file names
+  the upstream source and the sha256 of what it holds.
 
   third_party/microui/  microui 2.02
                         https://github.com/rxi/microui
@@ -132,18 +151,22 @@ MIT and permissive — the enhancements overlay (XBOXRECOMP_ENHANCE)
                         The OFL allows bundling them with software; they
                         are not sold on their own and are not renamed.
 
-  third_party/lucide/    Lucide 1.57.0 icon font, a 19-icon subset
+  third_party/lucide/    Lucide 1.57.0 icon font, a 20-icon subset
                         https://github.com/lucide-icons/lucide
                         (c) 2026 Lucide Icons and Contributors. ISC; the
                         icons Lucide took from Feather are (c) 2013-present
                         Cole Bemis, MIT. Both texts are in LICENSE beside
                         the font and in LICENSES/ISC-MIT-lucide.txt.
-                        Subset by tools/overlay/glyphs_to_ttf.py and
-                        embedded in the binary.
+                        Subset by tools/overlay/glyphs_to_ttf.py
+                        (pyftsubset to the 20 code points in VERSION; the
+                        copyright, licence and licence-URL names are set
+                        to Lucide's terms and fsType to 0) and embedded in
+                        the binary.
 
   third_party/kenney-input/
-                        Kenney Input Prompts 1.3, 129 prompts converted to
-                        a font by tools/overlay/glyphs_to_ttf.py
+                        Kenney Input Prompts 1.3: 152 of its SVGs
+                        (glyphs.txt) converted to one font, xbr-input.ttf,
+                        by tools/overlay/glyphs_to_ttf.py
                         https://kenney.nl/assets/input-prompts
                         Created and distributed by Kenney (www.kenney.nl).
                         CC0 1.0: no credit is required; this one is given
