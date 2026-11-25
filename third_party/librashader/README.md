@@ -20,10 +20,16 @@ same source and features, built in the pinned Steam Linux Runtime sniper
 SDK image (`Dockerfile.linux`, run as `docker build --output`, no bind
 mounts) so it needs no glibc newer than sniper's. Upstream builds the D3D11
 runtime on Windows only; `linux-d3d11.patch` widens its `target_os` gates
-and the `windows` crate dependency to Linux and changes no code, since
-dxvk-native gives the same D3D11 interfaces. `d3dcompiler_vkd3d.c`, linked
+and the `windows` crate dependency to Linux, since dxvk-native gives the
+same D3D11 interfaces. It also edits the workspace `Cargo.toml` (an
+`exclude` and a `[patch.crates-io]` table) and `Cargo.lock` (the registry
+source and checksum of four crates go), and adds `linux-stubs/`: the
+`windows`, `windows-core` and `windows-strings` crates, copied by the build
+with their gates opened, and an empty `windows-future`. `NOTICE` lists
+every file it modifies. `d3dcompiler_vkd3d.c`, linked
 into the library, defines the two d3dcompiler_47 functions the runtime
-calls (`D3DCompile`, `D3DCreateBlob`) over the game's libvkd3d-shader.so.1,
+calls (`D3DCompile`, `D3DCreateBlob`) over the game's libvkd3d-shader.so.1
+(linked dynamically, not bundled),
 with vkd3d-utils' options, so presets compile to the DXBC they get under
 Proton. `notices-linux.py` writes the zip's `THIRDPARTY.txt` (the crates,
 the -sys crates' native licences, the static libstdc++ and Rust's std); the

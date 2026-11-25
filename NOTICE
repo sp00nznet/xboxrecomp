@@ -191,16 +191,42 @@ MIT and permissive — the enhancements overlay (XBOXRECOMP_ENHANCE)
 MPL-2.0 — librashader (present.shader, XBOXRECOMP_ENHANCE)
 ----------------------------------------------------------
 
-  librashader.dll / librashader.dylib, staged beside the executable by
-  cmake/librashader.cmake: the upstream prebuilt release, unmodified (on
-  x86-64 Windows our build of the unmodified source with only the D3D11
-  runtime, made by third_party/librashader/build-windows.sh), pinned by sha256
-  and loaded at run time, never linked. The game's code
+  librashader.dll / librashader.dylib / librashader.so, staged beside the
+  executable by cmake/librashader.cmake: the upstream prebuilt release,
+  unmodified (on x86-64 Windows our build of the unmodified source with only
+  the D3D11 runtime, made by third_party/librashader/build-windows.sh; on
+  x86-64 Linux, for the dxvk-native build, our patched build, below), pinned
+  by sha256 and loaded at run time, never linked. The game's code
   stays under its own licence (MPL-2.0 applies file by file); the
   library's source is at
   https://github.com/SnowflakePowered/librashader/tree/librashader-v0.12.0
   and the licence text is in LICENSES/MPL-2.0-librashader.txt, which
   ships as shaders/LICENSE-librashader.txt beside the library.
+
+  The x86-64 Linux librashader.so is built from the same v0.12.0 source
+  with one patch, third_party/librashader/linux-d3d11.patch, so it is a
+  modified MPL-2.0 work. The patch modifies these files of librashader:
+  the workspace Cargo.toml (an exclude for linux-stubs/ and a
+  [patch.crates-io] table that points windows, windows-core,
+  windows-strings and windows-future at linux-stubs/); Cargo.lock (it drops
+  the registry source and checksum of those four crates); and the
+  cfg(windows) gates, widened to Linux, in the Cargo.toml and src/lib.rs
+  of librashader, librashader-cache, librashader-common and
+  librashader-runtime-d3d11 and in librashader-capi's Cargo.toml,
+  src/ctypes.rs, src/error.rs and src/runtime/mod.rs. It adds
+  linux-stubs/: the registry windows, windows-core and windows-strings
+  crates (MIT or Apache-2.0), copied by the build with their gates opened
+  and three std::os::windows string conversions made portable, and an
+  empty crate in place of the unused windows-future, so the library
+  compiles against dxvk-native's D3D11. A D3DCompile shim over
+  vkd3d-shader, third_party/librashader/d3dcompiler_vkd3d.c (ours, MIT, as
+  the toolkit), is linked in place of d3dcompiler_47. It calls the game's
+  own lib/libvkd3d-shader.so.1 (its own licence, in lib/), which is linked
+  dynamically, not bundled into the .so. The patch ships beside the
+  library as shaders/librashader-linux-d3d11.patch: with the upstream
+  source above, it is the source of librashader's modified files that
+  MPL-2.0 asks a binary to point to. third_party/librashader/build-linux.sh
+  builds the library and its README says how to redo the patch.
 
 
 MIT and permissive — what our x86-64 Windows librashader.dll links
@@ -285,6 +311,46 @@ MIT and permissive — what upstream's macOS librashader.dylib links
   third_party/librashader/notices-macos.sh (cargo-about 0.9.3 with
   about.toml there), committed as third_party/librashader/THIRDPARTY-macos.txt
   and staged as shaders/THIRDPARTY-librashader.txt beside the library.
+
+
+MIT and permissive — what our x86-64 Linux librashader.so links
+---------------------------------------------------------------
+
+  Our Linux build (above) links statically, from the Cargo.lock at the
+  v0.12.0 tag with the patch and --no-default-features --features
+  runtime-d3d11, built with Rust 1.99.1 and GCC 10.3 in the Steam Linux
+  Runtime sniper SDK image (build and dev dependencies are not linked):
+
+    C/C++ libraries
+      glslang (in glslang-sys): BSD-3-Clause and the other licences its
+        LICENSE.txt lists
+      SPIRV-Cross (in spirv-cross-sys): Apache-2.0, some files under the
+        Khronos free-use licence
+      GNU libstdc++ 10.3 (the sniper SDK's): GPL-3.0-or-later WITH
+        GCC-exception-3.1, whose runtime exception lets it be linked into
+        a work under any licence
+      the Rust 1.99.1 standard library (MIT OR Apache-2.0)
+      d3dcompiler_vkd3d.c, ours (above)
+    MPL-2.0
+      librashader's own crates, persy, smartstring
+    Apache-2.0
+      blake3, codespan-reporting, constant_time_eq, moxcms, pxfm, rspirv,
+      spirv
+    BSD-2-Clause / BSD-3-Clause
+      arrayref / encoding_rs (with MIT)
+    Zlib
+      foldhash
+    (MIT OR Apache-2.0) AND Unicode-3.0
+      unicode-ident
+    MIT (most also Apache-2.0)
+      109 crates, among them glslang, image, naga, nom, png, rayon, regex,
+      spirv-cross2, zune-jpeg and the patched windows crates
+
+  The texts, with every copyright, are in THIRDPARTY.txt in the release
+  zip, written by third_party/librashader/notices-linux.py in
+  build-linux.sh, and staged as shaders/THIRDPARTY-librashader.txt beside
+  the library. vkd3d-shader is not in it: the game ships that library in
+  lib/ under its own licence.
 
 
 Permissive — the toolchain runtime in every Windows executable

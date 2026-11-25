@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /**
  * D3DCompile and D3DCreateBlob for the Linux build of librashader's D3D11
  * runtime (build-linux.sh), over vkd3d-shader.
