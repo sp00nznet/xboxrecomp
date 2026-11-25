@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../d3d/d3d8_combiners_parse.h"
 #include "../d3d/d3d8_swizzle.h"
 #include "../d3d/d3d8_vsh_parse.h"
 #include "nv2a_pb_state.h"
@@ -111,6 +112,35 @@ static inline int nv2a_tex_filter_linear(uint32_t f, int mag)
     if (mag)
         return m == 2 || m == 4;
     return m == 2 || m == 4 || m == 6 || m == 7;
+}
+
+/* The signed channels, bits 28-31 (A, R, G, B): 1 A, 2 R, 4 G, 8 B. */
+static inline int nv2a_tex_filter_signed(uint32_t f)
+{
+    return (int)(f >> 28);
+}
+
+/* The bits of a decoded A8R8G8B8 texel that the signed channels' mask
+ * (nv2a_tex_filter_signed) flips: each marked byte's top bit. */
+static inline uint32_t nv2a_tex_signed_xor(int mask)
+{
+    return (mask & 1 ? 0x80000000u : 0u) | (mask & 2 ? 0x00800000u : 0u)
+         | (mask & 4 ? 0x00008000u : 0u) | (mask & 8 ? 0x00000080u : 0u);
+}
+
+/* The texels of a stage with signed channels as they go up: each marked
+ * byte from two's complement to offset binary (b ^ 0x80), so the sampler's
+ * unsigned filter interpolates the signed values. Filtered as stored, the
+ * bytes 0xFF (-1) and 0x01 (+1) of a bump map's du/dv crossing zero average
+ * to 0x80, -128: the hardware filters the signed value and gets 0. The
+ * shader takes the bias off again (NV2A_TEX_SIGNED_BIASED). */
+static inline void nv2a_tex_signed_bias(uint32_t *texels, size_t n, int mask)
+{
+    uint32_t x = nv2a_tex_signed_xor(mask);
+    size_t i;
+    if (x)
+        for (i = 0; i < n; i++)
+            texels[i] ^= x;
 }
 
 /* 0: level 0 only, 1: nearest level, 2: blend two levels. */
@@ -1455,6 +1485,21 @@ static inline void nv2a_ps_stage_key(const struct nv2a_stage st[4], uint32_t oth
             *extra |= 1u << (28 + n);
         *modes |= m << (5 * n);
     }
+}
+
+/* The signed-channel half of the key: each stage's nv2a_tex_filter_signed,
+ * 4 bits a stage from bit 0, for the stages whose pixel-shader mode fetches
+ * a texel (nv2a_texmode_samples, as the generators' nv2a_signed_on), so a
+ * mode that reads none keys no variant of its own; 0 for a stock draw. The
+ * backend unpacks it into the combiner state's tex_signed. */
+static inline uint32_t nv2a_ps_signed_key(const struct nv2a_stage st[4])
+{
+    uint32_t k = 0;
+    int n;
+    for (n = 0; n < 4; n++)
+        if (nv2a_texmode_samples((int)nv2a_stage_ps_mode(&st[n], n)))
+            k |= (uint32_t)nv2a_tex_filter_signed(st[n].filter) << (4 * n);
+    return k;
 }
 
 /* RECOMP_TRACE=bump: one line on stderr the first time a batch shows a

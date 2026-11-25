@@ -335,7 +335,51 @@ typedef struct NV2ACombinerState {
      * only for such draws, so the stock shader text is unchanged; in the
      * cache key. */
     int hex_tile;
+
+    /* SET_TEXTURE_FILTER's signed channels of each stage
+     * (nv2a_tex_filter_signed: 1 A, 2 R, 4 G, 8 B). A marked channel's byte
+     * is two's complement and the combiners read it as 2 s / 255. With
+     * NV2A_TEX_SIGNED_BIASED the texels went up biased (nv2a_tex_signed_bias)
+     * and the remap is exact under filtering; without, the texture is the
+     * stock bytes (a render target or a pack entry) and the remap is
+     * nv2a_signed_remap's, exact for point sampling. Bump and dot stages
+     * read the input as the stock bytes either way (xr<8+i>), since their
+     * decode takes the byte as signed already. 0 for every stage of a stock
+     * draw, so the stock shader text is unchanged; in the cache key. */
+    int tex_signed[NV2A_MAX_TEXTURES];
 } NV2ACombinerState;
+
+#define NV2A_TEX_SIGNED_BIASED 0x10
+
+/* The combiner value of a signed texel channel fetched unsigned, u = b/255:
+ * the byte b as two's complement s, read 2 s / 255 (the nxdk_pgraph_tests
+ * hardware goldens: 0x01 2/255, 0x40 128/255, 0x7F 254/255, 0x80 up
+ * negative). The split at 127.5/255 keeps a filtered texel between bytes
+ * on the side of its nearer byte. The CPU twin of the shaders' remap. */
+static inline float nv2a_signed_remap(float u)
+{
+    return u * 2.0f - (u >= 127.5f / 255.0f ? 512.0f / 255.0f : 0.0f);
+}
+
+/* Stage i's texel is remapped for its signed channels: it has some and its
+ * mode reads a texture. The generators then keep the texel as the stock
+ * bytes in xr<8+i> for the bump and dot stages that read it as their
+ * input. */
+static inline int nv2a_signed_on(const NV2ACombinerState *s, int i)
+{
+    return (s->tex_signed[i] & 0xF) && nv2a_texmode_samples((int)s->tex_mode[i]);
+}
+
+/* The swizzle of a tex_signed mask's channels, in rgba order: "rb", "a". */
+static inline void nv2a_signed_swizzle(int mask, char out[5])
+{
+    int k = 0;
+    if (mask & 2) out[k++] = 'r';
+    if (mask & 4) out[k++] = 'g';
+    if (mask & 8) out[k++] = 'b';
+    if (mask & 1) out[k++] = 'a';
+    out[k] = 0;
+}
 
 /**
  * Build combiner state from the NV2A's own registers, as the pushbuffer

@@ -1772,6 +1772,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_sync_interval | file_static | keep | - | stock present vsync interval from env |
 | src/d3d/nv2a_pb_d3d11.c | - | s_sync_said | file_static | keep | - | last vsync interval logged (present.vsync) |
 | src/d3d/nv2a_pb_d3d11.c | - | s_dev | file_static | keep | - | D3D11 device |
+| src/d3d/nv2a_pb_d3d11.c | - | s_tex_sgn | file_static | keep | - | signed channels for the next tex_bind, set and cleared by the stage loop |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ctx | file_static | keep | - | D3D11 immediate context |
 | src/d3d/nv2a_pb_d3d11.c | - | s_ctx1 | file_static | keep | - | D3D11.1 context for partial clears |
 | src/d3d/nv2a_pb_d3d11.c | - | s_swap | file_static | keep | - | DXGI swap chain |
@@ -2343,6 +2344,9 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_fs_hex | file_static | keep | - | textures.detile, the batch's hex stages, set again on each draw |
 | src/d3d/nv2a_pb_metal.m | - | s_up_scale | file_static | keep | - | the upload just made, read back by its caller |
 | src/d3d/nv2a_pb_metal.m | - | s_up_detile | file_static | keep | - | the upload just made, read back by its caller |
+| src/d3d/nv2a_pb_metal.m | - | s_up_biased | file_static | keep | - | the upload just made, read back by its caller |
+| src/d3d/nv2a_pb_metal.m | - | s_tex_sgn | file_static | keep | - | signed channels for the next tex_bind, set and cleared by the stage loop |
+| src/d3d/nv2a_pb_metal.m | - | s_fs_sraw | file_static | keep | - | signed stages bound unbiased, set again on each draw |
 | src/d3d/nv2a_pb_metal.m | - | s_up_blend | file_static | keep | - | the upload just made, read back by its caller |
 | src/d3d/nv2a_pb_metal.m | - | s_up_levels | file_static | keep | - | the upload just made, read back by its caller |
 | src/d3d/nv2a_pb_metal.m | - | s_tex_last | file_static | keep | - | the entry tex_bind just bound, set again on each bind |

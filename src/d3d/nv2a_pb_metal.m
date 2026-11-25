@@ -1264,6 +1264,10 @@ typedef struct {
     /* The pack entry it holds is marked XRTP_FLAG_DETILE_HEX: kept whatever
      * textures.detile says, so the menu's toggle needs no re-upload. */
     int            pack_detile;
+    /* The signed channels it was bound for (s_tex_sgn), in the key: the
+     * same texels bound unsigned are another entry. `biased`: they went up
+     * biased (nv2a_tex_signed_bias); a pack entry's never do. */
+    int            sgn, biased;
     uint64_t       hash;
     int            live;
     id<MTLTexture> tex;
@@ -1485,7 +1489,12 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube);
 /* What the last tex_upload left (TexEntry.pack_scale, .pack_levels,
  * .pack_blend, .pack_detile). */
 static uint32_t s_up_scale, s_up_levels;
-static int      s_up_blend, s_up_detile;
+static int      s_up_blend, s_up_detile, s_up_biased;
+/* The signed channels (nv2a_tex_filter_signed) the next tex_bind uploads
+ * biased: the stage's, set by the draw's stage loop for a combiner shader,
+ * whose key says how to read them back; 0 for fs_basic and everything
+ * else. */
+static int      s_tex_sgn;
 
 static id<MTLTexture> tex_upload(const Stage *t, uint64_t hash, int cube)
 {
@@ -1529,6 +1538,7 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
     s_up_levels = t->levels;
     s_up_blend = 0;
     s_up_detile = 0;
+    s_up_biased = 0;
     if (cube) {
         /* No pack entry is a cube map: the six faces go up from the guest.
          * tex_dump writes face 0, the first texels decoded. */
@@ -1536,8 +1546,11 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
             return nil;
         if (nv2a_tex_dump_on())
             nv2a_tex_dump_upload(t, hash, s_texels);
+        nv2a_tex_signed_bias(s_texels, nv2a_tex_texels(t->width, t->height, t->levels) * 6,
+                             s_tex_sgn);
         if (!(tex = tex_make_cube(t->width, t->levels, s_texels)))
             return nil;
+        s_up_biased = s_tex_sgn != 0;
         s_tex_uploads++;
         nv2a_stats_add(NV2A_STAT_TEX_UPLOADS, 1);
         return tex;
@@ -1582,9 +1595,12 @@ static id<MTLTexture> tex_upload_body(const Stage *t, uint64_t hash, int cube)
             return nil;
         if (nv2a_tex_dump_on())
             nv2a_stage_dump_upload(mem, t, hash, s_texels);
+        nv2a_tex_signed_bias(s_texels, nv2a_tex_texels(t->width, t->height, t->levels),
+                             s_tex_sgn);
         tex = tex_make(t->width, t->height, t->levels, s_texels, 0);
         if (!tex)
             return nil;
+        s_up_biased = s_tex_sgn != 0;
     }
     s_tex_uploads++;
     nv2a_stats_add(NV2A_STAT_TEX_UPLOADS, 1);
@@ -1678,7 +1694,7 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
                 && c->pitch == t->pitch && c->palette == t->palette
-                && c->levels == t->levels && c->cube == cube)
+                && c->levels == t->levels && c->cube == cube && c->sgn == s_tex_sgn)
             e = c;
     }
     for (i = 0; !e && i < n; i++) {
@@ -1686,7 +1702,7 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
                 && c->pitch == t->pitch && c->palette == t->palette
-                && c->levels == t->levels && c->cube == cube) {
+                && c->levels == t->levels && c->cube == cube && c->sgn == s_tex_sgn) {
             e = c;
             break;
         }
@@ -1714,6 +1730,7 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
                 e->pack_levels = s_up_levels;
                 e->pack_blend = s_up_blend;
                 e->pack_detile = s_up_detile;
+                e->biased = s_up_biased;
                 [e->tex release];
                 e->tex = nt;
             }
@@ -1736,6 +1753,8 @@ static id<MTLTexture> tex_bind_body(const Stage *t, int cube)
         e->palette = t->palette;
         e->levels = t->levels;
         e->cube = cube;
+        e->sgn = s_tex_sgn;
+        e->biased = s_up_biased;
         e->bytes = bytes;
         e->gen = g->flips;
         e->hash = h;
@@ -2233,6 +2252,12 @@ static int s_fs_mag;
  * fragment buffer 3 (nv2a_hex_tile.h). */
 static unsigned s_fs_hex;
 
+/* The stages with signed channels whose texture is the stock bytes, not
+ * biased (a render target, a pack entry, a fallback): their remap is the
+ * point-sampled one. 0 at the first pick, which assumes every signed stage
+ * biased; the stage loop sets it and the pick is made again. */
+static unsigned s_fs_sraw;
+
 static unsigned detile_mask(const RenderTarget *const srcs[4], const struct nv2a_ps_consts *pc)
 {
     unsigned mask = 0;
@@ -2289,7 +2314,9 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
             | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u)
             | (w ? 8u : 0u)    /* W-buffered: the w_depth variant */
             | (s_fs_mag ? 16u : 0u)    /* the trace's variant */
-            | (s_fs_hex ? 32u : 0u);   /* textures.detile: nv2a_hex */
+            | (s_fs_hex ? 32u : 0u)   /* textures.detile: nv2a_hex */
+            | nv2a_ps_signed_key(s_stage) << 8    /* SET_TEXTURE_FILTER signed */
+            | s_fs_sraw << 24;   /* ... read from the stock bytes */
     key[37] = inputs;
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.fn;
@@ -2304,6 +2331,11 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
     st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */
     st.tex_mag = (int)(key[36] >> 4 & 1u);     /* RECOMP_TRACE=tex_mag */
     st.hex_tile = (int)(key[36] >> 5 & 1u);    /* textures.detile */
+    for (n = 0; n < 4; n++) {   /* SET_TEXTURE_FILTER bits 28-31 */
+        st.tex_signed[n] = (int)(key[36] >> (8 + 4 * n) & 0xFu);
+        if (st.tex_signed[n] && !(key[36] >> (24 + n) & 1u))
+            st.tex_signed[n] |= NV2A_TEX_SIGNED_BIASED;
+    }
     for (n = 0; n < 4; n++) {
         st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
         st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
@@ -3143,6 +3175,10 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     int place = NV2A_PLACE_CENTRE;
     float lo_x = 0, hi_x = 0;   /* hor+: a 2D batch's x range, surface pixels */
     const RenderTarget *srcs[4] = { NULL, NULL, NULL, NULL };
+    /* Stages bound for the combiners' shader only: as cubes, black for a
+     * dot stage that reads none, or biased signed. A draw that ends on
+     * fs_basic after the stage loop binds them again as 2D. */
+    unsigned comb_only = 0;
     VsEntry *ve = NULL;
     /* Stencil only on a Z24S8 zeta surface, as on the CPU. */
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
@@ -3223,6 +3259,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         /* The variant declares the buffer: no buffer, no variant. */
         s_fs_mag = nv2a_tex_mag_on() && d->program && mag_init();
         s_fs_hex = 0;   /* known once the stages are bound, below */
+        s_fs_sraw = 0;  /* likewise */
         fs_wd = nv2a_w_depth_on(v, d->program != 0, v->rc_set && (v->rc_ctl & 0xFF));
         ffn = fs_select(v, fs_wd);
         for (i = 0; i < d->idx_count; i++) {
@@ -3358,9 +3395,13 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         /* Textures before the pass: a self copy is a blit between passes. */
         {
             int textured = 0;
+            /* Signed channels go up biased only for the combiners' shader,
+             * whose key reads them back (fs_basic ignores them). */
+            uint32_t sgk = s_fs_comb ? nv2a_ps_signed_key(s_stage) : 0;
             for (k = 0; k < 4; k++) {
                 const Stage *t = &s_stage[k];
                 RenderTarget *src;
+                int sg = (int)(sgk >> (4 * k) & 0xFu);
                 stex[k] = s_black;
                 s_stage_pack[k][0] = s_stage_pack[k][1] = 1;
                 s_stage_pack[k][2] = 0;
@@ -3375,11 +3416,18 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                  * fs_basic samples face 0. A dot stage that reads no
                  * texture keeps the black one: nothing to decode. */
                 if (s_fs_comb && !nv2a_texmode_samples((int)nv2a_stage_ps_mode(t, k))) {
+                    comb_only |= 1u << k;
                     continue;
                 } else if (s_fs_comb && nv2a_stage_cube_bind(t, nv2a_stage_ps_mode(t, k))) {
+                    s_tex_sgn = sg;
                     stex[k] = tex_bind(t, 1);
                     stage_from_cache(k);
+                    comb_only |= 1u << k;
+                    if (sg && !(s_tex_last && s_tex_last->biased))
+                        s_fs_sraw |= 1u << k;
                 } else if ((src = rt_texture(t, rt)) != NULL) {
+                    if (sg)
+                        s_fs_sraw |= 1u << k;
                     stex[k] = src->tex;
                     nv2a_ps_consts_rt(&mpc.b, k, t, src->w, src->h);
                     if (nv2a_rt_no_alpha(nv2a_tex_linear_twin(t->color)))
@@ -3392,12 +3440,18 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     s_rtt_binds++;
                     nv2a_tex_dump_rt(t);
                 } else {
+                    s_tex_sgn = sg;
                     stex[k] = tex_bind(t, 0);
                     stage_from_cache(k);
+                    if (sg && !(s_tex_last && s_tex_last->biased))
+                        s_fs_sraw |= 1u << k;
+                    else if (sg)
+                        comb_only |= 1u << k;
                     if (nv2a_aspect_picture(t->width, rt->w, bump_src >> k & 1))
                         guest_tex = 1;
                 }
             }
+            s_tex_sgn = 0;
             if (textured)
                 s_draws_tex++;
         }
@@ -3502,12 +3556,30 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         /* The variant follows the bound entries, so it is picked again
          * here; the stage loop's choices (s_fs_comb) do not change with it.
          * A hex variant that does not compile keeps the stock function the
-         * stages were bound for, never fs_basic (as D3D11's retry). */
-        if ((s_fs_hex = detile_mask(srcs, &mpc.b)) != 0) {
+         * stages were bound for, never fs_basic (as D3D11's retry), with
+         * the point remap of a signed stage bound unbiased (s_fs_sraw) if
+         * it has one. The first pick assumed every signed stage biased, so
+         * when no variant reads the stock bytes the draw takes fs_basic
+         * with comb_only bound again as fs_basic reads them, as D3D11's
+         * stages_flat. */
+        if ((s_fs_hex = detile_mask(srcs, &mpc.b)) != 0 || s_fs_sraw) {
             int comb = s_fs_comb, fw = s_fs_w;
             id<MTLFunction> hfn = fs_select(v, fs_wd);
+            if (!s_fs_comb && s_fs_hex && s_fs_sraw) {
+                s_fs_hex = 0;
+                hfn = fs_select(v, fs_wd);
+            }
             if (s_fs_comb) {
                 ffn = hfn;
+            } else if (s_fs_sraw) {
+                ffn = hfn;   /* fs_basic */
+                s_fs_hex = 0;
+                s_fs_sraw = 0;
+                for (k = 0; k < 4; k++)
+                    if (comb_only >> k & 1) {
+                        stex[k] = tex_bind(&s_stage[k], 0);   /* s_tex_sgn 0 */
+                        stage_from_cache(k);
+                    }
             } else {
                 s_fs_hex = 0;
                 s_fs_comb = comb;

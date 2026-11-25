@@ -42,6 +42,11 @@ static void input_src(const NV2ACombinerInput *in, int alpha_portion,
         snprintf(out, n, "x%d.%s", reg, in->alpha_rep ? "aaa" : "rgb");
 }
 
+/* The register a bump or dot stage reads its input stage's texel from: for
+ * a stage with signed channels the stock bytes (xr), not their signed
+ * remap, since those stages take the bytes as signed themselves. */
+#define IN_REG(state, in) (nv2a_signed_on((state), (in)) ? "xr" : "x")
+
 /* The texture shader's dot-product family, as xemu's psh.c: the input
  * texel as a vector by SET_DOT_RGBMAPPING (1 is D3D's (x - 128) / 127, 2
  * GL's, 3 two's complement; 0 and the HILO mappings read it unsigned), and
@@ -97,8 +102,8 @@ static int emit_dot_stage(const NV2ACombinerState *state, int i, int m,
     int in = state->tex_input[i];
     if (m != NV2A_TEXMODE_BRDF && m != NV2A_TEXMODE_DPNDNT_AR && m != NV2A_TEXMODE_DPNDNT_GB
             && m != NV2A_TEXMODE_DOT_RFLCT_SPEC_CONST)
-        EMIT("    dp%d = dot(i.tc%d.xyz, nv2a_dotmap(x%d, %d));\n",
-             i, i, 8 + in, state->dot_map[i]);
+        EMIT("    dp%d = dot(i.tc%d.xyz, nv2a_dotmap(%s%d, %d));\n",
+             i, i, IN_REG(state, in), 8 + in, state->dot_map[i]);
     if (!nv2a_texmode_samples(m)) {
         EMIT("    x%d = 0;\n", 8 + i);
         return off;
@@ -112,8 +117,8 @@ static int emit_dot_stage(const NV2ACombinerState *state, int i, int m,
     case NV2A_TEXMODE_DOT_RFLCT_DIFF:
         /* the normal's third component is stage 3's dot, by its own input
          * and mapping */
-        EMIT("        float3 nrm = float3(dp1, dp2, dot(i.tc3.xyz, nv2a_dotmap(x%d, %d)));\n",
-             8 + state->tex_input[3], state->dot_map[3]);
+        EMIT("        float3 nrm = float3(dp1, dp2, dot(i.tc3.xyz, nv2a_dotmap(%s%d, %d)));\n",
+             IN_REG(state, state->tex_input[3]), 8 + state->tex_input[3], state->dot_map[3]);
         off = emit_dot_cube(state, i, "nrm", buf, bufsize, off);
         break;
     case NV2A_TEXMODE_DOT_RFLCT_SPEC:
@@ -133,7 +138,8 @@ static int emit_dot_stage(const NV2ACombinerState *state, int i, int m,
     case NV2A_TEXMODE_DPNDNT_AR:
     case NV2A_TEXMODE_DPNDNT_GB: {
         char uv[16];
-        snprintf(uv, sizeof uv, "x%d.%s", 8 + in, m == NV2A_TEXMODE_DPNDNT_AR ? "ar" : "gb");
+        snprintf(uv, sizeof uv, "%s%d.%s", IN_REG(state, in), 8 + in,
+                 m == NV2A_TEXMODE_DPNDNT_AR ? "ar" : "gb");
         off = emit_dot_2d(state, i, uv, buf, bufsize, off);
         break;
     }
@@ -320,7 +326,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
              * linear-format texture). */
             int in = state->tex_input[i];
             EMIT("    {\n");
-            EMIT("        float2 ds = round(x%d.bg * 255.0);\n", 8 + in);
+            EMIT("        float2 ds = round(%s%d.bg * 255.0);\n", IN_REG(state, in), 8 + in);
             EMIT("        ds = (ds >= 128.0 ? ds - 256.0 : ds) / 128.0;\n");
             EMIT("        ds = float2(dot(ds, bump[%d].xw), dot(ds, bump[%d].yz));\n", i, i);
             if (state->rt_offset)
@@ -332,8 +338,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             if (m == NV2A_TEXMODE_BUMPENVMAP_LUM)
                 /* luminance: the input's unsigned red; it scales the whole
                  * texel, alpha too, as xemu's t = t * lum */
-                EMIT("        x%d *= x%d.r * bumpls[%d].x + bumpls[%d].y;\n",
-                     8 + i, 8 + in, i, i);
+                EMIT("        x%d *= %s%d.r * bumpls[%d].x + bumpls[%d].y;\n",
+                     8 + i, IN_REG(state, in), 8 + in, i, i);
             EMIT("    }\n");
         } else {
             /* textures.detile: only a stage declared Texture2D. */
@@ -407,6 +413,25 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         if (!NV2A_TEXMODE_DOT_ON(state, i) || nv2a_texmode_samples(m))
             EMIT("    if (alpha_only[%d] == 2u) x%d.a = 1.0;\n"
                  "    else if (alpha_only[%d] != 0u) x%d.rgb = 1.0;\n", i, 8 + i, i, 8 + i);
+        /* SET_TEXTURE_FILTER's signed channels: the bytes are two's
+         * complement, read 2 s / 255 (nv2a_signed_remap). */
+        if (nv2a_signed_on(state, i)) {
+            char sw[5];
+            nv2a_signed_swizzle(state->tex_signed[i], sw);
+            EMIT("    float4 xr%d = x%d;\n", 8 + i, 8 + i);
+            if (state->tex_signed[i] & NV2A_TEX_SIGNED_BIASED) {
+                /* biased up (b ^ 0x80): s = 255 u - 128, linear in u, so a
+                 * filtered texel reads the filtered signed value; xr gets
+                 * the stock byte back, two's complement */
+                EMIT("    xr%d.%s = x%d.%s + (128.0 / 255.0)"
+                     " - step(127.5 / 255.0, x%d.%s) * (256.0 / 255.0);\n",
+                     8 + i, sw, 8 + i, sw, 8 + i, sw);
+                EMIT("    x%d.%s = x%d.%s * 2.0 - (256.0 / 255.0);\n", 8 + i, sw, 8 + i, sw);
+            } else {
+                EMIT("    x%d.%s = x%d.%s * 2.0 - step(127.5 / 255.0, x%d.%s)"
+                     " * (512.0 / 255.0);\n", 8 + i, sw, 8 + i, sw, 8 + i, sw);
+            }
+        }
     }
     /* Before anything can discard: one 2x2 quad in each 8x8 screen tile.
      * The compiler may sink mag_lod's LOD into this branch, and an LOD (its

@@ -1794,6 +1794,10 @@ typedef struct {
     /* The pack entry it holds is marked XRTP_FLAG_DETILE_HEX: kept whatever
      * textures.detile says, so the menu's toggle needs no re-upload. */
     int      pack_detile;
+    /* The signed channels it was bound for (s_tex_sgn), in the key: the
+     * same texels bound unsigned are another entry. `biased`: they went up
+     * biased (nv2a_tex_signed_bias); a pack entry's never do. */
+    int      sgn, biased;
     ID3D11Texture2D          *tex;
     ID3D11ShaderResourceView *srv;
 } TexEntry;
@@ -2006,6 +2010,12 @@ static uint32_t s_tc_gen;
 /* The entry tex_bind's last view came from (NULL for magenta or black). */
 static TexEntry *s_tex_last;
 
+/* The signed channels (nv2a_tex_filter_signed) the next tex_bind uploads
+ * biased: the stage's, set by setup_pixel's stage loop for a combiner
+ * draw, whose shader key says how to read them back; 0 for everything
+ * else. As Metal's. */
+static int s_tex_sgn;
+
 static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
 {
     s_tc_gen++;
@@ -2023,6 +2033,8 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
             return 0;
         if (nv2a_tex_dump_on())
             nv2a_tex_dump_upload(t, hash, s_texels);
+        nv2a_tex_signed_bias(s_texels, nv2a_tex_texels(width, height, levels) * 6, s_tex_sgn);
+        e->biased = s_tex_sgn != 0;
         p = (const uint8_t *)s_texels;
         for (f = 0; f < 6; f++)
             for (l = 0; l < levels; l++) {
@@ -2080,6 +2092,7 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
         src = s_texels;
         if (nv2a_tex_dump_on())
             nv2a_stage_dump_upload(mem, t, hash, s_texels);
+        nv2a_tex_signed_bias(s_texels, nv2a_tex_texels(width, height, levels), s_tex_sgn);
     }
     /* Block levels go up as they are, one row of 4x4 blocks per pitch. */
     p = (const uint8_t *)src;
@@ -2096,6 +2109,7 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
     e->pack_levels = levels;
     e->pack_blend = pe && src != s_texels && (pe->flags & XRTP_FLAG_MIP_BLEND);
     e->pack_detile = pe && src != s_texels && (pe->flags & XRTP_FLAG_DETILE_HEX);
+    e->biased = src == s_texels && s_tex_sgn != 0;
     if (pe && src != s_texels)
         nv2a_tex_pack_release(pe);
     s_tex_uploads++;
@@ -2162,7 +2176,7 @@ static ID3D11ShaderResourceView *tex_bind_body(const Stage *t, int cube)
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
                 && c->pitch == t->pitch && c->palette == t->palette
-                && c->levels == t->levels && c->cube == cube)
+                && c->levels == t->levels && c->cube == cube && c->sgn == s_tex_sgn)
             e = c;
     }
     uint32_t n = tex_cache_n();
@@ -2171,7 +2185,7 @@ static ID3D11ShaderResourceView *tex_bind_body(const Stage *t, int cube)
         if (c->live && c->offset == t->offset && c->color == t->color
                 && c->width == t->width && c->height == t->height
                 && c->pitch == t->pitch && c->palette == t->palette
-                && c->levels == t->levels && c->cube == cube) {
+                && c->levels == t->levels && c->cube == cube && c->sgn == s_tex_sgn) {
             e = c;
             break;
         }
@@ -2207,6 +2221,7 @@ static ID3D11ShaderResourceView *tex_bind_body(const Stage *t, int cube)
         e->palette = t->palette;
         e->levels = t->levels;
         e->cube = cube;
+        e->sgn = s_tex_sgn;
         e->gen = g->flips;
         e->hash = tex_hash_pal(mem, t, bytes);
         e->pack_gen = nv2a_tex_pack_gen();
@@ -2989,7 +3004,8 @@ static int aspect_quad(struct aspect_batch *hp, const struct nv2a_pb_vsh *v, Ren
  * debug ones) after setup_pixel bound for the combiners': the stages in
  * mask, bound as cubes or black for a dot stage that reads none, get their
  * texture (a cube's face 0) as 2D, as before cubes and dot stages were
- * bound. */
+ * bound; a signed stage bound biased gets its stock bytes (s_tex_sgn is 0
+ * here), since these shaders do not undo the bias. */
 static void stages_flat(unsigned mask)
 {
     int n;
@@ -3089,6 +3105,12 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
                                * the basic shader wants their 2D texture */
     unsigned zero_mask = 0;   /* dot stages that read no texture */
     uint32_t rt_gen0 = s_rt_gen;   /* what cube_rt was decided against */
+    /* Signed channels go up biased only for a combiner draw, whose key
+     * reads them back; sraw: the signed stages bound as the stock bytes
+     * (a render target, a pack entry, a fallback). */
+    uint32_t sgk = combiner ? nv2a_ps_signed_key(s_stage) : 0;
+    unsigned sraw = 0;
+    unsigned sbias = 0;   /* bound biased: a fallback shader re-binds them */
     int lhit = memo_on() && lm.ok && lm.combiner == combiner
               && lm.stage_gen == s_stage_gen && lm.rt_gen == s_rt_gen
               && lm.tc_gen == s_tc_gen && lm.pack_gen == nv2a_tex_pack_gen()
@@ -3139,7 +3161,9 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
             flat_mask |= 1u << n;
             zero_mask |= 1u << n;
         } else if (t->mode && t->mode != 4) {
+            s_tex_sgn = (int)(sgk >> (4 * n) & 0xFu);
             srv[n] = tex_bind(t, cube);
+            s_tex_sgn = 0;
             flat_mask |= (unsigned)cube << n;
             lm.e[n] = s_tex_last;
             if (lm.e[n]) {
@@ -3155,6 +3179,13 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         }
         smp[n] = sampler(t, bump_src >> n & 1, lm.e[n]);
     }
+    for (n = 0; n < 4; n++)
+        if (sgk >> (4 * n) & 0xFu) {
+            if (lm.e[n] && lm.e[n]->biased && !s_stage_rt[n])
+                sbias |= 1u << n;
+            else
+                sraw |= 1u << n;
+        }
     if (nv2a_tex_mag_on() || nv2a_tex_dump_on())
         for (n = 0; n < 4; n++) {
             s_mag_hash[n] = lm.hash[n];
@@ -3324,7 +3355,9 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
                 | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u)
                 | (w ? 8u : 0u)    /* W-buffered: the w_depth variant */
                 | (mag_shader(d) ? 16u : 0u)    /* the trace's variant */
-                | (hexmask ? 32u : 0u);         /* textures.detile: nv2a_hex */
+                | (hexmask ? 32u : 0u)         /* textures.detile: nv2a_hex */
+                | nv2a_ps_signed_key(s_stage) << 8    /* SET_TEXTURE_FILTER signed */
+                | sraw << 24;   /* ... read from the stock bytes */
         key[37] = inputs;
         hit = memo_on() && memo.key_ok && !memcmp(memo.r, key, sizeof key);
         if (!hit) {
@@ -3338,6 +3371,11 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
             st.w_depth = (int)(key[36] >> 3 & 1u);     /* Z_PERSPECTIVE: nv2a_w_depth_on */
             st.tex_mag = (int)(key[36] >> 4 & 1u);     /* RECOMP_TRACE=tex_mag */
             st.hex_tile = (int)(key[36] >> 5 & 1u);    /* textures.detile */
+            for (n = 0; n < 4; n++) {   /* SET_TEXTURE_FILTER bits 28-31 */
+                st.tex_signed[n] = (int)(key[36] >> (8 + 4 * n) & 0xFu);
+                if (st.tex_signed[n] && !(key[36] >> (24 + n) & 1u))
+                    st.tex_signed[n] |= NV2A_TEX_SIGNED_BIASED;
+            }
             for (n = 0; n < 4; n++) {
                 st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
                 st.dot_map[n] = n ? (int)((inputs >> (16 + 4 * (n - 1))) & 0xF) : 0;
@@ -3351,7 +3389,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         }
         s_last_rc_on = 1;
         if (!s_dbg_post && (ps = debug_ps()) != NULL) {
-            stages_flat(flat_mask);   /* the debug shaders declare 2D */
+            /* the debug shaders declare 2D and read no signed stage */
+            stages_flat(flat_mask | sbias);
             return ps;
         }
         /* A compile since may have evicted the entry remembered. */
@@ -3393,8 +3432,9 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
             if (ps)
                 return ps;
         }
-        /* No combiners' shader (no HLSL, a compile failure). */
-        stages_flat(flat_mask);
+        /* No combiners' shader (no HLSL, a compile failure): the basic
+         * shader reads a signed stage as the stock bytes, as Metal's. */
+        stages_flat(flat_mask | sbias);
     }
     if (!(v->rc_set && (v->rc_ctl & 0xFF)))
         s_last_rc_on = 0;
