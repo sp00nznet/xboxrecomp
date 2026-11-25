@@ -1907,7 +1907,9 @@ static int batch_is_ffp(void)
  * emission + material ambient * global ambient into SCENE_AMBIENT_COLOR, so
  * the hardware sum is simply
  *   colour = scene_ambient + sum_i atten_i * (ambient_i + diffuse_i * max(0, N.L_i))
- * with alpha from SET_MATERIAL_ALPHA. Everything is in eye space.
+ * with alpha from SET_MATERIAL_ALPHA. With emission or ambient taken from the
+ * vertex, D3D puts what its colour is multiplied by into SET_MATERIAL_EMISSION
+ * instead: 1, or the global ambient. Everything is in eye space.
  *
  * ponytail: normals go through the model-view matrix itself rather than the
  * inverse transpose (exact for rotations and uniform scale), no specular, no
@@ -1946,7 +1948,7 @@ static int lit_color(uint32_t index, float out[4])
 {
     const float *mv = (const float *)&s_reg[0x0480 / 4];
     float pos[4], nrm[4], vc[4], e[3], n[3], len;
-    uint32_t mask = s_reg[0x03BC / 4], colmat = s_reg[0x0298 / 4];
+    uint32_t mask = s_reg[0x03BC / 4], colmat = s_reg[0x0298 / 4], from;
     int i, have_vc;
 
     if (!s_reg[0x0314 / 4] || !s_gpu.attr[2].size)
@@ -1983,6 +1985,16 @@ static int lit_color(uint32_t index, float out[4])
     }
 
     out[0] = reg_f(0x0A10); out[1] = reg_f(0x0A14); out[2] = reg_f(0x0A18);
+    /* COLOR_MATERIAL, emission (bits 0-1) and ambient (2-3): 1 is the vertex's
+     * diffuse colour, 2 its specular one. */
+    from = (colmat >> 2) & 3 ? (colmat >> 2) & 3 : colmat & 3;
+    if (from) {
+        float c[4];
+
+        if (from == 1 ? have_vc : fetch_attr(&s_gpu.attr[4], index, c))
+            for (i = 0; i < 3; i++)
+                out[i] += reg_f(0x03A8u + 4 * (uint32_t)i) * (from == 1 ? vc[i] : c[i]);
+    }
     for (i = 0; i < NV_LIGHTS; i++) {
         uint32_t kind = (mask >> (2 * i)) & 3, b = 0x1000 + (uint32_t)i * 0x80;
         float l[3], att = 1.0f, ndl, amb[3], dif[3];
