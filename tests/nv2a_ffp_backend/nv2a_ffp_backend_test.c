@@ -189,6 +189,29 @@ int main(void)
     CHECK((s_be.v[0].diffuse & 0x0000FF00u) == 0);
     m(0x0314, 0);
 
+    /* A texture matrix, row by row, for stage 0 where it is enabled. On a 1x1
+     * texture u and v are the coordinates themselves: vertex 1's (3, 4) become
+     * (-2 * 4 + 0.5, 3 * 3 + 0.25). */
+    {
+        static const float tm[16] = { 0, -2, 0, 0.5f,   3, 0, 0, 0.25f,
+                                      0, 0, 1, 0,       0, 0, 0, 2 };
+
+        m(0x1B04, 2u << 4 | 6u << 8 | 1u << 16);   /* stage 0: 2D, A8R8G8B8 swizzled, 1x1 */
+        for (i = 0; i < 6; i++)
+            putf(0x4800 + 4 * i, (float)(i + 1));
+        m(0x1720 + 4 * 9, 0x4800); m(0x1760 + 4 * 9, 2 | (2 << 4) | (8 << 8));  /* attr 9: float2 */
+        for (i = 0; i < 16; i++)
+            mf(0x06C0 + 4 * i, tm[i]);
+        m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+        CHECK(near_(s_be.v[1].u, 3) && near_(s_be.v[1].v, 4));
+        m(0x0420, 1);                                 /* SET_TEXTURE_MATRIX_ENABLE, stage 0 */
+        m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+        CHECK(near_(s_be.v[1].u, -7.5f) && near_(s_be.v[1].v, 9.25f));
+        m(0x0420, 0);
+        m(0x1760 + 4 * 9, 2);
+        m(0x1B04, 0);
+    }
+
     /* Anti-aliasing off: the same transform lands unscaled. */
     m(0x0208, 0x0008);
     m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
