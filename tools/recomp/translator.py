@@ -4065,7 +4065,18 @@ class BatchTranslator:
                 print(f"  Wrote {c_path} ({len(chunk)} functions)",
                       file=sys.stderr)
 
-        # Emit the stub bodies for call targets with no definition.
+        # Emit the stub bodies for call targets with no definition. With none
+        # left, a stub file from an earlier run goes, as a stale chunk does:
+        # globbed into the build, it would keep defining sub_ names for
+        # addresses that are now someone's real function (a redefinition) or
+        # nothing at all.
+        if not unresolved:
+            stale_stubs = os.path.join(output_dir,
+                                       f"{prefix}_stubs_unresolved.c")
+            if os.path.exists(stale_stubs):
+                os.remove(stale_stubs)
+                if verbose:
+                    print(f"  removed stale {os.path.basename(stale_stubs)}")
         if unresolved:
             stub_path = os.path.join(output_dir, f"{prefix}_stubs_unresolved.c")
             stub_lines = [

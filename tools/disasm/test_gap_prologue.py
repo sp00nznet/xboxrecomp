@@ -60,6 +60,11 @@ class _Engine:
         self.instructions = {i.address: i for i in insns}
         self._prologues = set(prologues)
         self._stub = False
+        self.jump_tables = {}
+        self.table_refs = set()
+
+    def is_jump_table_ref(self, addr):
+        return addr in self.table_refs
 
     def probes_as_prologue(self, addr):
         return addr in self._prologues
@@ -131,6 +136,17 @@ class GapPrologueTest(unittest.TestCase):
         insns = [_Insn(0x1000, 1, is_ret=True), _Insn(0x1001, 2)]
         det = _detector(insns, [_Func(0x1000, 0x1001)], {0x1001})
         det.engine.jump_tables = {0x1003: 0x1013}
+        self.assertFalse(det._pass_gap_prologues([]))
+        self.assertEqual(det.added, [])
+
+    def test_padding_before_a_short_jump_table_is_not_a_function(self):
+        # Burnout 3 0x00184BCA: `8b ff` after a `ret 0xc` decodes as the
+        # hot-patch `mov edi, edi`, but 0x00184BCC is a two-arm table, too
+        # short to be measured into jump_tables; only the `jmp [eax*4 +
+        # 0x184BCC]` names it.
+        insns = [_Insn(0x00184BC7, 3, is_ret=True), _Insn(0x00184BCA, 2)]
+        det = _detector(insns, [_Func(0x00184AD0, 0x00184BCA)], {0x00184BCA})
+        det.engine.table_refs = {0x00184BCC}
         self.assertFalse(det._pass_gap_prologues([]))
         self.assertEqual(det.added, [])
 

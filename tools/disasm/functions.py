@@ -495,8 +495,17 @@ class FunctionDetector:
             if not in_a_gap(nxt):
                 continue                    # an out-of-line tail, not a start
             first = self.engine.get_instruction(nxt)
-            if first and first.end_address in self.engine.jump_tables:
-                continue                    # alignment before a table, not a prologue
+            # Alignment before a table, not a prologue. A table of fewer than
+            # min_entries is not measured into jump_tables, but its
+            # `jmp [reg*4 + disp]` still names it: Burnout 3's two-arm switch
+            # at 0x00184BCC follows `8b ff` padding that decodes as the
+            # hot-patch `mov edi, edi`, and became a 9-byte function whose
+            # "jle" into the next function was an unresolved stub.
+            if first and (first.end_address in self.engine.jump_tables
+                          or self.engine.is_jump_table_ref(first.end_address)):
+                continue
+            if self.engine.is_jump_table_ref(nxt):
+                continue                    # the table itself
             # A prologue, or a whole small function.
             #
             # MSVC packs runs of constant-returning accessors -- "mov eax,

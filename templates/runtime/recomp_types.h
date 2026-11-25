@@ -613,6 +613,14 @@ uint64_t xbox_ReadTimeStampCounter(void);
 uint32_t xbox_PortIn(uint32_t port, int width);
 void     xbox_PortOut(uint32_t port, uint32_t value, int width);
 
+/* x86 `cli` / `sti`: the thread masks device interrupts (the raised-IRQL
+ * count the device models hold off on) without changing its IRQL. */
+void xbox_Cli(void);
+void xbox_Sti(void);
+/* x86 `sgdt m`: the 6-byte GDTR (limit, base) of a flat GDT the runtime
+ * keeps in guest memory. */
+void xbox_Sgdt(uint32_t va);
+
 void recomp_trace_enter(const char *name, uint32_t va);
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
 void recomp_trace_exit(const char *name, uint32_t va);

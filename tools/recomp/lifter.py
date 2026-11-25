@@ -120,6 +120,18 @@ def _func_ident(addr, name):
 
 # ── Operand formatting ──────────────────────────────────────
 
+def _far_jump_offset(op_str):
+    """The offset of a direct far jump (`ljmp 8:0x1d6acc`), or None."""
+    sel, sep, off = (op_str or "").partition(":")
+    if not sep:
+        return None
+    try:
+        int(sel.strip(), 0)
+        return int(off.strip(), 0)
+    except ValueError:
+        return None
+
+
 def _fmt_reg(name, size=4):
     """Format a register name as a C expression."""
     if not name:
@@ -1845,6 +1857,25 @@ class Lifter:
         if m == "wbinvd":
             return ["(void)0; /* wbinvd: coherent host memory, no separate guest cache */"]
 
+        # Descriptor tables. Burnout 3 installs a code-segment descriptor for
+        # its INIT section in GDT slot 1 and restores it later (0x001D6AAC):
+        # sgdt [esp+6], xchg the two dwords at base+8, `ljmp 8:<next>`. As a
+        # no-op, sgdt left the caller's argument where the base goes, and the
+        # xchg wrote to an address made from it. The runtime keeps a flat GDT
+        # in guest memory for it (kernel_hal.c, xbox_Sgdt).
+        if m == "sgdt" and nops == 1 and ops[0].type == "mem":
+            return [f"xbox_Sgdt((uint32_t)({_fmt_mem(ops[0])})); /* sgdt "
+                    f"{insn.op_str} */"]
+        # A far jump to the next instruction reloads CS, which a flat host
+        # address space has no use for: it is a fallthrough. Any other far
+        # jump stays unimplemented.
+        if m == "ljmp":
+            target = _far_jump_offset(insn.op_str)
+            if target is not None and target == insn.address + insn.size:
+                return [f"(void)0; /* ljmp {insn.op_str}: CS reload, falls "
+                        f"through */"]
+            return self._unimplemented(insn, m)
+
         if m in ("stc", "clc", "cmc"):
             if not self.needs_cf:
                 return [f"/* {m}: no adc/sbb in this function consumes CF */"]
@@ -1929,6 +1960,17 @@ class Lifter:
             return [f"xbox_PortOut({port_c}, (uint32_t)"
                     f"({_fmt_operand_read(data)}), {width}); /* {m} "
                     f"{insn.op_str} */"]
+
+        # ── Interrupt flag ──
+        #
+        # Kernel-mode XDK code brackets reads that must be consistent with
+        # cli/sti: Burnout 3's XPP samples the USB frame number and a timer
+        # register between them. Lifted as no-ops, the USB ISR could run in
+        # between. The runtime masks device interrupts on the thread without
+        # touching its IRQL (kernel_hal.c, xbox_Cli). Neither writes flags.
+        if m in ("cli", "sti") and not ops:
+            fn = "xbox_Cli" if m == "cli" else "xbox_Sti"
+            return [f"{fn}(); /* {m} */"]
 
         # ── Bit scan ──
         # Index of the lowest (bsf) or highest (bsr) set bit. When the source
