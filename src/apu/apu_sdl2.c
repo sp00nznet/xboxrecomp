@@ -47,6 +47,8 @@ static int       g_frames_written;  /* periods handed to the queue */
 static unsigned  g_underruns;
 static uint64_t  g_samples_queued;  /* samples handed to the queue, ever */
 static int       g_dry;
+/* The device plays once the queue holds this much (see xa2_submit_samples). */
+static int       g_primed;
 static int64_t   g_underrun_logged_ms;
 
 static int env_int(const char *name, int def, int lo, int hi)
@@ -127,8 +129,12 @@ int xa2_init(void)
     g_frames_written = 0;
     g_samples_queued = 0;
     g_dry = 0;
+    /* Left paused until the first periods are queued. Playing from the open,
+     * the device pulled a whole buffer 4 ms after the first submit, with one
+     * period (256 samples) of it queued: an underrun before the game had
+     * played anything. xa2_submit_samples resumes it. */
+    g_primed = 0;
     g_initialized = 1;
-    SDL_PauseAudioDevice(g_dev, 0);
 
     driver = SDL_GetCurrentAudioDriver();
     fprintf(stderr, "[SDL2] audio initialized: driver %s (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)%s\n",
@@ -174,6 +180,18 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     }
     g_frames_written++;
     g_samples_queued += (uint64_t)num_samples;
+    /* The pacer's low mark (the same marks apu_core paces by; 256 is one EP
+     * period) before the first pull: the pacer fills to its high mark, so
+     * the low one is always reached. */
+    if (!g_primed) {
+        int low, high;
+        xa2_pacing_marks(g_buf_samples, g_num_bufs, 256, &low, &high);
+        if (SDL_GetQueuedAudioSize(g_dev) / (SDLA_CHANNELS * sizeof(int16_t))
+                < (Uint32)low)
+            return 1;
+        g_primed = 1;
+        SDL_PauseAudioDevice(g_dev, 0);
+    }
     return 1;
 }
 
@@ -200,7 +218,7 @@ int xa2_queued_samples(void)
 
     if (!g_initialized || !g_dev) return 0;
     bytes = SDL_GetQueuedAudioSize(g_dev);
-    if (bytes == 0 && g_frames_written > 0) {
+    if (bytes == 0 && g_frames_written > 0 && g_primed) {
         if (!g_dry) {
             int64_t now = now_ms();
             g_dry = 1;
