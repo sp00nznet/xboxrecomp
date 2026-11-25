@@ -64,6 +64,17 @@ int main(void)
         return 1;
     }
 
+    /* A position written in part: z is 0 and w 1. */
+    i0[3] = (i0[3] & ~(0xFu << 12)) | (0xCu << 12);
+    nv2a_vsh_set_instruction(0, i0);
+    if (!nv2a_vsh_run((const float (*)[4])in, &o)
+        || fabsf(o.pos[0] - 640) > 1e-3f || fabsf(o.pos[1] - 120) > 1e-3f
+        || o.pos[2] != 0.0f || o.pos[3] != 1.0f) {
+        printf("FAIL: pos %g %g %g %g, want 640 120 0 1\n",
+               o.pos[0], o.pos[1], o.pos[2], o.pos[3]);
+        return 1;
+    }
+
     /* The colour outputs are clamped to 0..1, as the NV2A does before it
      * interpolates them: mov oD0, c[0] / mov oD1, -c[0] with c[0] out of
      * range. Lighting programs push oD0 well above 1, and unclamped every
