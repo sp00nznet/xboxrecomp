@@ -945,6 +945,109 @@ int xbox_IrqlCurrent(void)
     return (int)g_current_irql;
 }
 
+/* `cli` / `sti` in lifted code.
+ *
+ * Kernel-mode XDK code masks interrupts around a few reads that must be
+ * consistent: Burnout 3's XPP samples the USB frame number from the HCCA and
+ * a timer register between a cli and an sti, so the USB ISR cannot move one
+ * of them in between. They were lifted as logged no-ops.
+ *
+ * On the console the flag masks every interrupt on the one CPU, and with it
+ * every dispatch, but does not change the IRQL the guest reads. Here: the
+ * thread joins the raised count the device models hold their interrupts off
+ * on (xbox_IrqlBlocksInterrupts), and with RECOMP_DISPATCH_GATE=1 takes the
+ * gate as a raise to DISPATCH does, so no ISR or DPC runs beside it. The
+ * level in the KPCR stays as it was. Not nested: a second cli is a no-op
+ * and the first sti re-enables, as on hardware. A thread already counted
+ * at DISPATCH or above is not counted again. */
+static XBOX_THREAD_LOCAL int t_cli;           /* IF clear on this thread */
+static XBOX_THREAD_LOCAL int t_cli_counted;   /* cli moved the raised count */
+static XBOX_THREAD_LOCAL int t_cli_gate;      /* cli entered the gate */
+
+void xbox_Cli(void)
+{
+    if (t_cli)
+        return;
+    t_cli = 1;
+    if (t_irql_counted || g_current_irql >= DISPATCH_LEVEL)
+        return;                               /* already masking */
+    if (xbox_DispatchGateOn()) {
+        gate_enter();
+        t_cli_gate = 1;
+    }
+    t_cli_counted = 1;
+    InterlockedIncrement(&g_irql_raised_count);
+    InterlockedIncrement(&s_transitions);
+    irql_holder_add(IRQL_CALLER());
+}
+
+void xbox_Sti(void)
+{
+    if (!t_cli)
+        return;
+    t_cli = 0;
+    if (!t_cli_counted)
+        return;
+    t_cli_counted = 0;
+    /* What the mask held off is taken here, while this thread still holds
+     * the gate, as at a lower that gives it back. */
+    if (t_cli_gate)
+        xbox_IrqSafePoint();
+    InterlockedDecrement(&g_irql_raised_count);
+    InterlockedIncrement(&s_transitions);
+    irql_holder_drop();
+    if (t_cli_gate) {
+        t_cli_gate = 0;
+        gate_leave_raw();
+        if (!t_gate_depth)
+            irql_release_due();
+    }
+}
+
+/* `sgdt` in lifted code: a GDTR for a GDT that lives in guest memory.
+ *
+ * There is no descriptor table behind a flat host address space, but titles
+ * read and write one: Burnout 3 swaps a code-segment descriptor for its INIT
+ * section into slot 1 with two xchg's at base+8 and swaps the old one back
+ * later. The table here is the console kernel's shape (null, flat ring-0
+ * code at 8, flat data at 0x10, 128 slots): what a title writes into it is
+ * kept and read back, and nothing else uses it. */
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
+
+#define GUEST_GDT_SLOTS 128
+
+static volatile LONG s_guest_gdt;
+
+static uint32_t guest_gdt(void)
+{
+    uint32_t gdt = (uint32_t)InterlockedCompareExchange(&s_guest_gdt, 0, 0);
+    uint32_t *d;
+
+    if (gdt)
+        return gdt;
+    gdt = xbox_HeapAlloc(GUEST_GDT_SLOTS * 8, 16);
+    if (!gdt)
+        return 0;
+    d = (uint32_t *)((uintptr_t)g_xbox_mem_offset + gdt);
+    d[2] = 0x0000FFFFu; d[3] = 0x00CF9B00u;     /* 0x08: code, 4 GB, ring 0 */
+    d[4] = 0x0000FFFFu; d[5] = 0x00CF9300u;     /* 0x10: data, 4 GB, ring 0 */
+    /* A racing first call keeps the other thread's table; this one leaks
+     * its 1 KB, once. */
+    if (InterlockedCompareExchange(&s_guest_gdt, (LONG)gdt, 0) != 0)
+        gdt = (uint32_t)InterlockedCompareExchange(&s_guest_gdt, 0, 0);
+    return gdt;
+}
+
+void xbox_Sgdt(uint32_t va)
+{
+    uint8_t *p = (uint8_t *)((uintptr_t)g_xbox_mem_offset + va);
+    uint16_t limit = GUEST_GDT_SLOTS * 8 - 1;
+    uint32_t base = guest_gdt();
+
+    memcpy(p, &limit, 2);
+    memcpy(p + 2, &base, 4);
+}
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).

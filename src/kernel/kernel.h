@@ -891,6 +891,12 @@ KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
  * line for the whole processor on hardware, not just for one thread. */
 int     xbox_IrqlBlocksInterrupts(void);
 int     xbox_IrqlRaisedCount(void);
+/* Lifted `cli` / `sti`: mask device interrupts on the raised count (and
+ * the dispatch gate, when on) without changing the guest's IRQL. */
+void    xbox_Cli(void);
+void    xbox_Sti(void);
+/* Lifted `sgdt m`: writes a GDTR for a flat GDT in guest memory. */
+void    xbox_Sgdt(uint32_t va);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
 /* The one-CPU DISPATCH gate (kernel_hal.c), on under RECOMP_DISPATCH_GATE=1.
  * Off (the default) the entries below succeed and take nothing. */
