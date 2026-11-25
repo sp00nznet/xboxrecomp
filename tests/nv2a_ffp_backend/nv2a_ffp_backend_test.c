@@ -212,6 +212,64 @@ int main(void)
         m(0x1B04, 0);
     }
 
+    /* Stage 0's coordinates from the normal and the view direction, on a 1x1
+     * texture. Vertex 1 is at (1, 1, 1) before the eye, its normal at
+     * (0, 0.6, -0.8); the stream's coordinates are (7, 8). */
+    {
+        static const float mv[16] = { 0, -1, 0, 0,   1, 0, 0, 0,   0, 0, 1, 1,   0, 0, 0, 1 };
+        static const float inv[16] = { 0, -2, 0, 0,   2, 0, 0, 0,   0, 0, 2, 0 };
+        static const float twice[16] = { 2, 0, 0, 0,   0, 2, 0, 0,   0, 0, 2, 0,   0, 0, 0, 1 };
+        static const float I[16] = { 1, 0, 0, 0,   0, 1, 0, 0,   0, 0, 1, 0,   0, 0, 0, 1 };
+
+        m(0x1B04, 2u << 4 | 6u << 8 | 1u << 16);
+        for (i = 0; i < 3; i++) {
+            putf(0x4A00 + 12 * i, 0.6f); putf(0x4A04 + 12 * i, 0); putf(0x4A08 + 12 * i, -0.8f);
+            putf(0x4900 + 8 * i, 7); putf(0x4904 + 8 * i, 8);
+        }
+        m(0x1728, 0x4A00); m(0x1768, 2 | (3 << 4) | (12 << 8));        /* attr 2: float3 */
+        m(0x1720 + 4 * 9, 0x4900); m(0x1760 + 4 * 9, 2 | (2 << 4) | (8 << 8));
+        for (i = 0; i < 16; i++) {
+            mf(0x0480 + 4 * i, mv[i]);
+            mf(0x0580 + 4 * i, inv[i]);
+            mf(0x06C0 + 4 * i, twice[i]);
+        }
+        for (i = 0; i < 3; i++)
+            m(0x03C0 + 4 * i, 0x8511);               /* the normal, as long as it is */
+        m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+        CHECK(near_(s_be.v[1].u, 0) && near_(s_be.v[1].v, 1.2f));
+        m(0x03A4, 1);                                 /* SET_NORMALIZATION_ENABLE */
+        m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+        CHECK(near_(s_be.v[1].u, 0) && near_(s_be.v[1].v, 0.6f));
+        for (i = 0; i < 3; i++)
+            m(0x03C0 + 4 * i, 0x8512);               /* the view direction, reflected */
+        m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+        CHECK(near_(s_be.v[1].u, 0.57735f) && near_(s_be.v[1].v, 0.71591f));
+        m(0x0420, 1);                                 /* through the matrix */
+        m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+        CHECK(near_(s_be.v[1].u, 1.15470f) && near_(s_be.v[1].v, 1.43183f));
+        m(0x0420, 0);
+        m(0x03C0, 0);                                 /* each for itself */
+        m(0x03C8, 0);
+        m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+        CHECK(near_(s_be.v[1].u, 7) && near_(s_be.v[1].v, 0.71591f));
+        m(0x03C0, 0x2402);                            /* a sphere map */
+        m(0x03C4, 0x2402);
+        m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+        CHECK(near_(s_be.v[1].u, 0.67297f) && near_(s_be.v[1].v, 0.71449f));
+        m(0x1768, 2);                                 /* no normal: the stream's */
+        m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+        CHECK(near_(s_be.v[1].u, 7) && near_(s_be.v[1].v, 8));
+
+        m(0x03C0, 0);
+        m(0x03C4, 0);
+        m(0x03A4, 0);
+        m(0x1728, 0x4000); m(0x1768, 2 | (3 << 4) | (12 << 8));
+        m(0x1760 + 4 * 9, 2);
+        m(0x1B04, 0);
+        for (i = 0; i < 16; i++)
+            mf(0x0480 + 4 * i, I[i]);
+    }
+
     /* Anti-aliasing off: the same transform lands unscaled. */
     m(0x0208, 0x0008);
     m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
