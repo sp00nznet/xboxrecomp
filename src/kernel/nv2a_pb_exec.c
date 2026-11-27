@@ -3621,6 +3621,17 @@ static void frame_trace_flip(void)
     }
 }
 
+/* Read once: asked for every method and every draw, and a getenv searches the
+ * whole environment. */
+static int exec_verbose(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    return on;
+}
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -3701,7 +3712,7 @@ static void draw_primitive(void)
         }
     }
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (exec_verbose()) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -4187,6 +4198,39 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
     return 1;
 }
 
+/* A run of one method's words, without the general dispatch: the indices and
+ * inline vertices of a draw, most of what a title sends. The same is done with
+ * each of them as below. 0: not such a method, nothing done. */
+int nv2a_pb_exec_run(uint32_t method, const uint32_t *p, uint32_t n)
+{
+    uint32_t i;
+
+    if (!s_exec_inited || !n
+            || (method != NV097_ARRAY_ELEMENT16 && method != 0x1808
+                && method != NV097_INLINE_ARRAY))
+        return 0;
+    s_reg[method / 4] = p[n - 1];
+    if (!s_gpu.prim)
+        return 1;
+    switch (method) {
+    case NV097_ARRAY_ELEMENT16:
+        for (i = 0; i < n && s_gpu.idx_count + 2 <= NV_MAX_INDICES; i++) {
+            s_gpu.idx[s_gpu.idx_count++] = p[i] & 0xFFFF;
+            s_gpu.idx[s_gpu.idx_count++] = p[i] >> 16;
+        }
+        break;
+    case 0x1808:                            /* ARRAY_ELEMENT32 */
+        for (i = 0; i < n && s_gpu.idx_count < NV_MAX_INDICES; i++)
+            s_gpu.idx[s_gpu.idx_count++] = p[i];
+        break;
+    default:
+        for (i = 0; i < n && s_gpu.inline_count < NV_MAX_INLINE; i++)
+            s_gpu.inline_buf[s_gpu.inline_count++] = p[i];
+        break;
+    }
+    return 1;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
@@ -4218,12 +4262,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_reg[(method & 0x1FFCu) / 4] = param;
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
-     * the values are visible. Cached: this runs for every method, and an
-     * uncached getenv here was a quarter of the executor's time. */
-    static int verbose = -1;
-    if (verbose < 0)
-        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
-    if (verbose) {
+     * the values are visible. */
+    if (exec_verbose()) {
         static int shown[8];
         int slot = -1;
         switch (method) {
@@ -4576,7 +4616,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (s_backend && s_backend->flip)
             s_backend->flip();
 
-        if (verbose) {
+        if (exec_verbose()) {
             static unsigned n;
             if (n++ < 8) {
                 fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
