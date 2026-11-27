@@ -296,6 +296,15 @@ static vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
     return r;
 }
 
+float nv2a_vsh_rcc(float x)
+{
+    float f = 1.0f / x;
+
+    if (fabsf(f) < 5.42101e-20f) f = f < 0 ? -5.42101e-20f : 5.42101e-20f;
+    if (fabsf(f) > 1.884467e19f) f = f < 0 ? -1.884467e19f : 1.884467e19f;
+    return f;
+}
+
 static vec4 run_ilu(uint32_t op, vec4 c)
 {
     float x = c.v[0];
@@ -304,13 +313,7 @@ static vec4 run_ilu(uint32_t op, vec4 c)
     switch (op) {
     case 1: break;                                            /* mov */
     case 2: r = splat(x == 0.0f ? INFINITY : 1.0f / x); break;  /* rcp */
-    case 3: {                                                  /* rcc */
-        float f = 1.0f / x;
-        if (fabsf(f) < 5.42101e-20f) f = f < 0 ? -5.42101e-20f : 5.42101e-20f;
-        if (fabsf(f) > 1.884467e19f) f = f < 0 ? -1.884467e19f : 1.884467e19f;
-        r = splat(f);
-        break;
-    }
+    case 3: r = splat(nv2a_vsh_rcc(x)); break;                /* rcc */
     case 4: r = splat(1.0f / sqrtf(fabsf(x))); break;           /* rsq */
     case 5: {                                                  /* exp */
         float fl = floorf(x);

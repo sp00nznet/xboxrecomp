@@ -6,6 +6,8 @@
  *   - a composite matrix and viewport offset put a triangle where the
  *     transform says, scaled by the surface's anti-aliasing factor;
  *   - fixed-function lighting replaces the vertex colour with the light sum;
+ *   - the fixed function places a vertex on the same bits as a program that
+ *     ends as D3D's do (DP4s, RCC, MAD), for passes drawn with depth EQUAL;
  *   - the render state carries the stencil registers, with the hardware's
  *     reset values until the title writes them;
  *   - the semaphore release lands where the title said, method 0x0310 on
@@ -23,6 +25,7 @@
 #include <string.h>
 #include "nv2a_backend.h"
 #include "nv2a_backend_fixture.h"
+#include "nv2a_vsh_interp.h"
 
 #define MEM_BYTES 0x10000u
 static uint8_t s_mem[MEM_BYTES];
@@ -64,6 +67,15 @@ static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 static void mf(uint32_t method, float f) { m(method, f2u(f)); }
 static void put32(uint32_t at, uint32_t v) { memcpy(s_mem + at, &v, 4); }
 static void putf(uint32_t at, float f) { memcpy(s_mem + at, &f, 4); }
+
+/* A vertex program instruction's source `which` (A, B, C): mux 1 temp, 2 input,
+ * 3 constant; register; swizzle. */
+static void vsh_src(uint32_t w[4], int which, uint32_t mux, uint32_t reg, uint32_t swz)
+{
+    if (which == 0) { w[1] |= swz; w[2] |= (mux << 26) | (reg << 28); }
+    else if (which == 1) { w[2] |= (swz << 17) | (mux << 11) | (reg << 13); }
+    else { w[2] |= (swz << 2) | (reg >> 2); w[3] |= (mux << 28) | ((reg & 3) << 30); }
+}
 
 static int s_fail;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); s_fail = 1; } } while (0)
@@ -259,6 +271,60 @@ int main(void)
     nv2a_pb_exec_method(5, 0x0310, 0x11111111u);
     CHECK(s_pgraph_400b10 == 0x11111111u);
     nv2a_pb_set_semaphore_target(0x5000);
+
+    /* The same vertices through the fixed function and through a program as
+     * D3D's end, with the same matrix, land on the same bits: a title draws a
+     * light's pass with a program and a depth test of EQUAL over a
+     * fixed-function pass. Dividing by w, the fixed function's quotient
+     * missed the program's product by a bit at some vertices. */
+    {
+        const float M[16] = { 289.7f, 13.1f, 160.3f, 412.9f,
+                              -7.3f, -251.9f, 120.1f, 300.7f,
+                              0.0301f, 0.1137f, 0.49731f, 1.7313f,
+                              0.0317f, 0.1171f, 1.0133f, 2.3719f };
+        Nv2aVertex ffp[15];
+        uint32_t ins[5][4], k, n = 15, seed = 12345u;
+
+        for (i = 0; i < n * 3; i++) {
+            seed = seed * 1103515245u + 12345u;
+            putf(0x2000 + 4 * i, (float)((seed >> 8) & 0xFFFF) / 32768.0f - 1.0f);
+        }
+        for (i = 0; i < 16; i++)
+            mf(0x0680 + 4 * i, M[i]);
+        for (i = 0; i < 4; i++)
+            nv2a_vsh_set_constant(i, &M[4 * i]);
+        mf(0x0A20, 0.53125f); mf(0x0A24, 0.53125f); mf(0x0A28, 0.0f);
+        m(0x1E94, 0);                                 /* fixed */
+        m(0x17FC, 5); m(0x1810, (n - 1) << 24); m(0x17FC, 0);
+        CHECK(s_be.count == n);                       /* none clipped: 0 < z < w */
+        memcpy(ffp, s_be.v, sizeof ffp);
+
+        /* dp4 o[0].w, v0, c[3]; dp4 o[0].x/.y/.z, v0, c[0..2], the .y one with
+         * rcc R1.x, R12.w; mad o[0].xyz, R12, R1.x, c[59]. */
+        memset(ins, 0, sizeof ins);
+        for (k = 0; k < 4; k++) {
+            static const uint32_t row[4] = { 3, 0, 1, 2 }, mask[4] = { 1, 8, 4, 2 };
+            ins[k][1] = (7u << 21) | (row[k] << 13);
+            vsh_src(ins[k], 0, 2, 0, 0x1B); vsh_src(ins[k], 1, 3, 0, 0x1B);
+            ins[k][3] |= (mask[k] << 12) | (1u << 11);
+        }
+        ins[2][1] |= 3u << 25;
+        vsh_src(ins[2], 2, 1, 12, 0xFF);
+        ins[2][3] |= (7u << 20) | (8u << 16);
+        ins[4][1] = (4u << 21) | (59u << 13);
+        vsh_src(ins[4], 0, 1, 12, 0x1B); vsh_src(ins[4], 1, 1, 1, 0x00);
+        vsh_src(ins[4], 2, 3, 0, 0x1B);
+        ins[4][3] |= (0xEu << 12) | (1u << 11) | 1u;
+        for (k = 0; k < 5; k++)
+            nv2a_vsh_set_instruction(k, ins[k]);
+        m(0x1E94, 2);                                 /* program */
+        m(0x17FC, 5); m(0x1810, (n - 1) << 24); m(0x17FC, 0);
+        CHECK(s_be.count == n);
+        for (i = 0; i < n; i++)
+            CHECK(memcmp(&ffp[i].x, &s_be.v[i].x, 3 * sizeof(float)) == 0);
+        m(0x1E94, 0);
+        mf(0x0A20, 0.0f); mf(0x0A24, 0.0f);
+    }
 
     /* Clears and flips reach the back end. */
     m(0x1D90, 0xFF102030u);                           /* SET_COLOR_CLEAR_VALUE */
