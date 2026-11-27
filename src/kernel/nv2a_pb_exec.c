@@ -1884,9 +1884,8 @@ static uint32_t vertex_color(uint32_t index)
  * fixed-function batch shares the program path's near-plane clipping,
  * texturing, combiners and depth buffer.
  *
- * ponytail: no texture-coordinate generation or texture matrices (texture
- * coordinates are taken from the attribute streams as they are), no fog
- * coordinate, no specular, no point sprites. */
+ * ponytail: of the texture-coordinate generation no linear modes (the stream's
+ * coordinates stay), no fog coordinate, no specular, no point sprites. */
 
 /* Is this batch transformed by the fixed-function unit? Inline-array batches
  * are left to the screen-space path, as they were before. */
@@ -2022,6 +2021,77 @@ static int lit_color(uint32_t index, float out[4])
     return 1;
 }
 
+#define TEXGEN_SPHERE      0x2402u
+#define TEXGEN_NORMAL      0x8511u
+#define TEXGEN_REFLECTION  0x8512u
+
+/* SET_TEXGEN_S, T and R, which take OpenGL's values: what the normal and the
+ * view direction in eye space make of a coordinate, in place of the stream's.
+ *
+ * ponytail: always the local viewer (SET_TEXGEN_VIEW_MODEL). */
+static void texture_generation(uint32_t index, Nv2aVshOutput *out)
+{
+    const float *mv = (const float *)&s_reg[0x0480 / 4];
+    const float *inv = (const float *)&s_reg[0x0580 / 4];    /* the normals' matrix */
+    float n[3] = { 0 }, r[3] = { 0 }, s[3] = { 0 };
+    uint32_t st, i, known = 0;
+
+    for (st = 0; st < 4; st++) {
+        const uint32_t *mode = &s_reg[(0x03C0 + 16 * st) / 4];
+
+        for (i = 0; i < 3; i++) {
+            if (mode[i] != TEXGEN_NORMAL && mode[i] != TEXGEN_REFLECTION
+                && (mode[i] != TEXGEN_SPHERE || i == 2))
+                continue;
+            if (!known) {
+                float pos[4], nrm[4], u[3], len, d;
+                int k;
+
+                if (!fetch_attr(&s_gpu.attr[0], index, pos)
+                    || !fetch_attr(&s_gpu.attr[2], index, nrm))
+                    return;
+                for (k = 0; k < 3; k++) {
+                    u[k] = mv[4 * k] * pos[0] + mv[4 * k + 1] * pos[1]
+                         + mv[4 * k + 2] * pos[2] + mv[4 * k + 3] * pos[3];
+                    n[k] = inv[4 * k] * nrm[0] + inv[4 * k + 1] * nrm[1]
+                         + inv[4 * k + 2] * nrm[2];
+                }
+                len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                if (s_reg[0x03A4 / 4] && len > 1e-8f)    /* SET_NORMALIZATION_ENABLE */
+                    for (k = 0; k < 3; k++)
+                        n[k] /= len;
+                len = sqrtf(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+                if (len > 1e-8f)
+                    for (k = 0; k < 3; k++)
+                        u[k] /= len;
+                d = 2.0f * (n[0] * u[0] + n[1] * u[1] + n[2] * u[2]);
+                for (k = 0; k < 3; k++)
+                    r[k] = u[k] - d * n[k];
+                len = 2.0f * sqrtf(r[0] * r[0] + r[1] * r[1] + (r[2] + 1.0f) * (r[2] + 1.0f));
+                for (k = 0; k < 2; k++)
+                    s[k] = (len > 1e-8f ? r[k] / len : 0.0f) + 0.5f;
+                known = 1;
+            }
+            out->tex[st][i] = mode[i] == TEXGEN_NORMAL ? n[i]
+                            : mode[i] == TEXGEN_REFLECTION ? r[i] : s[i];
+        }
+    }
+}
+
+/* SET_TEXTURE_MATRIX_ENABLE and SET_TEXTURE_MATRIX, laid out as the composite. */
+static void texture_matrix(uint32_t st, float tc[4])
+{
+    uint32_t at = 0x06C0 + 64 * st, i;
+    float in[4];
+
+    if (!s_reg[(0x0420 + 4 * st) / 4])
+        return;
+    memcpy(in, tc, sizeof in);
+    for (i = 0; i < 4; i++)
+        tc[i] = reg_f(at + 16 * i) * in[0] + reg_f(at + 16 * i + 4) * in[1]
+              + reg_f(at + 16 * i + 8) * in[2] + reg_f(at + 16 * i + 12) * in[3];
+}
+
 /* One fixed-function vertex, in the shape a vertex program produces. */
 static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
 {
@@ -2057,6 +2127,9 @@ static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
     fetch_attr(texcoord_attr(), index, out->tex[0]);
     for (st = 1; st < 4; st++)
         fetch_attr(&s_gpu.attr[9 + st], index, out->tex[st]);
+    texture_generation(index, out);
+    for (st = 0; st < 4; st++)
+        texture_matrix(st, out->tex[st]);
     return 1;
 }
 

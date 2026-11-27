@@ -120,9 +120,14 @@ the combiners and the depth buffer. The 16 floats apply as
 near `(0, 0)`. `RECOMP_FFP_TRACE` prints the matrix and a few raw and
 transformed vertices, which is how the order was found.
 
-Texture coordinates are taken from the attribute streams as they are, with no
-texture-coordinate generation or texture matrix; there is no fog coordinate,
-specular, or point sprite.
+Texture coordinates are taken from the attribute streams, through the stage's
+texture matrix where `SET_TEXTURE_MATRIX_ENABLE` says so (laid out as the
+composite matrix). Before that, `SET_TEXGEN_S`, `T` and `R` may replace one by the
+eye-space normal, the view direction reflected about it, or a sphere map's
+coordinate, as OpenGL defines them, always from a local viewer; the normal goes
+through the inverse model-view matrix. There are no linear modes of it, no fog
+coordinate, specular, or point sprite. Reflection is checked against Splinter
+Cell's windows by eye, the other two by the test alone.
 
 ### Lighting
 
