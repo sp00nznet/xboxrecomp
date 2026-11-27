@@ -1888,12 +1888,11 @@ static uint32_t vertex_color(uint32_t index)
  * coordinates are taken from the attribute streams as they are), no fog
  * coordinate, no specular, no point sprites. */
 
-/* Is this batch transformed by the fixed-function unit? Inline-array batches
- * are left to the screen-space path, as they were before. */
+/* Is this batch transformed by the fixed-function unit? Where its vertices
+ * come from (arrays, INLINE_ARRAY, SET_VERTEX) makes no difference. */
 static int batch_is_ffp(void)
 {
-    return s_gpu.composite_set && (s_gpu.xf_mode & 3) != 2
-        && !s_gpu.inline_active;
+    return s_gpu.composite_set && (s_gpu.xf_mode & 3) != 2;
 }
 
 /* Fixed-function vertex lighting (SET_LIGHTING_ENABLE).

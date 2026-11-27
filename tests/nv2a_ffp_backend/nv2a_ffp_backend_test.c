@@ -195,6 +195,35 @@ int main(void)
     CHECK(s_be.surf.aa_sx == 1 && s_be.surf.width == 640);
     CHECK(near_(s_be.v[1].x, 640.0f) && near_(s_be.v[1].y, 480.0f));
 
+    /* The same triangle with its vertices in the pushbuffer: an inline array,
+     * packed as the formats above say, then immediate mode. */
+    {
+        static const float at[3][3] = { { -1, -1, 0 }, { 1, -1, 0 }, { 0, 1, 0 } };
+        int draws = s_be.draws, way, k;
+
+        for (way = 0; way < 2; way++) {
+            m(0x17FC, 5);
+            for (i = 0; i < 3; i++) {
+                if (way == 0) {
+                    for (k = 0; k < 3; k++)
+                        mf(0x1818, at[i][k]);             /* INLINE_ARRAY: position */
+                    mf(0x1818, 0); mf(0x1818, 0); mf(0x1818, 1);       /* normal */
+                    m(0x1818, 0xFF804020u);                            /* diffuse */
+                } else {
+                    m(0x1940 + 4 * 3, 0xFF204080u);       /* SET_VERTEX_DATA4UB, diffuse */
+                    for (k = 0; k < 3; k++)
+                        mf(0x1500 + 4 * k, at[i][k]);     /* SET_VERTEX3F */
+                }
+            }
+            m(0x17FC, 0);
+            CHECK(s_be.draws == draws + 1 + way && s_be.count == 3);
+            CHECK(near_(s_be.v[0].x, 0)   && near_(s_be.v[0].y, 480));
+            CHECK(near_(s_be.v[1].x, 640) && near_(s_be.v[1].y, 480));
+            CHECK(near_(s_be.v[2].x, 320) && near_(s_be.v[2].y, 0));
+            CHECK(s_be.v[0].diffuse == 0xFF804020u);
+        }
+    }
+
     /* A triangle strip of four vertices is two triangles. With
      * RECOMP_STRIP_ALT_WINDING the second one (odd) is emitted with its first two
      * vertices swapped so it winds like the first; without it the strip's order
