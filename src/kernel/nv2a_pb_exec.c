@@ -1156,6 +1156,8 @@ static uint32_t linear_twin(uint32_t fmt)
     }
 }
 
+static int zbuf_word(uint32_t addr, uint32_t x, uint32_t y, uint32_t *word);
+
 /* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
 static int sample_tex(const Texture *t, uint32_t face_offset,
                       uint32_t u, uint32_t v, uint32_t *argb)
@@ -1180,6 +1182,13 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     v = wrap_coord(v, t->height, t->addr_v);
 
     fmt = t->color;
+    /* A D24S8 depth buffer read as a linear 32-bit colour texture, as a title
+     * copies its shadow map: its depths are on the host, not in guest memory. */
+    if ((fmt == 0x12 || fmt == 0x1E) && !face_offset && zbuf_word(base, u, v, argb)) {
+        if (fmt == 0x1E)                            /* LIN_X8R8G8B8 */
+            *argb |= 0xFF000000u;
+        return 1;
+    }
     if (d3d8_format_dxt_block_bytes(fmt)) {
         /* Decoded blocks, direct-mapped by address. Every texel of a DXT
          * texture decodes its whole 4x4 block, and bilinear reads four
@@ -2290,9 +2299,45 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
  * the title does reads it back, so a float buffer per zeta offset is enough. */
 #define NV_ZBUF_W 1280   /* 640x480 at 2x2 anti-aliasing */
 #define NV_ZBUF_H 1024
-static struct { uint32_t offset; float *z; } s_zbufs[4];
+static struct { uint32_t offset, bits; float *z; } s_zbufs[4];
 static int s_ftrace;            /* frame trace: 0 idle, 2 tracing, 3 done */
 static int s_zbuf_next;
+
+/* The depth at (x, y) of the depth buffer at `addr` (resolved), and its bits,
+ * if the rasteriser has one there: a title reading its depth buffer as a
+ * texture reads it here, not in guest memory. */
+static int zbuf_read(uint32_t addr, uint32_t x, uint32_t y, float *z, uint32_t *bits)
+{
+    int i;
+
+    if (x >= NV_ZBUF_W || y >= NV_ZBUF_H)
+        return 0;
+    for (i = 0; i < 4; i++)
+        if (s_zbufs[i].z && dma_resolve(s_zbufs[i].offset) == addr) {
+            *z = s_zbufs[i].z[(size_t)y * NV_ZBUF_W + x];
+            *bits = s_zbufs[i].bits;
+            return 1;
+        }
+    return 0;
+}
+
+/* Texel (x, y) of a 32-bit colour texture at `addr` when that is a D24S8
+ * depth buffer: the word the hardware keeps, depth in the top 24 bits. The
+ * stencil is not kept, so its byte reads 0. */
+static int zbuf_word(uint32_t addr, uint32_t x, uint32_t y, uint32_t *word)
+{
+    float z;
+    uint32_t bits;
+
+    if (!zbuf_read(addr, x, y, &z, &bits) || bits != 24)
+        return 0;
+    /* Rounded before it is clamped: 16777215 + 0.5 is 16777216 in a float,
+     * which shifts out of the word and reads as the nearest depth. */
+    z = rintf(z);
+    z = z < 0.0f ? 0.0f : (z > 16777215.0f ? 16777215.0f : z);
+    *word = (uint32_t)z << 8;
+    return 1;
+}
 
 static float zclear_value(void)
 {
@@ -2318,6 +2363,7 @@ static float *zbuf_current(int create)
     if (!s_zbufs[i].z)
         return NULL;
     s_zbufs[i].offset = s_gpu.zeta_offset;
+    s_zbufs[i].bits = ((s_gpu.format >> 4) & 0xF) == 1 ? 16 : 24;   /* Z16, else Z24S8 */
     for (k = 0; k < (size_t)NV_ZBUF_W * NV_ZBUF_H; k++)
         s_zbufs[i].z[k] = 3.4e38f;
     return s_zbufs[i].z;
@@ -2496,7 +2542,6 @@ static float depth_texel(const Texture *t, int32_t u, int32_t v, uint32_t bits)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = bits == 24 ? 4 : 2, word = 0;  /* D24S8: depth and stencil in a word */
-    int i;
 
     if (t->border_color
         && ((t->addr_u == 4 && (u < 0 || u >= (int32_t)t->width))
@@ -2504,11 +2549,10 @@ static float depth_texel(const Texture *t, int32_t u, int32_t v, uint32_t bits)
         word = t->border;
     else {
         uint32_t x = wrap_coord((uint32_t)u, t->width, t->addr_u);
-        uint32_t y = wrap_coord((uint32_t)v, t->height, t->addr_v);
-        for (i = 0; i < 4; i++)
-            if (s_zbufs[i].z && dma_resolve(s_zbufs[i].offset) == t->offset
-                && x < NV_ZBUF_W && y < NV_ZBUF_H)
-                return s_zbufs[i].z[(size_t)y * NV_ZBUF_W + x];
+        uint32_t y = wrap_coord((uint32_t)v, t->height, t->addr_v), zbits;
+        float z;
+        if (zbuf_read(t->offset, x, y, &z, &zbits))
+            return z;
         if (d3d8_format_is_swizzled(t->color))
             memcpy(&word, mem + t->offset
                    + (size_t)swizzle_offset(x, y, t->width, t->height) * bpp, bpp);

@@ -27,6 +27,7 @@
 #define POS_AT    0x40000u
 #define TC_AT     0x41000u
 #define DIFF_AT   0x42000u
+#define COPY_AT   0x44000u
 #define MEM_BYTES 0x50000u
 static uint8_t s_mem[MEM_BYTES];
 
@@ -107,6 +108,26 @@ static void light(uint32_t tex_at, uint32_t mag, float du)
     quad(0, W, 0.0f, du, 2000.0f);
 }
 
+/* The depth buffer read as a LIN_A8R8G8B8 texture and drawn into COPY_AT, as a
+ * title copies its shadow map: the words it holds, depth in the top 24 bits. */
+static void copy_depths(void)
+{
+    memset(s_mem + COPY_AT, 0x80, 4u * W * H);
+    m(0x0210, COPY_AT);                            /* SET_SURFACE_COLOR_OFFSET */
+    m(0x0358, 0x01010101u);                        /* SET_COLOR_MASK: all */
+    m(0x030C, 0);                                  /* DEPTH_TEST_ENABLE: off */
+    m(0x035C, 0);                                  /* DEPTH_MASK: off */
+    m(0x1B00, ZETA_AT);                            /* TEXTURE_OFFSET */
+    m(0x1B04, (0x12u << 8) | (1u << 16));          /* FORMAT: LIN_A8R8G8B8, 1 level */
+    m(0x1B08, 3u | (3u << 8));                     /* ADDRESS: clamp */
+    m(0x1B10, (W * 4u) << 16);                     /* CONTROL1: pitch */
+    m(0x1B14, (1u << 24) | (1u << 16));            /* FILTER: nearest */
+    m(0x1B1C, ((uint32_t)W << 16) | H);            /* IMAGE_RECT */
+    m(0x028C, 0x18u << 8);                         /* final alpha: T0's */
+    quad(0, W, 0.0f, 0.0f, 0.0f);
+    m(0x028C, 0x20u << 8);                         /* final alpha: 1 again */
+}
+
 int main(void)
 {
     static const float I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
@@ -162,6 +183,18 @@ int main(void)
     CHECK(gray(7, 8) == 0, "linear x=7 is %d, want 0", gray(7, 8));
     CHECK(gray(8, 8) >= 126 && gray(8, 8) <= 129, "linear x=8 is %d, want about 128", gray(8, 8));
     CHECK(gray(9, 8) == 255, "linear x=9 is %d, want 255", gray(9, 8));
+
+    /* The depth buffer read as colour: the rasteriser keeps it on the host, and
+     * the copy has its words, the far clear's whole. */
+    copy_depths();
+    {
+        uint32_t near, far;
+        memcpy(&near, s_mem + COPY_AT + 4u * (8 * W + 3), 4);
+        memcpy(&far, s_mem + COPY_AT + 4u * (8 * W + 12), 4);
+        printf("copy: near %08X far %08X\n", near, far);
+        CHECK(near == (1000u << 8), "copy: near word %08X, want %08X", near, 1000u << 8);
+        CHECK(far == 0xFFFFFF00u, "copy: far word %08X, want FFFFFF00", far);
+    }
 
     /* Not a depth buffer the rasteriser drew: the words in memory, depth in
      * the top 24 bits. Near on the right half this time. */

@@ -173,7 +173,10 @@ from that buffer; any other is read from guest memory. A stage with a linear
 magnification filter weights the four texels' results as a bilinear tap. The
 result is 0 or 1 for each texel, in all four channels. Before this the stage
 had no format to read and sampled white, so every light lit everything.
-Float depths (`F24S8`, `F16`) are not read, and the host buffer holds z, so a
+A title may also copy its map, reading the depth buffer as a linear 32-bit
+colour texture (`LIN_A8R8G8B8`, `LIN_X8R8G8B8`) and sampling the copy as a
+depth texture later. Read so, a host `D24S8` buffer gives the hardware's word,
+depth in the top 24 bits and 0 for the stencil, which is not kept. Float depths (`F24S8`, `F16`) are not read, and the host buffer holds z, so a
 map drawn into a w-buffer (`SET_CONTROL0`'s `Z_PERSPECTIVE_ENABLE`) holds
 other numbers than the hardware's. `tests/nv2a_shadow_map` checks it.
 
