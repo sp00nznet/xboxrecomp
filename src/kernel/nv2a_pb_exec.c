@@ -1156,6 +1156,8 @@ static uint32_t linear_twin(uint32_t fmt)
     }
 }
 
+static int zbuf_word(uint32_t addr, uint32_t x, uint32_t y, uint32_t *word);
+
 /* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
 static int sample_tex(const Texture *t, uint32_t face_offset,
                       uint32_t u, uint32_t v, uint32_t *argb)
@@ -1180,6 +1182,13 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     v = wrap_coord(v, t->height, t->addr_v);
 
     fmt = t->color;
+    /* A D24S8 depth buffer read as a linear 32-bit colour texture, as a title
+     * copies its shadow map: its depths are on the host, not in guest memory. */
+    if ((fmt == 0x12 || fmt == 0x1E) && !face_offset && zbuf_word(base, u, v, argb)) {
+        if (fmt == 0x1E)                            /* LIN_X8R8G8B8 */
+            *argb |= 0xFF000000u;
+        return 1;
+    }
     if (d3d8_format_dxt_block_bytes(fmt)) {
         /* Decoded blocks, direct-mapped by address. Every texel of a DXT
          * texture decodes its whole 4x4 block, and bilinear reads four
@@ -2290,9 +2299,45 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
  * the title does reads it back, so a float buffer per zeta offset is enough. */
 #define NV_ZBUF_W 1280   /* 640x480 at 2x2 anti-aliasing */
 #define NV_ZBUF_H 1024
-static struct { uint32_t offset; float *z; } s_zbufs[4];
+static struct { uint32_t offset, bits; float *z; } s_zbufs[4];
 static int s_ftrace;            /* frame trace: 0 idle, 2 tracing, 3 done */
 static int s_zbuf_next;
+
+/* The depth at (x, y) of the depth buffer at `addr` (resolved), and its bits,
+ * if the rasteriser has one there: a title reading its depth buffer as a
+ * texture reads it here, not in guest memory. */
+static int zbuf_read(uint32_t addr, uint32_t x, uint32_t y, float *z, uint32_t *bits)
+{
+    int i;
+
+    if (x >= NV_ZBUF_W || y >= NV_ZBUF_H)
+        return 0;
+    for (i = 0; i < 4; i++)
+        if (s_zbufs[i].z && dma_resolve(s_zbufs[i].offset) == addr) {
+            *z = s_zbufs[i].z[(size_t)y * NV_ZBUF_W + x];
+            *bits = s_zbufs[i].bits;
+            return 1;
+        }
+    return 0;
+}
+
+/* Texel (x, y) of a 32-bit colour texture at `addr` when that is a D24S8
+ * depth buffer: the word the hardware keeps, depth in the top 24 bits. The
+ * stencil is not kept, so its byte reads 0. */
+static int zbuf_word(uint32_t addr, uint32_t x, uint32_t y, uint32_t *word)
+{
+    float z;
+    uint32_t bits;
+
+    if (!zbuf_read(addr, x, y, &z, &bits) || bits != 24)
+        return 0;
+    /* Rounded before it is clamped: 16777215 + 0.5 is 16777216 in a float,
+     * which shifts out of the word and reads as the nearest depth. */
+    z = rintf(z);
+    z = z < 0.0f ? 0.0f : (z > 16777215.0f ? 16777215.0f : z);
+    *word = (uint32_t)z << 8;
+    return 1;
+}
 
 static float zclear_value(void)
 {
@@ -2318,6 +2363,7 @@ static float *zbuf_current(int create)
     if (!s_zbufs[i].z)
         return NULL;
     s_zbufs[i].offset = s_gpu.zeta_offset;
+    s_zbufs[i].bits = ((s_gpu.format >> 4) & 0xF) == 1 ? 16 : 24;   /* Z16, else Z24S8 */
     for (k = 0; k < (size_t)NV_ZBUF_W * NV_ZBUF_H; k++)
         s_zbufs[i].z[k] = 3.4e38f;
     return s_zbufs[i].z;
@@ -2477,6 +2523,92 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
         out[0] = out[1] = out[2] = out[3] = 1.0f;
 }
 
+/* Bits of depth in a texture of a depth buffer's format (D24S8, D16, swizzled
+ * or linear), 0 for any other format. Float depths are not read. */
+static uint32_t depth_texel_bits(uint32_t fmt)
+{
+    switch (fmt) {
+    case 0x2A: case 0x2E: return 24;              /* D24S8, LIN_D24S8 */
+    case 0x2C: case 0x30: return 16;              /* D16, LIN_D16     */
+    default:              return 0;
+    }
+}
+
+/* The depth at texel (u, v) of a depth texture. A title samples the depth
+ * buffer it drew (shadow maps): the rasteriser keeps that one on the host,
+ * not in guest memory, so it is read from there when the texture's address is
+ * a depth buffer's; otherwise from the texture's own memory. */
+static float depth_texel(const Texture *t, int32_t u, int32_t v, uint32_t bits)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bpp = bits == 24 ? 4 : 2, word = 0;  /* D24S8: depth and stencil in a word */
+
+    if (t->border_color
+        && ((t->addr_u == 4 && (u < 0 || u >= (int32_t)t->width))
+         || (t->addr_v == 4 && (v < 0 || v >= (int32_t)t->height))))
+        word = t->border;
+    else {
+        uint32_t x = wrap_coord((uint32_t)u, t->width, t->addr_u);
+        uint32_t y = wrap_coord((uint32_t)v, t->height, t->addr_v), zbits;
+        float z;
+        if (zbuf_read(t->offset, x, y, &z, &zbits))
+            return z;
+        if (d3d8_format_is_swizzled(t->color))
+            memcpy(&word, mem + t->offset
+                   + (size_t)swizzle_offset(x, y, t->width, t->height) * bpp, bpp);
+        else
+            memcpy(&word, mem + t->offset + (size_t)y * t->pitch + (size_t)x * bpp, bpp);
+    }
+    return bits == 24 ? (float)(word >> 8) : (float)(word & 0xFFFFu);
+}
+
+/* SET_SHADOW_COMPARE_FUNC: does the coordinate compare so with the depth? */
+static float shadow_compared(float ref, float z)
+{
+    switch (s_reg[0x1E6C / 4] & 7) {
+    case 0:  return 0.0f;
+    case 1:  return ref >  z ? 1.0f : 0.0f;
+    case 2:  return ref == z ? 1.0f : 0.0f;
+    case 3:  return ref >= z ? 1.0f : 0.0f;
+    case 4:  return ref <  z ? 1.0f : 0.0f;
+    case 5:  return ref != z ? 1.0f : 0.0f;
+    case 6:  return ref <= z ? 1.0f : 0.0f;
+    default: return 1.0f;
+    }
+}
+
+/* A depth texture sampled at (u, v) with r = `ref`, both divided by q: how
+ * many of the texels pass the compare, all four channels alike. With a
+ * linear filter, the four around the point weighted as a bilinear tap. */
+static void rc_shadow(const Texture *t, float u, float v, float ref,
+                      uint32_t bits, float out[4])
+{
+    float most = bits == 24 ? 16777215.0f : 65535.0f, r;
+    int j;
+
+    if (tex_size_from_format(t->color)) {
+        u *= (float)t->width;
+        v *= (float)t->height;
+    }
+    ref = ref < 0.0f ? 0.0f : (ref > most ? most : ref);
+    if (((t->filter >> 24) & 0xF) == 1) {         /* MAG nearest */
+        r = shadow_compared(ref, depth_texel(t, (int32_t)floorf(u),
+                                             (int32_t)floorf(v), bits));
+    } else {
+        float fu = u - 0.5f, fv = v - 0.5f;
+        int32_t iu = (int32_t)floorf(fu), iv = (int32_t)floorf(fv);
+        float wu = fu - (float)iu, wv = fv - (float)iv;
+        float p00 = shadow_compared(ref, depth_texel(t, iu,     iv,     bits));
+        float p10 = shadow_compared(ref, depth_texel(t, iu + 1, iv,     bits));
+        float p01 = shadow_compared(ref, depth_texel(t, iu,     iv + 1, bits));
+        float p11 = shadow_compared(ref, depth_texel(t, iu + 1, iv + 1, bits));
+        r = (p00 * (1.0f - wu) + p10 * wu) * (1.0f - wv)
+          + (p01 * (1.0f - wu) + p11 * wu) * wv;
+    }
+    for (j = 0; j < 4; j++)
+        out[j] = r;
+}
+
 /* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
  * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
 static int rc_stage_fetch(int st, const float c[4], const float *cx,
@@ -2491,6 +2623,10 @@ static int rc_stage_fetch(int st, const float c[4], const float *cx,
         out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f;
         return 1;
     case 1: case 2:                               /* PROJECT2D / 3D */
+        if (depth_texel_bits(t->color) && t->valid) {
+            rc_shadow(t, c[0] / q, c[1] / q, c[2] / q, depth_texel_bits(t->color), out);
+            return 1;
+        }
         if (cx && cy) {                           /* neighbours: the gradient */
             float qx = cx[3] != 0.0f ? cx[3] : 1.0f, qy = cy[3] != 0.0f ? cy[3] : 1.0f;
             float u = c[0] / q, v = c[1] / q;
