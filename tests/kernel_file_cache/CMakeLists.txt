@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.20)
+project(kernel_file_cache_test C)
+# Windows only: the POSIX backend has no unbuffered opens.
+if(NOT WIN32)
+    return()
+endif()
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../.. runtime)
+add_executable(kernel_file_cache_test test_main.c)
+target_include_directories(kernel_file_cache_test PRIVATE ../../src/kernel)
+target_link_libraries(kernel_file_cache_test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME kernel_file_cache_test COMMAND kernel_file_cache_test)
