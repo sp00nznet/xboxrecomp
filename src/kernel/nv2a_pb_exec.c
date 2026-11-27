@@ -2842,6 +2842,7 @@ static void xf_rows_parallel(const XfTri *T, int ntris, long px,
     int n = raster_pool_size(), k;
 
     if (n <= 1 || px < NV_RASTER_MT_MIN_PIXELS) {
+        s_raster_last_workers = 1;
         for (k = 0; k < ntris; k++)
             xf_rows(&T[k], T[k].miny, 1, total);
         return;
