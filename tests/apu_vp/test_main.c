@@ -28,6 +28,12 @@
  *     one-shot at rate 1, a one-shot at rate 0.5 (the resampler returns a
  *     short count, then the voice is off) and a non-persist stream that runs
  *     out of packets.
+ *   - stream_dry_plays_first_list_armed: a persist stream that found its
+ *     next list empty waited on that list, so when the title rewrote the
+ *     finished list first (QR's music) the two packets played swapped.
+ *   - stream_voice_on_does_not_arm_stale_list: VOICE_ON armed the lists
+ *     from the counts they held, which outlive the voice, so a stream on a
+ *     reused handle played the previous stream's list B.
  *   - sample_reads_take_the_data_resolver: written with the data/phys split, so
  *     it pins it: PCM and ADPCM samples come from mcpx_apu_phys_data, the
  *     voice and SGE tables from mcpx_apu_phys.
@@ -453,6 +459,119 @@ static void stream_fetch_ending_before_ebo_plays_ebo(void)
           s_ram[done_at], d.vp.ssl[0].ssl_index);
 }
 
+/* A persist stream whose next list is empty when its list ends plays the
+ * first list the title arms after that. QR's DirectSound, finding SSL B done
+ * with A empty, rewrites B first and A after it; waiting on A
+ * played A's packet before B's, each pair of packets swapped. Until the
+ * title rewrites it, the list just finished keeps its old count, and those
+ * packets must not play again. */
+static void stream_dry_plays_first_list_armed(void)
+{
+    static MCPXAPUState d;
+    float samples[8][2];
+    /* Page 0: packet P (samples 1, 101, ..), page 1: packet Q (5000, ..). */
+    uint32_t ssl[4] = {
+        DATA_BASE, 8u | (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 16),
+        DATA_BASE + 0x100u, 8u | (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 16),
+    };
+
+    setup_pcm_loop_voice(&d, 8);
+    set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT,
+                  (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30) |
+                  (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28) |
+                  NV_PAVS_VOICE_CFG_FMT_DATA_TYPE |
+                  NV_PAVS_VOICE_CFG_FMT_PERSIST);
+    d.regs[NV_PAPU_VPSSLADDR] = SSL_BASE;
+    d.regs[NV_PAPU_FENADDR] = FEN_BASE;
+    d.regs[NV_PAPU_FECV] = 0;
+    memcpy(s_ram + SSL_BASE, ssl, sizeof(ssl));
+    for (unsigned i = 0; i < 8; i++) {
+        put_s16(i, (int16_t)(i * 100 + 1));
+        put_s16(0x80u + i, (int16_t)(5000 + i));
+    }
+    fe_method(&d, NV1BA0_PIO_SET_VOICE_SSL_A, (0u << 8) | 1u);
+    fe_method(&d, NV1BA0_PIO_SET_VOICE_SSL_B, (1u << 8) | 0u);
+
+    int n = voice_get_samples(&d, 0, samples, 8);
+    CHECK(n == 8 && d.vp.ssl[0].ssl_index == 1,
+          "list A played (%d samples, now on list %d)", n,
+          d.vp.ssl[0].ssl_index);
+
+    /* B is empty and A still holds the count of the packet just played. */
+    n = voice_get_samples(&d, 0, samples, 8);
+    CHECK(n < 0 && d.vp.ssl[0].ssl_index == 1,
+          "dry stream played the finished list's old packet again (%d "
+          "samples, list %d)", n, d.vp.ssl[0].ssl_index);
+
+    /* DirectSound frees A, then hands it packet Q. */
+    fe_method(&d, NV1BA0_PIO_SET_VOICE_SSL_A, (0u << 8) | 0u);
+    n = voice_get_samples(&d, 0, samples, 8);
+    CHECK(n < 0, "freed list A played (%d samples)", n);
+    fe_method(&d, NV1BA0_PIO_SET_VOICE_SSL_A, (1u << 8) | 1u);
+    n = voice_get_samples(&d, 0, samples, 8);
+    CHECK(n == 8 && samples[0][0] == int16_to_float(5000),
+          "rewritten list A not played next (%d samples, first %f, list %d)",
+          n, n > 0 ? samples[0][0] : 0.0f, d.vp.ssl[0].ssl_index);
+
+    /* Then B, armed after A, follows it. */
+    fe_method(&d, NV1BA0_PIO_SET_VOICE_SSL_B, (0u << 8) | 1u);
+    n = voice_get_samples(&d, 0, samples, 8);
+    CHECK(n == 8 && samples[0][0] == int16_to_float(1) &&
+          d.vp.ssl[0].ssl_index == 0,
+          "list B not played after A (%d samples, first %f, list %d)", n,
+          n > 0 ? samples[0][0] : 0.0f, d.vp.ssl[0].ssl_index);
+}
+
+/* SSL counts outlive the voice. A persist stream started on a reused handle
+ * with list A written empty and B never rewritten must not take B's count,
+ * the previous stream's, for a list armed: that played the old PRDs. */
+static void stream_voice_on_does_not_arm_stale_list(void)
+{
+    static MCPXAPUState d;
+    float samples[8][2];
+    uint32_t ssl[4] = {
+        DATA_BASE, 8u | (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 16),
+        DATA_BASE + 0x100u, 8u | (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 16),
+    };
+
+    setup_pcm_loop_voice(&d, 8);
+    set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT,
+                  (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30) |
+                  (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28) |
+                  NV_PAVS_VOICE_CFG_FMT_DATA_TYPE |
+                  NV_PAVS_VOICE_CFG_FMT_PERSIST);
+    d.regs[NV_PAPU_VPSSLADDR] = SSL_BASE;
+    d.regs[NV_PAPU_FENADDR] = FEN_BASE;
+    d.regs[NV_PAPU_FECV] = 0;
+    memcpy(s_ram + SSL_BASE, ssl, sizeof(ssl));
+    for (unsigned i = 0; i < 8; i++) {
+        put_s16(i, (int16_t)(i * 100 + 1));
+        put_s16(0x80u + i, (int16_t)(5000 + i));
+    }
+    /* The previous stream: both lists written, then the voice goes off. */
+    fe_method(&d, NV1BA0_PIO_SET_VOICE_SSL_A, (0u << 8) | 1u);
+    fe_method(&d, NV1BA0_PIO_SET_VOICE_SSL_B, (1u << 8) | 1u);
+    fe_method(&d, NV1BA0_PIO_VOICE_OFF, 0);
+
+    /* The next one writes A empty and starts; B still says count 1. */
+    fe_method(&d, NV1BA0_PIO_SET_VOICE_SSL_A, (0u << 8) | 0u);
+    fe_method(&d, NV1BA0_PIO_VOICE_ON, 0);
+    CHECK(d.vp.ssl[0].ssl_index == 0 && d.vp.ssl[0].count[1] == 1,
+          "setup: list %d, B count %u", d.vp.ssl[0].ssl_index,
+          d.vp.ssl[0].count[1]);
+    int n = voice_get_samples(&d, 0, samples, 8);
+    CHECK(n < 0 && d.vp.ssl[0].ssl_index == 0,
+          "new stream played the old stream's list B (%d samples, first %f, "
+          "list %d)", n, n > 0 ? samples[0][0] : 0.0f, d.vp.ssl[0].ssl_index);
+
+    /* B counts once this stream writes it. */
+    fe_method(&d, NV1BA0_PIO_SET_VOICE_SSL_B, (1u << 8) | 1u);
+    n = voice_get_samples(&d, 0, samples, 8);
+    CHECK(n == 8 && samples[0][0] == int16_to_float(5000),
+          "list B written by the new stream not played (%d samples, first %f)",
+          n, n > 0 ? samples[0][0] : 0.0f);
+}
+
 /* A 40-sample one-shot (EBO 39) at rate 1 ends 8 samples into its second
  * frame. Those 8 samples, sample ebo last, must reach the mix bins; the
  * frame after, with the voice off, adds nothing. Voice 0 is a 3D voice with
@@ -701,6 +820,8 @@ int main(void)
     loop_fetch_ending_before_ebo_plays_ebo();
     one_shot_fetch_ending_before_ebo_plays_ebo();
     stream_fetch_ending_before_ebo_plays_ebo();
+    stream_dry_plays_first_list_armed();
+    stream_voice_on_does_not_arm_stale_list();
     one_shot_final_frame_reaches_mix_bins();
     one_shot_half_rate_final_frame_reaches_mix_bins();
     stream_end_final_frame_reaches_mix_bins();
@@ -714,7 +835,8 @@ int main(void)
     }
     puts("PASS: every ADPCM block count the descriptor can name decodes; output buffer SGE entries go to the GP FIFO table; the "
          "resampler plays each frame's source, no sample held back; a fetch "
-         "ending before EBO still plays sample EBO; the frame a voice ends in "
+         "ending before EBO still plays sample EBO; a dry stream plays the "
+         "first list armed, never a previous stream's; the frame a voice ends in "
          "is mixed (one-shot at rate 1 and 0.5, stream end); volume changes "
          "ramp across a frame; samples are read through the data resolver and the "
          "voice and SGE tables through the other.");

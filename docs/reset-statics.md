@@ -2522,6 +2522,9 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/apu/apu_vp.c | - | s_trace_dropped | file_static | keep | - | trace or dump state, env gated |
 | src/apu/apu_vp.c | - | s_vstat | file_static | reset | apu | per-voice stats keyed by guest buffer address |
 | src/apu/apu_vp.c | - | s_vstat_on | file_static | keep | - | trace or dump state, env gated |
+| src/apu/apu_vp.c | - | s_ssl_on | file_static | keep | - | trace or dump state, env gated |
+| src/apu/apu_vp.c | - | s_ssl_done_at | file_static | reset | apu | frame stamps of the running boot's stream lists |
+| src/apu/apu_vp.c | - | s_ssl_dry_at | file_static | reset | apu | frame stamps of the running boot's stream lists |
 | src/apu/apu_vp.c | - | s_vdump_voice | file_static | keep | - | trace or dump state, env gated |
 | src/apu/apu_vp.c | - | s_vdump | file_static | keep | - | trace or dump state, env gated |
 | src/apu/apu_vp.c | - | s_vdump_all | file_static | keep | - | trace or dump state, env gated |

@@ -3002,7 +3002,7 @@ static void test_pages(void)
      * cpu. */
     static const uint32_t k_sum[12] = {
         0x4A5A6345u, 0x3ED5CDB2u, 0x569DC396u, 0xA87EE47Du, 0x348F895Fu, 0x864825F3u,
-        0x4FDE531Bu, 0x9F2616E0u, 0x6E28437Au, 0x1239F05Cu, 0x3F57887Bu, 0xE4B1DCECu };
+        0x4FDE531Bu, 0x9F2616E0u, 0xC7814C12u, 0x1239F05Cu, 0x3F57887Bu, 0xE4B1DCECu };
     /* Files shows Open exports folder only off Game Mode. Pack with a pack
      * loaded: with none it names the packs folder, an absolute path that
      * moves with the build folder. */

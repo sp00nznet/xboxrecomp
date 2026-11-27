@@ -374,6 +374,11 @@ typedef struct MCPXAPUVPSSLData {
     uint8_t count[MCPX_HW_SSLS_PER_VOICE];
     int ssl_index;
     int ssl_seg;
+    /* Bit per list: the title wrote it with a nonzero count since the VP last
+     * finished it or the voice went off, so its count is not the stale one
+     * of the packets played. Set by the title's thread, cleared by the frame
+     * thread: only qatomic_or/qatomic_and touch it. */
+    uint32_t armed;
 } MCPXAPUVPSSLData;
 
 typedef struct MCPXAPUVoiceFilter {

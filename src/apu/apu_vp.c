@@ -155,6 +155,90 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
 }
 
 /* ============================================================
+ * Stream trace (RECOMP_TRACE=apu_stream)
+ *
+ * A stream voice plays the packets the title hands DirectSound through two
+ * SSL lists, A and B: the VP plays one while the title's DPC refills the
+ * other from the list-done notification. A refill that comes after the VP
+ * has finished the list it was playing leaves a persist stream with nothing
+ * to play (dry): a hole in the music. These lines stamp every step of that
+ * hand-off with the APU frame count (1500 a second), so a capture shows per
+ * packet how much lead each refill had and how long each dry spell lasted.
+ * Submits come from title threads and are printed there; the VP's own lines
+ * go through vp_trace.
+ * ============================================================ */
+
+static int s_ssl_on = -1;
+static unsigned s_ssl_done_at[MCPX_HW_MAX_VOICES][MCPX_HW_SSLS_PER_VOICE];
+static unsigned s_ssl_dry_at[MCPX_HW_MAX_VOICES];   /* 0: not dry */
+
+/* 1: the list lines; apu_stream=2 adds a line per PRD the title writes. */
+static int ssl_trace_on(void)
+{
+    if (s_ssl_on < 0)
+        s_ssl_on = !recomp_env_on(RENV_APU_STREAM) ? 0
+                 : recomp_env_int(RENV_APU_STREAM, 1) > 1 ? 2 : 1;
+    return s_ssl_on;
+}
+
+static double ssl_now(void)
+{
+    return apu_irq_stats.se_frames / 1500.0;
+}
+
+/* Frames a list's segments hold, from the PRDs it names. */
+static uint32_t ssl_list_frames(MCPXAPUState *d, uint32_t base, int from,
+                                int count)
+{
+    uint32_t frames = 0;
+    for (int i = from; i < count; i++) {
+        hwaddr a = d->regs[NV_PAPU_VPSSLADDR] + (base + (uint32_t)i) * 8;
+        frames += ldl_le_phys(address_space_memory, a + 4) & 0xffff;
+    }
+    return frames;
+}
+
+static void ssl_trace_submit(MCPXAPUState *d, int v, int ssl)
+{
+    MCPXAPUVPSSLData *st = &d->vp.ssl[v];
+    uint32_t frames, lead = 0;
+    int playing = st->ssl_index;
+    unsigned now = apu_irq_stats.se_frames;
+    unsigned done_at = s_ssl_done_at[v][ssl];
+
+    frames = ssl_list_frames(d, st->base[ssl], 0, st->count[ssl]);
+    /* Lead: what the VP still has to play before it needs this list, read
+     * without d->lock (a trace may be a frame off). */
+    if (playing != ssl && st->count[playing]) {
+        uint32_t cbo = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
+                                      NV_PAVS_VOICE_PAR_OFFSET_CBO);
+        lead = ssl_list_frames(d, st->base[playing], st->ssl_seg,
+                               st->count[playing]);
+        lead = lead > cbo ? lead - cbo : 0;
+    }
+    {
+        /* Every segment (offset:frames), for matching them to the reads that
+         * fill them. */
+        char segs[200];
+        size_t n = 0;
+        segs[0] = '\0';
+        for (int i = 0; i < st->count[ssl] && n + 24 < sizeof(segs); i++) {
+            hwaddr a = d->regs[NV_PAPU_VPSSLADDR] + (st->base[ssl] + (uint32_t)i) * 8;
+            n += (size_t)snprintf(segs + n, sizeof(segs) - n, "%s%08X:%u",
+                                  i ? "," : "",
+                                  (unsigned)ldl_le_phys(address_space_memory, a),
+                                  (unsigned)(ldl_le_phys(address_space_memory, a + 4) & 0xffff));
+        }
+        fprintf(stderr, "[APU-SSL] t=%.3f v=%d set %c base=%u count=%u frames=%u"
+                " segs=%s playing=%c seg=%d lead=%u dry=%s since_done=%d\n",
+                ssl_now(), v, 'A' + ssl, st->base[ssl], st->count[ssl], frames,
+                n ? segs : "-", 'A' + playing, st->ssl_seg, lead,
+                s_ssl_dry_at[v] ? "yes" : "no",
+                done_at ? (int)(now - done_at) : -1);
+    }
+}
+
+/* ============================================================
  * Voice off / lock
  * ============================================================ */
 
@@ -162,6 +246,10 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
 {
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
+    /* Counts outlive the voice; the next stream on this handle arms only
+     * the lists it writes, or a dry start would play the old PRDs. */
+    if (v < MCPX_HW_MAX_VOICES)
+        qatomic_and(&d->vp.ssl[v].armed, 0u);
 
     bool stream = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                  NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0;
@@ -286,6 +374,14 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
         d->vp.ssl[selected_handle].ssl_seg = 0;
         d->vp.ssl[selected_handle].ssl_index = 0;
+        if (ssl_trace_on() && voice_get_mask(d, (uint16_t)selected_handle,
+                NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_DATA_TYPE)) {
+            s_ssl_dry_at[selected_handle] = 0;
+            fprintf(stderr, "[APU-SSL] t=%.3f v=%u on A count=%u B count=%u\n",
+                    ssl_now(), selected_handle,
+                    d->vp.ssl[selected_handle].count[0],
+                    d->vp.ssl[selected_handle].count[1]);
+        }
 
         unsigned int ea_start = GET_MASK(argument, NV1BA0_PIO_VOICE_ON_ENVA);
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
@@ -532,6 +628,12 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        if (d->vp.ssl[current_voice].count[ssl])
+            qatomic_or(&d->vp.ssl[current_voice].armed, 1u << ssl);
+        else
+            qatomic_and(&d->vp.ssl[current_voice].armed, ~(1u << ssl));
+        if (ssl_trace_on())
+            ssl_trace_submit(d, current_voice, ssl);
         break;
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
@@ -542,6 +644,12 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        if (d->vp.ssl[current_voice].count[ssl])
+            qatomic_or(&d->vp.ssl[current_voice].armed, 1u << ssl);
+        else
+            qatomic_and(&d->vp.ssl[current_voice].armed, ~(1u << ssl));
+        if (ssl_trace_on())
+            ssl_trace_submit(d, current_voice, ssl);
         break;
     }
 
@@ -606,6 +714,15 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                           + (d->vp.ssl_base_page * 8)
                           + (method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET);
             stl_le_phys(address_space_memory, addr, argument);
+            /* Which pages the title writes: a list submitted with a count
+             * past the pages written plays a stale PRD (QR's
+             * in-race B count=2 over a frontend PRD). */
+            if (ssl_trace_on() > 1)
+                fprintf(stderr, "[APU-SSL] t=%.3f prd page=%u %s=%08X\n",
+                        ssl_now(),
+                        d->vp.ssl_base_page +
+                            (method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET) / 8,
+                        (method & 4) ? "len" : "off", argument);
         } else if (method >= NV1BA0_PIO_SET_SUBMIX_HEADROOM &&
                    method <= NV1BA0_PIO_SET_SUBMIX_HEADROOM + 4 * (NUM_MIXBINS - 1)) {
             assert((method & 3) == 0);
@@ -886,7 +1003,10 @@ static unsigned s_vstat_frames, s_vstat_secs;
 static void vp_stat_init(void)
 {
     const char *e;
-    s_vstat_on = recomp_env_on(RENV_APU_TRACE);
+    /* apu_stream brings the per-voice stats without the apu tier's line per
+     * register access, which under Wine starves the title by itself (QR polls
+     * 0x200C thousands of times a second). */
+    s_vstat_on = recomp_env_on(RENV_APU_TRACE) || ssl_trace_on();
     e = recomp_env(RENV_APU_VOICE_DUMP);
     if (e && *e) {
         const char *path = recomp_env(RENV_APU_VOICE_DUMP_FILE);
@@ -1264,7 +1384,35 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         page = d->vp.ssl[v].base[ssl_index] + ssl_seg;
         count = d->vp.ssl[v].count[ssl_index];
 
+        /* A persist stream that ran dry plays the first list the title arms
+         * after it. When the list after the one playing is empty at its end,
+         * DirectSound refills the list that just finished first and the
+         * empty one after it (QR's in-race music once a packet ran early:
+         * B done with A empty, then B written, then A), so it means the
+         * finished list to play next. Waiting on the empty list instead
+         * played each pair of packets swapped, with a 10-60 ms gap before
+         * each swap, for the rest of the race. The other list
+         * counts only once rewritten: until DirectSound's DPC runs it holds
+         * the count of the packets just played. */
+        if (count == 0 && persist &&
+            (qatomic_read(&d->vp.ssl[v].armed) & (1u << (ssl_index ^ 1)))) {
+            ssl_index ^= 1;
+            ssl_seg = 0;
+            d->vp.ssl[v].ssl_index = ssl_index;
+            d->vp.ssl[v].ssl_seg = 0;
+            page = d->vp.ssl[v].base[ssl_index];
+            count = d->vp.ssl[v].count[ssl_index];
+            if (s_ssl_on > 0)
+                vp_trace("[APU-SSL] t=%.3f v=%u dry switch to %c count=%d\n",
+                         ssl_now(), v, 'A' + ssl_index, count);
+        }
+
         if (count == 0) {
+            if (s_ssl_on > 0 && persist && !s_ssl_dry_at[v]) {
+                s_ssl_dry_at[v] = apu_irq_stats.se_frames | 1u;
+                vp_trace("[APU-SSL] t=%.3f v=%u dry %c\n", ssl_now(), v,
+                         'A' + ssl_index);
+            }
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
             d->vp.ssl[v].ssl_seg = 0;
@@ -1279,6 +1427,12 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             return -1;
         }
 
+        if (s_ssl_dry_at[v]) {
+            vp_trace("[APU-SSL] t=%.3f v=%u wet %c dry_frames=%u\n",
+                     ssl_now(), v, 'A' + ssl_index,
+                     apu_irq_stats.se_frames - s_ssl_dry_at[v]);
+            s_ssl_dry_at[v] = 0;
+        }
         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
         segment_offset = ldl_le_phys(address_space_memory, addr);
         segment_length = ldl_le_phys(address_space_memory, addr + 4);
@@ -1425,6 +1579,14 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 int next_index = (ssl_index + 1) % 2;
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
+                qatomic_and(&d->vp.ssl[v].armed, ~(1u << ssl_index));
+                if (s_ssl_on > 0) {
+                    s_ssl_done_at[v][ssl_index] = apu_irq_stats.se_frames | 1u;
+                    vp_trace("[APU-SSL] t=%.3f v=%u done %c count=%u next %c"
+                             " count=%u\n", ssl_now(), v, 'A' + ssl_index,
+                             d->vp.ssl[v].count[ssl_index], 'A' + next_index,
+                             d->vp.ssl[v].count[next_index]);
+                }
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
                                   NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
             }
@@ -2018,6 +2180,7 @@ void mcpx_apu_vp_finalize(MCPXAPUState *d)
     memset(s_vdump_failed, 0, sizeof(s_vdump_failed));
     memset(s_vstat, 0, sizeof(s_vstat));
     s_vstat_on = -1;
+    s_ssl_on = -1;
     s_vdump_voice = -1;
     s_vstat_frames = s_vstat_secs = s_pos_frames = 0;
     s_ring_on = -1;
@@ -2030,6 +2193,9 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     d->vp.ssl_base_page = 0;
     d->vp.hrtf_headroom = 0;
     memset(d->vp.ssl, 0, sizeof(d->vp.ssl));
+    /* The trace's stamps name this boot's lists. */
+    memset(s_ssl_done_at, 0, sizeof(s_ssl_done_at));
+    memset(s_ssl_dry_at, 0, sizeof(s_ssl_dry_at));
     memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
     memset(d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));

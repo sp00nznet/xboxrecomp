@@ -230,6 +230,7 @@ extern "C" {
     X(APU_TRACE,         TRACE, "apu",             "RECOMP_APU_TRACE",         "APU register and frame trace; [APU-IRQ] line every 5 s") \
     X(AUDIO_HOST,        TRACE, "audio_host",      NULL,                       "host audio playback vs wall clock; [AUDIO-HOST] starve lines (on with apu)") \
     X(APU_LOCK_TRACE,    TRACE, "apu_lock",        NULL,                       "APU model lock: [APU-LOCK] hold and wait histograms per holder every 5 s") \
+    X(APU_STREAM,        TRACE, "apu_stream",      NULL,                       "APU stream voices (SSL packet lists): [APU-SSL] line per SSL A/B the title submits (segments, frames, lead), per list the VP finishes, and per dry spell (a persist stream with no list to play); apu_stream=2 adds a line per PRD the title writes; also the per-voice [APU-VSTAT] stats, without the apu tier's register lines") \
     X(APU_RING,          TRACE, "apu_ring",        NULL,                       "looping APU buffers refilled by the title: [APU-RING] lead and stale-lap replays") \
     X(USB_TRACE,         TRACE, "usb",             "RECOMP_USB_TRACE",         "OHCI trace") \
     X(USB_STATS,         TRACE, "usb_stats",       "RECOMP_USB_STATS",         "OHCI summary line every 5 s") \
