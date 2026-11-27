@@ -44,24 +44,44 @@ static int g_apu_mmio_decode_fail = 0;
  * private MOV/TEST/CMP/OR/AND decoder here did not.
  * ============================================================ */
 
+/* What the title actually asks the APU for (RECOMP_APU_TRACE_REGS, the first
+ * 400 accesses). The DSPs are stubbed here, so a title that waits on one
+ * waits forever, and the only way to work out what it is waiting for is to
+ * see the register traffic that precedes the wait. The value as well as the
+ * offset: finding which register carries the command-block address means
+ * recognising the address when it goes past. Logged from the access itself:
+ * reading the register again to show it can have side effects. */
+static void apu_mmio_note(const char *what, uint32_t off, uint64_t v)
+{
+    static volatile LONG n;
+    if (apu_trace_regs_on() && InterlockedIncrement(&n) <= 400)
+        apu_trace("  [APUMMIO] %s 0x%05X = %08llX\n", what, off,
+                  (unsigned long long)v);
+}
+
 /* The model's registers are 32-bit and its read/write ignore the size, so an
  * 8-byte access (the decoder emits size 8 for REX.W) is two 4-byte accesses
  * here; handing it over whole drops the high dword on a store and returns
  * zero for it on a load. The POSIX arm64 hook below splits the same way. */
 static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
 {
+    uint64_t v;
     g_apu_mmio_read_count++;
     if (size == 8) {
         uint64_t lo = mcpx_apu_mmio_read((MCPXAPUState *)dev, off, 4);
         uint64_t hi = mcpx_apu_mmio_read((MCPXAPUState *)dev, off + 4, 4);
-        return lo | (hi << 32);
+        v = lo | (hi << 32);
+    } else {
+        v = mcpx_apu_mmio_read((MCPXAPUState *)dev, off, (unsigned)size);
     }
-    return mcpx_apu_mmio_read((MCPXAPUState *)dev, off, (unsigned)size);
+    apu_mmio_note("read ", off, v);
+    return v;
 }
 
 static void apu_mmio_wr(void *dev, uint32_t off, uint64_t v, int size)
 {
     g_apu_mmio_write_count++;
+    apu_mmio_note("write", off, v);
     if (size == 8) {
         mcpx_apu_mmio_write((MCPXAPUState *)dev, off, (uint32_t)v, 4);
         mcpx_apu_mmio_write((MCPXAPUState *)dev, off + 4, (uint32_t)(v >> 32), 4);
@@ -96,27 +116,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
 bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)
 {
-    uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
-    bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
-
-    /* What the title actually asks the APU for. The DSPs are stubbed here, so
-     * a title that waits on one waits forever, and the only way to work out
-     * what it is waiting for is to see the register traffic that precedes the
-     * wait. */
-    if (apu_env_on("RECOMP_APU_TRACE")) {
-        static unsigned n;
-        if (n++ < 400) {
-            /* The value as well as the offset: finding which register carries
-             * the command-block address means recognising the address when it
-             * goes past, and an offset alone never shows it. */
-            uint64_t v = g_apu_state
-                       ? mcpx_apu_mmio_read(g_apu_state, mmio_offset, 4) : 0;
-            fprintf(stderr, "  [APUMMIO] %s 0x%05X = %08X%s\n",
-                    is_write ? "write" : "read ", mmio_offset,
-                    (uint32_t)v, ok ? "" : "  (decode failed)");
-        }
-    }
-    return ok;
+    return apu_decode_and_handle(ctx, fault_xbox_va - APU_MMIO_BASE, is_write);
 }
 
 #endif /* _WIN32 */

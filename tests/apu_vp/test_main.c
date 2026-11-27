@@ -53,6 +53,7 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
 
 const char *mcpx_apu_phys_class(uint64_t addr) { (void)addr; return "fake"; }
 int apu_env_on(const char *name) { (void)name; return 0; }
+void apu_trace(const char *fmt, ...) { (void)fmt; }
 ApuIrqStats apu_irq_stats;
 
 #define CHECK(cond, ...) do { if (!(cond)) { \

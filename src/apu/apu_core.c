@@ -25,6 +25,7 @@
 #include "apu_wav.h"
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
+#include <stdarg.h>
 
 /* ============================================================
  * Globals
@@ -173,13 +174,107 @@ int apu_env_on(const char *name)
     return e && *e && *e != '0';
 }
 
-/* RECOMP_APU_TRACE register lines, read once: every MMIO access tests it. */
-static int apu_mmio_trace(void)
+/* Read once: every MMIO access tests it. */
+int apu_trace_regs_on(void)
 {
     static int on = -1;
     if (on < 0)
-        on = apu_env_on("RECOMP_APU_TRACE");
+        on = apu_env_on("RECOMP_APU_TRACE_REGS");
     return on;
+}
+
+/* apu_trace's buffer. lock covers buf, len and dropped and is held only to
+ * copy; io keeps one drain at a time and is the only lock held while
+ * writing. Started by mcpx_apu_init_standalone when a switch that uses it is
+ * set; before that, apu_trace writes directly. */
+#define APU_TRACE_BUF (256 * 1024)
+static struct {
+    QemuMutex lock, io;
+    QemuThread thread;
+    char buf[APU_TRACE_BUF];
+    size_t len;
+    unsigned dropped;
+    volatile int running;
+} s_tr;
+
+void apu_trace(const char *fmt, ...)
+{
+    char line[1024];
+    va_list ap;
+    int n;
+
+    va_start(ap, fmt);
+    if (!s_tr.running) {
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+        return;
+    }
+    n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        return;
+    if (n >= (int)sizeof(line)) {         /* cut short, still one line */
+        n = (int)sizeof(line) - 1;
+        line[n - 1] = '\n';
+    }
+    qemu_mutex_lock(&s_tr.lock);
+    if (s_tr.len + (size_t)n <= sizeof(s_tr.buf)) {
+        memcpy(s_tr.buf + s_tr.len, line, (size_t)n);
+        s_tr.len += (size_t)n;
+    } else {
+        s_tr.dropped++;
+    }
+    qemu_mutex_unlock(&s_tr.lock);
+}
+
+static void apu_trace_drain(void)
+{
+    static char out[APU_TRACE_BUF];
+    size_t n;
+    unsigned dropped;
+
+    qemu_mutex_lock(&s_tr.io);
+    qemu_mutex_lock(&s_tr.lock);
+    n = s_tr.len;
+    memcpy(out, s_tr.buf, n);
+    s_tr.len = 0;
+    dropped = s_tr.dropped;
+    s_tr.dropped = 0;
+    qemu_mutex_unlock(&s_tr.lock);
+    if (n)
+        fwrite(out, 1, n, stderr);
+    if (dropped)
+        fprintf(stderr, "[APU] trace: %u lines dropped, stderr too slow\n",
+                dropped);
+    if (n || dropped)
+        fflush(stderr);
+    qemu_mutex_unlock(&s_tr.io);
+}
+
+static void *apu_trace_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        Sleep(50);
+        apu_trace_drain();
+    }
+    return NULL;
+}
+
+/* Once per process; a later APU instance keeps the same logger. Lines still
+ * buffered at exit are lost. */
+static void apu_trace_start(void)
+{
+    if (s_tr.running)
+        return;
+    if (!apu_env_on("RECOMP_APU_TRACE") && !apu_trace_regs_on()
+            && !apu_env_on("RECOMP_AUDIO_HOST"))
+        return;
+    qemu_mutex_init(&s_tr.lock);
+    qemu_mutex_init(&s_tr.io);
+    qemu_thread_create(&s_tr.thread, "mcpx.apu_trace", apu_trace_thread,
+                       NULL, QEMU_THREAD_JOINABLE);
+    s_tr.running = 1;
 }
 
 /* The interrupt line, as the frame thread sees it. update_irq used to call
@@ -398,8 +493,8 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
         break;
     }
 
-    if (apu_mmio_trace())
-        fprintf(stderr, "[APU] read  [0x%05llX] size=%u -> 0x%08llX\n",
+    if (apu_trace_regs_on())
+        apu_trace("[APU] read  [0x%05llX] size=%u -> 0x%08llX\n",
                 (unsigned long long)addr, size, (unsigned long long)r);
     (void)size;
     return r;
@@ -410,8 +505,8 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
 {
     MCPXAPUState *d = (MCPXAPUState *)opaque;
 
-    if (apu_mmio_trace())
-        fprintf(stderr, "[APU] write [0x%05llX] size=%u <- 0x%08llX\n",
+    if (apu_trace_regs_on())
+        apu_trace("[APU] write [0x%05llX] size=%u <- 0x%08llX\n",
                 (unsigned long long)addr, size, (unsigned long long)val);
     (void)size;
 
@@ -731,7 +826,7 @@ static void hs_trap(bool trapped)
         if (dur > g_hs.trap_max_us)
             g_hs.trap_max_us = dur;
         if (dur > 20000)
-            fprintf(stderr, "[AUDIO-HOST] trap spell %.1f ms ending at wav=%llu\n",
+            apu_trace("[AUDIO-HOST] trap spell %.1f ms ending at wav=%llu\n",
                     dur / 1000.0, (unsigned long long)g_hs.submitted);
         g_hs.trap_start_us = 0;
     }
@@ -777,7 +872,7 @@ static void hs_submit(int n, int ok, int q)
      * at, pauses included. */
     if (!g_hs.first_submit_us) {
         g_hs.first_submit_us = now;
-        fprintf(stderr, "[APU] first submit t=%.6f\n", now / 1e6);
+        apu_trace("[APU] first submit t=%.6f\n", now / 1e6);
     }
     if (g_hs.acct.t0_us == 0) {
         apu_starve_rebase(&g_hs.acct, now, played);
@@ -801,17 +896,17 @@ static void hs_submit(int n, int ok, int q)
     if (lost) {
         g_hs.starves++;
         g_hs.starved_ms += lost / 48.0;
-        fprintf(stderr, "[AUDIO-HOST] starve wav=%llu ms=%.1f queued=%d gap_ms=%.1f trapped=%d\n",
+        apu_trace("[AUDIO-HOST] starve wav=%llu ms=%.1f queued=%d gap_ms=%.1f trapped=%d\n",
                 (unsigned long long)g_hs.submitted, lost / 48.0, q, gap / 1000.0,
                 g_hs.trap_start_us != 0);
     }
     g_hs.submitted += (uint64_t)n;
     if (!ok && g_hs.refused++ < 100)
-        fprintf(stderr, "[AUDIO-HOST] refused wav=%llu queued=%d\n",
+        apu_trace("[AUDIO-HOST] refused wav=%llu queued=%d\n",
                 (unsigned long long)g_hs.submitted, q);
 
     if (now >= g_hs.next_report_us) {
-        fprintf(stderr, "[AUDIO-HOST] wav=%llu played=%llu starves=%u starved_ms=%.1f pending_ms=%.1f"
+        apu_trace("[AUDIO-HOST] wav=%llu played=%llu starves=%u starved_ms=%.1f pending_ms=%.1f"
                 " deficit=%lld refused=%u gap_max_ms=%.1f q_min=%d trap_spells=%u trap_long=%u"
                 " trap_max_ms=%.1f underruns=%u\n",
                 (unsigned long long)g_hs.submitted, (unsigned long long)played,
@@ -820,7 +915,7 @@ static void hs_submit(int n, int ok, int q)
                 g_hs.refused, g_hs.gap_max_us / 1000.0, g_hs.q_min,
                 g_hs.trap_spells, g_hs.trap_long, g_hs.trap_max_us / 1000.0,
                 xa2_underruns());
-        fprintf(stderr, "[APU] last submit t=%.6f samples=%llu\n", now / 1e6,
+        apu_trace("[APU] last submit t=%.6f samples=%llu\n", now / 1e6,
                 (unsigned long long)(g_hs.submitted - (uint64_t)n));
         g_hs.gap_max_us = 0;
         g_hs.trap_max_us = 0;
@@ -1247,7 +1342,7 @@ static void apu_irq_stats_line(void)
     if (now < s_irq_next_ns)
         return;
     if (s_irq_next_ns)
-        fprintf(stderr, "[APU-IRQ] traps %u se_frames %u fe-trapped-frames %u underruns %u\n",
+        apu_trace("[APU-IRQ] traps %u se_frames %u fe-trapped-frames %u underruns %u\n",
                 apu_irq_stats.traps, apu_irq_stats.se_frames,
                 apu_irq_stats.fe_trapped_frames, xa2_underruns());
     s_irq_next_ns = now + 5000000000ull;
@@ -1504,6 +1599,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
      * against this one's empty ISTS. */
     InterlockedExchange(&s_irq_line, 0);
     apu_diag_reset();
+    apu_trace_start();
 
     /* RECOMP_APU_SOLO=<voice>: mute every other voice in the mix, for
      * telling which voice a sound (or a noise) comes from. */

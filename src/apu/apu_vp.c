@@ -892,7 +892,7 @@ static void vp_stat_report(void)
     for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         struct VpVoiceStat *s = &s_vstat[v];
         if (!s->frames) continue;
-        fprintf(stderr, "[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
+        apu_trace("[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
                 " rate=%.3f ea=%.2f vol=%03X/%03X bin=%u/%u addr=%08X %s"
                 " frames=%u rms=%.0f zcr=%.2f\n",
                 s_vstat_secs, v, s->fmt,
@@ -1715,7 +1715,7 @@ static void vp_trace_positions(MCPXAPUState *d)
             uint16_t v = (uint16_t)h;
             if (voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
-                fprintf(stderr, "[APU] voice %u pos=%u/%u\n", (unsigned)v,
+                apu_trace("[APU] voice %u pos=%u/%u\n", (unsigned)v,
                         voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
                                        NV_PAVS_VOICE_PAR_OFFSET_CBO),
                         voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT,
