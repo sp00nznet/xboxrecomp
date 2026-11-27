@@ -162,6 +162,21 @@ a game project sets it for a mesh it has seen need it, so it cannot change how
 another title is lit. Check against xemu or hardware if a surface ever looks
 lit from the wrong side.
 
+## Shadow Maps
+
+A title draws a light's shadow map into a depth buffer with no colour surface,
+then samples that buffer as a depth texture (`D24S8`, `D16`, swizzled or
+linear) in a projective stage, comparing the coordinate's r/q with the depth
+there as `SET_SHADOW_COMPARE_FUNC` says. The CPU rasteriser keeps its depth
+buffers on the host, so a depth texture at a depth buffer's address is read
+from that buffer; any other is read from guest memory. A stage with a linear
+magnification filter weights the four texels' results as a bilinear tap. The
+result is 0 or 1 for each texel, in all four channels. Before this the stage
+had no format to read and sampled white, so every light lit everything.
+Float depths (`F24S8`, `F16`) are not read, and the host buffer holds z, so a
+map drawn into a w-buffer (`SET_CONTROL0`'s `Z_PERSPECTIVE_ENABLE`) holds
+other numbers than the hardware's. `tests/nv2a_shadow_map` checks it.
+
 ## Anti-Aliased Surfaces
 
 With multisampling on, the surface is 2× (or 2×2) the logical size, and
