@@ -2671,16 +2671,21 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                 }
                 argb = 0;
                 if (shade) {
+                    /* Colours and fog as the texture coordinates: across the
+                     * triangle in the eye's space, weighted by 1 / w. Linear on
+                     * the screen, a triangle whose near corners lie far off
+                     * the surface takes the far corner's colour alone. */
+                    float m0 = l0 * T->iw[0], m1 = l1 * T->iw[1], m2 = l2 * T->iw[2];
+                    pw = m0 + m1 + m2;
                     for (k = 0; k < 4; k++)
-                        col[k] = l0 * va->d0[k] + l1 * vb->d0[k] + l2 * vc->d0[k];
-                    pw = l0 * T->iw[0] + l1 * T->iw[1] + l2 * T->iw[2];
+                        col[k] = (m0 * va->d0[k] + m1 * vb->d0[k] + m2 * vc->d0[k]) / pw;
                     if (T->use_rc) {
                         float d1[4], fog[4], t[4][4], out[4], tc[4];
                         int st, j, keep = 1;
                         for (k = 0; k < 4; k++)
-                            d1[k] = l0 * va->d1[k] + l1 * vb->d1[k] + l2 * vc->d1[k];
+                            d1[k] = (m0 * va->d1[k] + m1 * vb->d1[k] + m2 * vc->d1[k]) / pw;
                         fog[0] = T->fogc[0]; fog[1] = T->fogc[1]; fog[2] = T->fogc[2];
-                        fog[3] = l0 * T->vfog[0] + l1 * T->vfog[1] + l2 * T->vfog[2];
+                        fog[3] = (m0 * T->vfog[0] + m1 * T->vfog[1] + m2 * T->vfog[2]) / pw;
                         for (st = 0; st < 4 && keep; st++) {
                             if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)) {
                                 t[st][0] = t[st][1] = t[st][2] = 0.0f;
