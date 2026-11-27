@@ -1558,23 +1558,22 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         /* The segment scan, the default: the bytes between
                          * the previous PUT and this one. The pushbuffer is a
                          * ring, so PUT coming back below where it was is a
-                         * wrap, not a rewind; the ring's bounds are learned
-                         * from the lowest and highest PUT seen. */
-                        static uint32_t put_lo, put_hi;
+                         * wrap, not a rewind: the scan follows the JUMP the
+                         * title left at the wrap. Without one, the ring is
+                         * taken to start at the lowest PUT seen. */
+                        static uint32_t put_lo;
+                        extern int nv2a_pb_scan_wrap(uint32_t, uint32_t);
                         if (!put_lo || put < put_lo) put_lo = put;
-                        if (put > put_hi) put_hi = put;
                         if (last_put && put > last_put) {
                             nv2a_pb_scan_segment(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                                  XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                        } else if (last_put && put < last_put) {
-                            if (put_hi > last_put)
-                                nv2a_pb_scan_segment(
-                                    XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                    XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                            if (put > put_lo)
-                                nv2a_pb_scan_segment(
-                                    XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                    XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
+                        } else if (last_put && put < last_put
+                                   && !nv2a_pb_scan_wrap(
+                                          XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                          XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu))
+                                   && put > put_lo) {
+                            nv2a_pb_scan_segment(XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
+                                                 XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
                         }
                     }
                     /* Periodic, because what the title submits at init is not
