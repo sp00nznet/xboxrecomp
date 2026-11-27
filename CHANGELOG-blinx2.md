@@ -9,6 +9,75 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.16.0] - 2026-11-27
+
+### Added
+- A native Linux build: the D3D11 backend builds against dxvk-native
+  with an SDL3 window, and librashader's D3D11 runtime loads there too,
+  so present shaders work on Linux without Proton.
+- `present.vsync`: a vsync setting on the menu for every game.
+- `audio.volume`: a master volume and an Audio page on the menu.
+- Back+L3 and F3 are among the default menu and stats bindings.
+- On a Steam Deck the menu warns when a game was started outside Steam.
+- The texture pack picker chooses packs by name, and the Pack page shows
+  the pack's art and info.
+- Pad recording from the overlay: a Recordings page, F1/F2/F5, a
+  playback strip, and import, export, rename, delete and Info for each
+  recording. Pad chains, setups and `!` actions, a bug-report bundle and
+  save re-signing build on it.
+- Opt-in scene ambient occlusion before the HUD (`render.ao`, Metal and
+  D3D11; off by default).
+- SMAA and CAS present shader presets, off by default.
+- Texture packs: recolour entries for palettised textures, opt-in
+  hex-tile sampling for entries marked `detile`, and a v6 mip blend mark
+  for minified 2D chains.
+- Developer tools: `RECOMP_TRACE=d3d11_prof` GPU timestamps,
+  `RECOMP_DEBUG=host_cpus`, a sampler bucketing tool
+  (`tools/prof/prof_buckets.py`), `host_prof`'s `prof_dur`, a per-batch
+  cost trace, `RECOMP_TRACE=suspend` and `apu_stream`, PNG frame and
+  texture dumps deflated on writer threads, and a store-tracing
+  generator option (`recomp --trace-stores`).
+- A `[FATAL]` crash line from the env layer on every host.
+
+### Changed
+- The run-ahead walker is on by default (depth 64): BLiNX 1 stage 1-3 on
+  the Steam Deck goes from 27.6-29.5 to 30 fps at stock, and from 20.8 to
+  25.9 enhanced. Deterministic mode keeps the lockstep; `run_ahead=0`
+  restores it.
+- The occlusion settle waits on the GPU instead of spinning, and the
+  checkpoint and semaphore defers while a report is pending are on by
+  default.
+- Faster pushbuffer execution: merge chains stay open across face flips,
+  program and constant uploads decode as one run, indices go through the
+  vertex ring, the D3D11 index buffer is bound once, and the walker's
+  per-word decode is lighter.
+- The overlay menu draws at the display's native pixels, on the SDL
+  D3D11 host as well, and keeps the window's shape under gamescope.
+- Under Windows and Wine, stdio is buffered and flushed once a flip.
+- The build restages present shaders only when they changed.
+- NOTICE lists the LGPL components, stb_image_write, the overlay asset
+  terms and the patched x86-64 Linux librashader.
+
+### Fixed
+- Quantum Redshift's in-race music no longer hiccups: a dry persist
+  stream plays the first sound list the title re-arms.
+- The recompiler assigns flags at joins it cannot follow instead of
+  reading unset flags.
+- TEXFILTER's signed channels (bits 28-31) on D3D11 and Metal.
+- BLiNX 1's lens flares no longer draw through walls on D3D11 (AO passes
+  stay out of an open visibility test).
+- Scene AO no longer flickers, including on content drawn after a pass
+  at unchanged depth (BLiNX 2's 1-1 pool water).
+- A thread another thread suspended now parks at a suspend point, which
+  cuts JSRF's CPU pressure on native Linux from 48% to 1.3%.
+- The 1 ms host timer period is taken at kernel init for every vblank
+  mode, so unpaced titles no longer underrun XAudio2.
+- A pad binding held through boot no longer fires on the first poll.
+- The menu never loads librashader on the pad thread (JSRF's pad on the
+  Steam Deck).
+- A pad session closes before it is removed on a signal.
+- `render.snap_2d` leaves texture-pack stages as they are with it off.
+
 ## [blinx2-v0.15.0] - 2026-11-07
 
 ### Added
