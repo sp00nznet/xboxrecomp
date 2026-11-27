@@ -2477,6 +2477,94 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
         out[0] = out[1] = out[2] = out[3] = 1.0f;
 }
 
+/* Bits of depth in a texture of a depth buffer's format (D24S8, D16, swizzled
+ * or linear), 0 for any other format. Float depths are not read. */
+static uint32_t depth_texel_bits(uint32_t fmt)
+{
+    switch (fmt) {
+    case 0x2A: case 0x2E: return 24;              /* D24S8, LIN_D24S8 */
+    case 0x2C: case 0x30: return 16;              /* D16, LIN_D16     */
+    default:              return 0;
+    }
+}
+
+/* The depth at texel (u, v) of a depth texture. A title samples the depth
+ * buffer it drew (shadow maps): the rasteriser keeps that one on the host,
+ * not in guest memory, so it is read from there when the texture's address is
+ * a depth buffer's; otherwise from the texture's own memory. */
+static float depth_texel(const Texture *t, int32_t u, int32_t v, uint32_t bits)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bpp = bits == 24 ? 4 : 2, word = 0;  /* D24S8: depth and stencil in a word */
+    int i;
+
+    if (t->border_color
+        && ((t->addr_u == 4 && (u < 0 || u >= (int32_t)t->width))
+         || (t->addr_v == 4 && (v < 0 || v >= (int32_t)t->height))))
+        word = t->border;
+    else {
+        uint32_t x = wrap_coord((uint32_t)u, t->width, t->addr_u);
+        uint32_t y = wrap_coord((uint32_t)v, t->height, t->addr_v);
+        for (i = 0; i < 4; i++)
+            if (s_zbufs[i].z && dma_resolve(s_zbufs[i].offset) == t->offset
+                && x < NV_ZBUF_W && y < NV_ZBUF_H)
+                return s_zbufs[i].z[(size_t)y * NV_ZBUF_W + x];
+        if (d3d8_format_is_swizzled(t->color))
+            memcpy(&word, mem + t->offset
+                   + (size_t)swizzle_offset(x, y, t->width, t->height) * bpp, bpp);
+        else
+            memcpy(&word, mem + t->offset + (size_t)y * t->pitch + (size_t)x * bpp, bpp);
+    }
+    return bits == 24 ? (float)(word >> 8) : (float)(word & 0xFFFFu);
+}
+
+/* SET_SHADOW_COMPARE_FUNC: does the coordinate compare so with the depth? */
+static float shadow_compared(float ref, float z)
+{
+    switch (s_reg[0x1E6C / 4] & 7) {
+    case 0:  return 0.0f;
+    case 1:  return ref >  z ? 1.0f : 0.0f;
+    case 2:  return ref == z ? 1.0f : 0.0f;
+    case 3:  return ref >= z ? 1.0f : 0.0f;
+    case 4:  return ref <  z ? 1.0f : 0.0f;
+    case 5:  return ref != z ? 1.0f : 0.0f;
+    case 6:  return ref <= z ? 1.0f : 0.0f;
+    default: return 1.0f;
+    }
+}
+
+/* A depth texture sampled at (u, v) with r = `ref`, both divided by q: how
+ * many of the texels pass the compare, all four channels alike. With a
+ * linear filter, the four around the point weighted as a bilinear tap. */
+static void rc_shadow(const Texture *t, float u, float v, float ref,
+                      uint32_t bits, float out[4])
+{
+    float most = bits == 24 ? 16777215.0f : 65535.0f, r;
+    int j;
+
+    if (tex_size_from_format(t->color)) {
+        u *= (float)t->width;
+        v *= (float)t->height;
+    }
+    ref = ref < 0.0f ? 0.0f : (ref > most ? most : ref);
+    if (((t->filter >> 24) & 0xF) == 1) {         /* MAG nearest */
+        r = shadow_compared(ref, depth_texel(t, (int32_t)floorf(u),
+                                             (int32_t)floorf(v), bits));
+    } else {
+        float fu = u - 0.5f, fv = v - 0.5f;
+        int32_t iu = (int32_t)floorf(fu), iv = (int32_t)floorf(fv);
+        float wu = fu - (float)iu, wv = fv - (float)iv;
+        float p00 = shadow_compared(ref, depth_texel(t, iu,     iv,     bits));
+        float p10 = shadow_compared(ref, depth_texel(t, iu + 1, iv,     bits));
+        float p01 = shadow_compared(ref, depth_texel(t, iu,     iv + 1, bits));
+        float p11 = shadow_compared(ref, depth_texel(t, iu + 1, iv + 1, bits));
+        r = (p00 * (1.0f - wu) + p10 * wu) * (1.0f - wv)
+          + (p01 * (1.0f - wu) + p11 * wu) * wv;
+    }
+    for (j = 0; j < 4; j++)
+        out[j] = r;
+}
+
 /* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
  * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
 static int rc_stage_fetch(int st, const float c[4], const float *cx,
@@ -2491,6 +2579,10 @@ static int rc_stage_fetch(int st, const float c[4], const float *cx,
         out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f;
         return 1;
     case 1: case 2:                               /* PROJECT2D / 3D */
+        if (depth_texel_bits(t->color) && t->valid) {
+            rc_shadow(t, c[0] / q, c[1] / q, c[2] / q, depth_texel_bits(t->color), out);
+            return 1;
+        }
         if (cx && cy) {                           /* neighbours: the gradient */
             float qx = cx[3] != 0.0f ? cx[3] : 1.0f, qy = cy[3] != 0.0f ? cy[3] : 1.0f;
             float u = c[0] / q, v = c[1] / q;
