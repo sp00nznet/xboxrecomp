@@ -114,7 +114,10 @@ uploaded and a fixed-function mode, `ffp_vertex()` transforms attribute 0,
 divides by w and adds the offset, and hands the result on in the shape a vertex
 program produces. So a fixed-function batch shares everything after the
 transform with a program batch: near-plane clipping, the four texture stages,
-the combiners and the depth buffer. The 16 floats apply as
+the combiners and the depth buffer. The divide is done as D3D's programs end,
+the interpreter's `RCC` of w and then a multiply-add with the offset, so a
+program pass over a fixed-function pass's vertices gets the same depths
+(a title may draw its lights so, with a depth test of `EQUAL`). The 16 floats apply as
 `clip[i] = Σ M[4i+j] · pos[j]` (translation in `M[3]`, `M[7]`, `M[11]`),
 **not** as a row vector times the matrix; the other order puts every vertex
 near `(0, 0)`. `RECOMP_FFP_TRACE` prints the matrix and a few raw and

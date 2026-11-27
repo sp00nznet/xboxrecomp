@@ -2043,10 +2043,19 @@ static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
     if (fabsf(w) <= 1e-6f)
         return 0;
 
+    /* Divided as D3D's vertex programs end (RCC of w, then a MAD with the
+     * offset), not by w: a title may draw a light over a fixed-function pass
+     * with a program and a depth test of EQUAL, and a quotient differs from
+     * the program's product in the last bit at a part of the pixels. */
     memset(out, 0, sizeof *out);
-    out->pos[0] = (clip[0] / w + off[0]) * s_gpu.aa_sx;
-    out->pos[1] = (clip[1] / w + off[1]) * s_gpu.aa_sy;
-    out->pos[2] = clip[2] / w + off[2];
+    {
+        float r = nv2a_vsh_rcc(w);
+
+        for (i = 0; i < 3; i++)
+            out->pos[i] = clip[i] * r + off[i];
+    }
+    out->pos[0] *= s_gpu.aa_sx;
+    out->pos[1] *= s_gpu.aa_sy;
     out->pos[3] = w;
 
     if (!lit_color(index, c) && !fetch_attr(color_attr(), index, c))
