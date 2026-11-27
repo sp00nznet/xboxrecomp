@@ -60,6 +60,14 @@ int main(void)
           reg(d, NV_PAPU_FEDECMETH) == SE2FE_IDLE_VOICE
               && reg(d, NV_PAPU_FEDECPARAM) == 66);
     CHECK("trap asks for the line", d->set_irq);
+
+    /* 1b. The title's methods while trapped leave the trapped one for the
+     *     ISR (a float argument once read as the voice). */
+    mcpx_apu_mmio_write(d, VP(NV1BA0_PIO_SET_ANTECEDENT_VOICE), 0x3C304B3Du, 4);
+    CHECK("PIO while trapped keeps FEDECMETH/PARAM",
+          reg(d, NV_PAPU_FEDECMETH) == SE2FE_IDLE_VOICE
+              && reg(d, NV_PAPU_FEDECPARAM) == 66);
+    mcpx_apu_mmio_write(d, VP(NV1BA0_PIO_SET_ANTECEDENT_VOICE), 0, 4);
     settle(d);
     CHECK("FETINTSTS latched", reg(d, NV_PAPU_ISTS) & NV_PAPU_ISTS_FETINTSTS);
     CHECK("line asserted", line(d));
