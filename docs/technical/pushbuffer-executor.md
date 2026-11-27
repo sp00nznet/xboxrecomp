@@ -186,6 +186,15 @@ contiguous window); a read outside it returns no vertex and the batch is dropped
 `SET_VERTEX_DATA_ARRAY_FORMAT` size 7
 (`3W`) reads as three components.
 
+## Interpolation
+
+The CPU rasteriser interpolates texture coordinates, colours (diffuse and
+specular) and the fog factor in perspective, weighted by 1/w, as a GPU does.
+Colours and fog used to be linear on the screen. That is close for small
+triangles, but a triangle with clipped near corners far off the surface took
+its colour from the far corner alone: light beams coloured at the window and
+black at their far end came out black. `tests/nv2a_persp_color` checks it.
+
 ## Render Back Ends
 
 `nv2a_backend.h` is the interface. A game project registers `clear`, `draw` and
