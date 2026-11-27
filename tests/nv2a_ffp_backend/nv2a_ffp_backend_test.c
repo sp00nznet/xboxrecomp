@@ -187,6 +187,36 @@ int main(void)
     mf(0x1080 + 0x24, 1.0f);                          /* light 1 out of range: only light 0 */
     m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
     CHECK((s_be.v[0].diffuse & 0x0000FF00u) == 0);
+
+    /* Emission from the vertex, whose colour is 0x804020: added as SET_MATERIAL_EMISSION
+     * says (1, as D3D sets it), to the scene's ambient and the lights; likewise ambient,
+     * with the global one there. Without COLOR_MATERIAL the register is not read. */
+    m(0x03BC, 1);
+    mf(0x1000 + 0x0C, 0.2f);
+    mf(0x0A10, 0.2f);
+    for (i = 0; i < 3; i++)
+        mf(0x03A8 + 4 * i, 1.0f);
+    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+    CHECK(s_be.v[0].diffuse == 0xFF660000u);          /* 0.2 + 0.2 */
+    m(0x0298, 1);
+    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+    CHECK(s_be.v[0].diffuse == 0xFFE64020u);          /* and 0x80 / 255, ... */
+    for (i = 0; i < 3; i++)
+        mf(0x03A8 + 4 * i, 0.5f);
+    m(0x0298, 1u << 2);
+    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+    CHECK(s_be.v[0].diffuse == 0xFFA62010u);
+    m(0x0298, 2);                                     /* the specular colour */
+    m(0x1730, 0x3100); m(0x1770, 0 | (4 << 4) | (4 << 8));
+    for (i = 0; i < 3; i++)
+        put32(0x3100 + 4 * i, 0xFF00FF00u);
+    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+    CHECK(s_be.v[0].diffuse == 0xFF668000u);
+    m(0x1770, 2);
+    m(0x0298, 0);
+    for (i = 0; i < 3; i++)
+        mf(0x03A8 + 4 * i, 0.0f);
+    mf(0x0A10, 0.0f);
     m(0x0314, 0);
 
     /* Anti-aliasing off: the same transform lands unscaled. */
