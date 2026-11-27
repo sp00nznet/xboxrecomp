@@ -19,6 +19,8 @@
  *            lands on a texel centre, so the blend is that one texel).
  *            Anisotropic filtering averages the three texels each pixel
  *            covers, so every pixel comes out near mid-grey.
+ *   ay8      2x1 texels of AY8, swizzled and linear, every byte 0x40: the
+ *            byte is all four channels, in every mode.
  *
  * Harness as tests/nv2a_raster_batch: no back end is registered, so the
  * software path draws. */
@@ -35,6 +37,9 @@
 #define COLOR2_AT 0x20000u
 #define TEX1_AT   0x30000u
 #define TEX2_AT   0x31000u
+#define COLOR3_AT 0x24000u
+#define COLOR4_AT 0x28000u
+#define TEX3_AT   0x32000u
 #define POS_AT    0x40000u
 #define UV_AT     0x41000u
 #define DIFF_AT   0x42000u
@@ -79,14 +84,14 @@ static void put_vertex(uint32_t n, float x, float y, float u, float v)
 
 /* A 64x64 quad (two triangles) with u running 0..u1 and v 0..1 across it,
  * drawn on the surface at `color_at` through the texture at `tex_at`. */
-static void draw_quad(uint32_t color_at, uint32_t tex_at, uint32_t tex_w,
-                      float u1, uint32_t wrap)
+static void draw_quad_fmt(uint32_t color_at, uint32_t tex_at, uint32_t tex_w,
+                          float u1, uint32_t wrap, uint32_t format, uint32_t bpp)
 {
     m(0x0210, color_at);                           /* SET_SURFACE_COLOR_OFFSET */
     m(0x1B00, tex_at);                             /* TEXTURE_OFFSET */
-    m(0x1B04, (0x12u << 8) | (1u << 16));          /* FORMAT: LIN_A8R8G8B8, 1 level */
+    m(0x1B04, format);                             /* FORMAT */
     m(0x1B08, wrap | (wrap << 8));                 /* ADDRESS: u and v */
-    m(0x1B10, (tex_w * 4u) << 16);                 /* CONTROL1: pitch */
+    m(0x1B10, (tex_w * bpp) << 16);                /* CONTROL1: pitch */
     m(0x1B1C, (tex_w << 16) | 1u);                 /* IMAGE_RECT: tex_w x 1 */
     put_vertex(0, 0,  0,  0,  0);
     put_vertex(1, W,  0,  u1, 0);
@@ -99,11 +104,23 @@ static void draw_quad(uint32_t color_at, uint32_t tex_at, uint32_t tex_w,
     m(0x17FC, 0);
 }
 
-static int gray(uint32_t color_at, int x, int y)
+static void draw_quad(uint32_t color_at, uint32_t tex_at, uint32_t tex_w,
+                      float u1, uint32_t wrap)
+{
+    draw_quad_fmt(color_at, tex_at, tex_w, u1, wrap,
+                  (0x12u << 8) | (1u << 16), 4);   /* LIN_A8R8G8B8, 1 level */
+}
+
+static uint32_t pixel(uint32_t color_at, int x, int y)
 {
     uint32_t p;
     memcpy(&p, s_mem + color_at + 4u * (uint32_t)(y * W + x), 4);
-    return (int)(p & 0xFFu);
+    return p;
+}
+
+static int gray(uint32_t color_at, int x, int y)
+{
+    return (int)(pixel(color_at, x, y) & 0xFFu);
 }
 
 int main(int argc, char **argv)
@@ -126,6 +143,7 @@ int main(int argc, char **argv)
     memcpy(s_mem + TEX1_AT + 4, &white, 4);
     for (x = 0; x < 64; x++)                     /* odd texels white */
         memcpy(s_mem + TEX2_AT + 4 * x, (x & 1) ? &white : &black, 4);
+    s_mem[TEX3_AT] = s_mem[TEX3_AT + 1] = 0x40;  /* AY8: one byte a texel */
 
     m(0x0208, 0x0008);                           /* SET_SURFACE_FORMAT: A8R8G8B8, no AA */
     m(0x0200, (uint32_t)W << 16);                /* CLIP_HORIZONTAL */
@@ -153,6 +171,17 @@ int main(int argc, char **argv)
 
     draw_quad(COLOR1_AT, TEX1_AT, 2, 2.0f, 3);       /* ramp: clamp */
     draw_quad(COLOR2_AT, TEX2_AT, 64, 192.0f, 1);    /* stripes: wrap */
+    /* AY8, swizzled (0x01, 2x1 from FORMAT's log2 sizes) and linear (0x1B). */
+    draw_quad_fmt(COLOR3_AT, TEX3_AT, 2, 2.0f, 3, (0x01u << 8) | (1u << 16) | (1u << 20), 1);
+    draw_quad_fmt(COLOR4_AT, TEX3_AT, 2, 2.0f, 3, (0x1Bu << 8) | (1u << 16), 1);
+    for (x = 0; x < 2; x++) {
+        uint32_t at = x ? COLOR4_AT : COLOR3_AT, p = pixel(at, 32, 32);
+        /* The byte is luminance and alpha. The rc variant's final alpha is 1. */
+        uint32_t want = strcmp(variant, "rc") ? 0x40404040u : 0xFF404040u;
+        printf("ay8 %s: 0x%08X\n", x ? "linear" : "swizzled", p);
+        CHECK(p == want, "ay8 %s is 0x%08X, want 0x%08X",
+              x ? "linear" : "swizzled", p, want);
+    }
 
     /* ramp, row 32 */
     mid = gray(COLOR1_AT, 32, 32);

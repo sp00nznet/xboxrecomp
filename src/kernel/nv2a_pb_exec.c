@@ -1145,6 +1145,7 @@ static uint32_t linear_twin(uint32_t fmt)
 {
     switch (fmt) {
     case 0x00: return 0x13;                /* L8        -> LIN_L8        */
+    case 0x01: return 0x1B;                /* AY8       -> LIN_AY8       */
     case 0x02: return 0x10;                /* A1R5G5B5  -> LIN_A1R5G5B5  */
     case 0x03: return 0x1C;                /* X1R5G5B5  -> LIN_X1R5G5B5  */
     case 0x04: return 0x1D;                /* A4R4G4B4  -> LIN_A4R4G4B4  */
@@ -1306,6 +1307,9 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     }
     case 0x1F:                                      /* LIN_A8 */
         *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
+        return 1;
+    case 0x1B:                                      /* LIN_AY8: one byte, all four */
+        *argb = (uint32_t)p[u] * 0x01010101u;
         return 1;
 
     /* 4:2:2 packed YUV, two texels per four bytes.
