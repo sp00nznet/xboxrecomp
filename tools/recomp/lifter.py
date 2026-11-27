@@ -381,6 +381,39 @@ COND_MAP = {
     "jcxz":  (None,      None,      "cx is zero"),
 }
 
+# The flag state of a join whose edges do not agree on a setter (see
+# _join_state in translator.py). Its conditions read the real flag bits out
+# of g_eflags, which every edge with a known setter writes just before it
+# reaches the join (publish_flags with a mask). The _cf form keeps CF in _cf
+# instead: it is the state of a join where some edge has nothing to write,
+# in a function that tracks the carry, where a jb/jae read _cf before.
+JOIN_EFLAGS = "__join_eflags"
+JOIN_EFLAGS_CF = "__join_eflags_cf"
+_JOIN_STATES = frozenset({JOIN_EFLAGS, JOIN_EFLAGS_CF})
+
+# The EFLAGS bits a condition reads, by its condition code.
+_CF, _PF, _ZF, _SF, _OF = 0x1, 0x4, 0x40, 0x80, 0x800
+FLAG_BITS = ((_CF, "jb", "CF"), (_PF, "jp", "PF"), (_ZF, "je", "ZF"),
+             (_SF, "js", "SF"), (_OF, "jo", "OF"))
+_CC_BITS = {
+    "b": _CF, "nae": _CF, "c": _CF, "ae": _CF, "nb": _CF, "nc": _CF,
+    "e": _ZF, "z": _ZF, "ne": _ZF, "nz": _ZF,
+    "be": _CF | _ZF, "na": _CF | _ZF, "a": _CF | _ZF, "nbe": _CF | _ZF,
+    "s": _SF, "ns": _SF, "o": _OF, "no": _OF,
+    "p": _PF, "pe": _PF, "np": _PF, "po": _PF, "u": _PF, "nu": _PF,
+    "l": _SF | _OF, "nge": _SF | _OF, "ge": _SF | _OF, "nl": _SF | _OF,
+    "le": _ZF | _SF | _OF, "ng": _ZF | _SF | _OF,
+    "g": _ZF | _SF | _OF, "nle": _ZF | _SF | _OF,
+}
+
+
+def cond_bits(mnemonic):
+    """The EFLAGS bits a jcc, setcc, cmovcc or fcmovcc reads; 0 for others."""
+    for prefix in ("fcmov", "cmov", "set", "j"):
+        if mnemonic.startswith(prefix):
+            return _CC_BITS.get(mnemonic[len(prefix):], 0)
+    return 0
+
 # Instructions that set arithmetic flags (primary set, fully handled)
 FLAG_SETTERS = frozenset({
     "cmp", "test", "sub", "add", "and", "or", "xor",
@@ -626,7 +659,8 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
-                        "fucomip", "fcomi", "sahf", "eflags"):
+                        "fucomip", "fcomi", "sahf", "eflags") or (
+            flag_setter in _JOIN_STATES):
         # EFLAGS must survive later x87 status changes and AH writes.
         # FCOMI clears SF/OF; SAHF loads SF from AH and preserves OF.
         # "eflags" is the state popfd leaves: the same bit layout, read from
@@ -647,8 +681,12 @@ def _make_condition(jcc, flag_setter, flag_ops):
         }
         expr = fpu_cmp_map.get(jcc)
         if expr:
-            if flag_setter == "eflags":
+            if flag_setter == JOIN_EFLAGS_CF:
+                expr = expr.replace(cf, "_cf")
+            if flag_setter == "eflags" or flag_setter in _JOIN_STATES:
                 expr = expr.replace("_fa", "g_eflags")
+            if flag_setter in _JOIN_STATES:
+                return f"{expr} /* join eflags */", desc
             return f"{expr} /* {flag_setter} */", desc
         return None
 
@@ -4196,23 +4234,34 @@ def _is_rep_compare(insn):
                                    "scasb", "scasw", "scasd"))
 
 
-def publish_flags(state, note="flags for pushfd"):
+_READS_CF = re.compile(r"\b_cf\b")
+
+
+def publish_flags(state, note="flags for pushfd", want=0x8C5, has_cf=True):
     """Write the tracked setter's CF/PF/ZF/SF/OF into g_eflags.
 
     Each flag comes from the condition a jcc on it would use (_make_condition),
     so the image and the branches agree, and a flag with no rule keeps the bit
-    g_eflags held. Only pushfd calls it: the flags stay lazy everywhere else,
-    and code that never pushes them pays nothing. A boundary that has to carry
-    the flags too (a call, a ret) can call it with its own note.
+    g_eflags held. pushfd publishes all five; an edge into a join that reads
+    its flags from g_eflags (JOIN_EFLAGS) publishes the bits in `want`, the
+    ones the join and the blocks after it read. Everywhere else the flags stay
+    lazy, and code that never needs them pays nothing. `has_cf` False drops a
+    flag whose rule reads _cf, for a function that does not declare it.
     """
-    if not state or state[0] == "eflags":
+    if not state or state[0] in ("eflags", JOIN_EFLAGS):
         return []
+    if state[0] == JOIN_EFLAGS_CF:
+        # Every flag but CF is in g_eflags already; CF lives in _cf.
+        if not want & _CF:
+            return []
+        return [f"g_eflags = (g_eflags & ~0x1u) | (_cf ? 0x1u : 0u); /* {note} */"]
     mask = 0
     bits = []
-    for condition, bit in (("jb", 1), ("jp", 4), ("je", 0x40),
-                           ("js", 0x80), ("jo", 0x800)):
+    for bit, condition, _ in FLAG_BITS:
+        if not want & bit:
+            continue
         value = _make_condition(condition, *state)
-        if value:
+        if value and (has_cf or not _READS_CF.search(value[0])):
             mask |= bit
             bits.append(f"(({value[0]}) ? 0x{bit:X}u : 0u)")
     if not bits:
@@ -4326,8 +4375,40 @@ def lift_basic_block(lifter, bb, flag_state=None):
     # g_eflags, so a pushfd there has nothing missing to flag.
     cf_only_over = None
 
+    # Which flags the block reads from the state it came in with, before a
+    # setter of its own replaces it. The translator uses them at joins that
+    # read g_eflags (JOIN_EFLAGS): those bits are what each edge into the
+    # join has to write. incoming_fallback says a reader found the incoming
+    # state unable to answer it. incoming_after_call holds the bits read
+    # after a call: call is in _EFLAGS_PRESERVE, so the incoming state is
+    # still the one read there, but a g_eflags join read then sees what the
+    # callee left in g_eflags (its own pushfd or joins), where a lazy state
+    # reads this function's snapshot. The translator reports those reads.
+    lifter.incoming_reads = 0
+    lifter.incoming_consumers = []
+    lifter.incoming_fallback = False
+    lifter.incoming_after_call = 0
+    live = True
+    crossed_call = False
+
+    def read_incoming(bits, mnemonic, answered):
+        if not live:
+            return
+        if not answered:
+            lifter.incoming_fallback = True
+            return
+        if last_flag_setter == JOIN_EFLAGS_CF:
+            bits &= ~_CF
+        lifter.incoming_reads |= bits
+        if crossed_call:
+            lifter.incoming_after_call |= bits
+        lifter.incoming_consumers.append(mnemonic)
+
     while i < len(insns):
         curr = insns[i]
+        if i and insns[i - 1].mnemonic.startswith("call"):
+            crossed_call = True
+        before = (last_flag_setter, last_flag_ops)
 
         # Try cmp/test + jcc pattern first (2-instruction match)
         match = try_match_cmp_jcc(insns, i, lifter=lifter)
@@ -4346,6 +4427,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 stmts.extend(lifter._snapshot_flags(
                     flag_insn, last_flag_ops, last_flag_setter))
             stmts.append(stmt)
+            live = False
             i += consumed
             continue
 
@@ -4367,6 +4449,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
                     last_flag_setter, last_flag_ops)
                 if probe:
                     zf_expr = probe[0]
+            if curr.mnemonic != "loop":
+                read_incoming(_ZF, curr.mnemonic, zf_expr is not None)
             stmts.extend(lifter._lift_loop(curr, zf_expr))
             i += 1
             continue
@@ -4379,6 +4463,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
         # camera, every matrix and the stunt-distance readout went NaN.
         # The flags come from the tracked setter, through the same
         # conditions the jcc forms use. AF is not modelled and reads 0.
+        if curr.mnemonic == "lahf":
+            read_incoming(_SF | _ZF | _PF | _CF, "lahf", bool(last_flag_setter))
         if curr.mnemonic == "lahf" and last_flag_setter:
             bits = []
             for jcc, bit in (("js", 0x80), ("je", 0x40), ("jp", 0x04),
@@ -4402,12 +4488,14 @@ def lift_basic_block(lifter, bb, flag_state=None):
         if curr.mnemonic == "pushfd" and last_flag_setter:
             state = (last_flag_setter, last_flag_ops)
             stmts.extend(publish_flags(state))
-            in_eflags = last_flag_setter == "eflags" or (
-                last_flag_setter == "__cf_only" and cf_only_over == "eflags")
+            in_g_eflags = ("eflags",) + tuple(_JOIN_STATES)
+            in_eflags = last_flag_setter in in_g_eflags or (
+                last_flag_setter == "__cf_only" and cf_only_over in in_g_eflags)
             missing = [name for jcc, name in (("jb", "CF"), ("jp", "PF"),
                                               ("je", "ZF"), ("js", "SF"),
                                               ("jo", "OF"))
                        if not in_eflags and not _make_condition(jcc, *state)]
+            read_incoming(_CF | _PF | _ZF | _SF | _OF, "pushfd", not missing)
             if missing:
                 source = ("stc/clc/cmc" if last_flag_setter == "__cf_only"
                           else last_flag_setter)
@@ -4417,6 +4505,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
                              f' rebuilt after {source}, kept from g_eflags",'
                              f' 0x{curr.address:08X}u);')
         elif curr.mnemonic == "pushfd":
+            read_incoming(0, "pushfd", False)
             # No tracked setter (function entry, after a call, a join whose
             # paths disagree, an instruction that leaves the flags undefined):
             # the pushed image is g_eflags as last written. A comment, not
@@ -4427,9 +4516,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
                          " as last written */")
 
         # Check if this instruction uses flags (jcc, setcc, cmovcc)
-        if curr.is_cond_jump and last_flag_setter:
-            result = _make_condition(
+        if curr.is_cond_jump:
+            result = (_make_condition(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
+                      if last_flag_setter else None)
+            read_incoming(cond_bits(curr.mnemonic), curr.mnemonic, bool(result))
             if result:
                 cond_expr, desc = result
                 target = curr.jump_target
@@ -4444,9 +4535,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
         if (curr.mnemonic in ("sete", "setne", "setb", "setae", "setbe",
                               "seta", "setl", "setge", "setle", "setg",
                               "sets", "setns", "setp", "setnp", "setpe", "setpo", "seto", "setno")
-                and last_flag_setter and len(curr.operands) >= 1):
-            cond = _make_setcc_value(
+                and len(curr.operands) >= 1):
+            cond = (_make_setcc_value(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
+                    if last_flag_setter else None)
+            read_incoming(cond_bits(curr.mnemonic), curr.mnemonic, bool(cond))
             if cond:
                 setcc = [_fmt_operand_write(curr.operands[0],
                                             f"({cond}) ? 1 : 0")
@@ -4461,9 +4554,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
                               "cmovbe", "cmova", "cmovl", "cmovge",
                               "cmovle", "cmovg", "cmovs", "cmovns",
                               "cmovp", "cmovnp", "cmovpe", "cmovpo", "cmovo", "cmovno")
-                and last_flag_setter and len(curr.operands) >= 2):
-            cond = _make_cmovcc_cond(
+                and len(curr.operands) >= 2):
+            cond = (_make_cmovcc_cond(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
+                    if last_flag_setter else None)
+            read_incoming(cond_bits(curr.mnemonic), curr.mnemonic, bool(cond))
             if cond:
                 src = _fmt_operand_read(curr.operands[1])
                 stmts.append(
@@ -4476,11 +4571,14 @@ def lift_basic_block(lifter, bb, flag_state=None):
         if curr.mnemonic == "sahf":
             overflow = (_make_condition("jo", last_flag_setter, last_flag_ops)
                         if last_flag_setter else None)
+            read_incoming(_OF, "sahf", overflow is not None)
             stmts.append(f"_fb = ({overflow[0] if overflow else '0'}) != 0; /* SAHF preserves OF */")
 
-        if curr.mnemonic in _FCMOV_JCC and last_flag_setter:
-            cond = _make_condition(_FCMOV_JCC[curr.mnemonic],
-                                   last_flag_setter, last_flag_ops)
+        if curr.mnemonic in _FCMOV_JCC:
+            cond = (_make_condition(_FCMOV_JCC[curr.mnemonic],
+                                    last_flag_setter, last_flag_ops)
+                    if last_flag_setter else None)
+            read_incoming(cond_bits(curr.mnemonic), curr.mnemonic, bool(cond))
             if cond:
                 stmts.append(_fcmov_statement(curr, cond[0]))
                 i += 1
@@ -4513,8 +4611,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # is `xor eax, eax; repe cmpsb; je` with the count = the shorter
             # length, so comparing against an empty string took the wrong
             # arm. Load the incoming ZF first, when a tracked setter has one.
-            if _is_rep_compare(curr) and last_flag_setter:
-                zf = _make_condition("je", last_flag_setter, last_flag_ops)
+            if _is_rep_compare(curr):
+                zf = (_make_condition("je", last_flag_setter, last_flag_ops)
+                      if last_flag_setter else None)
+                read_incoming(_ZF, curr.mnemonic, zf is not None)
                 if zf:
                     stmts.append(f"_flags = ({zf[0]}) ? 1 : 0;"
                                  " /* ZF in: a zero count keeps it */")
@@ -4537,9 +4637,15 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 curr.mnemonic, list(curr.operands))
         elif curr.mnemonic in ("stc", "clc", "cmc"):
             # CF is now _cf (the lift writes it); nothing else is tracked.
-            if last_flag_setter != "__cf_only":
-                cf_only_over = last_flag_setter
-            last_flag_setter, last_flag_ops = "__cf_only", []
+            # Over a g_eflags join the other flags are still there, which is
+            # JOIN_EFLAGS_CF exactly (CF from _cf, the rest from g_eflags),
+            # so the join's state carries on past the stc.
+            if last_flag_setter in _JOIN_STATES:
+                last_flag_setter, last_flag_ops = JOIN_EFLAGS_CF, []
+            else:
+                if last_flag_setter != "__cf_only":
+                    cf_only_over = last_flag_setter
+                last_flag_setter, last_flag_ops = "__cf_only", []
         elif curr.mnemonic == "popfd":
             # Every flag now comes from the image popfd loaded.
             last_flag_setter, last_flag_ops = "eflags", []
@@ -4597,6 +4703,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
             last_flag_setter = None
             last_flag_ops = []
 
+        if last_flag_setter is not before[0] or last_flag_ops is not before[1]:
+            live = False
         i += 1
 
     out_flag_state = (last_flag_setter, last_flag_ops) if last_flag_setter else None

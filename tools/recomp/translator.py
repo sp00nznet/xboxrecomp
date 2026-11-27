@@ -25,7 +25,7 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .flag_fallbacks import FlagFallbacks
-from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+from .lifter import (Lifter, lift_basic_block, publish_flags, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
@@ -114,6 +114,139 @@ def _incoming_flag_state(sources, known, is_entry):
     if not all(p in known for p in sources):
         return None
     return _merge_flag_states([known[p] for p in sources])
+
+
+def _join_state(sources, known, is_entry, has_cf, unseen):
+    """The state of a join whose edges leave no single setter: its flags are
+    read from g_eflags, and each edge writes them there (_join_edges).
+
+    This is the case _incoming_flag_state answers None for: the predecessors
+    disagree, or one of them has no state to give. Their readers used to
+    compile against _flags, which nothing assigns, so a jcc there was never
+    taken and a setcc wrote 0. Every predecessor must have an out-state by
+    now, or the pre-pass has not reached it yet and the block waits a round.
+    The function entry keeps the fallback: the edge that reaches it is the
+    caller's, and nothing here can write it.
+
+    In a function that tracks the carry, a join with an edge that cannot be
+    written keeps CF in _cf (JOIN_EFLAGS_CF), which is where its jb/jae read
+    it before -- the XCompress bit reader enters its refill that way.
+    """
+    from .lifter import JOIN_EFLAGS, JOIN_EFLAGS_CF
+    if is_entry or not sources or not all(p in known for p in sources):
+        return None
+    if has_cf and (unseen or any(known[p] is None or known[p][0] == JOIN_EFLAGS_CF
+                                 for p in sources)):
+        return (JOIN_EFLAGS_CF, [])
+    return (JOIN_EFLAGS, [])
+
+
+def _is_join_state(state):
+    from .lifter import _JOIN_STATES
+    return bool(state) and state[0] in _JOIN_STATES
+
+
+def _join_edges(preds, incoming_of, out_state, reads, unseen, has_cf, ends_indirect,
+                after_call=None, calls=(), no_line=()):
+    """What each edge into a g_eflags join has to write, and what it cannot.
+
+    A carried block reads `reads[b]` itself. One that sets no flags passes
+    the join's state on, so the blocks after it read the same g_eflags and
+    their bits are its needs too. Each predecessor with a setter of its own
+    writes the needed bits from that setter as it leaves; one that passes
+    the join state on is covered by its own predecessors, and popfd's state
+    is in g_eflags already.
+
+    A read after a call (after_call, and every need passed on through a
+    block with a call) is still published for, which is right whenever the
+    callee leaves g_eflags alone, but it is listed as "after call": a callee
+    with a pushfd or a join of its own rewrites g_eflags, and the lazy states
+    elsewhere read this function's flags there instead. A predecessor with
+    no line to write at (no_line) is listed, not silently dropped.
+
+    Returns ({pred: bits to publish}, [(block, need, [(pred, bits, why)])]),
+    the second listing every carried block that reads any flag; pred is None
+    for an edge the CFG does not show, "after call" for the reads above.
+    """
+    after_call = dict(after_call or {})
+    from .lifter import FLAG_BITS, _make_condition, _READS_CF
+    from .flag_fallbacks import state_kind
+    carried = {b for b, inc in incoming_of.items() if _is_join_state(inc)}
+    succs = {}
+    for b, ps in preds.items():
+        for p in ps:
+            succs.setdefault(p, set()).add(b)
+    need = {b: reads.get(b, 0) for b in carried}
+    changed = True
+    while changed:
+        changed = False
+        for b in carried:
+            if not _is_join_state(out_state.get(b)):
+                continue
+            n = need[b]
+            passed = 0
+            for t in succs.get(b, ()):
+                passed |= need.get(t, 0)
+            n |= passed
+            if b in calls and passed & ~after_call.get(b, 0):
+                after_call[b] = after_call.get(b, 0) | passed
+                changed = True
+            if n != need[b]:
+                need[b], changed = n, True
+    publish, report = {}, []
+    for b in sorted(carried):
+        n = need[b]
+        if not n:
+            continue
+        missing = []
+        if after_call.get(b):
+            missing.append(("after call", after_call[b],
+                            "read after a call, which may rewrite g_eflags"))
+        if b in unseen:
+            missing.append((None, n, "switch or address-taken entry"))
+        for p in sorted(preds[b]):
+            o = out_state.get(p)
+            if _is_join_state(o) or (o and o[0] == "eflags"):
+                continue
+            if o is None:
+                missing.append((p, n, None))
+                continue
+            if p in ends_indirect:
+                missing.append((p, n, "switch dispatch"))
+                continue
+            if p in no_line:
+                missing.append((p, n, "no line to write at"))
+                continue
+            got = 0
+            for bit, jcc, _ in FLAG_BITS:
+                if n & bit:
+                    v = _make_condition(jcc, *o)
+                    if v and (has_cf or not _READS_CF.search(v[0])):
+                        got |= bit
+            if got:
+                publish[p] = publish.get(p, 0) | got
+            if n & ~got:
+                missing.append((p, n & ~got, f"{state_kind(o)} cannot answer"))
+        report.append((b, n, missing))
+    return publish, report
+
+
+def _lift_apart(lifter, bb, state):
+    """lift_basic_block with what it adds to lifter.unimplemented kept apart,
+    so a lift that is thrown away leaves no trace in that report (it counts
+    the title's sites, not how often the lifter ran)."""
+    real = lifter.unimplemented
+    lifter.unimplemented = {}
+    try:
+        stmts, out = lift_basic_block(lifter, bb, flag_state=state)
+        return stmts, out, lifter.unimplemented
+    finally:
+        lifter.unimplemented = real
+
+
+def _keep_unimplemented(lifter, added):
+    for k, v in added.items():
+        lifter.unimplemented.setdefault(k, []).extend(v)
 
 
 _REG_TOKEN = None
@@ -3051,19 +3184,52 @@ class FunctionTranslator:
         # settled_state onto the dict that pass fills is what makes the two
         # cases one loop: it then reads exactly the states it has computed
         # itself, which is what this function did before the probe existed.
-        out_state = {}
-        settled_state = out_state
-        if any(p >= bb.start for bb in blocks for p in preds[bb.start]):
+        unseen_entries = set(self.lifter.imm_code_refs)
+        for insn in instructions:
+            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
+                unseen_entries.update(self.lifter._analyze_switch_table(insn.operands))
+
+        def lift_block(bb, known):
+            """(incoming, stmts, out) for bb, given the out-states known so far.
+
+            A join with no agreed state reads g_eflags (_join_state); so does
+            one whose merged state cannot answer a reader of its own, since
+            each edge's setter can. The unimplemented entries of the lift
+            returned come back apart (_lift_apart) for the caller to keep."""
+            srcs = preds[bb.start]
+            is_entry = bb.start == start
+            incoming = _incoming_flag_state(srcs, known, is_entry)
+            if incoming is not None and bb.start in rejoin:
+                joined = _join_state(srcs, known, is_entry, has_carry,
+                                     bb.start in unseen_entries)
+                if joined:
+                    return (joined,) + _lift_apart(self.lifter, bb, joined)
+            if incoming is None:
+                incoming = _join_state(srcs, known, is_entry, has_carry,
+                                       bb.start in unseen_entries)
+                return (incoming,) + _lift_apart(self.lifter, bb, incoming)
+            stmts, out, added = _lift_apart(self.lifter, bb, incoming)
+            if len(srcs) > 1 and self.lifter.incoming_fallback:
+                joined = _join_state(srcs, known, is_entry, has_carry,
+                                     bb.start in unseen_entries)
+                if joined:
+                    incoming = joined
+                    stmts, out, added = _lift_apart(self.lifter, bb, incoming)
+            return incoming, stmts, out, added
+
+        has_back_edge = any(p >= bb.start for bb in blocks for p in preds[bb.start])
+
+        def settle():
+            out_state = {}
+            if not has_back_edge:
+                return out_state, out_state
             saved_unimplemented = {
                 k: list(v) for k, v in self.lifter.unimplemented.items()
             }
             for _ in range(3):
                 changed = False
                 for bb in blocks:
-                    incoming = _incoming_flag_state(
-                        preds[bb.start], out_state, bb.start == start)
-                    _, new_out = lift_basic_block(
-                        self.lifter, bb, flag_state=incoming)
+                    _, _, new_out, _ = lift_block(bb, out_state)
                     if out_state.get(bb.start) != new_out:
                         out_state[bb.start] = new_out
                         changed = True
@@ -3071,14 +3237,80 @@ class FunctionTranslator:
                     break
             self.lifter.unimplemented.clear()
             self.lifter.unimplemented.update(saved_unimplemented)
-            settled_state = out_state
-            out_state = {}
+            return {}, out_state
 
-        unseen_entries = set(self.lifter.imm_code_refs)
-        for insn in instructions:
-            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
-                unseen_entries.update(self.lifter._analyze_switch_table(insn.operands))
-        edge_vars, edge_sets, block_lines = [], [], {}
+        def plan_blocks():
+            """Each block's incoming state, statements and reads, before any
+            line is emitted, plus the merge blocks that should have been
+            joins (see below)."""
+            plan, incoming_of, more = {}, {}, set()
+            edge_vars, edge_sets = [], []
+            for bb in blocks:
+                incoming, stmts, out_state[bb.start], added = lift_block(
+                    bb, settled_state)
+                reads = self.lifter.incoming_reads
+                after_call = self.lifter.incoming_after_call
+                readers = list(self.lifter.incoming_consumers)
+                fell_back = self.lifter.incoming_fallback
+
+                # A join whose predecessors disagree, where the join's first
+                # reader is its only one: let each edge evaluate that
+                # condition (see _edge_flag_plan) into a local, which costs
+                # less than writing g_eflags. The join state still flows on
+                # through out_state, so a reader in a later block is served
+                # by the edges' g_eflags writes. Blocks that may be entered
+                # from somewhere the edge list does not know -- a switch
+                # table, a code address taken as an immediate -- keep the
+                # g_eflags form, and so does a join an edge of which passes
+                # the join state on: that edge's condition would read a
+                # g_eflags nothing wrote for it.
+                if (_is_join_state(incoming) and len(readers) == 1
+                        and bb.start not in unseen_entries
+                        and not any(_is_join_state(settled_state.get(p))
+                                    for p in preds[bb.start])):
+                    jplan = _edge_flag_plan(bb, preds[bb.start], settled_state)
+                    if jplan and jplan[0] == readers[0]:
+                        m, conds = jplan
+                        alt, _, alt_added = _lift_apart(self.lifter, bb, None)
+                        var = f"_jf_{bb.start:08X}"
+                        for k, stmt in enumerate(alt):
+                            if f"_flags /* {m}" in stmt:
+                                alt[k] = stmt.replace(f"_flags /* {m}", f"{var} /* {m}", 1)
+                                edge_vars.append(var)
+                                edge_sets.extend((p, var, c) for p, c in conds.items())
+                                stmts, reads, after_call, added = alt, 0, 0, alt_added
+                                break
+                incoming_of[bb.start] = incoming
+                plan[bb.start] = (incoming, stmts, reads, after_call, added)
+
+                # A reader the merged state cannot answer, in a block that
+                # state reached unchanged from a merge through one-way edges
+                # (a call, a mov): the merge block itself should read
+                # g_eflags, so every edge into it writes what this reader
+                # needs. The merge block's own rejoin (lift_block) only sees
+                # its own readers.
+                if fell_back and incoming is not None and not _is_join_state(incoming):
+                    m = bb.start
+                    while len(preds[m]) == 1:
+                        (p,) = preds[m]
+                        if incoming_of.get(p) != incoming or out_state.get(p) != incoming:
+                            break
+                        m = p
+                    if m != bb.start and len(preds[m]) > 1 and m not in rejoin:
+                        more.add(m)
+            return plan, incoming_of, edge_vars, edge_sets, more
+
+        # A rejoin changes the states after it, so the plan runs again until
+        # no new merge block asks for one (each round adds at least one).
+        rejoin = set()
+        for _ in range(4):
+            out_state, settled_state = settle()
+            plan, incoming_of, edge_vars, edge_sets, more = plan_blocks()
+            if not more:
+                break
+            rejoin |= more
+        block_lines = {}
+        join_reads, join_after_call = {}, {}
 
         for bb in blocks:
             # Emit label if this block is a branch target
@@ -3095,29 +3327,10 @@ class FunctionTranslator:
             # states come from the pre-pass above, so a back edge's
             # predecessor is known here even though it sits later in address
             # order.
-            incoming = _incoming_flag_state(preds[bb.start], settled_state,
-                                            bb.start == start)
-
-            stmts, out_state[bb.start] = lift_basic_block(
-                self.lifter, bb, flag_state=incoming)
-
-            # A join whose predecessors disagree: let each edge evaluate the
-            # condition (see _edge_flag_plan). Blocks that may be entered
-            # from somewhere the edge list does not know -- a switch table, a
-            # code address taken as an immediate, the function entry -- keep
-            # the fallback, since an unseen edge would leave the variable
-            # holding another edge's answer.
-            if incoming is None and bb.start != start and bb.start not in unseen_entries:
-                plan = _edge_flag_plan(bb, preds[bb.start], settled_state)
-                if plan:
-                    m, conds = plan
-                    var = f"_jf_{bb.start:08X}"
-                    for k, stmt in enumerate(stmts):
-                        if f"_flags /* {m}" in stmt:
-                            stmts[k] = stmt.replace(f"_flags /* {m}", f"{var} /* {m}", 1)
-                            edge_vars.append(var)
-                            edge_sets.extend((p, var, c) for p, c in conds.items())
-                            break
+            incoming, stmts, reads, after_call, added = plan[bb.start]
+            _keep_unimplemented(self.lifter, added)
+            join_reads[bb.start] = reads
+            join_after_call[bb.start] = after_call
 
             self.flag_fallbacks.note_block(
                 start, name, bb, stmts, preds[bb.start], settled_state,
@@ -3154,6 +3367,29 @@ class FunctionTranslator:
             if stop > first:
                 inserts.append((stop - 1 if transfers else stop,
                                 f"    {var} = ({cond}) ? 1 : 0; /* flags of this edge */"))
+        # The same places write g_eflags for the joins that read it.
+        ends_indirect = {bb.start for bb in blocks if bb.instructions
+                         and bb.instructions[-1].mnemonic == "jmp"
+                         and not bb.instructions[-1].jump_target}
+        calls = {bb.start for bb in blocks
+                 if any(i.mnemonic.startswith("call") for i in bb.instructions)}
+        no_line = {p for p, (first, stop, _) in block_lines.items() if stop <= first}
+        publish, joins = _join_edges(preds, incoming_of, out_state, join_reads,
+                                     unseen_entries, has_carry, ends_indirect,
+                                     join_after_call, calls, no_line)
+        for p, want in sorted(publish.items()):
+            first, stop, transfers = block_lines[p]
+            for text in publish_flags(out_state[p], note="flags for the join",
+                                      want=want, has_cf=has_carry):
+                inserts.append((stop - 1 if transfers else stop, f"    {text}"))
+        by_start = {bb.start: bb for bb in blocks}
+        for b, need, missing in joins:
+            self.flag_fallbacks.note_join(
+                start, name, by_start[b], need,
+                [(p, bits, why if why or not isinstance(p, int)
+                  else self.flag_fallbacks.edge_reason(
+                    by_start[p], p == start, bool(preds[p])))
+                 for p, bits, why in missing])
         for at, text in sorted(inserts, key=lambda t: -t[0]):
             lines.insert(at, text)
         if edge_vars:

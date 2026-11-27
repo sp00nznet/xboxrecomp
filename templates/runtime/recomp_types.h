@@ -256,7 +256,9 @@ extern RECOMP_TLS uint32_t g_eflags; /* EFLAGS image: pushfd, popfd */
  *
  * The arithmetic flags are lazy: a jcc rebuilds them from the instruction
  * that set them, and the lifter writes them into g_eflags only right before
- * a pushfd (publish_flags in lifter.py), so code without one pays nothing.
+ * a pushfd (publish_flags in lifter.py), or on the edges into a join whose
+ * predecessors leave different setters (translator.py _join_edges: only the
+ * bits the join reads), so straight-line code pays nothing.
  * The rest of the word lives in g_eflags too: popfd loads it, masked to the
  * bits a P3 lets ring 0 write (CF PF AF ZF SF TF IF DF OF IOPL NT AC ID),
  * with bit 1 always set. The ID bit (21) round-trips, which is how code

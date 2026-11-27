@@ -739,8 +739,11 @@ def _write_flag_fallbacks(translator, output_dir):
     with open(path, "w", newline="\n") as f:
         json.dump(doc, f, indent=1)
         f.write("\n")
+    joins = doc["join_eflags"]
     print(f"Flag fallbacks: {doc['unique_sites']} unique sites "
-          f"({doc['emitted']} emitted), {doc['joins']} at joins ({path})",
+          f"({doc['emitted']} emitted), {doc['joins']} _flags at joins; "
+          f"{joins['blocks']} g_eflags joins, {joins['partial']} with an "
+          f"unassigned edge; {doc['live_unassigned']} live unassigned ({path})",
           file=sys.stderr)
     if doc["observed_functions"]:
         print("  in observed seeds: " + ", ".join(doc["observed_functions"]),

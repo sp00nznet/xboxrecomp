@@ -12,7 +12,8 @@ STAGE1_JOIN = bytes.fromhex('85c97405' '83f800' 'eb01' '48'
                             '7401' '90' 'c3')
 
 # The same join with mul on the alternate edge: mul leaves ZF undefined, so
-# that edge has nothing to evaluate and the join still falls back.
+# that edge has nothing to write. The join reads g_eflags (the compare edge
+# writes ZF there) and is listed with the mul edge unassigned.
 MUL_JOIN = bytes.fromhex('85c97405' '83f800' 'eb02' 'f7e1'
                          '7401' '90' 'c3')
 JOIN_JE = BASE + 2 + 2 + 3 + 2 + 2
@@ -38,21 +39,30 @@ def test_a_join_each_edge_answers_is_not_a_fallback():
 def test_a_join_with_an_unknown_edge_is_reported():
     ft, db = translator_for(MUL_JOIN, [BASE])
     code = ft.translate_function(BASE, db[BASE])
-    assert '_flags /* je' in code, code
-    site = ft.flag_fallbacks.sites[(JOIN_JE, 'je')]
-    assert site['reason'] == 'some predecessor unknown', site
+    assert '_flags /* je' not in code, code
+    assert '(g_eflags & 0x40u) /* join eflags */' in code, code
+    assert ft.flag_fallbacks.sites == {}
+    doc = ft.flag_fallbacks.to_json()
+    assert doc['live_unassigned'] == 1
+    assert doc['join_eflags']['partial'] == 1
+    (join,) = doc['join_eflags']['partial_joins']
+    assert join['block'] == f'0x{JOIN_JE:08X}' and join['reads'] == 'ZF'
+    assert join['edges'] == [{'from': f'0x{BASE + 9:08X}', 'flags': 'ZF',
+                              'reason': 'undefined after mul',
+                              'class': 'isa-undefined'}]
 
 
-def test_an_alias_body_counts_the_site_once_and_keeps_the_owner_reason():
+def test_an_alias_body_counts_the_site_once():
     ft, db = translator_for(MUL_JOIN, [BASE, JOIN_JE])
     ft.translate_function(JOIN_JE, db[JOIN_JE])     # alias: enters at the je
     ft.translate_function(BASE, db[BASE])
     summary = ft.flag_fallbacks.summary()
+    # The alias body still falls back at its entry (out of scope: no edge
+    # of that body exists to write the flags); the owner joins in g_eflags.
     assert summary['unique_sites'] == 1, ft.flag_fallbacks.sites
-    assert summary['emitted'] == 2
     site = ft.flag_fallbacks.sites[(JOIN_JE, 'je')]
-    assert site['bodies'] == 2
-    assert site['reason'] == 'some predecessor unknown'
+    assert site['reason'] == 'entry block' and site['class'] == 'function-entry'
+    assert summary['live_unassigned'] == 2
 
 
 def test_an_in_block_clobber_is_reported_as_such():
@@ -67,5 +77,5 @@ def test_observed_seeds_name_their_functions():
     ft, db = translator_for(MUL_JOIN, [BASE])
     ft.translate_function(BASE, db[BASE])
     assert ft.flag_fallbacks.summary({BASE})['observed_functions'] == [
-        ft.flag_fallbacks.sites[(JOIN_JE, 'je')]['function']]
+        ft.flag_fallbacks.joins[JOIN_JE]['function']]
     assert ft.flag_fallbacks.summary(set())['observed_functions'] == []

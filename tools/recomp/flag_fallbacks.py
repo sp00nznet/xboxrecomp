@@ -14,6 +14,14 @@ fixing. It is a counted diagnostic, not an error: most sites cannot be fixed
 because there is nothing to know, and a gate on the total could never pass.
 Sites are keyed by guest address, so the alias bodies that re-emit one guest
 branch count it once.
+
+Joins no longer fall back. One whose edges leave no single setter reads its
+flags from g_eflags, and every edge with a setter writes them there first
+(translator._join_edges). An edge with nothing to write -- the function
+entry, a mul, data decoded as code, a switch arm -- is listed under
+`join_eflags` with its reason, since the read behind it can still see a
+value no edge wrote. `live_unassigned` counts both kinds of read: the
+`_flags` sites and the joins with such an edge.
 """
 import re
 
@@ -68,6 +76,32 @@ def _incoming_reason(cond, sources, known, is_entry, merged):
     return f"incoming {state_kind(merged)} cannot answer {cond}"
 
 
+def _reason_class(reason):
+    """A coarse class for a site's or an edge's reason: what it would take to
+    give that read a value."""
+    for prefix, cls in (("entry block", "function-entry"),
+                        ("function entry", "function-entry"),
+                        ("no predecessors", "unreached"),
+                        ("unreached", "unreached"),
+                        ("in-block undefined", "isa-undefined"),
+                        ("undefined after", "isa-undefined"),
+                        ("in-block untracked", "untracked-instruction"),
+                        ("untracked", "untracked-instruction"),
+                        ("switch", "unseen-edge"),
+                        ("read after a call", "across-call"),
+                        ("no line", "no-line"),
+                        ("unmatched", "unmatched")):
+        if reason.startswith(prefix):
+            return cls
+    if "cannot answer" in reason:
+        return "setter-gap"
+    return "join"
+
+
+def _flag_names(bits):
+    return ",".join(name for bit, _, name in _L.FLAG_BITS if bits & bit)
+
+
 def _in_block_reason(insns, k, cond):
     """Why the consumer at insns[k] has no state, if the block itself says:
     a setter in front of it that cannot answer the condition, or an
@@ -92,6 +126,38 @@ class FlagFallbacks:
     def __init__(self):
         self.sites = {}      # (insn address, cond) -> record
         self.emitted = 0     # every emitted consumer, alias copies included
+        self.joins = {}      # g_eflags join block address -> record
+
+    @staticmethod
+    def edge_reason(bb, is_entry, has_preds):
+        """Why a predecessor leaves no flag state to write into a join."""
+        reason = _in_block_reason(bb.instructions, len(bb.instructions), "")
+        if reason and ("undefined after" in reason or "untracked" in reason):
+            return reason[len("in-block "):]
+        if is_entry:
+            return "function entry"
+        if not has_preds:
+            return "unreached predecessor"
+        return f"no state through 0x{bb.start:08X}"
+
+    def note_join(self, func_addr, func_name, bb, need, missing):
+        """A block reading its flags from g_eflags: `need` is every bit it
+        (and the blocks it passes them to) reads, `missing` the edges that
+        cannot write some of them, as (pred or None, bits, reason)."""
+        edges = [{"from": (f"0x{p:08X}" if isinstance(p, int)
+                           else p or "unseen"),
+                  "flags": _flag_names(bits), "reason": why,
+                  "class": _reason_class(why)}
+                 for p, bits, why in missing]
+        rec = self.joins.get(bb.start)
+        if rec is None or (edges and not rec["edges"]):
+            self.joins[bb.start] = {
+                "block": f"0x{bb.start:08X}", "reads": _flag_names(need),
+                "function": func_name, "function_start": f"0x{func_addr:08X}",
+                "bodies": rec["bodies"] + 1 if rec else 1, "edges": edges,
+            }
+        else:
+            rec["bodies"] += 1
 
     def note_block(self, func_addr, func_name, bb, stmts, sources, known,
                    is_entry, merged):
@@ -122,7 +188,8 @@ class FlagFallbacks:
             if rec is None:
                 self.sites[(addr, cond)] = {
                     "address": f"0x{addr:08X}", "cond": cond,
-                    "reason": reason, "function": func_name,
+                    "reason": reason, "class": _reason_class(reason),
+                    "function": func_name,
                     "function_start": f"0x{func_addr:08X}", "bodies": 1,
                 }
             else:
@@ -133,6 +200,7 @@ class FlagFallbacks:
                 if rec["reason"] == "entry block" and reason != "entry block":
                     rec.update(reason=reason, function=func_name,
                                function_start=f"0x{func_addr:08X}")
+                    rec["class"] = _reason_class(reason)
 
     def summary(self, observed=()):
         by_reason = {}
@@ -146,15 +214,34 @@ class FlagFallbacks:
                 key = "join"
             by_reason[key] = by_reason.get(key, 0) + 1
         observed = set(observed)
-        in_observed = sorted({rec["function"] for rec in self.sites.values()
+        partial = [r for r in self.joins.values() if r["edges"]]
+        live = list(self.sites.values()) + partial
+        in_observed = sorted({rec["function"] for rec in live
                               if int(rec["function_start"], 16) in observed})
+        by_class = {}
+        for rec in self.sites.values():
+            by_class[rec["class"]] = by_class.get(rec["class"], 0) + 1
+        edge_classes = {}
+        for rec in partial:
+            for cls in sorted({e["class"] for e in rec["edges"]}):
+                edge_classes[cls] = edge_classes.get(cls, 0) + 1
+
+        def ranked(d):
+            return dict(sorted(d.items(), key=lambda kv: (-kv[1], kv[0])))
         return {
             "emitted": self.emitted,
             "unique_sites": len(self.sites),
-            "by_reason": dict(sorted(by_reason.items(),
-                                     key=lambda kv: (-kv[1], kv[0]))),
+            "by_reason": ranked(by_reason),
+            "by_class": ranked(by_class),
             "joins": len([r for r in self.sites.values()
                           if r["reason"].startswith("join: ")]),
+            "join_eflags": {
+                "blocks": len(self.joins),
+                "assigned": len(self.joins) - len(partial),
+                "partial": len(partial),
+                "partial_by_edge_class": ranked(edge_classes),
+            },
+            "live_unassigned": len(live),
             "observed_functions": in_observed,
         }
 
@@ -162,4 +249,7 @@ class FlagFallbacks:
         doc = self.summary(observed)
         doc["sites"] = sorted(self.sites.values(),
                               key=lambda r: (r["address"], r["cond"]))
+        doc["join_eflags"]["partial_joins"] = sorted(
+            (r for r in self.joins.values() if r["edges"]),
+            key=lambda r: r["block"])
         return doc

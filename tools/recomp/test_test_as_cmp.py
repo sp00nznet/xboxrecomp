@@ -239,14 +239,17 @@ def test_the_cmp_test_join_keeps_its_branch():
     assert 'CMP_EQ(_fa, _fb)' in code
 
 
-def test_a_mixed_width_join_keeps_setne_and_falls_back_for_sets():
+def test_a_mixed_width_join_reads_sign_from_each_edge():
     # test ecx,ecx; jz alt; cmp eax,1; jmp join; alt: cmp bl,1;
-    # join: setne al; sets dl; ret
+    # join: setne al; sets dl; ret. The merged compare answers setne but not
+    # sets (the widths differ), so the join reads g_eflags and each edge
+    # writes ZF and SF there at its own width.
     image = bytes.fromhex('85c97405' '83f801' 'eb03' '80fb01'
                           '0f95c0' '0f98c2' 'c3')
     code = _translate(image)
-    assert '_flags /* setne */' not in code, code
-    assert '_flags /* sets */' in code, code
+    assert '_flags /*' not in code.split('{', 1)[1], code
+    assert '((g_eflags >> 7) & 1u) /* join eflags */' in code, code
+    assert '>> 31) != 0)) ? 0x80u' in code and '>> 7) != 0)) ? 0x80u' in code
 
 
 def test_mixed_widths_join_on_each_edge_even_for_sign():
