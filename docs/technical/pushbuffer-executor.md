@@ -120,8 +120,9 @@ the combiners and the depth buffer. The 16 floats apply as
 near `(0, 0)`. `RECOMP_FFP_TRACE` prints the matrix and a few raw and
 transformed vertices, which is how the order was found.
 
-Texture coordinates are taken from the attribute streams as they are, with no
-texture-coordinate generation or texture matrix; there is no fog coordinate,
+Texture coordinates are taken from the attribute streams, through the stage's
+texture matrix where `SET_TEXTURE_MATRIX_ENABLE` says so (laid out as the
+composite matrix). There is no texture-coordinate generation, fog coordinate,
 specular, or point sprite.
 
 ### Lighting

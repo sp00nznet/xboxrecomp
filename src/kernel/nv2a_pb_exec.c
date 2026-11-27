@@ -1884,9 +1884,9 @@ static uint32_t vertex_color(uint32_t index)
  * fixed-function batch shares the program path's near-plane clipping,
  * texturing, combiners and depth buffer.
  *
- * ponytail: no texture-coordinate generation or texture matrices (texture
- * coordinates are taken from the attribute streams as they are), no fog
- * coordinate, no specular, no point sprites. */
+ * ponytail: no texture-coordinate generation (texture coordinates are taken
+ * from the attribute streams), no fog coordinate, no specular, no point
+ * sprites. */
 
 /* Is this batch transformed by the fixed-function unit? Inline-array batches
  * are left to the screen-space path, as they were before. */
@@ -2022,6 +2022,20 @@ static int lit_color(uint32_t index, float out[4])
     return 1;
 }
 
+/* SET_TEXTURE_MATRIX_ENABLE and SET_TEXTURE_MATRIX, laid out as the composite. */
+static void texture_matrix(uint32_t st, float tc[4])
+{
+    uint32_t at = 0x06C0 + 64 * st, i;
+    float in[4];
+
+    if (!s_reg[(0x0420 + 4 * st) / 4])
+        return;
+    memcpy(in, tc, sizeof in);
+    for (i = 0; i < 4; i++)
+        tc[i] = reg_f(at + 16 * i) * in[0] + reg_f(at + 16 * i + 4) * in[1]
+              + reg_f(at + 16 * i + 8) * in[2] + reg_f(at + 16 * i + 12) * in[3];
+}
+
 /* One fixed-function vertex, in the shape a vertex program produces. */
 static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
 {
@@ -2057,6 +2071,8 @@ static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
     fetch_attr(texcoord_attr(), index, out->tex[0]);
     for (st = 1; st < 4; st++)
         fetch_attr(&s_gpu.attr[9 + st], index, out->tex[st]);
+    for (st = 0; st < 4; st++)
+        texture_matrix(st, out->tex[st]);
     return 1;
 }
 
