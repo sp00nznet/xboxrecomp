@@ -93,6 +93,8 @@ The executor is itself opt-in: set `RECOMP_PB_EXEC=1` to execute the pushbuffer.
 | `RECOMP_PB_UNHANDLED_ALL` | top 10 | Lists every method the executor does not model, not only the top ten. | `nv2a_pb_exec.c` |
 | `RECOMP_VBLANK[=paced]` | no vblanks | Raises vblanks: a ~50 Hz tick, or `paced` for the 60 Hz schedule. `0` or empty is off. | `kernel_bridge.c` |
 | `RECOMP_FLIP_PACING[=edge]` | off | Holds each flip to the vblank count. | `nv2a_pb_exec.c` |
+| `RECOMP_PGRAPH_TRAP=1` | off | Traps D3D's software methods (a `NO_OPERATION` with a value) to the title's own graphics interrupt handler, as the GPU does, and holds the pushbuffer until the handler acknowledges (100 ms at most). D3D8 3925 flips this way, so its `Present` never returns without it. Windows only. | `nv2a_pb_exec.c`, `xbox_memory_layout.c`, `kernel_bridge.c` |
+| `RECOMP_TRAP_SPIN=0` | on | With the above: waits for the acknowledgement in 2 ms steps instead of polling, and answers D3D's PFB flush only once per step. | `xbox_memory_layout.c` |
 | `RECOMP_FFP_FLIP_NORMALS` | off | Lights the side of a fixed-function mesh that faces the viewer. Not hardware behaviour. | `nv2a_pb_exec.c` |
 | `RECOMP_CLIP_NEAR_Z` | on | `0` turns off the near-plane clip. | `nv2a_pb_exec.c` |
 | `RECOMP_SWIZZLED_RT` | on | `0` stops rendering into swizzled render targets. | `nv2a_pb_exec.c` |

@@ -3233,6 +3233,55 @@ static void kernel_vblank_raise(void)
     }
 }
 
+/* A software-method trap (xbox_Nv2aPgraphRaise) latched in PGRAPH: the
+ * GPU thread asks, and the timer thread, which has a guest stack and a TIB,
+ * calls the NV2A ISR on its next pass. The ISR sees PMC_INTR_0's PGRAPH bit
+ * and queues its DPC, which runs the title's handler. Masked (the DPC has
+ * PMC_INTR_EN_0 down), the bit stays latched for that DPC's next look. */
+static volatile LONG g_gpu_trap_wanted;
+
+void xbox_Nv2aRaiseGpuIrq(void)
+{
+    InterlockedExchange(&g_gpu_trap_wanted, 1);
+    xbox_HostTimerWake();
+}
+
+static void kernel_gpu_trap_deliver(void)
+{
+    kernel_call_isr(NV2A_VECTOR);
+}
+
+static void kernel_gpu_trap_tick(void)
+{
+    if (!InterlockedExchange(&g_gpu_trap_wanted, 0))
+        return;
+    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR)
+        || !(BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0) & (1u << 12))
+        || !InterlockedCompareExchange((volatile LONG *)&BRIDGE_MEM32(
+               XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_EN_0), 0, 0))
+        return;
+    xbox_IrqSetHandler(XBOX_IRQ_PGRAPH, kernel_gpu_trap_deliver);
+    /* As the vblank is delivered (kernel_vblank_raise). */
+    switch (xbox_IrqSafePointsOn() ? xbox_IrqPost(XBOX_IRQ_PGRAPH)
+                                   : XBOX_IRQ_UNGATED) {
+    case XBOX_IRQ_GATED:
+        kernel_gpu_trap_deliver();
+        xbox_DispatchGateLeave();
+        break;
+    case XBOX_IRQ_UNGATED: {
+        int gated = xbox_DispatchGateTryEnter();
+        if (!gated)
+            xbox_IrqNoteUngated(XBOX_IRQ_PGRAPH);
+        kernel_gpu_trap_deliver();
+        if (gated)
+            xbox_DispatchGateLeave();
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 /* Vblank N is due at t0 + N * 1000 / 60 ms: an absolute schedule, so the
  * rate is 60 Hz however coarse the timer thread's sleep. It used to be
  * "now + 16" checked on a 10 ms tick, which fired every 20 ms -- 50 Hz -- and
@@ -3731,6 +3780,7 @@ static void kernel_timer_loop_ns(void)
          * drains at a raise runs now rather than at the next edge. */
         xbox_HostTimerSleepNs(wait);
         kernel_vblank_tick_ns(xbox_HostNowNs(), &vbl_next);
+        kernel_gpu_trap_tick();
         busy = kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
         now_ms = kernel_timer_clock_ms();
         kernel_fire_timers(now_ms, &timer_due);
@@ -3795,6 +3845,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
             Sleep(10);
             kernel_vblank_tick();  /* the GPU's frame clock */
+            kernel_gpu_trap_tick();
             kernel_drain_dpcs(&ran);
             kernel_fire_timers(kernel_timer_clock_ms(), &timer_due);
         }

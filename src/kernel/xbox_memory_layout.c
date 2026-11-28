@@ -20,6 +20,7 @@
 #include "guest_vmem.h"
 #include "kernel_missing.h"
 #include "nv2a_flip_hold.h"
+#include "platform/host_time.h"   /* xbox_HostNowNs */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1393,6 +1394,10 @@ static void framebuffer_probe_tick(void)
 #define NV2A_ACK_PMC_INTR_PCRTC     (1u << 24)
 #define NV2A_ACK_PCRTC_INTR_0       0x600100u
 #define NV2A_ACK_PCRTC_INTR_VBLANK  (1u << 0)
+/* The software-method trap's bits (below), which its acknowledgement owns. */
+#define NV2A_ACK_PGRAPH_INTR        0x400100u
+#define NV2A_ACK_PMC_INTR_PGRAPH    (1u << 12)
+static volatile LONG g_pgraph_trap_on = -1;   /* -1 until the first raise */
 
 /* Clear the request bits "hardware" would clear on its own.
  *
@@ -1427,6 +1432,15 @@ static void nv2a_ack_busy_bits(int flip_held)
             else if (NV2A_ACK[i].offset == NV2A_ACK_PCRTC_INTR_0)
                 mask &= ~NV2A_ACK_PCRTC_INTR_VBLANK;
         }
+        /* With software-method traps on, PGRAPH_INTR is write-1-to-clear
+         * and only a trap sets it: its bits are the title's to acknowledge.
+         * (A write here would fault on its read-only page, too.) */
+        if (g_pgraph_trap_on > 0) {
+            if (NV2A_ACK[i].offset == NV2A_ACK_PGRAPH_INTR)
+                continue;
+            if (NV2A_ACK[i].offset == NV2A_ACK_PMC_INTR_0)
+                mask &= ~NV2A_ACK_PMC_INTR_PGRAPH;
+        }
         /* Interlocked: the vblank-ack thread and the guest change other
          * bits of the same word meanwhile. */
         if (*r & mask)
@@ -1448,6 +1462,249 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
         return NULL;
     return (volatile uint32_t *)((char *)g_nv2a_memory + offset);
 }
+
+/* Software-method traps (RECOMP_PGRAPH_TRAP=1).
+ *
+ * D3D marks some pushbuffer points with a NO_OPERATION carrying a value. The
+ * GPU stops there, latches the method and value into PGRAPH_TRAPPED_ADDR and
+ * TRAPPED_DATA_LOW, and raises the graphics interrupt; D3D's handler reads
+ * them back and acknowledges by writing PGRAPH_INTR's bits back, which clears
+ * them. XDK 3925 flips this way: the handler queues the flip and the vblank
+ * DPC shows it and counts it, and Present waits on that count.
+ *
+ * PGRAPH_INTR is write-1-to-clear, and the aperture is plain memory, where
+ * the handler's write-back leaves the bits set: its DPC re-reads them and runs
+ * the same trap again. So with traps on, the PGRAPH page is read-only and a
+ * write to it single-steps, like the AC'97 page; a write to PGRAPH_INTR clears
+ * the bits it wrote. When none are left, PMC_INTR_0's PGRAPH bit drops and
+ * the waiting GPU thread goes on. Reads run at full speed. */
+#define PGRAPH_PAGE            0x400000u
+#define PGRAPH_INTR_OFF        0x100u
+#define PGRAPH_NSOURCE_OFF     0x108u
+#define PGRAPH_INTR_EN_OFF     0x140u
+#define PGRAPH_FIFO_OFF        0x720u
+#define PGRAPH_TRAPPED_ADDR    0x704u
+#define PGRAPH_TRAPPED_DATA    0x708u
+#define PGRAPH_INTR_NOTIFY     (1u << 0)
+#define PGRAPH_INTR_ERROR      (1u << 20)
+#define PGRAPH_NSOURCE_NOTIFY  (1u << 0)
+#define PMC_INTR_PGRAPH        (1u << 12)
+
+#if defined(_WIN32)
+static char *g_pgraph_page;
+static CRITICAL_SECTION g_pgraph_cs;          /* the page's open window */
+static HANDLE g_pgraph_acked;
+static RECOMP_TLS int s_pg_stepping;
+static RECOMP_TLS uint32_t s_pg_intr_before;
+static RECOMP_TLS int s_pg_intr_write;
+static volatile LONG g_pgraph_fifo_gate;      /* the FIFO was open at the raise */
+
+#define PG_REG(off) (*(volatile uint32_t *)(g_pgraph_page + (off)))
+
+/* The trap is over once PGRAPH_INTR is empty and the title has let the FIFO
+ * into PGRAPH again. Its handler closes NV_PGRAPH_FIFO for the whole
+ * service and reads what the pushbuffer left in the registers after the
+ * acknowledgement: a walker resumed at the acknowledgement overwrites them
+ * with the next frame's. Read under the page's lock: while a write steps,
+ * PGRAPH_INTR holds the value written, not what it leaves. */
+static int pgraph_trap_over(void)
+{
+    int over;
+
+    EnterCriticalSection(&g_pgraph_cs);
+    over = !PG_REG(PGRAPH_INTR_OFF)
+           && (!g_pgraph_fifo_gate || (PG_REG(PGRAPH_FIFO_OFF) & 1));
+    LeaveCriticalSection(&g_pgraph_cs);
+    return over;
+}
+
+/* PGRAPH_INTR has just changed to v: PMC_INTR_0 follows. */
+static void pgraph_intr_settled(uint32_t v)
+{
+    volatile LONG *pmc = (volatile LONG *)((char *)g_nv2a_memory + NV2A_ACK_PMC_INTR_0);
+
+    if (!v)
+        InterlockedAnd(pmc, (LONG)~PMC_INTR_PGRAPH);
+}
+
+static LONG CALLBACK pgraph_write_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    DWORD old;
+
+    if (code == EXCEPTION_SINGLE_STEP && s_pg_stepping) {
+        s_pg_stepping = 0;
+        if (s_pg_intr_write) {
+            /* What the write left is what it wrote: those bits clear. */
+            uint32_t v = s_pg_intr_before & ~PG_REG(PGRAPH_INTR_OFF);
+            PG_REG(PGRAPH_INTR_OFF) = v;
+            pgraph_intr_settled(v);
+        }
+        if (pgraph_trap_over())
+            SetEvent(g_pgraph_acked);
+        VirtualProtect(g_pgraph_page, 0x1000, PAGE_READONLY, &old);
+        LeaveCriticalSection(&g_pgraph_cs);
+        ep->ContextRecord->EFlags &= ~0x100u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code == EXCEPTION_ACCESS_VIOLATION
+            && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+        uintptr_t base = (uintptr_t)g_pgraph_page;
+
+        if (fault < base || fault >= base + 0x1000)
+            return EXCEPTION_CONTINUE_SEARCH;
+        /* Held until the step: one write at a time, and none beside the
+         * GPU thread's raise. */
+        EnterCriticalSection(&g_pgraph_cs);
+        if (!VirtualProtect(g_pgraph_page, 0x1000, PAGE_READWRITE, &old)) {
+            LeaveCriticalSection(&g_pgraph_cs);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        s_pg_intr_write = fault + 4 > base + PGRAPH_INTR_OFF
+                          && fault < base + PGRAPH_INTR_OFF + 4;
+        s_pg_intr_before = PG_REG(PGRAPH_INTR_OFF);
+        s_pg_stepping = 1;
+        ep->ContextRecord->EFlags |= 0x100u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void pgraph_trap_init(void)
+{
+    const char *e = getenv("RECOMP_PGRAPH_TRAP");
+    DWORD old;
+    LONG on = 0;
+
+    if (e && *e == '1' && g_nv2a_memory) {
+        g_pgraph_page = (char *)g_nv2a_memory + PGRAPH_PAGE;
+        InitializeCriticalSection(&g_pgraph_cs);
+        g_pgraph_acked = CreateEventW(NULL, FALSE, FALSE, NULL);
+        /* First, before the title's crash reporter, as for AC'97. */
+        if (g_pgraph_acked && AddVectoredExceptionHandler(1, pgraph_write_veh)
+                && VirtualProtect(g_pgraph_page, 0x1000, PAGE_READONLY, &old))
+            on = 1;
+        fprintf(stderr, "  [GPU] software-method traps %s\n",
+                on ? "on (PGRAPH_INTR write-1-to-clear)" : "could not be armed");
+        fflush(stderr);
+    }
+    InterlockedExchange(&g_pgraph_trap_on, on);
+}
+
+int xbox_Nv2aPgraphTrapOn(void)
+{
+    if (g_pgraph_trap_on < 0)
+        pgraph_trap_init();
+    return g_pgraph_trap_on > 0;
+}
+
+int xbox_Nv2aPgraphRaise(uint32_t trapped_addr, uint32_t data)
+{
+    static int said;
+    uint32_t en, bit;
+    DWORD old;
+
+    if (!xbox_Nv2aPgraphTrapOn())
+        return 0;
+    en = PG_REG(PGRAPH_INTR_EN_OFF);
+    bit = (en & PGRAPH_INTR_NOTIFY) ? PGRAPH_INTR_NOTIFY
+        : (en & PGRAPH_INTR_ERROR) ? PGRAPH_INTR_ERROR : 0;
+    if (said < 3) {
+        said++;
+        fprintf(stderr, "  [GPU] trap %08X data %08X: PGRAPH_INTR_EN %08X%s\n",
+                trapped_addr, data, en, bit ? "" : ", not raised");
+        fflush(stderr);
+    }
+    if (!bit)
+        return 0;
+    EnterCriticalSection(&g_pgraph_cs);
+    VirtualProtect(g_pgraph_page, 0x1000, PAGE_READWRITE, &old);
+    PG_REG(PGRAPH_TRAPPED_ADDR) = trapped_addr;
+    PG_REG(PGRAPH_TRAPPED_DATA) = data;
+    PG_REG(PGRAPH_NSOURCE_OFF) = PGRAPH_NSOURCE_NOTIFY;
+    InterlockedExchange(&g_pgraph_fifo_gate, PG_REG(PGRAPH_FIFO_OFF) & 1);
+    PG_REG(PGRAPH_INTR_OFF) |= bit;
+    ResetEvent(g_pgraph_acked);
+    VirtualProtect(g_pgraph_page, 0x1000, PAGE_READONLY, &old);
+    LeaveCriticalSection(&g_pgraph_cs);
+    InterlockedOr((volatile LONG *)((char *)g_nv2a_memory + NV2A_ACK_PMC_INTR_0),
+                  (LONG)PMC_INTR_PGRAPH);
+    return 1;
+}
+
+int xbox_Nv2aPgraphWaitAck(uint32_t timeout_ms)
+{
+    static volatile LONG giveups;
+    uint32_t waited;
+    DWORD old;
+    static int spin = -1;
+
+    if (spin < 0) {
+        const char *e = getenv("RECOMP_TRAP_SPIN");
+        spin = !(e && !strcmp(e, "0"));
+    }
+    /* The title's handler can KickOff before it acknowledges, spinning on
+     * the PFB flush that only this thread clears: answered once per 2 ms
+     * wait, every trap cost milliseconds. So poll, and answer the flush as
+     * it appears. RECOMP_TRAP_SPIN=0: the 2 ms waits. */
+    if (spin) {
+        volatile LONG *flush = (volatile LONG *)((char *)g_nv2a_memory + NV2A_ACK_PFB_FLUSH);
+        uint64_t start = xbox_HostNowNs(), raised = 0, now;
+
+        for (;;) {
+            if (pgraph_trap_over()
+                    || WaitForSingleObject(g_pgraph_acked, 0) == WAIT_OBJECT_0)
+                return 1;
+            if (*flush & (LONG)NV2A_ACK[0].busy_mask)
+                InterlockedAnd(flush, ~(LONG)NV2A_ACK[0].busy_mask);
+            now = xbox_HostNowNs();
+            if (now - start >= (uint64_t)timeout_ms * 1000000u)
+                break;
+            /* Asked again every 2 ms, as below. */
+            if (!raised || now - raised >= 2000000u) {
+                nv2a_ack_busy_bits(0);
+                xbox_Nv2aRaiseGpuIrq();
+                raised = now;
+            }
+            YieldProcessor();
+        }
+    }
+
+    /* Asked again every 2 ms: a raise that found the ISR masked stays
+     * latched for the DPC, which may have finished its pass just before. */
+    for (waited = spin ? timeout_ms : 0; waited < timeout_ms; waited += 2) {
+        if (pgraph_trap_over())
+            return 1;
+        /* This is the walker's thread, which answers D3D's kickoffs
+         * between commands; a title kicking off meanwhile waits on it. */
+        nv2a_ack_busy_bits(0);
+        xbox_Nv2aRaiseGpuIrq();
+        if (WaitForSingleObject(g_pgraph_acked, 2) == WAIT_OBJECT_0)
+            return 1;
+    }
+    EnterCriticalSection(&g_pgraph_cs);
+    VirtualProtect(g_pgraph_page, 0x1000, PAGE_READWRITE, &old);
+    PG_REG(PGRAPH_INTR_OFF) = 0;
+    VirtualProtect(g_pgraph_page, 0x1000, PAGE_READONLY, &old);
+    LeaveCriticalSection(&g_pgraph_cs);
+    pgraph_intr_settled(0);
+    if (InterlockedIncrement(&giveups) <= 3) {
+        fprintf(stderr, "  [GPU] trap not serviced in %u ms; cleared\n",
+                timeout_ms);
+        fflush(stderr);
+    }
+    return 0;
+}
+#else
+int xbox_Nv2aPgraphTrapOn(void) { g_pgraph_trap_on = 0; return 0; }
+int xbox_Nv2aPgraphRaise(uint32_t trapped_addr, uint32_t data)
+{
+    (void)trapped_addr; (void)data;
+    return 0;
+}
+int xbox_Nv2aPgraphWaitAck(uint32_t timeout_ms) { (void)timeout_ms; return 1; }
+#endif
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {

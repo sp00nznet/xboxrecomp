@@ -4469,7 +4469,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_NO_OPERATION:
         /* Non-zero, it is one of D3D's software methods, which the GPU traps
          * to D3D's interrupt handler on the console. Only the swap's interval
-         * matters here (nv2a_flip_hold.h); the rest stays a no-op. */
+         * matters here (nv2a_flip_hold.h); the rest stays a no-op.
+         *
+         * With RECOMP_PGRAPH_TRAP=1 the GPU traps it as the console does:
+         * the method and value are latched, the graphics interrupt raised,
+         * and this thread stops until the title's handler acknowledges.
+         * XDK 3925 needs it: its flips are queued by that handler. */
+        if (param && xbox_Nv2aPgraphRaise((subch << 16) | method, param))
+            xbox_Nv2aPgraphWaitAck(100);
         if (!nv2a_pb_exec_flip_pacing()) {
             if (!imm_vertex_method(method, param))
                 note_unhandled(method, param);   /* as before the hold */
@@ -4632,7 +4639,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x0354: s_gpu.depth_func = param; break; /* DEPTH_FUNC */
     case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
-    case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
+    case 0x1D8C: {                        /* ZSTENCIL_CLEAR_VALUE */
+        /* Latched in PGRAPH 0x401A88, where XDK 3925's software-method
+         * handler reads the address of the buffer to flip to. */
+        volatile uint32_t *r = xbox_Nv2aRegPtr(0x401A88);
+        s_gpu.zstencil_clear = param;
+        if (r)
+            *r = param;
+        break;
+    }
 
     default:
         if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
