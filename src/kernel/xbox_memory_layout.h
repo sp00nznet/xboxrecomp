@@ -566,8 +566,11 @@ HANDLE xbox_GetMappingHandle(void);
 
 
 /* Carve a simulated stack for a spawned thread. Returns the Xbox VA of the
- * stack top, or 0 when the pool is exhausted. */
+ * stack top, or 0 when the cap is reached or the heap is out. */
 uint32_t xbox_AllocThreadStack(void);
+
+/* Stacks in use and the cap, to tell which of the two a 0 above meant. */
+void xbox_ThreadStackCounts(int *live, int *cap);
 
 /* A TIB and TLS block for a newly spawned guest thread, copied from the
  * template the loader built. Returns the new TIB's Xbox VA, or 0. */
@@ -577,8 +580,7 @@ uint32_t xbox_AllocThreadTib(void);
  * Return a worker's stack when the worker ends. Takes the value
  * xbox_AllocThreadStack returned. Without this the pool counts threads ever
  * created rather than threads alive, and a title that cycles workers exhausts
- * it -- after which PsCreateSystemThreadEx runs them inline, which deadlocks
- * any caller that then waits for the worker it thought it had spawned.
+ * it, and the next worker gets no stack.
  */
 void xbox_FreeThreadStack(uint32_t stack_top);
 

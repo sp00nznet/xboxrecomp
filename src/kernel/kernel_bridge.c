@@ -707,6 +707,21 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
     xbox_GuestCpuLeaveCallback(took);
 }
 
+/* A worker with no stack stops the run. Running it inline instead deadlocks
+ * as soon as the worker idles waiting for requests, and the hang shows up far
+ * from its cause. */
+static void bridge_no_thread_stack(const char *who, uint32_t start_routine)
+{
+    int live, cap;
+
+    xbox_ThreadStackCounts(&live, &cap);
+    fprintf(stderr, "  [KERNEL] %s: no stack for worker 0x%08X: %s (%d live, "
+            "cap %d); stopping\n", who, start_routine,
+            live >= cap ? "cap reached" : "heap exhausted", live, cap);
+    fflush(stderr);
+    ExitProcess(1);
+}
+
 void guest_cpu_join(void);
 void guest_cpu_part(void);
 
@@ -936,11 +951,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                 stack_top = xbox_AllocThreadStack();
 
                 if (!stack_top) {
-                    fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: out of "
-                            "thread stacks, running worker 0x%08X inline\n",
-                            start_routine);
-                    fflush(stderr);
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    bridge_no_thread_stack("PsCreateSystemThreadEx", start_routine);
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
                                               stack_top, xbox_handle_ptr,
@@ -9327,7 +9338,7 @@ static void bridge_PsCreateSystemThread(void)
                 }
                 stack_top = xbox_AllocThreadStack();
                 if (!stack_top) {
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    bridge_no_thread_stack("PsCreateSystemThread", start_routine);
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
                                               stack_top, xbox_handle_ptr, 0);
