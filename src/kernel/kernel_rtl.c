@@ -697,6 +697,53 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     }
 }
 
+/* Takes the same lock Enter and Leave use, in either mode: a lock taken
+ * here is released by Leave, so a table of its own left Leave releasing a
+ * host lock the thread never took. */
+BOOLEAN __stdcall xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
+{
+    CRITICAL_SECTION* cs;
+
+    if (g_cs_single_mode < 0)
+        (void)xbox_cs_shadow(CriticalSection);      /* reads the mode */
+    if (g_cs_single_mode == 2) {
+        uint8_t* g = (uint8_t*)CriticalSection;
+        volatile LONG* lock = (volatile LONG*)(g + 0x10);
+        uint32_t* rec  = (uint32_t*)(g + 0x14);
+        volatile uint32_t* owner = (volatile uint32_t*)(g + 0x18);
+        uint32_t me = xbox_cs_guest_tid();
+        if (cs_guest_is_cs(g)) {
+            if (InterlockedCompareExchange(lock, 0, -1) == -1) {
+                *owner = me;
+                *rec = 1;
+                return TRUE;
+            }
+            if (*owner == me) {
+                InterlockedIncrement(lock);
+                (*rec)++;
+                return TRUE;
+            }
+            return FALSE;
+        }
+        if (*lock == 0 && *owner == 0 && *rec == 0
+                       && *(volatile uint32_t*)(g + 0x08) == 0
+                       && InterlockedCompareExchange((volatile LONG*)owner,
+                                                     (LONG)me, 0) == 0) {
+            /* Statically zeroed: claimed as Enter claims it. */
+            *(volatile LONG*)lock = 0;
+            *(volatile uint32_t*)(g + 0x00) = CS_GUEST_MARKER;
+            *rec = 1;
+            return TRUE;
+        }
+    }
+    cs = xbox_cs_shadow(CriticalSection);
+    if (!cs || !TryEnterCriticalSection(cs))
+        return FALSE;
+    InterlockedIncrement(&g_cs_enters);
+    xbox_cs_note_owner(cs);
+    return TRUE;
+}
+
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     if (g_cs_single_mode == 2 && cs_guest_is_cs((const uint8_t*)CriticalSection)) {
