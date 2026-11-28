@@ -521,28 +521,6 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
     /* "all" logs by address as well as index. Whether a lock's release is
      * missing or merely unrecognised by the index lookup are different bugs,
      * and only the raw address separates them. */
-    /* One lock, both sides, with the guest stack that got there.
-     *
-     * A take at one address and a release 0x78 lower is not a lock protocol
-     * this runtime can reason about from addresses alone -- it needs the two
-     * call sites, because the question is whether the guest computed different
-     * addresses or we did. */
-    {
-        static int watch = -1;
-        static uint32_t watch_va;
-        if (watch < 0) {
-            const char *w = getenv("RECOMP_CS_WATCH");
-            watch = w != NULL;
-            watch_va = w ? (uint32_t)strtoul(w, NULL, 0) : 0;
-        }
-        if (watch && va == watch_va) {
-            fprintf(stderr, "  [CSWATCH] t%-6lu %s 0x%08X\n",
-                    GetCurrentThreadId(), what, va);
-            xbox_guest_backtrace(8);
-            fflush(stderr);
-        }
-    }
-
     if (all) {
         fprintf(stderr, "  [CSTRACE] t%-6lu %-4s 0x%08X idx %d\n",
                 GetCurrentThreadId(), what, va, idx);
@@ -557,6 +535,38 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
 }
 
 extern RECOMP_TLS uint32_t g_xbox_kernel_caller;
+
+/* RECOMP_CS_WATCH=<guest address>: every initialise, take, wait and release
+ * of that one lock, in either mode, with the lock's count, recursion and
+ * owner as the guest bytes hold them, the kernel call's site and the guest
+ * stack. A lock found free under a sleeping waiter was reset or released
+ * by someone; this log says who. */
+static void cs_watch(const char *what, PRTL_CRITICAL_SECTION guest)
+{
+    static int watch = -1;
+    static uint32_t watch_va;
+    const uint8_t *g = (const uint8_t*)guest;
+    uint32_t va;
+
+    if (watch < 0) {
+        const char *w = getenv("RECOMP_CS_WATCH");
+        watch_va = w ? (uint32_t)strtoul(w, NULL, 0) : 0;
+        watch = w != NULL;
+    }
+    if (!watch)
+        return;
+    va = (uint32_t)((uintptr_t)guest - (uintptr_t)g_xbox_mem_offset);
+    if (va != watch_va)
+        return;
+    fprintf(stderr, "  [CSWATCH] t%-6lu %-5s 0x%08X count %ld rec %lu owner"
+                    " 0x%08X site 0x%08X\n",
+            GetCurrentThreadId(), what, va,
+            (long)*(const volatile int32_t*)(g + 0x10),
+            (unsigned long)*(const volatile uint32_t*)(g + 0x14),
+            *(const volatile uint32_t*)(g + 0x18), g_xbox_kernel_caller);
+    xbox_guest_backtrace(8);
+    fflush(stderr);
+}
 
 static void xbox_cs_note_owner(CRITICAL_SECTION* cs)
 {
@@ -588,7 +598,9 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         uint32_t* rec  = (uint32_t*)(g + 0x14);
         volatile uint32_t* owner = (volatile uint32_t*)(g + 0x18);
         uint32_t me = xbox_cs_guest_tid();
-        LONG v = InterlockedCompareExchange(lock, 0, -1);
+        LONG v;
+        cs_watch("take", CriticalSection);
+        v = InterlockedCompareExchange(lock, 0, -1);
         if (cs_guest_is_cs(g)) {
             if (v == -1) {                 /* was free: ours */
                 *owner = me;
@@ -609,9 +621,11 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
                 }
                 HANDLE sem = xbox_cs_sem(gva, 1);
                 if (sem) {
+                    cs_watch("wait", CriticalSection);
                     WaitForSingleObject(sem, INFINITE);
                     *owner = me;
                     *rec = 1;
+                    cs_watch("woke", CriticalSection);
                 } else {
                     /* No semaphore room (table full): the bytes are still
                      * ours to wait on -- spin at yield priority rather than
@@ -649,6 +663,7 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         return;
     InterlockedIncrement(&g_cs_enters);
     crt_lock_trace("take", CriticalSection);
+    cs_watch("take", CriticalSection);
     if (TryEnterCriticalSection(cs)) {
         xbox_cs_note_owner(cs);
         return;
@@ -697,6 +712,54 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     }
 }
 
+/* Takes the same lock Enter and Leave use, in either mode: a lock taken
+ * here is released by Leave, so a table of its own left Leave releasing a
+ * host lock the thread never took. */
+BOOLEAN __stdcall xbox_RtlTryEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
+{
+    CRITICAL_SECTION* cs;
+
+    cs_watch("try", CriticalSection);
+    if (g_cs_single_mode < 0)
+        (void)xbox_cs_shadow(CriticalSection);      /* reads the mode */
+    if (g_cs_single_mode == 2) {
+        uint8_t* g = (uint8_t*)CriticalSection;
+        volatile LONG* lock = (volatile LONG*)(g + 0x10);
+        uint32_t* rec  = (uint32_t*)(g + 0x14);
+        volatile uint32_t* owner = (volatile uint32_t*)(g + 0x18);
+        uint32_t me = xbox_cs_guest_tid();
+        if (cs_guest_is_cs(g)) {
+            if (InterlockedCompareExchange(lock, 0, -1) == -1) {
+                *owner = me;
+                *rec = 1;
+                return TRUE;
+            }
+            if (*owner == me) {
+                InterlockedIncrement(lock);
+                (*rec)++;
+                return TRUE;
+            }
+            return FALSE;
+        }
+        if (*lock == 0 && *owner == 0 && *rec == 0
+                       && *(volatile uint32_t*)(g + 0x08) == 0
+                       && InterlockedCompareExchange((volatile LONG*)owner,
+                                                     (LONG)me, 0) == 0) {
+            /* Statically zeroed: claimed as Enter claims it. */
+            *(volatile LONG*)lock = 0;
+            *(volatile uint32_t*)(g + 0x00) = CS_GUEST_MARKER;
+            *rec = 1;
+            return TRUE;
+        }
+    }
+    cs = xbox_cs_shadow(CriticalSection);
+    if (!cs || !TryEnterCriticalSection(cs))
+        return FALSE;
+    InterlockedIncrement(&g_cs_enters);
+    xbox_cs_note_owner(cs);
+    return TRUE;
+}
+
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     if (g_cs_single_mode == 2 && cs_guest_is_cs((const uint8_t*)CriticalSection)) {
@@ -705,6 +768,7 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         volatile LONG* lock = (volatile LONG*)(g + 0x10);
         uint32_t* rec  = (uint32_t*)(g + 0x14);
         volatile uint32_t* owner = (volatile uint32_t*)(g + 0x18);
+        cs_watch("drop", CriticalSection);
         if (*owner != xbox_cs_guest_tid())
             return;                        /* not ours: ignore, as the shadow does */
         if (--(*rec) == 0) {
@@ -724,6 +788,7 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     if (cs) {
         InterlockedIncrement(&g_cs_leaves);
         crt_lock_trace("drop", CriticalSection);
+        cs_watch("drop", CriticalSection);
         xbox_cs_clear_owner(cs);
         LeaveCriticalSection(cs);
     }
@@ -732,6 +797,7 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
 
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
+    cs_watch("init", CriticalSection);
     if (g_cs_single_mode == 2) {
         uint8_t* g = (uint8_t*)CriticalSection;
         *(uint32_t*)(g + 0x00) = 0x00040001u;   /* Type 1, Size 4 (as measured) */
